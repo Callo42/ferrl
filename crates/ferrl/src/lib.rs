@@ -15,6 +15,9 @@
 //! - the [`policy`] abstraction over generation and per-token log-probabilities;
 //! - a manual `LoRA` adapter ([`lora`]);
 //! - grad-safe building blocks and the grad-coverage canary ([`nn`]);
+//! - the GRPO training loop ([`trainer`]) — the `Trainer` that drives rollout →
+//!   reward → advantages → masked clipped surrogate (+ optional KL) →
+//!   canary-guarded `AdamW` step;
 //! - run telemetry ([`telemetry`]).
 //!
 //! Everything below the RL layer — tensors, autograd, optimizers, devices, and
@@ -47,6 +50,7 @@ pub mod nn;
 pub mod policy;
 pub mod reward;
 pub mod telemetry;
+pub mod trainer;
 
 #[doc(inline)]
 pub use grpo::{
@@ -61,3 +65,5 @@ pub use policy::Policy;
 pub use reward::RewardFn;
 #[doc(inline)]
 pub use telemetry::{init_tracing, Metrics, MetricsWriter, RunDir};
+#[doc(inline)]
+pub use trainer::{TokenizerLike, Trainer, TrainerConfig, TrainerError};
