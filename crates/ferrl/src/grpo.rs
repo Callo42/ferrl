@@ -13,9 +13,10 @@
 //! - **Advantages** are group-normalized:
 //!   `A_i = (r_i - mean_g) / (std_g + eps)` with `eps =` [`GROUP_STD_EPS`] and
 //!   `std_g` the *sample* (Bessel-corrected, `ddof = 1`) standard deviation over
-//!   the group — matching TRL's `nanstd` and candle's `Tensor::var`. Dividing by
-//!   the std is the [`ScaleRewards::Group`] default; [`ScaleRewards::None`] drops
-//!   it (the Dr.GRPO-recommended setting).
+//!   the group — matching TRL's `nanstd` / candle's `Tensor::var` on finite
+//!   rewards (non-finite handling differs; see below). Dividing by the std is the
+//!   [`ScaleRewards::Group`] default; [`ScaleRewards::None`] drops it (the
+//!   Dr.GRPO-recommended setting).
 //! - **KL** uses Schulman's k3 estimator `exp(d) - d - 1`, `d = logp_ref - logp`,
 //!   which is non-negative and unbiased.
 //! - **Surrogate** is the PPO-style clipped objective
@@ -75,11 +76,12 @@ pub enum ScaleRewards {
 /// **finite** entries of a slice.
 ///
 /// Returns `(mean, std)`. The std divides by `n - 1` where `n` counts only the
-/// finite entries. On all-finite input this matches candle's `Tensor::var`; on
-/// non-finite input it matches TRL's `nanstd` (which skips `NaN`) rather than a
-/// raw `Tensor::var` (which would propagate it). Non-finite entries (`NaN`,
-/// `±∞`) are ignored so one bad reward cannot poison the group; fewer than two
-/// finite entries give std `0` (no `0/0`), and none gives `(0, 0)`.
+/// finite entries. For **all-finite** input this matches candle's `Tensor::var`
+/// and `numpy.std(ddof=1)`. Non-finite entries (`NaN`, `±∞`) are *all* skipped so
+/// one bad reward cannot poison the group: this coincides with TRL's `nanstd`
+/// only for `NaN`, and is deliberately *stronger* for `±∞` (which both `nanstd`
+/// and a raw `Tensor::var` would propagate). Fewer than two finite entries give
+/// std `0` (no `0/0`), and none gives `(0, 0)`.
 #[must_use]
 fn mean_std(xs: &[f64]) -> (f64, f64) {
     let finite: Vec<f64> = xs.iter().copied().filter(|x| x.is_finite()).collect();

@@ -5,9 +5,11 @@ This is the *oracle*: a reference implementation of the GRPO quantities that
 ``crates/ferrl/src/grpo.rs`` re-derives in Rust, with the contested group
 statistic computed by **NumPy** rather than a hand-rolled copy of the Rust
 formula. The advantage std uses NumPy's ``std(ddof=1)`` (sample / Bessel-
-corrected), matching TRL's ``nanstd`` and candle's ``Tensor::var`` — so a
-population-vs-sample regression in the Rust code would make this fixture
-disagree (which a same-formula reimplementation could not catch).
+corrected), which — for the all-finite rewards in this fixture — matches TRL's
+``nanstd`` and candle's ``Tensor::var``, so a population-vs-sample regression in
+the Rust code would make this fixture disagree (which a same-formula
+reimplementation could not catch). Non-finite rewards are handled by the Rust
+code (``grpo::group_advantages`` skips NaN *and* ±inf), not exercised here.
 
 Formulas mirror TRL's ``GRPOTrainer`` / the DeepSeekMath paper:
 
