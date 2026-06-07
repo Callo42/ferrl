@@ -1,5 +1,5 @@
 {
-  "_comment": "Golden GRPO math oracle. Regenerate via scripts/gen_golden.py.",
+  "_comment": "Golden GRPO math oracle (NumPy ddof=1). Regenerate via scripts/gen_golden.py.",
   "eps_std": 0.0001,
   "groups": [
     {
@@ -10,8 +10,14 @@
         0.5
       ],
       "advantages": [
-        1.413813675478189,
-        -1.413813675478189,
+        1.2244449448582857,
+        -1.2244449448582857,
+        0.0,
+        0.0
+      ],
+      "advantages_unscaled": [
+        0.5,
+        -0.5,
         0.0,
         0.0
       ]
@@ -23,9 +29,14 @@
         0.0
       ],
       "advantages": [
-        1.3361990752948305,
-        -1.0689592602358642,
-        -0.26723981505896605
+        1.091018027284325,
+        -0.8728144218274599,
+        -0.21820360545686499
+      ],
+      "advantages_unscaled": [
+        1.6666666666666667,
+        -1.3333333333333333,
+        -0.3333333333333333
       ]
     }
   ],
