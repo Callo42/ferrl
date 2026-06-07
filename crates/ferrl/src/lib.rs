@@ -14,6 +14,7 @@
 //! - the [`reward`] abstraction (scalar rewards, never tensors);
 //! - the [`policy`] abstraction over generation and per-token log-probabilities;
 //! - a manual `LoRA` adapter ([`lora`]);
+//! - grad-safe building blocks and the grad-coverage canary ([`nn`]);
 //! - run telemetry ([`telemetry`]).
 //!
 //! Everything below the RL layer — tensors, autograd, optimizers, devices, and
@@ -42,6 +43,7 @@
 
 pub mod grpo;
 pub mod lora;
+pub mod nn;
 pub mod policy;
 pub mod reward;
 pub mod telemetry;
@@ -51,6 +53,8 @@ pub use grpo::{
     clipped_surrogate, group_advantages, k3_kl, masked_mean, zero_mask_rows, LossType,
     ScaleRewards, GROUP_STD_EPS,
 };
+#[doc(inline)]
+pub use nn::{grad_coverage, GradCoverage, RmsNorm};
 #[doc(inline)]
 pub use policy::Policy;
 #[doc(inline)]
