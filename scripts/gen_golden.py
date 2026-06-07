@@ -5,9 +5,11 @@ This is the *oracle*: a reference implementation of the GRPO quantities that
 ``crates/ferrl/src/grpo.rs`` re-derives in Rust, with the contested group
 statistic computed by **NumPy** rather than a hand-rolled copy of the Rust
 formula. The advantage std uses NumPy's ``std(ddof=1)`` (sample / Bessel-
-corrected), matching TRL's ``nanstd`` and candle's ``Tensor::var`` — so a
-population-vs-sample regression in the Rust code would make this fixture
-disagree (which a same-formula reimplementation could not catch).
+corrected), which — for the all-finite rewards in this fixture — matches TRL's
+``nanstd`` and candle's ``Tensor::var``, so a population-vs-sample regression in
+the Rust code would make this fixture disagree (which a same-formula
+reimplementation could not catch). Non-finite rewards are handled by the Rust
+code (``grpo::group_advantages`` skips NaN *and* ±inf), not exercised here.
 
 Formulas mirror TRL's ``GRPOTrainer`` / the DeepSeekMath paper:
 
@@ -15,7 +17,7 @@ Formulas mirror TRL's ``GRPOTrainer`` / the DeepSeekMath paper:
   (scale="group", default); A_i = r_i - mean_g (scale="none", Dr.GRPO-recommended)
 * k3 (Schulman) KL estimator   k3 = exp(d) - d - 1  where d = logp_ref - logp
 * per-token clipped surrogate  min(ratio * A, clip(ratio, 1-e, 1+e) * A)
-* masked mean reductions        "grpo"   -> mean over valid tokens per-sequence
+* masked mean reductions        "grpo"   -> mean over max(valid tokens, 1) per-seq
                                 "dr_grpo"-> sum / (num_seq * max_len)  (Dr.GRPO)
 
 Output is committed at ``crates/ferrl/tests/fixtures/grpo_golden.json`` and loaded
@@ -105,7 +107,7 @@ def main() -> None:
     # grpo: average over valid tokens per-sequence, then average over sequences.
     per_seq = []
     for row, mrow in zip(per_token, mask):
-        denom = sum(mrow)
+        denom = max(sum(mrow), 1.0)  # TRL clamp(min=1): an all-pad row contributes 0
         s = sum(v * m for v, m in zip(row, mrow))
         per_seq.append(s / denom)
     masked_mean_grpo = sum(per_seq) / num_seq

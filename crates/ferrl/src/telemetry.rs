@@ -162,7 +162,11 @@ impl RunDir {
 ///
 /// All fields are plain scalars; rewards are aggregated to mean/std *before*
 /// reaching this struct (rewards are never tensors in `ferrl`).
+///
+/// `#[non_exhaustive]`: construct via [`Metrics::at_step`] then set fields, so
+/// adding a metric later is not a breaking change for downstream crates.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Metrics {
     /// Global optimizer step (0-based).
     pub step: u64,
@@ -170,12 +174,31 @@ pub struct Metrics {
     pub reward_mean: f32,
     /// Standard deviation of scalar rewards over the batch.
     pub reward_std: f32,
+    /// Fraction of GRPO groups in the batch whose reward std is `0` — every
+    /// completion in the group scored identically, so its advantages are all `0`
+    /// and it contributes no gradient. Mirrors TRL's `frac_reward_zero_std`; a
+    /// value near `1` means the batch taught the policy almost nothing (rewards
+    /// saturated, or the task is too easy/hard for the current model).
+    ///
+    /// `#[serde(default)]` so `metrics.jsonl` records written before this field
+    /// existed still deserialize (defaulting to `0.0`).
+    #[serde(default)]
+    pub frac_reward_zero_std: f32,
     /// Mean k3 KL to the reference policy.
     pub kl: f32,
     /// Fraction of tokens whose surrogate hit the PPO clip band.
     pub clip_ratio: f32,
     /// Mean completion length in tokens.
     pub completion_len: f32,
+    /// Number of all-pad completion rows (no valid tokens) that contributed `0`
+    /// to the loss this step. Such rows are tolerated rather than fatal (see
+    /// [`crate::grpo::masked_mean`] / [`crate::grpo::zero_mask_rows`]); recorded
+    /// here so a batch that silently lost completions is observable. Normally `0`.
+    ///
+    /// `#[serde(default)]` for back-compat with pre-existing `metrics.jsonl`
+    /// records.
+    #[serde(default)]
+    pub dropped_rows: u32,
     /// Global gradient norm after backward (pre-clip).
     pub grad_norm: f32,
     /// Effective learning rate for this step.
@@ -191,12 +214,52 @@ impl Metrics {
             step,
             reward_mean: 0.0,
             reward_std: 0.0,
+            frac_reward_zero_std: 0.0,
             kl: 0.0,
             clip_ratio: 0.0,
             completion_len: 0.0,
+            dropped_rows: 0,
             grad_norm: 0.0,
             lr: 0.0,
         }
+    }
+
+    /// A copy with every non-finite `f32` field replaced by a finite value:
+    /// `NaN → 0`, `+∞ → f32::MAX`, `−∞ → f32::MIN`.
+    ///
+    /// JSON has no literal for non-finite floats — `serde_json` emits `null`,
+    /// which then fails to deserialize back into an `f32`. [`MetricsWriter::append`]
+    /// applies this automatically so `metrics.jsonl` stays valid, round-trippable
+    /// JSON; a value that blew up (e.g. an exploded `grad_norm`, or a `kl` from an
+    /// overflowed [`crate::k3_kl`]) surfaces as a saturated magnitude rather than a
+    /// parse failure.
+    #[must_use]
+    pub fn nan_to_num(&self) -> Self {
+        fn finite(x: f32) -> f32 {
+            if x.is_finite() {
+                x
+            } else if x.is_nan() {
+                0.0
+            } else if x.is_sign_positive() {
+                f32::MAX
+            } else {
+                f32::MIN
+            }
+        }
+        let mut m = self.clone();
+        for f in [
+            &mut m.reward_mean,
+            &mut m.reward_std,
+            &mut m.frac_reward_zero_std,
+            &mut m.kl,
+            &mut m.clip_ratio,
+            &mut m.completion_len,
+            &mut m.grad_norm,
+            &mut m.lr,
+        ] {
+            *f = finite(*f);
+        }
+        m
     }
 }
 
@@ -232,7 +295,8 @@ impl MetricsWriter {
     ///
     /// Returns [`TelemetryError`] if serialization or the write/flush fails.
     pub fn append(&mut self, metrics: &Metrics) -> Result<(), TelemetryError> {
-        let mut line = serde_json::to_string(metrics)?;
+        // Sanitize non-finite floats so the line stays valid, re-readable JSON.
+        let mut line = serde_json::to_string(&metrics.nan_to_num())?;
         line.push('\n');
         self.file
             .write_all(line.as_bytes())
@@ -365,15 +429,49 @@ mod tests {
             step: 7,
             reward_mean: 0.5,
             reward_std: 0.25,
+            frac_reward_zero_std: 0.125,
             kl: 0.02,
             clip_ratio: 0.1,
             completion_len: 42.0,
+            dropped_rows: 3,
             grad_norm: 1.23,
             lr: 5e-6,
         };
         let j = serde_json::to_string(&m).unwrap();
         let back: Metrics = serde_json::from_str(&j).unwrap();
         assert_eq!(back, m);
+    }
+
+    #[test]
+    fn metrics_deserializes_old_log_without_new_fields() {
+        // A pre-PR#3 metrics.jsonl line lacks frac_reward_zero_std and dropped_rows;
+        // #[serde(default)] must let it deserialize (defaulting both to 0).
+        let old = r#"{"step":3,"reward_mean":1.0,"reward_std":0.5,"kl":0.01,"clip_ratio":0.2,"completion_len":10.0,"grad_norm":1.0,"lr":1e-5}"#;
+        let m: Metrics = serde_json::from_str(old).unwrap();
+        assert_eq!(m.step, 3);
+        assert_eq!(m.frac_reward_zero_std, 0.0);
+        assert_eq!(m.dropped_rows, 0);
+    }
+
+    #[test]
+    fn metrics_writer_sanitizes_nonfinite_fields() {
+        // Non-finite f32 would serialize to JSON `null` and fail to re-read;
+        // append() must nan_to_num them so the line stays valid + parseable.
+        let tmp = TempDir::new("nonfinite");
+        let rd = RunDir::create(tmp.path(), "r").unwrap();
+        let mut w = rd.metrics_writer().unwrap();
+        let mut m = Metrics::at_step(0);
+        m.grad_norm = f32::INFINITY;
+        m.reward_mean = f32::NEG_INFINITY;
+        m.kl = f32::NAN;
+        w.append(&m).unwrap();
+        drop(w);
+
+        let raw = std::fs::read_to_string(rd.metrics_path()).unwrap();
+        let back: Metrics = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
+        assert_eq!(back.grad_norm, f32::MAX);
+        assert_eq!(back.reward_mean, f32::MIN);
+        assert_eq!(back.kl, 0.0);
     }
 
     #[test]

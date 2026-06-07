@@ -48,7 +48,8 @@ pub mod telemetry;
 
 #[doc(inline)]
 pub use grpo::{
-    clipped_surrogate, group_advantages, k3_kl, masked_mean, LossType, ScaleRewards, GROUP_STD_EPS,
+    clipped_surrogate, group_advantages, k3_kl, masked_mean, zero_mask_rows, LossType,
+    ScaleRewards, GROUP_STD_EPS,
 };
 #[doc(inline)]
 pub use policy::Policy;
