@@ -1,0 +1,6 @@
+# Pinned toolchain for a reproducible quality gate. `llvm-tools-preview` is
+# required by cargo-llvm-cov (source-based coverage). rustfmt + clippy back the
+# fmt / lint recipes. Bump deliberately, in its own commit.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy", "llvm-tools-preview"]

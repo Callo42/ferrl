@@ -1,0 +1,5 @@
+# Clippy tunables. The cognitive-complexity threshold is the analog of a strict
+# mccabe max-complexity = 7: any function whose branching cognitive complexity
+# exceeds this trips `clippy::cognitive_complexity` (warn -> error under CI's
+# -D warnings). Keep functions small and factored.
+cognitive-complexity-threshold = 7

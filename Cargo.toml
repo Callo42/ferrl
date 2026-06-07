@@ -1,0 +1,124 @@
+# ferrl workspace manifest.
+#
+# Single crate for now (crates/ferrl), but kept as a workspace so the lint and
+# dependency policy lives in one place and future crates (e.g. a CLI front-end)
+# inherit it. The [workspace.lints] table below is the LOCKED quality bar: CI
+# runs `cargo clippy --all-targets -- -D warnings`, so every lint set to `warn`
+# here becomes a hard error. The set is deliberately CURATED — `clippy::all`
+# plus a hand-picked slice of pedantic — so that correct, idiomatic code
+# compiles clean. We do NOT blanket-enable clippy::pedantic / clippy::nursery,
+# because under -D warnings their many opinionated lints would fail a fresh,
+# correct scaffold on the very first commit.
+
+[workspace]
+resolver = "2"
+members = ["crates/ferrl"]
+
+[workspace.package]
+edition = "2021"
+# candle 0.10.x declares no MSRV; 1.82 is a comfortable floor for the whole
+# dependency tree (cudarc 0.19, tokenizers 0.22, edition 2021). Bump on purpose.
+rust-version = "1.82"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Callo42/ferrl"
+authors = ["Callo42"]
+
+[workspace.dependencies]
+# Math / tensor / autograd / GPU / model backend. We OWN only the RL layer and
+# DELEGATE every tensor op, the autograd graph, GPU dispatch, and the model
+# forward to candle. The three crates MUST move in lockstep: pin them to the
+# SAME version so candle-nn / candle-transformers never resolve a candle-core
+# that differs from the one ferrl links. 0.10.2 is the current coherent set
+# (published 2026-04-01) and is the first line that ships the Qwen3 model.
+candle-core = "=0.10.2"
+candle-nn = "=0.10.2"
+candle-transformers = "=0.10.2"
+# Model + tokenizer assets.
+#
+# hf-hub fetches the Qwen3-0.6B-Base weights. We drop its default features
+# (which pull `native-tls` -> the system OpenSSL `openssl-sys` crate, breaking
+# on minimal CI / cluster images) and select the blocking `ureq` client, whose
+# TLS is rustls — no system OpenSSL, no tokio runtime for a synchronous
+# download. (`rustls-tls` is a weak `reqwest?/rustls-tls` toggle; harmless here
+# and documents intent on the async path.)
+hf-hub = { version = "0.5", default-features = false, features = ["ureq", "rustls-tls"] }
+# tokenizers loads the fast tokenizer. Pin the SAME minor candle 0.10.2 uses
+# internally (0.22) so a `tokenizers::Tokenizer` handed across a candle API is
+# one type, not a second copy from a divergent version. `default-features =
+# false` + `onig` keeps the surface minimal and mirrors candle's own usage.
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+# Telemetry. Structured spans for rollout / update phases.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+# Config / metrics serialization (config.json, metrics.jsonl, golden fixtures).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Errors. `thiserror` for the library's typed error enum; `anyhow` for binaries,
+# examples, and oracle/glue paths where a boxed error is fine.
+thiserror = "2"
+anyhow = "1"
+# RNG for GRPO sampling / group construction and reproducible test fixtures.
+rand = "0.10"
+# Dev: property-based testing for numeric invariants.
+proptest = "1"
+# Dev: deterministic float comparison in tests.
+approx = "0.5"
+
+[workspace.lints.rust]
+# Safety + docs gate. `unsafe_code` is forbidden at the crate root too
+# (#![forbid(unsafe_code)]); duplicating it here keeps future crates honest.
+unsafe_code = "forbid"
+missing_docs = "deny"
+unreachable_pub = "warn"
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "deny"
+
+[workspace.lints.clippy]
+# Baseline: the full `all` group (correctness, suspicious, style, complexity,
+# perf) at deny. `priority = -1` sinks the group below the individual keys
+# below, so any single-lint override here wins regardless of table order. This
+# is the bulk of the value and is safe under -D warnings for correct code.
+all = { level = "deny", priority = -1 }
+
+# Curated pedantic slice — high-signal lints that catch real readability /
+# correctness footguns without the false-positive noise of the full pedantic
+# group. Each passes clean on idiomatic scaffold code. (We intentionally OMIT
+# notoriously noisy pedantic lints such as must_use_candidate,
+# module_name_repetitions, and similar_names, which would fail a clean tree
+# under -D warnings.)
+doc_markdown = "warn"
+explicit_iter_loop = "warn"
+explicit_into_iter_loop = "warn"
+manual_let_else = "warn"
+match_same_arms = "warn"
+needless_pass_by_value = "warn"
+redundant_closure_for_method_calls = "warn"
+semicolon_if_nothing_returned = "warn"
+unnested_or_patterns = "warn"
+uninlined_format_args = "warn"
+cast_lossless = "warn"
+map_unwrap_or = "warn"
+return_self_not_must_use = "warn"
+inefficient_to_string = "warn"
+cloned_instead_of_copied = "warn"
+# NOTE: clippy::float_cmp is deliberately NOT enabled. This is a numeric RL
+# library: exact f32/f64 comparisons are routine and intentional (epsilon
+# guards like `denom == 0.0`, and `assert_eq!` on exactly-representable test
+# values). Tolerant comparison uses the `approx` dev-dep where it belongs.
+# Enabling float_cmp would force #[allow] on idiomatic numeric code — noise,
+# not signal — which violates the curated bar.
+
+# We log via `tracing`, never std streams. Direct prints are a bug.
+print_stdout = "deny"
+print_stderr = "deny"
+
+# Cognitive-complexity bound (~7 branches), the analog of mccabe
+# max-complexity = 7. This lint lives in clippy's `restriction` group (default
+# allow), so we opt in explicitly here; the numeric threshold lives in
+# clippy.toml (cognitive-complexity-threshold = 7).
+cognitive_complexity = "warn"
+
+# Encourage `# Errors` / `# Panics` doc sections on public fallible API.
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"

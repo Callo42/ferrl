@@ -1,0 +1,74 @@
+# pre-commit configuration for ferrl.
+#
+# Two stages are wired (install both: `pre-commit install && pre-commit install
+# --hook-type commit-msg`, or just `just bootstrap`):
+#
+#   * commit  — generic hygiene hooks + fast local `cargo fmt`/`clippy`.
+#   * commit-msg — Conventional Commits validation via cocogitto (`cog verify`).
+#
+# Heavy work (tests, coverage, full builds) is deliberately NOT here — it lives
+# in CI and in `just gate`. Pre-commit must stay fast enough to run on every
+# commit.
+#
+# NOTE on the local cargo hooks: they shell out through the justfile's `_cargo`
+# wrapper so that on platformax (NFS HOME) the CARGO_HOME/-TARGET_DIR reroute
+# applies inside the hook too — see the justfile header. On a laptop / CI this is
+# a no-op and behaves like a plain `cargo`.
+
+minimum_pre_commit_version: "3.5.0"
+
+# Default the framework-installed hook to the commit stage; the cocogitto hook
+# below overrides this to commit-msg explicitly.
+default_install_hook_types: [pre-commit, commit-msg]
+default_stages: [pre-commit]
+
+repos:
+  # --- Generic hygiene (pre-commit's own out-of-the-box hooks) --------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+        # Preserve significant trailing whitespace inside Markdown line breaks.
+        args: [--markdown-linebreak-ext=md]
+      - id: end-of-file-fixer
+      - id: check-merge-conflict
+      - id: check-toml
+      - id: check-yaml
+      - id: detect-private-key
+
+  # --- Local Rust hooks (fast, source-of-truth = the justfile) --------------
+  # `system` language: these run the tools already on PATH (rustup-managed),
+  # rather than letting pre-commit build an isolated environment.
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt (check)
+        description: Verify Rust formatting against rustfmt.toml (max_width=100).
+        entry: just fmt-check
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-clippy
+        name: cargo clippy (-D warnings)
+        description: Curated clippy lint set as hard errors (Cargo.toml workspace.lints).
+        entry: just clippy
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+  # --- Commit-message linting (cocogitto, Conventional Commits) -------------
+  # cocogitto ships no native pre-commit hook, so we invoke its CLI directly.
+  # `cog verify --file <msg-file>` validates the single in-flight commit message
+  # against the Conventional Commits spec. Runs at the commit-msg stage, where
+  # pre-commit passes the message file as the sole argument.
+  - repo: local
+    hooks:
+      - id: cog-verify
+        name: cog verify (Conventional Commits)
+        description: Validate the commit message via cocogitto.
+        entry: cog verify --file
+        language: system
+        stages: [commit-msg]
+        pass_filenames: true
+        always_run: true

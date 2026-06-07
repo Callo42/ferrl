@@ -1,0 +1,4 @@
+# Locked formatting contract. `just fmt` / `cargo fmt` must produce a stable
+# fixpoint; CI runs `cargo fmt --all -- --check`.
+edition = "2021"
+max_width = 100

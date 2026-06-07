@@ -1,0 +1,30 @@
+# --- Rust build artifacts ---
+# The cargo build dir. On the platformax cluster this is redirected to node-local
+# /tmp via CARGO_TARGET_DIR (see justfile), so /target here is for ordinary
+# contributors and GitHub runners.
+/target
+# rustfmt backup files
+**/*.rs.bk
+
+# --- Training run outputs ---
+# Each `runs/<run_id>/` holds config.json, metrics.jsonl, checkpoints and a human
+# log. These are produced by training and are not source; never commit them.
+/runs
+
+# --- Python oracle scratch ---
+# scripts/gen_golden.py is committed; its environment and bytecode are not.
+__pycache__/
+*.pyc
+.venv/
+.venv-oracle/
+
+# --- Editor / OS noise ---
+.DS_Store
+
+# NOTE: Cargo.lock IS committed (it is intentionally NOT ignored here).
+# ferrl is an application-like project: it builds binaries (examples/, training
+# CLI) and we want bit-reproducible training runs and a reproducible CI gate, so
+# we pin the exact dependency graph. This also matches Cargo's post-2023 guidance
+# to commit Cargo.lock as the default starting point. If ferrl is ever consumed
+# purely as a library crate, downstreams ignore this lockfile anyway (Cargo
+# excludes it from published packages).

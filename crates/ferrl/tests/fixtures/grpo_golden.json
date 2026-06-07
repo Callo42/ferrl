@@ -1,0 +1,117 @@
+{
+  "_comment": "Golden GRPO math oracle. Regenerate via scripts/gen_golden.py.",
+  "eps_std": 0.0001,
+  "groups": [
+    {
+      "rewards": [
+        1.0,
+        0.0,
+        0.5,
+        0.5
+      ],
+      "advantages": [
+        1.413813675478189,
+        -1.413813675478189,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "rewards": [
+        2.0,
+        -1.0,
+        0.0
+      ],
+      "advantages": [
+        1.3361990752948305,
+        -1.0689592602358642,
+        -0.26723981505896605
+      ]
+    }
+  ],
+  "k3_kl": [
+    {
+      "logp": -0.5,
+      "logp_ref": -0.4,
+      "kl": 0.005170918075647624
+    },
+    {
+      "logp": -1.0,
+      "logp_ref": -1.0,
+      "kl": 0.0
+    },
+    {
+      "logp": -2.0,
+      "logp_ref": -1.5,
+      "kl": 0.1487212707001282
+    },
+    {
+      "logp": 0.0,
+      "logp_ref": -0.25,
+      "kl": 0.02880078307140499
+    }
+  ],
+  "clipped_surrogate": [
+    {
+      "ratio": 1.0,
+      "advantage": 0.5,
+      "clip_eps": 0.2,
+      "value": 0.5
+    },
+    {
+      "ratio": 1.5,
+      "advantage": 0.5,
+      "clip_eps": 0.2,
+      "value": 0.6
+    },
+    {
+      "ratio": 1.5,
+      "advantage": -0.5,
+      "clip_eps": 0.2,
+      "value": -0.75
+    },
+    {
+      "ratio": 0.5,
+      "advantage": -0.5,
+      "clip_eps": 0.2,
+      "value": -0.4
+    },
+    {
+      "ratio": 0.8,
+      "advantage": 0.5,
+      "clip_eps": 0.2,
+      "value": 0.4
+    }
+  ],
+  "masked_mean": {
+    "per_token": [
+      [
+        1.0,
+        2.0,
+        3.0
+      ],
+      [
+        4.0,
+        5.0,
+        0.0
+      ]
+    ],
+    "mask": [
+      [
+        1.0,
+        1.0,
+        1.0
+      ],
+      [
+        1.0,
+        1.0,
+        0.0
+      ]
+    ],
+    "valid_tokens": 5.0,
+    "num_seq": 2,
+    "max_len": 3,
+    "grpo": 3.25,
+    "dr_grpo": 2.5
+  }
+}

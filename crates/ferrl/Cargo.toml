@@ -1,0 +1,62 @@
+[package]
+name = "ferrl"
+version = "0.0.1"
+description = "A candle-native GRPO reinforcement-learning library for RL-fine-tuning LLMs in Rust."
+keywords = ["rl", "grpo", "llm", "candle", "fine-tuning"]
+categories = ["science", "algorithms"]
+readme = "../../README.md"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+# Tensor / autograd / GPU backend and the shipped model + tokenizer stack.
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+candle-transformers = { workspace = true }
+hf-hub = { workspace = true }
+tokenizers = { workspace = true }
+# Telemetry, serialization, errors, RNG.
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+approx = { workspace = true }
+
+[features]
+# Default is CPU-only: this is what GitHub Actions CI builds and tests, and the
+# default for ordinary contributors without a GPU.
+default = []
+# `cuda` forwards the CUDA backend to every candle crate ferrl links. Because
+# ferrl depends on candle-core / candle-nn / candle-transformers directly (not
+# via candle's internal `candle` alias), the feature paths use those exact
+# dependency names. Built only on the Slurm GPU cluster, never in CI.
+#   cargo build --features cuda
+cuda = [
+    "candle-core/cuda",
+    "candle-nn/cuda",
+    "candle-transformers/cuda",
+]
+# cuDNN convolutions, layered on top of cuda. Optional GPU-only acceleration.
+cudnn = [
+    "cuda",
+    "candle-core/cudnn",
+    "candle-nn/cudnn",
+]
+# FlashAttention kernels (implies cuda). candle-transformers gates these behind
+# its own `flash-attn` feature.
+flash-attn = [
+    "cuda",
+    "candle-transformers/flash-attn",
+]
+
+[lints]
+workspace = true

@@ -1,0 +1,145 @@
+name: CI
+
+# ferrl CI — candle-native GRPO RL library, CPU-only on GitHub runners.
+# GPU runs are manual on a Slurm cluster and are deliberately NOT part of CI.
+#
+# Quality gate mirrors the locked bar: rustfmt, curated clippy with -D warnings,
+# test + doctests, cargo-llvm-cov with a HARD --fail-under-lines 90, rustdoc with
+# -D warnings, and a Conventional-Commits check via cocogitto on PRs.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same ref to save runner minutes (candle builds
+# are long); the latest commit on a branch/PR is the only one that matters.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: read-only checkout is all any job here needs.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail fast on warnings emitted by the compiler itself (not just clippy).
+  RUSTFLAGS: "-D warnings"
+  # Keep build noise/back-off out of CI logs and make network failures loud.
+  CARGO_NET_RETRY: "10"
+  RUSTUP_MAX_RETRIES: "10"
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust (pinned via rust-toolchain.toml) + rustfmt
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: cargo fmt --all --check
+        run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust + clippy
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Cache cargo registry + target (candle builds are slow)
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: clippy
+      # Lint levels are declared in Cargo.toml [workspace.lints]; -D warnings
+      # turns the curated set into hard failures. The scaffold is expected to be
+      # warning-clean against that curated set. DEFAULT (CPU) features only: the
+      # `cuda` / `cudnn` / `flash-attn` features pull cudarc, whose build script
+      # shells out to `nvcc` and fails on CPU-only runners — GPU lint/build is
+      # manual on the Slurm cluster, never CI.
+      - name: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: test + coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust + llvm-tools-preview
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: coverage
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      # Coverage run also exercises unit tests + integration tests. Doctests are
+      # NOT instrumented by llvm-cov, so they run separately below to guarantee
+      # the examples in docs stay correct.
+      # DEFAULT (CPU) features only — see the clippy job for why --all-features
+      # cannot run on CPU-only runners. examples/ and bins are excluded from the
+      # coverage denominator so glue code never dilutes the library gate.
+      - name: cargo llvm-cov (HARD gate: --fail-under-lines 90)
+        run: >-
+          cargo llvm-cov
+          --workspace
+          --ignore-filename-regex '(examples|bin)/'
+          --lcov
+          --output-path lcov.info
+          --fail-under-lines 90
+      - name: cargo test --doc (doctests, not covered by llvm-cov)
+        run: cargo test --workspace --doc
+      - name: Upload lcov coverage artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lcov
+          path: lcov.info
+          if-no-files-found: warn
+
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    env:
+      # Treat all rustdoc warnings (incl. broken intra-doc links) as errors.
+      RUSTDOCFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: docs
+      # DEFAULT (CPU) features only — GPU feature docs are not built in CI.
+      - name: cargo doc --no-deps
+        run: cargo doc --no-deps
+
+  commit-lint:
+    name: commit-lint (Conventional Commits)
+    # Only meaningful on PRs: validates the PR's commit range against the
+    # Conventional Commits spec via cocogitto's `cog check`.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # cog check walks the commit graph; it needs full history, not a
+          # shallow clone, or it will fail to resolve the commit range.
+          fetch-depth: 0
+      - name: Conventional Commits check (cog check)
+        uses: cocogitto/cocogitto-action@v4
+        with:
+          command: check
+          # Lint only this PR's commits (merge-base of base..HEAD), not the
+          # whole pre-existing history, so legacy/imported commits don't fail PRs.
+          args: --from-latest-tag

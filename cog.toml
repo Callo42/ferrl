@@ -1,0 +1,66 @@
+# cocogitto configuration for ferrl.
+#
+# cocogitto is our Conventional Commits + SemVer toolbox. It drives three things:
+#   * `cog verify` / `cog check`  — commit-message linting (pre-commit + CI).
+#   * `cog bump`                  — SemVer version bumps from commit history.
+#   * `cog changelog`             — CHANGELOG.md generation from commits.
+#
+# Schema: https://docs.cocogitto.io/reference/config.html  (cocogitto 7.x)
+
+# Tag every release `vX.Y.Z`. `cog bump`, `cog changelog`, and version detection
+# all key off this prefix (matches the `v` prefix referenced by CI).
+tag_prefix = "v"
+
+# Keep merge commits out of changelog/version analysis — they are not
+# Conventional Commits and would otherwise be flagged by `cog check`.
+ignore_merge_commits = true
+
+# Restrict releases to the trunk. Bumping/tagging from a feature branch is almost
+# always a mistake; this makes `cog bump` refuse to run off `main`.
+branch_whitelist = ["main"]
+
+[changelog]
+path = "CHANGELOG.md"
+# Use the GitHub-flavoured template so changelog entries link to commits, issues,
+# and contributors on github.com.
+template = "remote"
+remote = "github.com"
+repository = "ferrl"
+owner = "Callo42"
+# Map git author signatures to GitHub usernames for changelog attribution.
+authors = [
+    { signature = "Callo42", username = "Callo42" },
+]
+
+# --- Commit types -----------------------------------------------------------
+# cocogitto already knows the Angular set (feat, fix, build, ci, revert, docs,
+# test, style, chore, perf). We only customise titles/behaviour here.
+#
+# Bump policy:
+#   * feat -> minor, fix -> patch (Conventional Commits / SemVer defaults; a `!`
+#     or `BREAKING CHANGE:` footer forces a major regardless of type).
+#   * Pure-noise types (style, chore, ci) are accepted by `cog check` but omitted
+#     from the changelog to keep it signal-dense.
+[commit_types]
+feat = { changelog_title = "Features", bump_minor = true }
+fix = { changelog_title = "Bug Fixes", bump_patch = true }
+perf = { changelog_title = "Performance" }
+refactor = { changelog_title = "Refactoring" }
+docs = { changelog_title = "Documentation" }
+test = { changelog_title = "Tests" }
+build = { changelog_title = "Build System" }
+ci = { changelog_title = "Continuous Integration", omit_from_changelog = true }
+style = { changelog_title = "Style", omit_from_changelog = true }
+chore = { changelog_title = "Miscellaneous", omit_from_changelog = true }
+
+# --- Shared git hooks (the `cog install-hook` path) -------------------------
+# We standardise on the pre-commit FRAMEWORK (.pre-commit-config.yaml) for hooks.
+# This table is the cocogitto-native ALTERNATIVE for contributors who prefer
+# `cog install-hook --all` over the pre-commit framework — it reproduces the same
+# commit-msg check. Pick one; don't install both for commit-msg or the message
+# gets validated twice (harmless, just redundant).
+[git_hooks.commit-msg]
+script = """#!/bin/sh
+set -e
+cog verify --file "$1"
+"""
