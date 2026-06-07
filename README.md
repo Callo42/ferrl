@@ -145,8 +145,8 @@ advantage_i      = (r_i - mean(r)) / (std(r) + eps)          # eps = 1e-4
 ratio            = exp(logp - old_logp)
 clipped_surrogate= min( ratio * adv, clip(ratio, 1-e, 1+e) * adv )
 k3_kl            = exp(d) - d - 1,   d = ref_logp - logp      # >= 0
-masked_mean(grpo)   = mean_seq( sum_t v·m / sum_t m )         # per-seq mean, then mean
-masked_mean(drgrpo) = sum_all(v·m) / (num_seq · max_len)      # Dr.GRPO, length-unbiased
+masked_mean(grpo)   = mean_seq( sum_t v·m / max(sum_t m, 1) )  # all-pad row -> 0 (TRL clamp)
+masked_mean(drgrpo) = sum_all(v·m) / (num_seq · max_len)       # Dr.GRPO; requires max_len >= 1
 ```
 
 ---

@@ -25,10 +25,15 @@
 //!   `num_sequences * max_len`. The Dr.GRPO *paper* algorithm is
 //!   `LossType::DrGrpo` **plus** [`ScaleRewards::None`].
 //!
-//! Non-finite inputs are handled defensively, mirroring TRL's `nan_to_num`: a
-//! `NaN` (or `±∞`) reward is dropped from its group's mean/std and given a `0`
-//! advantage rather than poisoning the whole group, and an all-pad (zero-mask)
-//! sequence contributes `0` to either reduction instead of dividing by zero.
+//! Non-finite inputs are handled defensively (this is *stronger* than TRL's
+//! mainline path, which propagates `NaN` through `mean`/`std`): a `NaN`/`±∞`
+//! reward is dropped from its group's mean/std and given a `0` advantage — note
+//! `±∞ → 0`, unlike `torch.nan_to_num`, which maps `±∞` to finite extremes — so
+//! one bad completion cannot poison the group. In [`masked_mean`] a value in a
+//! masked-out position is ignored (so `0 · ∞` cannot leak `NaN`) and an all-pad
+//! row contributes `0` to either reduction. Masks must be finite and
+//! non-negative and rows must have width `≥ 1`; violations are caller bugs and
+//! panic.
 
 use serde::{Deserialize, Serialize};
 
@@ -70,10 +75,11 @@ pub enum ScaleRewards {
 /// **finite** entries of a slice.
 ///
 /// Returns `(mean, std)`. The std divides by `n - 1` where `n` counts only the
-/// finite entries, matching TRL's `nanstd` / candle's `Tensor::var`. Non-finite
-/// entries (`NaN`, `±∞`) are ignored so one bad reward cannot poison the group;
-/// fewer than two finite entries give std `0` (no `0/0`), and none gives
-/// `(0, 0)`.
+/// finite entries. On all-finite input this matches candle's `Tensor::var`; on
+/// non-finite input it matches TRL's `nanstd` (which skips `NaN`) rather than a
+/// raw `Tensor::var` (which would propagate it). Non-finite entries (`NaN`,
+/// `±∞`) are ignored so one bad reward cannot poison the group; fewer than two
+/// finite entries give std `0` (no `0/0`), and none gives `(0, 0)`.
 #[must_use]
 fn mean_std(xs: &[f64]) -> (f64, f64) {
     let finite: Vec<f64> = xs.iter().copied().filter(|x| x.is_finite()).collect();
@@ -100,10 +106,10 @@ fn mean_std(xs: &[f64]) -> (f64, f64) {
 /// The returned vector has the same length and order as `rewards`. A group of
 /// identical rewards — or a single completion — yields all-zero advantages.
 ///
-/// Non-finite rewards are handled like TRL's `nan_to_num`: a `NaN`/`±∞` reward
-/// is excluded from the group mean/std and its own advantage is forced to `0`,
-/// so one bad completion neither crashes the step nor distorts the rest of the
-/// group.
+/// Non-finite rewards are handled defensively: a `NaN`/`±∞` reward is excluded
+/// from the group mean/std and its own advantage is forced to `0` — note this
+/// maps `±∞ → 0`, *stronger* than `torch.nan_to_num` — so one bad completion
+/// neither crashes the step nor distorts the rest of the group.
 ///
 /// # Panics
 ///
@@ -121,7 +127,8 @@ pub fn group_advantages(rewards: &[f64], scale: ScaleRewards) -> Vec<f64> {
         .iter()
         .map(|&r| {
             let a = (r - mean) / denom;
-            // nan_to_num: a NaN reward (or any non-finite result) -> 0 advantage.
+            // Force any non-finite advantage (NaN or ±inf reward) to 0; this is
+            // stronger than torch.nan_to_num, which maps ±inf to finite extremes.
             if a.is_finite() {
                 a
             } else {
@@ -137,6 +144,13 @@ pub fn group_advantages(rewards: &[f64], scale: ScaleRewards) -> Vec<f64> {
 /// `logp` is the current policy's log-probability of the sampled token and
 /// `logp_ref` the reference (frozen) policy's. The estimator is non-negative,
 /// unbiased for the true KL, and lower-variance than the naive `logp - logp_ref`.
+///
+/// Following TRL it is intentionally **unclamped**: for a very large
+/// `d = logp_ref - logp` (`> ~709`) `exp(d)` overflows to `+∞`, and the estimate
+/// is asymmetric (a large *negative* `d` stays finite). Realistic sampled-token
+/// log-probs do not reach that regime, and `+∞` is the faithful limit, so it is
+/// not sanitized here; the telemetry layer sanitizes non-finite metrics on write
+/// (see [`crate::Metrics::nan_to_num`]).
 #[must_use]
 pub fn k3_kl(logp: f64, logp_ref: f64) -> f64 {
     let d = logp_ref - logp;
@@ -170,27 +184,56 @@ pub fn clipped_surrogate(ratio: f64, advantage: f64, clip_eps: f64) -> f64 {
 /// An all-pad sequence (a zero mask row) is tolerated in **both** reductions: it
 /// contributes `0` and is still counted in the denominator, mirroring TRL's
 /// per-sequence `clamp(min=1)`. Use [`zero_mask_rows`] to count such rows for
-/// telemetry, since they are otherwise silent.
+/// telemetry, since they are otherwise silent. A non-finite value sitting in a
+/// masked-out position is ignored (it cannot leak `NaN` via `0 · v`).
+///
+/// `mask` entries must be finite and non-negative (the contract is `0.0`/`1.0`),
+/// and rows must be non-empty (`max_len ≥ 1`).
 ///
 /// # Panics
 ///
-/// Panics if `values` and `mask` differ in shape (row count or any row length)
-/// or if `values` is empty.
+/// Panics if `values` and `mask` differ in shape (row count or any row length),
+/// if `values` is empty, if any row is zero-width (`max_len == 0`), or if any
+/// mask entry is negative or non-finite.
 #[must_use]
 pub fn masked_mean(values: &[Vec<f64>], mask: &[Vec<f64>], loss_type: LossType) -> f64 {
+    let (num_seq, max_len) = validate_masked_inputs(values, mask);
+    match loss_type {
+        LossType::Grpo => masked_mean_grpo(values, mask),
+        LossType::DrGrpo => masked_mean_dr_grpo(values, mask, num_seq, max_len),
+    }
+}
+
+/// Validate the shared [`masked_mean`] preconditions and return
+/// `(num_sequences, max_len)`. Split out to keep [`masked_mean`] under the
+/// cognitive-complexity bound.
+fn validate_masked_inputs(values: &[Vec<f64>], mask: &[Vec<f64>]) -> (usize, usize) {
     assert!(!values.is_empty(), "masked_mean: empty batch");
     assert_eq!(values.len(), mask.len(), "masked_mean: row count mismatch");
     let num_seq = values.len();
     let max_len = values[0].len();
-    // Require a rectangular [num_seq][max_len] shape: a ragged row would make the
-    // Dr.GRPO denominator (num_seq * max_len) silently wrong.
+    // A zero-width row makes the Dr.GRPO denominator (num_seq * max_len) zero.
+    assert!(max_len > 0, "masked_mean: zero-width rows (max_len == 0)");
+    // Require a rectangular [num_seq][max_len] shape with finite, non-negative
+    // masks: a ragged row would make the Dr.GRPO denominator silently wrong, and
+    // a negative/non-finite mask weight would desync the denominator from the
+    // zero_mask_rows / dropped_rows telemetry.
     for (row, mrow) in values.iter().zip(mask.iter()) {
         assert_eq!(row.len(), max_len, "masked_mean: ragged values row");
         assert_eq!(mrow.len(), max_len, "masked_mean: ragged mask row");
+        assert_nonneg_mask(mrow);
     }
-    match loss_type {
-        LossType::Grpo => masked_mean_grpo(values, mask),
-        LossType::DrGrpo => masked_mean_dr_grpo(values, mask, num_seq, max_len),
+    (num_seq, max_len)
+}
+
+/// Assert every entry of one mask row is finite and non-negative. Split out of
+/// [`masked_mean`] to keep it under the cognitive-complexity bound.
+fn assert_nonneg_mask(mrow: &[f64]) {
+    for &m in mrow {
+        assert!(
+            m.is_finite() && m >= 0.0,
+            "masked_mean: mask entries must be finite and non-negative"
+        );
     }
 }
 
@@ -205,7 +248,13 @@ fn masked_mean_grpo(values: &[Vec<f64>], mask: &[Vec<f64>]) -> f64 {
         // Clamp the per-sequence denominator to >= 1 (mirrors TRL): an all-pad
         // row then contributes 0 / 1 = 0 instead of dividing by zero.
         let denom: f64 = mrow.iter().sum::<f64>().max(1.0);
-        let s: f64 = row.iter().zip(mrow.iter()).map(|(v, m)| v * m).sum();
+        // Hard-zero masked-out cells so a non-finite value at a padding position
+        // (0 · v) cannot leak NaN into the sum.
+        let s: f64 = row
+            .iter()
+            .zip(mrow.iter())
+            .map(|(v, m)| if *m > 0.0 { v * m } else { 0.0 })
+            .sum();
         acc += s / denom;
     }
     acc / num_seq as f64
@@ -222,7 +271,13 @@ fn masked_mean_dr_grpo(
     let mut total = 0.0;
     for (row, mrow) in values.iter().zip(mask.iter()) {
         assert_eq!(row.len(), mrow.len(), "masked_mean: column count mismatch");
-        total += row.iter().zip(mrow.iter()).map(|(v, m)| v * m).sum::<f64>();
+        // Hard-zero masked-out cells (see masked_mean_grpo) so 0 · non-finite
+        // cannot leak NaN.
+        total += row
+            .iter()
+            .zip(mrow.iter())
+            .map(|(v, m)| if *m > 0.0 { v * m } else { 0.0 })
+            .sum::<f64>();
     }
     total / (num_seq as f64 * max_len as f64)
 }
@@ -405,6 +460,36 @@ mod tests {
     fn zero_mask_rows_counts_all_pad_sequences() {
         let m = vec![vec![1.0, 0.0], vec![0.0, 0.0], vec![0.0, 0.0]];
         assert_eq!(zero_mask_rows(&m), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "zero-width rows")]
+    fn masked_mean_zero_width_batch_panics() {
+        // max_len == 0 would make the Dr.GRPO denominator (num_seq * max_len) 0.
+        let v: Vec<Vec<f64>> = vec![vec![]];
+        let m: Vec<Vec<f64>> = vec![vec![]];
+        let _ = masked_mean(&v, &m, LossType::DrGrpo);
+    }
+
+    #[test]
+    #[should_panic(expected = "finite and non-negative")]
+    fn masked_mean_rejects_negative_mask() {
+        // A negative mask weight would desync the denominator from zero_mask_rows.
+        let v = vec![vec![1.0, 2.0]];
+        let m = vec![vec![1.0, -1.0]];
+        let _ = masked_mean(&v, &m, LossType::Grpo);
+    }
+
+    #[test]
+    fn masked_mean_ignores_nonfinite_value_in_masked_cell() {
+        // A NaN/inf value in a masked-out (m == 0) position must not leak into
+        // either reduction: the mask is the source of truth for what counts.
+        let v = vec![vec![1.0, f64::NAN], vec![5.0, f64::INFINITY]];
+        let m = vec![vec![1.0, 0.0], vec![1.0, 0.0]];
+        // grpo: each valid token alone -> per-seq means 1 and 5 -> (1 + 5) / 2 = 3.
+        assert_relative_eq!(masked_mean(&v, &m, LossType::Grpo), 3.0, epsilon = TOL);
+        // dr_grpo: total 1 + 5 = 6 over 2 * 2 = 4 -> 1.5.
+        assert_relative_eq!(masked_mean(&v, &m, LossType::DrGrpo), 1.5, epsilon = TOL);
     }
 
     #[test]
