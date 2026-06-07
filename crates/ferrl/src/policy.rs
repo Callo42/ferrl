@@ -61,9 +61,31 @@ impl Default for GenConfig {
 
 /// The trainable policy GRPO drives.
 ///
-/// The adapter toggle is what lets a single set of weights act as both the
-/// policy and its own frozen reference: score with the adapter enabled to get
-/// `logp`, disable it to get `logp_ref`, then re-enable for the update.
+/// # The three log-probability roles
+///
+/// A GRPO update needs three per-token log-probabilities of the *same* sampled
+/// completions. All three are obtained from this one trait — no extra method is
+/// required, so adding the inner optimization loop (`μ > 1`) later is **not** a
+/// breaking change:
+///
+/// - **current** `logp` — [`token_logprobs`](Policy::token_logprobs) with the
+///   adapter [enabled](Policy::set_adapter_enabled). Lives on the autograd tape;
+///   it is the numerator of the importance ratio and what `backward` flows
+///   through.
+/// - **old** `logp_old` — a *frozen snapshot* of the current log-probs, taken
+///   once when the rollout is generated (adapter enabled) and then **detached**
+///   from the tape and stored by the trainer. It is the ratio denominator in
+///   `exp(logp - logp_old)`. With a single inner step (`μ = 1`) it equals `logp`
+///   and the ratio is exactly `1`. The trait deliberately does *not* own this
+///   snapshot, keeping the policy stateless with respect to the optimizer step.
+/// - **reference** `logp_ref` — [`token_logprobs`](Policy::token_logprobs) with
+///   the adapter [disabled](Policy::set_adapter_enabled): the frozen base model.
+///   Feeds the k3 KL ([`crate::grpo::k3_kl`]) and is likewise detached (the
+///   reference is never trained).
+///
+/// The adapter toggle is what lets one set of weights serve all three: the same
+/// parameters are the policy (adapter on) and their own reference (adapter off);
+/// "old" is just an adapter-on snapshot frozen in time.
 pub trait Policy {
     /// Sample `cfg.group_size` completions for `prompt` under `cfg`.
     ///
