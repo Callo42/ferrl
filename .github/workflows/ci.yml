@@ -89,7 +89,7 @@ jobs:
       # DEFAULT (CPU) features only — see the clippy job for why --all-features
       # cannot run on CPU-only runners. examples/ and bins are excluded from the
       # coverage denominator so glue code never dilutes the library gate.
-      - name: cargo llvm-cov (HARD gate: --fail-under-lines 90)
+      - name: "cargo llvm-cov (HARD gate: --fail-under-lines 90)"
         run: >-
           cargo llvm-cov
           --workspace
