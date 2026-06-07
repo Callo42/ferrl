@@ -159,8 +159,9 @@ Each training run writes to `runs/<run_id>/`:
 runs/<run_id>/
 ├── config.json       # the full resolved run config
 ├── metrics.jsonl     # one JSON object per step:
-│                     #   step, reward_mean, reward_std, kl, clip_ratio,
-│                     #   completion_len, grad_norm, lr
+│                     #   step, reward_mean, reward_std, frac_reward_zero_std,
+│                     #   kl, clip_ratio, completion_len, dropped_rows,
+│                     #   grad_norm, lr
 ├── checkpoints/      # LoRA checkpoints
 └── run.log           # human-readable log
 ```

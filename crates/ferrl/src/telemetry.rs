@@ -170,12 +170,23 @@ pub struct Metrics {
     pub reward_mean: f32,
     /// Standard deviation of scalar rewards over the batch.
     pub reward_std: f32,
+    /// Fraction of GRPO groups in the batch whose reward std is `0` — every
+    /// completion in the group scored identically, so its advantages are all `0`
+    /// and it contributes no gradient. Mirrors TRL's `frac_reward_zero_std`; a
+    /// value near `1` means the batch taught the policy almost nothing (rewards
+    /// saturated, or the task is too easy/hard for the current model).
+    pub frac_reward_zero_std: f32,
     /// Mean k3 KL to the reference policy.
     pub kl: f32,
     /// Fraction of tokens whose surrogate hit the PPO clip band.
     pub clip_ratio: f32,
     /// Mean completion length in tokens.
     pub completion_len: f32,
+    /// Number of all-pad completion rows (no valid tokens) that contributed `0`
+    /// to the loss this step. Such rows are tolerated rather than fatal (see
+    /// [`crate::grpo::masked_mean`] / [`crate::grpo::zero_mask_rows`]); recorded
+    /// here so a batch that silently lost completions is observable. Normally `0`.
+    pub dropped_rows: u32,
     /// Global gradient norm after backward (pre-clip).
     pub grad_norm: f32,
     /// Effective learning rate for this step.
@@ -191,9 +202,11 @@ impl Metrics {
             step,
             reward_mean: 0.0,
             reward_std: 0.0,
+            frac_reward_zero_std: 0.0,
             kl: 0.0,
             clip_ratio: 0.0,
             completion_len: 0.0,
+            dropped_rows: 0,
             grad_norm: 0.0,
             lr: 0.0,
         }
@@ -365,9 +378,11 @@ mod tests {
             step: 7,
             reward_mean: 0.5,
             reward_std: 0.25,
+            frac_reward_zero_std: 0.125,
             kl: 0.02,
             clip_ratio: 0.1,
             completion_len: 42.0,
+            dropped_rows: 3,
             grad_norm: 1.23,
             lr: 5e-6,
         };
