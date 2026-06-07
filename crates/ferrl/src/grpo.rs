@@ -1,25 +1,29 @@
 //! Pure GRPO math.
 //!
 //! These functions are the *owned* core of `ferrl`: the closed-form GRPO
-//! quantities, expressed over plain Rust slices of `f32` so they are trivially
-//! unit-testable and free of any tensor / device dependency. The training loop
-//! re-expresses the same algebra in [`candle_core::Tensor`] ops (so candle can
-//! differentiate it); these scalar versions are the reference the tensor path is
-//! validated against, and they are themselves pinned to an independent Python
-//! oracle via the committed golden fixture (`grpo_golden.json`).
+//! quantities, expressed over plain Rust slices of `f64` so they are trivially
+//! unit-testable and free of any tensor / device dependency. Once the training
+//! loop exists it will re-express the same algebra in [`candle_core::Tensor`] ops
+//! (so candle can differentiate it), pinned to these scalar versions; the scalar
+//! versions are themselves checked against a `NumPy` reference oracle via the
+//! committed golden fixture (`grpo_golden.json`).
 //!
 //! The formulas follow TRL's `GRPOTrainer` and the `DeepSeekMath` paper:
 //!
 //! - **Advantages** are group-normalized:
 //!   `A_i = (r_i - mean_g) / (std_g + eps)` with `eps =` [`GROUP_STD_EPS`] and
-//!   `std_g` the *population* (biased) standard deviation over the group.
+//!   `std_g` the *sample* (Bessel-corrected, `ddof = 1`) standard deviation over
+//!   the group — matching TRL's `nanstd` and candle's `Tensor::var`. Dividing by
+//!   the std is the [`ScaleRewards::Group`] default; [`ScaleRewards::None`] drops
+//!   it (the Dr.GRPO-recommended setting).
 //! - **KL** uses Schulman's k3 estimator `exp(d) - d - 1`, `d = logp_ref - logp`,
 //!   which is non-negative and unbiased.
 //! - **Surrogate** is the PPO-style clipped objective
 //!   `min(ratio * A, clip(ratio, 1 - e, 1 + e) * A)`.
-//! - **Reduction** depends on the [`LossType`]: classic GRPO averages per
-//!   sequence then over sequences; Dr.GRPO divides the total by
-//!   `num_sequences * max_len` to remove length bias.
+//! - **Reduction** ([`LossType`]) is length-normalization only: classic GRPO
+//!   averages per sequence then over sequences; Dr.GRPO divides the total by
+//!   `num_sequences * max_len`. The Dr.GRPO *paper* algorithm is
+//!   `LossType::DrGrpo` **plus** [`ScaleRewards::None`].
 
 use serde::{Deserialize, Serialize};
 
@@ -45,35 +49,59 @@ pub enum LossType {
     DrGrpo,
 }
 
-/// Population (biased, `ddof = 0`) mean and standard deviation of a slice.
-///
-/// Returns `(mean, std)`. This mirrors the variance candle computes with
-/// `Tensor::var`-style population statistics, so the scalar and tensor paths
-/// agree bit-for-bit up to float rounding.
-#[must_use]
-fn mean_std(xs: &[f64]) -> (f64, f64) {
-    let n = xs.len() as f64;
-    let mean = xs.iter().sum::<f64>() / n;
-    let var = xs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
-    (mean, var.sqrt())
+/// How to scale group-centered rewards into advantages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScaleRewards {
+    /// Divide centered rewards by the group std `+ eps` (TRL / GRPO default).
+    #[default]
+    Group,
+    /// No std scaling: `A_i = r_i - mean_g`. Removes the question-difficulty
+    /// bias; pair with [`LossType::DrGrpo`] for the Dr.GRPO paper algorithm.
+    None,
 }
 
-/// Group-normalized advantages `A_i = (r_i - mean_g) / (std_g + eps)`.
+/// Sample (Bessel-corrected, `ddof = 1`) mean and standard deviation of a slice.
+///
+/// Returns `(mean, std)`. The std divides by `n - 1`, matching TRL's `nanstd` and
+/// candle's `Tensor::var`; a slice of length `< 2` has std `0` (no `0/0`).
+#[must_use]
+fn mean_std(xs: &[f64]) -> (f64, f64) {
+    let n = xs.len();
+    let mean = xs.iter().sum::<f64>() / n as f64;
+    let std = if n < 2 {
+        0.0
+    } else {
+        let var = xs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1) as f64;
+        var.sqrt()
+    };
+    (mean, std)
+}
+
+/// Group-normalized advantages for one GRPO group.
+///
+/// - [`ScaleRewards::Group`]: `A_i = (r_i - mean_g) / (std_g + eps)`.
+/// - [`ScaleRewards::None`]:  `A_i = r_i - mean_g` (centered only).
 ///
 /// `rewards` is one GRPO *group* (the completions sampled for a single prompt).
 /// The returned vector has the same length and order as `rewards`. A group of
-/// identical rewards yields all-zero advantages (the `+ eps` keeps it finite).
+/// identical rewards — or a single completion — yields all-zero advantages.
 ///
 /// # Panics
 ///
 /// Panics if `rewards` is empty: a GRPO group always has at least one
 /// completion, and an empty group is a caller bug, not a runtime condition.
 #[must_use]
-pub fn group_advantages(rewards: &[f64]) -> Vec<f64> {
+pub fn group_advantages(rewards: &[f64], scale: ScaleRewards) -> Vec<f64> {
     assert!(!rewards.is_empty(), "group_advantages: empty reward group");
     let (mean, std) = mean_std(rewards);
-    let denom = std + GROUP_STD_EPS;
-    rewards.iter().map(|&r| (r - mean) / denom).collect()
+    match scale {
+        ScaleRewards::None => rewards.iter().map(|&r| r - mean).collect(),
+        ScaleRewards::Group => {
+            let denom = std + GROUP_STD_EPS;
+            rewards.iter().map(|&r| (r - mean) / denom).collect()
+        }
+    }
 }
 
 /// Schulman's k3 KL estimator for a single token: `exp(d) - d - 1`, where
@@ -123,6 +151,12 @@ pub fn masked_mean(values: &[Vec<f64>], mask: &[Vec<f64>], loss_type: LossType) 
     assert_eq!(values.len(), mask.len(), "masked_mean: row count mismatch");
     let num_seq = values.len();
     let max_len = values[0].len();
+    // Require a rectangular [num_seq][max_len] shape: a ragged row would make the
+    // Dr.GRPO denominator (num_seq * max_len) silently wrong.
+    for (row, mrow) in values.iter().zip(mask.iter()) {
+        assert_eq!(row.len(), max_len, "masked_mean: ragged values row");
+        assert_eq!(mrow.len(), max_len, "masked_mean: ragged mask row");
+    }
     match loss_type {
         LossType::Grpo => masked_mean_grpo(values, mask),
         LossType::DrGrpo => masked_mean_dr_grpo(values, mask, num_seq, max_len),
@@ -176,10 +210,10 @@ mod tests {
 
     #[test]
     fn advantages_center_and_scale() {
-        // rewards [1, 0, 0.5, 0.5]: mean = 0.5.
-        // deviations [0.5, -0.5, 0, 0]; var = (0.25+0.25)/4 = 0.125; std ~ 0.35355.
-        let adv = group_advantages(&[1.0, 0.0, 0.5, 0.5]);
-        let std = 0.125_f64.sqrt();
+        // rewards [1, 0, 0.5, 0.5]: mean = 0.5; deviations [0.5, -0.5, 0, 0].
+        // SAMPLE var = (0.25 + 0.25) / (4 - 1) = 1/6; std = sqrt(1/6) ~ 0.40825.
+        let adv = group_advantages(&[1.0, 0.0, 0.5, 0.5], ScaleRewards::Group);
+        let std = (0.5_f64 / 3.0).sqrt();
         let denom = std + GROUP_STD_EPS;
         assert_relative_eq!(adv[0], 0.5 / denom, epsilon = TOL);
         assert_relative_eq!(adv[1], -0.5 / denom, epsilon = TOL);
@@ -190,9 +224,34 @@ mod tests {
     }
 
     #[test]
+    fn advantages_unscaled_is_centered_only() {
+        // ScaleRewards::None: advantage = r - mean, no std division.
+        let adv = group_advantages(&[1.0, 0.0, 0.5, 0.5], ScaleRewards::None);
+        assert_relative_eq!(adv[0], 0.5, epsilon = TOL);
+        assert_relative_eq!(adv[1], -0.5, epsilon = TOL);
+        assert_relative_eq!(adv[2], 0.0, epsilon = TOL);
+        assert_relative_eq!(adv[3], 0.0, epsilon = TOL);
+    }
+
+    #[test]
+    fn advantages_single_element_is_zero() {
+        // n < 2 -> std = 0 -> advantage = 0 / eps = 0 (no NaN from /(n-1)).
+        assert_relative_eq!(
+            group_advantages(&[5.0], ScaleRewards::Group)[0],
+            0.0,
+            epsilon = TOL
+        );
+        assert_relative_eq!(
+            group_advantages(&[5.0], ScaleRewards::None)[0],
+            0.0,
+            epsilon = TOL
+        );
+    }
+
+    #[test]
     fn advantages_degenerate_group_is_zero() {
         // All equal -> std = 0 -> every advantage is 0 / eps = 0 (finite).
-        let adv = group_advantages(&[2.0, 2.0, 2.0]);
+        let adv = group_advantages(&[2.0, 2.0, 2.0], ScaleRewards::Group);
         for a in adv {
             assert_relative_eq!(a, 0.0, epsilon = TOL);
         }
@@ -201,7 +260,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "empty reward group")]
     fn advantages_empty_panics() {
-        let _ = group_advantages(&[]);
+        let _ = group_advantages(&[], ScaleRewards::Group);
     }
 
     #[test]
@@ -275,6 +334,15 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "ragged")]
+    fn masked_mean_ragged_row_panics() {
+        // A ragged row would silently corrupt the Dr.GRPO denominator.
+        let v = vec![vec![1.0], vec![100.0, 100.0]];
+        let m = vec![vec![1.0], vec![1.0, 1.0]];
+        let _ = masked_mean(&v, &m, LossType::DrGrpo);
+    }
+
+    #[test]
     fn loss_type_default_is_grpo() {
         assert_eq!(LossType::default(), LossType::Grpo);
     }
@@ -293,6 +361,7 @@ mod tests {
     struct Group {
         rewards: Vec<f64>,
         advantages: Vec<f64>,
+        advantages_unscaled: Vec<f64>,
     }
 
     #[derive(Deserialize)]
@@ -329,9 +398,13 @@ mod tests {
 
     fn check_golden_advantages(groups: &[Group]) {
         for group in groups {
-            let got = group_advantages(&group.rewards);
-            assert_eq!(got.len(), group.advantages.len());
-            for (a, b) in got.iter().zip(group.advantages.iter()) {
+            let scaled = group_advantages(&group.rewards, ScaleRewards::Group);
+            let unscaled = group_advantages(&group.rewards, ScaleRewards::None);
+            assert_eq!(scaled.len(), group.advantages.len());
+            for (a, b) in scaled.iter().zip(group.advantages.iter()) {
+                assert_relative_eq!(a, b, epsilon = 1e-9);
+            }
+            for (a, b) in unscaled.iter().zip(group.advantages_unscaled.iter()) {
                 assert_relative_eq!(a, b, epsilon = 1e-9);
             }
         }
@@ -368,7 +441,7 @@ mod tests {
 
     #[test]
     fn matches_golden_fixture() {
-        // Committed by scripts/gen_golden.py — an independent Python oracle.
+        // Committed by scripts/gen_golden.py — a NumPy (ddof=1) reference oracle.
         let raw = include_str!("../tests/fixtures/grpo_golden.json");
         let g: Golden = serde_json::from_str(raw).expect("golden fixture parses");
 
@@ -387,7 +460,7 @@ mod tests {
     proptest! {
         #[test]
         fn prop_advantages_are_zero_mean(rewards in prop::collection::vec(-100.0f64..100.0, 1..16)) {
-            let adv = group_advantages(&rewards);
+            let adv = group_advantages(&rewards, ScaleRewards::Group);
             let sum: f64 = adv.iter().sum();
             // Mean-centered, so the advantages sum to ~0 (scaled by 1/(std+eps)).
             prop_assert!(sum.abs() < 1e-6);

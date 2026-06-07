@@ -239,27 +239,43 @@ mod tests {
     }
 
     #[test]
-    fn grad_coverage_canary_every_var_gets_nonzero_grad() {
-        // The core oracle: after backward on a loss that depends on the adapter,
-        // BOTH A and B must appear in the grad store with a non-zero gradient.
-        // (candle optimizers silently skip params missing from the GradStore.)
+    fn grad_coverage_canary_contract() {
+        // candle optimizers silently skip params missing from the GradStore, so
+        // the canary asserts grad COVERAGE — but the contract is init-dependent:
+        //
+        //  (1) standard init (B = 0): the update (x@Aᵀ)@Bᵀ is 0, so dL/dA is
+        //      legitimately 0; only B is guaranteed present with a non-zero grad.
+        //  (2) after a non-zero-B step: BOTH A and B must be present + non-zero.
+        //
+        // A runtime canary must therefore not require A != 0 at step 0, or it
+        // false-fails on standard zero-B LoRA init.
         let w = base(4, 3);
         let l = LoraLinear::new(w, None, 2, 8.0).unwrap();
-        // Make B nonzero so dL/dA is also nonzero (with B=0, A's grad is 0).
+        let x = Tensor::from_vec(vec![1.0f32, 2.0, 3.0], (1, 3), &Device::Cpu).unwrap();
+
+        // (1) standard init: B = 0 -> B has a non-zero grad (A's grad is ~0).
+        let loss = l.forward(&x).unwrap().sqr().unwrap().sum_all().unwrap();
+        let grads = loss.backward().unwrap();
+        let gb = grads
+            .get(l.b.as_tensor())
+            .expect("B missing from grad store");
+        let mag_b: f32 = gb.abs().unwrap().sum_all().unwrap().to_scalar().unwrap();
+        assert!(mag_b > 0.0, "B received a zero gradient at standard init");
+
+        // (2) after a non-zero-B update, every trainable var has a non-zero grad.
         l.b.set(&Tensor::ones((4, 2), DType::F32, &Device::Cpu).unwrap())
             .unwrap();
-
-        let x = Tensor::from_vec(vec![1.0f32, 2.0, 3.0], (1, 3), &Device::Cpu).unwrap();
-        let y = l.forward(&x).unwrap();
-        let loss = y.sqr().unwrap().sum_all().unwrap();
+        let loss = l.forward(&x).unwrap().sqr().unwrap().sum_all().unwrap();
         let grads = loss.backward().unwrap();
-
         for v in l.trainable_vars() {
             let g = grads
                 .get(v.as_tensor())
                 .expect("var missing from grad store");
             let mag: f32 = g.abs().unwrap().sum_all().unwrap().to_scalar().unwrap();
-            assert!(mag > 0.0, "trainable var received a zero gradient");
+            assert!(
+                mag > 0.0,
+                "trainable var received a zero gradient after a non-zero-B step"
+            );
         }
     }
 }
