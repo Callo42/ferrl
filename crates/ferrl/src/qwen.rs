@@ -405,6 +405,13 @@ impl QwenGradModel {
             .collect()
     }
 
+    /// The device the weights live on, so a caller (e.g. [`crate::QwenPolicy`])
+    /// can build `input_ids` tensors on the same device.
+    #[must_use]
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
     /// Additive causal mask `[1, 1, l, l]` (`0` on/below the diagonal, `-inf`
     /// above), matching candle's `Model::causal_mask` at offset 0.
     fn causal_mask(&self, l: usize) -> CandleResult<Tensor> {
