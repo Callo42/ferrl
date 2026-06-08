@@ -277,6 +277,16 @@ impl Trainer {
         // Rollout with the adapter on, then score it.
         policy.set_adapter_enabled(true);
         let prompt_ids = tokenizer.encode(prompt);
+        // A prompt that encodes to zero tokens (a real tokenizer can yield `[]` for
+        // empty/whitespace input) must fail HERE, before generate: teacher-forced
+        // scoring needs >= 1 prompt token, and a policy that builds an empty input
+        // and reads the last position (`len - 1`) underflows/panics. The rollout
+        // contract (`prompt_len >= 1`) is otherwise only checked after generation.
+        if prompt_ids.is_empty() {
+            return Err(TrainerError::Contract(format!(
+                "prompt encoded to zero tokens: {prompt:?}"
+            )));
+        }
         let gen = GenConfig {
             group_size: self.config.group_size,
             max_new_tokens: self.config.max_new_tokens,

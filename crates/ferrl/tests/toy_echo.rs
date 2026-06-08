@@ -683,3 +683,28 @@ fn wrong_rollout_size_is_a_typed_error() {
         "expected a Contract error, got {err:?}"
     );
 }
+
+#[test]
+fn empty_prompt_is_a_typed_error() {
+    // A prompt that encodes to zero tokens (CharTokenizer encodes "" -> []) must
+    // surface a typed Contract error BEFORE generate — never an underflow panic at
+    // a policy's `len - 1` last-position index, and never a malformed rollout.
+    let mut policy = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 1, TEMP).unwrap();
+    let prompts = vec![String::new()];
+    let cfg = TrainerConfig {
+        steps: 1,
+        group_size: 8,
+        max_new_tokens: 1,
+        ..TrainerConfig::default()
+    };
+    let tmp = TempDir::new("empty-prompt");
+    let run = RunDir::create(tmp.path(), "x").unwrap();
+    let mut trainer = Trainer::new(cfg, &run).unwrap();
+    let err = trainer
+        .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
+        .unwrap_err();
+    assert!(
+        matches!(err, TrainerError::Contract(_)),
+        "expected a Contract error, got {err:?}"
+    );
+}
