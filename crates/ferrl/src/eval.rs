@@ -96,9 +96,11 @@ pub enum EvalError {
 /// # Errors
 ///
 /// Returns [`EvalError::Contract`] if `prompts` is empty, a prompt encodes to zero
-/// tokens, or a policy returns a malformed rollout (wrong completion count, no
-/// prompt context, or a sequence shorter than the prompt); or [`EvalError::Candle`]
-/// if generation fails (including a `QwenPolicy` temperature mismatch).
+/// tokens, a policy returns a malformed rollout (wrong completion count, no prompt
+/// context, or a sequence shorter than the prompt), or a [`RewardFn`] returns a
+/// reward count that does not match the number of completions; or
+/// [`EvalError::Candle`] if generation fails (including a `QwenPolicy` temperature
+/// mismatch).
 pub fn evaluate<P: Policy, R: RewardFn>(
     policy: &mut P,
     reward_fn: &R,
@@ -187,6 +189,16 @@ fn mean_reward<P: Policy, R: RewardFn>(
         .map(|ids| tokenizer.decode(ids.get(rollout.prompt_len..).unwrap_or(&[])))
         .collect();
     let rewards = reward_fn.reward_group(prompt, &completions);
+    // Enforce the RewardFn contract (one reward per completion), exactly as the
+    // trainer does — otherwise eval would average over a different sample count
+    // than it generated and skew the base-vs-adapter comparison.
+    if rewards.len() != completions.len() {
+        return Err(EvalError::Contract(format!(
+            "reward_group returned {} rewards for {} completions",
+            rewards.len(),
+            completions.len()
+        )));
+    }
     Ok(finite_mean(&rewards))
 }
 
@@ -513,5 +525,32 @@ mod tests {
                 "{mode:?}: got {err:?}"
             );
         }
+    }
+
+    /// A reward that violates the one-reward-per-completion contract.
+    struct WrongCountReward;
+    impl RewardFn for WrongCountReward {
+        fn reward(&self, _prompt: &str, _completion: &str) -> f32 {
+            0.0
+        }
+        fn reward_group(&self, _prompt: &str, _completions: &[String]) -> Vec<f32> {
+            vec![1.0] // always one reward, regardless of the group size
+        }
+    }
+
+    #[test]
+    fn rejects_reward_count_mismatch() {
+        // group_size 3 -> 3 completions, but reward_group returns 1 reward.
+        let mut policy = ScriptedPolicy::new(0, 1);
+        let prompts = vec!["5".to_string()];
+        let err = evaluate(
+            &mut policy,
+            &WrongCountReward,
+            &DigitCodec,
+            &prompts,
+            &gen(3, 2),
+        )
+        .unwrap_err();
+        assert!(matches!(err, EvalError::Contract(_)), "got {err:?}");
     }
 }

@@ -143,6 +143,10 @@ pub fn save_adapter(dir: impl AsRef<Path>, vars: &[Var], step: u64) -> Result<()
 /// `Var`s belong to (cloned vars share storage). Returns the manifest; its `step`
 /// is where a resumed run should continue.
 ///
+/// **All-or-nothing:** every tensor is validated and device-prepared *before* any
+/// `Var::set` runs, so a mismatched or missing tensor leaves the model **entirely
+/// unmodified** rather than partially overwritten.
+///
 /// # Errors
 ///
 /// Returns [`CheckpointError::Mismatch`] if the format version is unknown, the
@@ -174,6 +178,11 @@ pub fn load_adapter(
 
     let adapter_path = dir.join(ADAPTER_FILE);
     let loaded = candle_core::safetensors::load(&adapter_path, &Device::Cpu)?;
+
+    // Pass 1 — validate and device-prepare EVERY tensor before mutating anything,
+    // so a missing/mis-shaped/mis-typed tensor aborts with the model untouched
+    // (a partial overwrite would silently corrupt the model).
+    let mut prepared: Vec<Tensor> = Vec::with_capacity(vars.len());
     for (i, v) in vars.iter().enumerate() {
         let key = var_key(i);
         let t = loaded.get(&key).ok_or_else(|| {
@@ -198,8 +207,14 @@ pub fn load_adapter(
         // allocated LoRA factors are) and copies from a same-device source. Move the
         // CPU-loaded tensor onto the var's device; shape and dtype are already
         // validated equal. (`contiguous()` on the source is belt-and-suspenders.)
-        let t = t.to_device(want.device())?.contiguous()?;
-        v.set(&t)?;
+        prepared.push(t.to_device(want.device())?.contiguous()?);
+    }
+
+    // Pass 2 — every tensor validated; apply. `set` cannot fail here on shape (it
+    // matches), a self-set (the source is a fresh load), or a non-contiguous
+    // destination (LoRA factors are contiguous).
+    for (v, t) in vars.iter().zip(prepared.iter()) {
+        v.set(t)?;
     }
     Ok(manifest)
 }
@@ -330,6 +345,41 @@ mod tests {
             CheckpointError::Mismatch(m) => assert!(m.contains("shape"), "{m}"),
             other => panic!("expected shape mismatch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn load_does_not_partially_mutate_on_a_later_mismatch() {
+        // var 0 is valid, var 1 is mis-shaped: load must reject WITHOUT having
+        // overwritten var 0 (all-or-nothing — validate every tensor before any set).
+        let tmp = TempDir::new("partial");
+        let vars = make_vars(); // shapes [2,3] and [4,2]
+        save_adapter(tmp.path(), &vars, 1).unwrap();
+
+        let ones0 = Tensor::ones((2, 3), DType::F32, &Device::Cpu).unwrap();
+        let dst0 = Var::from_tensor(&ones0).unwrap();
+        let dst1_wrong =
+            Var::from_tensor(&Tensor::zeros((9, 9), DType::F32, &Device::Cpu).unwrap()).unwrap();
+        let before0 = dst0
+            .as_tensor()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+
+        let dst = vec![dst0.clone(), dst1_wrong];
+        let err = load_adapter(tmp.path(), &dst).unwrap_err();
+        assert!(matches!(err, CheckpointError::Mismatch(_)), "got {err:?}");
+
+        let after0 = dst0
+            .as_tensor()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_eq!(
+            before0, after0,
+            "var 0 was mutated despite a later mismatch"
+        );
     }
 
     #[test]
