@@ -17,6 +17,9 @@
 //! - grad-safe building blocks and the grad-coverage canary ([`nn`]);
 //! - a grad-bearing, uncached `Qwen3` forward ([`qwen`]) — the trainable update
 //!   path, weight-identical to candle's shipped (no-grad) forward;
+//! - a [`Policy`] over the real model ([`qwen_policy`]) — [`QwenPolicy`] wraps that
+//!   grad forward as the trainer's policy seam, with uncached, adapter-aware
+//!   rollout, so the same `Trainer` drives Qwen3 as the P2 toy;
 //! - a real-model tokenizer adapter ([`tokenizer`]) — [`HfTokenizer`] wraps a
 //!   Hugging Face fast tokenizer behind the trainer's [`TokenizerLike`] bridge;
 //! - the GRPO training loop ([`trainer`]) — the `Trainer` that drives rollout →
@@ -55,6 +58,7 @@ pub mod lora;
 pub mod nn;
 pub mod policy;
 pub mod qwen;
+pub mod qwen_policy;
 pub mod reward;
 pub mod telemetry;
 pub mod tokenizer;
@@ -71,6 +75,8 @@ pub use nn::{grad_coverage, GradCoverage, RmsNorm};
 pub use policy::Policy;
 #[doc(inline)]
 pub use qwen::QwenGradModel;
+#[doc(inline)]
+pub use qwen_policy::QwenPolicy;
 #[doc(inline)]
 pub use reward::RewardFn;
 #[doc(inline)]

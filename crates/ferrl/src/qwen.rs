@@ -2,10 +2,13 @@
 //!
 //! candle-transformers ships a Qwen3 forward, but it is inference-shaped
 //! (`&mut self` + `ConcatKvCache`, all layer types `pub(crate)`) and built from
-//! ops that have **no backward**, so it cannot be used to train. P4 will use the
-//! shipped forward as the no-grad rollout path; this module is the *update* path:
-//! a full-sequence, uncached forward over the **same loaded weights**, expressed
-//! entirely in grad-bearing ops, with a manual `LoRA` adapter on `q_proj`/`v_proj`.
+//! ops that have **no backward**, so it cannot be used to train. This module is the
+//! *update* path: a full-sequence, uncached forward over the **same loaded
+//! weights**, expressed entirely in grad-bearing ops, with a manual `LoRA` adapter
+//! on `q_proj`/`v_proj`. It is **also** the (uncached) **rollout** forward used by
+//! [`crate::qwen_policy`] — the only *adapter-aware* forward; candle's shipped
+//! cached forward carries no adapter, so a fast merged-weight rollout is a later
+//! optimization.
 //!
 //! It is gated against the shipped forward by an equivalence test (same weights →
 //! same logits) and a LoRA-grad-coverage test (the adapter trains).
@@ -403,6 +406,13 @@ impl QwenGradModel {
             .iter()
             .flat_map(QwenLayer::trainable_vars)
             .collect()
+    }
+
+    /// The device the weights live on, so a caller (e.g. [`crate::QwenPolicy`])
+    /// can build `input_ids` tensors on the same device.
+    #[must_use]
+    pub fn device(&self) -> &Device {
+        &self.device
     }
 
     /// Additive causal mask `[1, 1, l, l]` (`0` on/below the diagonal, `-inf`
