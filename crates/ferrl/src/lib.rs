@@ -25,6 +25,10 @@
 //! - the GRPO training loop ([`trainer`]) — the `Trainer` that drives rollout →
 //!   reward → advantages → masked clipped surrogate (+ optional KL) →
 //!   canary-guarded `AdamW` step;
+//! - adapter checkpointing ([`checkpoint`]) — save/load the trainable `LoRA`
+//!   factors so a run can be resumed (see [`Trainer::train_from`]);
+//! - held-out evaluation ([`eval`]) — the base model vs. the trained adapter,
+//!   mean reward over a held-out set (the P4 gate's comparison);
 //! - run telemetry ([`telemetry`]).
 //!
 //! Everything below the RL layer — tensors, autograd, optimizers, devices, and
@@ -53,6 +57,8 @@
 //! Pre-`1.0`: the public surface may change between minor versions.
 #![forbid(unsafe_code)]
 
+pub mod checkpoint;
+pub mod eval;
 pub mod grpo;
 pub mod lora;
 pub mod nn;
@@ -64,6 +70,10 @@ pub mod telemetry;
 pub mod tokenizer;
 pub mod trainer;
 
+#[doc(inline)]
+pub use checkpoint::{load_adapter, save_adapter, CheckpointError, CheckpointManifest};
+#[doc(inline)]
+pub use eval::{evaluate, EvalError, EvalReport, PromptEval};
 #[doc(inline)]
 pub use grpo::{
     clipped_surrogate, group_advantages, k3_kl, masked_mean, zero_mask_rows, LossType,
