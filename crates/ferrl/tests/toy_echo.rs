@@ -296,6 +296,36 @@ impl RewardFn for BadCountReward {
     }
 }
 
+/// Wraps [`EchoPolicy`] but underfills the rollout (one completion instead of
+/// `group_size`), violating the `generate` contract.
+struct UnderfilledPolicy {
+    inner: EchoPolicy,
+}
+
+impl Policy for UnderfilledPolicy {
+    fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
+        let mut r = self.inner.generate(prompt, cfg)?;
+        r.token_ids.truncate(1);
+        Ok(r)
+    }
+
+    fn token_logprobs(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+        self.inner.token_logprobs(rollout)
+    }
+
+    fn set_adapter_enabled(&mut self, enabled: bool) {
+        self.inner.set_adapter_enabled(enabled);
+    }
+
+    fn adapter_enabled(&self) -> bool {
+        self.inner.adapter_enabled()
+    }
+
+    fn trainable_vars(&self) -> Vec<Var> {
+        self.inner.trainable_vars()
+    }
+}
+
 // ---- helpers ---------------------------------------------------------------
 
 /// `'a'..` prompts, one per vocab symbol, each a single token.
@@ -621,6 +651,32 @@ fn reward_count_mismatch_is_a_typed_error() {
     let mut trainer = Trainer::new(cfg, &run).unwrap();
     let err = trainer
         .train(&mut policy, &BadCountReward, &CharTokenizer, &prompts)
+        .unwrap_err();
+    assert!(
+        matches!(err, TrainerError::Contract(_)),
+        "expected a Contract error, got {err:?}"
+    );
+}
+
+#[test]
+fn wrong_rollout_size_is_a_typed_error() {
+    // A Policy returning fewer completions than group_size must surface a typed
+    // error, not silently become a degenerate single-item group that skips the step.
+    let mut policy = UnderfilledPolicy {
+        inner: EchoPolicy::new(VOCAB, VOCAB, GAMMA, 1, TEMP).unwrap(),
+    };
+    let prompts = echo_prompts(VOCAB);
+    let cfg = TrainerConfig {
+        steps: 1,
+        group_size: 8,
+        max_new_tokens: 1,
+        ..TrainerConfig::default()
+    };
+    let tmp = TempDir::new("underfilled");
+    let run = RunDir::create(tmp.path(), "x").unwrap();
+    let mut trainer = Trainer::new(cfg, &run).unwrap();
+    let err = trainer
+        .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
         .unwrap_err();
     assert!(
         matches!(err, TrainerError::Contract(_)),

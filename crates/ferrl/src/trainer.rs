@@ -287,6 +287,17 @@ impl Trainer {
         // an empty, ragged, or shorter-than-prompt rollout, so the decode slice
         // `ids[prompt_len..]` cannot panic on malformed Policy output.
         let (_, comp_len) = completion_dims(&rollout)?;
+        // Policy::generate is contracted to return exactly `group_size` completions.
+        // An underfilled rollout would otherwise become a degenerate single-item
+        // group (all-zero advantages -> silently skipped); an overfilled one would
+        // silently change the effective group size. Reject either.
+        if rollout.len() != self.config.group_size {
+            return Err(TrainerError::Contract(format!(
+                "Policy::generate returned {} completions for group_size {}",
+                rollout.len(),
+                self.config.group_size
+            )));
+        }
         let completions = decode_completions(&rollout, tokenizer);
         let rewards = reward_fn.reward_group(prompt, &completions);
         if rewards.len() != rollout.len() {
