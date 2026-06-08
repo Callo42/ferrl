@@ -17,6 +17,8 @@
 //! - grad-safe building blocks and the grad-coverage canary ([`nn`]);
 //! - a grad-bearing, uncached `Qwen3` forward ([`qwen`]) — the trainable update
 //!   path, weight-identical to candle's shipped (no-grad) forward;
+//! - a real-model tokenizer adapter ([`tokenizer`]) — [`HfTokenizer`] wraps a
+//!   Hugging Face fast tokenizer behind the trainer's [`TokenizerLike`] bridge;
 //! - the GRPO training loop ([`trainer`]) — the `Trainer` that drives rollout →
 //!   reward → advantages → masked clipped surrogate (+ optional KL) →
 //!   canary-guarded `AdamW` step;
@@ -37,9 +39,11 @@
 //! trainable `LoRA` [`candle_core::Var`]s appear in the grad store after
 //! `backward` with the expected (init-dependent) non-zero gradients — candle
 //! optimizers *silently* skip params missing from the grad store (see [`lora`]).
-//! Two further oracles are **planned, not yet implemented**: checking model
-//! forwards against candle's shipped implementation (with the model layer), and an
-//! end-to-end finite-difference gradcheck of the loss (with the trainer).
+//! The custom [`qwen`] forward is pinned to candle's shipped Qwen3 forward by a
+//! per-position equivalence oracle — on a tiny config in CI and on the real
+//! `Qwen3-0.6B-Base` checkpoint in `#[ignore]`d, weights-gated tests. One oracle
+//! remains **planned, not yet implemented**: an end-to-end finite-difference
+//! gradcheck of the loss (with the trainer).
 //!
 //! ## Stability
 //!
@@ -53,6 +57,7 @@ pub mod policy;
 pub mod qwen;
 pub mod reward;
 pub mod telemetry;
+pub mod tokenizer;
 pub mod trainer;
 
 #[doc(inline)]
@@ -70,5 +75,7 @@ pub use qwen::QwenGradModel;
 pub use reward::RewardFn;
 #[doc(inline)]
 pub use telemetry::{init_tracing, Metrics, MetricsWriter, RunDir};
+#[doc(inline)]
+pub use tokenizer::HfTokenizer;
 #[doc(inline)]
 pub use trainer::{TokenizerLike, Trainer, TrainerConfig, TrainerError};
