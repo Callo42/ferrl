@@ -32,7 +32,7 @@ use ferrl::nn::RmsNorm;
 use ferrl::policy::{GenConfig, Policy, Rollout};
 use ferrl::reward::RewardFn;
 use ferrl::telemetry::RunDir;
-use ferrl::trainer::{TokenizerLike, Trainer, TrainerConfig};
+use ferrl::trainer::{TokenizerLike, Trainer, TrainerConfig, TrainerError};
 use ferrl::Metrics;
 
 /// Toy vocabulary size; the (full-rank) `LoRA` rank equals it, so a rank-`VOCAB`
@@ -244,6 +244,55 @@ impl Policy for UncoveredPolicy {
         let mut vars = self.inner.trainable_vars();
         vars.push(self.dangling.clone());
         vars
+    }
+}
+
+// ---- contract-violation controls (malformed Policy / RewardFn output) ------
+
+/// Wraps [`EchoPolicy`] but overrides the rollout's `prompt_len` with a malformed
+/// value, so the trainer must reject it with a typed error instead of panicking
+/// downstream. `prompt_len` larger than the sequence ⇒ no completion tokens;
+/// `prompt_len == 0` ⇒ no prompt context (teacher forcing reads index -1).
+struct BadPromptLenPolicy {
+    inner: EchoPolicy,
+    prompt_len: usize,
+}
+
+impl Policy for BadPromptLenPolicy {
+    fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
+        let r = self.inner.generate(prompt, cfg)?;
+        Ok(Rollout {
+            token_ids: r.token_ids,
+            prompt_len: self.prompt_len,
+        })
+    }
+
+    fn token_logprobs(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+        self.inner.token_logprobs(rollout)
+    }
+
+    fn set_adapter_enabled(&mut self, enabled: bool) {
+        self.inner.set_adapter_enabled(enabled);
+    }
+
+    fn adapter_enabled(&self) -> bool {
+        self.inner.adapter_enabled()
+    }
+
+    fn trainable_vars(&self) -> Vec<Var> {
+        self.inner.trainable_vars()
+    }
+}
+
+/// A reward whose `reward_group` returns the wrong number of scores.
+struct BadCountReward;
+
+impl RewardFn for BadCountReward {
+    fn reward(&self, _prompt: &str, _completion: &str) -> f32 {
+        0.0
+    }
+    fn reward_group(&self, _prompt: &str, completions: &[String]) -> Vec<f32> {
+        vec![0.0; completions.len().saturating_sub(1)]
     }
 }
 
@@ -512,4 +561,69 @@ fn gate_mu_gt1_beta_zero_completes() {
     for m in &history {
         assert!(m.grad_norm.is_finite() && m.clip_ratio.is_finite());
     }
+}
+
+fn malformed_prompt_len_yields_contract_error(bad_prompt_len: usize, tag: &str) {
+    // A malformed rollout prompt_len must surface a typed TrainerError::Contract —
+    // never a decode-slice panic (prompt_len too long) or a usize underflow in the
+    // teacher-forced narrow at prompt_len - 1 (prompt_len == 0). Validation runs
+    // before decode/score, so both are caught up front.
+    let mut policy = BadPromptLenPolicy {
+        inner: EchoPolicy::new(VOCAB, VOCAB, GAMMA, 1, TEMP).unwrap(),
+        prompt_len: bad_prompt_len,
+    };
+    let prompts = echo_prompts(VOCAB);
+    let cfg = TrainerConfig {
+        steps: 1,
+        group_size: 8,
+        max_new_tokens: 1,
+        ..TrainerConfig::default()
+    };
+    let tmp = TempDir::new(tag);
+    let run = RunDir::create(tmp.path(), "x").unwrap();
+    let mut trainer = Trainer::new(cfg, &run).unwrap();
+    let err = trainer
+        .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
+        .unwrap_err();
+    assert!(
+        matches!(err, TrainerError::Contract(_)),
+        "expected a Contract error, got {err:?}"
+    );
+}
+
+#[test]
+fn malformed_rollout_too_long_prompt_is_a_typed_error() {
+    // prompt_len longer than the sequence -> no completion tokens (would panic the
+    // decode slice ids[prompt_len..]).
+    malformed_prompt_len_yields_contract_error(99, "malformed-long");
+}
+
+#[test]
+fn malformed_rollout_zero_prompt_is_a_typed_error() {
+    // prompt_len == 0 -> teacher forcing would underflow at narrow(1, prompt_len-1, ..).
+    malformed_prompt_len_yields_contract_error(0, "malformed-zero");
+}
+
+#[test]
+fn reward_count_mismatch_is_a_typed_error() {
+    // A RewardFn returning the wrong number of scores must surface a typed error,
+    // not a later cryptic shape/broadcast failure.
+    let mut policy = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 1, TEMP).unwrap();
+    let prompts = echo_prompts(VOCAB);
+    let cfg = TrainerConfig {
+        steps: 1,
+        group_size: 8,
+        max_new_tokens: 1,
+        ..TrainerConfig::default()
+    };
+    let tmp = TempDir::new("badreward");
+    let run = RunDir::create(tmp.path(), "x").unwrap();
+    let mut trainer = Trainer::new(cfg, &run).unwrap();
+    let err = trainer
+        .train(&mut policy, &BadCountReward, &CharTokenizer, &prompts)
+        .unwrap_err();
+    assert!(
+        matches!(err, TrainerError::Contract(_)),
+        "expected a Contract error, got {err:?}"
+    );
 }

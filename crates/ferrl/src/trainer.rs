@@ -60,6 +60,15 @@ pub enum TrainerError {
     /// Writing run telemetry (`config.json` / `metrics.jsonl`) failed.
     #[error(transparent)]
     Telemetry(#[from] TelemetryError),
+    /// A [`TrainerConfig`] field is out of range (rejected by
+    /// [`TrainerConfig::validate`]).
+    #[error("invalid trainer config: {0}")]
+    InvalidConfig(String),
+    /// A [`Policy`] or [`RewardFn`] returned output that violates the trainer's
+    /// contract (a malformed rollout, or a reward count that does not match the
+    /// number of completions).
+    #[error("contract violation: {0}")]
+    Contract(String),
 }
 
 /// Bridges prompt / completion text and token ids for the trainer.
@@ -130,6 +139,62 @@ impl Default for TrainerConfig {
     }
 }
 
+impl TrainerConfig {
+    /// Reject settings that would silently do nothing or crash mid-run.
+    ///
+    /// In particular `mu = 0` would run **no** inner update — no backward, no
+    /// canary, no optimizer step — while still emitting a metrics row, a silent
+    /// no-op exactly counter to the canary's fail-loud philosophy. Called by
+    /// [`Trainer::new`] before the config is persisted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrainerError::InvalidConfig`] if `mu`, `group_size`, or
+    /// `max_new_tokens` is `0`; if `temperature` is not finite and `> 0`; if `lr`,
+    /// `weight_decay`, or `beta` is not finite and `>= 0`; or if `clip_eps` is not
+    /// finite and in `[0, 1)` (`>= 1` makes the lower clip band cross `0`, which a
+    /// strictly-positive importance ratio can never reach, silently disabling the
+    /// lower clip).
+    pub fn validate(&self) -> Result<(), TrainerError> {
+        require(
+            self.mu >= 1,
+            "mu must be >= 1 (mu = 0 runs no inner update)",
+        )?;
+        require(self.group_size >= 1, "group_size must be >= 1")?;
+        require(self.max_new_tokens >= 1, "max_new_tokens must be >= 1")?;
+        require(
+            self.temperature.is_finite() && self.temperature > 0.0,
+            "temperature must be finite and > 0",
+        )?;
+        require(
+            self.lr.is_finite() && self.lr >= 0.0,
+            "lr must be finite and >= 0",
+        )?;
+        require(
+            self.weight_decay.is_finite() && self.weight_decay >= 0.0,
+            "weight_decay must be finite and >= 0",
+        )?;
+        require(
+            self.beta.is_finite() && self.beta >= 0.0,
+            "beta must be finite and >= 0",
+        )?;
+        require(
+            self.clip_eps.is_finite() && self.clip_eps >= 0.0 && self.clip_eps < 1.0,
+            "clip_eps must be finite and in [0, 1) (>= 1 disables the lower clip)",
+        )?;
+        Ok(())
+    }
+}
+
+/// Return [`TrainerError::InvalidConfig`] with `msg` unless `cond` holds.
+fn require(cond: bool, msg: &str) -> Result<(), TrainerError> {
+    if cond {
+        Ok(())
+    } else {
+        Err(TrainerError::InvalidConfig(msg.to_string()))
+    }
+}
+
 /// Drives the GRPO training loop over a [`Policy`] and a [`RewardFn`].
 #[derive(Debug)]
 pub struct Trainer {
@@ -151,9 +216,11 @@ impl Trainer {
     ///
     /// # Errors
     ///
-    /// Returns [`TrainerError::Telemetry`] if the config cannot be written or the
-    /// metrics file cannot be opened.
+    /// Returns [`TrainerError::InvalidConfig`] if [`TrainerConfig::validate`]
+    /// rejects `config`, or [`TrainerError::Telemetry`] if the config cannot be
+    /// written or the metrics file cannot be opened.
     pub fn new(config: TrainerConfig, run: &RunDir) -> Result<Self, TrainerError> {
+        config.validate()?;
         run.write_config(&config)?;
         let writer = run.metrics_writer()?;
         Ok(Self { config, writer })
@@ -216,10 +283,20 @@ impl Trainer {
             temperature: self.config.temperature,
         };
         let rollout = policy.generate(&prompt_ids, &gen)?;
+        // Validate the rollout BEFORE decoding/scoring it: completion_dims rejects
+        // an empty, ragged, or shorter-than-prompt rollout, so the decode slice
+        // `ids[prompt_len..]` cannot panic on malformed Policy output.
+        let (_, comp_len) = completion_dims(&rollout)?;
         let completions = decode_completions(&rollout, tokenizer);
         let rewards = reward_fn.reward_group(prompt, &completions);
+        if rewards.len() != rollout.len() {
+            return Err(TrainerError::Contract(format!(
+                "reward_group returned {} rewards for {} completions",
+                rewards.len(),
+                rollout.len()
+            )));
+        }
 
-        let (_, comp_len) = completion_dims(&rollout)?;
         // Rectangular toy: an all-ones mask drops no rows. zero_mask_rows is still
         // the source of truth (variable-length masking arrives with P4).
         let mask_rows = vec![vec![1.0_f64; comp_len]; rollout.len()];
@@ -411,24 +488,36 @@ fn advantages_tensor(advantages: &[f64], device: &Device) -> CandleResult<Tensor
 /// Validate that the rollout is rectangular with non-empty completions, and
 /// return `(num_seq, completion_len)`. The rectangular shape is required because
 /// [`Policy::token_logprobs`] returns a rectangular `[G, completion_len]` tensor;
-/// variable-length (ragged) completions arrive with P4.
-fn completion_dims(rollout: &Rollout) -> CandleResult<(usize, usize)> {
+/// variable-length (ragged) completions arrive with P4. Run this **before**
+/// decoding so a malformed rollout becomes a typed [`TrainerError::Contract`]
+/// rather than a slice panic.
+fn completion_dims(rollout: &Rollout) -> Result<(usize, usize), TrainerError> {
     if rollout.is_empty() {
-        return Err(candle_core::Error::Msg("trainer: empty rollout".into()));
+        return Err(TrainerError::Contract(
+            "empty rollout (no sequences)".into(),
+        ));
+    }
+    if rollout.prompt_len == 0 {
+        return Err(TrainerError::Contract(
+            "rollout has no prompt context (prompt_len == 0); teacher-forced scoring \
+             needs >= 1 prompt token to predict the first completion token"
+                .into(),
+        ));
     }
     let seq_len = rollout.token_ids[0].len();
     for ids in &rollout.token_ids {
         if ids.len() != seq_len {
-            return Err(candle_core::Error::Msg(
-                "trainer: ragged rollout (variable sequence length) is not supported yet".into(),
+            return Err(TrainerError::Contract(
+                "ragged rollout (variable sequence length) is not supported yet".into(),
             ));
         }
     }
     let comp_len = seq_len.saturating_sub(rollout.prompt_len);
     if comp_len == 0 {
-        return Err(candle_core::Error::Msg(
-            "trainer: empty completions (max_new_tokens == 0)".into(),
-        ));
+        return Err(TrainerError::Contract(format!(
+            "rollout has no completion tokens (sequence length {seq_len} <= prompt_len {})",
+            rollout.prompt_len
+        )));
     }
     Ok((rollout.len(), comp_len))
 }
@@ -497,7 +586,13 @@ fn k3_kl_tensor(logp: &Tensor, logp_ref: &Tensor) -> CandleResult<Tensor> {
 /// Mask-weighted reduction of a per-token objective, the differentiable
 /// counterpart of [`crate::grpo::masked_mean`]. Returns a scalar tensor.
 fn masked_mean_tensor(values: &Tensor, mask: &Tensor, loss_type: LossType) -> CandleResult<Tensor> {
-    let masked = values.broadcast_mul(mask)?;
+    // Hard-zero masked-out cells (mask <= 0) BEFORE multiplying, so a non-finite
+    // value at a padding position cannot leak NaN via `0 * inf` — matching the
+    // scalar oracle, which only sums `v * m` where `m > 0`. (Masks are 0/1 by
+    // contract; today they are all-ones, but P4 padding makes this load-bearing.)
+    let keep = mask.gt(0.0)?;
+    let kept = keep.where_cond(values, &values.zeros_like()?)?;
+    let masked = kept.broadcast_mul(mask)?;
     match loss_type {
         LossType::Grpo => {
             let per_seq_sum = masked.sum(D::Minus1)?;
@@ -659,6 +754,62 @@ mod tests {
             masked_mean(&v, &m, LossType::DrGrpo) as f32,
             epsilon = TOL
         );
+    }
+
+    #[test]
+    fn masked_mean_tensor_ignores_nonfinite_masked_cell() {
+        // A NaN/inf value at a masked-out (m == 0) position must not leak into the
+        // reduction (0 * inf): the tensor must match the scalar oracle and stay
+        // finite. This is the P4-padding guard.
+        let values = mat(&[&[1.0, f32::NAN], &[5.0, f32::INFINITY]]);
+        let mask = mat(&[&[1.0, 0.0], &[1.0, 0.0]]);
+        let v = vec![vec![1.0f64, f64::NAN], vec![5.0, f64::INFINITY]];
+        let m = vec![vec![1.0f64, 0.0], vec![1.0, 0.0]];
+        let grpo =
+            scalar_f32(&masked_mean_tensor(&values, &mask, LossType::Grpo).unwrap()).unwrap();
+        assert!(grpo.is_finite(), "masked-out NaN/inf leaked: {grpo}");
+        assert_relative_eq!(
+            grpo,
+            masked_mean(&v, &m, LossType::Grpo) as f32,
+            epsilon = TOL
+        );
+        let dr =
+            scalar_f32(&masked_mean_tensor(&values, &mask, LossType::DrGrpo).unwrap()).unwrap();
+        assert!(dr.is_finite());
+        assert_relative_eq!(
+            dr,
+            masked_mean(&v, &m, LossType::DrGrpo) as f32,
+            epsilon = TOL
+        );
+    }
+
+    #[test]
+    fn config_validate_accepts_default() {
+        assert!(TrainerConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn config_validate_rejects_bad_settings() {
+        let bad = |mutate: fn(&mut TrainerConfig)| {
+            let mut c = TrainerConfig::default();
+            mutate(&mut c);
+            assert!(
+                matches!(c.validate(), Err(TrainerError::InvalidConfig(_))),
+                "config should have been rejected"
+            );
+        };
+        bad(|c| c.mu = 0);
+        bad(|c| c.group_size = 0);
+        bad(|c| c.max_new_tokens = 0);
+        bad(|c| c.temperature = 0.0);
+        bad(|c| c.temperature = f64::NAN);
+        bad(|c| c.lr = -1.0);
+        bad(|c| c.lr = f64::INFINITY);
+        bad(|c| c.weight_decay = -0.1);
+        bad(|c| c.beta = -1.0);
+        bad(|c| c.clip_eps = f64::NAN);
+        bad(|c| c.clip_eps = 1.0);
+        bad(|c| c.clip_eps = 2.0);
     }
 
     #[test]
