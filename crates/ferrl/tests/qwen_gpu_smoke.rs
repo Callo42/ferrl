@@ -22,11 +22,13 @@
 
 use std::path::{Path, PathBuf};
 
-use candle_core::{DType, Device};
+use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::qwen3::Config;
+use ferrl::policy::{GenConfig, Rollout};
 use ferrl::{
-    HfTokenizer, Policy, QwenGradModel, QwenPolicy, RewardFn, RunDir, Trainer, TrainerConfig,
+    evaluate, load_adapter, save_adapter, HfTokenizer, Policy, QwenGradModel, QwenPolicy, RewardFn,
+    RunDir, Trainer, TrainerConfig,
 };
 
 /// `LoRA` rank / alpha for the smoke — a typical small adapter.
@@ -135,4 +137,76 @@ fn qwen_policy_grpo_smoke_on_gpu() {
     );
     // The adapter is restored enabled after the run.
     assert!(policy.adapter_enabled());
+}
+
+/// Assert two `[seq][tok]` log-prob grids agree within `tol`.
+fn assert_logprobs_close(a: &[Vec<f32>], b: &[Vec<f32>], tol: f32) {
+    let pairs = a.iter().flatten().zip(b.iter().flatten());
+    for (x, y) in pairs {
+        assert!(
+            (x - y).abs() <= tol,
+            "GPU checkpoint round-trip diverged: {x} vs {y}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs the real Qwen3-0.6B-Base checkpoint (FERRL_QWEN_WEIGHTS) + a CUDA build/GPU"]
+fn qwen_checkpoint_roundtrip_and_eval_on_gpu() {
+    // P4-PR2 on CUDA: the adapter save/load device transfer (GPU -> CPU on save,
+    // CPU -> GPU on load) and the eval harness, which the CPU tests cannot cover.
+    let dir = weights_dir();
+    let cfg = load_config(&dir);
+    let device = Device::new_cuda(0)
+        .expect("CUDA device 0 — build with --features cuda and run on a GPU node");
+    let buf = std::fs::read(dir.join("model.safetensors")).expect("read model.safetensors");
+    let vb = VarBuilder::from_buffered_safetensors(buf, DType::F32, &device)
+        .expect("load model.safetensors onto the GPU");
+    // Two models over the same GPU base weights, independent adapters.
+    let model_a = QwenGradModel::load(&cfg, &vb, RANK, ALPHA).expect("build model A");
+    let model_b = QwenGradModel::load(&cfg, &vb, RANK, ALPHA).expect("build model B");
+    let mut src = QwenPolicy::new(model_a, 1234, 1.0);
+    let dst = QwenPolicy::new(model_b, 1234, 1.0);
+
+    // Force src's adapter to a non-zero state on the GPU.
+    for v in &src.trainable_vars() {
+        let dims = v.as_tensor().dims().to_vec();
+        v.set(&Tensor::randn(0f32, 0.1f32, dims, &device).unwrap())
+            .unwrap();
+    }
+    let rollout = Rollout {
+        token_ids: vec![vec![1u32, 2, 3, 4, 5], vec![3, 1, 4, 1, 5]],
+        prompt_len: 2,
+    };
+    let logp_src = src
+        .token_logprobs(&rollout)
+        .unwrap()
+        .to_vec2::<f32>()
+        .unwrap();
+
+    // Save from GPU (-> CPU safetensors), load back onto the GPU into dst.
+    let tmp = TempDir::new();
+    save_adapter(&tmp.0, &src.trainable_vars(), 0).expect("save adapter from GPU");
+    let manifest = load_adapter(&tmp.0, &dst.trainable_vars()).expect("load adapter onto GPU");
+    assert_eq!(manifest.num_vars, src.trainable_vars().len());
+    let logp_dst = dst
+        .token_logprobs(&rollout)
+        .unwrap()
+        .to_vec2::<f32>()
+        .unwrap();
+
+    assert_logprobs_close(&logp_src, &logp_dst, 1e-5);
+
+    // The eval harness on GPU: base vs adapter, finite means, flag restored.
+    let tok = HfTokenizer::from_file(dir.join("tokenizer.json")).expect("load tokenizer");
+    let prompts = vec!["The capital of France is".to_string()];
+    let gen = GenConfig {
+        group_size: 4,
+        max_new_tokens: 6,
+        temperature: 1.0,
+    };
+    let report = evaluate(&mut src, &SpreadReward, &tok, &prompts, &gen).expect("eval on GPU");
+    assert_eq!(report.n_prompts, 1);
+    assert!(report.base_reward_mean.is_finite() && report.adapter_reward_mean.is_finite());
+    assert!(src.adapter_enabled());
 }

@@ -38,6 +38,8 @@
 //! are zero (`frac_reward_zero_std == 1`) — carries no learning signal and is a
 //! GRPO no-op: the trainer performs no update for that step (and runs no canary).
 
+use std::path::PathBuf;
+
 use candle_core::backprop::GradStore;
 use candle_core::{DType, Device, Result as CandleResult, Tensor, Var, D};
 use candle_nn::optim::{AdamW, ParamsAdamW};
@@ -69,6 +71,9 @@ pub enum TrainerError {
     /// number of completions).
     #[error("contract violation: {0}")]
     Contract(String),
+    /// Writing a periodic adapter checkpoint failed.
+    #[error(transparent)]
+    Checkpoint(#[from] crate::checkpoint::CheckpointError),
 }
 
 /// Bridges prompt / completion text and token ids for the trainer.
@@ -119,6 +124,14 @@ pub struct TrainerConfig {
     pub loss_type: LossType,
     /// How to scale group-centered rewards into advantages.
     pub scale_rewards: ScaleRewards,
+    /// If set, write an adapter checkpoint to `checkpoints/step-<n>/` (with a
+    /// resumable manifest) every `checkpoint_every` completed steps **and** after
+    /// the final step (so a completed run always persists its final adapter, even
+    /// when this does not divide `steps`). `None` (the default) disables
+    /// checkpointing entirely. `#[serde(default)]` so a `config.json` written before
+    /// this field existed still deserializes (to `None`).
+    #[serde(default)]
+    pub checkpoint_every: Option<u64>,
 }
 
 impl Default for TrainerConfig {
@@ -135,6 +148,7 @@ impl Default for TrainerConfig {
             weight_decay: 0.0,
             loss_type: LossType::Grpo,
             scale_rewards: ScaleRewards::Group,
+            checkpoint_every: None,
         }
     }
 }
@@ -151,10 +165,10 @@ impl TrainerConfig {
     ///
     /// Returns [`TrainerError::InvalidConfig`] if `mu`, `group_size`, or
     /// `max_new_tokens` is `0`; if `temperature` is not finite and `> 0`; if `lr`,
-    /// `weight_decay`, or `beta` is not finite and `>= 0`; or if `clip_eps` is not
+    /// `weight_decay`, or `beta` is not finite and `>= 0`; if `clip_eps` is not
     /// finite and in `[0, 1)` (`>= 1` makes the lower clip band cross `0`, which a
     /// strictly-positive importance ratio can never reach, silently disabling the
-    /// lower clip).
+    /// lower clip); or if `checkpoint_every` is `Some(0)`.
     pub fn validate(&self) -> Result<(), TrainerError> {
         require(
             self.mu >= 1,
@@ -182,6 +196,12 @@ impl TrainerConfig {
             self.clip_eps.is_finite() && self.clip_eps >= 0.0 && self.clip_eps < 1.0,
             "clip_eps must be finite and in [0, 1) (>= 1 disables the lower clip)",
         )?;
+        if let Some(every) = self.checkpoint_every {
+            require(
+                every >= 1,
+                "checkpoint_every must be >= 1 when set (0 would checkpoint every step)",
+            )?;
+        }
         Ok(())
     }
 }
@@ -200,6 +220,7 @@ fn require(cond: bool, msg: &str) -> Result<(), TrainerError> {
 pub struct Trainer {
     config: TrainerConfig,
     writer: MetricsWriter,
+    checkpoints_dir: PathBuf,
 }
 
 /// Per-inner-step quantities folded into the step's [`Metrics`].
@@ -223,7 +244,11 @@ impl Trainer {
         config.validate()?;
         run.write_config(&config)?;
         let writer = run.metrics_writer()?;
-        Ok(Self { config, writer })
+        Ok(Self {
+            config,
+            writer,
+            checkpoints_dir: run.checkpoints_dir(),
+        })
     }
 
     /// Run `config.steps` GRPO steps, cycling through `prompts`, returning the
@@ -244,6 +269,58 @@ impl Trainer {
         tokenizer: &dyn TokenizerLike,
         prompts: &[String],
     ) -> Result<Vec<Metrics>, TrainerError> {
+        self.run(0, policy, reward_fn, tokenizer, prompts)
+    }
+
+    /// Resume training from `start_step`, running steps `start_step .. config.steps`
+    /// (so the total run still ends at `config.steps`). Returns the per-step
+    /// [`Metrics`] for the steps actually executed (empty if `start_step >=
+    /// config.steps`); they are also **appended** to `metrics.jsonl`, continuing
+    /// the prior run's stream.
+    ///
+    /// The caller must have loaded the checkpoint's adapter into `policy` first —
+    /// [`crate::checkpoint::load_adapter`] returns the [`crate::checkpoint::CheckpointManifest`]
+    /// whose `step` is the `start_step` to pass here. Prompt cycling keys off the
+    /// global step index, so resuming at the recorded step keeps the same
+    /// prompt order an uninterrupted run would have seen.
+    ///
+    /// **Not bit-exact to an uninterrupted run.** A fresh `AdamW` is constructed
+    /// (its moment estimates restart from zero, re-warming the bias correction) and
+    /// the policy's sampler RNG is whatever the reloaded policy carries; neither is
+    /// persisted by [`crate::checkpoint`] (candle exposes no accessor for them).
+    /// The reloaded *adapter weights* are exact; the post-resume trajectory is a
+    /// faithful continuation, not a replay. (Momentum-faithful resume is deferred
+    /// to P5.)
+    ///
+    /// # Errors
+    ///
+    /// As [`train`](Self::train).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `prompts` is empty.
+    pub fn train_from<P: Policy, R: RewardFn>(
+        &mut self,
+        start_step: u64,
+        policy: &mut P,
+        reward_fn: &R,
+        tokenizer: &dyn TokenizerLike,
+        prompts: &[String],
+    ) -> Result<Vec<Metrics>, TrainerError> {
+        self.run(start_step, policy, reward_fn, tokenizer, prompts)
+    }
+
+    /// Shared loop for [`train`](Self::train) / [`train_from`](Self::train_from):
+    /// run steps `start_step .. config.steps`, checkpointing on the configured
+    /// cadence.
+    fn run<P: Policy, R: RewardFn>(
+        &mut self,
+        start_step: u64,
+        policy: &mut P,
+        reward_fn: &R,
+        tokenizer: &dyn TokenizerLike,
+        prompts: &[String],
+    ) -> Result<Vec<Metrics>, TrainerError> {
         assert!(!prompts.is_empty(), "train: no prompts");
         let vars = policy.trainable_vars();
         let params = ParamsAdamW {
@@ -252,14 +329,37 @@ impl Trainer {
             ..Default::default()
         };
         let mut opt = AdamW::new(vars.clone(), params)?;
-        let mut history = Vec::with_capacity(self.config.steps as usize);
-        for step in 0..self.config.steps {
+        let total = self.config.steps;
+        let remaining = total.saturating_sub(start_step) as usize;
+        let mut history = Vec::with_capacity(remaining);
+        for step in start_step..total {
             let prompt = &prompts[step as usize % prompts.len()];
             let m = self.run_step(step, policy, reward_fn, tokenizer, prompt, &mut opt, &vars)?;
             self.writer.append(&m)?;
             history.push(m);
+            self.maybe_checkpoint(step, &vars)?;
         }
         Ok(history)
+    }
+
+    /// After completing step `step` (0-based), write `checkpoints/step-<n>/` when
+    /// the configured cadence divides the completed-step count `n = step + 1`, **or**
+    /// `n` is the final step of the run. The final-step write guarantees a completed
+    /// run always persists its final adapter even when `checkpoint_every` does not
+    /// divide `steps` (otherwise the last steps' weights would live only in memory).
+    /// The recorded manifest `step` is `n`, the index a resume continues from.
+    fn maybe_checkpoint(&self, step: u64, vars: &[Var]) -> Result<(), TrainerError> {
+        let Some(every) = self.config.checkpoint_every else {
+            return Ok(());
+        };
+        let completed = step + 1;
+        let is_final = completed == self.config.steps;
+        if completed % every != 0 && !is_final {
+            return Ok(());
+        }
+        let dir = self.checkpoints_dir.join(format!("step-{completed}"));
+        crate::checkpoint::save_adapter(&dir, vars, completed)?;
+        Ok(())
     }
 
     /// One outer GRPO step over a single prompt's group.
@@ -831,6 +931,21 @@ mod tests {
         bad(|c| c.clip_eps = f64::NAN);
         bad(|c| c.clip_eps = 1.0);
         bad(|c| c.clip_eps = 2.0);
+        bad(|c| c.checkpoint_every = Some(0));
+    }
+
+    #[test]
+    fn config_validate_accepts_checkpoint_every() {
+        let with = TrainerConfig {
+            checkpoint_every: Some(5),
+            ..TrainerConfig::default()
+        };
+        assert!(with.validate().is_ok());
+        let without = TrainerConfig {
+            checkpoint_every: None,
+            ..TrainerConfig::default()
+        };
+        assert!(without.validate().is_ok());
     }
 
     #[test]
