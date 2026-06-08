@@ -300,13 +300,34 @@ impl QwenGradModel {
     ///
     /// `vb` must be over the Qwen3 safetensors (any dtype; F32 for the CPU
     /// equivalence gate). `cfg` is candle's own `qwen3::Config` so derived dims
-    /// match the shipped model exactly.
+    /// match the shipped model exactly. Only the bias-free, non-sliding-window
+    /// configuration (as used by Qwen3-0.6B-Base) is supported; other configs are
+    /// rejected (see Errors) rather than loaded as a silently non-parity model.
     ///
     /// # Errors
     ///
-    /// Returns a candle error if a weight tensor is missing or mis-shaped, or if
-    /// the `LoRA` factors cannot be allocated.
+    /// Returns a candle error if `cfg` requests an unsupported option
+    /// (`attention_bias`, `use_sliding_window`), if a weight tensor is missing or
+    /// mis-shaped, or if the `LoRA` factors cannot be allocated.
     pub fn load(cfg: &Config, vb: &VarBuilder, rank: usize, alpha: f64) -> CandleResult<Self> {
+        // Fail loud on Config options this forward does not implement, rather than
+        // silently loading a non-parity model. Qwen3-0.6B-Base uses neither: candle's
+        // shipped loader honors `attention_bias` on all four projections and a
+        // sliding-window mask, but this update path loads bias-free q/k/v/o and only
+        // a full causal mask.
+        if cfg.attention_bias {
+            candle_core::bail!(
+                "QwenGradModel: cfg.attention_bias=true is unsupported (this forward \
+                 loads bias-free q/k/v/o projections to match Qwen3-0.6B-Base; loading \
+                 it would silently produce non-parity logits)"
+            );
+        }
+        if cfg.use_sliding_window {
+            candle_core::bail!(
+                "QwenGradModel: cfg.use_sliding_window=true is unsupported (only a full \
+                 causal mask is implemented)"
+            );
+        }
         let h = cfg.hidden_size;
         let embed = vb
             .pp("model.embed_tokens")
@@ -687,6 +708,75 @@ mod tests {
     fn custom_forward_matches_shipped_single_token() {
         // seq == 1 exercises the mask == None branch.
         assert_matches_shipped(&tiny_cfg(), 1);
+    }
+
+    /// Stronger than the last-position gate: for EVERY position `t`, our
+    /// full-sequence logits at `t` must match the shipped model's last-position
+    /// logits on the prefix `[0..=t]`. The last-position-only gate cannot catch a
+    /// causal-mask bug in a non-final row or a full-seq indexing error — but GRPO
+    /// scores per-token log-probs across the WHOLE completion, so every position
+    /// must be parity-correct.
+    fn assert_matches_shipped_all_positions(cfg: &Config, seq: usize) {
+        let vb = tiny_vb(cfg);
+        let mut shipped = ModelForCausalLM::new(cfg, vb.clone()).unwrap();
+        let mut ours = QwenGradModel::load(cfg, &vb, 2, 4.0).unwrap();
+        ours.set_adapter_enabled(false); // base only, for a like-for-like compare
+        let input = ids(seq);
+        let ours_all = ours.forward(&input).unwrap(); // [1, seq, vocab]
+        for t in 0..seq {
+            let prefix = input.narrow(1, 0, t + 1).unwrap();
+            shipped.clear_kv_cache();
+            let shipped_t = shipped.forward(&prefix, 0).unwrap(); // [1, 1, vocab] @ pos t
+            let ours_t = ours_all.narrow(1, t, 1).unwrap();
+            let md: f32 = shipped_t
+                .broadcast_sub(&ours_t)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .max(0)
+                .unwrap()
+                .to_scalar()
+                .unwrap();
+            assert!(
+                md <= 1e-3,
+                "full-seq logits at position {t} diverged from shipped: max-abs={md}"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_forward_matches_shipped_every_position() {
+        // tied + GQA, and the untied lm_head branch — both at every position.
+        assert_matches_shipped_all_positions(&tiny_cfg(), 5);
+        assert_matches_shipped_all_positions(&cfg_variant(false), 4);
+    }
+
+    #[test]
+    fn load_rejects_attention_bias() {
+        // A valid Qwen3 Config we don't implement must fail loud, not load a
+        // silently non-parity (bias-free) model.
+        let mut cfg = tiny_cfg();
+        cfg.attention_bias = true;
+        let vb = tiny_vb(&cfg);
+        let err = QwenGradModel::load(&cfg, &vb, 2, 4.0).unwrap_err();
+        assert!(
+            err.to_string().contains("attention_bias"),
+            "expected an attention_bias rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_rejects_sliding_window() {
+        let mut cfg = tiny_cfg();
+        cfg.use_sliding_window = true;
+        let vb = tiny_vb(&cfg);
+        let err = QwenGradModel::load(&cfg, &vb, 2, 4.0).unwrap_err();
+        assert!(
+            err.to_string().contains("sliding_window"),
+            "expected a sliding-window rejection, got: {err}"
+        );
     }
 
     #[test]
