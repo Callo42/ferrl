@@ -15,6 +15,8 @@
 //! - the [`policy`] abstraction over generation and per-token log-probabilities;
 //! - a manual `LoRA` adapter ([`lora`]);
 //! - grad-safe building blocks and the grad-coverage canary ([`nn`]);
+//! - a grad-bearing, uncached `Qwen3` forward ([`qwen`]) — the trainable update
+//!   path, weight-identical to candle's shipped (no-grad) forward;
 //! - the GRPO training loop ([`trainer`]) — the `Trainer` that drives rollout →
 //!   reward → advantages → masked clipped surrogate (+ optional KL) →
 //!   canary-guarded `AdamW` step;
@@ -48,6 +50,7 @@ pub mod grpo;
 pub mod lora;
 pub mod nn;
 pub mod policy;
+pub mod qwen;
 pub mod reward;
 pub mod telemetry;
 pub mod trainer;
@@ -61,6 +64,8 @@ pub use grpo::{
 pub use nn::{grad_coverage, GradCoverage, RmsNorm};
 #[doc(inline)]
 pub use policy::Policy;
+#[doc(inline)]
+pub use qwen::QwenGradModel;
 #[doc(inline)]
 pub use reward::RewardFn;
 #[doc(inline)]
