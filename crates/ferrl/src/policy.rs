@@ -12,7 +12,7 @@
 //! the surrogate can be differentiated), whereas rewards stay scalar (see
 //! [`crate::reward`]).
 
-use candle_core::{Result as CandleResult, Tensor};
+use candle_core::{Result as CandleResult, Tensor, Var};
 
 /// A batch of sampled completions: token ids plus the prompt length that
 /// produced them, so callers can slice prompt from completion.
@@ -114,6 +114,17 @@ pub trait Policy {
 
     /// Whether the `LoRA` adapter is currently contributing to the forward pass.
     fn adapter_enabled(&self) -> bool;
+
+    /// The trainable parameters the optimizer updates and the grad-coverage
+    /// canary checks each step (e.g. the `LoRA` `A`/`B` factors).
+    ///
+    /// A cloned [`Var`] shares its inner storage (and tensor id) with the
+    /// original, so the returned vars *alias* the parameters used inside
+    /// [`token_logprobs`](Policy::token_logprobs): the trainer registers exactly
+    /// these with the optimizer and looks them up in the grad store after
+    /// `backward`. Implementors typically forward to their adapter's
+    /// `trainable_vars()`.
+    fn trainable_vars(&self) -> Vec<Var>;
 }
 
 #[cfg(test)]
