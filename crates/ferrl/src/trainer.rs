@@ -146,6 +146,16 @@ pub struct TrainerConfig {
     /// this field existed still deserializes (to `None`).
     #[serde(default)]
     pub checkpoint_every: Option<u64>,
+    /// End-of-sequence token id threaded into [`GenConfig::eos_token_id`] for
+    /// rollout: when `Some`, a sampled EOS ends a completion early (EOS-inclusive)
+    /// and the row is right-padded to `max_new_tokens`. `None` (the default) keeps
+    /// full-width rollouts, bit-identical to before. `#[serde(default)]` so a
+    /// `config.json` written before this field existed still deserializes (to
+    /// `None`). Note: this makes *generation* EOS-aware, but the loss mask and
+    /// length-aware decode that exclude the padded positions land in a follow-up
+    /// PR — until then [`validate`](Self::validate) **rejects** a `Some` value (fail loud), so a run can never silently train on the EOS padding.
+    #[serde(default)]
+    pub eos_token_id: Option<u32>,
 }
 
 /// `serde` default for [`TrainerConfig::grad_accum_steps`]: `1` (no accumulation).
@@ -169,6 +179,7 @@ impl Default for TrainerConfig {
             scale_rewards: ScaleRewards::Group,
             grad_accum_steps: 1,
             checkpoint_every: None,
+            eos_token_id: None,
         }
     }
 }
@@ -189,7 +200,10 @@ impl TrainerConfig {
     /// `weight_decay`, or `beta` is not finite and `>= 0`; if `clip_eps` is not
     /// finite and in `[0, 1)` (`>= 1` makes the lower clip band cross `0`, which a
     /// strictly-positive importance ratio can never reach, silently disabling the
-    /// lower clip); or if `checkpoint_every` is `Some(0)`.
+    /// lower clip); if `checkpoint_every` is `Some(0)`; or if `eos_token_id` is
+    /// `Some` (it is plumbed into rollout generation, but the loss mask and
+    /// length-aware decode that exclude its padded positions land in a follow-up PR
+    /// — fail loud rather than silently train on the padding).
     pub fn validate(&self) -> Result<(), TrainerError> {
         require(
             self.mu >= 1,
@@ -227,6 +241,12 @@ impl TrainerConfig {
                 "checkpoint_every must be >= 1 when set (0 would checkpoint every step)",
             )?;
         }
+        require(
+            self.eos_token_id.is_none(),
+            "eos_token_id is plumbed into rollout generation, but the loss mask and \
+             length-aware decode that exclude its padded positions land in a follow-up; \
+             leave it None until then (this guard is lifted when the loss path honors it)",
+        )?;
         Ok(())
     }
 }
@@ -480,6 +500,7 @@ impl Trainer {
             group_size: self.config.group_size,
             max_new_tokens: self.config.max_new_tokens,
             temperature: self.config.temperature,
+            eos_token_id: self.config.eos_token_id,
         };
         let rollout = policy.generate(&prompt_ids, &gen)?;
         // Validate the rollout BEFORE decoding/scoring it: completion_dims rejects
@@ -1147,6 +1168,8 @@ mod tests {
         bad(|c| c.clip_eps = 2.0);
         bad(|c| c.grad_accum_steps = 0);
         bad(|c| c.checkpoint_every = Some(0));
+        // Plumbed into generation but not yet honored by the loss path → fail loud.
+        bad(|c| c.eos_token_id = Some(0));
     }
 
     #[test]
@@ -1196,6 +1219,24 @@ mod tests {
     }
 
     #[test]
+    fn eos_token_id_round_trips_through_json() {
+        // Default (None) and an explicit Some both survive a JSON round-trip; serde
+        // carries Some verbatim even though `validate` rejects it until the loss path
+        // honors the EOS padding.
+        let dflt = TrainerConfig::default();
+        let back: TrainerConfig =
+            serde_json::from_str(&serde_json::to_string(&dflt).unwrap()).unwrap();
+        assert_eq!(back.eos_token_id, None);
+        let eos_cfg = TrainerConfig {
+            eos_token_id: Some(151_643),
+            ..TrainerConfig::default()
+        };
+        let back2: TrainerConfig =
+            serde_json::from_str(&serde_json::to_string(&eos_cfg).unwrap()).unwrap();
+        assert_eq!(back2.eos_token_id, Some(151_643));
+    }
+
+    #[test]
     fn grad_accum_steps_defaults_to_one_for_old_configs() {
         // A config.json written before grad_accum_steps existed must deserialize to 1
         // (no accumulation), not fail — the serde default keeps old runs loadable.
@@ -1204,6 +1245,8 @@ mod tests {
             "loss_type":"grpo","scale_rewards":"group"}"#;
         let cfg: TrainerConfig = serde_json::from_str(j).unwrap();
         assert_eq!(cfg.grad_accum_steps, 1);
+        // The EOS field also predates the JSON above; serde fills it from the default.
+        assert_eq!(cfg.eos_token_id, None);
         assert!(cfg.validate().is_ok());
     }
 

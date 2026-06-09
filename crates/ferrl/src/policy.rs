@@ -76,6 +76,15 @@ pub struct GenConfig {
     pub max_new_tokens: usize,
     /// Softmax temperature; `1.0` is unscaled.
     pub temperature: f64,
+    /// End-of-sequence token. When `Some(id)`, a sampled `id` ends that sequence's
+    /// completion early (the EOS token is **kept** — the recorded length is
+    /// EOS-*inclusive*) and the sequence is right-padded back to `max_new_tokens`
+    /// so the group stays rectangular at a fixed width; [`Rollout::completion_lens`]
+    /// records the true per-sequence length. When `None` (the default) no sequence
+    /// stops early, every completion is the full `max_new_tokens`, and the rollout
+    /// is bit-identical to the legacy no-early-stop behavior. A [`Policy`] backed by
+    /// a model with no EOS token (e.g. a base model) leaves this `None`.
+    pub eos_token_id: Option<u32>,
 }
 
 impl Default for GenConfig {
@@ -84,6 +93,7 @@ impl Default for GenConfig {
             group_size: 8,
             max_new_tokens: 256,
             temperature: 1.0,
+            eos_token_id: None,
         }
     }
 }
@@ -190,5 +200,7 @@ mod tests {
         assert_eq!(c.group_size, 8);
         assert_eq!(c.max_new_tokens, 256);
         assert_eq!(c.temperature, 1.0);
+        // The default disables EOS early-stop, preserving legacy full-width rollouts.
+        assert_eq!(c.eos_token_id, None);
     }
 }

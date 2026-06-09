@@ -18,11 +18,17 @@
 //!
 //! ## Rectangular rollouts
 //!
-//! [`generate`](QwenPolicy::generate) emits exactly `max_new_tokens` per
-//! completion with no early stop, so every sequence in a group has the same
-//! length — the rectangular shape the [`Trainer`] requires (it rejects ragged
-//! rollouts; variable-length completions with an attention mask arrive with the
-//! later P4 work). Scoring
+//! [`generate`](QwenPolicy::generate) always emits a **fixed** width of
+//! `max_new_tokens` completion tokens per sequence, so every sequence in a group
+//! has the same length — the rectangular shape the [`Trainer`] requires (it rejects
+//! ragged rollouts, and a fixed width keeps Dr.GRPO's token denominator constant).
+//! When [`GenConfig::eos_token_id`](crate::policy::GenConfig::eos_token_id) is set,
+//! a sequence that samples the EOS token stops early (the EOS token is **kept** — the
+//! length is EOS-*inclusive*) and is right-padded back to the fixed width with that
+//! same EOS id; [`Rollout::completion_lens`](crate::policy::Rollout::completion_lens)
+//! records each true length so the padding can be masked out of the loss downstream.
+//! With `eos_token_id == None` no sequence stops early, every completion is the full
+//! width, and the rollout is bit-identical to the legacy behavior. Scoring
 //! ([`token_logprobs`](QwenPolicy::token_logprobs)) is teacher-forced: forward all
 //! but the last token, read the positions that predict the completion tokens, and
 //! gather their log-probabilities.
@@ -102,10 +108,17 @@ impl Policy for QwenPolicy {
             );
         }
         let device = self.model.device().clone();
+        let prompt_len = prompt.len();
+        // The fixed rectangular width every sequence is padded/grown to.
+        let width = prompt_len + cfg.max_new_tokens;
         let mut token_ids = Vec::with_capacity(cfg.group_size);
+        let mut completion_lens = Vec::with_capacity(cfg.group_size);
         for _ in 0..cfg.group_size {
             let mut ids = prompt.to_vec();
-            for _ in 0..cfg.max_new_tokens {
+            // Real completion tokens, counting up to and INCLUDING the first EOS.
+            // Stays `max_new_tokens` unless an EOS early-stop overwrites it below.
+            let mut comp_len = cfg.max_new_tokens;
+            for step in 0..cfg.max_new_tokens {
                 let len = ids.len();
                 let input = Tensor::from_vec(ids.clone(), (1, len), &device)?;
                 // Uncached forward at the current adapter state; sample the last pos.
@@ -113,10 +126,32 @@ impl Policy for QwenPolicy {
                 let last = logits.i((0, len - 1))?;
                 let next = self.sampler.sample(&last)?;
                 ids.push(next);
+                // EOS-inclusive early stop: keep the EOS token, record the true
+                // length, and stop generating this sequence. With `eos_token_id ==
+                // None` this never fires, so the loop runs the full `max_new_tokens`
+                // and the rollout is bit-identical to the legacy behavior.
+                if cfg.eos_token_id == Some(next) {
+                    comp_len = step + 1;
+                    // Right-pad the stopped sequence back to the fixed width so the
+                    // group stays rectangular. The pad value is the EOS token itself:
+                    // guaranteed in-vocab (it was just sampled) and masked out of the
+                    // loss / ignored by length-aware decoding once those land.
+                    ids.resize(width, next);
+                    break;
+                }
             }
+            debug_assert_eq!(ids.len(), width, "rollout row is not the fixed width");
             token_ids.push(ids);
+            completion_lens.push(comp_len);
         }
-        Ok(Rollout::rectangular(token_ids, prompt.len()))
+        // Built directly (not via `Rollout::rectangular`) so `completion_lens` carries
+        // the true per-sequence lengths; under `eos_token_id == None` every entry is
+        // `max_new_tokens` and this equals the rectangular construction exactly.
+        Ok(Rollout {
+            token_ids,
+            prompt_len,
+            completion_lens,
+        })
     }
 
     fn token_logprobs(&self, rollout: &Rollout) -> CandleResult<Tensor> {
@@ -247,6 +282,25 @@ mod tests {
         QwenPolicy::new(model, 7, 1.0)
     }
 
+    /// Two policies sharing the SAME base weights and sampler seed, so they draw an
+    /// identical token stream. `weight_map` is random and unseeded, so two
+    /// independent `tiny_policy()` calls would NOT sample alike; cloning one map into
+    /// both `VarBuilder`s makes them bit-identical. (The `LoRA` adapter is a no-op at
+    /// its `B = 0` init, so only the shared base weights drive sampling — the
+    /// per-policy random `A` factors never reach the logits.) This lets one policy
+    /// observe a sampled token and the other stop on it *deterministically*, instead
+    /// of relying on a cross-policy RNG coincidence.
+    fn paired_policies() -> (QwenPolicy, QwenPolicy) {
+        let cfg = tiny_cfg();
+        let weights = weight_map(&cfg);
+        let build = || {
+            let vb = VarBuilder::from_tensors(weights.clone(), DType::F32, &Device::Cpu);
+            let model = QwenGradModel::load(&cfg, &vb, 2, 4.0).unwrap();
+            QwenPolicy::new(model, 7, 1.0)
+        };
+        (build(), build())
+    }
+
     #[test]
     fn generate_returns_rectangular_group() {
         let mut policy = tiny_policy();
@@ -254,6 +308,7 @@ mod tests {
             group_size: 4,
             max_new_tokens: 3,
             temperature: 1.0,
+            eos_token_id: None,
         };
         let rollout = policy.generate(&[1u32, 2, 3], &cfg).unwrap();
         assert_eq!(rollout.len(), 4);
@@ -263,6 +318,129 @@ mod tests {
             assert_eq!(ids.len(), 3 + 3);
             assert!(ids.iter().all(|&i| i < tiny_cfg().vocab_size as u32));
         }
+        // No EOS configured: every completion is the full width, no early stop.
+        assert_eq!(rollout.completion_lens, vec![3; 4]);
+    }
+
+    /// Assert the EOS-aware rollout invariants for every sequence: each row is the
+    /// fixed `prompt_len + max_new` width, `completion_lens[i]` is exactly the
+    /// EOS-inclusive length (first-EOS index + 1, or the full width when no EOS was
+    /// sampled), and everything at/after that length is EOS padding (an empty tail
+    /// for a full-width row). The `position` (first occurrence) check folds the
+    /// "EOS at the boundary, none before it" invariants into one comparison.
+    fn assert_eos_rollout_invariants(r: &Rollout, eos: u32, max_new: usize) {
+        let width = r.prompt_len + max_new;
+        for (gi, ids) in r.token_ids.iter().enumerate() {
+            assert_eq!(ids.len(), width, "seq {gi} not padded to the fixed width");
+            let comp = &ids[r.prompt_len..];
+            let expected = comp
+                .iter()
+                .position(|&t| t == eos)
+                .map_or(max_new, |i| i + 1);
+            let cl = r.completion_lens[gi];
+            assert_eq!(
+                cl, expected,
+                "seq {gi} completion_len {cl} != EOS-inclusive {expected}"
+            );
+            assert!(
+                comp[cl..].iter().all(|&t| t == eos),
+                "seq {gi} pad tail is not EOS-filled"
+            );
+        }
+    }
+
+    #[test]
+    fn generate_stops_at_eos_inclusive_and_right_pads_to_fixed_width() {
+        // EOS-aware generation: a sampled EOS ends the completion (EOS kept →
+        // inclusive length) and the row is right-padded back to the FIXED width, so
+        // the group stays rectangular and `completion_lens` carries the true lengths.
+        let prompt = [1u32, 2, 3];
+        let max_new = 5usize;
+        let width = prompt.len() + max_new;
+        let (mut p_ref, mut p_test) = paired_policies();
+
+        // Reference run, no EOS: full-width rectangular, lengths all == max_new.
+        let cfg_none = GenConfig {
+            group_size: 4,
+            max_new_tokens: max_new,
+            temperature: 1.0,
+            eos_token_id: None,
+        };
+        let r_none = p_ref.generate(&prompt, &cfg_none).unwrap();
+        assert_eq!(r_none.completion_lens, vec![max_new; 4]);
+        for ids in &r_none.token_ids {
+            assert_eq!(ids.len(), width);
+        }
+
+        // p_test shares p_ref's weights + seed, so it draws the SAME first token for
+        // seq 0; setting that token as the EOS makes seq 0 stop at step 0 → an
+        // EOS-inclusive length of exactly 1 with the rest padded.
+        let eos = r_none.token_ids[0][prompt.len()];
+        let cfg_eos = GenConfig {
+            eos_token_id: Some(eos),
+            ..cfg_none
+        };
+        let r = p_test.generate(&prompt, &cfg_eos).unwrap();
+
+        assert_eq!(r.len(), 4);
+        assert_eq!(r.prompt_len, prompt.len());
+        // seq 0 stops at its first sampled token (== eos): inclusive length 1.
+        assert_eq!(
+            r.completion_lens[0], 1,
+            "seq 0 did not stop at the first EOS"
+        );
+        // Every sequence: fixed width, EOS-inclusive length, EOS-filled pad tail.
+        assert_eos_rollout_invariants(&r, eos, max_new);
+    }
+
+    #[test]
+    fn generate_with_configured_but_unsampled_eos_is_full_width() {
+        // A configured EOS that is never sampled (here an out-of-vocab id) must leave
+        // generation identical to the None path: full width, every completion_len ==
+        // max_new. This pins the "configured-yet-inert" branch — distinct from None —
+        // deterministically: an out-of-vocab id can never equal a sampled token, so no
+        // RNG coincidence is required.
+        let mut policy = tiny_policy();
+        let max_new = 4usize;
+        let unsampled = tiny_cfg().vocab_size as u32; // == 16, never a valid sampled id
+        let cfg = GenConfig {
+            group_size: 4,
+            max_new_tokens: max_new,
+            temperature: 1.0,
+            eos_token_id: Some(unsampled),
+        };
+        let r = policy.generate(&[1u32, 2, 3], &cfg).unwrap();
+        assert_eq!(r.completion_lens, vec![max_new; 4]);
+        for ids in &r.token_ids {
+            assert_eq!(ids.len(), 3 + max_new);
+            assert!(ids.iter().all(|&t| t < unsampled));
+        }
+    }
+
+    #[test]
+    fn generate_eos_at_the_max_new_tokens_one_boundary() {
+        // max_new_tokens == 1 with an EOS sampled at the only step: comp_len == 1 ==
+        // max_new (the resize is a no-op — no double-handling) and each row is exactly
+        // prompt + 1 wide. Paired policies make the single draw deterministic.
+        let prompt = [2u32, 5];
+        let (mut p_ref, mut p_test) = paired_policies();
+        let base = GenConfig {
+            group_size: 3,
+            max_new_tokens: 1,
+            temperature: 1.0,
+            eos_token_id: None,
+        };
+        let eos = p_ref.generate(&prompt, &base).unwrap().token_ids[0][prompt.len()];
+        let cfg_eos = GenConfig {
+            eos_token_id: Some(eos),
+            ..base
+        };
+        let r = p_test.generate(&prompt, &cfg_eos).unwrap();
+        assert_eq!(r.completion_lens[0], 1);
+        for ids in &r.token_ids {
+            assert_eq!(ids.len(), prompt.len() + 1);
+        }
+        assert_eos_rollout_invariants(&r, eos, 1);
     }
 
     #[test]

@@ -574,6 +574,7 @@ fn gate_grad_path_equals_nograd_path() {
         group_size: 8,
         max_new_tokens: 1,
         temperature: TEMP,
+        eos_token_id: None,
     };
     let rollout = policy.generate(&[0u32], &cfg).unwrap();
 

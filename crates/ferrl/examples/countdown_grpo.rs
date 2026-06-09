@@ -172,6 +172,7 @@ fn main() -> Result<()> {
         group_size: tcfg.group_size,
         max_new_tokens: tcfg.max_new_tokens,
         temperature: tcfg.temperature,
+        eos_token_id: tcfg.eos_token_id,
     };
     info!(
         steps = tcfg.steps,
