@@ -338,6 +338,7 @@ mod tests {
             group_size,
             max_new_tokens,
             temperature: 1.0,
+            eos_token_id: None,
         }
     }
 

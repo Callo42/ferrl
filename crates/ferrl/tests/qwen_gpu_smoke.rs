@@ -201,6 +201,7 @@ fn qwen_checkpoint_roundtrip_and_eval_on_gpu() {
         group_size: 4,
         max_new_tokens: 6,
         temperature: 1.0,
+        eos_token_id: None,
     };
     let report = evaluate(&mut src, &SpreadReward, &tok, &prompts, &gen).expect("eval on GPU");
     assert_eq!(report.n_prompts, 1);

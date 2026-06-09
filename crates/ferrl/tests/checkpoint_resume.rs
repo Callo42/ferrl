@@ -338,6 +338,7 @@ fn evaluate_scores_base_and_adapter_through_qwen_policy() {
         group_size: 4,
         max_new_tokens: 3,
         temperature: 1.0, // must match the policy's baked temperature
+        eos_token_id: None,
     };
     let report = evaluate(&mut policy, &SpreadReward, &CharCodec, &prompts, &gen).unwrap();
 
