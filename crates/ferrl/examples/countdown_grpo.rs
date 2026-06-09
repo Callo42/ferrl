@@ -1,14 +1,28 @@
-//! P4-PR3 — the real Countdown GRPO run (the P4 gate).
+//! The real Countdown GRPO run — the P4 gate, now exercising P6-A EOS/length masking.
 //!
-//! Drives [`ferrl::QwenPolicy`] (real `Qwen3-0.6B-Base`, all-F32 on CUDA) through a
-//! GRPO run over the verifiable [`ferrl::countdown`] reward, then checks the P4
-//! gate: **the training reward rises AND the trained adapter beats base on a
-//! held-out Countdown eval** (via [`ferrl::evaluate`]).
+//! Drives [`ferrl::QwenPolicy`] (real `Qwen3-0.6B-Base`, bf16 base / F32 `LoRA`
+//! adapter on CUDA) through a GRPO run over the verifiable [`ferrl::countdown`]
+//! reward, then checks the P4 gate: **the training reward rises AND the trained
+//! adapter beats base on a held-out Countdown eval** (via [`ferrl::evaluate`]).
 //!
 //! This is a *run harness*, not a CI test: it needs the staged checkpoint and a
 //! GPU, so — like the `#[ignore]`d GPU tests — it lives outside the coverage-gated
 //! library (`cargo llvm-cov` skips `examples/`). The CI-tested task logic it drives
 //! lives in `src/countdown.rs`.
+//!
+//! # EOS / length masking (P6-A)
+//!
+//! The run is EOS-aware: each sampled completion stops at the model's
+//! end-of-sequence token, and only the real (EOS-inclusive) tokens feed the loss,
+//! the reward, and the eval — the padding tail is masked out. The EOS id is read
+//! from the checkpoint's `config.json` (candle's `qwen3::Config` does not carry it),
+//! so it tracks the model rather than a baked-in literal. `FERRL_CD_EOS` overrides:
+//! an integer forces that id, and `none` (or `off`) restores the legacy full-width
+//! rollout for an A/B comparison. For `Qwen3-0.6B-Base` the token is `<|endoftext|>`
+//! (id `151643`); the base model emits it to end a document, so a completion that
+//! finishes early is no longer trained on the repeated-garbage tail. The run logs
+//! the mean completion length, so a value below `max_new_tokens` witnesses EOS
+//! firing.
 //!
 //! # Running it
 //!
@@ -24,8 +38,9 @@
 //! ```
 //!
 //! Every knob has an `FERRL_CD_*` env override (steps, group size, max new tokens,
-//! lr, temperature, dataset sizes, `LoRA` rank/alpha, …) so the run can be sized to
-//! the GPU and tuned without a rebuild. Exits non-zero if the gate is not met.
+//! lr, temperature, dataset sizes, `LoRA` rank/alpha, EOS id, …) so the run can be
+//! sized to the GPU and tuned without a rebuild. Exits non-zero if the gate is not
+//! met.
 
 use std::collections::HashSet;
 use std::env;
@@ -59,6 +74,44 @@ fn load_config(dir: &Path) -> Result<Config> {
     serde_json::from_slice(&bytes).context("parse config.json into qwen3::Config")
 }
 
+/// The model's end-of-sequence token id, read from the checkpoint's `config.json`.
+///
+/// candle's [`Config`] does not deserialize `eos_token_id`, so read the raw JSON.
+/// Returns `Ok(None)` when the field is absent (a model with no EOS) or is not a
+/// plain integer — a list-valued `eos_token_id` (multi-EOS) is not handled, since
+/// [`GenConfig::eos_token_id`] carries a single id.
+fn config_eos(dir: &Path) -> Result<Option<u32>> {
+    let bytes = std::fs::read(dir.join("config.json")).context("read config.json")?;
+    let json: serde_json::Value = serde_json::from_slice(&bytes).context("parse config.json")?;
+    Ok(json
+        .get("eos_token_id")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|v| u32::try_from(v).ok()))
+}
+
+/// Resolve the EOS token id for the run.
+///
+/// `FERRL_CD_EOS` overrides the checkpoint default: unset reads the model's
+/// `eos_token_id` from `config.json` (the actual EOS run); `none`/`off` (any case)
+/// yields `None`, recovering the legacy full-width rollout for an A/B comparison;
+/// any other value is parsed as an explicit id.
+fn resolve_eos(dir: &Path) -> Result<Option<u32>> {
+    match env::var("FERRL_CD_EOS") {
+        Err(_) => config_eos(dir),
+        Ok(raw) => {
+            let v = raw.trim();
+            if v.eq_ignore_ascii_case("none") || v.eq_ignore_ascii_case("off") {
+                Ok(None)
+            } else {
+                let id = v.parse::<u32>().with_context(|| {
+                    format!("FERRL_CD_EOS must be an integer id or 'none', got {raw:?}")
+                })?;
+                Ok(Some(id))
+            }
+        }
+    }
+}
+
 /// Mean of an iterator of `f32` (0.0 when empty).
 fn mean(values: impl Iterator<Item = f32>) -> f32 {
     let mut sum = 0.0;
@@ -83,7 +136,8 @@ fn reward_trend(history: &[Metrics]) -> (f32, f32) {
     (first, last)
 }
 
-/// Build the policy over the real `Qwen3-0.6B-Base` checkpoint on CUDA (all-F32).
+/// Build the policy over the real `Qwen3-0.6B-Base` checkpoint on CUDA (bf16 base
+/// / F32 `LoRA` adapter).
 fn build_policy(dir: &Path, device: &Device) -> Result<(QwenPolicy, HfTokenizer)> {
     let cfg = load_config(dir)?;
     let buf = std::fs::read(dir.join("model.safetensors")).context("read model.safetensors")?;
@@ -141,8 +195,10 @@ fn build_splits() -> (Vec<String>, Vec<String>) {
     (train_prompts, eval_prompts)
 }
 
-/// The trainer config, every field env-overridable.
-fn build_trainer_config() -> TrainerConfig {
+/// The trainer config, every field env-overridable. `eos_token_id` is resolved by
+/// the caller (see [`resolve_eos`]) and flows into both training and the held-out
+/// eval so generation is EOS-aware on both paths.
+fn build_trainer_config(eos_token_id: Option<u32>) -> TrainerConfig {
     TrainerConfig {
         steps: env_parse("FERRL_CD_STEPS", 200u64),
         group_size: env_parse("FERRL_CD_GROUP", 8usize),
@@ -151,6 +207,7 @@ fn build_trainer_config() -> TrainerConfig {
         lr: env_parse("FERRL_CD_LR", 1e-5f64),
         beta: env_parse("FERRL_CD_BETA", 0.0f64),
         checkpoint_every: Some(env_parse("FERRL_CD_CKPT", 50u64)),
+        eos_token_id,
         ..TrainerConfig::default()
     }
 }
@@ -167,7 +224,10 @@ fn main() -> Result<()> {
     let (mut policy, tok) = build_policy(&dir, &device)?;
     let (train_prompts, eval_prompts) = build_splits();
     let reward = CountdownReward::default();
-    let tcfg = build_trainer_config();
+    // Read the model's EOS from config.json (env-overridable); flows into both the
+    // trainer and the eval `gen` below so generation is EOS-aware on both paths.
+    let eos = resolve_eos(&dir)?;
+    let tcfg = build_trainer_config(eos);
     let gen = GenConfig {
         group_size: tcfg.group_size,
         max_new_tokens: tcfg.max_new_tokens,
@@ -179,6 +239,7 @@ fn main() -> Result<()> {
         group_size = tcfg.group_size,
         max_new_tokens = tcfg.max_new_tokens,
         lr = tcfg.lr,
+        eos_token_id = ?tcfg.eos_token_id,
         train = train_prompts.len(),
         eval = eval_prompts.len(),
         "countdown GRPO run starting"
@@ -196,6 +257,10 @@ fn main() -> Result<()> {
     let post = evaluate(&mut policy, &reward, &tok, &eval_prompts, &gen)?;
     let (first, last) = reward_trend(&history);
     let improvement = post.improvement();
+    // EOS witness: the length-aware mean completion length over the run. Below
+    // `max_new_tokens` ⇒ EOS fired and the masked tail was kept out of the loss;
+    // equal to it ⇒ the model never emitted EOS within the window (or it is `None`).
+    let mean_completion_len = mean(history.iter().map(|m| m.completion_len));
 
     // Both conditions need a MARGIN: the reward means are Monte-Carlo (sampled),
     // so a bare `> 0` would pass on noise. Require a clear, ~tier-sized gap.
@@ -218,6 +283,12 @@ fn main() -> Result<()> {
         margin,
         beats_base,
         "post-train held-out eval"
+    );
+    info!(
+        mean_completion_len,
+        max_new_tokens = gen.max_new_tokens,
+        eos_token_id = ?gen.eos_token_id,
+        "EOS/length: mean completion length (< max_new_tokens ⇒ EOS fired)"
     );
     info!(
         gate_met,
