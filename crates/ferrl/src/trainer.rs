@@ -1652,6 +1652,15 @@ mod tests {
     // mixed-sign and non-zero, one completion column is masked out, and a reference
     // policy drives the k3 KL term — so a single check covers surrogate clipping,
     // KL, and masking under either reduction.
+    //
+    // Three mask shapes are checked. The **uniform** scenario masks the same trailing
+    // column for every row (constant per-row denominator). The **ragged** scenario uses
+    // the variable-per-row mask `length_mask_rows` builds from `Rollout::completion_lens`
+    // under EOS-aware generation — distinct per-row GRPO denominators, a row whose final
+    // column is a real token, and staggered padding. The **all-padding** scenario adds a
+    // zero-length row, exercising the GRPO denominator clamp and an entirely-masked row's
+    // gradient inertness. Together they numerically pin the gradient of exactly the mask
+    // the trainer back-propagates (the defense-in-depth for variable-length loss masking).
 
     /// Deterministic, rng-free `f64` fill in `[-0.5, 0.5)` — reproducible inputs so
     /// the gradcheck is byte-stable across platforms.
@@ -1729,20 +1738,34 @@ mod tests {
         }
     }
 
-    /// Run the gradcheck for one `(loss_type, beta)` setting.
-    fn run_gradcheck(loss_type: LossType, beta: f64) {
+    /// Run the gradcheck for one scenario: a `(loss_type, beta)` setting under a
+    /// specific per-token `shift` (which sets where importance ratios fall relative
+    /// to the clip band), `advantages` column, and loss `mask`. The geometry
+    /// `(G, T)` is read from `mask`; `shift` is `[G, T]` and `adv` is `[G, 1]`. Builds
+    /// the tiny `f64` `LoRA` map, then asserts candle's analytic gradient of
+    /// `grpo_loss` w.r.t. the `LoRA` factors `A` and `B` matches central differences.
+    /// `ctx` labels the scenario in assertion messages.
+    fn run_gradcheck_with(
+        loss_type: LossType,
+        beta: f64,
+        shift: &Tensor,
+        adv: &Tensor,
+        mask: &Tensor,
+        ctx: &str,
+    ) {
         let dev = cpu();
-        const G: usize = 4;
-        const T: usize = 3;
+        let (g, t) = mask.dims2().unwrap();
         const V: usize = 4;
         const R: usize = 2;
         const EPS: f64 = 0.2;
         const H: f64 = 1e-6;
 
-        let x = Tensor::from_vec(gc_fill(G * T * V, 1), (G, T, V), &dev).unwrap();
+        let x = Tensor::from_vec(gc_fill(g * t * V, 1), (g, t, V), &dev).unwrap();
         let w0 = Tensor::from_vec(gc_fill(V * V, 2), (V, V), &dev).unwrap();
-        let targets =
-            Tensor::from_vec(vec![0u32, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3], (G, T), &dev).unwrap();
+        // Targets cycle through the vocab (0,1,..,V-1,0,..) — identical to the prior
+        // hard-coded `[0,1,2,3,...]` at G=4,T=3,V=4, now derived from the geometry.
+        let target_ids: Vec<u32> = (0..g * t).map(|i| (i % V) as u32).collect();
+        let targets = Tensor::from_vec(target_ids, (g, t), &dev).unwrap();
         // B starts non-zero so the loss depends non-trivially on *both* factors
         // (a zero-init B — the real LoRA default — would give A a zero gradient).
         let a =
@@ -1758,28 +1781,8 @@ mod tests {
             scale: 1.0,
         };
 
-        // Per-token shifts: ratio = exp(shift) at the eval point. 0.30 -> 1.35 (above
-        // band), -0.30 -> 0.74 (below band), 0.05 -> 1.05 (inside). Column 2 is masked.
-        #[rustfmt::skip]
-        let shift = Tensor::from_vec(
-            vec![0.30, 0.05, 0.10,
-                 -0.30, 0.05, 0.10,
-                 0.05, 0.30, 0.10,
-                 0.05, -0.30, 0.10f64],
-            (G, T), &dev,
-        ).unwrap();
-        let adv = Tensor::from_vec(vec![0.8, -0.7, 0.5, -0.4f64], (G, 1), &dev).unwrap();
-        #[rustfmt::skip]
-        let mask = Tensor::from_vec(
-            vec![1.0, 1.0, 0.0,
-                 1.0, 1.0, 0.0,
-                 1.0, 1.0, 0.0,
-                 1.0, 1.0, 0.0f64],
-            (G, T), &dev,
-        ).unwrap();
-
         let logp0 = model.logp().unwrap().detach();
-        let logp_old = logp0.broadcast_sub(&shift).unwrap().detach();
+        let logp_old = logp0.broadcast_sub(shift).unwrap().detach();
         let logp_ref = (beta > 0.0).then(|| logp0.affine(1.0, 0.1).unwrap().detach());
 
         let loss_of = || -> f64 {
@@ -1788,8 +1791,8 @@ mod tests {
                 &logp,
                 &logp_old,
                 logp_ref.as_ref(),
-                &adv,
-                &mask,
+                adv,
+                mask,
                 EPS,
                 beta,
                 loss_type,
@@ -1805,8 +1808,8 @@ mod tests {
             &logp,
             &logp_old,
             logp_ref.as_ref(),
-            &adv,
-            &mask,
+            adv,
+            mask,
             EPS,
             beta,
             loss_type,
@@ -1831,9 +1834,125 @@ mod tests {
         let na = gc_numeric_grad(&a, &dev, &loss_of, H);
         let nb = gc_numeric_grad(&b, &dev, &loss_of, H);
 
-        let ctx = format!("loss_type={loss_type:?}, beta={beta}");
-        gc_assert_close(&ga, &na, 1e-5, "A", &ctx);
-        gc_assert_close(&gb, &nb, 1e-5, "B", &ctx);
+        gc_assert_close(&ga, &na, 1e-5, "A", ctx);
+        gc_assert_close(&gb, &nb, 1e-5, "B", ctx);
+    }
+
+    /// Gradcheck under the **uniform** mask: the trailing completion column (`T-1`)
+    /// is masked out for every row — one masked column, a constant per-row
+    /// denominator. Shifts straddle the clip band on both sides; advantages are
+    /// mixed-sign.
+    fn run_gradcheck(loss_type: LossType, beta: f64) {
+        let dev = cpu();
+        // Per-token shifts: ratio = exp(shift) at the eval point. 0.30 -> 1.35 (above
+        // band), -0.30 -> 0.74 (below band), 0.05 -> 1.05 (inside). Column 2 is masked.
+        #[rustfmt::skip]
+        let shift = Tensor::from_vec(
+            vec![0.30, 0.05, 0.10,
+                 -0.30, 0.05, 0.10,
+                 0.05, 0.30, 0.10,
+                 0.05, -0.30, 0.10f64],
+            (4, 3), &dev,
+        ).unwrap();
+        let adv = Tensor::from_vec(vec![0.8, -0.7, 0.5, -0.4f64], (4, 1), &dev).unwrap();
+        #[rustfmt::skip]
+        let mask = Tensor::from_vec(
+            vec![1.0, 1.0, 0.0,
+                 1.0, 1.0, 0.0,
+                 1.0, 1.0, 0.0,
+                 1.0, 1.0, 0.0f64],
+            (4, 3), &dev,
+        ).unwrap();
+        let ctx = format!("uniform-mask, loss_type={loss_type:?}, beta={beta}");
+        run_gradcheck_with(loss_type, beta, &shift, &adv, &mask, &ctx);
+    }
+
+    /// Shared driver for a ragged-mask gradcheck. Builds the `[G, T]` loss mask from
+    /// `completion_lens` via the production [`length_mask_rows`] (so the gradcheck pins
+    /// the same `j < completion_lens[i]` predicate `collect_prompt` uses, at `f64` for
+    /// accurate central differences), hard-asserts the mask is ragged exactly as
+    /// specified (premise guard — else the check could silently degrade to a
+    /// uniform/all-ones mask and stop exercising variable lengths), then runs the
+    /// analytic-vs-numeric gradcheck. `T` is read from `shift`'s last dim; `shift` is
+    /// `[G, T]` and `adv` is `[G, 1]`.
+    fn run_gradcheck_ragged_with(
+        loss_type: LossType,
+        beta: f64,
+        completion_lens: Vec<usize>,
+        shift: &Tensor,
+        adv: &Tensor,
+        dev: &Device,
+    ) {
+        let g = completion_lens.len();
+        let t = shift.dims2().unwrap().1;
+        let expected: Vec<f64> = completion_lens.iter().map(|&l| l.min(t) as f64).collect();
+        let ctx =
+            format!("ragged-mask lens={completion_lens:?}, loss_type={loss_type:?}, beta={beta}");
+        let rollout = Rollout {
+            token_ids: vec![Vec::new(); g],
+            prompt_len: 0,
+            completion_lens,
+        };
+        let mask_rows = length_mask_rows(&rollout, t);
+        let mask_data: Vec<f64> = mask_rows.iter().flatten().copied().collect();
+        let mask = Tensor::from_vec(mask_data, (g, t), dev).unwrap();
+        let row_sums: Vec<f64> = mask.sum(D::Minus1).unwrap().to_vec1().unwrap();
+        assert_eq!(row_sums, expected, "ragged mask premise");
+        run_gradcheck_with(loss_type, beta, shift, adv, &mask, &ctx);
+    }
+
+    /// Gradcheck under a **ragged** mask — variable real-completion lengths per row,
+    /// the shape [`length_mask_rows`] builds from [`Rollout::completion_lens`] under
+    /// EOS-aware generation. Lengths `[1, 2, 3, 2]` over `T = 3` give per-row GRPO
+    /// denominators `1, 2, 3, 2` (the uniform case only ever exercised a constant
+    /// denominator of 2), a row (`len = 3`) whose **final** column is a real
+    /// gradient-bearing token (every uniform row masked it), and padding columns that
+    /// differ per row — so the `keep.where_cond` substitution in `grpo_loss` is
+    /// verified not to corrupt the real-position gradient at genuinely staggered
+    /// padding. Shifts straddle the clip band at **kept** positions (padding ratios are
+    /// forced to 1 and contribute nothing).
+    fn run_gradcheck_ragged(loss_type: LossType, beta: f64) {
+        let dev = cpu();
+        // Shifts placed so each row's clip-band straddle lands on a KEPT column:
+        // row0 keeps {0} -> above-band at col0; row1 keeps {0,1} -> below-band at col1;
+        // row2 keeps {0,1,2} -> above-band at the kept final col2; row3 keeps {0,1} ->
+        // below-band at col0. Padding-column shifts are irrelevant (masked) -> 0.10.
+        #[rustfmt::skip]
+        let shift = Tensor::from_vec(
+            vec![0.30, 0.10, 0.10,
+                 0.05, -0.30, 0.10,
+                 0.05, 0.05, 0.30,
+                 -0.30, 0.05, 0.10f64],
+            (4, 3), &dev,
+        ).unwrap();
+        let adv = Tensor::from_vec(vec![0.8, -0.7, 0.5, -0.4f64], (4, 1), &dev).unwrap();
+        run_gradcheck_ragged_with(loss_type, beta, vec![1, 2, 3, 2], &shift, &adv, &dev);
+    }
+
+    /// Gradcheck under a ragged mask containing an **all-padding row** — lengths
+    /// `[0, 2, 3, 1]` over `T = 3`, so row 0 keeps no real tokens. This exercises the
+    /// GRPO denominator clamp `mask.sum(-1).maximum(1)` in [`masked_mean_tensor`]
+    /// (without it the zero-length row's `0 / 0` is `NaN` and poisons the whole
+    /// backward) and confirms an entirely-masked row is gradient-inert: it contributes
+    /// exactly zero to the loss and to every parameter gradient while the other rows
+    /// stay correct. A `completion_lens` of `0` is a contract-valid value
+    /// (`0..=comp_len`) the production loss deliberately defends against, so the oracle
+    /// covers it.
+    fn run_gradcheck_all_padding(loss_type: LossType, beta: f64) {
+        let dev = cpu();
+        // Row 0 is fully masked (its shifts/advantage are irrelevant). Remaining kept
+        // positions straddle the clip band: row1 keeps {0,1} -> above/below; row2 keeps
+        // {0,1,2} incl. the final col; row3 keeps {0} -> below-band.
+        #[rustfmt::skip]
+        let shift = Tensor::from_vec(
+            vec![0.10, 0.10, 0.10,
+                 0.30, -0.30, 0.10,
+                 0.05, 0.30, -0.30,
+                 -0.30, 0.10, 0.10f64],
+            (4, 3), &dev,
+        ).unwrap();
+        let adv = Tensor::from_vec(vec![0.8, -0.7, 0.5, -0.4f64], (4, 1), &dev).unwrap();
+        run_gradcheck_ragged_with(loss_type, beta, vec![0, 2, 3, 1], &shift, &adv, &dev);
     }
 
     #[test]
@@ -1852,5 +1971,41 @@ mod tests {
     fn gradcheck_dr_grpo_with_kl() {
         // Dr.GRPO fixed-denominator reduction with the KL penalty active.
         run_gradcheck(LossType::DrGrpo, 0.1);
+    }
+
+    #[test]
+    fn gradcheck_ragged_grpo_no_kl() {
+        // Variable per-row GRPO denominator (1/len_i), surrogate only (beta = 0).
+        run_gradcheck_ragged(LossType::Grpo, 0.0);
+    }
+
+    #[test]
+    fn gradcheck_ragged_grpo_with_kl() {
+        // Variable per-row GRPO denominator with the k3 KL penalty active.
+        run_gradcheck_ragged(LossType::Grpo, 0.1);
+    }
+
+    #[test]
+    fn gradcheck_ragged_dr_grpo_with_kl() {
+        // Dr.GRPO fixed denominator under ragged real-token counts, KL active.
+        run_gradcheck_ragged(LossType::DrGrpo, 0.1);
+    }
+
+    #[test]
+    fn gradcheck_all_padding_grpo_no_kl() {
+        // All-padding row (len 0) exercises the GRPO denominator clamp; surrogate only.
+        run_gradcheck_all_padding(LossType::Grpo, 0.0);
+    }
+
+    #[test]
+    fn gradcheck_all_padding_grpo_with_kl() {
+        // GRPO denominator clamp with the k3 KL penalty active.
+        run_gradcheck_all_padding(LossType::Grpo, 0.1);
+    }
+
+    #[test]
+    fn gradcheck_all_padding_dr_grpo_with_kl() {
+        // Dr.GRPO fixed denom: a fully-masked row stays gradient-inert, KL active.
+        run_gradcheck_all_padding(LossType::DrGrpo, 0.1);
     }
 }
