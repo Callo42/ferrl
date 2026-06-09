@@ -169,10 +169,7 @@ impl Drop for TempDir {
 
 /// A fixed rectangular rollout for deterministic scoring (`prompt_len` 2, comp 3).
 fn fixed_rollout() -> Rollout {
-    Rollout {
-        token_ids: vec![vec![1u32, 2, 3, 4, 5], vec![3, 1, 4, 1, 5]],
-        prompt_len: 2,
-    }
+    Rollout::rectangular(vec![vec![1u32, 2, 3, 4, 5], vec![3, 1, 4, 1, 5]], 2)
 }
 
 #[test]

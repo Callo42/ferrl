@@ -22,9 +22,38 @@ pub struct Rollout {
     pub token_ids: Vec<Vec<u32>>,
     /// Number of leading prompt tokens shared by every sequence in this rollout.
     pub prompt_len: usize,
+    /// Number of *real* completion tokens in each sequence — the count of
+    /// generated tokens up to and including the first EOS (EOS-inclusive), or the
+    /// full completion width if no EOS was sampled. Positions at or beyond this
+    /// index within the (rectangular) completion are padding and are masked out of
+    /// the GRPO loss. For a fixed-length, no-early-stop rollout this equals the
+    /// full completion width for every sequence (see [`Rollout::rectangular`]); a
+    /// per-element value is in `0..=comp_len`.
+    pub completion_lens: Vec<usize>,
 }
 
 impl Rollout {
+    /// Construct a **rectangular** rollout in which every sequence is a real
+    /// completion of the full width — the legacy, no-EOS-early-stop behavior.
+    ///
+    /// Each `completion_lens[i]` is `token_ids[i].len() - prompt_len` (saturating,
+    /// so a degenerate `prompt_len >= row length` yields `0` rather than
+    /// panicking). EOS-aware generation, which stops sequences early, instead sets
+    /// `completion_lens` to the true per-sequence lengths and right-pads
+    /// `token_ids` to a common width.
+    #[must_use]
+    pub fn rectangular(token_ids: Vec<Vec<u32>>, prompt_len: usize) -> Self {
+        let completion_lens = token_ids
+            .iter()
+            .map(|ids| ids.len().saturating_sub(prompt_len))
+            .collect();
+        Self {
+            token_ids,
+            prompt_len,
+            completion_lens,
+        }
+    }
+
     /// Number of sequences in the rollout.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -133,19 +162,26 @@ mod tests {
 
     #[test]
     fn rollout_len_and_empty() {
-        let r = Rollout {
-            token_ids: vec![vec![1, 2, 3], vec![1, 4, 5]],
-            prompt_len: 1,
-        };
+        let r = Rollout::rectangular(vec![vec![1, 2, 3], vec![1, 4, 5]], 1);
         assert_eq!(r.len(), 2);
         assert!(!r.is_empty());
 
-        let e = Rollout {
-            token_ids: vec![],
-            prompt_len: 0,
-        };
+        let e = Rollout::rectangular(vec![], 0);
         assert_eq!(e.len(), 0);
         assert!(e.is_empty());
+    }
+
+    #[test]
+    fn rectangular_fills_completion_lens_to_full_width() {
+        // Every sequence is a full-width real completion: prompt_len 2, comp 3.
+        let r = Rollout::rectangular(vec![vec![1, 2, 3, 4, 5], vec![1, 2, 6, 7, 8]], 2);
+        assert_eq!(r.completion_lens, vec![3, 3]);
+        // An empty rollout has no per-sequence lengths.
+        let e = Rollout::rectangular(vec![], 0);
+        assert!(e.completion_lens.is_empty());
+        // Saturating: a row no longer than the prompt yields a zero completion.
+        let z = Rollout::rectangular(vec![vec![1, 2]], 2);
+        assert_eq!(z.completion_lens, vec![0]);
     }
 
     #[test]

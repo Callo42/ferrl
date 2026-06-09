@@ -111,10 +111,7 @@ impl Policy for EchoPolicy {
             }
             token_ids.push(ids);
         }
-        Ok(Rollout {
-            token_ids,
-            prompt_len: prompt.len(),
-        })
+        Ok(Rollout::rectangular(token_ids, prompt.len()))
     }
 
     fn token_logprobs(&self, rollout: &Rollout) -> CandleResult<Tensor> {
@@ -261,10 +258,7 @@ struct BadPromptLenPolicy {
 impl Policy for BadPromptLenPolicy {
     fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
         let r = self.inner.generate(prompt, cfg)?;
-        Ok(Rollout {
-            token_ids: r.token_ids,
-            prompt_len: self.prompt_len,
-        })
+        Ok(Rollout::rectangular(r.token_ids, self.prompt_len))
     }
 
     fn token_logprobs(&self, rollout: &Rollout) -> CandleResult<Tensor> {
