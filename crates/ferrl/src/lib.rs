@@ -12,6 +12,9 @@
 //! - the pure GRPO math ([`grpo`]) — advantages, the k3 KL estimator, the
 //!   clipped surrogate, and the masked-mean reductions;
 //! - the [`reward`] abstraction (scalar rewards, never tensors);
+//! - a reference verifiable task ([`countdown`]) — the Countdown arithmetic task: a
+//!   solvable-by-construction problem generator, a few-shot prompt builder, and a
+//!   shaped, exact [`CountdownReward`] (the P4 task);
 //! - the [`policy`] abstraction over generation and per-token log-probabilities;
 //! - a manual `LoRA` adapter ([`lora`]);
 //! - grad-safe building blocks and the grad-coverage canary ([`nn`]);
@@ -58,6 +61,7 @@
 #![forbid(unsafe_code)]
 
 pub mod checkpoint;
+pub mod countdown;
 pub mod eval;
 pub mod grpo;
 pub mod lora;
@@ -72,6 +76,11 @@ pub mod trainer;
 
 #[doc(inline)]
 pub use checkpoint::{load_adapter, save_adapter, CheckpointError, CheckpointManifest};
+#[doc(inline)]
+pub use countdown::{
+    build_prompt, generate_dataset, parse_problem_from_prompt, CountdownConfig, CountdownProblem,
+    CountdownReward,
+};
 #[doc(inline)]
 pub use eval::{evaluate, EvalError, EvalReport, PromptEval};
 #[doc(inline)]
