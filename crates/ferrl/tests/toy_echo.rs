@@ -25,12 +25,12 @@ use std::path::{Path, PathBuf};
 
 use candle_core::{DType, Device, IndexOp, Result as CandleResult, Tensor, Var, D};
 use candle_nn::ops::log_softmax;
-use candle_transformers::generation::{LogitsProcessor, Sampling};
 
 use ferrl::lora::LoraLinear;
 use ferrl::nn::RmsNorm;
 use ferrl::policy::{GenConfig, Policy, Rollout};
 use ferrl::reward::RewardFn;
+use ferrl::sampler::GrpoSampler;
 use ferrl::telemetry::RunDir;
 use ferrl::trainer::{TokenizerLike, Trainer, TrainerConfig, TrainerError};
 use ferrl::{LossType, Metrics, ScaleRewards};
@@ -54,7 +54,7 @@ struct EchoPolicy {
     lora: LoraLinear,
     norm: RmsNorm,
     vocab: usize,
-    sampler: LogitsProcessor,
+    sampler: GrpoSampler,
     device: Device,
 }
 
@@ -75,7 +75,7 @@ impl EchoPolicy {
         // become peaky enough for the reward to approach 1.
         let gamma = Tensor::ones(vocab, DType::F32, &device)?.affine(gamma_scale, 0.0)?;
         let norm = RmsNorm::new(gamma, 1e-6);
-        let sampler = LogitsProcessor::from_sampling(seed, Sampling::All { temperature });
+        let sampler = GrpoSampler::new(seed, temperature);
         Ok(Self {
             lora,
             norm,

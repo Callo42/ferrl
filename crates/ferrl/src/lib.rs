@@ -23,6 +23,10 @@
 //! - a [`Policy`] over the real model ([`qwen_policy`]) — [`QwenPolicy`] wraps that
 //!   grad forward as the trainer's policy seam, with uncached, adapter-aware
 //!   rollout, so the same `Trainer` drives Qwen3 as the P2 toy;
+//! - a ferrl-owned rollout sampler ([`sampler`]) — [`GrpoSampler`] reproduces
+//!   candle's temperature multinomial sampling on a `serde`-serializable
+//!   `Xoshiro256PlusPlus`, so the rollout RNG can be captured and restored for
+//!   momentum-faithful resume (replacing candle's accessor-less `LogitsProcessor`);
 //! - a real-model tokenizer adapter ([`tokenizer`]) — [`HfTokenizer`] wraps a
 //!   Hugging Face fast tokenizer behind the trainer's [`TokenizerLike`] bridge;
 //! - the GRPO training loop ([`trainer`]) — the `Trainer` that drives rollout →
@@ -77,6 +81,7 @@ pub mod policy;
 pub mod qwen;
 pub mod qwen_policy;
 pub mod reward;
+pub mod sampler;
 pub mod telemetry;
 pub mod tokenizer;
 pub mod trainer;
@@ -107,6 +112,8 @@ pub use qwen::QwenGradModel;
 pub use qwen_policy::QwenPolicy;
 #[doc(inline)]
 pub use reward::RewardFn;
+#[doc(inline)]
+pub use sampler::GrpoSampler;
 #[doc(inline)]
 pub use telemetry::{init_tracing, Metrics, MetricsWriter, RunDir};
 #[doc(inline)]

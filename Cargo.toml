@@ -57,8 +57,10 @@ serde_json = "1"
 # examples, and oracle/glue paths where a boxed error is fine.
 thiserror = "2"
 anyhow = "1"
-# RNG for GRPO sampling / group construction and reproducible test fixtures.
-rand = "0.10"
+# RNG for GRPO sampling / group construction and reproducible test fixtures. The
+# `serde` feature serializes the sampler RNG state (`GrpoSampler`'s
+# `Xoshiro256PlusPlus`) so a checkpoint can capture and restore it (P6-B resume).
+rand = { version = "0.10", features = ["serde"] }
 # Dev: property-based testing for numeric invariants.
 proptest = "1"
 # Dev: deterministic float comparison in tests.

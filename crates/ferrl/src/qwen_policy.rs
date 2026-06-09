@@ -37,10 +37,10 @@
 
 use candle_core::{DType, IndexOp, Result as CandleResult, Tensor, Var, D};
 use candle_nn::ops::log_softmax;
-use candle_transformers::generation::{LogitsProcessor, Sampling};
 
 use crate::policy::{GenConfig, Policy, Rollout};
 use crate::qwen::QwenGradModel;
+use crate::sampler::GrpoSampler;
 
 /// A [`Policy`] backed by the grad-bearing [`QwenGradModel`].
 ///
@@ -50,12 +50,13 @@ use crate::qwen::QwenGradModel;
 /// whose BF16 logits the scoring path upcasts to F32 for the surrogate.
 pub struct QwenPolicy {
     model: QwenGradModel,
-    sampler: LogitsProcessor,
+    sampler: GrpoSampler,
     temperature: f64,
     enabled: bool,
 }
 
-// `LogitsProcessor` is not `Debug`; format the inspectable fields and elide it.
+// Elide the sampler's RNG state and the heavy model fields; show the inspectable
+// scalars. (`GrpoSampler` is `Debug`, but the raw RNG words add only noise.)
 impl std::fmt::Debug for QwenPolicy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QwenPolicy")
@@ -70,15 +71,15 @@ impl QwenPolicy {
     /// Wrap a loaded [`QwenGradModel`] as a policy, seeding the rollout sampler.
     ///
     /// `temperature` is the rollout sampling temperature, fixed for this policy's
-    /// lifetime: candle's [`LogitsProcessor`] owns the sampling RNG and exposes no
-    /// per-call temperature, so it is baked in here. [`generate`](Self::generate)
+    /// lifetime: the [`GrpoSampler`] bakes it in (as candle's `LogitsProcessor`
+    /// does), exposing no per-call temperature. [`generate`](Self::generate)
     /// **fails loud** if handed a [`GenConfig`] whose `temperature` differs (rather
     /// than silently sampling at the wrong temperature); the trainer passes this
     /// same value through. Scoring is always at temperature 1. The adapter starts
     /// enabled (the trainer toggles it off for the KL reference forward).
     #[must_use]
     pub fn new(model: QwenGradModel, seed: u64, temperature: f64) -> Self {
-        let sampler = LogitsProcessor::from_sampling(seed, Sampling::All { temperature });
+        let sampler = GrpoSampler::new(seed, temperature);
         Self {
             model,
             sampler,
