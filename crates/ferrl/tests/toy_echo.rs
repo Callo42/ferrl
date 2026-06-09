@@ -570,26 +570,34 @@ fn gate_dr_grpo_paper_config_learns() {
 
 #[test]
 fn gate_grad_accum_effective_batch_learns() {
-    // Gradient accumulation across prompts: group_size 4 with grad_accum_steps 2
-    // forms an effective batch of 8 completions per optimizer step (the lever the
+    // Gradient accumulation across prompts: group_size 4 with grad_accum_steps 8
+    // forms an effective batch of 32 completions per optimizer step (the lever the
     // Countdown run wanted to escape degenerate group-4 windows). Each optimizer step
-    // accumulates two prompts' group-4 gradients into one AdamW update. Must still
+    // accumulates eight prompts' group-4 gradients into one AdamW update. Must still
     // learn the echo map. `history.len() == steps` (one row per optimizer step, each
     // having consumed grad_accum_steps prompts) is itself the windowing invariant.
     //
     // Wide margins on purpose — seeded but platform-dependent (float
     // non-associativity), like the other reward-trend gates. group_size 4 is the
     // smallest in the suite (closest to the degeneracy cliff — which is the point:
-    // accumulation is what escapes it), so lr is kept at the proven-safe 0.05 (as
-    // gate_reward_trends_up uses) to minimise overshoot on a numerically-different CI
-    // CPU. On the dev host this run converges to ~1.0 from ~0.45, so both
-    // `late > early + 0.2` and `late > 0.5` carry ample slack.
+    // accumulation is what escapes it). The effective batch (4 * 8 = 32) matches the
+    // proven-robust group-32 learning gates (gate_reward_trends_up / gate_dr_grpo):
+    // a *small* effective batch is what lets a group-4 run land in a CPU-dependent
+    // optimum — with grad_accum_steps 2 (effective 8) it converged to ~1.0 on the dev
+    // host but a weak ~0.59 on a CI runner under the P6-B Xoshiro sampler — so
+    // accumulation is dialed up to the robust batch size rather than tuning a seed to
+    // one CPU. lr stays at the proven-safe 0.05. `early` is the step-0 reward (the
+    // deterministic ~1/VOCAB baseline), NOT a 40-step window: with this effective
+    // batch the climb is fast and float-fragile, so a windowed "early" can already sit
+    // near the ceiling and leave no head-room under the margin. Across 10 parallel
+    // full-suite runs late lands in [0.80, 1.0] from the 0.25 baseline, so
+    // `late > early + 0.2` (> 0.45) and `late > 0.5` carry slack.
     let mut policy = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 29, TEMP).unwrap();
     let prompts = echo_prompts(VOCAB);
     let cfg = TrainerConfig {
         steps: 500,
         group_size: 4,
-        grad_accum_steps: 2,
+        grad_accum_steps: 8,
         max_new_tokens: 1,
         temperature: TEMP,
         lr: 0.05,
@@ -606,11 +614,11 @@ fn gate_grad_accum_effective_batch_learns() {
         500,
         "one metrics row per optimizer step (window)"
     );
-    let early = window_mean(&history[..40]);
+    let early = window_mean(&history[..1]);
     let late = window_mean(&history[history.len() - 40..]);
     assert!(
         late > early + 0.2,
-        "grad-accum did not learn: early-40 mean={early}, late-40 mean={late}"
+        "grad-accum did not learn: early(step0)={early}, late-40 mean={late}"
     );
     assert!(
         late > 0.5,
