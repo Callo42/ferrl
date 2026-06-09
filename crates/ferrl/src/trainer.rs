@@ -3,8 +3,9 @@
 //! [`Trainer`] drives one GRPO optimizer step at a time over a [`Policy`] and a
 //! [`RewardFn`], owning the pieces candle does not provide: the rollout →
 //! reward → advantage → masked clipped-surrogate (+ optional KL) → backward →
-//! **grad-coverage canary** → optimizer-step pipeline, plus the inner update
-//! loop (`μ`) and per-step telemetry.
+//! **grad-coverage canary** → optimizer-step pipeline, plus the inner-update loop
+//! (`μ`), gradient accumulation across prompts (`grad_accum_steps`), and per-step
+//! telemetry.
 //!
 //! It is generic over the [`Policy`] and [`RewardFn`] traits and never names a
 //! concrete model: the trainable parameters reach it only through
@@ -124,6 +125,19 @@ pub struct TrainerConfig {
     pub loss_type: LossType,
     /// How to scale group-centered rewards into advantages.
     pub scale_rewards: ScaleRewards,
+    /// Number of prompts whose gradients are accumulated into a single optimizer
+    /// step (gradient accumulation **across prompts**). Each [`steps`](Self::steps)
+    /// outer step consumes this many prompts — a *window* — summing their per-prompt
+    /// group gradients (each scaled by `1 / grad_accum_steps`) before one `AdamW`
+    /// update, giving an effective batch of `grad_accum_steps` groups at a single
+    /// group's peak memory (only one group's grad forward is held at a time). A
+    /// degenerate (all-equal-reward) prompt in a window contributes no gradient but
+    /// still counts toward the `1 / grad_accum_steps` scale, and a window is skipped
+    /// only when *every* prompt in it is degenerate. `1` (the default) is plain
+    /// per-prompt stepping, bit-identical to no accumulation. `#[serde(default)]` via
+    /// the `default_grad_accum_steps` fn so an older `config.json` still deserializes.
+    #[serde(default = "default_grad_accum_steps")]
+    pub grad_accum_steps: usize,
     /// If set, write an adapter checkpoint to `checkpoints/step-<n>/` (with a
     /// resumable manifest) every `checkpoint_every` completed steps **and** after
     /// the final step (so a completed run always persists its final adapter, even
@@ -132,6 +146,11 @@ pub struct TrainerConfig {
     /// this field existed still deserializes (to `None`).
     #[serde(default)]
     pub checkpoint_every: Option<u64>,
+}
+
+/// `serde` default for [`TrainerConfig::grad_accum_steps`]: `1` (no accumulation).
+fn default_grad_accum_steps() -> usize {
+    1
 }
 
 impl Default for TrainerConfig {
@@ -148,6 +167,7 @@ impl Default for TrainerConfig {
             weight_decay: 0.0,
             loss_type: LossType::Grpo,
             scale_rewards: ScaleRewards::Group,
+            grad_accum_steps: 1,
             checkpoint_every: None,
         }
     }
@@ -163,8 +183,9 @@ impl TrainerConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`TrainerError::InvalidConfig`] if `mu`, `group_size`, or
-    /// `max_new_tokens` is `0`; if `temperature` is not finite and `> 0`; if `lr`,
+    /// Returns [`TrainerError::InvalidConfig`] if `mu`, `group_size`,
+    /// `max_new_tokens`, or `grad_accum_steps` is `0`; if `temperature` is not
+    /// finite and `> 0`; if `lr`,
     /// `weight_decay`, or `beta` is not finite and `>= 0`; if `clip_eps` is not
     /// finite and in `[0, 1)` (`>= 1` makes the lower clip band cross `0`, which a
     /// strictly-positive importance ratio can never reach, silently disabling the
@@ -176,6 +197,10 @@ impl TrainerConfig {
         )?;
         require(self.group_size >= 1, "group_size must be >= 1")?;
         require(self.max_new_tokens >= 1, "max_new_tokens must be >= 1")?;
+        require(
+            self.grad_accum_steps >= 1,
+            "grad_accum_steps must be >= 1 (0 would never step the optimizer)",
+        )?;
         require(
             self.temperature.is_finite() && self.temperature > 0.0,
             "temperature must be finite and > 0",
@@ -231,6 +256,28 @@ struct InnerAgg {
     grad_norm: f32,
 }
 
+/// A non-degenerate prompt's data, captured once per accumulation window so the
+/// `mu` inner epochs can re-forward it. `logp_old` / `logp_ref` are the detached
+/// old / reference snapshots taken at the window's start; `advantages` is the
+/// detached `[G, 1]` column and `mask` the `[G, comp_len]` all-ones mask.
+struct LiveItem {
+    rollout: Rollout,
+    advantages: Tensor,
+    logp_old: Tensor,
+    logp_ref: Option<Tensor>,
+    mask: Tensor,
+}
+
+/// Per-prompt quantities aggregated into a window's [`Metrics`] (the reward
+/// distribution, completion length, dropped rows, and whether the group was a
+/// degenerate all-equal-reward no-op).
+struct PromptStat {
+    rewards: Vec<f32>,
+    completion_len: f32,
+    dropped: usize,
+    degenerate: bool,
+}
+
 impl Trainer {
     /// Open a trainer for `config`, persisting it to `run`'s `config.json` and
     /// opening the `metrics.jsonl` writer.
@@ -251,8 +298,9 @@ impl Trainer {
         })
     }
 
-    /// Run `config.steps` GRPO steps, cycling through `prompts`, returning the
-    /// per-step [`Metrics`] (also appended to `metrics.jsonl`).
+    /// Run `config.steps` optimizer steps — each over a window of
+    /// `config.grad_accum_steps` prompts — cycling through `prompts`, returning one
+    /// [`Metrics`] row per optimizer step (also appended to `metrics.jsonl`).
     ///
     /// # Errors
     ///
@@ -281,8 +329,9 @@ impl Trainer {
     /// The caller must have loaded the checkpoint's adapter into `policy` first —
     /// [`crate::checkpoint::load_adapter`] returns the [`crate::checkpoint::CheckpointManifest`]
     /// whose `step` is the `start_step` to pass here. Prompt cycling keys off the
-    /// global step index, so resuming at the recorded step keeps the same
-    /// prompt order an uninterrupted run would have seen.
+    /// window index — window `start_step` consumes prompts beginning at
+    /// `start_step * grad_accum_steps` (mod len) — so resuming at the recorded window
+    /// continues the prompt order an uninterrupted run would have seen.
     ///
     /// **Not bit-exact to an uninterrupted run.** A fresh `AdamW` is constructed
     /// (its moment estimates restart from zero, re-warming the bias correction) and
@@ -311,8 +360,8 @@ impl Trainer {
     }
 
     /// Shared loop for [`train`](Self::train) / [`train_from`](Self::train_from):
-    /// run steps `start_step .. config.steps`, checkpointing on the configured
-    /// cadence.
+    /// run optimizer steps `start_step .. config.steps`, each consuming a window of
+    /// `grad_accum_steps` prompts, checkpointing on the configured cadence.
     fn run<P: Policy, R: RewardFn>(
         &mut self,
         start_step: u64,
@@ -333,13 +382,52 @@ impl Trainer {
         let remaining = total.saturating_sub(start_step) as usize;
         let mut history = Vec::with_capacity(remaining);
         for step in start_step..total {
-            let prompt = &prompts[step as usize % prompts.len()];
-            let m = self.run_step(step, policy, reward_fn, tokenizer, prompt, &mut opt, &vars)?;
+            let m =
+                self.run_window(step, policy, reward_fn, tokenizer, prompts, &mut opt, &vars)?;
             self.writer.append(&m)?;
             history.push(m);
             self.maybe_checkpoint(step, &vars)?;
         }
         Ok(history)
+    }
+
+    /// One optimizer step over a window of `grad_accum_steps` prompts: collect each
+    /// prompt's group (rollout → reward → advantages, snapshotting the non-degenerate
+    /// ones), then run the `mu` inner epochs that accumulate the window's gradients
+    /// into a single `AdamW` update. Returns the window's aggregated [`Metrics`].
+    #[allow(clippy::too_many_arguments)]
+    fn run_window<P: Policy, R: RewardFn>(
+        &self,
+        step: u64,
+        policy: &mut P,
+        reward_fn: &R,
+        tokenizer: &dyn TokenizerLike,
+        prompts: &[String],
+        opt: &mut AdamW,
+        vars: &[Var],
+    ) -> Result<Metrics, TrainerError> {
+        let accum = self.config.grad_accum_steps;
+        let mut stats = Vec::with_capacity(accum);
+        let mut live = Vec::with_capacity(accum);
+        for j in 0..accum {
+            // Continuous prompt cycling across windows: window `step` consumes prompts
+            // `step*accum .. step*accum + accum` (mod len), so a resume at window
+            // `start_step` continues the order an uninterrupted run would have seen.
+            let idx = (step as usize * accum + j) % prompts.len();
+            let (stat, item) = self.collect_prompt(policy, reward_fn, tokenizer, &prompts[idx])?;
+            stats.push(stat);
+            if let Some(item) = item {
+                live.push(item);
+            }
+        }
+        // A window with no live prompts (every group degenerate) is a GRPO no-op: no
+        // update, no canary — mirroring the single-prompt degenerate skip.
+        let agg = if live.is_empty() {
+            InnerAgg::default()
+        } else {
+            self.update_window(policy, &live, vars, opt)?
+        };
+        Ok(self.build_window_metrics(step, &stats, &agg, opt))
     }
 
     /// After completing step `step` (0-based), write `checkpoints/step-<n>/` when
@@ -362,18 +450,19 @@ impl Trainer {
         Ok(())
     }
 
-    /// One outer GRPO step over a single prompt's group.
-    #[allow(clippy::too_many_arguments)]
-    fn run_step<P: Policy, R: RewardFn>(
+    /// Collect one prompt's group for the current window: rollout (adapter on) →
+    /// reward → group advantages, validating the `Policy` / `RewardFn` contract. A
+    /// degenerate (all-zero-advantage) group returns `(stat, None)` — a GRPO no-op
+    /// with no snapshot and no update; a live group also snapshots the old / reference
+    /// log-probs (taken now, at the window's start) into a [`LiveItem`] for the inner
+    /// epochs.
+    fn collect_prompt<P: Policy, R: RewardFn>(
         &self,
-        step: u64,
         policy: &mut P,
         reward_fn: &R,
         tokenizer: &dyn TokenizerLike,
         prompt: &str,
-        opt: &mut AdamW,
-        vars: &[Var],
-    ) -> Result<Metrics, TrainerError> {
+    ) -> Result<(PromptStat, Option<LiveItem>), TrainerError> {
         // Rollout with the adapter on, then score it.
         policy.set_adapter_enabled(true);
         let prompt_ids = tokenizer.encode(prompt);
@@ -419,122 +508,150 @@ impl Trainer {
         }
 
         // Rectangular toy: an all-ones mask drops no rows. zero_mask_rows is still
-        // the source of truth (variable-length masking arrives with P4).
+        // the source of truth (variable-length masking arrives later).
         let mask_rows = vec![vec![1.0_f64; comp_len]; rollout.len()];
         let dropped = zero_mask_rows(&mask_rows);
 
         // Group-normalized advantages (scalar oracle). A group whose advantages are
         // all exactly zero — no reward spread, or non-finite rewards forced to a 0
-        // advantage — carries no gradient, so the update (and the canary, which
-        // would correctly flag the resulting all-zero gradient) is skipped.
+        // advantage — carries no gradient, so it is a no-op (no snapshot, no update,
+        // no canary), exactly as the single-prompt path skipped it.
         let rewards_f64: Vec<f64> = rewards.iter().map(|&r| f64::from(r)).collect();
         let advantages = group_advantages(&rewards_f64, self.config.scale_rewards);
         let degenerate = advantages.iter().all(|a| *a == 0.0);
-        let agg = if degenerate {
-            InnerAgg::default()
-        } else {
-            self.update_group(policy, &rollout, &advantages, comp_len, vars, opt)?
+        let stat = PromptStat {
+            completion_len: mean_completion_len(&rollout),
+            dropped,
+            degenerate,
+            rewards,
         };
+        if degenerate {
+            return Ok((stat, None));
+        }
 
-        Ok(self.build_metrics(step, &rewards, &rollout, dropped, degenerate, &agg, opt))
+        // Snapshot the old / reference log-probs once (the window's "old" policy),
+        // reused across the mu inner epochs.
+        let logp_old = policy.token_logprobs(&rollout)?.detach();
+        let device = logp_old.device().clone();
+        let mask = Tensor::ones((rollout.len(), comp_len), DType::F32, &device)?;
+        let logp_ref = self.reference_logprobs(policy, &rollout)?;
+        let advantages = advantages_tensor(&advantages, &device)?;
+        let item = LiveItem {
+            rollout,
+            advantages,
+            logp_old,
+            logp_ref,
+            mask,
+        };
+        Ok((stat, Some(item)))
     }
 
-    /// Run the `mu` inner updates for a group that has a non-zero advantage
-    /// signal: snapshot the old / reference log-probs, then optimize.
-    #[allow(clippy::too_many_arguments)]
-    fn update_group<P: Policy>(
+    /// Run the `mu` inner epochs over a window's live items, each epoch accumulating
+    /// every live prompt's gradient into one `AdamW` step. The last epoch's
+    /// diagnostics land in the window's metrics.
+    fn update_window<P: Policy>(
         &self,
-        policy: &mut P,
-        rollout: &Rollout,
-        advantages: &[f64],
-        comp_len: usize,
+        policy: &P,
+        live: &[LiveItem],
         vars: &[Var],
         opt: &mut AdamW,
     ) -> Result<InnerAgg, TrainerError> {
-        let logp_old = policy.token_logprobs(rollout)?.detach();
-        let device = logp_old.device().clone();
-        let mask = Tensor::ones((rollout.len(), comp_len), DType::F32, &device)?;
-        let logp_ref = self.reference_logprobs(policy, rollout)?;
-        let advantages = advantages_tensor(advantages, &device)?;
-
-        // mu inner updates; the last one's diagnostics land in the metrics.
         let mut agg = InnerAgg::default();
         for _ in 0..self.config.mu {
-            agg = self.inner_update(
-                policy,
-                rollout,
-                &logp_old,
-                logp_ref.as_ref(),
-                &advantages,
-                &mask,
-                vars,
-                opt,
-            )?;
+            agg = self.accumulate_step(policy, live, vars, opt)?;
         }
         Ok(agg)
     }
 
-    /// One inner optimization step: grad forward, surrogate (+ optional KL),
-    /// masked aggregation, backward, the canary, then the optimizer step.
-    #[allow(clippy::too_many_arguments)]
-    fn inner_update<P: Policy>(
+    /// One inner epoch: forward+backward each live prompt, fold its trainable-var
+    /// gradients into a running sum, run the grad-coverage canary on the accumulated
+    /// gradient, then take one optimizer step. Only one prompt's grad forward is held
+    /// at a time (the accumulator keeps just the small per-var sums), so the window's
+    /// peak memory is a single group's.
+    fn accumulate_step<P: Policy>(
         &self,
         policy: &P,
-        rollout: &Rollout,
-        logp_old: &Tensor,
-        logp_ref: Option<&Tensor>,
-        advantages: &Tensor,
-        mask: &Tensor,
+        live: &[LiveItem],
         vars: &[Var],
         opt: &mut AdamW,
     ) -> Result<InnerAgg, TrainerError> {
-        let logp = policy.token_logprobs(rollout)?;
-        // The single differentiated loss, assembled by `grpo_loss` — the *same*
-        // function the finite-difference gradcheck pins, so the gradcheck verifies
-        // candle's analytic gradient of exactly this expression.
-        let loss = grpo_loss(
-            &logp,
-            logp_old,
-            logp_ref,
-            advantages,
-            mask,
-            self.config.clip_eps,
-            self.config.beta,
-            self.config.loss_type,
-        )?;
-        // Scalar diagnostics, off the differentiated path: the clip fraction and the
-        // mean k3 KL. Recomputing the ratio / KL here (rather than threading them out
-        // of `grpo_loss`) keeps the loss assembly a single, gradcheck-pinned unit.
-        let ratio = importance_ratio(&logp, logp_old)?;
-        let clip_frac = clip_fraction(&ratio, advantages, self.config.clip_eps, mask)?;
-        let kl = self.kl_metric(&logp, logp_ref, mask)?;
-
-        let grads = loss.backward()?;
-        let cov = grad_coverage(vars, &grads)?;
-        // Fatal: a missing var (candle's silent-skip landmine — a real autograd cut
-        // is an absent grad entry) or a non-finite gradient (a blowup). into_result
-        // emits the precise message for whichever fired.
+        let n_live = live.len() as f32;
+        let mut acc: Vec<Option<Tensor>> = vec![None; vars.len()];
+        let mut covered = vec![true; vars.len()];
+        let mut container: Option<GradStore> = None;
+        let mut sum_kl = 0.0_f32;
+        let mut sum_clip = 0.0_f32;
+        for item in live {
+            let (grads, kl, clip_frac) = self.item_backward(policy, item)?;
+            sum_kl += kl;
+            sum_clip += clip_frac;
+            fold_var_grads(vars, &grads, &mut acc, &mut covered)?;
+            container = Some(grads);
+        }
+        // Reuse the last backward's store as the optimizer container, overwriting its
+        // trainable-var entries with the accumulated sums (and dropping any var absent
+        // from some prompt so the canary catches the silent-skip).
+        let store = combine_into_store(vars, container.expect("live is non-empty"), &acc, &covered);
+        let cov = grad_coverage(vars, &store)?;
+        let kl = sum_kl / n_live;
+        let clip_frac = sum_clip / n_live;
+        // Fatal: a missing var (candle's silent-skip landmine — an absent grad entry)
+        // or a non-finite accumulated gradient (a blowup).
         if !cov.is_covered() || cov.nonfinite > 0 {
             cov.clone().into_result()?;
         }
         if !cov.is_live() {
-            // Covered + finite + all-zero gradient: no usable signal this inner step
-            // (fully-clipped trust region, or mean-centered advantages cancelling).
-            // Skip the optimizer step rather than mislabel it a dead forward.
+            // Covered + finite + all-zero accumulated gradient: no usable signal this
+            // epoch (every live prompt fully clipped, or advantages cancelling). Skip
+            // the optimizer step rather than mislabel it a dead forward.
             return Ok(InnerAgg {
                 kl,
                 clip_frac,
                 grad_norm: 0.0,
             });
         }
-        let grad_norm = global_grad_norm(vars, &grads)? as f32;
-        opt.step(&grads)?;
-
+        let grad_norm = global_grad_norm(vars, &store)? as f32;
+        opt.step(&store)?;
         Ok(InnerAgg {
             kl,
             clip_frac,
             grad_norm,
         })
+    }
+
+    /// Forward + backward one live prompt: the single `grpo_loss` (scaled by
+    /// `1 / grad_accum_steps` when accumulating, so once folded the window's gradient
+    /// is the sum over its live prompts divided by the full window size — the mean
+    /// when every prompt is live, with degenerate prompts diluting the step) plus its
+    /// scalar diagnostics (clip fraction, mean k3 KL). Returns the backward's
+    /// [`GradStore`] and the diagnostics. The scale is skipped at
+    /// `grad_accum_steps == 1`, keeping the no-accumulation path bit-identical (no
+    /// extra affine node, identical to the prior single-step loss).
+    fn item_backward<P: Policy>(
+        &self,
+        policy: &P,
+        item: &LiveItem,
+    ) -> Result<(GradStore, f32, f32), TrainerError> {
+        let logp = policy.token_logprobs(&item.rollout)?;
+        let mut loss = grpo_loss(
+            &logp,
+            &item.logp_old,
+            item.logp_ref.as_ref(),
+            &item.advantages,
+            &item.mask,
+            self.config.clip_eps,
+            self.config.beta,
+            self.config.loss_type,
+        )?;
+        if self.config.grad_accum_steps > 1 {
+            loss = loss.affine(1.0 / self.config.grad_accum_steps as f64, 0.0)?;
+        }
+        // Scalar diagnostics, off the differentiated path.
+        let ratio = importance_ratio(&logp, &item.logp_old)?;
+        let clip_frac = clip_fraction(&ratio, &item.advantages, self.config.clip_eps, &item.mask)?;
+        let kl = self.kl_metric(&logp, item.logp_ref.as_ref(), &item.mask)?;
+        let grads = loss.backward()?;
+        Ok((grads, kl, clip_frac))
     }
 
     /// Mean masked k3 KL for the step's metrics — the diagnostic counterpart of the
@@ -569,29 +686,33 @@ impl Trainer {
         Ok(Some(logp?.detach()))
     }
 
-    /// Populate the step's [`Metrics`] from the rewards, rollout, and inner-step
-    /// diagnostics.
-    #[allow(clippy::too_many_arguments)]
-    fn build_metrics(
+    /// Aggregate a window's per-prompt [`PromptStat`]s and the update's diagnostics
+    /// into one [`Metrics`] row: mean/std reward over **every** completion in the
+    /// window, the fraction of degenerate groups, mean completion length, and total
+    /// dropped rows. At `grad_accum_steps == 1` the window is a single prompt and this
+    /// is identical to the prior per-prompt metrics.
+    fn build_window_metrics(
         &self,
         step: u64,
-        rewards: &[f32],
-        rollout: &Rollout,
-        dropped: usize,
-        degenerate: bool,
+        stats: &[PromptStat],
         agg: &InnerAgg,
         opt: &AdamW,
     ) -> Metrics {
         let mut m = Metrics::at_step(step);
-        let (mean, std) = reward_stats(rewards);
+        let all_rewards: Vec<f32> = stats
+            .iter()
+            .flat_map(|s| s.rewards.iter().copied())
+            .collect();
+        let (mean, std) = reward_stats(&all_rewards);
         m.reward_mean = mean;
         m.reward_std = std;
-        // Tie the zero-std flag to the same condition that drove the skip, so the
-        // metric and the optimizer can never disagree (covers all-non-finite groups
-        // too, which group_advantages forces to all-zero advantages).
-        m.frac_reward_zero_std = if degenerate { 1.0 } else { 0.0 };
-        m.completion_len = mean_completion_len(rollout);
-        m.dropped_rows = dropped as u32;
+        // Fraction of the window's groups that were degenerate no-ops — tied to the
+        // same condition that drove each skip, so metric and optimizer never disagree
+        // (covers all-non-finite groups too, forced to all-zero advantages).
+        let degenerate = stats.iter().filter(|s| s.degenerate).count();
+        m.frac_reward_zero_std = degenerate as f32 / stats.len() as f32;
+        m.completion_len = stats.iter().map(|s| s.completion_len).sum::<f32>() / stats.len() as f32;
+        m.dropped_rows = stats.iter().map(|s| s.dropped as u32).sum();
         m.kl = agg.kl;
         m.clip_ratio = agg.clip_frac;
         m.grad_norm = agg.grad_norm;
@@ -607,6 +728,53 @@ fn decode_completions(rollout: &Rollout, tokenizer: &dyn TokenizerLike) -> Vec<S
         .iter()
         .map(|ids| tokenizer.decode(&ids[rollout.prompt_len..]))
         .collect()
+}
+
+/// Fold the `vars` gradients from one backward's `grads` into the running per-var
+/// accumulator `acc` (summing across an accumulation window's prompts). A var
+/// **absent** from `grads` marks `covered[i] = false` — candle's silent-skip
+/// landmine — surfaced as a canary abort once the window's combined store is built.
+fn fold_var_grads(
+    vars: &[Var],
+    grads: &GradStore,
+    acc: &mut [Option<Tensor>],
+    covered: &mut [bool],
+) -> CandleResult<()> {
+    for (i, v) in vars.iter().enumerate() {
+        match grads.get(v.as_tensor()) {
+            None => covered[i] = false,
+            Some(g) => {
+                acc[i] = Some(match acc[i].take() {
+                    None => g.clone(),
+                    Some(prev) => prev.add(g)?,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Build the optimizer's gradient store for an accumulation window by overwriting
+/// `store`'s trainable-var entries with the accumulated sums in `acc`. A var marked
+/// uncovered (absent from some prompt's backward) is left out entirely so
+/// [`grad_coverage`] flags it. `store` (reused from the last prompt's backward) also
+/// carries unrelated intermediate-node grads; the optimizer and canary read only the
+/// var entries, so those are harmless.
+fn combine_into_store(
+    vars: &[Var],
+    mut store: GradStore,
+    acc: &[Option<Tensor>],
+    covered: &[bool],
+) -> GradStore {
+    for (i, v) in vars.iter().enumerate() {
+        store.remove(v.as_tensor());
+        if covered[i] {
+            if let Some(g) = &acc[i] {
+                store.insert(v.as_tensor(), g.clone());
+            }
+        }
+    }
+    store
 }
 
 /// The scalar group advantages as a detached `[G, 1]` tensor (broadcast over the
@@ -743,10 +911,11 @@ fn masked_mean_tensor(values: &Tensor, mask: &Tensor, loss_type: LossType) -> Ca
 /// Assemble the GRPO loss for one inner step: the negative masked-mean of the
 /// per-token objective `surrogate - beta * k3_kl` (the KL term only when a
 /// reference policy is supplied). This is the **single** differentiated loss the
-/// trainer back-propagates; [`Trainer::inner_update`] calls it on the live policy
-/// log-probs and the in-module finite-difference gradcheck (`gradcheck_*`) calls
-/// it on a tiny `f64` stand-in, so the gradcheck verifies candle's analytic
-/// gradient of *exactly* this expression w.r.t. the `LoRA` parameters.
+/// trainer back-propagates; the trainer's inner step (`item_backward`) calls it on
+/// the live policy log-probs and the in-module finite-difference gradcheck
+/// (`gradcheck_*`) calls it on a tiny `f64` stand-in, so the gradcheck verifies
+/// candle's analytic gradient of *exactly* this expression w.r.t. the `LoRA`
+/// parameters.
 ///
 /// `logp` is `[num_seq, comp_len]`; `logp_old` / `logp_ref` share that shape and
 /// are detached constants (the only trainable path is `logp`); `advantages` is a
@@ -976,6 +1145,7 @@ mod tests {
         bad(|c| c.clip_eps = f64::NAN);
         bad(|c| c.clip_eps = 1.0);
         bad(|c| c.clip_eps = 2.0);
+        bad(|c| c.grad_accum_steps = 0);
         bad(|c| c.checkpoint_every = Some(0));
     }
 
@@ -1022,6 +1192,19 @@ mod tests {
         assert_eq!(back.beta, cfg.beta);
         assert_eq!(back.loss_type, cfg.loss_type);
         assert_eq!(back.scale_rewards, cfg.scale_rewards);
+        assert_eq!(back.grad_accum_steps, cfg.grad_accum_steps);
+    }
+
+    #[test]
+    fn grad_accum_steps_defaults_to_one_for_old_configs() {
+        // A config.json written before grad_accum_steps existed must deserialize to 1
+        // (no accumulation), not fail — the serde default keeps old runs loadable.
+        let j = r#"{"steps":10,"group_size":8,"max_new_tokens":16,"temperature":1.0,
+            "mu":1,"beta":0.0,"clip_eps":0.2,"lr":0.001,"weight_decay":0.0,
+            "loss_type":"grpo","scale_rewards":"group"}"#;
+        let cfg: TrainerConfig = serde_json::from_str(j).unwrap();
+        assert_eq!(cfg.grad_accum_steps, 1);
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
@@ -1050,13 +1233,78 @@ mod tests {
         assert_eq!(std, 0.0);
     }
 
+    // ---- gradient accumulation (fold across backwards) ---------------------
+
+    #[test]
+    fn fold_var_grads_sums_gradients_across_backwards() {
+        // Two separate backward passes on a shared Var; folding both must yield the
+        // element-wise sum of their gradients — the core grad-accumulation invariant.
+        let dev = cpu();
+        let x =
+            Var::from_tensor(&Tensor::from_vec(vec![2.0f64, 3.0], (2,), &dev).unwrap()).unwrap();
+        let vars = vec![x.clone()];
+        // loss1 = sum(x^2) -> grad 2x = [4, 6]; loss2 = sum(3x) -> grad [3, 3].
+        let g1 = x
+            .as_tensor()
+            .sqr()
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .backward()
+            .unwrap();
+        let g2 = x
+            .as_tensor()
+            .affine(3.0, 0.0)
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .backward()
+            .unwrap();
+        let mut acc: Vec<Option<Tensor>> = vec![None];
+        let mut covered = vec![true];
+        fold_var_grads(&vars, &g1, &mut acc, &mut covered).unwrap();
+        fold_var_grads(&vars, &g2, &mut acc, &mut covered).unwrap();
+        assert!(covered[0]);
+        let summed = acc[0].as_ref().unwrap().to_vec1::<f64>().unwrap();
+        assert_relative_eq!(summed[0], 7.0, epsilon = 1e-9); // 4 + 3
+        assert_relative_eq!(summed[1], 9.0, epsilon = 1e-9); // 6 + 3
+    }
+
+    #[test]
+    fn fold_var_grads_marks_var_absent_from_a_backward_uncovered() {
+        // A var that never reached a given loss is absent from that backward's store:
+        // fold must flag it uncovered (the silent-skip landmine) so the window's
+        // canary aborts, rather than silently treating it as a zero contribution.
+        let dev = cpu();
+        let x = Var::from_tensor(&Tensor::from_vec(vec![1.0f64], (1,), &dev).unwrap()).unwrap();
+        let y = Var::from_tensor(&Tensor::from_vec(vec![1.0f64], (1,), &dev).unwrap()).unwrap();
+        let vars = vec![x.clone(), y.clone()];
+        // The loss depends only on x, so y is absent from the grad store.
+        let g = x
+            .as_tensor()
+            .sqr()
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .backward()
+            .unwrap();
+        let mut acc: Vec<Option<Tensor>> = vec![None, None];
+        let mut covered = vec![true, true];
+        fold_var_grads(&vars, &g, &mut acc, &mut covered).unwrap();
+        assert!(covered[0] && acc[0].is_some(), "x must be covered");
+        assert!(
+            !covered[1] && acc[1].is_none(),
+            "y must be flagged uncovered"
+        );
+    }
+
     // ---- finite-difference gradcheck of the GRPO loss ----------------------
     //
     // The PLAN's last correctness oracle: numerically verify candle's analytic
     // gradient of `grpo_loss` — the exact loss the trainer back-propagates — w.r.t.
     // the LoRA parameters. We do it on a hermetic, double-precision LoRA-style map
     // (`f64` so central differences are accurate) and pin the *production* loss
-    // function, so this cannot drift from what `inner_update` actually optimizes.
+    // function, so this cannot drift from what the trainer actually back-propagates.
     // The `logp_old` shifts are chosen so the importance ratios straddle the clip
     // band (both branches of the surrogate `min` are exercised), advantages are
     // mixed-sign and non-zero, one completion column is masked out, and a reference

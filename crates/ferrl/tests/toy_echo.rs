@@ -455,6 +455,56 @@ fn gate_dr_grpo_paper_config_learns() {
 }
 
 #[test]
+fn gate_grad_accum_effective_batch_learns() {
+    // Gradient accumulation across prompts: group_size 4 with grad_accum_steps 2
+    // forms an effective batch of 8 completions per optimizer step (the lever the
+    // Countdown run wanted to escape degenerate group-4 windows). Each optimizer step
+    // accumulates two prompts' group-4 gradients into one AdamW update. Must still
+    // learn the echo map. `history.len() == steps` (one row per optimizer step, each
+    // having consumed grad_accum_steps prompts) is itself the windowing invariant.
+    //
+    // Wide margins on purpose — seeded but platform-dependent (float
+    // non-associativity), like the other reward-trend gates. group_size 4 is the
+    // smallest in the suite (closest to the degeneracy cliff — which is the point:
+    // accumulation is what escapes it), so lr is kept at the proven-safe 0.05 (as
+    // gate_reward_trends_up uses) to minimise overshoot on a numerically-different CI
+    // CPU. On the dev host this run converges to ~1.0 from ~0.45, so both
+    // `late > early + 0.2` and `late > 0.5` carry ample slack.
+    let mut policy = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 29, TEMP).unwrap();
+    let prompts = echo_prompts(VOCAB);
+    let cfg = TrainerConfig {
+        steps: 500,
+        group_size: 4,
+        grad_accum_steps: 2,
+        max_new_tokens: 1,
+        temperature: TEMP,
+        lr: 0.05,
+        ..TrainerConfig::default()
+    };
+    let tmp = TempDir::new("grad-accum");
+    let run = RunDir::create(tmp.path(), "echo").unwrap();
+    let mut trainer = Trainer::new(cfg, &run).unwrap();
+    let history = trainer
+        .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
+        .unwrap();
+    assert_eq!(
+        history.len(),
+        500,
+        "one metrics row per optimizer step (window)"
+    );
+    let early = window_mean(&history[..40]);
+    let late = window_mean(&history[history.len() - 40..]);
+    assert!(
+        late > early + 0.2,
+        "grad-accum did not learn: early-40 mean={early}, late-40 mean={late}"
+    );
+    assert!(
+        late > 0.5,
+        "grad-accum final reward too low: late-40 mean={late}"
+    );
+}
+
+#[test]
 fn gate_canary_holds_on_every_real_update() {
     // The canary is a hard error (missing var / non-finite gradient) on every real
     // update, so a completed run with many real updates proves it held on all of

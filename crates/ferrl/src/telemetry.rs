@@ -170,9 +170,12 @@ impl RunDir {
 pub struct Metrics {
     /// Global optimizer step (0-based).
     pub step: u64,
-    /// Mean scalar reward over the batch.
+    /// Mean scalar reward over the batch (all completions in the step's window —
+    /// `grad_accum_steps` prompts' groups pooled when accumulating).
     pub reward_mean: f32,
-    /// Standard deviation of scalar rewards over the batch.
+    /// Standard deviation of scalar rewards over the batch. At `grad_accum_steps > 1`
+    /// this is the std over the window's pooled completions (mixing cross-prompt
+    /// variance), not a single group's spread.
     pub reward_std: f32,
     /// Fraction of GRPO groups in the batch whose reward std is `0` — every
     /// completion in the group scored identically, so its advantages are all `0`
