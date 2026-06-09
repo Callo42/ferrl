@@ -116,10 +116,7 @@ impl Policy for QwenPolicy {
             }
             token_ids.push(ids);
         }
-        Ok(Rollout {
-            token_ids,
-            prompt_len: prompt.len(),
-        })
+        Ok(Rollout::rectangular(token_ids, prompt.len()))
     }
 
     fn token_logprobs(&self, rollout: &Rollout) -> CandleResult<Tensor> {
@@ -271,11 +268,8 @@ mod tests {
     #[test]
     fn token_logprobs_shape_and_finiteness() {
         let policy = tiny_policy();
-        let rollout = Rollout {
-            // Two sequences, prompt_len 2, completion_len 3 (rectangular).
-            token_ids: vec![vec![1u32, 2, 3, 4, 5], vec![1, 2, 6, 7, 8]],
-            prompt_len: 2,
-        };
+        // Two sequences, prompt_len 2, completion_len 3 (rectangular).
+        let rollout = Rollout::rectangular(vec![vec![1u32, 2, 3, 4, 5], vec![1, 2, 6, 7, 8]], 2);
         let logp = policy.token_logprobs(&rollout).unwrap();
         assert_eq!(logp.dims(), &[2, 3]);
         // Log-probs are <= 0 and finite.
@@ -291,10 +285,7 @@ mod tests {
         // log_softmax(logits)[g, prompt_len-1+j, completion_token] recomputed
         // independently of the narrow/gather under test.
         let policy = tiny_policy();
-        let rollout = Rollout {
-            token_ids: vec![vec![1u32, 2, 3, 4, 5], vec![3, 1, 4, 1, 5]],
-            prompt_len: 2,
-        };
+        let rollout = Rollout::rectangular(vec![vec![1u32, 2, 3, 4, 5], vec![3, 1, 4, 1, 5]], 2);
         let got = policy
             .token_logprobs(&rollout)
             .unwrap()
@@ -374,10 +365,7 @@ mod tests {
         // severed A-path is invisible to a single backward (the P3 PR-B trap); the
         // two-phase check (force B nonzero) closes it.
         let policy = tiny_policy();
-        let rollout = Rollout {
-            token_ids: vec![vec![1u32, 2, 3, 4, 5], vec![5, 4, 3, 2, 1]],
-            prompt_len: 2,
-        };
+        let rollout = Rollout::rectangular(vec![vec![1u32, 2, 3, 4, 5], vec![5, 4, 3, 2, 1]], 2);
         let vars = policy.trainable_vars();
         assert_eq!(vars.len(), 2 * 4); // per layer: q_A, q_B, v_A, v_B
         let (q_vars, v_vars) = branch_split(&vars);
@@ -413,10 +401,7 @@ mod tests {
     fn adapter_toggle_tracks_state_and_is_noop_at_zero_b() {
         let mut policy = tiny_policy();
         assert!(policy.adapter_enabled());
-        let rollout = Rollout {
-            token_ids: vec![vec![1u32, 2, 3, 4]],
-            prompt_len: 2,
-        };
+        let rollout = Rollout::rectangular(vec![vec![1u32, 2, 3, 4]], 2);
         let on = policy.token_logprobs(&rollout).unwrap();
         policy.set_adapter_enabled(false);
         assert!(!policy.adapter_enabled());

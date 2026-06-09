@@ -174,10 +174,7 @@ fn qwen_checkpoint_roundtrip_and_eval_on_gpu() {
         v.set(&Tensor::randn(0f32, 0.1f32, dims, &device).unwrap())
             .unwrap();
     }
-    let rollout = Rollout {
-        token_ids: vec![vec![1u32, 2, 3, 4, 5], vec![3, 1, 4, 1, 5]],
-        prompt_len: 2,
-    };
+    let rollout = Rollout::rectangular(vec![vec![1u32, 2, 3, 4, 5], vec![3, 1, 4, 1, 5]], 2);
     let logp_src = src
         .token_logprobs(&rollout)
         .unwrap()

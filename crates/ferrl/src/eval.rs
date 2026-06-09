@@ -287,10 +287,7 @@ mod tests {
                 ids.extend(std::iter::repeat_n(tok, cfg.max_new_tokens));
                 token_ids.push(ids);
             }
-            Ok(Rollout {
-                token_ids,
-                prompt_len: prompt.len(),
-            })
+            Ok(Rollout::rectangular(token_ids, prompt.len()))
         }
 
         fn token_logprobs(&self, _rollout: &Rollout) -> CandleResult<Tensor> {
@@ -486,10 +483,7 @@ mod tests {
                     (v, 0)
                 }
             };
-            Ok(Rollout {
-                token_ids,
-                prompt_len,
-            })
+            Ok(Rollout::rectangular(token_ids, prompt_len))
         }
         fn token_logprobs(&self, _rollout: &Rollout) -> CandleResult<Tensor> {
             Tensor::zeros((1, 1), DType::F32, &Device::Cpu)
