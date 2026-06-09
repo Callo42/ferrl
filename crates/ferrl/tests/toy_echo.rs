@@ -278,6 +278,72 @@ impl Policy for BadPromptLenPolicy {
     }
 }
 
+/// Wraps [`EchoPolicy`] and rewrites each completion to be **EOS-padded**: keep the
+/// first `real_lens[i % len]` sampled tokens of sequence `i`, overwrite the rest with
+/// `pad`, and record that length in `completion_lens` — exactly the shape EOS
+/// early-stop produces, with a **variable per-row** length so the trainer's
+/// length-aware mask is genuinely per-sequence (not a uniform column).
+/// `token_logprobs` delegates to the inner policy (it scores the full rectangular
+/// width; the trainer's length-aware mask is what excludes the padding from the
+/// loss). Lets a test drive the real `Trainer` with `eos_token_id` set and confirm
+/// the loss mask + length-aware decode honor `completion_lens` end-to-end.
+struct EosPaddedEchoPolicy {
+    inner: EchoPolicy,
+    real_lens: Vec<usize>,
+    pad: u32,
+}
+
+impl EosPaddedEchoPolicy {
+    /// The real length recorded for sequence `i`, cycling `real_lens` and capped at
+    /// the available completion width.
+    fn real_len(&self, i: usize, max_real: usize) -> usize {
+        self.real_lens[i % self.real_lens.len()].min(max_real)
+    }
+}
+
+impl Policy for EosPaddedEchoPolicy {
+    fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
+        let r = self.inner.generate(prompt, cfg)?;
+        let prompt_len = r.prompt_len;
+        let max_real = r.token_ids[0].len() - prompt_len;
+        let mut completion_lens = Vec::with_capacity(r.token_ids.len());
+        let token_ids: Vec<Vec<u32>> = r
+            .token_ids
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut ids)| {
+                let real = self.real_len(i, max_real);
+                completion_lens.push(real);
+                for slot in ids.iter_mut().skip(prompt_len + real) {
+                    *slot = self.pad;
+                }
+                ids
+            })
+            .collect();
+        Ok(Rollout {
+            token_ids,
+            prompt_len,
+            completion_lens,
+        })
+    }
+
+    fn token_logprobs(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+        self.inner.token_logprobs(rollout)
+    }
+
+    fn set_adapter_enabled(&mut self, enabled: bool) {
+        self.inner.set_adapter_enabled(enabled);
+    }
+
+    fn adapter_enabled(&self) -> bool {
+        self.inner.adapter_enabled()
+    }
+
+    fn trainable_vars(&self) -> Vec<Var> {
+        self.inner.trainable_vars()
+    }
+}
+
 /// A reward whose `reward_group` returns the wrong number of scores.
 struct BadCountReward;
 
@@ -397,6 +463,58 @@ fn gate_reward_trends_up() {
 }
 
 #[test]
+fn eos_padded_rollout_trains_with_length_aware_mask() {
+    // The trainer consumes completion_lens end-to-end with a VARIABLE per-row length:
+    // a `Some` eos_token_id no longer errors (the PR3 guard-lift), each sequence keeps a
+    // different number of real tokens (lengths 1 and 2, alternating), and the run steps
+    // cleanly through a genuinely per-sequence masked backward — the EOS padding (scored
+    // by token_logprobs but masked out) stays out of the loss. The completion_len metric
+    // reports the mean real length (1.5), not the padded width (3). The mask's per-token
+    // gradient inertness — including the exp-overflow corner — is pinned unit-side by
+    // `padding_columns_are_inert_in_the_grpo_loss` and
+    // `padding_with_an_exp_overflowing_logp_gap_stays_grad_finite`; the dedicated
+    // variable-length finite-difference gradcheck lands in PR4.
+    let inner = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 7, TEMP).unwrap();
+    let mut policy = EosPaddedEchoPolicy {
+        inner,
+        real_lens: vec![1, 2], // per-row lengths: rows alternate 1 and 2 real tokens
+        pad: 0,
+    };
+    let prompts = echo_prompts(VOCAB);
+    let cfg = TrainerConfig {
+        steps: 5,
+        group_size: 8, // even -> four rows of length 1, four of length 2 -> mean 1.5
+        max_new_tokens: 3, // padded width 3
+        temperature: TEMP,
+        eos_token_id: Some(0), // accepted now; the mask honors completion_lens
+        lr: 0.05,
+        ..TrainerConfig::default()
+    };
+    let tmp = TempDir::new("eos-padded");
+    let run = RunDir::create(tmp.path(), "echo").unwrap();
+    let mut trainer = Trainer::new(cfg, &run).unwrap();
+    let history = trainer
+        .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
+        .unwrap();
+
+    assert_eq!(history.len(), 5);
+    for m in &history {
+        assert!(
+            m.reward_mean.is_finite() && m.grad_norm.is_finite(),
+            "non-finite metric at step {}",
+            m.step
+        );
+        // Mean of the per-row real lengths (1 and 2), not the padded width (3).
+        assert!(
+            (m.completion_len - 1.5).abs() < 1e-6,
+            "completion_len {} != mean real length 1.5 at step {}",
+            m.completion_len,
+            m.step
+        );
+    }
+}
+
+#[test]
 fn gate_dr_grpo_paper_config_learns() {
     // The Dr.GRPO *paper* config — the DrGrpo reduction AND ScaleRewards::None
     // (centered-only advantages) — driven end-to-end through Trainer::train for the
@@ -404,9 +522,11 @@ fn gate_dr_grpo_paper_config_learns() {
     // tested). It must learn the echo map.
     //
     // Honest scope: for this toy the DrGrpo reduction is *numerically identical* to
-    // classic Grpo. The two diverge only on ragged / padded masks, and the toy always
-    // produces rectangular, all-ones masks (the trainer rejects ragged rollouts;
-    // variable-length / EOS masking is deferred). So what this gate uniquely proves is
+    // classic Grpo. The two diverge only on ragged / padded masks, and this toy always
+    // produces rectangular, all-ones masks (the trainer rejects ragged rollouts, and
+    // this policy generates no EOS, so its length-aware mask is all-ones — the
+    // EOS-padded variant is exercised by `eos_padded_rollout_trains_with_length_aware_mask`).
+    // So what this gate uniquely proves is
     // (a) ScaleRewards::None — the variant that genuinely changes the trajectory —
     // learns through the real loop, and (b) the DrGrpo config path runs end-to-end
     // without error. The reductions' distinct denominators are pinned where they
