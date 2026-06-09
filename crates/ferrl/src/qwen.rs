@@ -118,7 +118,13 @@ struct QwenAttention {
 }
 
 impl QwenAttention {
-    fn load(cfg: &Config, vb: &VarBuilder, rank: usize, alpha: f64) -> CandleResult<Self> {
+    fn load(
+        cfg: &Config,
+        vb: &VarBuilder,
+        rank: usize,
+        alpha: f64,
+        adapter_dtype: DType,
+    ) -> CandleResult<Self> {
         let h = cfg.hidden_size;
         let head_dim = cfg.head_dim;
         let q_out = cfg.num_attention_heads * head_dim;
@@ -127,8 +133,8 @@ impl QwenAttention {
         let v_weight = vb.pp("v_proj").get((kv_out, h), "weight")?;
         let eps = cfg.rms_norm_eps as f32;
         Ok(Self {
-            q_proj: LoraLinear::new(q_weight, None, rank, alpha)?,
-            v_proj: LoraLinear::new(v_weight, None, rank, alpha)?,
+            q_proj: LoraLinear::with_adapter_dtype(q_weight, None, rank, alpha, adapter_dtype)?,
+            v_proj: LoraLinear::with_adapter_dtype(v_weight, None, rank, alpha, adapter_dtype)?,
             k_weight: vb.pp("k_proj").get((kv_out, h), "weight")?,
             o_weight: vb.pp("o_proj").get((h, q_out), "weight")?,
             q_norm: RmsNorm::new(vb.pp("q_norm").get(head_dim, "weight")?, eps),
@@ -245,12 +251,18 @@ struct QwenLayer {
 }
 
 impl QwenLayer {
-    fn load(cfg: &Config, vb: &VarBuilder, rank: usize, alpha: f64) -> CandleResult<Self> {
+    fn load(
+        cfg: &Config,
+        vb: &VarBuilder,
+        rank: usize,
+        alpha: f64,
+        adapter_dtype: DType,
+    ) -> CandleResult<Self> {
         let eps = cfg.rms_norm_eps as f32;
         let h = cfg.hidden_size;
         Ok(Self {
             ln1: RmsNorm::new(vb.pp("input_layernorm").get(h, "weight")?, eps),
-            attn: QwenAttention::load(cfg, &vb.pp("self_attn"), rank, alpha)?,
+            attn: QwenAttention::load(cfg, &vb.pp("self_attn"), rank, alpha, adapter_dtype)?,
             ln2: RmsNorm::new(vb.pp("post_attention_layernorm").get(h, "weight")?, eps),
             mlp: QwenMlp::load(cfg, &vb.pp("mlp"))?,
         })
@@ -313,6 +325,29 @@ impl QwenGradModel {
     /// (`attention_bias`, `use_sliding_window`), if a weight tensor is missing or
     /// mis-shaped, or if the `LoRA` factors cannot be allocated.
     pub fn load(cfg: &Config, vb: &VarBuilder, rank: usize, alpha: f64) -> CandleResult<Self> {
+        // The adapter shares the base weights' dtype (the toy / all-F32 case).
+        Self::load_with_adapter_dtype(cfg, vb, rank, alpha, vb.dtype())
+    }
+
+    /// Like [`load`](Self::load), but holds the trainable `LoRA` adapter in
+    /// `adapter_dtype`, independent of the (frozen) base weights' dtype.
+    ///
+    /// This is the **bf16-base / F32-adapter** split: load `vb` in BF16 (halving the
+    /// base weights *and* the retained activations that dominate the GRPO grad
+    /// forward's memory) while keeping the adapter — and so its gradients and the
+    /// `AdamW` moments — in F32, where a small update cannot collapse. See
+    /// [`crate::lora::LoraLinear::with_adapter_dtype`].
+    ///
+    /// # Errors
+    ///
+    /// As [`load`](Self::load).
+    pub fn load_with_adapter_dtype(
+        cfg: &Config,
+        vb: &VarBuilder,
+        rank: usize,
+        alpha: f64,
+        adapter_dtype: DType,
+    ) -> CandleResult<Self> {
         // Fail loud on Config options this forward does not implement, rather than
         // silently loading a non-parity model. Qwen3-0.6B-Base uses neither: candle's
         // shipped loader honors `attention_bias` on all four projections and a
@@ -343,7 +378,13 @@ impl QwenGradModel {
         let layers_vb = vb.pp("model.layers");
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
-            layers.push(QwenLayer::load(cfg, &layers_vb.pp(i), rank, alpha)?);
+            layers.push(QwenLayer::load(
+                cfg,
+                &layers_vb.pp(i),
+                rank,
+                alpha,
+                adapter_dtype,
+            )?);
         }
         Ok(Self {
             embed,
@@ -533,6 +574,48 @@ mod tests {
             .to_scalar()
             .unwrap();
         assert!(s.is_finite());
+    }
+
+    #[test]
+    fn dtype_split_forward_and_grad() {
+        // The dtype-split mechanism on a tiny model: the adapter is held in a
+        // different (higher) precision than the base, the forward runs in the base
+        // dtype, and the adapter's gradients land in the adapter dtype. The real
+        // instance is bf16-base / F32-adapter, but candle's CPU backend has no bf16
+        // matmul, so the CPU gate uses F32-base / F64-adapter (the bf16 instance is
+        // exercised on the GPU by the Countdown run and the `#[ignore]`d GPU gates).
+        let cfg = tiny_cfg();
+        let vb = tiny_vb(&cfg); // F32 base
+        let mut model =
+            QwenGradModel::load_with_adapter_dtype(&cfg, &vb, 2, 4.0, DType::F64).unwrap();
+        model.set_adapter_enabled(true);
+        let vars = model.trainable_vars();
+        // Force every B (odd indices: q_B, v_B per layer) nonzero so A also carries a
+        // live gradient through the backward.
+        for v in vars.iter().skip(1).step_by(2) {
+            let dims = v.as_tensor().dims().to_vec();
+            v.set(&Tensor::ones(dims, DType::F64, &dev()).unwrap())
+                .unwrap();
+        }
+
+        let logits = model.forward(&ids(5)).unwrap();
+        assert_eq!(
+            logits.dtype(),
+            DType::F32,
+            "the forward runs in the base/activation dtype"
+        );
+        let loss = logits.sqr().unwrap().sum_all().unwrap();
+        let grads = loss.backward().unwrap();
+        for v in &vars {
+            let g = grads
+                .get(v.as_tensor())
+                .expect("adapter var missing from grad store");
+            assert_eq!(
+                g.dtype(),
+                DType::F64,
+                "master adapter must receive a grad in its own dtype"
+            );
+        }
     }
 
     #[test]
