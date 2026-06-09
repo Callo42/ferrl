@@ -489,13 +489,25 @@ impl Trainer {
         opt: &mut AdamW,
     ) -> Result<InnerAgg, TrainerError> {
         let logp = policy.token_logprobs(rollout)?;
+        // The single differentiated loss, assembled by `grpo_loss` — the *same*
+        // function the finite-difference gradcheck pins, so the gradcheck verifies
+        // candle's analytic gradient of exactly this expression.
+        let loss = grpo_loss(
+            &logp,
+            logp_old,
+            logp_ref,
+            advantages,
+            mask,
+            self.config.clip_eps,
+            self.config.beta,
+            self.config.loss_type,
+        )?;
+        // Scalar diagnostics, off the differentiated path: the clip fraction and the
+        // mean k3 KL. Recomputing the ratio / KL here (rather than threading them out
+        // of `grpo_loss`) keeps the loss assembly a single, gradcheck-pinned unit.
         let ratio = importance_ratio(&logp, logp_old)?;
-        let surrogate = clipped_surrogate_tensor(&ratio, advantages, self.config.clip_eps)?;
-        let (per_token, kl) = self.apply_kl(&surrogate, &logp, logp_ref, mask)?;
         let clip_frac = clip_fraction(&ratio, advantages, self.config.clip_eps, mask)?;
-
-        let objective = masked_mean_tensor(&per_token, mask, self.config.loss_type)?;
-        let loss = objective.neg()?;
+        let kl = self.kl_metric(&logp, logp_ref, mask)?;
 
         let grads = loss.backward()?;
         let cov = grad_coverage(vars, &grads)?;
@@ -525,22 +537,20 @@ impl Trainer {
         })
     }
 
-    /// Subtract `beta * k3_kl` from the surrogate when a reference is present.
-    fn apply_kl(
+    /// Mean masked k3 KL for the step's metrics — the diagnostic counterpart of the
+    /// KL penalty [`grpo_loss`] folds into the differentiated objective. Returns `0`
+    /// when no reference policy is active (`beta == 0`, so `logp_ref` is `None`).
+    fn kl_metric(
         &self,
-        surrogate: &Tensor,
         logp: &Tensor,
         logp_ref: Option<&Tensor>,
         mask: &Tensor,
-    ) -> CandleResult<(Tensor, f32)> {
+    ) -> CandleResult<f32> {
         let Some(logp_ref) = logp_ref else {
-            return Ok((surrogate.clone(), 0.0));
+            return Ok(0.0);
         };
         let kl = k3_kl_tensor(logp, logp_ref)?;
-        let kl_mean = scalar_f32(&masked_mean_tensor(&kl, mask, self.config.loss_type)?)?;
-        let penalty = kl.affine(self.config.beta, 0.0)?;
-        let per_token = surrogate.broadcast_sub(&penalty)?;
-        Ok((per_token, kl_mean))
+        scalar_f32(&masked_mean_tensor(&kl, mask, self.config.loss_type)?)
     }
 
     /// Reference (adapter-disabled) log-probs, restoring the adapter before any
@@ -728,6 +738,41 @@ fn masked_mean_tensor(values: &Tensor, mask: &Tensor, loss_type: LossType) -> Ca
             total.affine(1.0 / (num_seq as f64 * max_len as f64), 0.0)
         }
     }
+}
+
+/// Assemble the GRPO loss for one inner step: the negative masked-mean of the
+/// per-token objective `surrogate - beta * k3_kl` (the KL term only when a
+/// reference policy is supplied). This is the **single** differentiated loss the
+/// trainer back-propagates; [`Trainer::inner_update`] calls it on the live policy
+/// log-probs and the in-module finite-difference gradcheck (`gradcheck_*`) calls
+/// it on a tiny `f64` stand-in, so the gradcheck verifies candle's analytic
+/// gradient of *exactly* this expression w.r.t. the `LoRA` parameters.
+///
+/// `logp` is `[num_seq, comp_len]`; `logp_old` / `logp_ref` share that shape and
+/// are detached constants (the only trainable path is `logp`); `advantages` is a
+/// detached `[num_seq, 1]` column broadcast over the completion length; `mask` is
+/// `[num_seq, comp_len]`. Returns a scalar loss tensor.
+#[allow(clippy::too_many_arguments)]
+fn grpo_loss(
+    logp: &Tensor,
+    logp_old: &Tensor,
+    logp_ref: Option<&Tensor>,
+    advantages: &Tensor,
+    mask: &Tensor,
+    clip_eps: f64,
+    beta: f64,
+    loss_type: LossType,
+) -> CandleResult<Tensor> {
+    let ratio = importance_ratio(logp, logp_old)?;
+    let surrogate = clipped_surrogate_tensor(&ratio, advantages, clip_eps)?;
+    let per_token = match logp_ref {
+        None => surrogate,
+        Some(logp_ref) => {
+            let penalty = k3_kl_tensor(logp, logp_ref)?.affine(beta, 0.0)?;
+            surrogate.broadcast_sub(&penalty)?
+        }
+    };
+    masked_mean_tensor(&per_token, mask, loss_type)?.neg()
 }
 
 /// Fraction of valid tokens whose surrogate `min` selected the clipped term.
@@ -1003,5 +1048,219 @@ mod tests {
         let (mean, std) = reward_stats(&[f32::NAN, f32::NAN]);
         assert_eq!(mean, 0.0);
         assert_eq!(std, 0.0);
+    }
+
+    // ---- finite-difference gradcheck of the GRPO loss ----------------------
+    //
+    // The PLAN's last correctness oracle: numerically verify candle's analytic
+    // gradient of `grpo_loss` — the exact loss the trainer back-propagates — w.r.t.
+    // the LoRA parameters. We do it on a hermetic, double-precision LoRA-style map
+    // (`f64` so central differences are accurate) and pin the *production* loss
+    // function, so this cannot drift from what `inner_update` actually optimizes.
+    // The `logp_old` shifts are chosen so the importance ratios straddle the clip
+    // band (both branches of the surrogate `min` are exercised), advantages are
+    // mixed-sign and non-zero, one completion column is masked out, and a reference
+    // policy drives the k3 KL term — so a single check covers surrogate clipping,
+    // KL, and masking under either reduction.
+
+    /// Deterministic, rng-free `f64` fill in `[-0.5, 0.5)` — reproducible inputs so
+    /// the gradcheck is byte-stable across platforms.
+    fn gc_fill(n: usize, seed: u64) -> Vec<f64> {
+        (0..n)
+            .map(|i| {
+                let z = (i as u64)
+                    .wrapping_mul(2_654_435_761)
+                    .wrapping_add(seed.wrapping_mul(40_503));
+                (z % 1000) as f64 / 1000.0 - 0.5
+            })
+            .collect()
+    }
+
+    /// A tiny `f64` LoRA-style map `(A, B) -> logp[G, T]`, mirroring a policy's
+    /// `one_hot -> linear -> log_softmax -> gather` token-logprob path:
+    /// `logits = x · (W0 + scale · B·A)`, then gather the target log-probs.
+    struct GcModel {
+        x: Tensor,       // [G, T, V] fixed inputs
+        w0: Tensor,      // [V, V] fixed frozen base
+        targets: Tensor, // [G, T] fixed target ids
+        a: Var,          // [R, V]
+        b: Var,          // [V, R]
+        scale: f64,      // alpha / rank
+    }
+
+    impl GcModel {
+        fn logp(&self) -> CandleResult<Tensor> {
+            let (g, t, v) = self.x.dims3()?;
+            let delta = self.b.as_tensor().matmul(self.a.as_tensor())?; // [V, V]
+            let w = self.w0.add(&delta.affine(self.scale, 0.0)?)?; // [V, V]
+            let logits = self.x.reshape((g * t, v))?.matmul(&w)?.reshape((g, t, v))?;
+            let logp_full = candle_nn::ops::log_softmax(&logits, D::Minus1)?; // [G, T, V]
+            let idx = self.targets.unsqueeze(D::Minus1)?; // [G, T, 1]
+            logp_full.gather(&idx, D::Minus1)?.squeeze(D::Minus1) // [G, T]
+        }
+    }
+
+    /// Central finite-difference gradient of `loss_of` w.r.t. every element of
+    /// `var`, restoring `var` to its original value before returning. `var` shares
+    /// storage with the model's copy, so perturbing it changes what `loss_of` sees.
+    fn gc_numeric_grad(var: &Var, dev: &Device, loss_of: &dyn Fn() -> f64, h: f64) -> Vec<f64> {
+        let shape = var.as_tensor().shape().clone();
+        let orig: Vec<f64> = var.as_tensor().flatten_all().unwrap().to_vec1().unwrap();
+        let set = |data: Vec<f64>| {
+            var.set(&Tensor::from_vec(data, shape.clone(), dev).unwrap())
+                .unwrap();
+        };
+        let mut grad = vec![0.0; orig.len()];
+        for (k, g) in grad.iter_mut().enumerate() {
+            let mut up = orig.clone();
+            up[k] += h;
+            set(up);
+            let l_plus = loss_of();
+            let mut dn = orig.clone();
+            dn[k] -= h;
+            set(dn);
+            let l_minus = loss_of();
+            *g = (l_plus - l_minus) / (2.0 * h);
+        }
+        set(orig); // restore
+        grad
+    }
+
+    /// Assert analytic and numeric gradients agree (absolute or relative tolerance).
+    fn gc_assert_close(analytic: &[f64], numeric: &[f64], tol: f64, name: &str, ctx: &str) {
+        assert_eq!(analytic.len(), numeric.len(), "{name}: length mismatch");
+        for (k, (a, n)) in analytic.iter().zip(numeric).enumerate() {
+            let diff = (a - n).abs();
+            let rel = diff / a.abs().max(1.0);
+            assert!(
+                diff < tol || rel < tol,
+                "gradcheck {name}[{k}] ({ctx}): analytic={a}, numeric={n}, diff={diff}"
+            );
+        }
+    }
+
+    /// Run the gradcheck for one `(loss_type, beta)` setting.
+    fn run_gradcheck(loss_type: LossType, beta: f64) {
+        let dev = cpu();
+        const G: usize = 4;
+        const T: usize = 3;
+        const V: usize = 4;
+        const R: usize = 2;
+        const EPS: f64 = 0.2;
+        const H: f64 = 1e-6;
+
+        let x = Tensor::from_vec(gc_fill(G * T * V, 1), (G, T, V), &dev).unwrap();
+        let w0 = Tensor::from_vec(gc_fill(V * V, 2), (V, V), &dev).unwrap();
+        let targets =
+            Tensor::from_vec(vec![0u32, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3], (G, T), &dev).unwrap();
+        // B starts non-zero so the loss depends non-trivially on *both* factors
+        // (a zero-init B — the real LoRA default — would give A a zero gradient).
+        let a =
+            Var::from_tensor(&Tensor::from_vec(gc_fill(R * V, 3), (R, V), &dev).unwrap()).unwrap();
+        let b =
+            Var::from_tensor(&Tensor::from_vec(gc_fill(V * R, 4), (V, R), &dev).unwrap()).unwrap();
+        let model = GcModel {
+            x,
+            w0,
+            targets,
+            a: a.clone(),
+            b: b.clone(),
+            scale: 1.0,
+        };
+
+        // Per-token shifts: ratio = exp(shift) at the eval point. 0.30 -> 1.35 (above
+        // band), -0.30 -> 0.74 (below band), 0.05 -> 1.05 (inside). Column 2 is masked.
+        #[rustfmt::skip]
+        let shift = Tensor::from_vec(
+            vec![0.30, 0.05, 0.10,
+                 -0.30, 0.05, 0.10,
+                 0.05, 0.30, 0.10,
+                 0.05, -0.30, 0.10f64],
+            (G, T), &dev,
+        ).unwrap();
+        let adv = Tensor::from_vec(vec![0.8, -0.7, 0.5, -0.4f64], (G, 1), &dev).unwrap();
+        #[rustfmt::skip]
+        let mask = Tensor::from_vec(
+            vec![1.0, 1.0, 0.0,
+                 1.0, 1.0, 0.0,
+                 1.0, 1.0, 0.0,
+                 1.0, 1.0, 0.0f64],
+            (G, T), &dev,
+        ).unwrap();
+
+        let logp0 = model.logp().unwrap().detach();
+        let logp_old = logp0.broadcast_sub(&shift).unwrap().detach();
+        let logp_ref = (beta > 0.0).then(|| logp0.affine(1.0, 0.1).unwrap().detach());
+
+        let loss_of = || -> f64 {
+            let logp = model.logp().unwrap();
+            grpo_loss(
+                &logp,
+                &logp_old,
+                logp_ref.as_ref(),
+                &adv,
+                &mask,
+                EPS,
+                beta,
+                loss_type,
+            )
+            .unwrap()
+            .to_scalar::<f64>()
+            .unwrap()
+        };
+
+        // Analytic gradients (extract to Vec before perturbing anything).
+        let logp = model.logp().unwrap();
+        let loss = grpo_loss(
+            &logp,
+            &logp_old,
+            logp_ref.as_ref(),
+            &adv,
+            &mask,
+            EPS,
+            beta,
+            loss_type,
+        )
+        .unwrap();
+        let grads = loss.backward().unwrap();
+        let ga: Vec<f64> = grads
+            .get(a.as_tensor())
+            .expect("A in grad store")
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let gb: Vec<f64> = grads
+            .get(b.as_tensor())
+            .expect("B in grad store")
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+
+        let na = gc_numeric_grad(&a, &dev, &loss_of, H);
+        let nb = gc_numeric_grad(&b, &dev, &loss_of, H);
+
+        let ctx = format!("loss_type={loss_type:?}, beta={beta}");
+        gc_assert_close(&ga, &na, 1e-5, "A", &ctx);
+        gc_assert_close(&gb, &nb, 1e-5, "B", &ctx);
+    }
+
+    #[test]
+    fn gradcheck_grpo_no_kl() {
+        // Classic GRPO reduction, no reference policy (beta = 0): surrogate only.
+        run_gradcheck(LossType::Grpo, 0.0);
+    }
+
+    #[test]
+    fn gradcheck_grpo_with_kl() {
+        // Classic GRPO reduction with the k3 KL penalty active (beta > 0).
+        run_gradcheck(LossType::Grpo, 0.1);
+    }
+
+    #[test]
+    fn gradcheck_dr_grpo_with_kl() {
+        // Dr.GRPO fixed-denominator reduction with the KL penalty active.
+        run_gradcheck(LossType::DrGrpo, 0.1);
     }
 }
