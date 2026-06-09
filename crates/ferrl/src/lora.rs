@@ -278,6 +278,12 @@ mod tests {
         // dtype, the gradient (and so the optimizer's update) lands on the adapter in
         // its master dtype — a tiny step that would round away in the compute dtype
         // survives in the master. (CPU stand-in for bf16-base / F32-adapter; see above.)
+        //
+        // This proves the dtype *routing* (the grad reaches the master in the master's
+        // dtype, via the cast's upcast adjoint). It does NOT stress bf16's in-gradient
+        // precision: the analog computes the grad in F32 and upcasts to F64, whereas the
+        // bf16 instance computes it in bf16 and upcasts to F32. That the bf16 rounding is
+        // tolerable is established empirically by the GPU Countdown run, not here.
         let w = base(4, 3); // F32 base
         let l = LoraLinear::with_adapter_dtype(w, None, 2, 8.0, DType::F64).unwrap();
         // Force B nonzero so A also carries a live gradient.
