@@ -148,12 +148,13 @@ pub struct TrainerConfig {
     pub checkpoint_every: Option<u64>,
     /// End-of-sequence token id threaded into [`GenConfig::eos_token_id`] for
     /// rollout: when `Some`, a sampled EOS ends a completion early (EOS-inclusive)
-    /// and the row is right-padded to `max_new_tokens`. `None` (the default) keeps
-    /// full-width rollouts, bit-identical to before. `#[serde(default)]` so a
-    /// `config.json` written before this field existed still deserializes (to
-    /// `None`). Note: this makes *generation* EOS-aware, but the loss mask and
-    /// length-aware decode that exclude the padded positions land in a follow-up
-    /// PR — until then [`validate`](Self::validate) **rejects** a `Some` value (fail loud), so a run can never silently train on the EOS padding.
+    /// and the row is right-padded to `max_new_tokens`, the true length recorded in
+    /// [`Rollout::completion_lens`](crate::policy::Rollout::completion_lens). The loss
+    /// mask zeroes the padded positions and the reward decode stops at the true
+    /// length, so the EOS padding never enters the objective or the reward. `None`
+    /// (the default) keeps full-width rollouts, bit-identical to before.
+    /// `#[serde(default)]` so a `config.json` written before this field existed still
+    /// deserializes (to `None`).
     #[serde(default)]
     pub eos_token_id: Option<u32>,
 }
@@ -200,10 +201,7 @@ impl TrainerConfig {
     /// `weight_decay`, or `beta` is not finite and `>= 0`; if `clip_eps` is not
     /// finite and in `[0, 1)` (`>= 1` makes the lower clip band cross `0`, which a
     /// strictly-positive importance ratio can never reach, silently disabling the
-    /// lower clip); if `checkpoint_every` is `Some(0)`; or if `eos_token_id` is
-    /// `Some` (it is plumbed into rollout generation, but the loss mask and
-    /// length-aware decode that exclude its padded positions land in a follow-up PR
-    /// — fail loud rather than silently train on the padding).
+    /// lower clip); or if `checkpoint_every` is `Some(0)`.
     pub fn validate(&self) -> Result<(), TrainerError> {
         require(
             self.mu >= 1,
@@ -241,12 +239,6 @@ impl TrainerConfig {
                 "checkpoint_every must be >= 1 when set (0 would checkpoint every step)",
             )?;
         }
-        require(
-            self.eos_token_id.is_none(),
-            "eos_token_id is plumbed into rollout generation, but the loss mask and \
-             length-aware decode that exclude its padded positions land in a follow-up; \
-             leave it None until then (this guard is lifted when the loss path honors it)",
-        )?;
         Ok(())
     }
 }
@@ -279,7 +271,8 @@ struct InnerAgg {
 /// A non-degenerate prompt's data, captured once per accumulation window so the
 /// `mu` inner epochs can re-forward it. `logp_old` / `logp_ref` are the detached
 /// old / reference snapshots taken at the window's start; `advantages` is the
-/// detached `[G, 1]` column and `mask` the `[G, comp_len]` all-ones mask.
+/// detached `[G, 1]` column and `mask` the `[G, comp_len]` length-aware loss mask
+/// (`1` on each sequence's real completion tokens, `0` on its EOS padding).
 struct LiveItem {
     rollout: Rollout,
     advantages: Tensor,
@@ -528,9 +521,14 @@ impl Trainer {
             )));
         }
 
-        // Rectangular toy: an all-ones mask drops no rows. zero_mask_rows is still
-        // the source of truth (variable-length masking arrives later).
-        let mask_rows = vec![vec![1.0_f64; comp_len]; rollout.len()];
+        // Length-aware loss mask: column j of sequence i is a real completion token
+        // (kept, 1.0) iff j < completion_lens[i]; the EOS padding at and beyond that
+        // index is masked out (0.0). With eos_token_id == None every length is the
+        // full width, so every row is all-ones — bit-identical to the legacy mask.
+        // zero_mask_rows counts any all-pad row: unreachable from EOS-inclusive
+        // generation (every recorded length is >= 1), but retained as the
+        // dropped-rows guard against a degenerate zero-length completion.
+        let mask_rows = length_mask_rows(&rollout, comp_len);
         let dropped = zero_mask_rows(&mask_rows);
 
         // Group-normalized advantages (scalar oracle). A group whose advantages are
@@ -554,7 +552,7 @@ impl Trainer {
         // reused across the mu inner epochs.
         let logp_old = policy.token_logprobs(&rollout)?.detach();
         let device = logp_old.device().clone();
-        let mask = Tensor::ones((rollout.len(), comp_len), DType::F32, &device)?;
+        let mask = mask_rows_to_tensor(&mask_rows, &device)?;
         let logp_ref = self.reference_logprobs(policy, &rollout)?;
         let advantages = advantages_tensor(&advantages, &device)?;
         let item = LiveItem {
@@ -742,13 +740,51 @@ impl Trainer {
     }
 }
 
-/// Decode each completion (the tokens after the shared prompt) to text.
+/// Decode each completion to text for the reward — the **real** completion tokens
+/// only. `completion_lens[i]` is the EOS-inclusive real length (see
+/// [`Rollout::completion_lens`]), so the slice stops there and the EOS padding never
+/// reaches the [`RewardFn`]. With `eos_token_id == None` every length is the full
+/// width and this is the entire post-prompt slice, unchanged. [`completion_dims`] has
+/// already bounded every length by the completion width, so `prompt_len + len` is in
+/// range; `.min(ids.len())` is a defensive belt so a future change can never panic.
 fn decode_completions(rollout: &Rollout, tokenizer: &dyn TokenizerLike) -> Vec<String> {
     rollout
         .token_ids
         .iter()
-        .map(|ids| tokenizer.decode(&ids[rollout.prompt_len..]))
+        .zip(&rollout.completion_lens)
+        .map(|(ids, &len)| {
+            let start = rollout.prompt_len;
+            let end = (start + len).min(ids.len());
+            tokenizer.decode(&ids[start..end])
+        })
         .collect()
+}
+
+/// The length-aware loss mask as `[G][comp_len]` `f64` rows: `1.0` on the real
+/// completion tokens (column `j < completion_lens[i]`) and `0.0` on the EOS padding.
+/// Shared by the dropped-row count ([`zero_mask_rows`]) and the differentiated mask
+/// tensor ([`mask_rows_to_tensor`]) so the two never disagree. [`completion_dims`]
+/// has already bounded every length by `comp_len`.
+fn length_mask_rows(rollout: &Rollout, comp_len: usize) -> Vec<Vec<f64>> {
+    rollout
+        .completion_lens
+        .iter()
+        .map(|&len| {
+            (0..comp_len)
+                .map(|j| if j < len { 1.0 } else { 0.0 })
+                .collect()
+        })
+        .collect()
+}
+
+/// Build the `[G, comp_len]` F32 mask tensor from the `f64` mask rows (the same rows
+/// [`zero_mask_rows`] counted), so the differentiated mask and the dropped-row
+/// telemetry are the one source of truth.
+fn mask_rows_to_tensor(rows: &[Vec<f64>], device: &Device) -> CandleResult<Tensor> {
+    let g = rows.len();
+    let comp_len = rows.first().map_or(0, Vec::len);
+    let data: Vec<f32> = rows.iter().flatten().map(|&m| m as f32).collect();
+    Tensor::from_vec(data, (g, comp_len), device)
 }
 
 /// Fold the `vars` gradients from one backward's `grads` into the running per-var
@@ -805,12 +841,14 @@ fn advantages_tensor(advantages: &[f64], device: &Device) -> CandleResult<Tensor
     Tensor::from_vec(adv, (advantages.len(), 1), device)
 }
 
-/// Validate that the rollout is rectangular with non-empty completions, and
-/// return `(num_seq, completion_len)`. The rectangular shape is required because
-/// [`Policy::token_logprobs`] returns a rectangular `[G, completion_len]` tensor;
-/// variable-length (ragged) completions arrive with P4. Run this **before**
-/// decoding so a malformed rollout becomes a typed [`TrainerError::Contract`]
-/// rather than a slice panic.
+/// Validate that the rollout is rectangular with non-empty completions and a
+/// well-formed `completion_lens`, and return `(num_seq, completion_len)`. The rows
+/// stay a fixed rectangular width (EOS early-stop right-pads back to it); the real
+/// per-sequence lengths live in [`Rollout::completion_lens`] and drive the loss mask,
+/// which is why they are validated here. The rectangular shape is required because
+/// [`Policy::token_logprobs`] returns a rectangular `[G, completion_len]` tensor. Run
+/// this **before** decoding so a malformed rollout becomes a typed
+/// [`TrainerError::Contract`] rather than a slice panic.
 fn completion_dims(rollout: &Rollout) -> Result<(usize, usize), TrainerError> {
     if rollout.is_empty() {
         return Err(TrainerError::Contract(
@@ -839,19 +877,42 @@ fn completion_dims(rollout: &Rollout) -> Result<(usize, usize), TrainerError> {
             rollout.prompt_len
         )));
     }
+    validate_completion_lens(rollout, comp_len)?;
     Ok((rollout.len(), comp_len))
 }
 
-/// Mean completion length (tokens after the prompt) over the rollout.
+/// Validate that `completion_lens` aligns with the rollout and stays within the
+/// rectangular completion width. It drives the loss mask and the reward decode, so a
+/// count that does not match the sequences, or a length past the width (which would
+/// treat padding as real tokens and over-read the decode slice), is malformed
+/// `Policy` output. A per-sequence length of `0..=comp_len` is allowed; an all-pad
+/// (`0`) row is tolerated and counted by [`zero_mask_rows`]. Split out of
+/// [`completion_dims`] to keep it under the cognitive-complexity bound.
+fn validate_completion_lens(rollout: &Rollout, comp_len: usize) -> Result<(), TrainerError> {
+    if rollout.completion_lens.len() != rollout.len() {
+        return Err(TrainerError::Contract(format!(
+            "rollout has {} completion_lens for {} sequences",
+            rollout.completion_lens.len(),
+            rollout.len()
+        )));
+    }
+    if let Some(&bad) = rollout.completion_lens.iter().find(|&&len| len > comp_len) {
+        return Err(TrainerError::Contract(format!(
+            "completion_len {bad} exceeds the completion width {comp_len}"
+        )));
+    }
+    Ok(())
+}
+
+/// Mean *real* completion length (EOS-inclusive tokens, per
+/// [`Rollout::completion_lens`]) over the rollout — so the telemetry reports the
+/// length the policy actually generated, not the padded width. With `eos_token_id ==
+/// None` every length is the full width and this is the padded width, unchanged.
 fn mean_completion_len(rollout: &Rollout) -> f32 {
     if rollout.is_empty() {
         return 0.0;
     }
-    let total: usize = rollout
-        .token_ids
-        .iter()
-        .map(|ids| ids.len().saturating_sub(rollout.prompt_len))
-        .sum();
+    let total: usize = rollout.completion_lens.iter().sum();
     total as f32 / rollout.len() as f32
 }
 
@@ -942,6 +1003,22 @@ fn masked_mean_tensor(values: &Tensor, mask: &Tensor, loss_type: LossType) -> Ca
 /// are detached constants (the only trainable path is `logp`); `advantages` is a
 /// detached `[num_seq, 1]` column broadcast over the completion length; `mask` is
 /// `[num_seq, comp_len]`. Returns a scalar loss tensor.
+///
+/// # EOS-padding gradient inertness
+///
+/// Masked-out (EOS-padding) positions are dropped from the reduction by
+/// [`masked_mean_tensor`], so they cannot change the loss *value*. But they still
+/// flow through the `exp` in the importance ratio and the k3 KL, and `exp` overflows
+/// f32 at an argument `> ~88`: at a padding position whose log-prob diverges that far,
+/// `exp` is `inf`, and its backward `grad * node = 0 * inf` is `NaN` — the upstream
+/// gradient is correctly `0` (the cell is masked), but `exp`'s local derivative is
+/// `inf`, poisoning the gradient of an otherwise-inert padding token (the canary would
+/// then fail the whole step loud). So force the `exp` arguments to `0` at padding by
+/// substituting the detached `logp_old` / `logp_ref` for `logp` there (`exp(0) = 1`,
+/// finite). Real positions (`keep == 1`) are untouched — the differentiated loss is
+/// identical — and with an all-ones mask (`eos_token_id == None`) this is a no-op, so
+/// it is bit-identical to the pre-masking loss. This makes padding gradient-inert
+/// *unconditionally* rather than only fail-loud in the overflow corner.
 #[allow(clippy::too_many_arguments)]
 fn grpo_loss(
     logp: &Tensor,
@@ -953,12 +1030,18 @@ fn grpo_loss(
     beta: f64,
     loss_type: LossType,
 ) -> CandleResult<Tensor> {
-    let ratio = importance_ratio(logp, logp_old)?;
+    let keep = mask.gt(0.0)?;
+    // At padding, substitute logp_old so the ratio's exp argument is 0 (see the
+    // "EOS-padding gradient inertness" note); identical to `logp` where keep == 1.
+    let logp_ratio = keep.where_cond(logp, logp_old)?;
+    let ratio = importance_ratio(&logp_ratio, logp_old)?;
     let surrogate = clipped_surrogate_tensor(&ratio, advantages, clip_eps)?;
     let per_token = match logp_ref {
         None => surrogate,
         Some(logp_ref) => {
-            let penalty = k3_kl_tensor(logp, logp_ref)?.affine(beta, 0.0)?;
+            // At padding, substitute logp_ref so the k3 KL's exp argument is 0.
+            let logp_kl = keep.where_cond(logp, logp_ref)?;
+            let penalty = k3_kl_tensor(&logp_kl, logp_ref)?.affine(beta, 0.0)?;
             surrogate.broadcast_sub(&penalty)?
         }
     };
@@ -1168,8 +1251,18 @@ mod tests {
         bad(|c| c.clip_eps = 2.0);
         bad(|c| c.grad_accum_steps = 0);
         bad(|c| c.checkpoint_every = Some(0));
-        // Plumbed into generation but not yet honored by the loss path → fail loud.
-        bad(|c| c.eos_token_id = Some(0));
+    }
+
+    #[test]
+    fn config_validate_accepts_eos_token_id() {
+        // The loss mask + length-aware decode now honor the EOS padding, so a `Some`
+        // eos_token_id is a valid run (the PR3 guard-lift; before it `validate`
+        // rejected it to avoid silently scoring the padding).
+        let cfg = TrainerConfig {
+            eos_token_id: Some(151_643),
+            ..TrainerConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
@@ -1274,6 +1367,212 @@ mod tests {
         let (mean, std) = reward_stats(&[f32::NAN, f32::NAN]);
         assert_eq!(mean, 0.0);
         assert_eq!(std, 0.0);
+    }
+
+    // ---- completion_lens consumption (length-aware mask / decode / metric) --
+
+    /// A trivial codec that renders token ids as comma-joined decimals, so a decode
+    /// test can see exactly which tokens reached it.
+    struct JoinCodec;
+    impl TokenizerLike for JoinCodec {
+        fn encode(&self, _text: &str) -> Vec<u32> {
+            Vec::new()
+        }
+        fn decode(&self, ids: &[u32]) -> String {
+            ids.iter().map(u32::to_string).collect::<Vec<_>>().join(",")
+        }
+    }
+
+    #[test]
+    fn length_mask_rows_marks_padding_and_is_all_ones_at_full_width() {
+        // Shorter-than-width lengths => 1.0 up to the length, 0.0 after (the padding).
+        let r = Rollout {
+            token_ids: vec![vec![0u32; 5]; 3],
+            prompt_len: 2,
+            completion_lens: vec![1, 3, 2],
+        };
+        assert_eq!(
+            length_mask_rows(&r, 3),
+            vec![
+                vec![1.0, 0.0, 0.0],
+                vec![1.0, 1.0, 1.0],
+                vec![1.0, 1.0, 0.0],
+            ]
+        );
+        // Full-width lengths => all-ones, bit-identical to the legacy Tensor::ones mask.
+        let full = Rollout {
+            token_ids: vec![vec![0u32; 5]; 2],
+            prompt_len: 2,
+            completion_lens: vec![3, 3],
+        };
+        assert_eq!(length_mask_rows(&full, 3), vec![vec![1.0; 3]; 2]);
+    }
+
+    #[test]
+    fn decode_completions_stops_at_completion_len() {
+        // seq 0: length 3 (full) => all three completion tokens decoded.
+        // seq 1: length 1 => only the first; the trailing pad tokens (7, 7) excluded.
+        let r = Rollout {
+            token_ids: vec![vec![9, 9, 1, 2, 7], vec![9, 9, 3, 7, 7]],
+            prompt_len: 2,
+            completion_lens: vec![3, 1],
+        };
+        assert_eq!(
+            decode_completions(&r, &JoinCodec),
+            vec!["1,2,7".to_string(), "3".to_string()]
+        );
+    }
+
+    #[test]
+    fn mean_completion_len_uses_real_completion_lengths() {
+        // Real lengths 1 and 3 (not the padded width 3) => mean 2.0.
+        let r = Rollout {
+            token_ids: vec![vec![0u32; 5], vec![0u32; 5]],
+            prompt_len: 2,
+            completion_lens: vec![1, 3],
+        };
+        assert_relative_eq!(mean_completion_len(&r), 2.0, epsilon = TOL);
+        // Empty rollout => 0.0 (no divide-by-zero).
+        let e = Rollout {
+            token_ids: vec![],
+            prompt_len: 0,
+            completion_lens: vec![],
+        };
+        assert_relative_eq!(mean_completion_len(&e), 0.0, epsilon = TOL);
+    }
+
+    #[test]
+    fn completion_dims_rejects_misaligned_or_overlong_completion_lens() {
+        // Aligned + within-width passes (comp_len here is 3).
+        let ok = Rollout {
+            token_ids: vec![vec![0u32; 5], vec![0u32; 5]],
+            prompt_len: 2,
+            completion_lens: vec![1, 3],
+        };
+        assert_eq!(completion_dims(&ok).unwrap(), (2, 3));
+        // Wrong number of lengths (one length for two sequences).
+        let misaligned = Rollout {
+            token_ids: vec![vec![0u32; 5], vec![0u32; 5]],
+            prompt_len: 2,
+            completion_lens: vec![3],
+        };
+        assert!(matches!(
+            completion_dims(&misaligned),
+            Err(TrainerError::Contract(_))
+        ));
+        // A recorded length past the completion width (4 > 3).
+        let overlong = Rollout {
+            token_ids: vec![vec![0u32; 5], vec![0u32; 5]],
+            prompt_len: 2,
+            completion_lens: vec![3, 4],
+        };
+        assert!(matches!(
+            completion_dims(&overlong),
+            Err(TrainerError::Contract(_))
+        ));
+    }
+
+    #[test]
+    fn padding_columns_are_inert_in_the_grpo_loss() {
+        // A length-aware mask whose last column is EOS padding must (a) leave a zero
+        // gradient at the padded positions and (b) under the GRPO reduction give the
+        // SAME gradient on the real columns as a loss with no padding column at all
+        // (the per-sequence denominator is the real-token count in both). Proves the
+        // EOS padding is fully inert in the differentiated objective — on the exact
+        // production `grpo_loss`.
+        let dev = cpu();
+        let logp_data = [-0.2f32, -0.5, -0.9, -0.3, -0.7, -0.1]; // 2 rows x 3 cols
+        let make = |cols: usize| {
+            let mut d = Vec::new();
+            for row in 0..2 {
+                d.extend_from_slice(&logp_data[row * 3..row * 3 + cols]);
+            }
+            Var::from_tensor(&Tensor::from_vec(d, (2, cols), &dev).unwrap()).unwrap()
+        };
+        let adv = Tensor::from_vec(vec![0.6f32, -0.4], (2, 1), &dev).unwrap();
+        let grad_of = |v: &Var, mask: &Tensor| -> Vec<Vec<f32>> {
+            let old = v.as_tensor().detach();
+            grpo_loss(
+                v.as_tensor(),
+                &old,
+                None,
+                &adv,
+                mask,
+                0.2,
+                0.0,
+                LossType::Grpo,
+            )
+            .unwrap()
+            .backward()
+            .unwrap()
+            .get(v.as_tensor())
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap()
+        };
+
+        // Padded: 3 columns, the last masked out per row (real length 2).
+        let v3 = make(3);
+        let grad3 = grad_of(&v3, &mat(&[&[1.0, 1.0, 0.0], &[1.0, 1.0, 0.0]]));
+        // (a) the padded column carries no gradient.
+        assert_eq!(grad3[0][2], 0.0);
+        assert_eq!(grad3[1][2], 0.0);
+
+        // Unpadded reference: 2 real columns, all kept.
+        let v2 = make(2);
+        let grad2 = grad_of(&v2, &mat(&[&[1.0, 1.0], &[1.0, 1.0]]));
+        // (b) the real columns match the no-padding loss exactly.
+        for row in 0..2 {
+            for col in 0..2 {
+                assert_relative_eq!(grad3[row][col], grad2[row][col], epsilon = TOL);
+            }
+        }
+    }
+
+    #[test]
+    fn padding_with_an_exp_overflowing_logp_gap_stays_grad_finite() {
+        // A masked (EOS-padding) position whose log-prob is wildly below the reference
+        // makes the k3 KL's exp(logp_ref - logp) overflow f32 to +inf (argument ~200 >>
+        // 88). Without the exp-argument masking in grpo_loss, exp's backward there is
+        // `0 * inf = NaN` (the cell is masked so its upstream grad is 0, but exp's local
+        // derivative is inf), which would poison the LoRA gradient of an inert padding
+        // token and fail the step via the canary. The masked column's gradient must stay
+        // EXACTLY zero and finite, and the real column unaffected.
+        let dev = cpu();
+        // One sequence, 2 columns; column 1 is padding (mask 0) with a huge -logp.
+        let logp = Var::from_tensor(&mat(&[&[-0.5, -200.0]])).unwrap();
+        let logp_old = logp.as_tensor().detach(); // ratio == 1 everywhere (mu = 1)
+        let logp_ref = mat(&[&[-0.5, -0.5]]); // ref - logp at col 1 == 199.5 -> exp overflow
+        let adv = Tensor::from_vec(vec![0.7f32], (1, 1), &dev).unwrap();
+        let mask = mat(&[&[1.0, 0.0]]);
+        let grads = grpo_loss(
+            logp.as_tensor(),
+            &logp_old,
+            Some(&logp_ref),
+            &adv,
+            &mask,
+            0.2,
+            0.1, // beta > 0: the k3 KL term is active
+            LossType::Grpo,
+        )
+        .unwrap()
+        .backward()
+        .unwrap();
+        let g = grads
+            .get(logp.as_tensor())
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+        assert!(
+            g[0][0].is_finite(),
+            "real-column gradient went non-finite: {}",
+            g[0][0]
+        );
+        assert_eq!(
+            g[0][1], 0.0,
+            "padding gradient is not exactly zero (NaN leaked from exp overflow?): {}",
+            g[0][1]
+        );
     }
 
     // ---- gradient accumulation (fold across backwards) ---------------------

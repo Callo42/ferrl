@@ -22,6 +22,14 @@
 //! advances the policy's sampler, and restores the adapter-enabled flag to its
 //! prior state before returning — on success, on a returned error, or on a panic
 //! (an RAII guard).
+//!
+//! ## EOS / length-aware scoring
+//!
+//! When [`GenConfig::eos_token_id`] is set, EOS-aware generation right-pads each
+//! early-stopped completion back to a fixed width and records the true length in
+//! [`Rollout::completion_lens`]. Decoding stops at that length, so the EOS padding
+//! never reaches the [`RewardFn`]; with `eos_token_id == None` every length is the
+//! full width and decoding is the entire post-prompt slice, unchanged.
 
 use crate::policy::{GenConfig, Policy, Rollout};
 use crate::reward::RewardFn;
@@ -95,14 +103,12 @@ pub enum EvalError {
 ///
 /// # Errors
 ///
-/// Returns [`EvalError::Contract`] if `prompts` is empty; if `gen.eos_token_id` is
-/// `Some` (EOS-aware scoring needs the length-aware decode that lands in a follow-up
-/// PR — fail loud rather than score the EOS padding); if a prompt encodes to zero
+/// Returns [`EvalError::Contract`] if `prompts` is empty; if a prompt encodes to zero
 /// tokens; if a policy returns a malformed rollout (wrong completion count, no prompt
-/// context, or a sequence shorter than the prompt); or if a [`RewardFn`] returns a
-/// reward count that does not match the number of completions; or
-/// [`EvalError::Candle`] if generation fails (including a `QwenPolicy` temperature
-/// mismatch).
+/// context, a sequence shorter than the prompt, or a `completion_lens` that does not
+/// align with the sequences); or if a [`RewardFn`] returns a reward count that does
+/// not match the number of completions; or [`EvalError::Candle`] if generation fails
+/// (including a `QwenPolicy` temperature mismatch).
 pub fn evaluate<P: Policy, R: RewardFn>(
     policy: &mut P,
     reward_fn: &R,
@@ -112,19 +118,6 @@ pub fn evaluate<P: Policy, R: RewardFn>(
 ) -> Result<EvalReport, EvalError> {
     if prompts.is_empty() {
         return Err(EvalError::Contract("no eval prompts".into()));
-    }
-    // EOS-aware generation right-pads early-stopped completions; until the
-    // length-aware decode that strips that padding lands (a follow-up PR, alongside
-    // the trainer's loss mask), `mean_reward` would decode and score the padding
-    // tail. Reject a `Some` eos_token_id here — fail loud, mirroring
-    // `TrainerConfig::validate` — so neither scoring path can silently mis-score.
-    if gen.eos_token_id.is_some() {
-        return Err(EvalError::Contract(
-            "eos_token_id is set, but the length-aware decode that excludes the EOS \
-             padding from the scored completion lands in a follow-up; leave it None \
-             until then (eval would otherwise score the padding tail)"
-                .into(),
-        ));
     }
     // Restore the adapter flag on the way out — on success, on a `?` early return,
     // and on a panic — via the guard's Drop.
@@ -199,9 +192,16 @@ fn mean_reward<P: Policy, R: RewardFn>(
     let completions: Vec<String> = rollout
         .token_ids
         .iter()
-        // `validate_rollout` guarantees every sequence >= prompt_len; slice
-        // defensively anyway so a future change can never turn into a panic.
-        .map(|ids| tokenizer.decode(ids.get(rollout.prompt_len..).unwrap_or(&[])))
+        .zip(&rollout.completion_lens)
+        // Decode only the real completion tokens (the EOS-inclusive length), so EOS
+        // padding never reaches the reward. `validate_rollout` has bounded every
+        // length by its sequence's completion span; slice defensively anyway so a
+        // future change can never turn into a panic.
+        .map(|(ids, &len)| {
+            let start = rollout.prompt_len;
+            let end = start.saturating_add(len).min(ids.len());
+            tokenizer.decode(ids.get(start..end).unwrap_or(&[]))
+        })
         .collect();
     let rewards = reward_fn.reward_group(prompt, &completions);
     // Enforce the RewardFn contract (one reward per completion), exactly as the
@@ -219,12 +219,12 @@ fn mean_reward<P: Policy, R: RewardFn>(
 
 /// Reject a malformed rollout the same way the trainer's `completion_dims` does, so
 /// eval and train agree on what a valid `Policy::generate` returns: exactly
-/// `group_size` completions, a non-empty prompt context, and every sequence at
-/// least as long as the prompt (so the completion slice is well-defined). It does
-/// **not** require rectangular completions — eval scores each sequence
-/// independently. Decoding here is not yet length-aware (it reads the full
-/// completion slice), so [`evaluate`] rejects a `Some` `eos_token_id` upstream until
-/// the length-aware decode lands; rollouts reaching here are therefore full-width.
+/// `group_size` completions, a non-empty prompt context, every sequence at least as
+/// long as the prompt (so the completion slice is well-defined), and a
+/// `completion_lens` that aligns with the sequences and stays within each one's
+/// completion span (it drives the length-aware decode). It does **not** require
+/// rectangular completions — eval scores each sequence independently, so the length
+/// bound is per-sequence rather than a shared width.
 fn validate_rollout(rollout: &Rollout, group_size: usize) -> Result<(), EvalError> {
     if rollout.len() != group_size {
         return Err(EvalError::Contract(format!(
@@ -247,6 +247,34 @@ fn validate_rollout(rollout: &Rollout, group_size: usize) -> Result<(), EvalErro
             short.len(),
             rollout.prompt_len
         )));
+    }
+    validate_completion_lens(rollout, group_size)?;
+    Ok(())
+}
+
+/// Validate `completion_lens` for length-aware decoding: one length per sequence,
+/// each within its sequence's completion span (`ids.len() - prompt_len`). Eval does
+/// not require rectangular rows, so the bound is per-sequence; a length past the
+/// available tokens would over-read the decode slice / score nonexistent tokens.
+/// Split out of [`validate_rollout`] to keep it under the cognitive-complexity bound.
+fn validate_completion_lens(rollout: &Rollout, group_size: usize) -> Result<(), EvalError> {
+    if rollout.completion_lens.len() != group_size {
+        return Err(EvalError::Contract(format!(
+            "rollout has {} completion_lens for group_size {group_size}",
+            rollout.completion_lens.len()
+        )));
+    }
+    for (i, (ids, &len)) in rollout
+        .token_ids
+        .iter()
+        .zip(&rollout.completion_lens)
+        .enumerate()
+    {
+        if len > ids.len().saturating_sub(rollout.prompt_len) {
+            return Err(EvalError::Contract(format!(
+                "completion_len {len} at sequence {i} exceeds its completion span"
+            )));
+        }
     }
     Ok(())
 }
@@ -392,22 +420,65 @@ mod tests {
         assert_eq!(report.improvement(), 6.0);
     }
 
+    /// A policy that emits EOS-padded rollouts: `real` real completion tokens then a
+    /// `pad` token repeated to `max_new_tokens`, recording the true (short) length in
+    /// `completion_lens` — the shape EOS early-stop produces. The pad token is chosen
+    /// to inflate the reward if it were (wrongly) scored, so a passing test proves the
+    /// length-aware decode excludes it. It ignores the adapter flag (base == adapter),
+    /// isolating the decode behavior.
+    struct EosPaddedPolicy {
+        real: Vec<u32>,
+        pad: u32,
+    }
+    impl Policy for EosPaddedPolicy {
+        fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
+            let len = self.real.len().min(cfg.max_new_tokens);
+            let width = prompt.len() + cfg.max_new_tokens;
+            let mut token_ids = Vec::with_capacity(cfg.group_size);
+            let mut completion_lens = Vec::with_capacity(cfg.group_size);
+            for _ in 0..cfg.group_size {
+                let mut ids = prompt.to_vec();
+                ids.extend_from_slice(&self.real[..len]);
+                ids.resize(width, self.pad);
+                token_ids.push(ids);
+                completion_lens.push(len);
+            }
+            Ok(Rollout {
+                token_ids,
+                prompt_len: prompt.len(),
+                completion_lens,
+            })
+        }
+        fn token_logprobs(&self, _rollout: &Rollout) -> CandleResult<Tensor> {
+            Tensor::zeros((1, 1), DType::F32, &Device::Cpu)
+        }
+        fn set_adapter_enabled(&mut self, _enabled: bool) {}
+        fn adapter_enabled(&self) -> bool {
+            true
+        }
+        fn trainable_vars(&self) -> Vec<Var> {
+            vec![]
+        }
+    }
+
     #[test]
-    fn rejects_eos_token_id_until_length_aware_decode() {
-        // EOS-aware generation right-pads completions; until the length-aware decode
-        // that strips that padding lands, eval would score the padding tail. A `Some`
-        // eos_token_id is rejected up front (fail loud), mirroring the trainer guard.
-        let mut policy = ScriptedPolicy::new(0, 1);
+    fn eos_aware_eval_scores_only_the_real_completion() {
+        // Real completion "1" (digit-sum reward 1) padded with "9"s to width 3. A
+        // full-slice decode would score "199" (reward 19); the length-aware decode
+        // scores only "1". evaluate now accepts a `Some` eos_token_id (the PR3
+        // guard-lift) and the decode honors completion_lens.
+        let mut policy = EosPaddedPolicy {
+            real: vec![1],
+            pad: 9,
+        };
         let prompts = vec!["5".to_string()];
         let cfg = GenConfig {
-            eos_token_id: Some(0),
-            ..gen(2, 2)
+            eos_token_id: Some(9),
+            ..gen(4, 3)
         };
-        let err = evaluate(&mut policy, &DigitSumReward, &DigitCodec, &prompts, &cfg).unwrap_err();
-        assert!(
-            matches!(err, EvalError::Contract(_)),
-            "expected a Contract rejection, got {err:?}"
-        );
+        let report = evaluate(&mut policy, &DigitSumReward, &DigitCodec, &prompts, &cfg).unwrap();
+        assert_eq!(report.base_reward_mean, 1.0);
+        assert_eq!(report.adapter_reward_mean, 1.0);
     }
 
     #[test]
@@ -492,6 +563,8 @@ mod tests {
         ShortSeq,
         /// `prompt_len == 0` (no prompt context).
         ZeroPromptLen,
+        /// `completion_lens` has fewer entries than sequences (misaligned).
+        BadLens,
     }
 
     /// A policy that emits a chosen malformed rollout.
@@ -517,8 +590,17 @@ mod tests {
                     let v = (0..cfg.group_size).map(|_| vec![0u32, 1]).collect();
                     (v, 0)
                 }
+                Malformed::BadLens => {
+                    let v = (0..cfg.group_size).map(|_| body(0)).collect();
+                    (v, prompt.len())
+                }
             };
-            Ok(Rollout::rectangular(token_ids, prompt_len))
+            let mut rollout = Rollout::rectangular(token_ids, prompt_len);
+            if let Malformed::BadLens = self.0 {
+                // Drop one length so completion_lens no longer aligns with the rows.
+                rollout.completion_lens.pop();
+            }
+            Ok(rollout)
         }
         fn token_logprobs(&self, _rollout: &Rollout) -> CandleResult<Tensor> {
             Tensor::zeros((1, 1), DType::F32, &Device::Cpu)
@@ -539,6 +621,7 @@ mod tests {
             Malformed::Overfill,
             Malformed::ShortSeq,
             Malformed::ZeroPromptLen,
+            Malformed::BadLens,
         ] {
             let mut policy = MalformedPolicy(mode);
             let err = evaluate(
