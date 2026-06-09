@@ -27,7 +27,11 @@
 //!   Hugging Face fast tokenizer behind the trainer's [`TokenizerLike`] bridge;
 //! - the GRPO training loop ([`trainer`]) — the `Trainer` that drives rollout →
 //!   reward → advantages → masked clipped surrogate (+ optional KL) →
-//!   canary-guarded `AdamW` step;
+//!   canary-guarded [`FerrlAdamW`] step;
+//! - a candle-bit-identical `AdamW` ([`optim`]) — [`FerrlAdamW`], a line-for-line
+//!   clone of candle's optimizer that ferrl owns so it can later persist and
+//!   restore the moment state for momentum-faithful resume, pinned to candle by a
+//!   permanent equivalence canary;
 //! - adapter checkpointing ([`checkpoint`]) — save/load the trainable `LoRA`
 //!   factors so a run can be resumed (see [`Trainer::train_from`]);
 //! - held-out evaluation ([`eval`]) — the base model vs. the trained adapter,
@@ -68,6 +72,7 @@ pub mod eval;
 pub mod grpo;
 pub mod lora;
 pub mod nn;
+pub mod optim;
 pub mod policy;
 pub mod qwen;
 pub mod qwen_policy;
@@ -92,6 +97,8 @@ pub use grpo::{
 };
 #[doc(inline)]
 pub use nn::{grad_coverage, GradCoverage, RmsNorm};
+#[doc(inline)]
+pub use optim::FerrlAdamW;
 #[doc(inline)]
 pub use policy::Policy;
 #[doc(inline)]

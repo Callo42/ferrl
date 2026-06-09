@@ -20,13 +20,14 @@
 //!
 //! ## What is NOT persisted (yet)
 //!
-//! Only the adapter weights and the completed-step count. The `AdamW` optimizer
-//! moments and the rollout sampler RNG are intentionally **not** serialized
-//! (candle exposes neither through a public accessor): a resumed run restores the
-//! trained weights and the step index but re-warms Adam's bias correction and
+//! Only the adapter weights and the completed-step count. The optimizer moments
+//! and the rollout sampler RNG are not serialized **yet**: a resumed run restores
+//! the trained weights and the step index but re-warms Adam's bias correction and
 //! re-seeds sampling. This is a documented limitation — bit-exact,
-//! momentum-faithful resume is deferred to P5 (where the optimizer state would be
-//! owned/extended). The adapter weights themselves round-trip bit-exactly.
+//! momentum-faithful resume is **P6-B**: ferrl now owns the optimizer
+//! ([`crate::optim::FerrlAdamW`]), so a later PR can serialize and restore its
+//! moments; the sampler RNG still needs an owned, seekable replacement for candle's
+//! `LogitsProcessor`. The adapter weights themselves round-trip bit-exactly.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

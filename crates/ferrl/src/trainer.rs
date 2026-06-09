@@ -43,12 +43,13 @@ use std::path::PathBuf;
 
 use candle_core::backprop::GradStore;
 use candle_core::{DType, Device, Result as CandleResult, Tensor, Var, D};
-use candle_nn::optim::{AdamW, ParamsAdamW};
+use candle_nn::optim::ParamsAdamW;
 use candle_nn::Optimizer;
 use serde::{Deserialize, Serialize};
 
 use crate::grpo::{group_advantages, zero_mask_rows, LossType, ScaleRewards};
 use crate::nn::grad_coverage;
+use crate::optim::FerrlAdamW;
 use crate::policy::{GenConfig, Policy, Rollout};
 use crate::reward::RewardFn;
 use crate::telemetry::{Metrics, MetricsWriter, RunDir, TelemetryError};
@@ -346,13 +347,14 @@ impl Trainer {
     /// `start_step * grad_accum_steps` (mod len) — so resuming at the recorded window
     /// continues the prompt order an uninterrupted run would have seen.
     ///
-    /// **Not bit-exact to an uninterrupted run.** A fresh `AdamW` is constructed
-    /// (its moment estimates restart from zero, re-warming the bias correction) and
-    /// the policy's sampler RNG is whatever the reloaded policy carries; neither is
-    /// persisted by [`crate::checkpoint`] (candle exposes no accessor for them).
-    /// The reloaded *adapter weights* are exact; the post-resume trajectory is a
-    /// faithful continuation, not a replay. (Momentum-faithful resume is deferred
-    /// to P5.)
+    /// **Not bit-exact to an uninterrupted run.** A fresh [`FerrlAdamW`] is
+    /// constructed (its moment estimates restart from zero, re-warming the bias
+    /// correction) and the policy's sampler RNG is whatever the reloaded policy
+    /// carries; neither is persisted by [`crate::checkpoint`] yet. The reloaded
+    /// *adapter weights* are exact; the post-resume trajectory is a faithful
+    /// continuation, not a replay. (Momentum-faithful resume — persisting and
+    /// restoring both the optimizer moments and the sampler RNG — is P6-B; owning
+    /// [`FerrlAdamW`] instead of candle's `AdamW` is its first step.)
     ///
     /// # Errors
     ///
@@ -390,7 +392,7 @@ impl Trainer {
             weight_decay: self.config.weight_decay,
             ..Default::default()
         };
-        let mut opt = AdamW::new(vars.clone(), params)?;
+        let mut opt = FerrlAdamW::new(vars.clone(), params)?;
         let total = self.config.steps;
         let remaining = total.saturating_sub(start_step) as usize;
         let mut history = Vec::with_capacity(remaining);
@@ -416,7 +418,7 @@ impl Trainer {
         reward_fn: &R,
         tokenizer: &dyn TokenizerLike,
         prompts: &[String],
-        opt: &mut AdamW,
+        opt: &mut FerrlAdamW,
         vars: &[Var],
     ) -> Result<Metrics, TrainerError> {
         let accum = self.config.grad_accum_steps;
@@ -573,7 +575,7 @@ impl Trainer {
         policy: &P,
         live: &[LiveItem],
         vars: &[Var],
-        opt: &mut AdamW,
+        opt: &mut FerrlAdamW,
     ) -> Result<InnerAgg, TrainerError> {
         let mut agg = InnerAgg::default();
         for _ in 0..self.config.mu {
@@ -592,7 +594,7 @@ impl Trainer {
         policy: &P,
         live: &[LiveItem],
         vars: &[Var],
-        opt: &mut AdamW,
+        opt: &mut FerrlAdamW,
     ) -> Result<InnerAgg, TrainerError> {
         let n_live = live.len() as f32;
         let mut acc: Vec<Option<Tensor>> = vec![None; vars.len()];
@@ -715,7 +717,7 @@ impl Trainer {
         step: u64,
         stats: &[PromptStat],
         agg: &InnerAgg,
-        opt: &AdamW,
+        opt: &FerrlAdamW,
     ) -> Metrics {
         let mut m = Metrics::at_step(step);
         let all_rewards: Vec<f32> = stats
