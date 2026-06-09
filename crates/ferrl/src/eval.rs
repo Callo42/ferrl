@@ -95,9 +95,11 @@ pub enum EvalError {
 ///
 /// # Errors
 ///
-/// Returns [`EvalError::Contract`] if `prompts` is empty, a prompt encodes to zero
-/// tokens, a policy returns a malformed rollout (wrong completion count, no prompt
-/// context, or a sequence shorter than the prompt), or a [`RewardFn`] returns a
+/// Returns [`EvalError::Contract`] if `prompts` is empty; if `gen.eos_token_id` is
+/// `Some` (EOS-aware scoring needs the length-aware decode that lands in a follow-up
+/// PR — fail loud rather than score the EOS padding); if a prompt encodes to zero
+/// tokens; if a policy returns a malformed rollout (wrong completion count, no prompt
+/// context, or a sequence shorter than the prompt); or if a [`RewardFn`] returns a
 /// reward count that does not match the number of completions; or
 /// [`EvalError::Candle`] if generation fails (including a `QwenPolicy` temperature
 /// mismatch).
@@ -110,6 +112,19 @@ pub fn evaluate<P: Policy, R: RewardFn>(
 ) -> Result<EvalReport, EvalError> {
     if prompts.is_empty() {
         return Err(EvalError::Contract("no eval prompts".into()));
+    }
+    // EOS-aware generation right-pads early-stopped completions; until the
+    // length-aware decode that strips that padding lands (a follow-up PR, alongside
+    // the trainer's loss mask), `mean_reward` would decode and score the padding
+    // tail. Reject a `Some` eos_token_id here — fail loud, mirroring
+    // `TrainerConfig::validate` — so neither scoring path can silently mis-score.
+    if gen.eos_token_id.is_some() {
+        return Err(EvalError::Contract(
+            "eos_token_id is set, but the length-aware decode that excludes the EOS \
+             padding from the scored completion lands in a follow-up; leave it None \
+             until then (eval would otherwise score the padding tail)"
+                .into(),
+        ));
     }
     // Restore the adapter flag on the way out — on success, on a `?` early return,
     // and on a panic — via the guard's Drop.
@@ -205,10 +220,11 @@ fn mean_reward<P: Policy, R: RewardFn>(
 /// Reject a malformed rollout the same way the trainer's `completion_dims` does, so
 /// eval and train agree on what a valid `Policy::generate` returns: exactly
 /// `group_size` completions, a non-empty prompt context, and every sequence at
-/// least as long as the prompt (so the completion slice is well-defined). Unlike
-/// the trainer it does **not** require rectangular completions — eval decodes and
-/// scores each sequence independently, so ragged (early-stopped) completions are
-/// fine.
+/// least as long as the prompt (so the completion slice is well-defined). It does
+/// **not** require rectangular completions — eval scores each sequence
+/// independently. Decoding here is not yet length-aware (it reads the full
+/// completion slice), so [`evaluate`] rejects a `Some` `eos_token_id` upstream until
+/// the length-aware decode lands; rollouts reaching here are therefore full-width.
 fn validate_rollout(rollout: &Rollout, group_size: usize) -> Result<(), EvalError> {
     if rollout.len() != group_size {
         return Err(EvalError::Contract(format!(
@@ -374,6 +390,24 @@ mod tests {
         };
         assert_eq!(report, expected);
         assert_eq!(report.improvement(), 6.0);
+    }
+
+    #[test]
+    fn rejects_eos_token_id_until_length_aware_decode() {
+        // EOS-aware generation right-pads completions; until the length-aware decode
+        // that strips that padding lands, eval would score the padding tail. A `Some`
+        // eos_token_id is rejected up front (fail loud), mirroring the trainer guard.
+        let mut policy = ScriptedPolicy::new(0, 1);
+        let prompts = vec!["5".to_string()];
+        let cfg = GenConfig {
+            eos_token_id: Some(0),
+            ..gen(2, 2)
+        };
+        let err = evaluate(&mut policy, &DigitSumReward, &DigitCodec, &prompts, &cfg).unwrap_err();
+        assert!(
+            matches!(err, EvalError::Contract(_)),
+            "expected a Contract rejection, got {err:?}"
+        );
     }
 
     #[test]
