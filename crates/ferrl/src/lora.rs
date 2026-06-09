@@ -21,7 +21,7 @@
 //! Disabling the adapter ([`LoraLinear::set_enabled`]) drops the update term,
 //! yielding the frozen base distribution — the GRPO reference policy.
 
-use candle_core::{Result as CandleResult, Tensor, Var};
+use candle_core::{DType, Result as CandleResult, Tensor, Var};
 
 /// A linear layer with a frozen base weight and a trainable low-rank adapter.
 #[derive(Debug, Clone)]
@@ -41,33 +41,62 @@ pub struct LoraLinear {
 }
 
 impl LoraLinear {
-    /// Build a `LoRA` layer from a frozen base weight/bias and freshly created,
-    /// zero-`B` adapter factors of the given `rank`.
+    /// Build a `LoRA` layer with adapter factors in the **base weight's** dtype.
     ///
-    /// `base_weight` must be `[out, in]`; `base_bias`, if present, must be
-    /// `[out]`. `A` is sampled `N(0, 0.02)` and `B` is zero-initialized, so the
-    /// adapter starts as an identity (no-op) on top of the base model. The
-    /// update is scaled by `alpha / rank`.
+    /// See [`with_adapter_dtype`](Self::with_adapter_dtype) for the details; this
+    /// is the common case (toy / all-F32) where the adapter and base share a dtype.
     ///
     /// # Errors
     ///
-    /// Returns a candle error if `rank == 0` or if the adapter factors cannot be
-    /// allocated on the base weight's device/dtype.
+    /// As [`with_adapter_dtype`](Self::with_adapter_dtype).
     pub fn new(
         base_weight: Tensor,
         base_bias: Option<Tensor>,
         rank: usize,
         alpha: f64,
     ) -> CandleResult<Self> {
+        let dtype = base_weight.dtype();
+        Self::with_adapter_dtype(base_weight, base_bias, rank, alpha, dtype)
+    }
+
+    /// Build a `LoRA` layer whose **trainable adapter** (`A`/`B`) is held in
+    /// `adapter_dtype`, independent of the frozen base weight's dtype.
+    ///
+    /// `base_weight` must be `[out, in]`; `base_bias`, if present, must be `[out]`.
+    /// `A` is sampled `N(0, 0.02)` and `B` is zero-initialized, so the adapter
+    /// starts as an identity (no-op) on top of the base model. The update is scaled
+    /// by `alpha / rank`.
+    ///
+    /// # The dtype split (bf16 base / F32 adapter)
+    ///
+    /// For a real model the frozen base is loaded in BF16 (halving weight **and**
+    /// activation memory), but a BF16 *adapter* would lose the GRPO update: a tiny
+    /// `lr · grad` step rounds away in BF16's ~3 significant digits — the precision
+    /// collapse P3 flagged. Keeping `A`/`B` (and therefore their gradients and the
+    /// optimizer's moment estimates) in F32 preserves the update; the [`forward`](Self::forward)
+    /// casts them down to the activation dtype only for the matmul, so the big
+    /// activations stay BF16. This is standard mixed-precision: an F32 master copy,
+    /// a BF16 compute path.
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if `rank == 0` or if the adapter factors cannot be
+    /// allocated on the base weight's device.
+    pub fn with_adapter_dtype(
+        base_weight: Tensor,
+        base_bias: Option<Tensor>,
+        rank: usize,
+        alpha: f64,
+        adapter_dtype: DType,
+    ) -> CandleResult<Self> {
         let (out, in_) = base_weight.dims2()?;
         if rank == 0 {
             return Err(candle_core::Error::Msg("lora rank must be > 0".into()));
         }
         let device = base_weight.device();
-        let dtype = base_weight.dtype();
-        let a = Var::randn(0.0, 0.02, (rank, in_), device)?.to_dtype(dtype)?;
+        let a = Var::randn(0.0, 0.02, (rank, in_), device)?.to_dtype(adapter_dtype)?;
         let a = Var::from_tensor(&a)?;
-        let b = Var::zeros((out, rank), dtype, device)?;
+        let b = Var::zeros((out, rank), adapter_dtype, device)?;
         let scale = alpha / rank as f64;
         Ok(Self {
             base_weight,
@@ -121,9 +150,17 @@ impl LoraLinear {
         if !self.enabled {
             return Ok(base);
         }
+        // The adapter factors may be held in a higher-precision dtype than the
+        // activations (the bf16-base / F32-adapter split — see `with_adapter_dtype`).
+        // Cast them down to the activation dtype for the matmul (a no-op when they
+        // already match); the F32 master copy is what the optimizer updates, so its
+        // precision is preserved regardless of this compute-dtype cast.
+        let dtype = self.base_weight.dtype();
+        let a = self.a.as_tensor().to_dtype(dtype)?;
+        let b = self.b.as_tensor().to_dtype(dtype)?;
         // (x Aᵀ) Bᵀ, scaled.
-        let xa = x.broadcast_matmul(&self.a.as_tensor().t()?)?;
-        let xab = xa.broadcast_matmul(&self.b.as_tensor().t()?)?;
+        let xa = x.broadcast_matmul(&a.t()?)?;
+        let xab = xa.broadcast_matmul(&b.t()?)?;
         let update = (xab * self.scale)?;
         base.broadcast_add(&update)
     }
@@ -216,6 +253,57 @@ mod tests {
             .to_scalar()
             .unwrap();
         assert!(d_en > 1e-3);
+    }
+
+    #[test]
+    fn adapter_dtype_is_independent_of_the_base() {
+        // The dtype split: the trainable adapter is held in its own precision,
+        // independent of the frozen base. The real instance is bf16-base / F32-adapter,
+        // but candle's CPU backend has no bf16 matmul, so we test the mechanism on CPU
+        // with F32-base / F64-adapter (same direction: adapter higher precision than
+        // the compute path).
+        let w = base(4, 3); // F32 base
+        let l = LoraLinear::with_adapter_dtype(w, None, 2, 8.0, DType::F64).unwrap();
+        assert_eq!(l.a.as_tensor().dtype(), DType::F64);
+        assert_eq!(l.b.as_tensor().dtype(), DType::F64);
+        // The forward runs in the activation/base dtype (F32), not the adapter's.
+        let x = Tensor::from_vec(vec![1.0f32, 2.0, 3.0], (1, 3), &Device::Cpu).unwrap();
+        let y = l.forward(&x).unwrap();
+        assert_eq!(y.dtype(), DType::F32);
+    }
+
+    #[test]
+    fn master_adapter_receives_its_own_dtype_grad() {
+        // The anti-collapse property: even though the matmul runs in the lower compute
+        // dtype, the gradient (and so the optimizer's update) lands on the adapter in
+        // its master dtype — a tiny step that would round away in the compute dtype
+        // survives in the master. (CPU stand-in for bf16-base / F32-adapter; see above.)
+        //
+        // This proves the dtype *routing* (the grad reaches the master in the master's
+        // dtype, via the cast's upcast adjoint). It does NOT stress bf16's in-gradient
+        // precision: the analog computes the grad in F32 and upcasts to F64, whereas the
+        // bf16 instance computes it in bf16 and upcasts to F32. That the bf16 rounding is
+        // tolerable is established empirically by the GPU Countdown run, not here.
+        let w = base(4, 3); // F32 base
+        let l = LoraLinear::with_adapter_dtype(w, None, 2, 8.0, DType::F64).unwrap();
+        // Force B nonzero so A also carries a live gradient.
+        l.b.set(&Tensor::ones((4, 2), DType::F64, &Device::Cpu).unwrap())
+            .unwrap();
+        let x = Tensor::from_vec(vec![1.0f32, 2.0, 3.0], (1, 3), &Device::Cpu).unwrap();
+        let loss = l.forward(&x).unwrap().sqr().unwrap().sum_all().unwrap();
+        let grads = loss.backward().unwrap();
+        for v in l.trainable_vars() {
+            let g = grads
+                .get(v.as_tensor())
+                .expect("var missing from grad store");
+            assert_eq!(
+                g.dtype(),
+                DType::F64,
+                "master adapter must receive a grad in its own dtype"
+            );
+            let mag: f64 = g.abs().unwrap().sum_all().unwrap().to_scalar().unwrap();
+            assert!(mag > 0.0, "master adapter received a zero gradient");
+        }
     }
 
     #[test]

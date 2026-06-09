@@ -29,7 +29,7 @@
 //!
 //! [`Trainer`]: crate::trainer::Trainer
 
-use candle_core::{IndexOp, Result as CandleResult, Tensor, Var, D};
+use candle_core::{DType, IndexOp, Result as CandleResult, Tensor, Var, D};
 use candle_nn::ops::log_softmax;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
 
@@ -39,7 +39,9 @@ use crate::qwen::QwenGradModel;
 /// A [`Policy`] backed by the grad-bearing [`QwenGradModel`].
 ///
 /// Construct it from a loaded model with [`QwenPolicy::new`]; the device and dtype
-/// follow the model's (F32 on either CPU or CUDA for the current phase).
+/// follow the model's — all-F32, or the bf16-base / F32-adapter split (see
+/// [`QwenGradModel::load_with_adapter_dtype`](crate::qwen::QwenGradModel::load_with_adapter_dtype)),
+/// whose BF16 logits the scoring path upcasts to F32 for the surrogate.
 pub struct QwenPolicy {
     model: QwenGradModel,
     sampler: LogitsProcessor,
@@ -141,7 +143,14 @@ impl Policy for QwenPolicy {
 
         // The positions that predict the completion tokens are
         // [prompt_len - 1 .. prompt_len - 1 + comp_len].
-        let pred = logits.narrow(1, prompt_len - 1, comp_len)?;
+        // Upcast just the completion-position logits (a small `[g, comp_len, vocab]`
+        // slice, NOT the full sequence) to F32 before the log-softmax, so the
+        // surrogate's log-probs keep F32 precision even when the model runs in BF16
+        // (the dtype split); the big full-sequence logits stay BF16. A no-op when the
+        // model is already F32.
+        let pred = logits
+            .narrow(1, prompt_len - 1, comp_len)?
+            .to_dtype(DType::F32)?;
         let logp = log_softmax(&pred, D::Minus1)?;
 
         let mut tgt_data = Vec::with_capacity(g * comp_len);
