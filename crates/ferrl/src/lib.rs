@@ -51,9 +51,11 @@
 //! optimizers *silently* skip params missing from the grad store (see [`lora`]).
 //! The custom [`qwen`] forward is pinned to candle's shipped Qwen3 forward by a
 //! per-position equivalence oracle — on a tiny config in CI and on the real
-//! `Qwen3-0.6B-Base` checkpoint in `#[ignore]`d, weights-gated tests. One oracle
-//! remains **planned, not yet implemented**: an end-to-end finite-difference
-//! gradcheck of the loss (with the trainer).
+//! `Qwen3-0.6B-Base` checkpoint in `#[ignore]`d, weights-gated tests. Finally, an
+//! end-to-end **finite-difference gradcheck** pins candle's analytic gradient of
+//! the GRPO loss — the exact `grpo_loss` the trainer back-propagates — against
+//! central differences w.r.t. the `LoRA` parameters, exercising the clipped
+//! surrogate, the k3 KL penalty, and both masked reductions.
 //!
 //! ## Stability
 //!

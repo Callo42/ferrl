@@ -33,7 +33,7 @@ use ferrl::policy::{GenConfig, Policy, Rollout};
 use ferrl::reward::RewardFn;
 use ferrl::telemetry::RunDir;
 use ferrl::trainer::{TokenizerLike, Trainer, TrainerConfig, TrainerError};
-use ferrl::Metrics;
+use ferrl::{LossType, Metrics, ScaleRewards};
 
 /// Toy vocabulary size; the (full-rank) `LoRA` rank equals it, so a rank-`VOCAB`
 /// adapter can represent the whole echo map.
@@ -400,6 +400,58 @@ fn gate_reward_trends_up() {
         "reward did not trend up: early-40 mean={early}, late-40 mean={late}"
     );
     assert!(late > 0.5, "final reward too low: late-40 mean={late}");
+}
+
+#[test]
+fn gate_dr_grpo_paper_config_learns() {
+    // The Dr.GRPO *paper* config — the DrGrpo reduction AND ScaleRewards::None
+    // (centered-only advantages) — driven end-to-end through Trainer::train for the
+    // first time (both non-default variants are otherwise only tensor-/oracle-unit
+    // tested). It must learn the echo map.
+    //
+    // Honest scope: for this toy the DrGrpo reduction is *numerically identical* to
+    // classic Grpo. The two diverge only on ragged / padded masks, and the toy always
+    // produces rectangular, all-ones masks (the trainer rejects ragged rollouts;
+    // variable-length / EOS masking is deferred). So what this gate uniquely proves is
+    // (a) ScaleRewards::None — the variant that genuinely changes the trajectory —
+    // learns through the real loop, and (b) the DrGrpo config path runs end-to-end
+    // without error. The reductions' distinct denominators are pinned where they
+    // actually differ — the tensor test `masked_mean_tensor_matches_scalar_oracle_*`
+    // and the gradcheck `gradcheck_dr_grpo_with_kl`, both on ragged masks.
+    //
+    // Wide margins on purpose — the trajectory is seeded but platform-dependent (float
+    // non-associativity), like the other reward-trend gates. lr is kept modest (low
+    // overshoot risk on a numerically-different CI CPU); the un-std-scaled advantages
+    // already converge near 1 on the dev host, so `late > 0.5` keeps ample slack.
+    let mut policy = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 17, TEMP).unwrap();
+    let prompts = echo_prompts(VOCAB);
+    let cfg = TrainerConfig {
+        steps: 500,
+        group_size: 32,
+        max_new_tokens: 1,
+        temperature: TEMP,
+        lr: 0.1,
+        loss_type: LossType::DrGrpo,
+        scale_rewards: ScaleRewards::None,
+        ..TrainerConfig::default()
+    };
+    let tmp = TempDir::new("drgrpo-paper");
+    let run = RunDir::create(tmp.path(), "echo").unwrap();
+    let mut trainer = Trainer::new(cfg, &run).unwrap();
+    let history = trainer
+        .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
+        .unwrap();
+
+    let early = window_mean(&history[..40]);
+    let late = window_mean(&history[history.len() - 40..]);
+    assert!(
+        late > early + 0.2,
+        "Dr.GRPO paper config did not learn: early-40 mean={early}, late-40 mean={late}"
+    );
+    assert!(
+        late > 0.5,
+        "Dr.GRPO paper config final reward too low: late-40 mean={late}"
+    );
 }
 
 #[test]
