@@ -20,6 +20,11 @@
 //!
 //! Disabling the adapter ([`LoraLinear::set_enabled`]) drops the update term,
 //! yielding the frozen base distribution — the GRPO reference policy.
+//!
+//! For the cached rollout path, [`LoraLinear::merged_weight`] folds the live
+//! adapter into one frozen, tape-detached weight `W + (alpha/rank) · B @ A`
+//! (or just `W` when disabled), so a KV-cached decoder can apply the adapter
+//! as a single plain matmul per step. The grad/scoring path never uses it.
 
 use candle_core::{DType, Result as CandleResult, Tensor, Var};
 
@@ -130,6 +135,60 @@ impl LoraLinear {
     #[must_use]
     pub fn scale(&self) -> f64 {
         self.scale
+    }
+
+    /// The frozen base bias, if any — unchanged by the adapter (`LoRA` updates
+    /// only the weight), exposed so a merged-weight forward can apply the same
+    /// bias the unmerged [`forward`](Self::forward) applies.
+    #[must_use]
+    pub fn base_bias(&self) -> Option<&Tensor> {
+        self.base_bias.as_ref()
+    }
+
+    /// The single effective weight the **current** forward applies: `W` when the
+    /// adapter is disabled, `W + scale · (B @ A)` when enabled — so
+    /// `x @ merged_weight()ᵀ (+ bias)` reproduces [`forward`](Self::forward)`(x)`
+    /// up to matmul-associativity rounding, at every toggle state.
+    ///
+    /// The merge uses the **same cast order as the forward**: the (possibly
+    /// higher-precision master) factors are cast down to the base dtype *before*
+    /// the matmul, so the merged weight sees exactly the adapter the activations
+    /// would see — not a higher-precision variant of it.
+    ///
+    /// The result is a plain frozen [`Tensor`], **detached** from the autograd
+    /// tape: it is an op-free non-variable leaf (the factors are detached and the
+    /// result is re-detached), so a forward built from it can never carry
+    /// gradient into (or out of) the adapter. It is a *snapshot* of the live
+    /// factor values — recompute it after any optimizer step **or any
+    /// [`set_enabled`](Self::set_enabled) change** (the cached-rollout decoder
+    /// rebuilds it per `generate()` call, which covers both and makes staleness
+    /// structurally impossible).
+    ///
+    /// At BF16, merge fidelity is bounded by half-ulp of `W` per element: an
+    /// adapter contribution below ~0.2 % of the corresponding base-weight element
+    /// is absorbed into `W` by rounding (very early in training the merged
+    /// rollout policy can equal the base policy exactly while the scoring
+    /// forward sees a slightly adapted one). This is inherent reassociation
+    /// rounding — any merge has it — and the grad/scoring path is unaffected.
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if the dtype cast, matmul, or add fails.
+    pub fn merged_weight(&self) -> CandleResult<Tensor> {
+        if !self.enabled {
+            // detach() so the result is an op-free leaf even if a caller ever
+            // constructed the layer from a tape-tracked base tensor.
+            return Ok(self.base_weight.detach());
+        }
+        let dtype = self.base_weight.dtype();
+        // The detached/cast factors may still ALIAS the live Var storage (candle's
+        // detach shares storage; a same-dtype to_dtype is a clone). The snapshot
+        // guarantee holds because matmul/affine/add below all allocate fresh
+        // storage — no fast path may ever return a cast/detached factor directly.
+        let a = self.a.as_tensor().detach().to_dtype(dtype)?;
+        let b = self.b.as_tensor().detach().to_dtype(dtype)?;
+        let delta = (b.matmul(&a)? * self.scale)?;
+        Ok((&self.base_weight + &delta)?.detach())
     }
 
     /// Forward pass `y = x Wᵀ (+ b) [+ scale · (x Aᵀ) Bᵀ]`.
@@ -324,6 +383,176 @@ mod tests {
             .to_scalar()
             .unwrap();
         assert!(diff < 1e-6);
+    }
+
+    /// Max-abs elementwise difference between two tensors, as f32.
+    fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
+        (a - b)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_scalar()
+            .unwrap()
+    }
+
+    /// A `LoRA` layer with both factors forced to non-trivial values, so the
+    /// adapter genuinely moves the output (zero-B init would make every merge
+    /// test vacuously pass on `delta == 0`).
+    fn nonzero_lora(out: usize, in_: usize, rank: usize, alpha: f64) -> LoraLinear {
+        let l = LoraLinear::new(base(out, in_), None, rank, alpha).unwrap();
+        let a_data: Vec<f32> = (0..rank * in_).map(|i| 0.3 - i as f32 * 0.07).collect();
+        l.a.set(&Tensor::from_vec(a_data, (rank, in_), &Device::Cpu).unwrap())
+            .unwrap();
+        let b_data: Vec<f32> = (0..out * rank).map(|i| 0.1 + i as f32 * 0.05).collect();
+        l.b.set(&Tensor::from_vec(b_data, (out, rank), &Device::Cpu).unwrap())
+            .unwrap();
+        l
+    }
+
+    #[test]
+    fn merged_weight_equals_base_at_zero_b_init() {
+        // B = 0 ⇒ delta = scale·B@A = 0 ⇒ the merged weight IS the base weight.
+        let w = base(4, 3);
+        let l = LoraLinear::new(w.clone(), None, 2, 8.0).unwrap();
+        let m = l.merged_weight().unwrap();
+        assert_eq!(m.dims(), w.dims());
+        assert_eq!(max_abs_diff(&m, &w), 0.0);
+    }
+
+    #[test]
+    fn merged_forward_matches_lora_forward_with_nonzero_factors() {
+        // THE faithfulness property: x @ merged_weight()ᵀ == forward(x) for a
+        // genuinely non-trivial adapter, up to matmul-associativity rounding.
+        let l = nonzero_lora(4, 3, 2, 8.0);
+        let x = Tensor::from_vec(
+            vec![0.5f32, -1.0, 2.0, 1.5, 0.0, -0.5],
+            (2, 3),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let want = l.forward(&x).unwrap();
+        let got = x
+            .broadcast_matmul(&l.merged_weight().unwrap().t().unwrap())
+            .unwrap();
+        let md = max_abs_diff(&got, &want);
+        assert!(
+            md <= 1e-5,
+            "merged forward diverged from LoRA forward: {md}"
+        );
+        // And the adapter is genuinely non-trivial (the property is not vacuous).
+        let base_y = x.broadcast_matmul(&base(4, 3).t().unwrap()).unwrap();
+        assert!(max_abs_diff(&want, &base_y) > 1e-3, "adapter was a no-op");
+    }
+
+    #[test]
+    fn merged_weight_respects_the_adapter_toggle() {
+        // Disabled ⇒ the merged weight is the pure base (the eval/base-rollout
+        // case); enabled ⇒ it differs. `x @ mergedᵀ == forward(x)` must hold at
+        // BOTH toggle states — that is what lets a per-generate rebuild serve the
+        // adapter-on policy rollout and the adapter-off eval rollout unchanged.
+        let mut l = nonzero_lora(4, 3, 2, 8.0);
+        let w = base(4, 3);
+        let on = l.merged_weight().unwrap();
+        assert!(
+            max_abs_diff(&on, &w) > 1e-3,
+            "enabled merge ignored the adapter"
+        );
+
+        l.set_enabled(false);
+        let off = l.merged_weight().unwrap();
+        assert_eq!(max_abs_diff(&off, &w), 0.0);
+        let x = Tensor::from_vec(vec![1.0f32, -2.0, 0.5], (1, 3), &Device::Cpu).unwrap();
+        let want = l.forward(&x).unwrap();
+        let got = x.broadcast_matmul(&off.t().unwrap()).unwrap();
+        assert!(max_abs_diff(&got, &want) <= 1e-6);
+    }
+
+    #[test]
+    fn merged_weight_with_bias_reproduces_forward() {
+        // The merge covers only the weight; the caller applies the (unchanged)
+        // frozen bias via `base_bias()`. Together they reproduce forward().
+        let bias = Tensor::from_vec(vec![10.0f32, -3.0, 0.25, 7.5], 4, &Device::Cpu).unwrap();
+        let l = LoraLinear::new(base(4, 3), Some(bias.clone()), 2, 8.0).unwrap();
+        l.b.set(&Tensor::ones((4, 2), DType::F32, &Device::Cpu).unwrap())
+            .unwrap();
+        let x = Tensor::from_vec(vec![0.5f32, 1.0, -1.5], (1, 3), &Device::Cpu).unwrap();
+        let want = l.forward(&x).unwrap();
+        let got = x
+            .broadcast_matmul(&l.merged_weight().unwrap().t().unwrap())
+            .unwrap()
+            .broadcast_add(l.base_bias().unwrap())
+            .unwrap();
+        let md = max_abs_diff(&got, &want);
+        assert!(md <= 1e-5, "merged + bias diverged from forward: {md}");
+    }
+
+    #[test]
+    fn merged_weight_casts_factors_down_before_the_matmul() {
+        // Pin the cast ORDER under the dtype split, not just the result dtype.
+        // F32 base / F64 adapter, with A built for catastrophic cancellation:
+        // delta = B@A = 1·(1e8 + 0.25) + 1·(−1e8). Cast-to-F32-then-matmul (the
+        // forward's order) rounds 1e8 + 0.25 → 1e8 ⇒ delta == 0 exactly; a
+        // matmul-in-F64-then-cast merge would keep delta == 0.25 — far above any
+        // rounding tolerance, so the wrong order cannot sneak through.
+        let w = base(1, 1);
+        let l = LoraLinear::with_adapter_dtype(w.clone(), None, 2, 2.0, DType::F64).unwrap();
+        l.a.set(&Tensor::from_vec(vec![1.0e8f64 + 0.25, -1.0e8], (2, 1), &Device::Cpu).unwrap())
+            .unwrap();
+        l.b.set(&Tensor::from_vec(vec![1.0f64, 1.0], (1, 2), &Device::Cpu).unwrap())
+            .unwrap();
+        let m = l.merged_weight().unwrap();
+        assert_eq!(m.dtype(), DType::F32, "the merge runs in the base dtype");
+        assert_eq!(
+            max_abs_diff(&m, &w),
+            0.0,
+            "merge multiplied the F64 masters before casting down — it must cast \
+             to the base dtype first, exactly as the forward does"
+        );
+    }
+
+    #[test]
+    fn merged_weight_is_detached_from_the_tape() {
+        // Structural guarantee: a loss built from the merged weight reaches
+        // NEITHER LoRA factor — the rollout forward can never leak gradient into
+        // the adapter (or drag the rollout graph onto the tape).
+        let l = nonzero_lora(4, 3, 2, 8.0);
+        let x = Tensor::from_vec(vec![1.0f32, 2.0, 3.0], (1, 3), &Device::Cpu).unwrap();
+        let loss = x
+            .broadcast_matmul(&l.merged_weight().unwrap().t().unwrap())
+            .unwrap()
+            .sqr()
+            .unwrap()
+            .sum_all()
+            .unwrap();
+        let grads = loss.backward().unwrap();
+        for v in l.trainable_vars() {
+            assert!(
+                grads.get(v.as_tensor()).is_none(),
+                "merged_weight leaked a grad path into a LoRA factor"
+            );
+        }
+    }
+
+    #[test]
+    fn merged_weight_reflects_live_var_values() {
+        // The merge is a snapshot of the LIVE factors: after an (optimizer-style)
+        // in-place Var update, a fresh merge differs from the stale one — the
+        // per-generate rebuild is what keeps the cached rollout current.
+        let l = nonzero_lora(4, 3, 2, 8.0);
+        let before = l.merged_weight().unwrap();
+        let bumped = ((l.b.as_tensor() + 0.5).unwrap()).detach();
+        l.b.set(&bumped).unwrap();
+        let after = l.merged_weight().unwrap();
+        assert!(
+            max_abs_diff(&after, &before) > 1e-3,
+            "merged_weight did not track an in-place Var update"
+        );
     }
 
     #[test]
