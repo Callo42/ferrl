@@ -18,11 +18,20 @@
 //! - the [`policy`] abstraction over generation and per-token log-probabilities;
 //! - a manual `LoRA` adapter ([`lora`]);
 //! - grad-safe building blocks and the grad-coverage canary ([`nn`]);
+//! - the model-generality seam ([`model`]) — the [`GradModel`] / [`CachedDecoder`]
+//!   traits: the entire surface a model must provide (grad-bearing full-sequence
+//!   forward, trainable `LoRA` vars, adapter toggle, merged cached decoder) for
+//!   the generic policy to RL-fine-tune it;
+//! - architecture-neutral decoder building blocks ([`blocks`]) — frozen linear,
+//!   GQA `repeat_kv`, rotate-half `RoPE` tables, and the causal-mask builders,
+//!   shared by every model implementation;
 //! - a grad-bearing, uncached `Qwen3` forward ([`qwen`]) — the trainable update
-//!   path, weight-identical to candle's shipped (no-grad) forward;
-//! - a [`Policy`] over the real model ([`qwen_policy`]) — [`QwenPolicy`] wraps that
-//!   grad forward as the trainer's policy seam, with uncached, adapter-aware
-//!   rollout, so the same `Trainer` drives Qwen3 as the P2 toy;
+//!   path, weight-identical to candle's shipped (no-grad) forward; the first
+//!   [`GradModel`] implementor;
+//! - a [`Policy`] over any [`GradModel`] ([`lm_policy`]) — [`LmPolicy`] wraps a
+//!   grad forward as the trainer's policy seam, with KV-cached, adapter-aware
+//!   rollout; [`QwenPolicy`] is its Qwen3 instantiation, so the same `Trainer`
+//!   drives Qwen3 as the P2 toy;
 //! - a ferrl-owned rollout sampler ([`sampler`]) — [`GrpoSampler`] reproduces
 //!   candle's temperature multinomial sampling on a `serde`-serializable
 //!   `Xoshiro256PlusPlus`, so the rollout RNG can be captured and restored for
@@ -75,17 +84,19 @@
 //! Pre-`1.0`: the public surface may change between minor versions.
 #![forbid(unsafe_code)]
 
+pub mod blocks;
 pub mod checkpoint;
 pub mod countdown;
 pub mod cuda_compat;
 pub mod eval;
 pub mod grpo;
+pub mod lm_policy;
 pub mod lora;
+pub mod model;
 pub mod nn;
 pub mod optim;
 pub mod policy;
 pub mod qwen;
-pub mod qwen_policy;
 pub mod reward;
 pub mod sampler;
 pub mod telemetry;
@@ -112,6 +123,10 @@ pub use grpo::{
     ScaleRewards, GROUP_STD_EPS,
 };
 #[doc(inline)]
+pub use lm_policy::{LmPolicy, QwenPolicy};
+#[doc(inline)]
+pub use model::{CachedDecoder, GradModel};
+#[doc(inline)]
 pub use nn::{grad_coverage, GradCoverage, RmsNorm};
 #[doc(inline)]
 pub use optim::{FerrlAdamW, OptimizerState};
@@ -119,8 +134,6 @@ pub use optim::{FerrlAdamW, OptimizerState};
 pub use policy::Policy;
 #[doc(inline)]
 pub use qwen::{MergedDecoder, QwenGradModel};
-#[doc(inline)]
-pub use qwen_policy::QwenPolicy;
 #[doc(inline)]
 pub use reward::RewardFn;
 #[doc(inline)]

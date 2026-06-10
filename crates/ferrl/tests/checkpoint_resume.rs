@@ -1,7 +1,7 @@
 //! Checkpoint / resume / eval through the real `QwenPolicy` path (tiny CPU model).
 //!
 //! These are the P4-PR2 deliverables exercised end-to-end on a runnable-on-CPU
-//! Qwen3 config (the same tiny scaffold `qwen.rs`/`qwen_policy.rs` use in-crate):
+//! Qwen3 config (the same tiny scaffold `qwen.rs`/`lm_policy.rs` use in-crate):
 //!
 //! 1. an adapter saved from one model loads bit-exactly into a *fresh* model and
 //!    changes its forward (proving [`load_adapter`] writes through the aliasing
