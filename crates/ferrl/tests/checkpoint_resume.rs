@@ -15,12 +15,13 @@ use std::path::{Path, PathBuf};
 
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{Activation, VarBuilder};
+use candle_transformers::models::llama::Config as LlamaConfig;
 use candle_transformers::models::qwen3::Config;
 
 use ferrl::policy::{GenConfig, Rollout};
 use ferrl::{
-    evaluate, load_adapter, save_adapter, EvalReport, Policy, QwenGradModel, QwenPolicy, RewardFn,
-    RunDir, TokenizerLike, Trainer, TrainerConfig,
+    evaluate, load_adapter, save_adapter, EvalReport, LlamaGradModel, LlamaPolicy, Policy,
+    QwenGradModel, QwenPolicy, RewardFn, RunDir, TokenizerLike, Trainer, TrainerConfig,
 };
 
 const RANK: usize = 2;
@@ -224,6 +225,129 @@ fn adapter_round_trips_into_a_fresh_model() {
     assert_eq!(
         logp_src, logp_dst_after,
         "loaded adapter must reproduce src's scores bit-for-bit"
+    );
+}
+
+/// A tiny dense-Llama config (2 layers, 2 Q / 1 KV head, derived `head_dim` 4)
+/// — the same scaffold `llama.rs`/`lm_policy.rs` use, at a runnable CPU scale.
+fn llama_tiny_cfg() -> LlamaConfig {
+    LlamaConfig {
+        hidden_size: 8,
+        intermediate_size: 16,
+        vocab_size: 16,
+        num_hidden_layers: 2,
+        num_attention_heads: 2,
+        num_key_value_heads: 1,
+        use_flash_attn: false,
+        rms_norm_eps: 1e-6,
+        rope_theta: 10000.0,
+        bos_token_id: None,
+        eos_token_id: None,
+        rope_scaling: None,
+        max_position_embeddings: 32,
+        tie_word_embeddings: true,
+    }
+}
+
+/// Random weights matching the llama dotted tensor names (tied head → no
+/// `lm_head.weight`; no QK-norm tensors, no biases).
+fn llama_weight_map(cfg: &LlamaConfig) -> HashMap<String, Tensor> {
+    let d = Device::Cpu;
+    let mut t: HashMap<String, Tensor> = HashMap::new();
+    let mut put = |name: &str, dims: &[usize]| {
+        t.insert(
+            name.to_string(),
+            Tensor::randn(0f32, 0.2f32, dims.to_vec(), &d).unwrap(),
+        );
+    };
+    let h = cfg.hidden_size;
+    let i = cfg.intermediate_size;
+    let head_dim = cfg.hidden_size / cfg.num_attention_heads;
+    let qo = cfg.num_attention_heads * head_dim;
+    let kvo = cfg.num_key_value_heads * head_dim;
+    put("model.embed_tokens.weight", &[cfg.vocab_size, h]);
+    put("model.norm.weight", &[h]);
+    for l in 0..cfg.num_hidden_layers {
+        let p = format!("model.layers.{l}");
+        put(&format!("{p}.input_layernorm.weight"), &[h]);
+        put(&format!("{p}.post_attention_layernorm.weight"), &[h]);
+        put(&format!("{p}.self_attn.q_proj.weight"), &[qo, h]);
+        put(&format!("{p}.self_attn.k_proj.weight"), &[kvo, h]);
+        put(&format!("{p}.self_attn.v_proj.weight"), &[kvo, h]);
+        put(&format!("{p}.self_attn.o_proj.weight"), &[h, qo]);
+        put(&format!("{p}.mlp.gate_proj.weight"), &[i, h]);
+        put(&format!("{p}.mlp.up_proj.weight"), &[i, h]);
+        put(&format!("{p}.mlp.down_proj.weight"), &[h, i]);
+    }
+    t
+}
+
+#[test]
+fn llama_adapter_round_trips_into_a_fresh_model() {
+    // The M1 mirror of `adapter_round_trips_into_a_fresh_model`: the adapter
+    // checkpoint POSITIONAL contract (`trainable_vars()` order is the schema —
+    // see `checkpoint.rs`) must hold for the second `GradModel` too. Save from
+    // a trained-ish LlamaPolicy, load into a fresh model over the same base
+    // weights, and the forwards must agree bit-for-bit.
+    let cfg = llama_tiny_cfg();
+    let weights = llama_weight_map(&cfg);
+    let policy_over = |w: &HashMap<String, Tensor>| -> LlamaPolicy {
+        let vb = VarBuilder::from_tensors(w.clone(), DType::F32, &Device::Cpu);
+        LlamaPolicy::new(
+            LlamaGradModel::load(&cfg, &vb, RANK, ALPHA).unwrap(),
+            SEED,
+            1.0,
+        )
+    };
+    // Two models over the SAME base weights, independent fresh adapters.
+    let src = policy_over(&weights);
+    let dst = policy_over(&weights);
+    let rollout = fixed_rollout();
+
+    // Force `src`'s adapter to a clearly non-zero ("trained-ish") state so it
+    // diverges from the zero-B `dst`.
+    for v in &src.trainable_vars() {
+        let dims = v.as_tensor().dims().to_vec();
+        v.set(&Tensor::randn(0f32, 0.1f32, dims, &Device::Cpu).unwrap())
+            .unwrap();
+    }
+    let logp_src = src
+        .token_logprobs(&rollout)
+        .unwrap()
+        .to_vec2::<f32>()
+        .unwrap();
+    let logp_dst_before = dst
+        .token_logprobs(&rollout)
+        .unwrap()
+        .to_vec2::<f32>()
+        .unwrap();
+    // Premise: the non-zero adapter actually moved src's scores off dst's
+    // (otherwise the bit-equality below would be vacuous).
+    let max_diff = logp_src
+        .iter()
+        .flatten()
+        .zip(logp_dst_before.iter().flatten())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_diff > 1e-4,
+        "forced adapter did not change scores: {max_diff}"
+    );
+
+    // Save src's adapter, load it into dst: forwards must now agree bit-for-bit.
+    let tmp = TempDir::new("llama-roundtrip");
+    save_adapter(tmp.path(), &src.trainable_vars(), 0).unwrap();
+    let manifest = load_adapter(tmp.path(), &dst.trainable_vars()).unwrap();
+    assert_eq!(manifest.num_vars, src.trainable_vars().len());
+
+    let logp_dst_after = dst
+        .token_logprobs(&rollout)
+        .unwrap()
+        .to_vec2::<f32>()
+        .unwrap();
+    assert_eq!(
+        logp_src, logp_dst_after,
+        "loaded Llama adapter must reproduce src's scores bit-for-bit"
     );
 }
 

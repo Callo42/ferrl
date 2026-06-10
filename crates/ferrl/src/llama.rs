@@ -37,7 +37,18 @@
 //! - `rope_scaling`: `None` (or `Some` with `rope_type: Default`) is the plain
 //!   `1/theta^(2i/d)` family; `Some` with `rope_type: Llama3` applies the llama3
 //!   wavelength-smoothing rescale to the inv-freqs at table-build time — both
-//!   mirrored from the shipped `Cache::new` and pinned by the equivalence gates.
+//!   mirrored from the shipped `Cache::new`, pinned by exact-value inv-freq
+//!   pins (every smoothing branch) plus the equivalence gates.
+//!
+//! ## What is NOT yet validated: the bf16 path
+//!
+//! Every CI test here runs on CPU at F32, where the attention force-cast pair
+//! is a same-dtype `to_dtype` — an op-free clone, structurally absent from the
+//! autograd graph. The bf16-only behaviors (a real `ToDType` node's backward
+//! through the attention cast, bf16 logit equivalence vs shipped, bf16
+//! merged-weight fidelity) are **not** covered by this module's tests; they
+//! await the Llama real-weights GPU gate (a follow-up, mirroring how the Qwen
+//! path was validated on real hardware before its bf16 rollout).
 
 use candle_core::{DType, Device, Result as CandleResult, Tensor, Var, D};
 use candle_nn::kv_cache::ConcatKvCache;
@@ -359,6 +370,19 @@ impl LlamaGradModel {
                  would silently produce non-parity logits)"
             );
         }
+        // head_dim is DERIVED as hidden_size / num_attention_heads (the llama
+        // Config has no head_dim field). The shipped loader trips a reshape
+        // error deep in the forward when the division truncates; we would
+        // silently run a degenerate (non-parity) model — so reject it at load.
+        if cfg.hidden_size % cfg.num_attention_heads != 0 {
+            candle_core::bail!(
+                "LlamaGradModel: hidden_size {} is not divisible by num_attention_heads {} \
+                 (head_dim is derived as their quotient; such a config cannot be a real \
+                 Llama and would silently load as a degenerate model)",
+                cfg.hidden_size,
+                cfg.num_attention_heads
+            );
+        }
         let h = cfg.hidden_size;
         let embed = vb
             .pp("model.embed_tokens")
@@ -644,6 +668,17 @@ impl LlamaMergedDecoder {
         let mut layers = Vec::with_capacity(model.layers.len());
         for layer in &model.layers {
             let a = &layer.attn;
+            // This snapshot applies NO bias (the llama family has none, and
+            // `load` hard-codes `None`) — if a future construction path ever
+            // hands q/v a biased LoraLinear, fail loud here rather than let the
+            // cached rollout silently diverge from the biased uncached forward.
+            if a.q_proj.base_bias().is_some() || a.v_proj.base_bias().is_some() {
+                candle_core::bail!(
+                    "LlamaMergedDecoder: q_proj/v_proj carry a base bias, but this merged \
+                     snapshot is bias-free (extend LlamaMergedAttention to apply base_bias() \
+                     before using a biased adapter here)"
+                );
+            }
             layers.push(LlamaMergedLayer {
                 ln1: layer.ln1.clone(),
                 attn: LlamaMergedAttention {
@@ -754,10 +789,50 @@ mod tests {
     use super::*;
     use crate::nn::grad_coverage;
     use candle_transformers::models::llama::{Cache, Llama};
+    use rand::rngs::Xoshiro256PlusPlus;
+    use rand::{RngExt, SeedableRng};
     use std::collections::HashMap;
 
     fn dev() -> Device {
         Device::Cpu
+    }
+
+    /// Seed for the deterministic test-weight RNG. The weights MUST be seeded:
+    /// with unseeded `Tensor::randn` a real forward bug shows up as an
+    /// *intermittent* CI failure (each run draws fresh weights), which reads as
+    /// flake and gets retried into green. Seeded weights make every gate
+    /// reproduce identically on every run.
+    const WEIGHT_SEED: u64 = 0x4C4C_414D_4131; // "LLAMA1"
+
+    /// Weight std for the tiny test models. At the original `N(0, 0.2)` and
+    /// hidden 8, attention was near-uniform (scores ≈ 1/seq for every key), so
+    /// even deleting `RoPE` moved the logits by less than the gate envelopes —
+    /// the equivalence gates were close to vacuous. `N(0, 1)` makes attention
+    /// decisively non-uniform at these dims (measured; see the gate envelopes).
+    const WEIGHT_STD: f32 = 1.0;
+
+    /// Deterministic `N(0, std)` tensor: seeded Xoshiro (the same RNG family as
+    /// `crate::sampler`) + Box–Muller, since `rand` alone ships no Normal
+    /// distribution and candle's CPU device rejects `set_seed`.
+    fn seeded_randn(
+        rng: &mut Xoshiro256PlusPlus,
+        std: f32,
+        dims: &[usize],
+        device: &Device,
+    ) -> Tensor {
+        let n: usize = dims.iter().product();
+        let mut v = Vec::with_capacity(n + 1);
+        while v.len() < n {
+            // Box–Muller: two uniforms -> two independent standard normals.
+            let u1: f32 = rng.random::<f32>().max(f32::MIN_POSITIVE);
+            let u2: f32 = rng.random();
+            let r = (-2.0f32 * u1.ln()).sqrt();
+            let (sin, cos) = (2.0 * std::f32::consts::PI * u2).sin_cos();
+            v.push(std * r * cos);
+            v.push(std * r * sin);
+        }
+        v.truncate(n);
+        Tensor::from_vec(v, dims.to_vec(), device).unwrap()
     }
 
     /// A tiny dense-Llama config (2 layers, 2 Q / 1 KV head → real GQA, derived
@@ -805,17 +880,20 @@ mod tests {
         }
     }
 
-    /// Random weights matching `cfg`'s dotted tensor names (incl.
-    /// `lm_head.weight` only when untied — the tied map must NOT carry it, so a
-    /// shared `VarBuilder` proves neither loader requires it). Norm weights are
-    /// 1-D `[n]`, projections `[out, in]`. No QK-norm tensors, no biases.
+    /// Deterministic (seeded — see [`WEIGHT_SEED`]) random weights matching
+    /// `cfg`'s dotted tensor names (incl. `lm_head.weight` only when untied —
+    /// the tied map must NOT carry it, so a shared `VarBuilder` proves neither
+    /// loader requires it). Norm weights are 1-D `[n]`, projections
+    /// `[out, in]`. No QK-norm tensors, no biases. Insertion order is fixed,
+    /// so every call yields bit-identical tensors.
     fn weight_map(cfg: &Config) -> HashMap<String, Tensor> {
         let d = dev();
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(WEIGHT_SEED);
         let mut t: HashMap<String, Tensor> = HashMap::new();
         let mut put = |name: &str, dims: &[usize]| {
             t.insert(
                 name.to_string(),
-                Tensor::randn(0f32, 0.2f32, dims.to_vec(), &d).unwrap(),
+                seeded_randn(&mut rng, WEIGHT_STD, dims, &d),
             );
         };
         let h = cfg.hidden_size;
@@ -854,6 +932,38 @@ mod tests {
         Tensor::from_vec(v, (1, seq), &dev()).unwrap()
     }
 
+    // ---- gate envelopes ----------------------------------------------------
+    //
+    // All measured under the seeded `WEIGHT_SEED`/`WEIGHT_STD` weights (the
+    // measured worst per gate is recorded next to each constant; logit scale
+    // ≈ 6–7), then set with ~10–30x headroom for cross-host float
+    // reassociation (CI's CPU is not the dev host's — the P2 platform
+    // lesson; the floors themselves are deterministic under the seed). Tight
+    // envelopes are what make these gates non-vacuous: at the old 1e-3 with
+    // unseeded N(0, 0.2) weights, even removing RoPE entirely passed most
+    // draws, while here the RoPE-scaling signal alone is ~1.2 in logit space
+    // — four orders of magnitude above every envelope.
+
+    /// OUR uncached forward vs candle's SHIPPED forward (slow-twin vs fused
+    /// kernels over the same weights). Measured worst across the four
+    /// configs: 4.8e-6 → ~10x headroom.
+    const SHIPPED_TOL: f32 = 5e-5;
+
+    /// Cached (merged-decoder) vs OUR uncached forward, adapter armed — same
+    /// grad-safe ops on both sides, so only cache-chunking + merge
+    /// reassociation. Measured worst across the five gates: 3.4e-6 → ~15x.
+    const MERGED_TOL: f32 = 5e-5;
+
+    /// Cached base-only decode vs candle's shipped KV-cached forward (crosses
+    /// the slow-twin/fused-kernel gap AND the cache wiring). Measured worst
+    /// 1.7e-6 → ~30x.
+    const SHIPPED_CACHED_TOL: f32 = 5e-5;
+
+    /// The cache-only pin: cached base-only vs uncached base — identical ops,
+    /// the ONLY difference is incremental caching, so its floor is the lowest
+    /// of all (measured worst 9.6e-7); kept at ≥100x headroom.
+    const CACHE_PIN_TOL: f32 = 1e-4;
+
     /// Max absolute element-wise difference between two (broadcast-compatible)
     /// tensors.
     fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
@@ -891,30 +1001,63 @@ mod tests {
         // The dtype-split mechanism on a tiny model (same CPU surrogate as the
         // Qwen gate: F32 base / F64 adapter — candle's CPU backend has no bf16
         // matmul): the forward runs in the base dtype and the adapter masters
-        // receive their gradients in the adapter dtype.
+        // receive their gradients in the adapter dtype. Two-phase per-branch
+        // MAGNITUDE coverage (not just presence + dtype): a cast bug yielding
+        // present-but-ZERO grads must fail here, the same bar the all-F32
+        // grad test holds.
         let cfg = tiny_cfg();
         let vb = tiny_vb(&cfg); // F32 base
         let mut model =
             LlamaGradModel::load_with_adapter_dtype(&cfg, &vb, 2, 4.0, DType::F64).unwrap();
         model.set_adapter_enabled(true);
         let vars = model.trainable_vars();
-        // Force every B (odd indices: q_B, v_B per layer) nonzero so A also
-        // carries a live gradient through the backward.
-        for v in vars.iter().skip(1).step_by(2) {
-            let dims = v.as_tensor().dims().to_vec();
-            v.set(&Tensor::ones(dims, DType::F64, &dev()).unwrap())
-                .unwrap();
-        }
+        let (q_vars, v_vars) = branch_split(&vars);
 
+        // The forward itself stays in the base/activation dtype.
         let logits = model.forward(&ids(5)).unwrap();
         assert_eq!(
             logits.dtype(),
             DType::F32,
             "the forward runs in the base/activation dtype"
         );
-        let loss = logits.sqr().unwrap().sum_all().unwrap();
-        let grads = loss.backward().unwrap();
-        for v in &vars {
+
+        // Phase 1 — zero-B init: every var present in the grad store, each
+        // branch live (via dL/dB), all grads finite, and every grad lands in
+        // the MASTER dtype (F64), not the F32 compute dtype.
+        let g1 = backward_grads(&model);
+        assert!(
+            grad_coverage(&q_vars, &g1).unwrap().is_ok(),
+            "q-branch unhealthy at zero-B init under the dtype split"
+        );
+        assert!(
+            grad_coverage(&v_vars, &g1).unwrap().is_ok(),
+            "v-branch unhealthy at zero-B init under the dtype split"
+        );
+        assert_grads_in_master_dtype(&g1, &vars);
+
+        // Phase 2 — force every B nonzero (`force_b_nonzero` casts to the var
+        // dtype, F64 here): now EVERY A and B must carry a nonzero finite
+        // grad in the master dtype, proving the A-input path survives the
+        // dtype casts too.
+        force_b_nonzero(&vars);
+        let g2 = backward_grads(&model);
+        let qc = grad_coverage(&q_vars, &g2).unwrap();
+        let vc = grad_coverage(&v_vars, &g2).unwrap();
+        assert!(
+            qc.nonzero == qc.total && qc.nonfinite == 0,
+            "q-branch: not every dtype-split LoRA var is live after nonzero-B: {qc:?}"
+        );
+        assert!(
+            vc.nonzero == vc.total && vc.nonfinite == 0,
+            "v-branch: not every dtype-split LoRA var is live after nonzero-B: {vc:?}"
+        );
+        assert_grads_in_master_dtype(&g2, &vars);
+    }
+
+    /// Every var's gradient must land in the F64 MASTER dtype (the dtype-split
+    /// routing property), not the F32 compute dtype.
+    fn assert_grads_in_master_dtype(grads: &candle_core::backprop::GradStore, vars: &[Var]) {
+        for v in vars {
             let g = grads
                 .get(v.as_tensor())
                 .expect("adapter var missing from grad store");
@@ -954,13 +1097,18 @@ mod tests {
     }
 
     /// Set every `B` factor (the odd index within each `[A, B]` pair) to small
-    /// noise, so the update is no longer a no-op and `dL/dA` is no longer 0.
+    /// seeded noise, so the update is no longer a no-op and `dL/dA` is no
+    /// longer 0. Cast to each var's own dtype, so it also serves the
+    /// dtype-split (F64-adapter) model.
     fn force_b_nonzero(vars: &[Var]) {
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(WEIGHT_SEED ^ 0xB);
         for (i, v) in vars.iter().enumerate() {
             if i % 2 == 1 {
                 let dims = v.as_tensor().dims().to_vec();
-                v.set(&Tensor::randn(0f32, 0.02f32, dims, &dev()).unwrap())
+                let noise = seeded_randn(&mut rng, 0.02, &dims, &dev())
+                    .to_dtype(v.dtype())
                     .unwrap();
+                v.set(&noise).unwrap();
             }
         }
     }
@@ -968,8 +1116,12 @@ mod tests {
     #[test]
     fn lora_grads_flow_through_llama_backward() {
         // Two-phase, PER-BRANCH grad coverage through the full Llama backward
-        // (rms_norm_slow + rope_slow + grad-bearing softmax + the F32 cast pair
-        // on the q path; the always-grad-safe net on the v path).
+        // (rms_norm_slow + rope_slow + grad-bearing softmax on the q path; the
+        // always-grad-safe net on the v path). NOTE: at F32 the attention
+        // force-cast pair is a same-dtype `to_dtype` — an op-free clone,
+        // structurally ABSENT from this graph — so this test does NOT cover
+        // the bf16 `ToDType` backward (that awaits the Llama GPU gate; see the
+        // module docs).
         let cfg = tiny_cfg();
         let vb = tiny_vb(&cfg);
         let mut model = LlamaGradModel::load(&cfg, &vb, 2, 4.0).unwrap();
@@ -1036,19 +1188,13 @@ mod tests {
 
     #[test]
     fn adapter_toggle_changes_output_with_trained_b() {
-        // Force every LoRA B nonzero (odd trainable_vars indices), then assert
+        // Force every LoRA B nonzero (seeded, via arm_adapter), then assert
         // enabling the adapter changes the output — proving set_adapter_enabled
         // fans out to every layer's q_proj AND v_proj.
         let cfg = tiny_cfg();
         let vb = tiny_vb(&cfg);
         let mut model = LlamaGradModel::load(&cfg, &vb, 2, 4.0).unwrap();
-        for (i, v) in model.trainable_vars().iter().enumerate() {
-            if i % 2 == 1 {
-                let dims = v.as_tensor().dims().to_vec();
-                v.set(&Tensor::randn(0f32, 1f32, dims, &dev()).unwrap())
-                    .unwrap();
-            }
-        }
+        arm_adapter(&model);
         let input = ids(4);
         model.set_adapter_enabled(true);
         let on = model.forward(&input).unwrap();
@@ -1083,6 +1229,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn load_rejects_indivisible_head_dim() {
+        // hidden_size not divisible by num_attention_heads: the shipped model
+        // errors at a reshape mid-forward; ours derives a truncated head_dim
+        // and would silently run a degenerate non-parity model — so the load
+        // must fail loud instead (the P3 pattern).
+        let mut cfg = tiny_cfg();
+        cfg.hidden_size = 10; // 10 % 2 == 0 would pass; use 4 heads: 10 % 4 != 0
+        cfg.num_attention_heads = 4;
+        cfg.num_key_value_heads = 2;
+        let vb = tiny_vb(&cfg);
+        let err = LlamaGradModel::load(&cfg, &vb, 2, 4.0).unwrap_err();
+        assert!(
+            err.to_string().contains("num_attention_heads"),
+            "expected a divisibility rejection, got: {err}"
+        );
+    }
+
     // ---- equivalence vs candle's shipped llama::Llama ----------------------
 
     /// The shipped model's logits at position `t` (i.e. on the prefix
@@ -1114,7 +1278,7 @@ mod tests {
             let ours_t = ours_all.narrow(1, t, 1).unwrap(); // (1, 1, vocab)
             let md = max_abs_diff(&shipped_t, &ours_t);
             assert!(
-                md <= 1e-3,
+                md <= SHIPPED_TOL,
                 "full-seq logits at position {t} diverged from shipped: max-abs={md}"
             );
             worst = worst.max(md);
@@ -1146,9 +1310,82 @@ mod tests {
         // The llama3 RoPE-scaling branches, each pinned against shipped (whose
         // Cache::new computes the same smoothing): original_max 16 → the smooth
         // interpolation + scaled-down branches; original_max 28 → the
-        // pass-through + scaled-down branches. Together all three.
+        // pass-through + scaled-down branches. Together all three. (The exact
+        // per-branch numerics are pinned independently of weights by
+        // `inv_freq_pins_the_llama3_scaling_branches_exactly` — this gate then
+        // proves the scaled tables flow through the forward as shipped's do.)
         assert_matches_shipped_all_positions(&cfg_rope_scaled(16), 5);
         assert_matches_shipped_all_positions(&cfg_rope_scaled(28), 5);
+
+        // Non-vacuity premise: over the SAME weights, scaled-vs-unscaled
+        // tables must move the logits by MORE than the gate envelope — i.e.
+        // had we built unscaled tables, the gate above COULD have failed.
+        let scaled_cfg = cfg_rope_scaled(16);
+        let vb = tiny_vb(&scaled_cfg); // same weight shapes as tiny_cfg's
+        let mut scaled = LlamaGradModel::load(&scaled_cfg, &vb, 2, 4.0).unwrap();
+        scaled.set_adapter_enabled(false);
+        let mut plain = LlamaGradModel::load(&tiny_cfg(), &vb, 2, 4.0).unwrap();
+        plain.set_adapter_enabled(false);
+        let input = ids(5);
+        let premise = max_abs_diff(
+            &scaled.forward(&input).unwrap(),
+            &plain.forward(&input).unwrap(),
+        );
+        assert!(
+            premise > SHIPPED_TOL,
+            "rope-scaling moved the logits by only {premise} (≤ envelope {SHIPPED_TOL}) — \
+             the rope-scaled equivalence gate would be vacuous at these dims"
+        );
+    }
+
+    #[test]
+    fn inv_freq_pins_the_llama3_scaling_branches_exactly() {
+        // The weight-based equivalence gates alone CANNOT catch llama3
+        // smoothing-branch bugs at the tiny dims: a planted `freq` instead of
+        // `freq/factor`, or swapped smooth-interpolation weights, moved the
+        // logits by only ~4e-5..9e-5 (the pre-fix adversarial sweep measured
+        // 0/30 random draws failing). So pin `inv_freq_for` itself against
+        // HAND-COMPUTED values from the shipped `Cache::new` formula, one pin
+        // per smoothing branch — deterministic and independent of weights.
+        //
+        // Tiny config: head_dim 4 → two inv-freqs: freq0 = 1/10000^0 = 1.0,
+        // freq1 = 1/10000^(2/4) = 0.01. Scaling params: factor 8,
+        // low_freq_factor 1, high_freq_factor 4.
+        //
+        // The tolerance is f32-epsilon scale (≈8 ULP at these magnitudes; it
+        // only absorbs platform `powf`/rounding jitter), while the branch-bug
+        // deltas are ≥ 2.7e-2 (swapped smooth weights) and 8.75e-3 (unscaled
+        // low-freq) — 4+ orders of magnitude above it.
+        let tol = 1e-6f32;
+        let check = |got: Vec<f32>, want: [f32; 2], ctx: &str| {
+            assert_eq!(got.len(), want.len(), "{ctx}: inv-freq count");
+            for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                assert!(
+                    (g - w).abs() <= tol,
+                    "{ctx}: inv_freq[{i}] = {g}, want {w} (±{tol})"
+                );
+            }
+        };
+
+        // original_max 16: low_freq_wavelen 16, high_freq_wavelen 4.
+        //   freq0 = 1.0:  wavelen 2π ≈ 6.28319 ∈ (4, 16) → SMOOTH branch:
+        //     smooth = (16/2π − 1)/(4 − 1)            = 0.51549303
+        //     expect = (1 − smooth)·1.0/8 + smooth·1.0 = 0.57605640
+        //   freq1 = 0.01: wavelen 2π/0.01 ≈ 628.3 > 16 → SCALED: 0.01/8.
+        check(
+            inv_freq_for(&cfg_rope_scaled(16)),
+            [0.576_056_4, 0.001_25],
+            "original_max 16 (smooth + scaled branches)",
+        );
+
+        // original_max 28: low_freq_wavelen 28, high_freq_wavelen 7.
+        //   freq0 = 1.0:  wavelen ≈ 6.28319 < 7  → PASS-THROUGH: exactly 1.0.
+        //   freq1 = 0.01: wavelen ≈ 628.3   > 28 → SCALED: 0.01/8.
+        check(
+            inv_freq_for(&cfg_rope_scaled(28)),
+            [1.0, 0.001_25],
+            "original_max 28 (pass-through + scaled branches)",
+        );
     }
 
     #[test]
@@ -1176,15 +1413,16 @@ mod tests {
 
     // ---- LlamaMergedDecoder: cached-rollout equivalence gates ---------------
 
-    /// Force every `LoRA` B factor (odd `trainable_vars` indices) to small
+    /// Force every `LoRA` B factor (odd `trainable_vars` indices) to seeded
     /// random values so the adapter is a genuine perturbation, not the zero-B
-    /// no-op — the merge must then differ from the base.
+    /// no-op — the merge must then differ from the base. Seeded for the same
+    /// reason as the weights: the decoder-gate floors must be reproducible.
     fn arm_adapter(model: &LlamaGradModel) {
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(WEIGHT_SEED ^ 0xA);
         for (i, v) in model.trainable_vars().iter().enumerate() {
             if i % 2 == 1 {
                 let dims = v.as_tensor().dims().to_vec();
-                v.set(&Tensor::randn(0f32, 0.5f32, dims, &dev()).unwrap())
-                    .unwrap();
+                v.set(&seeded_randn(&mut rng, 0.5, &dims, &dev())).unwrap();
             }
         }
     }
@@ -1228,7 +1466,7 @@ mod tests {
             worst = worst.max(max_abs_diff(&logits_t, &reference.narrow(1, t, 1).unwrap()));
         }
         assert!(
-            worst <= 1e-3,
+            worst <= MERGED_TOL,
             "cached token-by-token decode diverged from uncached forward: {worst}"
         );
     }
@@ -1267,7 +1505,7 @@ mod tests {
             worst = worst.max(max_abs_diff(&logits_t, &reference.narrow(1, t, 1).unwrap()));
         }
         assert!(
-            worst <= 1e-3,
+            worst <= MERGED_TOL,
             "cached prefill+incremental decode diverged from uncached forward: {worst}"
         );
     }
@@ -1310,7 +1548,7 @@ mod tests {
             ));
         }
         assert!(
-            worst <= 1e-3,
+            worst <= MERGED_TOL,
             "chunked decode (multi-token chunk at offset>0) diverged from uncached: {worst}"
         );
     }
@@ -1340,7 +1578,7 @@ mod tests {
             worst = worst.max(max_abs_diff(&shipped_t, &ours_t));
         }
         assert!(
-            worst <= 1e-3,
+            worst <= SHIPPED_CACHED_TOL,
             "base-only cached decode diverged from candle's shipped cached forward: {worst}"
         );
     }
@@ -1367,7 +1605,7 @@ mod tests {
             ));
         }
         assert!(
-            worst <= 1e-4,
+            worst <= CACHE_PIN_TOL,
             "base-only cached decode diverged from uncached base forward: {worst}"
         );
     }
@@ -1395,7 +1633,7 @@ mod tests {
             worst = worst.max(max_abs_diff(&lt, &reference.narrow(1, t, 1).unwrap()));
         }
         assert!(
-            worst <= 1e-3,
+            worst <= MERGED_TOL,
             "decode after reset_cache diverged from the reference: {worst}"
         );
     }
@@ -1429,5 +1667,26 @@ mod tests {
 
         // A rejected call must not have mutated the cache: the correct offset 1 works.
         dec.forward(&input.narrow(1, 1, 1).unwrap(), 1).unwrap();
+    }
+
+    #[test]
+    fn merged_decoder_rejects_a_biased_q_or_v_projection() {
+        // The llama Config cannot express projection biases today (`load`
+        // hard-codes None), but `LoraLinear` can carry one — and the merged
+        // snapshot applies NO bias, so a future biased q/v would make the
+        // cached rollout silently diverge from the uncached forward. The
+        // snapshot must fail loud instead.
+        let cfg = tiny_cfg();
+        let vb = tiny_vb(&cfg);
+        let mut model = LlamaGradModel::load(&cfg, &vb, 2, 4.0).unwrap();
+        let h = cfg.hidden_size; // q_out == hidden at these dims
+        let w = Tensor::zeros((h, h), DType::F32, &dev()).unwrap();
+        let bias = Tensor::ones(h, DType::F32, &dev()).unwrap();
+        model.layers[0].attn.q_proj = LoraLinear::new(w, Some(bias), 2, 4.0).unwrap();
+        let err = model.merged_decoder().unwrap_err();
+        assert!(
+            err.to_string().contains("base bias"),
+            "expected a biased-projection rejection, got: {err}"
+        );
     }
 }
