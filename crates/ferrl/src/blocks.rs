@@ -75,11 +75,33 @@ impl RotaryTables {
         device: &Device,
     ) -> CandleResult<Self> {
         let dim = head_dim;
-        let max_pos = max_position_embeddings;
         let inv_freq: Vec<f32> = (0..dim)
             .step_by(2)
             .map(|i| 1f32 / rope_theta.powf(i as f64 / dim as f64) as f32)
             .collect();
+        Self::with_inv_freq(inv_freq, max_position_embeddings, dtype, device)
+    }
+
+    /// Build the tables from **precomputed** inverse frequencies (one per
+    /// rotated dimension pair, i.e. `head_dim / 2` entries) — the generic core
+    /// [`new`](Self::new) delegates to.
+    ///
+    /// This is the seam for architectures whose inv-freqs are *not* the plain
+    /// `1/theta^(2i/d)` family: e.g. Llama-3.x `RoPE` scaling rescales the
+    /// inv-freqs at table-build time ([`crate::llama`] computes the smoothed
+    /// frequencies and passes them here), while the table layout, slicing, and
+    /// dtype handling stay identical.
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if a table tensor cannot be built on `device`.
+    pub fn with_inv_freq(
+        inv_freq: Vec<f32>,
+        max_position_embeddings: usize,
+        dtype: DType,
+        device: &Device,
+    ) -> CandleResult<Self> {
+        let max_pos = max_position_embeddings;
         let inv_freq_len = inv_freq.len();
         let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), device)?;
         let t = Tensor::arange(0u32, max_pos as u32, device)?
