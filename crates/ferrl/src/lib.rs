@@ -33,11 +33,13 @@
 //!   reward → advantages → masked clipped surrogate (+ optional KL) →
 //!   canary-guarded [`FerrlAdamW`] step;
 //! - a candle-bit-identical `AdamW` ([`optim`]) — [`FerrlAdamW`], a line-for-line
-//!   clone of candle's optimizer that ferrl owns so it can later persist and
-//!   restore the moment state for momentum-faithful resume, pinned to candle by a
-//!   permanent equivalence canary;
-//! - adapter checkpointing ([`checkpoint`]) — save/load the trainable `LoRA`
-//!   factors so a run can be resumed (see [`Trainer::train_from`]);
+//!   clone of candle's optimizer that ferrl owns so it can persist and restore the
+//!   moment state ([`OptimizerState`]) for momentum-faithful resume, pinned to candle
+//!   by a permanent equivalence canary;
+//! - checkpointing ([`checkpoint`]) — adapter-only save/load for eval
+//!   ([`save_adapter`]), and a **momentum-faithful** v2 checkpoint
+//!   ([`save_checkpoint`]) that also persists the optimizer moments and the rollout
+//!   sampler RNG, so [`Trainer::resume`] continues an interrupted run **bit-exactly**;
 //! - held-out evaluation ([`eval`]) — the base model vs. the trained adapter,
 //!   mean reward over a held-out set (the P4 gate's comparison);
 //! - run telemetry ([`telemetry`]).
@@ -87,7 +89,10 @@ pub mod tokenizer;
 pub mod trainer;
 
 #[doc(inline)]
-pub use checkpoint::{load_adapter, save_adapter, CheckpointError, CheckpointManifest};
+pub use checkpoint::{
+    load_adapter, load_checkpoint, save_adapter, save_checkpoint, CheckpointError,
+    CheckpointManifest, LoadedCheckpoint,
+};
 #[doc(inline)]
 pub use countdown::{
     build_prompt, generate_dataset, parse_problem_from_prompt, CountdownConfig, CountdownProblem,
@@ -103,7 +108,7 @@ pub use grpo::{
 #[doc(inline)]
 pub use nn::{grad_coverage, GradCoverage, RmsNorm};
 #[doc(inline)]
-pub use optim::FerrlAdamW;
+pub use optim::{FerrlAdamW, OptimizerState};
 #[doc(inline)]
 pub use policy::Policy;
 #[doc(inline)]

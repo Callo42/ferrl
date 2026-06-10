@@ -73,6 +73,33 @@ impl GrpoSampler {
         self.temperature
     }
 
+    /// Serialize the full sampler state (RNG state + temperature) to an opaque byte
+    /// blob, for momentum-faithful checkpoint persistence. Round-trips with
+    /// [`from_state_bytes`](Self::from_state_bytes) — a sampler restored from the blob
+    /// reproduces the exact remaining token stream (the property
+    /// `serde_snapshot_restores_the_exact_stream` pins).
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if serialization fails (it does not for this type, whose
+    /// fields are all plain data — the `Result` keeps the seam uniform with the rest of
+    /// the checkpoint path).
+    pub fn to_state_bytes(&self) -> CandleResult<Vec<u8>> {
+        serde_json::to_vec(self).map_err(candle_core::Error::wrap)
+    }
+
+    /// Reconstruct a sampler from a blob produced by
+    /// [`to_state_bytes`](Self::to_state_bytes).
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if `bytes` is not a valid serialized [`GrpoSampler`]
+    /// (fail-loud: a malformed or mismatched checkpoint RNG blob aborts the restore
+    /// rather than silently re-seeding).
+    pub fn from_state_bytes(bytes: &[u8]) -> CandleResult<Self> {
+        serde_json::from_slice(bytes).map_err(candle_core::Error::wrap)
+    }
+
     /// Sample one token id from a 1-D `[vocab]` `logits` tensor.
     ///
     /// Reproduces candle's `Sampling::All { temperature }`: cast to F32, divide by
@@ -160,6 +187,35 @@ mod tests {
             restored.temperature(),
             1.0,
             "temperature must round-trip too"
+        );
+    }
+
+    /// The opaque byte-blob seam used by the checkpoint: `to_state_bytes` /
+    /// `from_state_bytes` round-trip the advanced RNG state and the temperature, so a
+    /// restored sampler reproduces the exact continuation; malformed bytes fail loud.
+    #[test]
+    fn state_bytes_round_trip_and_reject_garbage() {
+        let logits = Tensor::from_vec(vec![0f32; 64], 64, &Device::Cpu).unwrap();
+        let mut s = GrpoSampler::new(2024, 0.7);
+        for _ in 0..5 {
+            let _ = s.sample(&logits).unwrap();
+        }
+        let blob = s.to_state_bytes().unwrap();
+
+        let mut cont = s.clone();
+        let expected: Vec<u32> = (0..8).map(|_| cont.sample(&logits).unwrap()).collect();
+
+        let mut restored = GrpoSampler::from_state_bytes(&blob).unwrap();
+        let got: Vec<u32> = (0..8).map(|_| restored.sample(&logits).unwrap()).collect();
+        assert_eq!(
+            expected, got,
+            "byte blob must reproduce the exact continuation"
+        );
+        assert_eq!(restored.temperature(), 0.7, "temperature must round-trip");
+
+        assert!(
+            GrpoSampler::from_state_bytes(b"not a sampler").is_err(),
+            "a malformed blob must fail loud, not silently re-seed"
         );
     }
 

@@ -39,7 +39,7 @@
 //! are zero (`frac_reward_zero_std == 1`) — carries no learning signal and is a
 //! GRPO no-op: the trainer performs no update for that step (and runs no canary).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use candle_core::backprop::GradStore;
 use candle_core::{DType, Device, Result as CandleResult, Tensor, Var, D};
@@ -49,7 +49,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::grpo::{group_advantages, zero_mask_rows, LossType, ScaleRewards};
 use crate::nn::grad_coverage;
-use crate::optim::FerrlAdamW;
+use crate::optim::{FerrlAdamW, OptimizerState};
 use crate::policy::{GenConfig, Policy, Rollout};
 use crate::reward::RewardFn;
 use crate::telemetry::{Metrics, MetricsWriter, RunDir, TelemetryError};
@@ -331,7 +331,7 @@ impl Trainer {
         tokenizer: &dyn TokenizerLike,
         prompts: &[String],
     ) -> Result<Vec<Metrics>, TrainerError> {
-        self.run(0, policy, reward_fn, tokenizer, prompts)
+        self.run(0, None, policy, reward_fn, tokenizer, prompts)
     }
 
     /// Resume training from `start_step`, running steps `start_step .. config.steps`
@@ -347,14 +347,14 @@ impl Trainer {
     /// `start_step * grad_accum_steps` (mod len) — so resuming at the recorded window
     /// continues the prompt order an uninterrupted run would have seen.
     ///
-    /// **Not bit-exact to an uninterrupted run.** A fresh [`FerrlAdamW`] is
-    /// constructed (its moment estimates restart from zero, re-warming the bias
-    /// correction) and the policy's sampler RNG is whatever the reloaded policy
-    /// carries; neither is persisted by [`crate::checkpoint`] yet. The reloaded
-    /// *adapter weights* are exact; the post-resume trajectory is a faithful
-    /// continuation, not a replay. (Momentum-faithful resume — persisting and
-    /// restoring both the optimizer moments and the sampler RNG — is P6-B; owning
-    /// [`FerrlAdamW`] instead of candle's `AdamW` is its first step.)
+    /// **Not momentum-faithful.** This continues from `start_step` with a **fresh**
+    /// [`FerrlAdamW`] (its moments restart from zero, re-warming the bias correction)
+    /// and whatever sampler RNG the reloaded policy carries — the caller is expected to
+    /// have loaded only the adapter (e.g. via [`crate::checkpoint::load_adapter`]). The
+    /// reloaded *adapter weights* are exact; the post-resume trajectory is a faithful
+    /// continuation, not a bit-exact replay. For a **bit-exact** resume that also
+    /// restores the optimizer moments and the sampler RNG from a momentum-faithful (v2)
+    /// checkpoint, use [`resume`](Self::resume) instead.
     ///
     /// # Errors
     ///
@@ -371,7 +371,54 @@ impl Trainer {
         tokenizer: &dyn TokenizerLike,
         prompts: &[String],
     ) -> Result<Vec<Metrics>, TrainerError> {
-        self.run(start_step, policy, reward_fn, tokenizer, prompts)
+        self.run(start_step, None, policy, reward_fn, tokenizer, prompts)
+    }
+
+    /// Resume an interrupted run from a checkpoint directory, **momentum-faithfully**.
+    ///
+    /// Loads the checkpoint's adapter into `policy`, restores the optimizer moments and
+    /// the rollout-sampler RNG, and continues from the recorded step — so on the same
+    /// machine the post-resume trajectory is **bit-identical** to an uninterrupted run
+    /// (pinned by the toy gate `interrupted_run_resumes_bit_identically`). For a v1
+    /// (adapter-only) checkpoint there is no optimizer/sampler state to restore, so this
+    /// falls back to a fresh [`FerrlAdamW`] and the policy's current sampler (a faithful
+    /// continuation, not a bit-exact replay — exactly like [`train_from`](Self::train_from)).
+    ///
+    /// `policy` must be the same architecture the checkpoint was written from: the
+    /// adapter load and the optimizer-moment load each validate count/shape/dtype and
+    /// fail loud otherwise, and a malformed sampler blob fails loud too.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrainerError`] if the checkpoint cannot be read or does not match
+    /// `policy`, or if a training step fails (as [`train`](Self::train)).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `prompts` is empty.
+    pub fn resume<P: Policy, R: RewardFn>(
+        &mut self,
+        checkpoint_dir: impl AsRef<Path>,
+        policy: &mut P,
+        reward_fn: &R,
+        tokenizer: &dyn TokenizerLike,
+        prompts: &[String],
+    ) -> Result<Vec<Metrics>, TrainerError> {
+        let vars = policy.trainable_vars();
+        let loaded = crate::checkpoint::load_checkpoint(checkpoint_dir, &vars)?;
+        // Restore the sampler RNG (v2). A v1 checkpoint carries none → keep the policy's
+        // current sampler (the documented fresh-momentum fallback).
+        if let Some(blob) = &loaded.sampler_state {
+            policy.restore_sampler_state(blob)?;
+        }
+        self.run(
+            loaded.step,
+            loaded.optimizer_state,
+            policy,
+            reward_fn,
+            tokenizer,
+            prompts,
+        )
     }
 
     /// Shared loop for [`train`](Self::train) / [`train_from`](Self::train_from):
@@ -380,6 +427,7 @@ impl Trainer {
     fn run<P: Policy, R: RewardFn>(
         &mut self,
         start_step: u64,
+        resume_opt_state: Option<OptimizerState>,
         policy: &mut P,
         reward_fn: &R,
         tokenizer: &dyn TokenizerLike,
@@ -393,6 +441,12 @@ impl Trainer {
             ..Default::default()
         };
         let mut opt = FerrlAdamW::new(vars.clone(), params)?;
+        // Momentum-faithful resume: restore the optimizer moments + step counter before
+        // the first step, so the bias correction and Adam state continue exactly where
+        // the interrupted run left off (validated against `vars` inside `load_state`).
+        if let Some(state) = resume_opt_state {
+            opt.load_state(&state)?;
+        }
         let total = self.config.steps;
         let remaining = total.saturating_sub(start_step) as usize;
         let mut history = Vec::with_capacity(remaining);
@@ -401,7 +455,7 @@ impl Trainer {
                 self.run_window(step, policy, reward_fn, tokenizer, prompts, &mut opt, &vars)?;
             self.writer.append(&m)?;
             history.push(m);
-            self.maybe_checkpoint(step, &vars)?;
+            self.maybe_checkpoint(step, &vars, &opt, policy)?;
         }
         Ok(history)
     }
@@ -445,13 +499,22 @@ impl Trainer {
         Ok(self.build_window_metrics(step, &stats, &agg, opt))
     }
 
-    /// After completing step `step` (0-based), write `checkpoints/step-<n>/` when
-    /// the configured cadence divides the completed-step count `n = step + 1`, **or**
-    /// `n` is the final step of the run. The final-step write guarantees a completed
-    /// run always persists its final adapter even when `checkpoint_every` does not
-    /// divide `steps` (otherwise the last steps' weights would live only in memory).
-    /// The recorded manifest `step` is `n`, the index a resume continues from.
-    fn maybe_checkpoint(&self, step: u64, vars: &[Var]) -> Result<(), TrainerError> {
+    /// After completing step `step` (0-based), write a momentum-faithful (v2)
+    /// `checkpoints/step-<n>/` when the configured cadence divides the completed-step
+    /// count `n = step + 1`, **or** `n` is the final step of the run. The final-step
+    /// write guarantees a completed run always persists its final state even when
+    /// `checkpoint_every` does not divide `steps`. The checkpoint captures the adapter
+    /// weights, the optimizer moments (`opt`), and the policy's rollout-sampler RNG —
+    /// taken *after* this window's rollouts and update, so a [`resume`](Self::resume) at
+    /// the recorded manifest `step` = `n` continues bit-exactly. (The optimizer's own
+    /// `step_t` counts only non-degenerate windows and is captured independently of `n`.)
+    fn maybe_checkpoint<P: Policy>(
+        &self,
+        step: u64,
+        vars: &[Var],
+        opt: &FerrlAdamW,
+        policy: &P,
+    ) -> Result<(), TrainerError> {
         let Some(every) = self.config.checkpoint_every else {
             return Ok(());
         };
@@ -461,7 +524,9 @@ impl Trainer {
             return Ok(());
         }
         let dir = self.checkpoints_dir.join(format!("step-{completed}"));
-        crate::checkpoint::save_adapter(&dir, vars, completed)?;
+        let opt_state = opt.state()?;
+        let sampler_state = policy.sampler_state()?;
+        crate::checkpoint::save_checkpoint(&dir, vars, &opt_state, &sampler_state, completed)?;
         Ok(())
     }
 
