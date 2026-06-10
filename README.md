@@ -276,10 +276,12 @@ toolkit you can build with.
 | 550.54.14                    | 12.4             | 8.4     |
 | 555.42.02                    | 12.5             | 8.5     |
 | 560.28.03                    | 12.6             | 8.5     |
+| 565.57.01                    | 12.7             | 8.6     |
 | 570.26                       | 12.8             | 8.7     |
 | 575.51.03                    | 12.9             | 8.8     |
 
-(There is no PTX ISA 8.6; CUDA 12.6 reuses 8.5.)
+(CUDA 12.6 reuses ISA 8.5; CUDA 12.7 — the r565 driver generation, which reports CUDA
+12.7 via the driver API — introduced ISA 8.6.)
 
 The driver column is NVIDIA's minimum for the full toolkit. The built-in preflight
 instead names the driver that can *JIT* your build's PTX ISA — the floor that error 222

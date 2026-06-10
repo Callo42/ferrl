@@ -47,8 +47,9 @@ pub(crate) mod logic {
     pub(crate) type DriverFacts<'a> = (Version, Version, &'a str);
 
     /// CUDA toolkit version → the maximum PTX ISA version it emits (Linux `x86_64`).
-    /// Sourced from NVIDIA's PTX ISA release notes. Ascending; `12.6` reuses ISA
-    /// `8.5` (there is no ISA `8.6`).
+    /// Sourced from NVIDIA's PTX ISA release notes. Ascending; `12.6` reuses ISA `8.5`,
+    /// then `12.7` (the r565 generation; a 565 driver reports CUDA `12.7`) introduces
+    /// ISA `8.6`, `12.8` → `8.7`, `12.9` → `8.8`.
     pub(crate) const CUDA_TO_MAX_ISA: &[(Version, Version)] = &[
         ((11, 8), (7, 8)),
         ((12, 0), (8, 0)),
@@ -58,6 +59,7 @@ pub(crate) mod logic {
         ((12, 4), (8, 4)),
         ((12, 5), (8, 5)),
         ((12, 6), (8, 5)),
+        ((12, 7), (8, 6)),
         ((12, 8), (8, 7)),
         ((12, 9), (8, 8)),
     ];
@@ -77,6 +79,7 @@ pub(crate) mod logic {
         ((8, 3), "545.23.06"),
         ((8, 4), "550.54.14"),
         ((8, 5), "555.42.02"),
+        ((8, 6), "565.57.01"),
         ((8, 7), "570.26"),
         ((8, 8), "575.51.03"),
     ];
@@ -236,11 +239,12 @@ pub(crate) mod logic {
 
         #[test]
         fn driver_max_isa_clamps_down_and_never_overshoots_a_newer_driver() {
-            // Exact row.
+            // Exact rows, including the r565 generation (a 565 driver reports CUDA 12.7).
             assert_eq!(driver_max_isa((12, 8)), Some((8, 7)));
-            // A driver CUDA with no exact row clamps DOWN to the nearest tabulated
-            // toolkit (12.7 -> 12.6 -> ISA 8.5), never up to 12.8/8.7.
-            assert_eq!(driver_max_isa((12, 7)), Some((8, 5)));
+            assert_eq!(driver_max_isa((12, 7)), Some((8, 6)));
+            // A driver CUDA with no exact row clamps DOWN to the nearest lower tabulated
+            // toolkit (11.9 -> 11.8 -> ISA 7.8), never UP.
+            assert_eq!(driver_max_isa((11, 9)), Some((7, 8)));
             // A driver NEWER than the whole table -> None, so the caller never emits
             // a false "too old" for a perfectly capable new driver.
             assert_eq!(driver_max_isa((13, 0)), None);
@@ -248,13 +252,20 @@ pub(crate) mod logic {
         }
 
         #[test]
-        fn isa_and_cuda_table_lookups() {
+        fn min_driver_for_isa_lookups() {
             assert_eq!(min_driver_for_isa((7, 8)), Some("520.61.05"));
             assert_eq!(min_driver_for_isa((8, 4)), Some("550.54.14"));
+            assert_eq!(min_driver_for_isa((8, 6)), Some("565.57.01"));
             assert_eq!(min_driver_for_isa((8, 7)), Some("570.26"));
-            // Max toolkit for a given ISA: 8.5 is reused by 12.6 (the newest).
+        }
+
+        #[test]
+        fn max_cuda_for_isa_lookups() {
+            // Max toolkit for a given ISA: 8.5 is reused by 12.6 (the newest), and 8.6
+            // is the r565 generation (CUDA 12.7).
             assert_eq!(max_cuda_for_isa((8, 4)), Some((12, 4)));
             assert_eq!(max_cuda_for_isa((8, 5)), Some((12, 6)));
+            assert_eq!(max_cuda_for_isa((8, 6)), Some((12, 7)));
             assert_eq!(max_cuda_for_isa((8, 7)), Some((12, 8)));
         }
 
