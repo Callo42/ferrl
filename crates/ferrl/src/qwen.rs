@@ -5,10 +5,12 @@
 //! ops that have **no backward**, so it cannot be used to train. This module is the
 //! *update* path: a full-sequence, uncached forward over the **same loaded
 //! weights**, expressed entirely in grad-bearing ops, with a manual `LoRA` adapter
-//! on `q_proj`/`v_proj`. It is **also** the (uncached) **rollout** forward used by
-//! [`crate::lm_policy`] — the only *adapter-aware* forward; candle's shipped
-//! cached forward carries no adapter, so a fast merged-weight rollout is a later
-//! optimization.
+//! on `q_proj`/`v_proj`. Rollout is handled by the KV-cached [`MergedDecoder`]
+//! below (the production `generate` path since P6-C): candle's shipped cached
+//! forward carries no adapter, so the merged-weight snapshot — the live adapter
+//! folded into the base per `generate` call — is what makes a fast *adapter-aware*
+//! rollout possible. The uncached forward here remains the only grad-bearing
+//! (scoring / KL-reference) forward, and serves as the cached path's test oracle.
 //!
 //! It is gated against the shipped forward by an equivalence test (same weights →
 //! same logits) and a LoRA-grad-coverage test (the adapter trains).

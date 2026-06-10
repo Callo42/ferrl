@@ -4,15 +4,22 @@
 //! on any particular architecture's config type: frozen linear projection,
 //! grouped-query KV repeat, the precomputed `RoPE` cos/sin tables, and the
 //! additive causal-mask builders (full-sequence and offset-aware). They were
-//! extracted verbatim from the Qwen3 forward ([`crate::qwen`]) so a second
-//! architecture (e.g. a dense Llama-3.x, which uses the same rotate-half `RoPE`
-//! family, GQA, and causal masking) can reuse them instead of re-deriving them.
+//! extracted from the Qwen3 forward ([`crate::qwen`]) — behavior-preserving,
+//! though not literally verbatim: [`RotaryTables::new`] generalized its
+//! signature from the Qwen config type to plain scalars (and gained
+//! [`RotaryTables::with_inv_freq`] for precomputed frequencies), and
+//! [`causal_mask`] became a delegation to the offset-aware [`causal_mask_at`] —
+//! so a second architecture (e.g. a dense Llama-3.x, which uses the same
+//! rotate-half `RoPE` family, GQA, and causal masking) can reuse them instead
+//! of re-deriving them.
 //!
 //! Everything here is grad-bearing (pure tensor ops, no autograd-cutting custom
 //! kernels), so the blocks are safe in both the update (grad) forward and the
-//! cached rollout decoder. Behavior is pinned by the [`crate::qwen`] equivalence
-//! gates against candle's shipped forward, which exercise every function in this
-//! module at every position.
+//! cached rollout decoder. Behavior is pinned by the [`crate::qwen`] **and**
+//! [`crate::llama`] equivalence gates against candle's shipped forwards, at
+//! every position — [`RotaryTables::with_inv_freq`] is reached only by the
+//! llama gates (plus exact inv-freq pins there); the rest are exercised by both
+//! architectures.
 
 use candle_core::{DType, Device, Result as CandleResult, Tensor};
 
