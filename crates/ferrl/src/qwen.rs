@@ -31,6 +31,7 @@
 //! is grad-bearing and reused verbatim.
 
 use candle_core::{DType, Device, Result as CandleResult, Tensor, Var, D};
+use candle_nn::kv_cache::ConcatKvCache;
 use candle_nn::ops::softmax;
 use candle_nn::rotary_emb::rope_slow;
 use candle_nn::{Activation, VarBuilder};
@@ -90,11 +91,19 @@ impl RotaryTables {
         })
     }
 
-    /// `cos`/`sin` narrowed to the first `seq_len` positions.
+    /// `cos`/`sin` narrowed to the first `seq_len` positions (offset 0).
     fn slice(&self, seq_len: usize) -> CandleResult<(Tensor, Tensor)> {
+        self.slice_at(0, seq_len)
+    }
+
+    /// `cos`/`sin` narrowed to the `seq_len` positions starting at absolute
+    /// position `offset` — the cached-decode generalization of [`slice`](Self::slice),
+    /// matching candle's `Qwen3RotaryEmbedding::apply` (`cos.narrow(0, offset, seq_len)`).
+    /// At `offset == 0` it is exactly [`slice`](Self::slice).
+    fn slice_at(&self, offset: usize, seq_len: usize) -> CandleResult<(Tensor, Tensor)> {
         Ok((
-            self.cos.narrow(0, 0, seq_len)?,
-            self.sin.narrow(0, 0, seq_len)?,
+            self.cos.narrow(0, offset, seq_len)?,
+            self.sin.narrow(0, offset, seq_len)?,
         ))
     }
 }
@@ -213,8 +222,9 @@ impl QwenAttention {
     }
 }
 
-/// `SwiGLU` MLP, all frozen.
-#[derive(Debug)]
+/// `SwiGLU` MLP, all frozen. `Clone` is cheap (every field is a frozen
+/// `Tensor`, i.e. an `Arc` bump) — the cached [`MergedDecoder`] snapshots it.
+#[derive(Debug, Clone)]
 struct QwenMlp {
     gate_weight: Tensor,
     up_weight: Tensor,
@@ -456,6 +466,29 @@ impl QwenGradModel {
         &self.device
     }
 
+    /// Snapshot the **current** effective weights into a KV-cached, grad-free
+    /// [`MergedDecoder`] for fast incremental rollout.
+    ///
+    /// This is the build half of the cached-rollout optimization. It folds the
+    /// live `LoRA` adapter into each `q_proj`/`v_proj` via
+    /// [`crate::lora::LoraLinear::merged_weight`] (respecting the adapter toggle,
+    /// so a disabled adapter snapshots the pure base model), clones the frozen
+    /// rest, and hands back a decoder that walks the sequence one chunk at a time
+    /// over candle's `ConcatKvCache` — O(L) per token instead of the uncached
+    /// forward's O(L²).
+    ///
+    /// **Rebuild after every optimizer step** (and after any `set_adapter_enabled`
+    /// flip): the returned decoder is a value snapshot, frozen at the `Var` values
+    /// it read. The grad/scoring path ([`forward`](Self::forward)) is untouched and
+    /// must keep being used for training — the merged weights are tape-detached.
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if any `merged_weight` build fails.
+    pub fn merged_decoder(&self) -> CandleResult<MergedDecoder> {
+        MergedDecoder::from_model(self)
+    }
+
     /// Additive causal mask `[1, 1, l, l]` (`0` on/below the diagonal, `-inf`
     /// above), matching candle's `Model::causal_mask` at offset 0.
     fn causal_mask(&self, l: usize) -> CandleResult<Tensor> {
@@ -466,6 +499,296 @@ impl QwenGradModel {
             }
         }
         Tensor::from_vec(data, (1, 1, l, l), &self.device)?.to_dtype(self.dtype)
+    }
+}
+
+/// `y = x Wᵀ (+ bias)` for a merged projection weight `w` (`[out, in]`) and an
+/// optional frozen `bias` (`[out]`). The bias is applied exactly as
+/// [`LoraLinear::forward`] applies [`LoraLinear::base_bias`], so a merged-weight
+/// projection reproduces the unmerged one. Qwen3-0.6B-Base is bias-free (q/v are
+/// loaded with `None`), but wiring the bias keeps the decoder faithful if it ever
+/// is not.
+fn merged_linear(x: &Tensor, w: &Tensor, bias: Option<&Tensor>) -> CandleResult<Tensor> {
+    let y = x.broadcast_matmul(&w.t()?)?;
+    match bias {
+        Some(b) => y.broadcast_add(b),
+        None => Ok(y),
+    }
+}
+
+/// One Qwen3 attention block over **merged** weights with an incremental KV cache.
+///
+/// The grad-free mirror of [`QwenAttention`]: `q`/`v` use the folded
+/// [`LoraLinear::merged_weight`] (so the adapter is baked in, no `LoRA` side-path),
+/// `k`/`o` reuse the frozen base weights, and the un-repeated K/V are appended to a
+/// [`ConcatKvCache`] before `repeat_kv` — the exact op order of candle's shipped
+/// `Qwen3Attention` (project → reshape/transpose → per-head q/k-norm → `RoPE(offset)`
+/// → `cache.append` → `repeat_kv` → SDPA → `o_proj`), with the same grad-safe op twins
+/// [`QwenAttention`] uses so the cached logits equal the uncached ones.
+#[derive(Debug)]
+struct MergedAttention {
+    q_weight: Tensor,
+    k_weight: Tensor,
+    v_weight: Tensor,
+    o_weight: Tensor,
+    q_bias: Option<Tensor>,
+    v_bias: Option<Tensor>,
+    q_norm: RmsNorm,
+    k_norm: RmsNorm,
+    num_heads: usize,
+    num_kv_heads: usize,
+    num_kv_groups: usize,
+    head_dim: usize,
+    attn_hidden: usize,
+    /// Un-repeated K/V cache (`[b, kv_heads, seq, head_dim]`), concatenated on the
+    /// sequence axis (dim 2). `repeat_kv` is applied to the cache's output, never
+    /// to what is stored — storing the repeated KV would inflate the cache by
+    /// `num_kv_groups`.
+    cache: ConcatKvCache,
+}
+
+impl MergedAttention {
+    fn forward(
+        &mut self,
+        x: &Tensor,
+        offset: usize,
+        mask: Option<&Tensor>,
+        rot: &RotaryTables,
+    ) -> CandleResult<Tensor> {
+        let (b, l, _) = x.dims3()?;
+
+        // 1. Projections over merged weights (q, v carry the folded adapter; k frozen).
+        let q = merged_linear(x, &self.q_weight, self.q_bias.as_ref())?;
+        let k = frozen_linear(x, &self.k_weight)?;
+        let v = merged_linear(x, &self.v_weight, self.v_bias.as_ref())?;
+
+        // 2. (B, L, H, D) -> (B, H, L, D).
+        let q = q
+            .reshape((b, l, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let k = k
+            .reshape((b, l, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let v = v
+            .reshape((b, l, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+
+        // 3. Per-head QK-Norm (grad-safe rms_norm_slow) BEFORE RoPE.
+        let q = self.q_norm.forward(&q.contiguous()?)?;
+        let k = self.k_norm.forward(&k.contiguous()?)?;
+
+        // 4. RoPE at the absolute position `offset` (grad-safe rope_slow).
+        let (cos, sin) = rot.slice_at(offset, l)?;
+        let q = rope_slow(&q.contiguous()?, &cos, &sin)?;
+        let k = rope_slow(&k.contiguous()?, &cos, &sin)?;
+
+        // 5. Append the UN-repeated K/V, then GQA-repeat the full cached K/V —
+        //    repeat AFTER append (the shipped order) so the cache stays compact.
+        let (k, v) = self.cache.append(&k, &v)?;
+        let k = repeat_kv(&k, self.num_kv_groups)?.contiguous()?;
+        let v = repeat_kv(&v, self.num_kv_groups)?.contiguous()?;
+
+        // 6. Scaled dot-product attention with grad-safe softmax.
+        let scale = 1.0 / (self.head_dim as f64).sqrt();
+        let mut scores = (q.contiguous()?.matmul(&k.transpose(2, 3)?.contiguous()?)? * scale)?;
+        if let Some(m) = mask {
+            scores = scores.broadcast_add(m)?;
+        }
+        let probs = softmax(&scores, D::Minus1)?;
+        let ctx = probs.matmul(&v)?;
+
+        // 7. Output projection.
+        let ctx = ctx
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((b, l, self.attn_hidden))?;
+        frozen_linear(&ctx, &self.o_weight)
+    }
+}
+
+/// One decoder layer over merged weights: pre-norm cached attention + pre-norm
+/// frozen `SwiGLU`, both residual. The grad-free mirror of [`QwenLayer`].
+#[derive(Debug)]
+struct MergedLayer {
+    ln1: RmsNorm,
+    attn: MergedAttention,
+    ln2: RmsNorm,
+    mlp: QwenMlp,
+}
+
+impl MergedLayer {
+    fn forward(
+        &mut self,
+        x: &Tensor,
+        offset: usize,
+        mask: Option<&Tensor>,
+        rot: &RotaryTables,
+    ) -> CandleResult<Tensor> {
+        let h = self.ln1.forward(x)?;
+        let h = self.attn.forward(&h, offset, mask, rot)?;
+        let x = x.broadcast_add(&h)?;
+        let h2 = self.ln2.forward(&x)?;
+        let h2 = self.mlp.forward(&h2)?;
+        x.broadcast_add(&h2)
+    }
+}
+
+/// A KV-cached, **grad-free** Qwen3 decoder over weights with the `LoRA` adapter
+/// already folded in — the fast rollout twin of [`QwenGradModel`].
+///
+/// Built by [`QwenGradModel::merged_decoder`], which snapshots the live merged
+/// weights (so it captures whatever the adapter is at build time, toggle included).
+/// [`forward`](Self::forward) consumes one chunk of new tokens at a time, advancing
+/// a per-layer [`ConcatKvCache`], so generating `L` tokens costs O(L) attention work
+/// instead of the uncached forward's O(L²). It holds **no** `Var` and records no
+/// autograd tape — it is for inference/rollout only; training still goes through
+/// [`QwenGradModel::forward`].
+///
+/// Faithfulness is CI-gated: cached logits equal the uncached
+/// [`QwenGradModel::forward`] logits position-by-position at F32 (adapter on), and
+/// the adapter-off snapshot equals candle's shipped cached forward at every position.
+///
+/// # Cache lifecycle
+///
+/// The cache grows with each [`forward`](Self::forward); positions are placed at the
+/// `offset` you pass (which must equal the number of tokens already consumed). Call
+/// [`reset_cache`](Self::reset_cache) to reuse one decoder for a fresh sequence, or
+/// build a new decoder. Because the cache is mutable state, `forward` takes `&mut self`.
+#[derive(Debug)]
+pub struct MergedDecoder {
+    embed: Tensor,
+    lm_head: Option<Tensor>,
+    layers: Vec<MergedLayer>,
+    norm: RmsNorm,
+    rot: RotaryTables,
+    hidden: usize,
+    device: Device,
+    dtype: DType,
+}
+
+impl MergedDecoder {
+    /// Snapshot a [`QwenGradModel`]'s current effective weights. Private — callers
+    /// go through [`QwenGradModel::merged_decoder`].
+    fn from_model(model: &QwenGradModel) -> CandleResult<Self> {
+        let mut layers = Vec::with_capacity(model.layers.len());
+        for layer in &model.layers {
+            let a = &layer.attn;
+            layers.push(MergedLayer {
+                ln1: layer.ln1.clone(),
+                attn: MergedAttention {
+                    q_weight: a.q_proj.merged_weight()?,
+                    k_weight: a.k_weight.clone(),
+                    v_weight: a.v_proj.merged_weight()?,
+                    o_weight: a.o_weight.clone(),
+                    q_bias: a.q_proj.base_bias().cloned(),
+                    v_bias: a.v_proj.base_bias().cloned(),
+                    q_norm: a.q_norm.clone(),
+                    k_norm: a.k_norm.clone(),
+                    num_heads: a.num_heads,
+                    num_kv_heads: a.num_kv_heads,
+                    num_kv_groups: a.num_kv_groups,
+                    head_dim: a.head_dim,
+                    attn_hidden: a.attn_hidden,
+                    cache: ConcatKvCache::new(2),
+                },
+                ln2: layer.ln2.clone(),
+                mlp: layer.mlp.clone(),
+            });
+        }
+        Ok(Self {
+            embed: model.embed.clone(),
+            lm_head: model.lm_head.clone(),
+            layers,
+            norm: model.norm.clone(),
+            rot: model.rot.clone(),
+            hidden: model.hidden,
+            device: model.device.clone(),
+            dtype: model.dtype,
+        })
+    }
+
+    /// Logits `[batch, chunk_len, vocab]` for `input_ids` (`[batch, chunk_len]`,
+    /// `u32`) placed at absolute positions `[offset, offset + chunk_len)`, appending
+    /// to the KV cache.
+    ///
+    /// Pass the whole prompt at `offset == 0` to prefill, then one token at a time
+    /// at the running offset to decode. `offset` **must** equal the number of tokens
+    /// already in the cache (it indexes the `RoPE` tables and sizes the causal mask);
+    /// a mismatch is rejected (see Errors) rather than silently producing wrong
+    /// logits. Like [`QwenGradModel::forward`], every position is returned (the
+    /// caller narrows to the last for sampling).
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if `offset` does not equal the cached sequence length,
+    /// if any tensor op fails (e.g. a shape mismatch), or if `offset + chunk_len`
+    /// exceeds the `RoPE` table's `max_position_embeddings`.
+    pub fn forward(&mut self, input_ids: &Tensor, offset: usize) -> CandleResult<Tensor> {
+        let (b, l) = input_ids.dims2()?;
+        // The caller's `offset` must equal the number of tokens already cached: it
+        // positions RoPE and sizes the causal mask, but the `l == 1` decode path
+        // builds no mask, so a desync would NOT trip a shape check — it would silently
+        // corrupt the logits. Fail loud instead, so an offset-bookkeeping bug (the
+        // exact risk in the generation/eval loop) surfaces as an error, not as quietly
+        // wrong rollout. All layer caches advance in lockstep, so layer 0 is the truth.
+        let cached = self
+            .layers
+            .first()
+            .map_or(0, |layer| layer.attn.cache.current_seq_len());
+        if offset != cached {
+            candle_core::bail!(
+                "MergedDecoder::forward: offset {offset} != cached sequence length \
+                 {cached} (pass offset == tokens already decoded; 0 to prefill)"
+            );
+        }
+        let ids = input_ids.flatten_all()?;
+        let mut h = self
+            .embed
+            .index_select(&ids, 0)?
+            .reshape((b, l, self.hidden))?;
+        // A single new token attends to the whole cache (all past keys are causally
+        // valid), matching both the uncached `l == 1` branch and the shipped model.
+        let mask = if l == 1 {
+            None
+        } else {
+            Some(self.causal_mask(l, offset)?)
+        };
+        for layer in &mut self.layers {
+            h = layer.forward(&h, offset, mask.as_ref(), &self.rot)?;
+        }
+        let h = self.norm.forward(&h)?;
+        match &self.lm_head {
+            Some(w) => frozen_linear(&h, w),
+            None => frozen_linear(&h, &self.embed),
+        }
+    }
+
+    /// Clear every layer's KV cache so the decoder can start a fresh sequence
+    /// (next [`forward`](Self::forward) must use `offset == 0`).
+    pub fn reset_cache(&mut self) {
+        for layer in &mut self.layers {
+            layer.attn.cache.reset();
+        }
+    }
+
+    /// Additive causal mask `[1, 1, chunk_len, offset + chunk_len]` for a chunk of
+    /// `chunk_len` queries at absolute positions `[offset, offset + chunk_len)`
+    /// against `offset + chunk_len` keys: `0` where query `i` (absolute `i+offset`)
+    /// may attend to key `j` (`j <= i + offset`), `-inf` above. Matches candle's
+    /// `Model::causal_mask(b, tgt, offset, None)`.
+    fn causal_mask(&self, chunk_len: usize, offset: usize) -> CandleResult<Tensor> {
+        let total = offset + chunk_len;
+        let mut data = Vec::with_capacity(chunk_len * total);
+        for i in 0..chunk_len {
+            for j in 0..total {
+                data.push(if j <= i + offset {
+                    0f32
+                } else {
+                    f32::NEG_INFINITY
+                });
+            }
+        }
+        Tensor::from_vec(data, (1, 1, chunk_len, total), &self.device)?.to_dtype(self.dtype)
     }
 }
 
@@ -999,5 +1322,276 @@ mod tests {
             g2.get(v2.as_tensor()).is_none(),
             "softmax_last_dim must sever gradient"
         );
+    }
+
+    // ---- MergedDecoder: cached-rollout equivalence gates -------------------
+
+    /// Max absolute element-wise difference between two same-shaped tensors.
+    fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
+        a.broadcast_sub(b)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar()
+            .unwrap()
+    }
+
+    /// Force every `LoRA` B factor (odd `trainable_vars` indices: `q_B`, `v_B` per
+    /// layer) to small random values so the adapter is a genuine perturbation, not
+    /// the zero-B no-op — the merge must then differ from the base.
+    fn arm_adapter(model: &QwenGradModel) {
+        for (i, v) in model.trainable_vars().iter().enumerate() {
+            if i % 2 == 1 {
+                let dims = v.as_tensor().dims().to_vec();
+                v.set(&Tensor::randn(0f32, 0.5f32, dims, &dev()).unwrap())
+                    .unwrap();
+            }
+        }
+    }
+
+    /// Uncached base-only logits over the same weights `vb`, for the non-vacuity
+    /// witness (the armed adapter must move the logits away from this).
+    fn uncached_base_logits(cfg: &Config, vb: &VarBuilder, input: &Tensor) -> Tensor {
+        let mut m = QwenGradModel::load(cfg, vb, 2, 4.0).unwrap();
+        m.set_adapter_enabled(false);
+        m.forward(input).unwrap()
+    }
+
+    #[test]
+    fn merged_decoder_matches_uncached_token_by_token() {
+        // THE core gate: cached single-token decode == uncached full-seq forward at
+        // every position, adapter ON, at F32.
+        let cfg = tiny_cfg();
+        let vb = tiny_vb(&cfg);
+        let mut model = QwenGradModel::load(&cfg, &vb, 2, 4.0).unwrap();
+        arm_adapter(&model);
+        model.set_adapter_enabled(true);
+
+        let seq = 6;
+        let input = ids(seq);
+        let reference = model.forward(&input).unwrap(); // adapter-aware, uncached
+
+        // Non-vacuity: the armed adapter must actually move the logits, else a
+        // no-op merge would pass this gate trivially.
+        assert!(
+            max_abs_diff(&reference, &uncached_base_logits(&cfg, &vb, &input)) > 1e-3,
+            "armed adapter must change the logits (gate would be vacuous otherwise)"
+        );
+
+        let mut dec = model.merged_decoder().unwrap();
+        let mut worst = 0f32;
+        for t in 0..seq {
+            let tok = input.narrow(1, t, 1).unwrap();
+            let logits_t = dec.forward(&tok, t).unwrap();
+            assert_eq!(logits_t.dims(), &[1, 1, cfg.vocab_size]);
+            worst = worst.max(max_abs_diff(&logits_t, &reference.narrow(1, t, 1).unwrap()));
+        }
+        assert!(
+            worst <= 1e-3,
+            "cached token-by-token decode diverged from uncached forward: {worst}"
+        );
+    }
+
+    #[test]
+    fn merged_decoder_prefill_then_incremental_matches_uncached() {
+        // The realistic generate() pattern: prefill the prompt in one chunk
+        // (exercises the multi-token causal mask), then decode one token at a time
+        // at the running offset (exercises offset>0 incremental decode).
+        let cfg = tiny_cfg();
+        let vb = tiny_vb(&cfg);
+        let mut model = QwenGradModel::load(&cfg, &vb, 2, 4.0).unwrap();
+        arm_adapter(&model);
+        model.set_adapter_enabled(true);
+
+        let seq = 7;
+        let prompt_len = 3;
+        let input = ids(seq);
+        let reference = model.forward(&input).unwrap();
+
+        let mut dec = model.merged_decoder().unwrap();
+        let mut worst = 0f32;
+
+        let prefill = input.narrow(1, 0, prompt_len).unwrap();
+        let pre = dec.forward(&prefill, 0).unwrap();
+        assert_eq!(pre.dims(), &[1, prompt_len, cfg.vocab_size]);
+        for t in 0..prompt_len {
+            worst = worst.max(max_abs_diff(
+                &pre.narrow(1, t, 1).unwrap(),
+                &reference.narrow(1, t, 1).unwrap(),
+            ));
+        }
+        for t in prompt_len..seq {
+            let tok = input.narrow(1, t, 1).unwrap();
+            let logits_t = dec.forward(&tok, t).unwrap();
+            worst = worst.max(max_abs_diff(&logits_t, &reference.narrow(1, t, 1).unwrap()));
+        }
+        assert!(
+            worst <= 1e-3,
+            "cached prefill+incremental decode diverged from uncached forward: {worst}"
+        );
+    }
+
+    #[test]
+    fn merged_decoder_chunked_at_offset_matches_uncached() {
+        // Two MULTI-token chunks: [0..3] at offset 0, then [3..7] at offset 3. The
+        // second chunk has chunk_len>1 AND offset>0, the only path that builds the
+        // rectangular causal mask `[1,1,chunk_len,offset+chunk_len]` — never reached
+        // by prefill (offset 0) or single-token decode (l==1 => mask None). Adapter ON.
+        let cfg = tiny_cfg();
+        let vb = tiny_vb(&cfg);
+        let mut model = QwenGradModel::load(&cfg, &vb, 2, 4.0).unwrap();
+        arm_adapter(&model);
+        model.set_adapter_enabled(true);
+
+        let seq = 7;
+        let split = 3;
+        let input = ids(seq);
+        let reference = model.forward(&input).unwrap();
+
+        let mut dec = model.merged_decoder().unwrap();
+        let first = dec.forward(&input.narrow(1, 0, split).unwrap(), 0).unwrap();
+        let second = dec
+            .forward(&input.narrow(1, split, seq - split).unwrap(), split)
+            .unwrap();
+        assert_eq!(second.dims(), &[1, seq - split, cfg.vocab_size]);
+
+        let mut worst = 0f32;
+        for t in 0..split {
+            worst = worst.max(max_abs_diff(
+                &first.narrow(1, t, 1).unwrap(),
+                &reference.narrow(1, t, 1).unwrap(),
+            ));
+        }
+        for t in 0..(seq - split) {
+            worst = worst.max(max_abs_diff(
+                &second.narrow(1, t, 1).unwrap(),
+                &reference.narrow(1, split + t, 1).unwrap(),
+            ));
+        }
+        assert!(
+            worst <= 1e-3,
+            "chunked decode (multi-token chunk at offset>0) diverged from uncached: {worst}"
+        );
+    }
+
+    #[test]
+    fn merged_decoder_base_only_matches_shipped_every_position() {
+        // The second gate: the adapter-OFF snapshot == candle's shipped cached
+        // forward at every position (also proves merged_weight respects the toggle —
+        // the adapter is armed but disabled, so the snapshot must be pure base).
+        let cfg = tiny_cfg();
+        let vb = tiny_vb(&cfg);
+        let mut model = QwenGradModel::load(&cfg, &vb, 2, 4.0).unwrap();
+        arm_adapter(&model);
+        model.set_adapter_enabled(false);
+        let mut dec = model.merged_decoder().unwrap();
+
+        let mut shipped = ModelForCausalLM::new(&cfg, vb.clone()).unwrap();
+        shipped.clear_kv_cache();
+
+        let seq = 6;
+        let input = ids(seq);
+        let mut worst = 0f32;
+        for t in 0..seq {
+            let tok = input.narrow(1, t, 1).unwrap();
+            let ours_t = dec.forward(&tok, t).unwrap();
+            let shipped_t = shipped.forward(&tok, t).unwrap();
+            worst = worst.max(max_abs_diff(&ours_t, &shipped_t));
+        }
+        assert!(
+            worst <= 1e-3,
+            "base-only cached decode diverged from candle's shipped cached forward: {worst}"
+        );
+    }
+
+    #[test]
+    fn merged_decoder_base_only_matches_uncached_base() {
+        // Same grad-safe ops on both sides; the ONLY difference is incremental
+        // caching, so this is a tight pin on the cache/offset/mask wiring alone,
+        // independent of the slow-twin vs fused-kernel gap the shipped gate tolerates.
+        let cfg = tiny_cfg();
+        let vb = tiny_vb(&cfg);
+        let mut model = QwenGradModel::load(&cfg, &vb, 2, 4.0).unwrap();
+        model.set_adapter_enabled(false);
+        let input = ids(6);
+        let reference = model.forward(&input).unwrap();
+        let mut dec = model.merged_decoder().unwrap();
+        let mut worst = 0f32;
+        for t in 0..6 {
+            let tok = input.narrow(1, t, 1).unwrap();
+            worst = worst.max(max_abs_diff(
+                &dec.forward(&tok, t).unwrap(),
+                &reference.narrow(1, t, 1).unwrap(),
+            ));
+        }
+        assert!(
+            worst <= 1e-4,
+            "base-only cached decode diverged from uncached base forward: {worst}"
+        );
+    }
+
+    #[test]
+    fn merged_decoder_reset_cache_restarts_sequence() {
+        // reset_cache() lets one decoder serve a fresh sequence; a replay after
+        // reset must reproduce the reference (a leftover cache would not).
+        let cfg = tiny_cfg();
+        let vb = tiny_vb(&cfg);
+        let mut model = QwenGradModel::load(&cfg, &vb, 2, 4.0).unwrap();
+        arm_adapter(&model);
+        model.set_adapter_enabled(true);
+        let input = ids(5);
+        let reference = model.forward(&input).unwrap();
+
+        let mut dec = model.merged_decoder().unwrap();
+        for t in 0..5 {
+            dec.forward(&input.narrow(1, t, 1).unwrap(), t).unwrap();
+        }
+        dec.reset_cache();
+        let mut worst = 0f32;
+        for t in 0..5 {
+            let lt = dec.forward(&input.narrow(1, t, 1).unwrap(), t).unwrap();
+            worst = worst.max(max_abs_diff(&lt, &reference.narrow(1, t, 1).unwrap()));
+        }
+        assert!(
+            worst <= 1e-3,
+            "decode after reset_cache diverged from the reference: {worst}"
+        );
+    }
+
+    #[test]
+    fn merged_decoder_rejects_offset_mismatch() {
+        // The offset MUST equal the cached length. On the l==1 decode path no mask is
+        // built, so a desync (e.g. a generation-loop offset-bookkeeping bug) would
+        // silently corrupt the logits rather than trip a shape error — the decoder
+        // guards against it and fails loud. This is the negative control with teeth:
+        // a wrong offset cannot pass quietly.
+        let cfg = tiny_cfg();
+        let vb = tiny_vb(&cfg);
+        let mut model = QwenGradModel::load(&cfg, &vb, 2, 4.0).unwrap();
+        model.set_adapter_enabled(false);
+        let input = ids(5);
+        let mut dec = model.merged_decoder().unwrap();
+
+        // A non-zero offset on the first (empty-cache) call is rejected.
+        let err = dec.forward(&input.narrow(1, 0, 1).unwrap(), 3).unwrap_err();
+        assert!(
+            err.to_string().contains("offset"),
+            "first-call offset!=0 should be rejected, got: {err}"
+        );
+
+        // Prime position 0, then feed token 1 at the WRONG offset 0 (should be 1).
+        dec.forward(&input.narrow(1, 0, 1).unwrap(), 0).unwrap();
+        let err = dec.forward(&input.narrow(1, 1, 1).unwrap(), 0).unwrap_err();
+        assert!(
+            err.to_string().contains("offset"),
+            "stale offset should be rejected, got: {err}"
+        );
+
+        // A rejected call must not have mutated the cache: the correct offset 1 works.
+        dec.forward(&input.narrow(1, 1, 1).unwrap(), 1).unwrap();
     }
 }
