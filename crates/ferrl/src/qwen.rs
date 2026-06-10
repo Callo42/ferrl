@@ -714,15 +714,33 @@ impl MergedDecoder {
     /// Pass the whole prompt at `offset == 0` to prefill, then one token at a time
     /// at the running offset to decode. `offset` **must** equal the number of tokens
     /// already in the cache (it indexes the `RoPE` tables and sizes the causal mask);
-    /// a mismatch silently produces wrong logits. Like [`QwenGradModel::forward`],
-    /// every position is returned (the caller narrows to the last for sampling).
+    /// a mismatch is rejected (see Errors) rather than silently producing wrong
+    /// logits. Like [`QwenGradModel::forward`], every position is returned (the
+    /// caller narrows to the last for sampling).
     ///
     /// # Errors
     ///
-    /// Returns a candle error if any tensor op fails (e.g. a shape mismatch, or
-    /// `offset + chunk_len` exceeding the `RoPE` table's `max_position_embeddings`).
+    /// Returns a candle error if `offset` does not equal the cached sequence length,
+    /// if any tensor op fails (e.g. a shape mismatch), or if `offset + chunk_len`
+    /// exceeds the `RoPE` table's `max_position_embeddings`.
     pub fn forward(&mut self, input_ids: &Tensor, offset: usize) -> CandleResult<Tensor> {
         let (b, l) = input_ids.dims2()?;
+        // The caller's `offset` must equal the number of tokens already cached: it
+        // positions RoPE and sizes the causal mask, but the `l == 1` decode path
+        // builds no mask, so a desync would NOT trip a shape check — it would silently
+        // corrupt the logits. Fail loud instead, so an offset-bookkeeping bug (the
+        // exact risk in the generation/eval loop) surfaces as an error, not as quietly
+        // wrong rollout. All layer caches advance in lockstep, so layer 0 is the truth.
+        let cached = self
+            .layers
+            .first()
+            .map_or(0, |layer| layer.attn.cache.current_seq_len());
+        if offset != cached {
+            candle_core::bail!(
+                "MergedDecoder::forward: offset {offset} != cached sequence length \
+                 {cached} (pass offset == tokens already decoded; 0 to prefill)"
+            );
+        }
         let ids = input_ids.flatten_all()?;
         let mut h = self
             .embed
@@ -1545,39 +1563,35 @@ mod tests {
     }
 
     #[test]
-    fn merged_decoder_wrong_offset_diverges_far_more_than_correct() {
-        // Negative control: the equivalence gates have teeth. RoPE is *relative*, so
-        // a one-position offset error on adjacent tokens is subtle in absolute terms
-        // (and model-scale-dependent), so we assert it diverges by ORDERS more than
-        // the correct offset rather than against a brittle fixed threshold — proving
-        // the gate distinguishes right from wrong cache wiring.
+    fn merged_decoder_rejects_offset_mismatch() {
+        // The offset MUST equal the cached length. On the l==1 decode path no mask is
+        // built, so a desync (e.g. a generation-loop offset-bookkeeping bug) would
+        // silently corrupt the logits rather than trip a shape error — the decoder
+        // guards against it and fails loud. This is the negative control with teeth:
+        // a wrong offset cannot pass quietly.
         let cfg = tiny_cfg();
         let vb = tiny_vb(&cfg);
         let mut model = QwenGradModel::load(&cfg, &vb, 2, 4.0).unwrap();
         model.set_adapter_enabled(false);
         let input = ids(5);
-        let ref1 = model.forward(&input).unwrap().narrow(1, 1, 1).unwrap();
+        let mut dec = model.merged_decoder().unwrap();
 
-        // Correct: token 1 at offset 1.
-        let mut good = model.merged_decoder().unwrap();
-        good.forward(&input.narrow(1, 0, 1).unwrap(), 0).unwrap();
-        let good_diff = max_abs_diff(
-            &good.forward(&input.narrow(1, 1, 1).unwrap(), 1).unwrap(),
-            &ref1,
-        );
-
-        // Wrong: token 1 fed at offset 0 (stale RoPE position).
-        let mut bad = model.merged_decoder().unwrap();
-        bad.forward(&input.narrow(1, 0, 1).unwrap(), 0).unwrap();
-        let bad_diff = max_abs_diff(
-            &bad.forward(&input.narrow(1, 1, 1).unwrap(), 0).unwrap(),
-            &ref1,
-        );
-
+        // A non-zero offset on the first (empty-cache) call is rejected.
+        let err = dec.forward(&input.narrow(1, 0, 1).unwrap(), 3).unwrap_err();
         assert!(
-            bad_diff > 50.0 * good_diff.max(1e-12) && bad_diff > 1e-5,
-            "a wrong offset ({bad_diff}) should diverge far more than the correct \
-             offset ({good_diff}) — the equivalence gate would be vacuous otherwise"
+            err.to_string().contains("offset"),
+            "first-call offset!=0 should be rejected, got: {err}"
         );
+
+        // Prime position 0, then feed token 1 at the WRONG offset 0 (should be 1).
+        dec.forward(&input.narrow(1, 0, 1).unwrap(), 0).unwrap();
+        let err = dec.forward(&input.narrow(1, 1, 1).unwrap(), 0).unwrap_err();
+        assert!(
+            err.to_string().contains("offset"),
+            "stale offset should be rejected, got: {err}"
+        );
+
+        // A rejected call must not have mutated the cache: the correct offset 1 works.
+        dec.forward(&input.narrow(1, 1, 1).unwrap(), 1).unwrap();
     }
 }
