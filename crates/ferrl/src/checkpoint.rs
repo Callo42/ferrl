@@ -18,17 +18,22 @@
 //! checkpoint from a mismatched architecture fails loud rather than corrupting the
 //! model.
 //!
-//! ## What is NOT persisted (yet)
+//! ## Two checkpoint flavors
 //!
-//! Only the adapter weights and the completed-step count. The optimizer moments
-//! and the rollout sampler RNG are not serialized **yet**: a resumed run restores
-//! the trained weights and the step index but re-warms Adam's bias correction and
-//! re-seeds sampling. This is a documented limitation — bit-exact,
-//! momentum-faithful resume is **P6-B**: ferrl now owns both the optimizer
-//! ([`crate::optim::FerrlAdamW`]) and the rollout sampler
-//! ([`crate::sampler::GrpoSampler`], whose RNG state is `serde`-serializable), so a
-//! later PR can serialize and restore both. The adapter weights themselves
-//! round-trip bit-exactly.
+//! - [`save_adapter`] / [`load_adapter`] — **adapter only** (the eval / inference
+//!   path): just the trainable weights + the step count. This is the legacy
+//!   **format version 1** layout, and is what [`crate::eval`] loads.
+//! - [`save_checkpoint`] / [`load_checkpoint`] — a **momentum-faithful** checkpoint
+//!   (**format version 2**): the adapter weights *plus* the optimizer moments
+//!   ([`crate::optim::FerrlAdamW`]'s `m`/`v`/`step_t`) *plus* the rollout sampler RNG
+//!   blob ([`crate::sampler::GrpoSampler`], whose state is `serde`-serializable). This
+//!   is what lets [`crate::Trainer::resume`] continue an interrupted run **bit-exactly**
+//!   — the same machine produces the identical post-resume trajectory.
+//!
+//! A v1 checkpoint still loads (both readers accept format versions `1..=2`); when only
+//! the adapter was persisted, [`load_checkpoint`] returns no optimizer/sampler state and
+//! a resume falls back to fresh momentum + the policy's current RNG. The manifest is
+//! always written **last** within a checkpoint directory, as the commit marker.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -36,12 +41,20 @@ use std::path::{Path, PathBuf};
 use candle_core::{Device, Tensor, Var};
 use serde::{Deserialize, Serialize};
 
+use crate::optim::OptimizerState;
+
 /// Filename of the serialized adapter tensors within a checkpoint directory.
 const ADAPTER_FILE: &str = "adapter.safetensors";
+/// Filename of the serialized optimizer moment tensors (format version 2).
+const OPTIMIZER_FILE: &str = "optimizer.safetensors";
 /// Filename of the checkpoint manifest within a checkpoint directory.
 const MANIFEST_FILE: &str = "manifest.json";
-/// On-disk checkpoint layout version; bumped on an incompatible format change.
-const FORMAT_VERSION: u32 = 1;
+/// On-disk checkpoint layout version; bumped on an incompatible format change. v1 =
+/// adapter only; v2 = adapter + optimizer moments + sampler RNG (momentum-faithful).
+const FORMAT_VERSION: u32 = 2;
+/// Lowest on-disk format version this build can read. Older (v1, adapter-only)
+/// checkpoints still load — a resume then falls back to fresh momentum.
+const MIN_FORMAT_VERSION: u32 = 1;
 
 /// Errors raised while saving or loading an adapter checkpoint.
 #[derive(Debug, thiserror::Error)]
@@ -68,22 +81,44 @@ pub enum CheckpointError {
 }
 
 /// Self-describing metadata stored alongside the adapter tensors.
+///
+/// The three `Option` fields are the **format-version-2** additions; they are
+/// `#[serde(default)]` so a v1 manifest (which lacks them) still deserializes, with each
+/// defaulting to `None` (the fresh-momentum-on-resume fallback).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckpointManifest {
-    /// On-disk format version (validated by [`load_adapter`]).
+    /// On-disk format version (validated against `1..=2` by [`load_adapter`]).
     pub format_version: u32,
     /// Number of optimizer steps completed before this checkpoint was written —
     /// the step index a resumed run should continue from
-    /// (see [`crate::Trainer::train_from`]).
+    /// (see [`crate::Trainer::resume`]).
     pub step: u64,
     /// Number of trainable tensors persisted (the `trainable_vars()` count).
     pub num_vars: usize,
+    /// v2: the optimizer's global step counter `t` (bias-correction state), if the
+    /// optimizer moments were persisted.
+    #[serde(default)]
+    pub optimizer_step_t: Option<usize>,
+    /// v2: the number of optimizer moment pairs persisted (the float-filtered parameter
+    /// count), if the optimizer moments were persisted.
+    #[serde(default)]
+    pub optimizer_num_vars: Option<usize>,
+    /// v2: the opaque rollout-sampler RNG blob ([`crate::Policy::sampler_state`]), if it
+    /// was persisted.
+    #[serde(default)]
+    pub sampler_state: Option<Vec<u8>>,
 }
 
 /// Tensor key for the `i`-th trainable var, zero-padded so lexical order matches
 /// numeric order.
 fn var_key(i: usize) -> String {
     format!("lora.{i:05}")
+}
+
+/// Tensor key for the `i`-th optimizer moment of kind `kind` (`"m"` first moment,
+/// `"v"` second moment), zero-padded like [`var_key`].
+fn moment_key(kind: &str, i: usize) -> String {
+    format!("{kind}.{i:05}")
 }
 
 /// Build a [`CheckpointError::Io`] for `path`.
@@ -127,9 +162,12 @@ pub fn save_adapter(dir: impl AsRef<Path>, vars: &[Var], step: u64) -> Result<()
     candle_core::safetensors::save(&tensors, &adapter_path)?;
 
     let manifest = CheckpointManifest {
-        format_version: FORMAT_VERSION,
+        format_version: 1,
         step,
         num_vars: vars.len(),
+        optimizer_step_t: None,
+        optimizer_num_vars: None,
+        sampler_state: None,
     };
     let manifest_path = dir.join(MANIFEST_FILE);
     let json = serde_json::to_string_pretty(&manifest)?;
@@ -164,9 +202,9 @@ pub fn load_adapter(
     let manifest_path = dir.join(MANIFEST_FILE);
     let raw = std::fs::read_to_string(&manifest_path).map_err(|e| io(&manifest_path, e))?;
     let manifest: CheckpointManifest = serde_json::from_str(&raw)?;
-    if manifest.format_version != FORMAT_VERSION {
+    if manifest.format_version < MIN_FORMAT_VERSION || manifest.format_version > FORMAT_VERSION {
         return Err(CheckpointError::Mismatch(format!(
-            "unknown checkpoint format_version {} (this build reads {FORMAT_VERSION})",
+            "unsupported checkpoint format_version {} (this build reads {MIN_FORMAT_VERSION}..={FORMAT_VERSION})",
             manifest.format_version
         )));
     }
@@ -219,6 +257,149 @@ pub fn load_adapter(
         v.set(t)?;
     }
     Ok(manifest)
+}
+
+/// The result of [`load_checkpoint`]: the resume step plus any persisted optimizer and
+/// sampler state.
+///
+/// For a v1 (adapter-only) checkpoint, `optimizer_state` and `sampler_state` are `None`
+/// — [`crate::Trainer::resume`] then falls back to fresh momentum and the policy's
+/// current sampler.
+#[derive(Debug)]
+pub struct LoadedCheckpoint {
+    /// Completed optimizer steps — the `start_step` a resume continues from.
+    pub step: u64,
+    /// The optimizer moments + step counter, if the checkpoint persisted them (v2).
+    pub optimizer_state: Option<OptimizerState>,
+    /// The opaque rollout-sampler RNG blob, if the checkpoint persisted it (v2).
+    pub sampler_state: Option<Vec<u8>>,
+}
+
+/// Persist a **momentum-faithful** checkpoint (format version 2): the adapter weights,
+/// the optimizer moments, and the rollout-sampler RNG blob.
+///
+/// Writes `adapter.safetensors`, `optimizer.safetensors`, and (last, as the commit
+/// marker) `manifest.json`. The optimizer moments are keyed by parameter index; the
+/// optimizer step counter and the `sampler_state` blob live in the manifest. Each tensor
+/// is moved to the CPU and made contiguous first, so a CUDA-resident run checkpoints the
+/// same way. Restored as a unit by [`load_checkpoint`] + [`crate::Trainer::resume`].
+///
+/// `sampler_state` is the opaque blob from [`crate::Policy::sampler_state`]; it is stored
+/// verbatim and only the policy interprets it on restore.
+///
+/// # Errors
+///
+/// Returns [`CheckpointError`] if `dir` cannot be created, a tensor cannot be moved to
+/// CPU / serialized, or the manifest cannot be written.
+pub fn save_checkpoint(
+    dir: impl AsRef<Path>,
+    vars: &[Var],
+    opt_state: &OptimizerState,
+    sampler_state: &[u8],
+    step: u64,
+) -> Result<(), CheckpointError> {
+    let dir = dir.as_ref();
+    std::fs::create_dir_all(dir).map_err(|e| io(dir, e))?;
+
+    // Adapter weights (identical to the v1 layout).
+    let mut adapter: HashMap<String, Tensor> = HashMap::with_capacity(vars.len());
+    for (i, v) in vars.iter().enumerate() {
+        let t = v.as_tensor().to_device(&Device::Cpu)?.contiguous()?;
+        adapter.insert(var_key(i), t);
+    }
+    candle_core::safetensors::save(&adapter, dir.join(ADAPTER_FILE))?;
+
+    // Optimizer moments: `m.<i>` / `v.<i>`, CPU + contiguous.
+    let n = opt_state.first_moments.len();
+    let mut moments: HashMap<String, Tensor> = HashMap::with_capacity(n * 2);
+    for i in 0..n {
+        let m = opt_state.first_moments[i]
+            .to_device(&Device::Cpu)?
+            .contiguous()?;
+        let v = opt_state.second_moments[i]
+            .to_device(&Device::Cpu)?
+            .contiguous()?;
+        moments.insert(moment_key("m", i), m);
+        moments.insert(moment_key("v", i), v);
+    }
+    candle_core::safetensors::save(&moments, dir.join(OPTIMIZER_FILE))?;
+
+    // Manifest LAST — the commit marker (a crash before it leaves the load failing
+    // cleanly rather than reading partial state).
+    let manifest = CheckpointManifest {
+        format_version: FORMAT_VERSION,
+        step,
+        num_vars: vars.len(),
+        optimizer_step_t: Some(opt_state.step_t),
+        optimizer_num_vars: Some(n),
+        sampler_state: Some(sampler_state.to_vec()),
+    };
+    let manifest_path = dir.join(MANIFEST_FILE);
+    let json = serde_json::to_string_pretty(&manifest)?;
+    std::fs::write(&manifest_path, json).map_err(|e| io(&manifest_path, e))?;
+    Ok(())
+}
+
+/// Restore a checkpoint from `dir` into `vars`, returning the resume step and any
+/// persisted optimizer / sampler state for a momentum-faithful resume.
+///
+/// Loads the adapter weights into `vars` exactly as [`load_adapter`] (same
+/// all-or-nothing shape/dtype/count validation and `1..=2` version check). For a **v2**
+/// checkpoint it additionally reads the optimizer moments (the manifest records how
+/// many) and the sampler RNG blob; for a **v1** checkpoint both come back `None`.
+///
+/// The optimizer moments are **not** validated against `vars` here — the optimizer
+/// filters to float parameters, so [`crate::optim::FerrlAdamW::load_state`] validates
+/// them against its own parameter set (count + shape + dtype) when they are applied.
+///
+/// # Errors
+///
+/// As [`load_adapter`], plus [`CheckpointError::Mismatch`] if a v2 manifest references
+/// optimizer moments that are missing from `optimizer.safetensors`.
+pub fn load_checkpoint(
+    dir: impl AsRef<Path>,
+    vars: &[Var],
+) -> Result<LoadedCheckpoint, CheckpointError> {
+    let dir = dir.as_ref();
+    // Reuses the adapter load + all-or-nothing validation + version-range check.
+    let manifest = load_adapter(dir, vars)?;
+
+    let optimizer_state = match (manifest.optimizer_step_t, manifest.optimizer_num_vars) {
+        (Some(step_t), Some(num)) => {
+            let opt_path = dir.join(OPTIMIZER_FILE);
+            let loaded = candle_core::safetensors::load(&opt_path, &Device::Cpu)?;
+            let mut first_moments = Vec::with_capacity(num);
+            let mut second_moments = Vec::with_capacity(num);
+            for i in 0..num {
+                let mk = moment_key("m", i);
+                let vk = moment_key("v", i);
+                let m = loaded.get(&mk).ok_or_else(|| {
+                    CheckpointError::Mismatch(format!(
+                        "checkpoint is missing optimizer tensor {mk}"
+                    ))
+                })?;
+                let v = loaded.get(&vk).ok_or_else(|| {
+                    CheckpointError::Mismatch(format!(
+                        "checkpoint is missing optimizer tensor {vk}"
+                    ))
+                })?;
+                first_moments.push(m.clone());
+                second_moments.push(v.clone());
+            }
+            Some(OptimizerState {
+                step_t,
+                first_moments,
+                second_moments,
+            })
+        }
+        _ => None,
+    };
+
+    Ok(LoadedCheckpoint {
+        step: manifest.step,
+        optimizer_state,
+        sampler_state: manifest.sampler_state,
+    })
 }
 
 #[cfg(test)]
@@ -409,6 +590,9 @@ mod tests {
             format_version: FORMAT_VERSION + 1,
             step: 1,
             num_vars: vars.len(),
+            optimizer_step_t: None,
+            optimizer_num_vars: None,
+            sampler_state: None,
         };
         std::fs::write(
             tmp.path().join(MANIFEST_FILE),
@@ -436,9 +620,125 @@ mod tests {
             format_version: FORMAT_VERSION,
             step: 42,
             num_vars: 8,
+            optimizer_step_t: Some(40),
+            optimizer_num_vars: Some(8),
+            sampler_state: Some(vec![1, 2, 3, 4]),
         };
         let j = serde_json::to_string(&m).unwrap();
         let back: CheckpointManifest = serde_json::from_str(&j).unwrap();
         assert_eq!(back, m);
+    }
+
+    /// A v1 manifest (no optimizer/sampler fields on disk) still deserializes — the
+    /// `#[serde(default)]` fields come back `None` (the fresh-momentum fallback).
+    #[test]
+    fn v1_manifest_without_v2_fields_deserializes() {
+        let j = r#"{"format_version":1,"step":7,"num_vars":2}"#;
+        let m: CheckpointManifest = serde_json::from_str(j).unwrap();
+        assert_eq!(m.format_version, 1);
+        assert_eq!(m.step, 7);
+        assert_eq!(m.num_vars, 2);
+        assert_eq!(m.optimizer_step_t, None);
+        assert_eq!(m.optimizer_num_vars, None);
+        assert_eq!(m.sampler_state, None);
+    }
+
+    /// Build an [`OptimizerState`] of two moment pairs matching `make_vars`' shapes,
+    /// filled deterministically so a round-trip is checkable bit-for-bit.
+    fn make_opt_state() -> OptimizerState {
+        let m0 = Tensor::from_vec(
+            (0..6).map(|i| i as f32 * 0.1).collect::<Vec<_>>(),
+            (2, 3),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let v0 = Tensor::from_vec(
+            (0..6).map(|i| i as f32 * 0.2).collect::<Vec<_>>(),
+            (2, 3),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let m1 = Tensor::from_vec(
+            (0..8).map(|i| i as f32 * 0.3).collect::<Vec<_>>(),
+            (4, 2),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let v1 = Tensor::from_vec(
+            (0..8).map(|i| i as f32 * 0.4).collect::<Vec<_>>(),
+            (4, 2),
+            &Device::Cpu,
+        )
+        .unwrap();
+        OptimizerState {
+            step_t: 11,
+            first_moments: vec![m0, m1],
+            second_moments: vec![v0, v1],
+        }
+    }
+
+    fn flat(t: &Tensor) -> Vec<f32> {
+        t.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+    }
+
+    /// Zero every var (so a subsequent load has something to overwrite).
+    fn clobber(vars: &[Var]) {
+        for v in vars {
+            v.set(&Tensor::zeros(v.as_tensor().dims(), DType::F32, &Device::Cpu).unwrap())
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn save_checkpoint_round_trips_the_adapter_and_step() {
+        let tmp = TempDir::new("v2-adapter");
+        let vars = make_vars();
+        let adapter = snapshot(&vars);
+        save_checkpoint(tmp.path(), &vars, &make_opt_state(), &[9u8, 8, 7], 13).unwrap();
+        clobber(&vars);
+        let loaded = load_checkpoint(tmp.path(), &vars).unwrap();
+        assert_eq!(loaded.step, 13);
+        assert_eq!(
+            snapshot(&vars),
+            adapter,
+            "adapter must round-trip bit-for-bit"
+        );
+    }
+
+    #[test]
+    fn save_checkpoint_round_trips_the_optimizer_and_sampler() {
+        let tmp = TempDir::new("v2-opt-sampler");
+        let vars = make_vars();
+        let opt = make_opt_state();
+        let sampler_blob = vec![9u8, 8, 7, 6, 5];
+        save_checkpoint(tmp.path(), &vars, &opt, &sampler_blob, 13).unwrap();
+        let loaded = load_checkpoint(tmp.path(), &vars).unwrap();
+        let os = loaded
+            .optimizer_state
+            .expect("v2 must carry optimizer state");
+        assert_eq!(os.step_t, 11);
+        assert_eq!(flat(&os.first_moments[0]), flat(&opt.first_moments[0]));
+        assert_eq!(flat(&os.second_moments[1]), flat(&opt.second_moments[1]));
+        assert_eq!(
+            loaded.sampler_state,
+            Some(sampler_blob),
+            "sampler blob must round-trip verbatim"
+        );
+    }
+
+    #[test]
+    fn load_checkpoint_on_a_v1_adapter_only_yields_no_optimizer_or_sampler() {
+        // A v1 checkpoint (save_adapter) loads through load_checkpoint with no optimizer
+        // or sampler state — the documented fresh-momentum fallback.
+        let tmp = TempDir::new("v1-via-checkpoint");
+        let vars = make_vars();
+        save_adapter(tmp.path(), &vars, 4).unwrap();
+        let loaded = load_checkpoint(tmp.path(), &vars).unwrap();
+        assert_eq!(loaded.step, 4);
+        assert!(
+            loaded.optimizer_state.is_none(),
+            "v1 has no optimizer state"
+        );
+        assert!(loaded.sampler_state.is_none(), "v1 has no sampler state");
     }
 }

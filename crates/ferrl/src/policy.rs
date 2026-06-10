@@ -164,6 +164,36 @@ pub trait Policy {
     /// `backward`. Implementors typically forward to their adapter's
     /// `trainable_vars()`.
     fn trainable_vars(&self) -> Vec<Var>;
+
+    /// Serialize the policy's rollout-sampler RNG state to an opaque byte blob, for
+    /// momentum-faithful checkpoint persistence.
+    ///
+    /// A faithful resume must continue the *same* rollout token stream an uninterrupted
+    /// run would have produced, which requires capturing the sampler's RNG state.
+    /// candle's `LogitsProcessor` hides its `StdRng` behind no accessor — which is why
+    /// ferrl owns [`GrpoSampler`](crate::sampler::GrpoSampler), whose state *is*
+    /// `serde`-serializable. The returned blob is opaque to the checkpoint; only
+    /// [`restore_sampler_state`](Self::restore_sampler_state) interprets it. A policy
+    /// with no rollout RNG returns an empty blob.
+    ///
+    /// This is a **required** method (not defaulted) so that giving a policy a sampler
+    /// can never silently skip RNG capture — the resume footgun a faithful checkpoint
+    /// must avoid.
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if the sampler state cannot be serialized.
+    fn sampler_state(&self) -> CandleResult<Vec<u8>>;
+
+    /// Restore the rollout-sampler RNG state from a blob produced by
+    /// [`sampler_state`](Self::sampler_state), so a resumed run continues the exact
+    /// token stream. **Fails loud** if the blob is malformed or does not match this
+    /// policy's sampler, rather than silently re-seeding.
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if `state` is not a valid blob for this policy's sampler.
+    fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()>;
 }
 
 #[cfg(test)]

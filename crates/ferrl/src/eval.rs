@@ -351,6 +351,14 @@ mod tests {
         fn trainable_vars(&self) -> Vec<Var> {
             vec![]
         }
+
+        fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+            Ok(Vec::new())
+        }
+
+        fn restore_sampler_state(&mut self, _state: &[u8]) -> CandleResult<()> {
+            Ok(())
+        }
     }
 
     /// Codec over single decimal digits: char `'d'` <-> token `d`.
@@ -458,6 +466,12 @@ mod tests {
         }
         fn trainable_vars(&self) -> Vec<Var> {
             vec![]
+        }
+        fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+            Ok(Vec::new())
+        }
+        fn restore_sampler_state(&mut self, _state: &[u8]) -> CandleResult<()> {
+            Ok(())
         }
     }
 
@@ -611,6 +625,12 @@ mod tests {
         }
         fn trainable_vars(&self) -> Vec<Var> {
             vec![]
+        }
+        fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+            Ok(Vec::new())
+        }
+        fn restore_sampler_state(&mut self, _state: &[u8]) -> CandleResult<()> {
+            Ok(())
         }
     }
 

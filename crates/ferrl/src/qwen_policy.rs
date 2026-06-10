@@ -207,6 +207,15 @@ impl Policy for QwenPolicy {
     fn trainable_vars(&self) -> Vec<Var> {
         self.model.trainable_vars()
     }
+
+    fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+        self.sampler.to_state_bytes()
+    }
+
+    fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
+        self.sampler = GrpoSampler::from_state_bytes(state)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
