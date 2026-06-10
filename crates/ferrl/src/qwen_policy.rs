@@ -5,16 +5,23 @@
 //! the P2 echo toy drives Qwen3-0.6B-Base unchanged. It is the production
 //! counterpart of the in-test `EchoPolicy`.
 //!
-//! ## Generation is uncached and adapter-aware
+//! ## Generation is KV-cached over merged weights, and adapter-aware
 //!
-//! Sampling re-runs the full-sequence [`QwenGradModel::forward`] each step (no KV
-//! cache), exactly like the toy. This is deliberate: the rollout must be drawn
-//! from the *current* policy (`LoRA` adapter **on**), and candle's shipped
-//! `ModelForCausalLM` — the only KV-cached forward available — carries no adapter,
-//! so generating from it would sample the frozen base model and the policy's
-//! rollouts would never reflect training. A fast adapter-aware rollout (e.g.
-//! merging `W + scale·BA` into a cached forward) is a throughput optimization for
-//! later; correctness comes first.
+//! [`generate`](QwenPolicy::generate) snapshots the policy's **current** effective
+//! weights into a [`MergedDecoder`](crate::qwen::MergedDecoder) — the `LoRA` adapter
+//! folded into the base (`W + scale·BA` when enabled, plain `W` when disabled, so the
+//! eval adapter-off path samples the frozen base) — and decodes incrementally over a
+//! KV cache: **O(L) per token** instead of the uncached forward's O(L²). The rollout
+//! is still drawn from the *current* policy at every step (candle's shipped
+//! `ModelForCausalLM` carries no adapter, so it could only sample the frozen base —
+//! the merge is what makes a cached **adapter-aware** rollout possible). The merged
+//! decoder is a tape-detached value snapshot, rebuilt every `generate` call, so it
+//! always reflects the latest optimizer step. **Scoring is unaffected** — the
+//! grad-bearing [`token_logprobs`](QwenPolicy::token_logprobs) and the KL reference
+//! forward still run the uncached [`QwenGradModel::forward`] (the cache holds no tape).
+//! The cached and uncached rollouts are equivalent up to F32 reassociation of the
+//! merge (CI-gated: identical token stream **and** identical sampler-RNG consumption
+//! on a tiny model); the bf16-merge faithfulness is a manual GPU gate.
 //!
 //! ## Rectangular rollouts
 //!
@@ -94,6 +101,44 @@ impl QwenPolicy {
     pub fn model(&self) -> &QwenGradModel {
         &self.model
     }
+
+    /// The pre-P6-C **uncached** rollout: re-run the full-sequence
+    /// [`QwenGradModel::forward`] every step. Kept as the equivalence oracle for the
+    /// cached [`generate`](Self::generate) — same sampler, same EOS/padding logic, so
+    /// a per-token-identical cached path must reproduce its token stream and RNG
+    /// consumption exactly. Test-only; the production path is `generate`.
+    #[cfg(test)]
+    fn generate_uncached(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
+        let device = self.model.device().clone();
+        let prompt_len = prompt.len();
+        let width = prompt_len + cfg.max_new_tokens;
+        let mut token_ids = Vec::with_capacity(cfg.group_size);
+        let mut completion_lens = Vec::with_capacity(cfg.group_size);
+        for _ in 0..cfg.group_size {
+            let mut ids = prompt.to_vec();
+            let mut comp_len = cfg.max_new_tokens;
+            for step in 0..cfg.max_new_tokens {
+                let len = ids.len();
+                let input = Tensor::from_vec(ids.clone(), (1, len), &device)?;
+                let logits = self.model.forward(&input)?;
+                let last = logits.i((0, len - 1))?;
+                let next = self.sampler.sample(&last)?;
+                ids.push(next);
+                if cfg.eos_token_id == Some(next) {
+                    comp_len = step + 1;
+                    ids.resize(width, next);
+                    break;
+                }
+            }
+            token_ids.push(ids);
+            completion_lens.push(comp_len);
+        }
+        Ok(Rollout {
+            token_ids,
+            prompt_len,
+            completion_lens,
+        })
+    }
 }
 
 impl Policy for QwenPolicy {
@@ -112,40 +157,56 @@ impl Policy for QwenPolicy {
         let prompt_len = prompt.len();
         // The fixed rectangular width every sequence is padded/grown to.
         let width = prompt_len + cfg.max_new_tokens;
+        // One KV-cached decoder snapshots the CURRENT merged weights (adapter folded
+        // in, toggle respected) for the whole call; `reset_cache` starts each group
+        // member on a fresh sequence. The first GPU kernel JIT happens building the
+        // merged weights / in the first forward, so translate a driver-too-old PTX
+        // mismatch (`CUDA_ERROR_UNSUPPORTED_PTX_VERSION`) into an actionable
+        // rebuild/upgrade message — a no-op off the `cuda` build and on the success path.
+        let mut decoder = self
+            .model
+            .merged_decoder()
+            .map_err(crate::cuda_compat::translate_ptx_error)?;
         let mut token_ids = Vec::with_capacity(cfg.group_size);
         let mut completion_lens = Vec::with_capacity(cfg.group_size);
         for _ in 0..cfg.group_size {
+            decoder.reset_cache();
             let mut ids = prompt.to_vec();
             // Real completion tokens, counting up to and INCLUDING the first EOS.
             // Stays `max_new_tokens` unless an EOS early-stop overwrites it below.
             let mut comp_len = cfg.max_new_tokens;
+            // Prefill the prompt (offset 0); its last position predicts token 1.
+            let prompt_input = Tensor::from_vec(prompt.to_vec(), (1, prompt_len), &device)?;
+            let logits = decoder
+                .forward(&prompt_input, 0)
+                .map_err(crate::cuda_compat::translate_ptx_error)?;
+            let mut last = logits.i((0, prompt_len - 1))?;
+            let mut offset = prompt_len;
             for step in 0..cfg.max_new_tokens {
-                let len = ids.len();
-                let input = Tensor::from_vec(ids.clone(), (1, len), &device)?;
-                // Uncached forward at the current adapter state; sample the last pos.
-                // The first GPU kernel JIT happens inside this forward, so translate a
-                // driver-too-old PTX mismatch (`CUDA_ERROR_UNSUPPORTED_PTX_VERSION`) into
-                // an actionable rebuild/upgrade message instead of a cryptic driver code.
-                // A no-op off the `cuda` build and free on the success path.
-                let logits = self
-                    .model
-                    .forward(&input)
-                    .map_err(crate::cuda_compat::translate_ptx_error)?;
-                let last = logits.i((0, len - 1))?;
                 let next = self.sampler.sample(&last)?;
                 ids.push(next);
                 // EOS-inclusive early stop: keep the EOS token, record the true
                 // length, and stop generating this sequence. With `eos_token_id ==
-                // None` this never fires, so the loop runs the full `max_new_tokens`
-                // and the rollout is bit-identical to the legacy behavior.
+                // None` this never fires, so the loop runs the full `max_new_tokens`.
                 if cfg.eos_token_id == Some(next) {
                     comp_len = step + 1;
                     // Right-pad the stopped sequence back to the fixed width so the
                     // group stays rectangular. The pad value is the EOS token itself:
                     // guaranteed in-vocab (it was just sampled) and masked out of the
-                    // loss / ignored by length-aware decoding once those land.
+                    // loss / ignored by length-aware decoding.
                     ids.resize(width, next);
                     break;
+                }
+                // Feed the just-sampled token to advance the cache and get the next
+                // step's logits — unless this was the final step (no further token to
+                // predict), which keeps the sampler-draw count exactly `comp_len`.
+                if step + 1 < cfg.max_new_tokens {
+                    let tok = Tensor::from_vec(vec![next], (1, 1), &device)?;
+                    let logits = decoder
+                        .forward(&tok, offset)
+                        .map_err(crate::cuda_compat::translate_ptx_error)?;
+                    last = logits.i((0, 0))?;
+                    offset += 1;
                 }
             }
             debug_assert_eq!(ids.len(), width, "rollout row is not the fixed width");
@@ -463,6 +524,92 @@ mod tests {
             assert_eq!(ids.len(), prompt.len() + 1);
         }
         assert_eos_rollout_invariants(&r, eos, 1);
+    }
+
+    /// The P6-C cached-rollout equivalence gate: the cached [`generate`] must
+    /// reproduce the uncached oracle's token stream **and** consume an identical
+    /// amount of sampler RNG (same draw count — which the RNG-state equality proves,
+    /// since each draw advances the RNG a fixed amount regardless of the token). Runs
+    /// both paths from the *same* saved sampler state on one policy.
+    fn assert_cached_matches_uncached(policy: &mut QwenPolicy, prompt: &[u32], cfg: &GenConfig) {
+        let start = policy.sampler_state().unwrap();
+        let cached = policy.generate(prompt, cfg).unwrap();
+        let after_cached = policy.sampler_state().unwrap();
+
+        policy.restore_sampler_state(&start).unwrap();
+        let uncached = policy.generate_uncached(prompt, cfg).unwrap();
+        let after_uncached = policy.sampler_state().unwrap();
+
+        assert_eq!(
+            cached.token_ids, uncached.token_ids,
+            "cached rollout token stream diverged from the uncached oracle"
+        );
+        assert_eq!(
+            cached.completion_lens, uncached.completion_lens,
+            "cached rollout completion_lens diverged from the uncached oracle"
+        );
+        assert_eq!(cached.prompt_len, uncached.prompt_len);
+        assert_eq!(
+            after_cached, after_uncached,
+            "cached path consumed a different amount of sampler RNG (draw-count mismatch)"
+        );
+    }
+
+    #[test]
+    fn cached_generate_matches_uncached_adapter_on() {
+        // Arm the adapter (B != 0) so the merge is non-trivial: the cached path must
+        // reproduce the ADAPTER-AWARE uncached stream, not merely the base one.
+        let mut policy = tiny_policy();
+        force_b_nonzero(&policy.trainable_vars());
+        assert!(policy.adapter_enabled());
+        let cfg = GenConfig {
+            group_size: 4,
+            max_new_tokens: 6,
+            temperature: 1.0,
+            eos_token_id: None,
+        };
+        assert_cached_matches_uncached(&mut policy, &[1u32, 2, 3], &cfg);
+    }
+
+    #[test]
+    fn cached_generate_matches_uncached_adapter_off() {
+        // The eval path: adapter disabled => the snapshot is the pure base model.
+        // Proves the toggle-respecting merge keeps eval's adapter-off rollout (and its
+        // RNG consumption) identical to the uncached one.
+        let mut policy = tiny_policy();
+        force_b_nonzero(&policy.trainable_vars()); // armed, but...
+        policy.set_adapter_enabled(false); // ...disabled => base only
+        let cfg = GenConfig {
+            group_size: 3,
+            max_new_tokens: 5,
+            temperature: 1.0,
+            eos_token_id: None,
+        };
+        assert_cached_matches_uncached(&mut policy, &[2u32, 4, 1], &cfg);
+    }
+
+    #[test]
+    fn cached_generate_matches_uncached_with_eos() {
+        // EOS early-stop + right-pad must be identical between paths, and the
+        // sampler-RNG consumption must match — eval draws base then adapter from
+        // successive RNG points, so a draw-count mismatch would desync them. A paired
+        // probe picks a real first-token EOS deterministically; then compare cached vs
+        // uncached on a fresh-sampler policy that draws that same first token.
+        let prompt = [1u32, 2, 3];
+        let max_new = 5usize;
+        let (mut probe, mut policy) = paired_policies();
+        let base = GenConfig {
+            group_size: 4,
+            max_new_tokens: max_new,
+            temperature: 1.0,
+            eos_token_id: None,
+        };
+        let eos = probe.generate_uncached(&prompt, &base).unwrap().token_ids[0][prompt.len()];
+        let cfg_eos = GenConfig {
+            eos_token_id: Some(eos),
+            ..base
+        };
+        assert_cached_matches_uncached(&mut policy, &prompt, &cfg_eos);
     }
 
     #[test]

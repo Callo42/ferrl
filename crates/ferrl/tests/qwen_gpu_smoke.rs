@@ -21,14 +21,15 @@
 //! f32-adapter split is a later memory optimization (see `PLAN.md`).
 
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
-use candle_core::{DType, Device, Tensor};
+use candle_core::{DType, Device, IndexOp, Tensor, D};
 use candle_nn::VarBuilder;
 use candle_transformers::models::qwen3::Config;
 use ferrl::policy::{GenConfig, Rollout};
 use ferrl::{
     evaluate, load_adapter, save_adapter, HfTokenizer, Policy, QwenGradModel, QwenPolicy, RewardFn,
-    RunDir, Trainer, TrainerConfig,
+    RunDir, TokenizerLike, Trainer, TrainerConfig,
 };
 
 /// `LoRA` rank / alpha for the smoke — a typical small adapter.
@@ -206,6 +207,213 @@ fn qwen_v2_resume_smoke_on_gpu() {
             m.step
         );
     }
+}
+
+/// Argmax token id of a 1-D `[vocab]` logits row.
+fn argmax_u32(row: &Tensor) -> u32 {
+    row.argmax(D::Minus1).unwrap().to_scalar::<u32>().unwrap()
+}
+
+/// Arm every `LoRA` `B` factor (odd `trainable_vars` indices) to small random values
+/// so the merge carries a real, representative adapter signal (not the zero-B no-op).
+fn arm_adapter(policy: &QwenPolicy, device: &Device) {
+    for (i, v) in policy.trainable_vars().iter().enumerate() {
+        if i % 2 == 1 {
+            let dims = v.as_tensor().dims().to_vec();
+            v.set(&Tensor::randn(0f32, 0.05f32, dims, device).unwrap())
+                .unwrap();
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs the real Qwen3-0.6B-Base checkpoint (FERRL_QWEN_WEIGHTS) + a CUDA build/GPU"]
+#[allow(clippy::print_stderr)] // a manual gate: the printed agreement/diff numbers are the deliverable
+fn merged_decoder_bf16_faithfulness_on_gpu() {
+    // The P6-C **required manual bf16 GPU gate**: prove the cached `MergedDecoder`
+    // rollout (the production path) is faithful to the uncached adapter-aware forward
+    // in the real **bf16-base / F32-adapter** dtype split — the regime CPU CI cannot
+    // reach (candle's CPU backend has no bf16 matmul). The CPU gates pin the F32 family
+    // bit-for-position; this reports the bf16 argmax-agreement rate + max-abs logit diff.
+    //
+    // What differs, and why a small divergence is EXPECTED (not a bug): BOTH paths run
+    // the adapter in bf16 — the forward casts A/B down to the base dtype before the
+    // matmuls (the PR1 cast-order contract), so this is NOT "merged-bf16 vs an F32
+    // adapter the uncached path keeps". The difference is *where* the small adapter
+    // contribution lands. The cached path forms the merged weight `W + scale·BA` in bf16
+    // (WEIGHT space), so per-element deltas below ~half-ulp(W) round into W and vanish
+    // (the documented ~0.2 % absorption bound). The uncached path adds `scale·(x@Aᵀ)@Bᵀ`
+    // in ACTIVATION space, where that contribution survives relative to the activation
+    // magnitude. So the merged rollout can be very slightly *less* adapted — bounded and
+    // expected; the grad/scoring path (always the uncached forward) is unaffected.
+    let dir = weights_dir();
+    let cfg = load_config(&dir);
+    let device = Device::new_cuda(0)
+        .expect("CUDA device 0 — build with --features cuda and run on a GPU node");
+    let buf = std::fs::read(dir.join("model.safetensors")).expect("read model.safetensors");
+    // Production dtype split: bf16 base, F32 adapter.
+    let vb = VarBuilder::from_buffered_safetensors(buf, DType::BF16, &device)
+        .expect("load model.safetensors (bf16) onto the GPU");
+    let model = QwenGradModel::load_with_adapter_dtype(&cfg, &vb, RANK, ALPHA, DType::F32)
+        .expect("build bf16-base/F32-adapter QwenGradModel");
+    let mut policy = QwenPolicy::new(model, 1234, 1.0);
+    arm_adapter(&policy, &device);
+    assert!(policy.adapter_enabled());
+
+    // A realistic sequence: a generated continuation (cached path) of a real prompt.
+    let tok = HfTokenizer::from_file(dir.join("tokenizer.json")).expect("load tokenizer");
+    let prompt_ids = tok.encode("The capital of France is");
+    let gcfg = GenConfig {
+        group_size: 1,
+        max_new_tokens: 16,
+        temperature: 1.0,
+        eos_token_id: None,
+    };
+    let seq = policy
+        .generate(&prompt_ids, &gcfg)
+        .expect("cached generate")
+        .token_ids[0]
+        .clone();
+    let len = seq.len();
+
+    // Uncached adapter-aware reference: full-sequence forward, all positions (bf16).
+    let input = Tensor::from_vec(seq.clone(), (1, len), &device).unwrap();
+    let uncached = policy.model().forward(&input).expect("uncached forward"); // [1, len, vocab]
+
+    // Cached: prefill + single-token incremental decode, collecting every position.
+    // Also track the logit *scale* (max-abs logit) so the diff can be judged relatively
+    // — argmax agreement alone can stay high while logit magnitudes blow up.
+    let mut dec = policy.model().merged_decoder().expect("merged decoder");
+    let mut agree = 0usize;
+    let mut max_abs = 0f32;
+    let mut max_logit = 0f32;
+    let abs_max = |t: &Tensor| -> f32 {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(D::Minus1)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap()
+    };
+    for (t, &id) in seq.iter().enumerate() {
+        let tokt = Tensor::from_vec(vec![id], (1, 1), &device).unwrap();
+        let cached_row = dec.forward(&tokt, t).unwrap().i((0, 0)).unwrap();
+        let uncached_row = uncached.i((0, t)).unwrap();
+        if argmax_u32(&cached_row) == argmax_u32(&uncached_row) {
+            agree += 1;
+        }
+        let diff = cached_row
+            .to_dtype(DType::F32)
+            .unwrap()
+            .sub(&uncached_row.to_dtype(DType::F32).unwrap())
+            .unwrap();
+        max_abs = max_abs.max(abs_max(&diff));
+        max_logit = max_logit.max(abs_max(&uncached_row));
+    }
+    let rate = agree as f64 / len as f64;
+    let rel = max_abs / max_logit.max(f32::EPSILON);
+    eprintln!(
+        "[bf16 GPU gate] cached-vs-uncached over {len} positions: argmax agreement \
+         {agree}/{len} = {rate:.4}; max-abs logit diff {max_abs:.4} (logit scale \
+         {max_logit:.2}, rel {rel:.4}). Interpret vs the ~0.2% bf16 merge-absorption bound."
+    );
+    assert!(
+        max_abs.is_finite(),
+        "bf16 cached logits diverged non-finitely from uncached"
+    );
+    // A magnitude backstop the argmax rate can't see: the merge-vs-uncached divergence
+    // must stay a small fraction of the logit scale. A correct bf16 merge sits at a few
+    // percent; a wrong scale / dropped or corrupted delta lands comparable to the logits
+    // themselves. 50% cleaves between, with wide margin against honest bf16 noise.
+    assert!(
+        rel <= 0.5,
+        "bf16 cached max-abs logit diff {max_abs:.4} is {rel:.2}x the logit scale \
+         {max_logit:.2} — a magnitude blow-up the argmax-agreement rate would miss"
+    );
+    assert!(
+        rate >= 0.9,
+        "bf16 cached argmax agreement {rate:.4} below 0.9 — the merge is shifting the \
+         rollout distribution more than bf16 absorption alone explains; investigate"
+    );
+}
+
+#[test]
+#[ignore = "needs the real Qwen3-0.6B-Base checkpoint (FERRL_QWEN_WEIGHTS) + a CUDA build/GPU"]
+#[allow(clippy::print_stderr)] // a manual gate: the printed timings are the deliverable
+fn cached_rollout_perf_witness_on_gpu() {
+    // The throughput witness the whole of P6-C exists for: the cached decoder's
+    // incremental forward cost is O(L) per token vs the uncached forward's O(L²)
+    // (it re-runs the full prefix every step). Times the FORWARD cost of both over a
+    // real generation length on the real model; a scalar read at the end of each phase
+    // forces the CUDA stream to drain so the wall-clock is honest. The asymptotic gap
+    // is large at this length, so the direction (cached << uncached) is non-flaky.
+    let dir = weights_dir();
+    let cfg = load_config(&dir);
+    let device = Device::new_cuda(0)
+        .expect("CUDA device 0 — build with --features cuda and run on a GPU node");
+    let buf = std::fs::read(dir.join("model.safetensors")).expect("read model.safetensors");
+    let vb = VarBuilder::from_buffered_safetensors(buf, DType::BF16, &device)
+        .expect("load model.safetensors (bf16) onto the GPU");
+    let model = QwenGradModel::load_with_adapter_dtype(&cfg, &vb, RANK, ALPHA, DType::F32)
+        .expect("build QwenGradModel");
+    let policy = QwenPolicy::new(model, 1234, 1.0);
+    let tok = HfTokenizer::from_file(dir.join("tokenizer.json")).expect("load tokenizer");
+    let prompt_ids = tok.encode("The capital of France is");
+    let n = 48usize;
+
+    // Forces the CUDA stream to complete the work queued so far.
+    let sync = |t: &Tensor| {
+        let _ = t
+            .to_dtype(DType::F32)
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+    };
+
+    // Pre-grow a sequence with varying in-vocab tokens so each timed uncached forward
+    // just slices a longer prefix (no per-iteration push to confound the timing).
+    let mut grown = prompt_ids.clone();
+    while grown.len() < prompt_ids.len() + n {
+        grown.push((grown.len() % 256) as u32);
+    }
+
+    // Uncached: re-run the full-sequence forward over a growing prefix, n times.
+    let t0 = Instant::now();
+    let mut last = None;
+    for k in 0..n {
+        let plen = prompt_ids.len() + k;
+        let inp = Tensor::from_vec(grown[..plen].to_vec(), (1, plen), &device).unwrap();
+        last = Some(policy.model().forward(&inp).unwrap());
+    }
+    sync(last.as_ref().unwrap());
+    let uncached_t = t0.elapsed();
+
+    // Cached: one prefill + n single-token incremental steps (offset == cache length).
+    let t1 = Instant::now();
+    let mut dec = policy.model().merged_decoder().unwrap();
+    let pin = Tensor::from_vec(prompt_ids.clone(), (1, prompt_ids.len()), &device).unwrap();
+    let mut last = dec.forward(&pin, 0).unwrap();
+    for off in prompt_ids.len()..prompt_ids.len() + n {
+        let tokt = Tensor::from_vec(vec![0u32], (1, 1), &device).unwrap();
+        last = dec.forward(&tokt, off).unwrap();
+    }
+    sync(&last);
+    let cached_t = t1.elapsed();
+
+    let speedup = uncached_t.as_secs_f64() / cached_t.as_secs_f64();
+    eprintln!(
+        "[perf witness] {n} steps (prompt {}): uncached forward {uncached_t:?} vs cached \
+         {cached_t:?} => {speedup:.1}x. (Uncached is O(L²), cached O(L).)",
+        prompt_ids.len()
+    );
+    assert!(
+        cached_t < uncached_t,
+        "cached decode ({cached_t:?}) was not faster than uncached ({uncached_t:?})"
+    );
 }
 
 /// Assert two `[seq][tok]` log-prob grids agree within `tol`.
