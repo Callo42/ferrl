@@ -40,15 +40,30 @@
 //!   mirrored from the shipped `Cache::new`, pinned by exact-value inv-freq
 //!   pins (every smoothing branch) plus the equivalence gates.
 //!
-//! ## What is NOT yet validated: the bf16 path
+//! ## Validation beyond CPU CI: real weights and the bf16 path
 //!
 //! Every CI test here runs on CPU at F32, where the attention force-cast pair
 //! is a same-dtype `to_dtype` — an op-free clone, structurally absent from the
-//! autograd graph. The bf16-only behaviors (a real `ToDType` node's backward
-//! through the attention cast, bf16 logit equivalence vs shipped, bf16
-//! merged-weight fidelity) are **not** covered by this module's tests; they
-//! await the Llama real-weights GPU gate (a follow-up, mirroring how the Qwen
-//! path was validated on real hardware before its bf16 rollout).
+//! autograd graph. The gaps that leaves are closed by two `#[ignore]`d manual
+//! gates (run by hand with a staged Llama-3.2-1B checkpoint; see their module
+//! docs), both green as of 2026-06:
+//!
+//! - `tests/llama_real_weights.rs` (CPU, F32): per-position equivalence vs
+//!   shipped at real scale — including the real llama3 `RoPE`-scaling regime
+//!   (factor 32 over 131k positions) and the tied 128k-row head — measured
+//!   worst per-position max-abs divergence 1.7e-5; plus two-phase per-branch
+//!   `LoRA`-grad coverage and a tokenizer round-trip.
+//! - `tests/llama_gpu_smoke.rs` (CUDA, bf16): the three behaviors previously
+//!   deferred here, now validated on an `sm_80` GPU — **bf16 logit equivalence
+//!   vs shipped** (argmax agreement 12/12, max rel diff 0.95% of logit scale),
+//!   **a real `ToDType` backward through the attention cast** (bf16-base /
+//!   F32-adapter two-phase grad coverage, every gradient landing in the F32
+//!   master dtype), and **bf16 merged-weight fidelity** (cached vs uncached:
+//!   argmax 21/21, max rel diff 1.9%) — plus a GRPO smoke driving
+//!   `LmPolicy<LlamaGradModel>` through the unchanged generic `Trainer`.
+//!
+//! Honest residual: these gates are manual (CI stays offline and CPU-only), so
+//! a bf16 regression surfaces at the next manual gate run, not in CI.
 
 use candle_core::{DType, Device, Result as CandleResult, Tensor, Var, D};
 use candle_nn::kv_cache::ConcatKvCache;
@@ -1120,8 +1135,9 @@ mod tests {
         // always-grad-safe net on the v path). NOTE: at F32 the attention
         // force-cast pair is a same-dtype `to_dtype` — an op-free clone,
         // structurally ABSENT from this graph — so this test does NOT cover
-        // the bf16 `ToDType` backward (that awaits the Llama GPU gate; see the
-        // module docs).
+        // the bf16 `ToDType` backward (covered by the `#[ignore]`d
+        // `llama_bf16_dtype_split_grads_on_gpu` gate in
+        // `tests/llama_gpu_smoke.rs`; see the module docs).
         let cfg = tiny_cfg();
         let vb = tiny_vb(&cfg);
         let mut model = LlamaGradModel::load(&cfg, &vb, 2, 4.0).unwrap();
