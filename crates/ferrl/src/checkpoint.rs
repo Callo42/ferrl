@@ -24,10 +24,11 @@
 //! and the rollout sampler RNG are not serialized **yet**: a resumed run restores
 //! the trained weights and the step index but re-warms Adam's bias correction and
 //! re-seeds sampling. This is a documented limitation — bit-exact,
-//! momentum-faithful resume is **P6-B**: ferrl now owns the optimizer
-//! ([`crate::optim::FerrlAdamW`]), so a later PR can serialize and restore its
-//! moments; the sampler RNG still needs an owned, seekable replacement for candle's
-//! `LogitsProcessor`. The adapter weights themselves round-trip bit-exactly.
+//! momentum-faithful resume is **P6-B**: ferrl now owns both the optimizer
+//! ([`crate::optim::FerrlAdamW`]) and the rollout sampler
+//! ([`crate::sampler::GrpoSampler`], whose RNG state is `serde`-serializable), so a
+//! later PR can serialize and restore both. The adapter weights themselves
+//! round-trip bit-exactly.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
