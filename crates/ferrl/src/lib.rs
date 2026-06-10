@@ -118,7 +118,7 @@ pub use optim::{FerrlAdamW, OptimizerState};
 #[doc(inline)]
 pub use policy::Policy;
 #[doc(inline)]
-pub use qwen::QwenGradModel;
+pub use qwen::{MergedDecoder, QwenGradModel};
 #[doc(inline)]
 pub use qwen_policy::QwenPolicy;
 #[doc(inline)]
