@@ -58,7 +58,7 @@ use ferrl::policy::GenConfig;
 use ferrl::{
     evaluate, HfTokenizer, Metrics, QwenGradModel, QwenPolicy, RunDir, Trainer, TrainerConfig,
 };
-use tracing::info;
+use tracing::{info, warn};
 
 /// Read `key` from the environment, parsing it as `T`, falling back to `default`.
 fn env_parse<T: FromStr>(key: &str, default: T) -> T {
@@ -212,15 +212,28 @@ fn build_trainer_config(eos_token_id: Option<u32>) -> TrainerConfig {
     }
 }
 
+/// Open CUDA device 0 and run the driver-compatibility preflight: warn early on a
+/// likely PTX/driver mismatch (proactive, warn-only), then force the first kernel JIT
+/// so a real mismatch fails *here* with an actionable rebuild/upgrade message rather
+/// than buried in the first training forward. Both checks need only the device, so
+/// this runs before the multi-second weight load.
+fn open_cuda_device() -> Result<Device> {
+    let device = Device::new_cuda(0)
+        .context("CUDA device 0 — build with --features cuda and run on a GPU node")?;
+    if let Some(w) = ferrl::check_driver_compat(&device).warning() {
+        warn!("{w}");
+    }
+    ferrl::guard_first_kernel(&device).context("CUDA preflight")?;
+    Ok(device)
+}
+
 fn main() -> Result<()> {
     let _ = ferrl::init_tracing();
 
     let weights = env::var("FERRL_QWEN_WEIGHTS")
         .map_err(|_| anyhow!("set FERRL_QWEN_WEIGHTS to the Qwen3-0.6B-Base asset directory"))?;
     let dir = PathBuf::from(weights);
-    let device = Device::new_cuda(0)
-        .context("CUDA device 0 — build with --features cuda and run on a GPU node")?;
-
+    let device = open_cuda_device()?;
     let (mut policy, tok) = build_policy(&dir, &device)?;
     let (train_prompts, eval_prompts) = build_splits();
     let reward = CountdownReward::default();

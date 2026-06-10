@@ -42,6 +42,9 @@
 //!   sampler RNG, so [`Trainer::resume`] continues an interrupted run **bit-exactly**;
 //! - held-out evaluation ([`eval`]) — the base model vs. the trained adapter,
 //!   mean reward over a held-out set (the P4 gate's comparison);
+//! - a CUDA driver-compatibility preflight ([`cuda_compat`]) — translates the cryptic
+//!   `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` (a build-PTX-newer-than-driver mismatch) into
+//!   an actionable rebuild/upgrade message; a no-op without the `cuda` feature;
 //! - run telemetry ([`telemetry`]).
 //!
 //! Everything below the RL layer — tensors, autograd, optimizers, devices, and
@@ -74,6 +77,7 @@
 
 pub mod checkpoint;
 pub mod countdown;
+pub mod cuda_compat;
 pub mod eval;
 pub mod grpo;
 pub mod lora;
@@ -98,6 +102,8 @@ pub use countdown::{
     build_prompt, generate_dataset, parse_problem_from_prompt, CountdownConfig, CountdownProblem,
     CountdownReward,
 };
+#[doc(inline)]
+pub use cuda_compat::{check_driver_compat, guard_first_kernel, translate_ptx_error, CompatReport};
 #[doc(inline)]
 pub use eval::{evaluate, EvalError, EvalReport, PromptEval};
 #[doc(inline)]

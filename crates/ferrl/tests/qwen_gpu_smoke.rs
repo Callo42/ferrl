@@ -277,3 +277,36 @@ fn qwen_checkpoint_roundtrip_and_eval_on_gpu() {
     assert!(report.base_reward_mean.is_finite() && report.adapter_reward_mean.is_finite());
     assert!(src.adapter_enabled());
 }
+
+#[test]
+#[ignore = "needs a CUDA build + a GPU (no weights required)"]
+fn cuda_preflight_agrees_on_a_supported_gpu() {
+    // The `cuda_compat` preflight on a node whose driver DOES support this build's PTX
+    // (it must, or the other GPU tests here could not run). `guard_first_kernel` is the
+    // AUTHORITY — it actually JITs a kernel — and must pass. `check_driver_compat` is a
+    // warn-only heuristic; on an untabulated driver it may *conservatively* say `TooOld`
+    // even though the guard passed, which is acceptable (it never blocks). So the real
+    // `222` translation is exercised by the deliberately-mismatched build documented in
+    // the PR (an old-driver node), which CI/this suite cannot stage.
+    let device = Device::new_cuda(0)
+        .expect("CUDA device 0 — build with --features cuda and run on a GPU node");
+    ferrl::guard_first_kernel(&device).expect("guard_first_kernel must pass on a supported GPU");
+    match ferrl::check_driver_compat(&device) {
+        ferrl::CompatReport::Ok {
+            built_isa,
+            driver_cuda,
+            ..
+        } => {
+            // Both were read for real (built ISA from the embedded PTX, driver from
+            // the runtime query), so they are plausible version numbers.
+            assert!(built_isa.0 >= 7, "implausible built PTX ISA {built_isa:?}");
+            assert!(
+                driver_cuda.0 >= 11,
+                "implausible driver CUDA {driver_cuda:?}"
+            );
+        }
+        // Query unavailable (Unknown) or a conservative TooOld are both fine: the guard,
+        // not this heuristic, is the authority, and it passed above.
+        ferrl::CompatReport::Unknown(_) | ferrl::CompatReport::TooOld { .. } => {}
+    }
+}

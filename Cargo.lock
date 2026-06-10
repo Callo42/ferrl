@@ -673,6 +673,7 @@ dependencies = [
  "candle-core",
  "candle-nn",
  "candle-transformers",
+ "cudarc 0.19.7",
  "hf-hub",
  "proptest",
  "rand 0.10.1",
