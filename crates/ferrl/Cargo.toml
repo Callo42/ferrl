@@ -26,6 +26,9 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 rand = { workspace = true }
+# Optional, activated only by the `cuda` feature (see below): the proactive
+# driver-version query in `cuda_compat`. Off by default, so the CPU build is unchanged.
+cudarc = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
@@ -44,6 +47,10 @@ cuda = [
     "candle-core/cuda",
     "candle-nn/cuda",
     "candle-transformers/cuda",
+    # Activate the optional direct cudarc dep and its `runtime` module (which
+    # provides the safe `get_driver_version`) for the `cuda_compat` preflight.
+    "dep:cudarc",
+    "cudarc/runtime",
 ]
 # cuDNN convolutions, layered on top of cuda. Optional GPU-only acceleration.
 cudnn = [

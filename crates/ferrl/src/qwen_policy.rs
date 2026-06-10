@@ -123,7 +123,14 @@ impl Policy for QwenPolicy {
                 let len = ids.len();
                 let input = Tensor::from_vec(ids.clone(), (1, len), &device)?;
                 // Uncached forward at the current adapter state; sample the last pos.
-                let logits = self.model.forward(&input)?;
+                // The first GPU kernel JIT happens inside this forward, so translate a
+                // driver-too-old PTX mismatch (`CUDA_ERROR_UNSUPPORTED_PTX_VERSION`) into
+                // an actionable rebuild/upgrade message instead of a cryptic driver code.
+                // A no-op off the `cuda` build and free on the success path.
+                let logits = self
+                    .model
+                    .forward(&input)
+                    .map_err(crate::cuda_compat::translate_ptx_error)?;
                 let last = logits.i((0, len - 1))?;
                 let next = self.sampler.sample(&last)?;
                 ids.push(next);
@@ -172,7 +179,12 @@ impl Policy for QwenPolicy {
             input_data.extend_from_slice(&ids[..input_len]);
         }
         let input = Tensor::from_vec(input_data, (g, input_len), device)?;
-        let logits = self.model.forward(&input)?; // [g, input_len, vocab]
+        // Same CUDA-compat translation as `generate` (see there): a no-op off the
+        // `cuda` build and on the success path.
+        let logits = self
+            .model
+            .forward(&input)
+            .map_err(crate::cuda_compat::translate_ptx_error)?; // [g, input_len, vocab]
 
         // The positions that predict the completion tokens are
         // [prompt_len - 1 .. prompt_len - 1 + comp_len].

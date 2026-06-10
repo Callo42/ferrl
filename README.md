@@ -203,13 +203,103 @@ See the `justfile` header for the exact override variables and defaults.
 ## GPU builds
 
 The `cuda`, `cudnn`, and `flash-attn` cargo features forward candle's GPU backends.
-They require a CUDA toolkit (`nvcc`) and are built **manually on the Slurm cluster**,
-never in CI:
+They require a CUDA toolkit (`nvcc`) and a compatible NVIDIA driver. We build them
+**manually on a Slurm cluster, never in CI** — but that is our workflow, not a
+requirement: any machine with a CUDA toolkit and a new-enough driver can build them.
 
 ```sh
 just clippy-cuda        # lint the GPU feature set
 cargo build --features cuda
 ```
+
+### CUDA driver compatibility
+
+The CUDA kernels ferrl uses are compiled to **PTX** at *build* time by the CUDA
+toolkit (`nvcc`) on the build machine. At *run* time your NVIDIA **driver**
+JIT-compiles that PTX for your GPU, and it enforces its own maximum supported PTX ISA
+version. As NVIDIA's compatibility guide puts it:
+
+> Applications that compile device code to PTX will not work on older drivers.
+
+So the rule is one-directional:
+
+> **The CUDA toolkit you build with must emit PTX no newer than your runtime driver
+> understands.** Older PTX runs fine on newer drivers; newer PTX does not run on older
+> drivers.
+
+`CUDA_COMPUTE_CAP` sets the **GPU SM architecture** (e.g. `80` = Ampere), **not** the
+PTX ISA version. Only the toolkit (`nvcc`) version sets the ISA — lowering
+`CUDA_COMPUTE_CAP` will **not** fix a driver-too-old error.
+
+#### Symptom
+
+If you build with a toolkit newer than your driver supports, the **first** GPU kernel
+load (the first model forward) fails at run time — not at build time — with:
+
+```
+CUDA_ERROR_UNSUPPORTED_PTX_VERSION   (CUDA driver error 222)
+```
+
+ferrl detects this and replaces the cryptic driver error with an actionable message
+telling you to rebuild with an older toolkit or upgrade your driver (see "Built-in
+preflight" below).
+
+#### Fixing it for your driver
+
+1. Find your driver's CUDA ceiling: run `nvidia-smi`. The top-right **"CUDA Version"**
+   field is the maximum CUDA toolkit your driver can run (distinct from the driver
+   number on the left, e.g. `550.54.14`).
+2. Build ferrl with a CUDA toolkit **at or below** that ceiling (the table below maps
+   driver minimums to the maximum toolkit), **or** upgrade your NVIDIA driver to the
+   minimum for the toolkit you want.
+3. If several CUDA toolkits are installed (e.g. a distro toolkit plus an HPC SDK), the
+   kernels are compiled with whichever `nvcc` is **first on `PATH`** — put the toolkit
+   you intend to build with first.
+
+A CUDA **major-family** minimum driver (e.g. "CUDA 12.x runs on ≥ 525.60.13") does
+**not** cover PTX JIT of a newer ISA. Meet the **per-toolkit** minimum in the table
+below, not just the family floor.
+
+#### Compatibility table
+
+Driver minimums are **Linux x86_64** (Windows minimums differ — see the NVIDIA CUDA
+Toolkit Release Notes). Match your driver against the first column to find the newest
+toolkit you can build with.
+
+| Your driver ≥ (Linux x86_64) | Max CUDA toolkit | PTX ISA |
+| ---------------------------- | ---------------- | ------- |
+| 520.61.05                    | 11.8             | 7.8     |
+| 525.60.13                    | 12.0             | 8.0     |
+| 530.30.02                    | 12.1             | 8.1     |
+| 535.54.03                    | 12.2             | 8.2     |
+| 545.23.06                    | 12.3             | 8.3     |
+| 550.54.14                    | 12.4             | 8.4     |
+| 555.42.02                    | 12.5             | 8.5     |
+| 560.28.03                    | 12.6             | 8.5     |
+| 565.57.01                    | 12.7             | 8.6     |
+| 570.26                       | 12.8             | 8.7     |
+| 575.51.03                    | 12.9             | 8.8     |
+
+(CUDA 12.6 reuses ISA 8.5; CUDA 12.7 — the r565 driver generation, which reports CUDA
+12.7 via the driver API — introduced ISA 8.6.)
+
+The driver column is NVIDIA's minimum for the full toolkit. The built-in preflight
+instead names the driver that can *JIT* your build's PTX ISA — the floor that error 222
+actually keys on — which can be lower (e.g. `555.42.02` for ISA 8.5, even from a CUDA 12.6
+build). Both are correct; error 222 only concerns PTX JIT, so follow whichever number the
+preflight prints.
+
+#### Built-in preflight
+
+When built with `--features cuda`, ferrl turns the cryptic
+`CUDA_ERROR_UNSUPPORTED_PTX_VERSION` into an actionable rebuild/upgrade message:
+
+- A **reactive guard** — `ferrl::guard_first_kernel(&device)`, also applied
+  automatically on ferrl's first GPU forward — runs one tiny kernel and, on a PTX
+  mismatch, reports exactly how to fix it. This is the authoritative check.
+- An optional **proactive check** — `ferrl::check_driver_compat(&device)` — compares
+  your driver's reported CUDA version against the PTX ISA this binary was built with
+  and **warns** early. It never blocks a working setup.
 
 ---
 

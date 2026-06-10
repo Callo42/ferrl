@@ -61,6 +61,13 @@ anyhow = "1"
 # `serde` feature serializes the sampler RNG state (`GrpoSampler`'s
 # `Xoshiro256PlusPlus`) so a checkpoint can capture and restore it (P6-B resume).
 rand = { version = "0.10", features = ["serde"] }
+# Optional CUDA driver/runtime bindings. candle pulls cudarc transitively but not
+# its `runtime` module; ferrl takes a direct OPTIONAL dep (activated only by the
+# `cuda` feature, via `cudarc/runtime`) solely to reach the safe `get_driver_version`
+# that powers the `cuda_compat` driver-compatibility preflight. A bare `0.19` (not a
+# `=` pin) tracks the exact 0.19.x patch candle resolves, so the two share ONE cudarc
+# and the types unify. No new system lib: cudart is already linked by candle-kernels.
+cudarc = { version = "0.19", default-features = false }
 # Dev: property-based testing for numeric invariants.
 proptest = "1"
 # Dev: deterministic float comparison in tests.

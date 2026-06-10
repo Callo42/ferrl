@@ -37,3 +37,10 @@ autograd, GPU, and the base model forward to [candle](https://github.com/hugging
   gradient) after `backward()`.
 - The shipped Qwen forward is inference-shaped (`&mut self` KV-cache); the training
   update needs a separate uncached, full-sequence, gradient-bearing forward.
+- The build toolkit's **PTX ISA** must be `<=` the runtime NVIDIA driver's maximum, or
+  the **first** CUDA kernel load fails at run time with
+  `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` (driver error 222). `CUDA_COMPUTE_CAP` sets the
+  SM architecture, **not** the ISA — only the `nvcc` version sets the ISA. The
+  `cuda_compat` preflight translates this into an actionable message
+  (`guard_first_kernel` reactive + auto-applied, `check_driver_compat` proactive warn);
+  see the README "GPU builds" → "CUDA driver compatibility".
