@@ -25,8 +25,225 @@
 //! adapter into one frozen, tape-detached weight `W + (alpha/rank) · B @ A`
 //! (or just `W` when disabled), so a KV-cached decoder can apply the adapter
 //! as a single plain matmul per step. The grad/scoring path never uses it.
+//!
+//! Which projections of a model carry the adapter is a **recipe**:
+//! [`DenseLoraTargets`] for the dense (attention + `SwiGLU`-MLP) models
+//! ([`crate::qwen`], [`crate::llama`]); the hybrid `qwen3_5` family has its own
+//! extended recipe ([`crate::qwen35::LoraTargets`]) with the `GatedDeltaNet`
+//! opt-ins. The recipe (together with the config) determines the trainable-var
+//! order — the positional checkpoint contract.
 
 use candle_core::{DType, Result as CandleResult, Tensor, Var};
+use candle_nn::VarBuilder;
+
+use crate::blocks::frozen_linear;
+
+/// Which projections of a **dense** (attention + `SwiGLU`-MLP) transformer
+/// carry the `LoRA` adapter — the recipe for [`crate::qwen::QwenGradModel`]
+/// and [`crate::llama::LlamaGradModel`].
+///
+/// The default is the **industrial** recipe (every attention and MLP
+/// projection — what TRL/verl/ms-swift configure for RL fine-tuning in 2026;
+/// see [`industrial`](Self::industrial)). The **historical** ferrl recipe is
+/// q/v-only ([`legacy`](Self::legacy)) — the dense models' `load()` /
+/// `load_with_adapter_dtype()` constructors keep it so every pre-existing
+/// adapter checkpoint stays positionally loadable (see the type docs'
+/// var-order note below).
+///
+/// Norm weights, the embedding, and the (tied or untied) `lm_head` are never
+/// adapted — no framework adapts them.
+///
+/// The recipe (together with the config) **determines the trainable-var
+/// order** — layer-major, fixed projection order within each layer
+/// (`q,k,v,o,gate,up,down`, adapted ones only, each contributing `[A, B]`) —
+/// which is the positional checkpoint contract;
+/// [`canonical`](Self::canonical) is the stable string form for recording it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct DenseLoraTargets {
+    /// Attention `q_proj`.
+    pub attn_q: bool,
+    /// Attention `k_proj`.
+    pub attn_k: bool,
+    /// Attention `v_proj`.
+    pub attn_v: bool,
+    /// Attention `o_proj`.
+    pub attn_o: bool,
+    /// MLP `gate_proj`.
+    pub mlp_gate: bool,
+    /// MLP `up_proj`.
+    pub mlp_up: bool,
+    /// MLP `down_proj`.
+    pub mlp_down: bool,
+}
+
+impl Default for DenseLoraTargets {
+    fn default() -> Self {
+        Self::industrial()
+    }
+}
+
+impl DenseLoraTargets {
+    /// The industrial default recipe: every attention and MLP projection.
+    #[must_use]
+    pub fn industrial() -> Self {
+        Self {
+            attn_q: true,
+            attn_k: true,
+            attn_v: true,
+            attn_o: true,
+            mlp_gate: true,
+            mlp_up: true,
+            mlp_down: true,
+        }
+    }
+
+    /// The historical ferrl recipe: `q_proj`/`v_proj` only. This is what the
+    /// dense models hard-wired before the recipe existed, and what their
+    /// `load()` constructors still use — pre-recipe adapter checkpoints
+    /// (canonical `attn:qv|mlp:-`) restore positionally under it.
+    #[must_use]
+    pub fn legacy() -> Self {
+        Self {
+            attn_q: true,
+            attn_k: false,
+            attn_v: true,
+            attn_o: false,
+            mlp_gate: false,
+            mlp_up: false,
+            mlp_down: false,
+        }
+    }
+
+    /// Whether any projection is targeted at all (a no-target model would
+    /// train nothing — the loaders reject it).
+    #[must_use]
+    pub fn any(&self) -> bool {
+        self.attn_q
+            || self.attn_k
+            || self.attn_v
+            || self.attn_o
+            || self.mlp_gate
+            || self.mlp_up
+            || self.mlp_down
+    }
+
+    /// A stable, human-readable encoding of the recipe (for logs and
+    /// checkpoint metadata): e.g. the industrial default is
+    /// `attn:qkvo|mlp:gud`, the legacy recipe `attn:qv|mlp:-`.
+    #[must_use]
+    pub fn canonical(&self) -> String {
+        let pick = |pairs: &[(bool, char)]| -> String {
+            let s: String = pairs
+                .iter()
+                .filter(|(on, _)| *on)
+                .map(|(_, c)| *c)
+                .collect();
+            if s.is_empty() {
+                "-".to_string()
+            } else {
+                s
+            }
+        };
+        format!(
+            "attn:{}|mlp:{}",
+            pick(&[
+                (self.attn_q, 'q'),
+                (self.attn_k, 'k'),
+                (self.attn_v, 'v'),
+                (self.attn_o, 'o'),
+            ]),
+            pick(&[
+                (self.mlp_gate, 'g'),
+                (self.mlp_up, 'u'),
+                (self.mlp_down, 'd'),
+            ]),
+        )
+    }
+}
+
+/// A bias-free linear projection that either stays frozen or carries the
+/// `LoRA` adapter, per a recipe flag — the shared building block every
+/// recipe-driven model loader is assembled from.
+#[derive(Debug)]
+pub(crate) enum Proj {
+    /// The frozen base weight, `[out, in]`.
+    Frozen(Tensor),
+    /// The same weight wrapped with a trainable adapter.
+    Lora(LoraLinear),
+}
+
+impl Proj {
+    /// Load `<name>.weight` of `shape` from `vb`, adapted iff `adapted`.
+    pub(crate) fn load(
+        vb: &VarBuilder,
+        name: &str,
+        shape: (usize, usize),
+        adapted: bool,
+        rank: usize,
+        alpha: f64,
+        adapter_dtype: DType,
+    ) -> CandleResult<Self> {
+        let w = vb.pp(name).get(shape, "weight")?;
+        if adapted {
+            Ok(Self::Lora(LoraLinear::with_adapter_dtype(
+                w,
+                None,
+                rank,
+                alpha,
+                adapter_dtype,
+            )?))
+        } else {
+            Ok(Self::Frozen(w))
+        }
+    }
+
+    /// `y = x Wᵀ` (plus the adapter side-path when adapted and enabled).
+    pub(crate) fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
+        match self {
+            Self::Frozen(w) => frozen_linear(x, w),
+            Self::Lora(l) => l.forward(x),
+        }
+    }
+
+    /// The single effective weight of the current forward (see
+    /// [`LoraLinear::merged_weight`]); a frozen projection is its own merge.
+    ///
+    /// Fails loud on a biased adapted projection: [`Proj::load`] always builds
+    /// bias-free, but `LoraLinear` can carry a bias — and every merged decoder
+    /// applies NONE, so a future biased construction path would silently make
+    /// the cached rollout diverge from the biased uncached forward.
+    pub(crate) fn merged_weight(&self) -> CandleResult<Tensor> {
+        match self {
+            Self::Frozen(w) => Ok(w.detach()),
+            Self::Lora(l) => {
+                if l.base_bias().is_some() {
+                    candle_core::bail!(
+                        "Proj::merged_weight: this projection carries a base bias, but the \
+                         merged snapshot is bias-free (extend the merged decoder to apply \
+                         base_bias() before using a biased adapter here)"
+                    );
+                }
+                l.merged_weight()
+            }
+        }
+    }
+
+    /// Append this projection's trainable [`Var`]s (`[A, B]` when adapted,
+    /// nothing when frozen) — the positional-order building block.
+    pub(crate) fn push_vars(&self, out: &mut Vec<Var>) {
+        if let Self::Lora(l) = self {
+            out.extend(l.trainable_vars());
+        }
+    }
+
+    /// Forward the adapter toggle (a no-op on a frozen projection).
+    pub(crate) fn set_enabled(&mut self, enabled: bool) {
+        if let Self::Lora(l) = self {
+            l.set_enabled(enabled);
+        }
+    }
+}
 
 /// A linear layer with a frozen base weight and a trainable low-rank adapter.
 #[derive(Debug, Clone)]
@@ -234,6 +451,89 @@ mod tests {
         // Deterministic ramp weight so forward outputs are predictable.
         let data: Vec<f32> = (0..out * in_).map(|i| i as f32 * 0.1).collect();
         Tensor::from_vec(data, (out, in_), &Device::Cpu).unwrap()
+    }
+
+    #[test]
+    fn dense_targets_canonical_strings() {
+        assert_eq!(
+            DenseLoraTargets::industrial().canonical(),
+            "attn:qkvo|mlp:gud"
+        );
+        // The default IS the industrial recipe (mirrors the qwen3_5 LoraTargets
+        // convention); the dense models' load() keeps legacy() explicitly.
+        assert_eq!(DenseLoraTargets::default(), DenseLoraTargets::industrial());
+        // The legacy string must equal what the pre-recipe models hard-wired
+        // into checkpoint manifests ("attn:qv|mlp:-") — manifest continuity.
+        assert_eq!(DenseLoraTargets::legacy().canonical(), "attn:qv|mlp:-");
+    }
+
+    #[test]
+    fn dense_targets_empty_recipe_is_detectable() {
+        let none = DenseLoraTargets {
+            attn_q: false,
+            attn_k: false,
+            attn_v: false,
+            attn_o: false,
+            mlp_gate: false,
+            mlp_up: false,
+            mlp_down: false,
+        };
+        assert_eq!(none.canonical(), "attn:-|mlp:-");
+        assert!(!none.any());
+        assert!(DenseLoraTargets::legacy().any());
+        assert!(DenseLoraTargets::industrial().any());
+    }
+
+    #[test]
+    fn proj_frozen_forward_equals_frozen_linear_and_has_no_vars() {
+        let w = base(4, 3);
+        let p = Proj::Frozen(w.clone());
+        let x = Tensor::from_vec(vec![1f32, 2.0, 3.0], (1, 1, 3), &Device::Cpu).unwrap();
+        let got = p.forward(&x).unwrap();
+        let want = crate::blocks::frozen_linear(&x, &w).unwrap();
+        let diff: f32 = got
+            .broadcast_sub(&want)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .to_scalar()
+            .unwrap();
+        assert_eq!(diff, 0.0);
+        let mut vars = Vec::new();
+        p.push_vars(&mut vars);
+        assert!(vars.is_empty());
+        // A frozen projection is its own merge (same values, detached).
+        let m = p.merged_weight().unwrap();
+        let mdiff: f32 = m
+            .broadcast_sub(&w)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .to_scalar()
+            .unwrap();
+        assert_eq!(mdiff, 0.0);
+    }
+
+    #[test]
+    fn proj_merged_weight_rejects_a_biased_adapter() {
+        // Proj::load always builds bias-free, but a hand-built biased
+        // LoraLinear must be rejected at merge time — every merged decoder
+        // applies no bias, so silently dropping one would corrupt rollout.
+        let w = base(4, 3);
+        let bias = Tensor::ones(4, DType::F32, &Device::Cpu).unwrap();
+        let p = Proj::Lora(LoraLinear::new(w, Some(bias), 2, 4.0).unwrap());
+        let err = p.merged_weight().unwrap_err();
+        assert!(
+            err.to_string().contains("base bias"),
+            "expected a biased-adapter rejection, got: {err}"
+        );
+        // Forward still applies the bias (only the merge path is unsupported).
+        let x = Tensor::from_vec(vec![1f32, 2.0, 3.0], (1, 1, 3), &Device::Cpu).unwrap();
+        assert!(p.forward(&x).is_ok());
     }
 
     #[test]

@@ -7,7 +7,10 @@
 //! rotate-half `RoPE` with optional llama3 scaling, `SwiGLU`, `RMSNorm`, no
 //! QK-norm, no biases): a full-sequence, uncached forward over the **same loaded
 //! weights** as candle's shipped `llama::Llama`, expressed entirely in
-//! grad-bearing ops, with a manual `LoRA` adapter on `q_proj`/`v_proj`.
+//! grad-bearing ops, with a manual `LoRA` adapter attached per a
+//! [`DenseLoraTargets`] recipe (the historical `load()` default is q/v-only;
+//! see [`LlamaGradModel::load_with_targets`] for the industrial
+//! every-projection recipe).
 //!
 //! It is the second implementor of the [`GradModel`] / [`CachedDecoder`] seam
 //! (after [`crate::qwen`]) — the validator that the model abstraction is real:
@@ -73,7 +76,7 @@ use candle_nn::{Activation, VarBuilder};
 use candle_transformers::models::llama::{Config, Llama3RopeConfig, Llama3RopeType};
 
 use crate::blocks::{causal_mask, causal_mask_at, frozen_linear, repeat_kv, RotaryTables};
-use crate::lora::LoraLinear;
+use crate::lora::{DenseLoraTargets, Proj};
 use crate::model::{CachedDecoder, GradModel};
 use crate::nn::RmsNorm;
 
@@ -124,16 +127,16 @@ fn inv_freq_for(cfg: &Config) -> Vec<f32> {
     }
 }
 
-/// One dense-Llama attention block. `q_proj`/`v_proj` carry the `LoRA` adapter;
-/// `k_proj`/`o_proj` are frozen. Replicates the shipped `CausalSelfAttention`
-/// (no QK-norm, no biases, F32 score path) with the grad-safe substitutions and
-/// no KV cache.
+/// One dense-Llama attention block; each projection carries the `LoRA` adapter
+/// or stays frozen per the [`DenseLoraTargets`] recipe. Replicates the shipped
+/// `CausalSelfAttention` (no QK-norm, no biases, F32 score path) with the
+/// grad-safe substitutions and no KV cache.
 #[derive(Debug)]
 struct LlamaAttention {
-    q_proj: LoraLinear,
-    v_proj: LoraLinear,
-    k_weight: Tensor,
-    o_weight: Tensor,
+    q_proj: Proj,
+    k_proj: Proj,
+    v_proj: Proj,
+    o_proj: Proj,
     num_heads: usize,
     num_kv_heads: usize,
     num_kv_groups: usize,
@@ -145,6 +148,7 @@ impl LlamaAttention {
     fn load(
         cfg: &Config,
         vb: &VarBuilder,
+        targets: DenseLoraTargets,
         rank: usize,
         alpha: f64,
         adapter_dtype: DType,
@@ -154,13 +158,43 @@ impl LlamaAttention {
         let head_dim = cfg.hidden_size / cfg.num_attention_heads;
         let q_out = cfg.num_attention_heads * head_dim;
         let kv_out = cfg.num_key_value_heads * head_dim;
-        let q_weight = vb.pp("q_proj").get((q_out, h), "weight")?;
-        let v_weight = vb.pp("v_proj").get((kv_out, h), "weight")?;
         Ok(Self {
-            q_proj: LoraLinear::with_adapter_dtype(q_weight, None, rank, alpha, adapter_dtype)?,
-            v_proj: LoraLinear::with_adapter_dtype(v_weight, None, rank, alpha, adapter_dtype)?,
-            k_weight: vb.pp("k_proj").get((kv_out, h), "weight")?,
-            o_weight: vb.pp("o_proj").get((h, q_out), "weight")?,
+            q_proj: Proj::load(
+                vb,
+                "q_proj",
+                (q_out, h),
+                targets.attn_q,
+                rank,
+                alpha,
+                adapter_dtype,
+            )?,
+            k_proj: Proj::load(
+                vb,
+                "k_proj",
+                (kv_out, h),
+                targets.attn_k,
+                rank,
+                alpha,
+                adapter_dtype,
+            )?,
+            v_proj: Proj::load(
+                vb,
+                "v_proj",
+                (kv_out, h),
+                targets.attn_v,
+                rank,
+                alpha,
+                adapter_dtype,
+            )?,
+            o_proj: Proj::load(
+                vb,
+                "o_proj",
+                (h, q_out),
+                targets.attn_o,
+                rank,
+                alpha,
+                adapter_dtype,
+            )?,
             num_heads: cfg.num_attention_heads,
             num_kv_heads: cfg.num_key_value_heads,
             num_kv_groups: cfg.num_attention_heads / cfg.num_key_value_heads,
@@ -178,9 +212,10 @@ impl LlamaAttention {
         let (b, l, _) = x.dims3()?;
         let in_dtype = x.dtype();
 
-        // 1. Projections (q, v carry LoRA; k frozen). No biases anywhere.
+        // 1. Projections, each adapted or frozen per the recipe. No biases
+        //    anywhere.
         let q = self.q_proj.forward(x)?;
-        let k = frozen_linear(x, &self.k_weight)?;
+        let k = self.k_proj.forward(x)?;
         let v = self.v_proj.forward(x)?;
 
         // 2. (B, L, H, D) -> (B, H, L, D).
@@ -222,46 +257,95 @@ impl LlamaAttention {
             .transpose(1, 2)?
             .contiguous()?
             .reshape((b, l, self.attn_hidden))?;
-        frozen_linear(&ctx, &self.o_weight)
+        self.o_proj.forward(&ctx)
     }
 
     fn set_adapter_enabled(&mut self, enabled: bool) {
         self.q_proj.set_enabled(enabled);
+        self.k_proj.set_enabled(enabled);
         self.v_proj.set_enabled(enabled);
+        self.o_proj.set_enabled(enabled);
     }
 
-    fn trainable_vars(&self) -> Vec<Var> {
-        let mut vars = self.q_proj.trainable_vars();
-        vars.extend(self.v_proj.trainable_vars());
-        vars
+    /// Var order within the layer: `q_proj, k_proj, v_proj, o_proj` (adapted
+    /// ones only).
+    fn push_vars(&self, out: &mut Vec<Var>) {
+        self.q_proj.push_vars(out);
+        self.k_proj.push_vars(out);
+        self.v_proj.push_vars(out);
+        self.o_proj.push_vars(out);
     }
 }
 
-/// `SwiGLU` MLP, all frozen, activation fixed to `silu` (the llama Config has
-/// no `hidden_act` knob). `Clone` is cheap (every field is a frozen `Tensor`,
-/// i.e. an `Arc` bump) — the cached [`LlamaMergedDecoder`] snapshots it.
-#[derive(Debug, Clone)]
+/// `SwiGLU` MLP, activation fixed to `silu` (the llama Config has no
+/// `hidden_act` knob); each projection may carry the adapter per the
+/// [`DenseLoraTargets`] recipe.
+#[derive(Debug)]
 struct LlamaMlp {
-    gate_weight: Tensor,
-    up_weight: Tensor,
-    down_weight: Tensor,
+    gate_proj: Proj,
+    up_proj: Proj,
+    down_proj: Proj,
 }
 
 impl LlamaMlp {
-    fn load(cfg: &Config, vb: &VarBuilder) -> CandleResult<Self> {
+    fn load(
+        cfg: &Config,
+        vb: &VarBuilder,
+        targets: DenseLoraTargets,
+        rank: usize,
+        alpha: f64,
+        adapter_dtype: DType,
+    ) -> CandleResult<Self> {
         let h = cfg.hidden_size;
         let i = cfg.intermediate_size;
         Ok(Self {
-            gate_weight: vb.pp("gate_proj").get((i, h), "weight")?,
-            up_weight: vb.pp("up_proj").get((i, h), "weight")?,
-            down_weight: vb.pp("down_proj").get((h, i), "weight")?,
+            gate_proj: Proj::load(
+                vb,
+                "gate_proj",
+                (i, h),
+                targets.mlp_gate,
+                rank,
+                alpha,
+                adapter_dtype,
+            )?,
+            up_proj: Proj::load(
+                vb,
+                "up_proj",
+                (i, h),
+                targets.mlp_up,
+                rank,
+                alpha,
+                adapter_dtype,
+            )?,
+            down_proj: Proj::load(
+                vb,
+                "down_proj",
+                (h, i),
+                targets.mlp_down,
+                rank,
+                alpha,
+                adapter_dtype,
+            )?,
         })
     }
 
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
-        let lhs = frozen_linear(x, &self.gate_weight)?.apply(&Activation::Silu)?;
-        let rhs = frozen_linear(x, &self.up_weight)?;
-        frozen_linear(&lhs.broadcast_mul(&rhs)?, &self.down_weight)
+        let lhs = self.gate_proj.forward(x)?.apply(&Activation::Silu)?;
+        let rhs = self.up_proj.forward(x)?;
+        self.down_proj.forward(&lhs.broadcast_mul(&rhs)?)
+    }
+
+    fn set_adapter_enabled(&mut self, enabled: bool) {
+        self.gate_proj.set_enabled(enabled);
+        self.up_proj.set_enabled(enabled);
+        self.down_proj.set_enabled(enabled);
+    }
+
+    /// Var order: `gate_proj, up_proj, down_proj` (adapted ones only).
+    fn push_vars(&self, out: &mut Vec<Var>) {
+        self.gate_proj.push_vars(out);
+        self.up_proj.push_vars(out);
+        self.down_proj.push_vars(out);
     }
 }
 
@@ -278,6 +362,7 @@ impl LlamaLayer {
     fn load(
         cfg: &Config,
         vb: &VarBuilder,
+        targets: DenseLoraTargets,
         rank: usize,
         alpha: f64,
         adapter_dtype: DType,
@@ -286,9 +371,16 @@ impl LlamaLayer {
         let h = cfg.hidden_size;
         Ok(Self {
             ln1: RmsNorm::new(vb.pp("input_layernorm").get(h, "weight")?, eps),
-            attn: LlamaAttention::load(cfg, &vb.pp("self_attn"), rank, alpha, adapter_dtype)?,
+            attn: LlamaAttention::load(
+                cfg,
+                &vb.pp("self_attn"),
+                targets,
+                rank,
+                alpha,
+                adapter_dtype,
+            )?,
             ln2: RmsNorm::new(vb.pp("post_attention_layernorm").get(h, "weight")?, eps),
-            mlp: LlamaMlp::load(cfg, &vb.pp("mlp"))?,
+            mlp: LlamaMlp::load(cfg, &vb.pp("mlp"), targets, rank, alpha, adapter_dtype)?,
         })
     }
 
@@ -308,20 +400,25 @@ impl LlamaLayer {
 
     fn set_adapter_enabled(&mut self, enabled: bool) {
         self.attn.set_adapter_enabled(enabled);
+        self.mlp.set_adapter_enabled(enabled);
     }
 
-    fn trainable_vars(&self) -> Vec<Var> {
-        self.attn.trainable_vars()
+    /// Var order within the layer: the attention projections first, then the
+    /// MLP's.
+    fn push_vars(&self, out: &mut Vec<Var>) {
+        self.attn.push_vars(out);
+        self.mlp.push_vars(out);
     }
 }
 
-/// A grad-bearing, uncached dense Llama-3.x forward with `LoRA` on
-/// `q_proj`/`v_proj` — the second [`GradModel`] implementor.
+/// A grad-bearing, uncached dense Llama-3.x forward with `LoRA` attached per a
+/// [`DenseLoraTargets`] recipe — the second [`GradModel`] implementor.
 ///
 /// Built from the same [`VarBuilder`] (over the same safetensors) as candle's
 /// shipped `llama::Llama`, so the two are weight-identical and their logits
 /// match (the M1 equivalence gate). The base weights are frozen [`Tensor`]s;
-/// only the `LoRA` `A`/`B` factors are trainable [`Var`]s.
+/// only the `LoRA` `A`/`B` factors are trainable [`Var`]s, in a deterministic
+/// layer-major order (the positional checkpoint contract).
 #[derive(Debug)]
 pub struct LlamaGradModel {
     embed: Tensor,
@@ -331,11 +428,17 @@ pub struct LlamaGradModel {
     rot: RotaryTables,
     hidden: usize,
     device: Device,
+    targets: DenseLoraTargets,
 }
 
 impl LlamaGradModel {
     /// Load the model from `vb`, attaching a `LoRA` adapter of the given `rank`
-    /// and `alpha` to every layer's `q_proj` and `v_proj`.
+    /// and `alpha` with the **historical q/v-only recipe**
+    /// ([`DenseLoraTargets::legacy`]) — kept (rather than the industrial
+    /// default) so pre-recipe adapter checkpoints stay positionally loadable
+    /// through this constructor. Use
+    /// [`load_with_targets`](Self::load_with_targets) for the industrial
+    /// recipe.
     ///
     /// `vb` must be over the Llama safetensors (any dtype; F32 for the CPU
     /// equivalence gate). `cfg` is candle's own `llama::Config` so derived dims
@@ -346,16 +449,15 @@ impl LlamaGradModel {
     ///
     /// # Errors
     ///
-    /// Returns a candle error if `cfg.use_flash_attn` is set, if a weight
-    /// tensor is missing or mis-shaped, or if the `LoRA` factors cannot be
-    /// allocated.
+    /// As [`load_with_targets`](Self::load_with_targets).
     pub fn load(cfg: &Config, vb: &VarBuilder, rank: usize, alpha: f64) -> CandleResult<Self> {
         // The adapter shares the base weights' dtype (the toy / all-F32 case).
-        Self::load_with_adapter_dtype(cfg, vb, rank, alpha, vb.dtype())
+        Self::load_with_targets(cfg, vb, rank, alpha, vb.dtype(), DenseLoraTargets::legacy())
     }
 
-    /// Like [`load`](Self::load), but holds the trainable `LoRA` adapter in
-    /// `adapter_dtype`, independent of the (frozen) base weights' dtype.
+    /// Like [`load`](Self::load) (the historical q/v-only recipe), but holds
+    /// the trainable `LoRA` adapter in `adapter_dtype`, independent of the
+    /// (frozen) base weights' dtype.
     ///
     /// This is the same **bf16-base / F32-adapter** split as
     /// [`crate::qwen::QwenGradModel::load_with_adapter_dtype`]: load `vb` in
@@ -365,7 +467,7 @@ impl LlamaGradModel {
     ///
     /// # Errors
     ///
-    /// As [`load`](Self::load).
+    /// As [`load_with_targets`](Self::load_with_targets).
     pub fn load_with_adapter_dtype(
         cfg: &Config,
         vb: &VarBuilder,
@@ -373,6 +475,39 @@ impl LlamaGradModel {
         alpha: f64,
         adapter_dtype: DType,
     ) -> CandleResult<Self> {
+        Self::load_with_targets(
+            cfg,
+            vb,
+            rank,
+            alpha,
+            adapter_dtype,
+            DenseLoraTargets::legacy(),
+        )
+    }
+
+    /// Load the model from `vb`, attaching the `LoRA` adapter per `targets`
+    /// (see [`DenseLoraTargets`]; `DenseLoraTargets::default()` is the
+    /// industrial every-projection recipe).
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if `cfg.use_flash_attn` is set, if `targets`
+    /// selects nothing (an untrainable model), if a weight tensor is missing
+    /// or mis-shaped, or if the `LoRA` factors cannot be allocated.
+    pub fn load_with_targets(
+        cfg: &Config,
+        vb: &VarBuilder,
+        rank: usize,
+        alpha: f64,
+        adapter_dtype: DType,
+        targets: DenseLoraTargets,
+    ) -> CandleResult<Self> {
+        if !targets.any() {
+            candle_core::bail!(
+                "LlamaGradModel: DenseLoraTargets selects no projection — the model would \
+                 have no trainable parameters"
+            );
+        }
         // Fail loud on Config options this forward does not implement, rather
         // than silently loading a non-parity model (the P3 pattern). Flash
         // attention is a fused GPU kernel with no backward and different
@@ -413,6 +548,7 @@ impl LlamaGradModel {
             layers.push(LlamaLayer::load(
                 cfg,
                 &layers_vb.pp(i),
+                targets,
                 rank,
                 alpha,
                 adapter_dtype,
@@ -437,7 +573,15 @@ impl LlamaGradModel {
             )?,
             hidden: h,
             device: vb.device().clone(),
+            targets,
         })
+    }
+
+    /// The [`DenseLoraTargets`] recipe this model was loaded with (for logging
+    /// and checkpoint metadata — see [`DenseLoraTargets::canonical`]).
+    #[must_use]
+    pub fn lora_targets(&self) -> DenseLoraTargets {
+        self.targets
     }
 
     /// Full-sequence logits `[batch, seq, vocab]` for `input_ids` (`[batch,
@@ -480,14 +624,18 @@ impl LlamaGradModel {
         }
     }
 
-    /// All trainable `LoRA` [`Var`]s (every layer's `q_proj`/`v_proj` `A`/`B`),
-    /// in a stable order, for the optimizer and the grad-coverage canary.
+    /// All trainable `LoRA` [`Var`]s in a **deterministic** order — layer-major;
+    /// within a layer the attention projections first (`q,k,v,o`), then the
+    /// MLP's (`gate,up,down`); each adapted projection contributes `[A, B]`.
+    /// The order is a pure function of (config, [`DenseLoraTargets`]) — the
+    /// positional checkpoint contract.
     #[must_use]
     pub fn trainable_vars(&self) -> Vec<Var> {
-        self.layers
-            .iter()
-            .flat_map(LlamaLayer::trainable_vars)
-            .collect()
+        let mut vars = Vec::new();
+        for layer in &self.layers {
+            layer.push_vars(&mut vars);
+        }
+        vars
     }
 
     /// The device the weights live on, so a caller (e.g.
@@ -501,7 +649,7 @@ impl LlamaGradModel {
     /// [`LlamaMergedDecoder`] for fast incremental rollout.
     ///
     /// Same design as [`crate::qwen::QwenGradModel::merged_decoder`]: folds the
-    /// live `LoRA` adapter into each `q_proj`/`v_proj` via
+    /// live `LoRA` adapter into every adapted projection via
     /// [`crate::lora::LoraLinear::merged_weight`] (respecting the adapter
     /// toggle), clones the frozen rest, and hands back a decoder over candle's
     /// `ConcatKvCache` — O(L) per token instead of the uncached forward's
@@ -544,19 +692,18 @@ impl GradModel for LlamaGradModel {
     }
 
     fn lora_recipe(&self) -> Option<String> {
-        // Legacy q/v-only recipe, hard-wired (LoraTargets retrofit tracked as
-        // R1 follow-up); recorded honestly in checkpoint manifests.
-        Some("attn:qv|mlp:-".to_string())
+        Some(self.targets.canonical())
     }
 }
 
 /// One dense-Llama attention block over **merged** weights with an incremental
-/// KV cache — the grad-free mirror of [`LlamaAttention`]. `q`/`v` use the
-/// folded [`LoraLinear::merged_weight`]; `k`/`o` reuse the frozen base weights
-/// (all bias-free — the llama family has no projection biases); the un-repeated
-/// K/V are appended to a [`ConcatKvCache`] before `repeat_kv`, the shipped op
-/// order (project → reshape/transpose → `RoPE(offset)` → cache append →
-/// `repeat_kv` → F32 SDPA → `o_proj`).
+/// KV cache — the grad-free mirror of [`LlamaAttention`]. Every projection uses
+/// its single effective weight (the folded
+/// [`crate::lora::LoraLinear::merged_weight`] when adapted, the frozen base
+/// otherwise; all bias-free — the llama family has no projection biases); the
+/// un-repeated K/V are appended to a [`ConcatKvCache`] before `repeat_kv`, the
+/// shipped op order (project → reshape/transpose → `RoPE(offset)` → cache
+/// append → `repeat_kv` → F32 SDPA → `o_proj`).
 #[derive(Debug)]
 struct LlamaMergedAttention {
     q_weight: Tensor,
@@ -585,8 +732,8 @@ impl LlamaMergedAttention {
         let (b, l, _) = x.dims3()?;
         let in_dtype = x.dtype();
 
-        // 1. Projections over merged weights (q, v carry the folded adapter; k
-        //    frozen). Bias-free by construction.
+        // 1. Projections over merged weights (adapted ones carry the folded
+        //    adapter; the rest are the frozen base). Bias-free by construction.
         let q = frozen_linear(x, &self.q_weight)?;
         let k = frozen_linear(x, &self.k_weight)?;
         let v = frozen_linear(x, &self.v_weight)?;
@@ -635,14 +782,38 @@ impl LlamaMergedAttention {
     }
 }
 
+/// `SwiGLU` MLP over merged weights — the grad-free mirror of [`LlamaMlp`].
+#[derive(Debug)]
+struct LlamaMergedMlp {
+    gate_weight: Tensor,
+    up_weight: Tensor,
+    down_weight: Tensor,
+}
+
+impl LlamaMergedMlp {
+    fn from_layer(mlp: &LlamaMlp) -> CandleResult<Self> {
+        Ok(Self {
+            gate_weight: mlp.gate_proj.merged_weight()?,
+            up_weight: mlp.up_proj.merged_weight()?,
+            down_weight: mlp.down_proj.merged_weight()?,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
+        let lhs = frozen_linear(x, &self.gate_weight)?.apply(&Activation::Silu)?;
+        let rhs = frozen_linear(x, &self.up_weight)?;
+        frozen_linear(&lhs.broadcast_mul(&rhs)?, &self.down_weight)
+    }
+}
+
 /// One decoder layer over merged weights: pre-norm cached attention + pre-norm
-/// frozen `SwiGLU`, both residual. The grad-free mirror of [`LlamaLayer`].
+/// merged `SwiGLU`, both residual. The grad-free mirror of [`LlamaLayer`].
 #[derive(Debug)]
 struct LlamaMergedLayer {
     ln1: RmsNorm,
     attn: LlamaMergedAttention,
     ln2: RmsNorm,
-    mlp: LlamaMlp,
+    mlp: LlamaMergedMlp,
 }
 
 impl LlamaMergedLayer {
@@ -689,24 +860,16 @@ impl LlamaMergedDecoder {
         let mut layers = Vec::with_capacity(model.layers.len());
         for layer in &model.layers {
             let a = &layer.attn;
-            // This snapshot applies NO bias (the llama family has none, and
-            // `load` hard-codes `None`) — if a future construction path ever
-            // hands q/v a biased LoraLinear, fail loud here rather than let the
-            // cached rollout silently diverge from the biased uncached forward.
-            if a.q_proj.base_bias().is_some() || a.v_proj.base_bias().is_some() {
-                candle_core::bail!(
-                    "LlamaMergedDecoder: q_proj/v_proj carry a base bias, but this merged \
-                     snapshot is bias-free (extend LlamaMergedAttention to apply base_bias() \
-                     before using a biased adapter here)"
-                );
-            }
+            // This snapshot applies NO bias, which is sound by construction:
+            // every projection is a `Proj`, and `Proj::load` always builds
+            // bias-free (the llama family has no projection biases).
             layers.push(LlamaMergedLayer {
                 ln1: layer.ln1.clone(),
                 attn: LlamaMergedAttention {
                     q_weight: a.q_proj.merged_weight()?,
-                    k_weight: a.k_weight.clone(),
+                    k_weight: a.k_proj.merged_weight()?,
                     v_weight: a.v_proj.merged_weight()?,
-                    o_weight: a.o_weight.clone(),
+                    o_weight: a.o_proj.merged_weight()?,
                     num_heads: a.num_heads,
                     num_kv_heads: a.num_kv_heads,
                     num_kv_groups: a.num_kv_groups,
@@ -715,7 +878,7 @@ impl LlamaMergedDecoder {
                     cache: ConcatKvCache::new(2),
                 },
                 ln2: layer.ln2.clone(),
-                mlp: layer.mlp.clone(),
+                mlp: LlamaMergedMlp::from_layer(&layer.mlp)?,
             });
         }
         Ok(Self {
@@ -1692,23 +1855,253 @@ mod tests {
     }
 
     #[test]
-    fn merged_decoder_rejects_a_biased_q_or_v_projection() {
-        // The llama Config cannot express projection biases today (`load`
-        // hard-codes None), but `LoraLinear` can carry one — and the merged
-        // snapshot applies NO bias, so a future biased q/v would make the
-        // cached rollout silently diverge from the uncached forward. The
-        // snapshot must fail loud instead.
+    fn merged_decoder_rejects_a_biased_projection() {
+        // `Proj::load` always builds bias-free (no supported config has
+        // projection biases), but `LoraLinear` can carry one — and the merged
+        // snapshot applies NO bias, so a future biased construction path would
+        // make the cached rollout silently diverge from the uncached forward.
+        // The snapshot must fail loud instead (the guard lives in
+        // `Proj::merged_weight`, shared by every model's merged decoder).
         let cfg = tiny_cfg();
         let vb = tiny_vb(&cfg);
         let mut model = LlamaGradModel::load(&cfg, &vb, 2, 4.0).unwrap();
         let h = cfg.hidden_size; // q_out == hidden at these dims
         let w = Tensor::zeros((h, h), DType::F32, &dev()).unwrap();
         let bias = Tensor::ones(h, DType::F32, &dev()).unwrap();
-        model.layers[0].attn.q_proj = LoraLinear::new(w, Some(bias), 2, 4.0).unwrap();
+        model.layers[0].attn.q_proj =
+            Proj::Lora(crate::lora::LoraLinear::new(w, Some(bias), 2, 4.0).unwrap());
         let err = model.merged_decoder().unwrap_err();
         assert!(
             err.to_string().contains("base bias"),
             "expected a biased-projection rejection, got: {err}"
+        );
+    }
+
+    // ---- DenseLoraTargets recipe gates -------------------------------------
+
+    /// The trainable [`Var`]s of one projection (`[A, B]` when adapted, empty
+    /// when frozen) — the building block the order pins compare against.
+    fn proj_vars(p: &Proj) -> Vec<Var> {
+        let mut out = Vec::new();
+        p.push_vars(&mut out);
+        out
+    }
+
+    #[test]
+    fn load_with_targets_rejects_an_empty_recipe() {
+        let cfg = tiny_cfg();
+        let vb = tiny_vb(&cfg);
+        let none = DenseLoraTargets {
+            attn_q: false,
+            attn_k: false,
+            attn_v: false,
+            attn_o: false,
+            mlp_gate: false,
+            mlp_up: false,
+            mlp_down: false,
+        };
+        let err =
+            LlamaGradModel::load_with_targets(&cfg, &vb, 2, 4.0, DType::F32, none).unwrap_err();
+        assert!(
+            err.to_string().contains("no projection"),
+            "expected a no-target rejection, got: {err}"
+        );
+    }
+
+    /// Assert `vars[base..base+expect.len()]` are exactly `expect`, by Var
+    /// identity (shape alone could not catch a same-shape swap, e.g. k/v).
+    fn assert_var_ids_match(vars: &[Var], expect: &[Var], base: usize) {
+        for (j, e) in expect.iter().enumerate() {
+            assert_eq!(
+                vars[base + j].as_tensor().id(),
+                e.as_tensor().id(),
+                "var {} out of positional order",
+                base + j
+            );
+        }
+    }
+
+    /// Every projection the legacy q/v-only recipe must NOT adapt stays frozen.
+    fn assert_legacy_frozen(layer: &LlamaLayer) {
+        for (p, name) in [
+            (&layer.attn.k_proj, "k_proj"),
+            (&layer.attn.o_proj, "o_proj"),
+            (&layer.mlp.gate_proj, "gate_proj"),
+            (&layer.mlp.up_proj, "up_proj"),
+            (&layer.mlp.down_proj, "down_proj"),
+        ] {
+            assert!(
+                matches!(p, Proj::Frozen(_)),
+                "{name} must stay frozen under the legacy recipe"
+            );
+        }
+    }
+
+    /// One layer's vars in the DOCUMENTED industrial order
+    /// `[q,k,v,o,gate,up,down]`, built directly from the layer fields — so a
+    /// swap inside any `push_vars` reddens the pin that compares against this.
+    fn industrial_layer_vars(layer: &LlamaLayer) -> Vec<Var> {
+        let mut out = Vec::new();
+        for p in [
+            &layer.attn.q_proj,
+            &layer.attn.k_proj,
+            &layer.attn.v_proj,
+            &layer.attn.o_proj,
+            &layer.mlp.gate_proj,
+            &layer.mlp.up_proj,
+            &layer.mlp.down_proj,
+        ] {
+            p.push_vars(&mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn legacy_load_pins_the_qv_only_var_order_and_recipe() {
+        // load() = the historical q/v-only recipe: 4 vars per layer in
+        // [q_A, q_B, v_A, v_B] order — THE positional back-compat contract for
+        // pre-recipe adapter checkpoints — plus frozen-ness of everything the
+        // legacy recipe must not adapt.
+        let cfg = tiny_cfg();
+        let vb = tiny_vb(&cfg);
+        let model = LlamaGradModel::load(&cfg, &vb, 2, 4.0).unwrap();
+        assert_eq!(model.lora_recipe(), Some("attn:qv|mlp:-".to_string()));
+        let vars = model.trainable_vars();
+        assert_eq!(vars.len(), cfg.num_hidden_layers * 4);
+        for (l, layer) in model.layers.iter().enumerate() {
+            let mut expect = proj_vars(&layer.attn.q_proj);
+            expect.extend(proj_vars(&layer.attn.v_proj));
+            assert_var_ids_match(&vars, &expect, l * 4);
+            assert_legacy_frozen(layer);
+        }
+    }
+
+    #[test]
+    fn industrial_recipe_var_order_is_layer_major_qkvo_then_mlp() {
+        // The positional checkpoint contract under the industrial recipe:
+        // layer-major, [q,k,v,o,gate,up,down] within a layer, [A,B] per
+        // projection — pinned by Var identity against an expectation built
+        // directly from the layer fields in the documented order.
+        let cfg = tiny_cfg();
+        let vb = tiny_vb(&cfg);
+        let model = LlamaGradModel::load_with_targets(
+            &cfg,
+            &vb,
+            2,
+            4.0,
+            DType::F32,
+            DenseLoraTargets::industrial(),
+        )
+        .unwrap();
+        assert_eq!(model.lora_recipe(), Some("attn:qkvo|mlp:gud".to_string()));
+        let vars = model.trainable_vars();
+        assert_eq!(vars.len(), cfg.num_hidden_layers * 14);
+        for (l, layer) in model.layers.iter().enumerate() {
+            let expect = industrial_layer_vars(layer);
+            assert_eq!(expect.len(), 14);
+            assert_var_ids_match(&vars, &expect, l * 14);
+        }
+    }
+
+    #[test]
+    fn industrial_grads_flow_to_every_projection() {
+        // Per-projection liveness under the industrial recipe: each adapted
+        // projection's [A, B] pair gets a present, finite, nonzero gradient.
+        // An aggregate-only canary could hide one dead projection (e.g. a
+        // newly-adaptable o_proj or down_proj wired around the tape).
+        let cfg = tiny_cfg();
+        let vb = tiny_vb(&cfg);
+        let mut model = LlamaGradModel::load_with_targets(
+            &cfg,
+            &vb,
+            2,
+            4.0,
+            DType::F32,
+            DenseLoraTargets::industrial(),
+        )
+        .unwrap();
+        model.set_adapter_enabled(true);
+        let vars = model.trainable_vars();
+        force_b_nonzero(&vars);
+        let grads = backward_grads(&model);
+        for (pair_idx, pair) in vars.chunks(2).enumerate() {
+            let c = grad_coverage(pair, &grads).unwrap();
+            assert!(
+                c.is_covered() && c.is_live() && c.nonfinite == 0,
+                "projection pair {pair_idx} has dead/missing grads: {c:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn adapter_toggle_reaches_the_mlp_projections() {
+        // A recipe adapting ONLY mlp_down, armed: the toggle must change the
+        // output — proving set_adapter_enabled fans out past the attention
+        // block into the MLP (newly adaptable in this retrofit).
+        let cfg = tiny_cfg();
+        let vb = tiny_vb(&cfg);
+        let targets = DenseLoraTargets {
+            attn_q: false,
+            attn_k: false,
+            attn_v: false,
+            attn_o: false,
+            mlp_gate: false,
+            mlp_up: false,
+            mlp_down: true,
+        };
+        let mut model =
+            LlamaGradModel::load_with_targets(&cfg, &vb, 2, 4.0, DType::F32, targets).unwrap();
+        assert_eq!(model.trainable_vars().len(), cfg.num_hidden_layers * 2);
+        arm_adapter(&model);
+        let input = ids(4);
+        model.set_adapter_enabled(true);
+        let on = model.forward(&input).unwrap();
+        model.set_adapter_enabled(false);
+        let off = model.forward(&input).unwrap();
+        assert!(
+            max_abs_diff(&on, &off) > 1e-4,
+            "an armed mlp_down adapter must change the output when enabled"
+        );
+    }
+
+    #[test]
+    fn merged_decoder_matches_uncached_under_the_industrial_recipe() {
+        // The cached-equivalence gate with EVERY projection adapted and armed:
+        // pins the merged fold of k/o/gate/up/down — the projections this
+        // retrofit makes adaptable for the first time.
+        let cfg = tiny_cfg();
+        let vb = tiny_vb(&cfg);
+        let mut model = LlamaGradModel::load_with_targets(
+            &cfg,
+            &vb,
+            2,
+            4.0,
+            DType::F32,
+            DenseLoraTargets::industrial(),
+        )
+        .unwrap();
+        arm_adapter(&model);
+        model.set_adapter_enabled(true);
+
+        let seq = 6;
+        let input = ids(seq);
+        let reference = model.forward(&input).unwrap();
+        // Non-vacuity: the armed all-projection adapter must move the logits.
+        assert!(
+            max_abs_diff(&reference, &uncached_base_logits(&cfg, &vb, &input)) > 1e-3,
+            "armed industrial adapter must change the logits (gate would be vacuous)"
+        );
+
+        let mut dec = model.merged_decoder().unwrap();
+        let mut worst = 0f32;
+        for t in 0..seq {
+            let tok = input.narrow(1, t, 1).unwrap();
+            let logits_t = dec.forward(&tok, t).unwrap();
+            worst = worst.max(max_abs_diff(&logits_t, &reference.narrow(1, t, 1).unwrap()));
+        }
+        assert!(
+            worst <= 1e-3,
+            "industrial-recipe cached decode diverged from uncached forward: {worst}"
         );
     }
 }

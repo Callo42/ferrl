@@ -5,7 +5,9 @@
 //! ops that have **no backward**, so it cannot be used to train. This module is the
 //! *update* path: a full-sequence, uncached forward over the **same loaded
 //! weights**, expressed entirely in grad-bearing ops, with a manual `LoRA` adapter
-//! on `q_proj`/`v_proj`. Rollout is handled by the KV-cached [`MergedDecoder`]
+//! attached per a [`DenseLoraTargets`] recipe (the historical `load()` default is
+//! q/v-only; see [`QwenGradModel::load_with_targets`] for the industrial
+//! every-projection recipe). Rollout is handled by the KV-cached [`MergedDecoder`]
 //! below (the production `generate` path since P6-C): candle's shipped cached
 //! forward carries no adapter, so the merged-weight snapshot — the live adapter
 //! folded into the base per `generate` call — is what makes a fast *adapter-aware*
@@ -40,19 +42,20 @@ use candle_nn::{Activation, VarBuilder};
 use candle_transformers::models::qwen3::Config;
 
 use crate::blocks::{causal_mask, causal_mask_at, frozen_linear, repeat_kv, RotaryTables};
-use crate::lora::LoraLinear;
+use crate::lora::{DenseLoraTargets, Proj};
 use crate::model::{CachedDecoder, GradModel};
 use crate::nn::RmsNorm;
 
-/// One Qwen3 attention block. `q_proj`/`v_proj` carry the `LoRA` adapter; the
-/// rest are frozen. Replicates candle's `Qwen3Attention::forward` with the three
-/// grad-safe substitutions and no KV cache.
+/// One Qwen3 attention block; each projection carries the `LoRA` adapter or
+/// stays frozen per the [`DenseLoraTargets`] recipe. Replicates candle's
+/// `Qwen3Attention::forward` with the three grad-safe substitutions and no KV
+/// cache.
 #[derive(Debug)]
 struct QwenAttention {
-    q_proj: LoraLinear,
-    v_proj: LoraLinear,
-    k_weight: Tensor,
-    o_weight: Tensor,
+    q_proj: Proj,
+    k_proj: Proj,
+    v_proj: Proj,
+    o_proj: Proj,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
     num_heads: usize,
@@ -66,6 +69,7 @@ impl QwenAttention {
     fn load(
         cfg: &Config,
         vb: &VarBuilder,
+        targets: DenseLoraTargets,
         rank: usize,
         alpha: f64,
         adapter_dtype: DType,
@@ -74,14 +78,44 @@ impl QwenAttention {
         let head_dim = cfg.head_dim;
         let q_out = cfg.num_attention_heads * head_dim;
         let kv_out = cfg.num_key_value_heads * head_dim;
-        let q_weight = vb.pp("q_proj").get((q_out, h), "weight")?;
-        let v_weight = vb.pp("v_proj").get((kv_out, h), "weight")?;
         let eps = cfg.rms_norm_eps as f32;
         Ok(Self {
-            q_proj: LoraLinear::with_adapter_dtype(q_weight, None, rank, alpha, adapter_dtype)?,
-            v_proj: LoraLinear::with_adapter_dtype(v_weight, None, rank, alpha, adapter_dtype)?,
-            k_weight: vb.pp("k_proj").get((kv_out, h), "weight")?,
-            o_weight: vb.pp("o_proj").get((h, q_out), "weight")?,
+            q_proj: Proj::load(
+                vb,
+                "q_proj",
+                (q_out, h),
+                targets.attn_q,
+                rank,
+                alpha,
+                adapter_dtype,
+            )?,
+            k_proj: Proj::load(
+                vb,
+                "k_proj",
+                (kv_out, h),
+                targets.attn_k,
+                rank,
+                alpha,
+                adapter_dtype,
+            )?,
+            v_proj: Proj::load(
+                vb,
+                "v_proj",
+                (kv_out, h),
+                targets.attn_v,
+                rank,
+                alpha,
+                adapter_dtype,
+            )?,
+            o_proj: Proj::load(
+                vb,
+                "o_proj",
+                (h, q_out),
+                targets.attn_o,
+                rank,
+                alpha,
+                adapter_dtype,
+            )?,
             q_norm: RmsNorm::new(vb.pp("q_norm").get(head_dim, "weight")?, eps),
             k_norm: RmsNorm::new(vb.pp("k_norm").get(head_dim, "weight")?, eps),
             num_heads: cfg.num_attention_heads,
@@ -100,9 +134,9 @@ impl QwenAttention {
     ) -> CandleResult<Tensor> {
         let (b, l, _) = x.dims3()?;
 
-        // 1. Projections (q, v carry LoRA; k frozen).
+        // 1. Projections, each adapted or frozen per the recipe.
         let q = self.q_proj.forward(x)?;
-        let k = frozen_linear(x, &self.k_weight)?;
+        let k = self.k_proj.forward(x)?;
         let v = self.v_proj.forward(x)?;
 
         // 2. (B, L, H, D) -> (B, H, L, D).
@@ -143,47 +177,96 @@ impl QwenAttention {
             .transpose(1, 2)?
             .contiguous()?
             .reshape((b, l, self.attn_hidden))?;
-        frozen_linear(&ctx, &self.o_weight)
+        self.o_proj.forward(&ctx)
     }
 
     fn set_adapter_enabled(&mut self, enabled: bool) {
         self.q_proj.set_enabled(enabled);
+        self.k_proj.set_enabled(enabled);
         self.v_proj.set_enabled(enabled);
+        self.o_proj.set_enabled(enabled);
     }
 
-    fn trainable_vars(&self) -> Vec<Var> {
-        let mut vars = self.q_proj.trainable_vars();
-        vars.extend(self.v_proj.trainable_vars());
-        vars
+    /// Var order within the layer: `q_proj, k_proj, v_proj, o_proj` (adapted
+    /// ones only).
+    fn push_vars(&self, out: &mut Vec<Var>) {
+        self.q_proj.push_vars(out);
+        self.k_proj.push_vars(out);
+        self.v_proj.push_vars(out);
+        self.o_proj.push_vars(out);
     }
 }
 
-/// `SwiGLU` MLP, all frozen. `Clone` is cheap (every field is a frozen
-/// `Tensor`, i.e. an `Arc` bump) — the cached [`MergedDecoder`] snapshots it.
-#[derive(Debug, Clone)]
+/// `SwiGLU` MLP; each projection may carry the adapter per the
+/// [`DenseLoraTargets`] recipe.
+#[derive(Debug)]
 struct QwenMlp {
-    gate_weight: Tensor,
-    up_weight: Tensor,
-    down_weight: Tensor,
+    gate_proj: Proj,
+    up_proj: Proj,
+    down_proj: Proj,
     act: Activation,
 }
 
 impl QwenMlp {
-    fn load(cfg: &Config, vb: &VarBuilder) -> CandleResult<Self> {
+    fn load(
+        cfg: &Config,
+        vb: &VarBuilder,
+        targets: DenseLoraTargets,
+        rank: usize,
+        alpha: f64,
+        adapter_dtype: DType,
+    ) -> CandleResult<Self> {
         let h = cfg.hidden_size;
         let i = cfg.intermediate_size;
         Ok(Self {
-            gate_weight: vb.pp("gate_proj").get((i, h), "weight")?,
-            up_weight: vb.pp("up_proj").get((i, h), "weight")?,
-            down_weight: vb.pp("down_proj").get((h, i), "weight")?,
+            gate_proj: Proj::load(
+                vb,
+                "gate_proj",
+                (i, h),
+                targets.mlp_gate,
+                rank,
+                alpha,
+                adapter_dtype,
+            )?,
+            up_proj: Proj::load(
+                vb,
+                "up_proj",
+                (i, h),
+                targets.mlp_up,
+                rank,
+                alpha,
+                adapter_dtype,
+            )?,
+            down_proj: Proj::load(
+                vb,
+                "down_proj",
+                (h, i),
+                targets.mlp_down,
+                rank,
+                alpha,
+                adapter_dtype,
+            )?,
             act: cfg.hidden_act,
         })
     }
 
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
-        let lhs = frozen_linear(x, &self.gate_weight)?.apply(&self.act)?;
-        let rhs = frozen_linear(x, &self.up_weight)?;
-        frozen_linear(&lhs.broadcast_mul(&rhs)?, &self.down_weight)
+        let lhs = self.gate_proj.forward(x)?.apply(&self.act)?;
+        let rhs = self.up_proj.forward(x)?;
+        self.down_proj.forward(&lhs.broadcast_mul(&rhs)?)
+    }
+
+    fn set_adapter_enabled(&mut self, enabled: bool) {
+        self.gate_proj.set_enabled(enabled);
+        self.up_proj.set_enabled(enabled);
+        self.down_proj.set_enabled(enabled);
+    }
+
+    /// Var order: `gate_proj, up_proj, down_proj` (adapted ones only).
+    fn push_vars(&self, out: &mut Vec<Var>) {
+        self.gate_proj.push_vars(out);
+        self.up_proj.push_vars(out);
+        self.down_proj.push_vars(out);
     }
 }
 
@@ -200,6 +283,7 @@ impl QwenLayer {
     fn load(
         cfg: &Config,
         vb: &VarBuilder,
+        targets: DenseLoraTargets,
         rank: usize,
         alpha: f64,
         adapter_dtype: DType,
@@ -208,9 +292,16 @@ impl QwenLayer {
         let h = cfg.hidden_size;
         Ok(Self {
             ln1: RmsNorm::new(vb.pp("input_layernorm").get(h, "weight")?, eps),
-            attn: QwenAttention::load(cfg, &vb.pp("self_attn"), rank, alpha, adapter_dtype)?,
+            attn: QwenAttention::load(
+                cfg,
+                &vb.pp("self_attn"),
+                targets,
+                rank,
+                alpha,
+                adapter_dtype,
+            )?,
             ln2: RmsNorm::new(vb.pp("post_attention_layernorm").get(h, "weight")?, eps),
-            mlp: QwenMlp::load(cfg, &vb.pp("mlp"))?,
+            mlp: QwenMlp::load(cfg, &vb.pp("mlp"), targets, rank, alpha, adapter_dtype)?,
         })
     }
 
@@ -230,19 +321,25 @@ impl QwenLayer {
 
     fn set_adapter_enabled(&mut self, enabled: bool) {
         self.attn.set_adapter_enabled(enabled);
+        self.mlp.set_adapter_enabled(enabled);
     }
 
-    fn trainable_vars(&self) -> Vec<Var> {
-        self.attn.trainable_vars()
+    /// Var order within the layer: the attention projections first, then the
+    /// MLP's.
+    fn push_vars(&self, out: &mut Vec<Var>) {
+        self.attn.push_vars(out);
+        self.mlp.push_vars(out);
     }
 }
 
-/// A grad-bearing, uncached Qwen3 forward with `LoRA` on `q_proj`/`v_proj`.
+/// A grad-bearing, uncached Qwen3 forward with `LoRA` attached per a
+/// [`DenseLoraTargets`] recipe.
 ///
 /// Built from the same [`VarBuilder`] (over the same safetensors) as candle's
 /// shipped `ModelForCausalLM`, so the two are weight-identical and their logits
 /// match (the P3 equivalence gate). The base weights are frozen [`Tensor`]s; only
-/// the `LoRA` `A`/`B` factors are trainable [`Var`]s.
+/// the `LoRA` `A`/`B` factors are trainable [`Var`]s, in a deterministic
+/// layer-major order (the positional checkpoint contract).
 #[derive(Debug)]
 pub struct QwenGradModel {
     embed: Tensor,
@@ -253,11 +350,17 @@ pub struct QwenGradModel {
     hidden: usize,
     device: Device,
     dtype: DType,
+    targets: DenseLoraTargets,
 }
 
 impl QwenGradModel {
     /// Load the model from `vb`, attaching a `LoRA` adapter of the given `rank`
-    /// and `alpha` to every layer's `q_proj` and `v_proj`.
+    /// and `alpha` with the **historical q/v-only recipe**
+    /// ([`DenseLoraTargets::legacy`]) — kept (rather than the industrial
+    /// default) so pre-recipe adapter checkpoints stay positionally loadable
+    /// through this constructor. Use
+    /// [`load_with_targets`](Self::load_with_targets) for the industrial
+    /// recipe.
     ///
     /// `vb` must be over the Qwen3 safetensors (any dtype; F32 for the CPU
     /// equivalence gate). `cfg` is candle's own `qwen3::Config` so derived dims
@@ -267,16 +370,15 @@ impl QwenGradModel {
     ///
     /// # Errors
     ///
-    /// Returns a candle error if `cfg` requests an unsupported option
-    /// (`attention_bias`, `use_sliding_window`), if a weight tensor is missing or
-    /// mis-shaped, or if the `LoRA` factors cannot be allocated.
+    /// As [`load_with_targets`](Self::load_with_targets).
     pub fn load(cfg: &Config, vb: &VarBuilder, rank: usize, alpha: f64) -> CandleResult<Self> {
         // The adapter shares the base weights' dtype (the toy / all-F32 case).
-        Self::load_with_adapter_dtype(cfg, vb, rank, alpha, vb.dtype())
+        Self::load_with_targets(cfg, vb, rank, alpha, vb.dtype(), DenseLoraTargets::legacy())
     }
 
-    /// Like [`load`](Self::load), but holds the trainable `LoRA` adapter in
-    /// `adapter_dtype`, independent of the (frozen) base weights' dtype.
+    /// Like [`load`](Self::load) (the historical q/v-only recipe), but holds
+    /// the trainable `LoRA` adapter in `adapter_dtype`, independent of the
+    /// (frozen) base weights' dtype.
     ///
     /// This is the **bf16-base / F32-adapter** split: load `vb` in BF16 (halving the
     /// base weights *and* the retained activations that dominate the GRPO grad
@@ -286,7 +388,7 @@ impl QwenGradModel {
     ///
     /// # Errors
     ///
-    /// As [`load`](Self::load).
+    /// As [`load_with_targets`](Self::load_with_targets).
     pub fn load_with_adapter_dtype(
         cfg: &Config,
         vb: &VarBuilder,
@@ -294,6 +396,40 @@ impl QwenGradModel {
         alpha: f64,
         adapter_dtype: DType,
     ) -> CandleResult<Self> {
+        Self::load_with_targets(
+            cfg,
+            vb,
+            rank,
+            alpha,
+            adapter_dtype,
+            DenseLoraTargets::legacy(),
+        )
+    }
+
+    /// Load the model from `vb`, attaching the `LoRA` adapter per `targets`
+    /// (see [`DenseLoraTargets`]; `DenseLoraTargets::default()` is the
+    /// industrial every-projection recipe).
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if `cfg` requests an unsupported option
+    /// (`attention_bias`, `use_sliding_window`), if `targets` selects nothing
+    /// (an untrainable model), if a weight tensor is missing or mis-shaped, or
+    /// if the `LoRA` factors cannot be allocated.
+    pub fn load_with_targets(
+        cfg: &Config,
+        vb: &VarBuilder,
+        rank: usize,
+        alpha: f64,
+        adapter_dtype: DType,
+        targets: DenseLoraTargets,
+    ) -> CandleResult<Self> {
+        if !targets.any() {
+            candle_core::bail!(
+                "QwenGradModel: DenseLoraTargets selects no projection — the model would \
+                 have no trainable parameters"
+            );
+        }
         // Fail loud on Config options this forward does not implement, rather than
         // silently loading a non-parity model. Qwen3-0.6B-Base uses neither: candle's
         // shipped loader honors `attention_bias` on all four projections and a
@@ -327,6 +463,7 @@ impl QwenGradModel {
             layers.push(QwenLayer::load(
                 cfg,
                 &layers_vb.pp(i),
+                targets,
                 rank,
                 alpha,
                 adapter_dtype,
@@ -352,7 +489,15 @@ impl QwenGradModel {
             hidden: h,
             device: vb.device().clone(),
             dtype: vb.dtype(),
+            targets,
         })
+    }
+
+    /// The [`DenseLoraTargets`] recipe this model was loaded with (for logging
+    /// and checkpoint metadata — see [`DenseLoraTargets::canonical`]).
+    #[must_use]
+    pub fn lora_targets(&self) -> DenseLoraTargets {
+        self.targets
     }
 
     /// Full-sequence logits `[batch, seq, vocab]` for `input_ids` (`[batch, seq]`,
@@ -393,14 +538,18 @@ impl QwenGradModel {
         }
     }
 
-    /// All trainable `LoRA` [`Var`]s (every layer's `q_proj`/`v_proj` `A`/`B`),
-    /// in a stable order, for the optimizer and the grad-coverage canary.
+    /// All trainable `LoRA` [`Var`]s in a **deterministic** order — layer-major;
+    /// within a layer the attention projections first (`q,k,v,o`), then the
+    /// MLP's (`gate,up,down`); each adapted projection contributes `[A, B]`.
+    /// The order is a pure function of (config, [`DenseLoraTargets`]) — the
+    /// positional checkpoint contract.
     #[must_use]
     pub fn trainable_vars(&self) -> Vec<Var> {
-        self.layers
-            .iter()
-            .flat_map(QwenLayer::trainable_vars)
-            .collect()
+        let mut vars = Vec::new();
+        for layer in &self.layers {
+            layer.push_vars(&mut vars);
+        }
+        vars
     }
 
     /// The device the weights live on, so a caller (e.g. [`crate::QwenPolicy`])
@@ -414,7 +563,7 @@ impl QwenGradModel {
     /// [`MergedDecoder`] for fast incremental rollout.
     ///
     /// This is the build half of the cached-rollout optimization. It folds the
-    /// live `LoRA` adapter into each `q_proj`/`v_proj` via
+    /// live `LoRA` adapter into every adapted projection via
     /// [`crate::lora::LoraLinear::merged_weight`] (respecting the adapter toggle,
     /// so a disabled adapter snapshots the pure base model), clones the frozen
     /// rest, and hands back a decoder that walks the sequence one chunk at a time
@@ -461,35 +610,20 @@ impl GradModel for QwenGradModel {
     }
 
     fn lora_recipe(&self) -> Option<String> {
-        // This model hard-wires the legacy q/v-only recipe (the configurable
-        // `LoraTargets` retrofit is tracked R1 follow-up work); the manifest
-        // string records that fact honestly.
-        Some("attn:qv|mlp:-".to_string())
-    }
-}
-
-/// `y = x Wᵀ (+ bias)` for a merged projection weight `w` (`[out, in]`) and an
-/// optional frozen `bias` (`[out]`). The bias is applied exactly as
-/// [`LoraLinear::forward`] applies [`LoraLinear::base_bias`], so a merged-weight
-/// projection reproduces the unmerged one. Qwen3-0.6B-Base is bias-free (q/v are
-/// loaded with `None`), but wiring the bias keeps the decoder faithful if it ever
-/// is not.
-fn merged_linear(x: &Tensor, w: &Tensor, bias: Option<&Tensor>) -> CandleResult<Tensor> {
-    let y = x.broadcast_matmul(&w.t()?)?;
-    match bias {
-        Some(b) => y.broadcast_add(b),
-        None => Ok(y),
+        Some(self.targets.canonical())
     }
 }
 
 /// One Qwen3 attention block over **merged** weights with an incremental KV cache.
 ///
-/// The grad-free mirror of [`QwenAttention`]: `q`/`v` use the folded
-/// [`LoraLinear::merged_weight`] (so the adapter is baked in, no `LoRA` side-path),
-/// `k`/`o` reuse the frozen base weights, and the un-repeated K/V are appended to a
-/// [`ConcatKvCache`] before `repeat_kv` — the exact op order of candle's shipped
-/// `Qwen3Attention` (project → reshape/transpose → per-head q/k-norm → `RoPE(offset)`
-/// → `cache.append` → `repeat_kv` → SDPA → `o_proj`), with the same grad-safe op twins
+/// The grad-free mirror of [`QwenAttention`]: every projection uses its single
+/// effective weight (the folded [`crate::lora::LoraLinear::merged_weight`] when
+/// adapted — no `LoRA` side-path; the frozen base weight otherwise; all
+/// bias-free — the supported Qwen3 configs have no projection biases), and the
+/// un-repeated K/V are appended to a [`ConcatKvCache`] before `repeat_kv` — the
+/// exact op order of candle's shipped `Qwen3Attention` (project →
+/// reshape/transpose → per-head q/k-norm → `RoPE(offset)` → `cache.append` →
+/// `repeat_kv` → SDPA → `o_proj`), with the same grad-safe op twins
 /// [`QwenAttention`] uses so the cached logits equal the uncached ones.
 #[derive(Debug)]
 struct MergedAttention {
@@ -497,8 +631,6 @@ struct MergedAttention {
     k_weight: Tensor,
     v_weight: Tensor,
     o_weight: Tensor,
-    q_bias: Option<Tensor>,
-    v_bias: Option<Tensor>,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
     num_heads: usize,
@@ -523,10 +655,11 @@ impl MergedAttention {
     ) -> CandleResult<Tensor> {
         let (b, l, _) = x.dims3()?;
 
-        // 1. Projections over merged weights (q, v carry the folded adapter; k frozen).
-        let q = merged_linear(x, &self.q_weight, self.q_bias.as_ref())?;
+        // 1. Projections over merged weights (adapted ones carry the folded
+        //    adapter; the rest are the frozen base).
+        let q = frozen_linear(x, &self.q_weight)?;
         let k = frozen_linear(x, &self.k_weight)?;
-        let v = merged_linear(x, &self.v_weight, self.v_bias.as_ref())?;
+        let v = frozen_linear(x, &self.v_weight)?;
 
         // 2. (B, L, H, D) -> (B, H, L, D).
         let q = q
@@ -572,14 +705,40 @@ impl MergedAttention {
     }
 }
 
+/// `SwiGLU` MLP over merged weights — the grad-free mirror of [`QwenMlp`].
+#[derive(Debug)]
+struct MergedMlp {
+    gate_weight: Tensor,
+    up_weight: Tensor,
+    down_weight: Tensor,
+    act: Activation,
+}
+
+impl MergedMlp {
+    fn from_layer(mlp: &QwenMlp) -> CandleResult<Self> {
+        Ok(Self {
+            gate_weight: mlp.gate_proj.merged_weight()?,
+            up_weight: mlp.up_proj.merged_weight()?,
+            down_weight: mlp.down_proj.merged_weight()?,
+            act: mlp.act,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
+        let lhs = frozen_linear(x, &self.gate_weight)?.apply(&self.act)?;
+        let rhs = frozen_linear(x, &self.up_weight)?;
+        frozen_linear(&lhs.broadcast_mul(&rhs)?, &self.down_weight)
+    }
+}
+
 /// One decoder layer over merged weights: pre-norm cached attention + pre-norm
-/// frozen `SwiGLU`, both residual. The grad-free mirror of [`QwenLayer`].
+/// merged `SwiGLU`, both residual. The grad-free mirror of [`QwenLayer`].
 #[derive(Debug)]
 struct MergedLayer {
     ln1: RmsNorm,
     attn: MergedAttention,
     ln2: RmsNorm,
-    mlp: QwenMlp,
+    mlp: MergedMlp,
 }
 
 impl MergedLayer {
@@ -643,11 +802,9 @@ impl MergedDecoder {
                 ln1: layer.ln1.clone(),
                 attn: MergedAttention {
                     q_weight: a.q_proj.merged_weight()?,
-                    k_weight: a.k_weight.clone(),
+                    k_weight: a.k_proj.merged_weight()?,
                     v_weight: a.v_proj.merged_weight()?,
-                    o_weight: a.o_weight.clone(),
-                    q_bias: a.q_proj.base_bias().cloned(),
-                    v_bias: a.v_proj.base_bias().cloned(),
+                    o_weight: a.o_proj.merged_weight()?,
                     q_norm: a.q_norm.clone(),
                     k_norm: a.k_norm.clone(),
                     num_heads: a.num_heads,
@@ -658,7 +815,7 @@ impl MergedDecoder {
                     cache: ConcatKvCache::new(2),
                 },
                 ln2: layer.ln2.clone(),
-                mlp: layer.mlp.clone(),
+                mlp: MergedMlp::from_layer(&layer.mlp)?,
             });
         }
         Ok(Self {
@@ -1299,9 +1456,10 @@ mod tests {
             .unwrap()
     }
 
-    /// Force every `LoRA` B factor (odd `trainable_vars` indices: `q_B`, `v_B` per
-    /// layer) to small random values so the adapter is a genuine perturbation, not
-    /// the zero-B no-op — the merge must then differ from the base.
+    /// Force every `LoRA` B factor (the odd `trainable_vars` indices — each
+    /// adapted projection contributes `[A, B]`) to small random values so the
+    /// adapter is a genuine perturbation, not the zero-B no-op — the merge must
+    /// then differ from the base. Recipe-agnostic.
     fn arm_adapter(model: &QwenGradModel) {
         for (i, v) in model.trainable_vars().iter().enumerate() {
             if i % 2 == 1 {
@@ -1552,5 +1710,245 @@ mod tests {
 
         // A rejected call must not have mutated the cache: the correct offset 1 works.
         dec.forward(&input.narrow(1, 1, 1).unwrap(), 1).unwrap();
+    }
+
+    // ---- DenseLoraTargets recipe gates -------------------------------------
+
+    /// The trainable [`Var`]s of one projection (`[A, B]` when adapted, empty
+    /// when frozen) — the building block the order pins compare against.
+    fn proj_vars(p: &Proj) -> Vec<Var> {
+        let mut out = Vec::new();
+        p.push_vars(&mut out);
+        out
+    }
+
+    #[test]
+    fn load_with_targets_rejects_an_empty_recipe() {
+        let cfg = tiny_cfg();
+        let vb = tiny_vb(&cfg);
+        let none = DenseLoraTargets {
+            attn_q: false,
+            attn_k: false,
+            attn_v: false,
+            attn_o: false,
+            mlp_gate: false,
+            mlp_up: false,
+            mlp_down: false,
+        };
+        let err =
+            QwenGradModel::load_with_targets(&cfg, &vb, 2, 4.0, DType::F32, none).unwrap_err();
+        assert!(
+            err.to_string().contains("no projection"),
+            "expected a no-target rejection, got: {err}"
+        );
+    }
+
+    /// Assert `vars[base..base+expect.len()]` are exactly `expect`, by Var
+    /// identity (shape alone could not catch a same-shape swap, e.g. k/v).
+    fn assert_var_ids_match(vars: &[Var], expect: &[Var], base: usize) {
+        for (j, e) in expect.iter().enumerate() {
+            assert_eq!(
+                vars[base + j].as_tensor().id(),
+                e.as_tensor().id(),
+                "var {} out of positional order",
+                base + j
+            );
+        }
+    }
+
+    /// Every projection the legacy q/v-only recipe must NOT adapt stays frozen.
+    fn assert_legacy_frozen(layer: &QwenLayer) {
+        for (p, name) in [
+            (&layer.attn.k_proj, "k_proj"),
+            (&layer.attn.o_proj, "o_proj"),
+            (&layer.mlp.gate_proj, "gate_proj"),
+            (&layer.mlp.up_proj, "up_proj"),
+            (&layer.mlp.down_proj, "down_proj"),
+        ] {
+            assert!(
+                matches!(p, Proj::Frozen(_)),
+                "{name} must stay frozen under the legacy recipe"
+            );
+        }
+    }
+
+    /// One layer's vars in the DOCUMENTED industrial order
+    /// `[q,k,v,o,gate,up,down]`, built directly from the layer fields — so a
+    /// swap inside any `push_vars` reddens the pin that compares against this.
+    fn industrial_layer_vars(layer: &QwenLayer) -> Vec<Var> {
+        let mut out = Vec::new();
+        for p in [
+            &layer.attn.q_proj,
+            &layer.attn.k_proj,
+            &layer.attn.v_proj,
+            &layer.attn.o_proj,
+            &layer.mlp.gate_proj,
+            &layer.mlp.up_proj,
+            &layer.mlp.down_proj,
+        ] {
+            p.push_vars(&mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn legacy_load_pins_the_qv_only_var_order_and_recipe() {
+        // load() = the historical q/v-only recipe: 4 vars per layer in
+        // [q_A, q_B, v_A, v_B] order — THE positional back-compat contract for
+        // pre-recipe adapter checkpoints — plus frozen-ness of everything the
+        // legacy recipe must not adapt.
+        let cfg = tiny_cfg();
+        let vb = tiny_vb(&cfg);
+        let model = QwenGradModel::load(&cfg, &vb, 2, 4.0).unwrap();
+        assert_eq!(model.lora_recipe(), Some("attn:qv|mlp:-".to_string()));
+        let vars = model.trainable_vars();
+        assert_eq!(vars.len(), cfg.num_hidden_layers * 4);
+        for (l, layer) in model.layers.iter().enumerate() {
+            let mut expect = proj_vars(&layer.attn.q_proj);
+            expect.extend(proj_vars(&layer.attn.v_proj));
+            assert_var_ids_match(&vars, &expect, l * 4);
+            assert_legacy_frozen(layer);
+        }
+    }
+
+    #[test]
+    fn industrial_recipe_var_order_is_layer_major_qkvo_then_mlp() {
+        // The positional checkpoint contract under the industrial recipe:
+        // layer-major, [q,k,v,o,gate,up,down] within a layer, [A,B] per
+        // projection — pinned by Var identity against an expectation built
+        // directly from the layer fields in the documented order.
+        let cfg = tiny_cfg();
+        let vb = tiny_vb(&cfg);
+        let model = QwenGradModel::load_with_targets(
+            &cfg,
+            &vb,
+            2,
+            4.0,
+            DType::F32,
+            DenseLoraTargets::industrial(),
+        )
+        .unwrap();
+        assert_eq!(model.lora_recipe(), Some("attn:qkvo|mlp:gud".to_string()));
+        let vars = model.trainable_vars();
+        assert_eq!(vars.len(), cfg.num_hidden_layers * 14);
+        for (l, layer) in model.layers.iter().enumerate() {
+            let expect = industrial_layer_vars(layer);
+            assert_eq!(expect.len(), 14);
+            assert_var_ids_match(&vars, &expect, l * 14);
+        }
+    }
+
+    #[test]
+    fn industrial_grads_flow_to_every_projection() {
+        // Per-projection liveness under the industrial recipe: each adapted
+        // projection's [A, B] pair gets a present, finite, nonzero gradient.
+        // An aggregate-only canary could hide one dead projection (e.g. a
+        // newly-adaptable o_proj or down_proj wired around the tape).
+        let cfg = tiny_cfg();
+        let vb = tiny_vb(&cfg);
+        let mut model = QwenGradModel::load_with_targets(
+            &cfg,
+            &vb,
+            2,
+            4.0,
+            DType::F32,
+            DenseLoraTargets::industrial(),
+        )
+        .unwrap();
+        model.set_adapter_enabled(true);
+        let vars = model.trainable_vars();
+        // Arm every B (odd indices) so every A also carries a live gradient.
+        for v in vars.iter().skip(1).step_by(2) {
+            let dims = v.as_tensor().dims().to_vec();
+            v.set(&Tensor::randn(0f32, 0.2f32, dims, &dev()).unwrap())
+                .unwrap();
+        }
+        let loss = model
+            .forward(&ids(6))
+            .unwrap()
+            .sqr()
+            .unwrap()
+            .sum_all()
+            .unwrap();
+        let grads = loss.backward().unwrap();
+        for (pair_idx, pair) in vars.chunks(2).enumerate() {
+            let c = grad_coverage(pair, &grads).unwrap();
+            assert!(
+                c.is_covered() && c.is_live() && c.nonfinite == 0,
+                "projection pair {pair_idx} has dead/missing grads: {c:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn adapter_toggle_reaches_the_mlp_projections() {
+        // A recipe adapting ONLY mlp_down, armed: the toggle must change the
+        // output — proving set_adapter_enabled fans out past the attention
+        // block into the MLP (newly adaptable in this retrofit).
+        let cfg = tiny_cfg();
+        let vb = tiny_vb(&cfg);
+        let targets = DenseLoraTargets {
+            attn_q: false,
+            attn_k: false,
+            attn_v: false,
+            attn_o: false,
+            mlp_gate: false,
+            mlp_up: false,
+            mlp_down: true,
+        };
+        let mut model =
+            QwenGradModel::load_with_targets(&cfg, &vb, 2, 4.0, DType::F32, targets).unwrap();
+        assert_eq!(model.trainable_vars().len(), cfg.num_hidden_layers * 2);
+        arm_adapter(&model);
+        let input = ids(4);
+        model.set_adapter_enabled(true);
+        let on = model.forward(&input).unwrap();
+        model.set_adapter_enabled(false);
+        let off = model.forward(&input).unwrap();
+        assert!(
+            max_abs_diff(&on, &off) > 1e-4,
+            "an armed mlp_down adapter must change the output when enabled"
+        );
+    }
+
+    #[test]
+    fn merged_decoder_matches_uncached_under_the_industrial_recipe() {
+        // The cached-equivalence gate with EVERY projection adapted and armed:
+        // pins the merged fold of k/o/gate/up/down — the projections this
+        // retrofit makes adaptable for the first time.
+        let cfg = tiny_cfg();
+        let vb = tiny_vb(&cfg);
+        let mut model = QwenGradModel::load_with_targets(
+            &cfg,
+            &vb,
+            2,
+            4.0,
+            DType::F32,
+            DenseLoraTargets::industrial(),
+        )
+        .unwrap();
+        arm_adapter(&model);
+        model.set_adapter_enabled(true);
+
+        let seq = 6;
+        let input = ids(seq);
+        let reference = model.forward(&input).unwrap();
+        // Non-vacuity: the armed all-projection adapter must move the logits.
+        assert!(
+            max_abs_diff(&reference, &uncached_base_logits(&cfg, &vb, &input)) > 1e-3,
+            "armed industrial adapter must change the logits (gate would be vacuous)"
+        );
+
+        let mut dec = model.merged_decoder().unwrap();
+        let mut worst = 0f32;
+        for t in 0..seq {
+            let tok = input.narrow(1, t, 1).unwrap();
+            let logits_t = dec.forward(&tok, t).unwrap();
+            worst = worst.max(max_abs_diff(&logits_t, &reference.narrow(1, t, 1).unwrap()));
+        }
+        assert!(
+            worst <= 1e-3,
+            "industrial-recipe cached decode diverged from uncached forward: {worst}"
+        );
     }
 }
