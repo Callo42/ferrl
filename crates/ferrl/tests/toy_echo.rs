@@ -367,6 +367,7 @@ impl Policy for EosPaddedEchoPolicy {
             token_ids,
             prompt_len,
             completion_lens,
+            rollout_logprobs: None,
         })
     }
 
@@ -693,6 +694,64 @@ fn truncation_masking_off_keeps_full_width_rows() {
     for m in &history_off {
         assert_eq!(m.frac_truncated, 0.0);
         assert_eq!(m.dropped_rows, 0);
+    }
+}
+
+#[test]
+fn tis_fails_loud_when_the_policy_captures_no_rollout_logprobs() {
+    // The toy policy emits `Rollout::rectangular` rollouts — no behavior
+    // log-probs — so a config demanding the TIS correction must abort on the
+    // FIRST prompt with a contract violation rather than silently training
+    // uncorrected (the weight would be undefined). The telemetry-only default
+    // is pinned by `capture_free_policy_reports_neutral_rollout_ratios`.
+    let mut policy = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 11, TEMP).unwrap();
+    let prompts = echo_prompts(VOCAB);
+    let cfg = TrainerConfig {
+        steps: 2,
+        group_size: 4,
+        max_new_tokens: 1,
+        temperature: TEMP,
+        tis: true,
+        ..TrainerConfig::default()
+    };
+    let tmp = TempDir::new("tis-no-capture");
+    let run = RunDir::create(tmp.path(), "echo").unwrap();
+    let mut trainer = Trainer::new(cfg, &run).unwrap();
+    let err = trainer
+        .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
+        .unwrap_err();
+    assert!(
+        matches!(err, TrainerError::Contract(_)),
+        "expected a contract violation, got {err:?}"
+    );
+    assert!(err.to_string().contains("rollout log-probs"), "got {err}");
+}
+
+#[test]
+fn capture_free_policy_reports_neutral_rollout_ratios() {
+    // The telemetry-only default (`tis: false`) trains a capture-free policy
+    // fine, and its metrics carry the neutral on-policy ratio values (1.0 mean
+    // and max, 0 capped) — what the math assumes when no behavior log-probs
+    // exist.
+    let mut policy = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 11, TEMP).unwrap();
+    let prompts = echo_prompts(VOCAB);
+    let cfg = TrainerConfig {
+        steps: 2,
+        group_size: 4,
+        max_new_tokens: 1,
+        temperature: TEMP,
+        ..TrainerConfig::default()
+    };
+    let tmp = TempDir::new("neutral-ratios");
+    let run = RunDir::create(tmp.path(), "echo").unwrap();
+    let mut trainer = Trainer::new(cfg, &run).unwrap();
+    let history = trainer
+        .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
+        .unwrap();
+    for m in &history {
+        assert_eq!(m.rollout_ratio_mean, 1.0);
+        assert_eq!(m.rollout_ratio_max, 1.0);
+        assert_eq!(m.frac_rollout_ratio_capped, 0.0);
     }
 }
 
@@ -1382,6 +1441,7 @@ fn gate_grad_path_equals_nograd_path() {
         max_new_tokens: 1,
         temperature: TEMP,
         eos_token_id: None,
+        eval_sampling: None,
     };
     let rollout = policy.generate(&[0u32], &cfg).unwrap();
 

@@ -11,17 +11,31 @@
 //! Qwen policy are evaluated by identical code, and the adapter toggle is the same
 //! seam the trainer uses for the KL reference.
 //!
-//! ## Sampling, not greedy
+//! ## Sampling, not greedy — avg@k
 //!
 //! Generation goes through [`Policy::generate`] — the policy's own (seeded)
 //! sampler — so the reported means are Monte-Carlo estimates of `E[reward]` under
-//! each policy at the rollout temperature, averaged over `group_size` samples per
-//! prompt. Base and adapter draw from different points of the sampler's RNG
-//! stream, so with a small `group_size` the comparison carries sampling variance;
+//! each policy, averaged over `group_size` samples per prompt: **avg@k** with
+//! `k = group_size`. For a 0/1 verifier reward each per-prompt mean is the
+//! k-sample estimate of *sampled pass@1* — the standard held-out RL eval
+//! quantity. Base and adapter draw from different points of the sampler's RNG
+//! stream, so with a small `k` the comparison carries sampling variance;
 //! pass a `group_size` large enough to resolve the gap you care about. `evaluate`
 //! advances the policy's sampler, and restores the adapter-enabled flag to its
 //! prior state before returning — on success, on a returned error, or on a panic
 //! (an RAII guard).
+//!
+//! ## Eval-only sampling parameters
+//!
+//! The convention samples eval at a *different* distribution than training
+//! (temperature ≈ 0.6 with nucleus top-p 0.95, vs the untruncated training
+//! temperature): set [`GenConfig::eval_sampling`] — e.g.
+//! `Some(EvalSampling::default())` — on the config passed in. That override is
+//! the **only** channel through which top-p reaches the sampler, so training
+//! rollouts structurally stay untruncated; without it, eval samples exactly the
+//! policy's training distribution, as before.
+//!
+//! [`EvalSampling`]: crate::policy::EvalSampling
 //!
 //! ## EOS / length-aware scoring
 //!
@@ -49,7 +63,8 @@ pub struct PromptEval {
 pub struct EvalReport {
     /// Number of held-out prompts evaluated.
     pub n_prompts: usize,
-    /// Completions sampled per prompt, for each of base and adapter.
+    /// Completions sampled per prompt, for each of base and adapter — the `k`
+    /// of the avg@k estimates below.
     pub group_size: usize,
     /// Mean over prompts of the per-prompt base-model mean reward.
     pub base_reward_mean: f32,
@@ -99,7 +114,10 @@ pub enum EvalError {
 /// `gen` drives [`Policy::generate`]. For a [`crate::QwenPolicy`], `gen.temperature`
 /// **must** equal the temperature the policy was built with — that policy bakes its
 /// sampler temperature and rejects a mismatch — otherwise generation returns an
-/// error surfaced here as [`EvalError::Candle`].
+/// error surfaced here as [`EvalError::Candle`]. To sample the eval convention
+/// instead (temperature ≈ 0.6, top-p 0.95) set `gen.eval_sampling` (see
+/// [`crate::policy::EvalSampling`]); the override deliberately bypasses that
+/// temperature check and is the only path that enables nucleus filtering.
 ///
 /// # Errors
 ///
@@ -391,6 +409,7 @@ mod tests {
             max_new_tokens,
             temperature: 1.0,
             eos_token_id: None,
+            eval_sampling: None,
         }
     }
 
@@ -455,6 +474,7 @@ mod tests {
                 token_ids,
                 prompt_len: prompt.len(),
                 completion_lens,
+                rollout_logprobs: None,
             })
         }
         fn token_logprobs(&self, _rollout: &Rollout) -> CandleResult<Tensor> {

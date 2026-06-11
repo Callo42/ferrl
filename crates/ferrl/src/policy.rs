@@ -30,6 +30,21 @@ pub struct Rollout {
     /// full completion width for every sequence (see [`Rollout::rectangular`]); a
     /// per-element value is in `0..=comp_len`.
     pub completion_lens: Vec<usize>,
+    /// Per-token **behavior-policy** log-probabilities of the sampled completion
+    /// tokens — the probability each token was *actually drawn with* (the rollout
+    /// path's logits at the sampling temperature, nucleus-renormalized when top-p
+    /// is active), captured by the sampler at draw time. Row `i` has exactly
+    /// [`completion_lens`](Self::completion_lens)`[i]` entries (one per real
+    /// draw; EOS padding was never sampled, so it carries no log-prob).
+    ///
+    /// `None` when the policy does not capture them (toy/test policies;
+    /// [`Rollout::rectangular`] always sets `None`). When present, the trainer
+    /// compares them against its own scoring forward to surface the
+    /// rollout-vs-train mismatch (the off-policy gap a cached/merged — possibly
+    /// bf16 — decode path opens against the f32 uncached scoring forward) as
+    /// ratio telemetry, and optionally corrects the surrogate with truncated
+    /// importance sampling (TIS).
+    pub rollout_logprobs: Option<Vec<Vec<f32>>>,
 }
 
 impl Rollout {
@@ -51,6 +66,7 @@ impl Rollout {
             token_ids,
             prompt_len,
             completion_lens,
+            rollout_logprobs: None,
         }
     }
 
@@ -67,6 +83,38 @@ impl Rollout {
     }
 }
 
+/// **Eval-only** sampling parameters, the deliberate override channel for
+/// [`GenConfig::eval_sampling`].
+///
+/// Training rollouts must sample at the policy's own (baked, scoring-consistent)
+/// temperature — [`crate::LmPolicy`] fails loud on a mismatched
+/// [`GenConfig::temperature`] precisely to catch a drifted config. Held-out
+/// evaluation legitimately wants *different* sampling (the 2026 convention:
+/// temperature ≈ 0.6 with nucleus top-p 0.95 for avg@k sampled pass@1), so the
+/// override is a separate, explicit field rather than a relaxation of that
+/// check: setting it says "I know this is not the training distribution."
+/// Nucleus (top-p) filtering can **only** enter generation through here —
+/// training rollouts structurally stay untruncated.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EvalSampling {
+    /// Eval softmax temperature (must be finite and `> 0`).
+    pub temperature: f64,
+    /// Optional nucleus filter: keep the smallest top-probability set whose
+    /// cumulative mass reaches this value (in `(0, 1]`; the crossing token is
+    /// included), renormalize, and sample from it. `None` disables filtering.
+    pub top_p: Option<f64>,
+}
+
+impl Default for EvalSampling {
+    /// The 2026 eval convention: temperature `0.6`, nucleus top-p `0.95`.
+    fn default() -> Self {
+        Self {
+            temperature: 0.6,
+            top_p: Some(0.95),
+        }
+    }
+}
+
 /// Sampling controls for [`Policy::generate`].
 #[derive(Debug, Clone, Copy)]
 pub struct GenConfig {
@@ -74,7 +122,9 @@ pub struct GenConfig {
     pub group_size: usize,
     /// Maximum number of new tokens to generate.
     pub max_new_tokens: usize,
-    /// Softmax temperature; `1.0` is unscaled.
+    /// Softmax temperature; `1.0` is unscaled. Ignored when
+    /// [`eval_sampling`](Self::eval_sampling) is set (the override carries its
+    /// own temperature).
     pub temperature: f64,
     /// End-of-sequence token. When `Some(id)`, a sampled `id` ends that sequence's
     /// completion early (the EOS token is **kept** — the recorded length is
@@ -85,6 +135,12 @@ pub struct GenConfig {
     /// is bit-identical to the legacy no-early-stop behavior. A [`Policy`] backed by
     /// a model with no EOS token (e.g. a base model) leaves this `None`.
     pub eos_token_id: Option<u32>,
+    /// Eval-only sampling override (see [`EvalSampling`]). `None` (the default,
+    /// and what the trainer always passes) samples at
+    /// [`temperature`](Self::temperature) with no nucleus filtering, exactly the
+    /// legacy behavior; `Some` deliberately samples the eval distribution
+    /// instead. The held-out eval harness is the intended setter.
+    pub eval_sampling: Option<EvalSampling>,
 }
 
 impl Default for GenConfig {
@@ -94,6 +150,7 @@ impl Default for GenConfig {
             max_new_tokens: 256,
             temperature: 1.0,
             eos_token_id: None,
+            eval_sampling: None,
         }
     }
 }
@@ -242,5 +299,22 @@ mod tests {
         assert_eq!(c.temperature, 1.0);
         // The default disables EOS early-stop, preserving legacy full-width rollouts.
         assert_eq!(c.eos_token_id, None);
+        // No eval override by default: training-path sampling, no nucleus filter.
+        assert_eq!(c.eval_sampling, None);
+    }
+
+    #[test]
+    fn eval_sampling_default_is_the_2026_convention() {
+        let e = EvalSampling::default();
+        assert_eq!(e.temperature, 0.6);
+        assert_eq!(e.top_p, Some(0.95));
+    }
+
+    #[test]
+    fn rectangular_captures_no_rollout_logprobs() {
+        // The convenience constructor is the no-capture path by contract: toy
+        // policies built through it must never claim behavior log-probs.
+        let r = Rollout::rectangular(vec![vec![1, 2, 3]], 1);
+        assert_eq!(r.rollout_logprobs, None);
     }
 }

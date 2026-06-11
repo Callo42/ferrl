@@ -41,7 +41,22 @@
 //! width, and the rollout is bit-identical to the legacy behavior. Scoring
 //! ([`token_logprobs`](LmPolicy::token_logprobs)) is teacher-forced: forward all
 //! but the last token, read the positions that predict the completion tokens, and
-//! gather their log-probabilities.
+//! gather their log-probabilities — divided by the policy's rollout temperature
+//! first (temperature-consistent scoring, TRL parity; a guarded no-op at the
+//! `1.0` default).
+//!
+//! ## Behavior log-probs and the off-policy gap
+//!
+//! [`generate`](LmPolicy::generate) also records each drawn token's log-prob
+//! under the distribution it was sampled from
+//! ([`Rollout::rollout_logprobs`](crate::policy::Rollout::rollout_logprobs) —
+//! the sampler computes the full distribution anyway, so the capture is free).
+//! Rollout draws from the **merged cached** decoder while training scores with
+//! the **uncached grad** forward; on an all-F32 model the two differ only by
+//! float reassociation of the merge, but a bf16 base makes the rollout
+//! genuinely off-policy relative to the f32-scored objective — exactly the
+//! mismatch the trainer's rollout-ratio telemetry (and optional TIS
+//! correction) measures from these captured log-probs.
 //!
 //! [`Trainer`]: crate::trainer::Trainer
 
@@ -100,11 +115,17 @@ impl<M: GradModel> LmPolicy<M> {
     ///
     /// `temperature` is the rollout sampling temperature, fixed for this policy's
     /// lifetime: the [`GrpoSampler`] bakes it in (as candle's `LogitsProcessor`
-    /// does), exposing no per-call temperature. [`generate`](Self::generate)
-    /// **fails loud** if handed a [`GenConfig`] whose `temperature` differs (rather
-    /// than silently sampling at the wrong temperature); the trainer passes this
-    /// same value through. Scoring is always at temperature 1. The adapter starts
-    /// enabled (the trainer toggles it off for the KL reference forward).
+    /// does). [`generate`](Self::generate) **fails loud** if handed a
+    /// [`GenConfig`] whose `temperature` differs (rather than silently sampling
+    /// at the wrong temperature); the trainer passes this same value through.
+    /// The one exception is an explicit eval-only override
+    /// ([`GenConfig::eval_sampling`](crate::policy::GenConfig::eval_sampling)),
+    /// which deliberately samples the eval distribution instead. **Scoring is
+    /// temperature-consistent** ([`token_logprobs`](Self::token_logprobs) divides
+    /// the logits by this same temperature — TRL parity — so the distribution
+    /// GRPO optimizes is the one the rollout sampled from; at the `1.0` default
+    /// this is bit-identical to unscaled scoring). The adapter starts enabled
+    /// (the trainer toggles it off for the KL reference forward).
     #[must_use]
     pub fn new(model: M, seed: u64, temperature: f64) -> Self {
         let sampler = GrpoSampler::new(seed, temperature);
@@ -135,16 +156,19 @@ impl<M: GradModel> LmPolicy<M> {
         let width = prompt_len + cfg.max_new_tokens;
         let mut token_ids = Vec::with_capacity(cfg.group_size);
         let mut completion_lens = Vec::with_capacity(cfg.group_size);
+        let mut rollout_logprobs = Vec::with_capacity(cfg.group_size);
         for _ in 0..cfg.group_size {
             let mut ids = prompt.to_vec();
+            let mut logprobs = Vec::with_capacity(cfg.max_new_tokens);
             let mut comp_len = cfg.max_new_tokens;
             for step in 0..cfg.max_new_tokens {
                 let len = ids.len();
                 let input = Tensor::from_vec(ids.clone(), (1, len), &device)?;
                 let logits = self.model.forward(&input)?;
                 let last = logits.i((0, len - 1))?;
-                let next = self.sampler.sample(&last)?;
+                let (next, logprob) = self.sampler.sample_with(&last, self.temperature, None)?;
                 ids.push(next);
+                logprobs.push(logprob);
                 if cfg.eos_token_id == Some(next) {
                     comp_len = step + 1;
                     ids.resize(width, next);
@@ -153,31 +177,123 @@ impl<M: GradModel> LmPolicy<M> {
             }
             token_ids.push(ids);
             completion_lens.push(comp_len);
+            rollout_logprobs.push(logprobs);
         }
         Ok(Rollout {
             token_ids,
             prompt_len,
             completion_lens,
+            rollout_logprobs: Some(rollout_logprobs),
         })
     }
 }
 
+impl<M: GradModel> LmPolicy<M> {
+    /// Resolve one `generate` call's sampling parameters. The training path
+    /// (no override) keeps the fail-loud temperature check: the sampler's
+    /// temperature is fixed at construction (see [`new`](Self::new)) and
+    /// scoring is temperature-consistent with it, so a disagreeing
+    /// `cfg.temperature` is a drifted config, not a request. An explicit eval
+    /// override (`cfg.eval_sampling`) deliberately samples a DIFFERENT
+    /// distribution — eval-only temperature / nucleus top-p — and skips the
+    /// check (`cfg.temperature` is documented as ignored then).
+    fn resolve_sampling(&self, cfg: &GenConfig) -> CandleResult<(f64, Option<f64>)> {
+        match cfg.eval_sampling {
+            Some(eval) => {
+                if !eval.temperature.is_finite() || eval.temperature <= 0.0 {
+                    candle_core::bail!(
+                        "eval_sampling.temperature must be finite and > 0, got {}",
+                        eval.temperature
+                    );
+                }
+                Ok((eval.temperature, eval.top_p))
+            }
+            None => {
+                if (cfg.temperature - self.temperature).abs() > f64::EPSILON {
+                    candle_core::bail!(
+                        "LmPolicy was built with temperature {} but generate was called \
+                         with cfg.temperature {}; rebuild the policy to change it",
+                        self.temperature,
+                        cfg.temperature
+                    );
+                }
+                Ok((self.temperature, None))
+            }
+        }
+    }
+}
+
+/// Decode one group member on the shared cached decoder: reset the cache,
+/// prefill the prompt, then sample up to `cfg.max_new_tokens` tokens at the
+/// resolved `(temperature, top_p)` — EOS-inclusive early stop, right-padded
+/// back to the fixed rectangular width — capturing each draw's behavior
+/// log-prob. Returns `(ids, behavior_logprobs, completion_len)`; `ids` is the
+/// full fixed-width row, `behavior_logprobs` has exactly `completion_len`
+/// entries (one per real draw).
+fn sample_one_sequence<D: CachedDecoder>(
+    sampler: &mut GrpoSampler,
+    decoder: &mut D,
+    prompt: &[u32],
+    cfg: &GenConfig,
+    (temperature, top_p): (f64, Option<f64>),
+    device: &candle_core::Device,
+) -> CandleResult<(Vec<u32>, Vec<f32>, usize)> {
+    let prompt_len = prompt.len();
+    // The fixed rectangular width every sequence is padded/grown to.
+    let width = prompt_len + cfg.max_new_tokens;
+    decoder.reset_cache();
+    let mut ids = prompt.to_vec();
+    let mut logprobs = Vec::with_capacity(cfg.max_new_tokens);
+    // Real completion tokens, counting up to and INCLUDING the first EOS.
+    // Stays `max_new_tokens` unless an EOS early-stop overwrites it below.
+    let mut comp_len = cfg.max_new_tokens;
+    // Prefill the prompt (offset 0); its last position predicts token 1.
+    let prompt_input = Tensor::from_vec(prompt.to_vec(), (1, prompt_len), device)?;
+    let logits = decoder
+        .forward(&prompt_input, 0)
+        .map_err(crate::cuda_compat::translate_ptx_error)?;
+    let mut last = logits.i((0, prompt_len - 1))?;
+    let mut offset = prompt_len;
+    for step in 0..cfg.max_new_tokens {
+        let (next, logprob) = sampler.sample_with(&last, temperature, top_p)?;
+        ids.push(next);
+        logprobs.push(logprob);
+        // EOS-inclusive early stop: keep the EOS token, record the true
+        // length, and stop generating this sequence. With `eos_token_id ==
+        // None` this never fires, so the loop runs the full `max_new_tokens`.
+        if cfg.eos_token_id == Some(next) {
+            comp_len = step + 1;
+            // Right-pad the stopped sequence back to the fixed width so the
+            // group stays rectangular. The pad value is the EOS token itself:
+            // guaranteed in-vocab (it was just sampled) and masked out of the
+            // loss / ignored by length-aware decoding.
+            ids.resize(width, next);
+            break;
+        }
+        // Feed the just-sampled token to advance the cache and get the next
+        // step's logits — unless this was the final step (no further token to
+        // predict), which keeps the sampler-draw count exactly `comp_len`.
+        if step + 1 < cfg.max_new_tokens {
+            let tok = Tensor::from_vec(vec![next], (1, 1), device)?;
+            let logits = decoder
+                .forward(&tok, offset)
+                .map_err(crate::cuda_compat::translate_ptx_error)?;
+            last = logits.i((0, 0))?;
+            offset += 1;
+        }
+    }
+    // (`logprobs.len() == comp_len` — one per real draw — is pinned by the
+    // capture-alignment tests rather than a debug_assert, which would tip this
+    // function over the cognitive-complexity bound.)
+    debug_assert_eq!(ids.len(), width, "rollout row is not the fixed width");
+    Ok((ids, logprobs, comp_len))
+}
+
 impl<M: GradModel> Policy for LmPolicy<M> {
     fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
-        // The sampler's temperature is fixed at construction (see `new`); fail loud
-        // rather than silently sampling at a different cfg.temperature.
-        if (cfg.temperature - self.temperature).abs() > f64::EPSILON {
-            candle_core::bail!(
-                "LmPolicy was built with temperature {} but generate was called \
-                 with cfg.temperature {}; rebuild the policy to change it",
-                self.temperature,
-                cfg.temperature
-            );
-        }
+        let (temperature, top_p) = self.resolve_sampling(cfg)?;
         let device = self.model.device().clone();
         let prompt_len = prompt.len();
-        // The fixed rectangular width every sequence is padded/grown to.
-        let width = prompt_len + cfg.max_new_tokens;
         // One KV-cached decoder snapshots the CURRENT merged weights (adapter folded
         // in, toggle respected) for the whole call; `reset_cache` starts each group
         // member on a fresh sequence. The first GPU kernel JIT happens building the
@@ -190,49 +306,22 @@ impl<M: GradModel> Policy for LmPolicy<M> {
             .map_err(crate::cuda_compat::translate_ptx_error)?;
         let mut token_ids = Vec::with_capacity(cfg.group_size);
         let mut completion_lens = Vec::with_capacity(cfg.group_size);
+        // Behavior-policy log-probs, one per draw: the sampler computes the full
+        // sampling distribution anyway, so capturing the drawn token's log-prob
+        // is free — see `Rollout::rollout_logprobs`.
+        let mut rollout_logprobs = Vec::with_capacity(cfg.group_size);
         for _ in 0..cfg.group_size {
-            decoder.reset_cache();
-            let mut ids = prompt.to_vec();
-            // Real completion tokens, counting up to and INCLUDING the first EOS.
-            // Stays `max_new_tokens` unless an EOS early-stop overwrites it below.
-            let mut comp_len = cfg.max_new_tokens;
-            // Prefill the prompt (offset 0); its last position predicts token 1.
-            let prompt_input = Tensor::from_vec(prompt.to_vec(), (1, prompt_len), &device)?;
-            let logits = decoder
-                .forward(&prompt_input, 0)
-                .map_err(crate::cuda_compat::translate_ptx_error)?;
-            let mut last = logits.i((0, prompt_len - 1))?;
-            let mut offset = prompt_len;
-            for step in 0..cfg.max_new_tokens {
-                let next = self.sampler.sample(&last)?;
-                ids.push(next);
-                // EOS-inclusive early stop: keep the EOS token, record the true
-                // length, and stop generating this sequence. With `eos_token_id ==
-                // None` this never fires, so the loop runs the full `max_new_tokens`.
-                if cfg.eos_token_id == Some(next) {
-                    comp_len = step + 1;
-                    // Right-pad the stopped sequence back to the fixed width so the
-                    // group stays rectangular. The pad value is the EOS token itself:
-                    // guaranteed in-vocab (it was just sampled) and masked out of the
-                    // loss / ignored by length-aware decoding.
-                    ids.resize(width, next);
-                    break;
-                }
-                // Feed the just-sampled token to advance the cache and get the next
-                // step's logits — unless this was the final step (no further token to
-                // predict), which keeps the sampler-draw count exactly `comp_len`.
-                if step + 1 < cfg.max_new_tokens {
-                    let tok = Tensor::from_vec(vec![next], (1, 1), &device)?;
-                    let logits = decoder
-                        .forward(&tok, offset)
-                        .map_err(crate::cuda_compat::translate_ptx_error)?;
-                    last = logits.i((0, 0))?;
-                    offset += 1;
-                }
-            }
-            debug_assert_eq!(ids.len(), width, "rollout row is not the fixed width");
+            let (ids, logprobs, comp_len) = sample_one_sequence(
+                &mut self.sampler,
+                &mut decoder,
+                prompt,
+                cfg,
+                (temperature, top_p),
+                &device,
+            )?;
             token_ids.push(ids);
             completion_lens.push(comp_len);
+            rollout_logprobs.push(logprobs);
         }
         // Built directly (not via `Rollout::rectangular`) so `completion_lens` carries
         // the true per-sequence lengths; under `eos_token_id == None` every entry is
@@ -241,6 +330,7 @@ impl<M: GradModel> Policy for LmPolicy<M> {
             token_ids,
             prompt_len,
             completion_lens,
+            rollout_logprobs: Some(rollout_logprobs),
         })
     }
 
@@ -275,9 +365,16 @@ impl<M: GradModel> Policy for LmPolicy<M> {
         // surrogate's log-probs keep F32 precision even when the model runs in BF16
         // (the dtype split); the big full-sequence logits stay BF16. A no-op when the
         // model is already F32.
-        let pred = logits
+        let mut pred = logits
             .narrow(1, prompt_len - 1, comp_len)?
             .to_dtype(DType::F32)?;
+        // Temperature-consistent scoring (TRL parity): divide the logits by the
+        // policy's rollout temperature before the log-softmax, so the distribution
+        // being optimized IS the one the rollout sampled from. Guarded so the
+        // T = 1.0 default adds no op and stays bit-identical to the pre-R2 path.
+        if (self.temperature - 1.0).abs() > f64::EPSILON {
+            pred = (pred / self.temperature)?;
+        }
         let logp = log_softmax(&pred, D::Minus1)?;
 
         let mut tgt_data = Vec::with_capacity(g * comp_len);
@@ -384,10 +481,16 @@ mod tests {
     }
 
     fn tiny_policy() -> QwenPolicy {
+        tiny_policy_at(1.0)
+    }
+
+    /// A tiny policy at an explicit rollout temperature (the temperature-consistent
+    /// scoring tests need a non-1.0 one).
+    fn tiny_policy_at(temperature: f64) -> QwenPolicy {
         let cfg = tiny_cfg();
         let vb = VarBuilder::from_tensors(weight_map(&cfg), DType::F32, &Device::Cpu);
         let model = QwenGradModel::load(&cfg, &vb, 2, 4.0).unwrap();
-        QwenPolicy::new(model, 7, 1.0)
+        QwenPolicy::new(model, 7, temperature)
     }
 
     /// Two policies sharing the SAME base weights and sampler seed, so they draw an
@@ -417,6 +520,7 @@ mod tests {
             max_new_tokens: 3,
             temperature: 1.0,
             eos_token_id: None,
+            eval_sampling: None,
         };
         let rollout = policy.generate(&[1u32, 2, 3], &cfg).unwrap();
         assert_eq!(rollout.len(), 4);
@@ -473,6 +577,7 @@ mod tests {
             max_new_tokens: max_new,
             temperature: 1.0,
             eos_token_id: None,
+            eval_sampling: None,
         };
         let r_none = p_ref.generate(&prompt, &cfg_none).unwrap();
         assert_eq!(r_none.completion_lens, vec![max_new; 4]);
@@ -516,6 +621,7 @@ mod tests {
             max_new_tokens: max_new,
             temperature: 1.0,
             eos_token_id: Some(unsampled),
+            eval_sampling: None,
         };
         let r = policy.generate(&[1u32, 2, 3], &cfg).unwrap();
         assert_eq!(r.completion_lens, vec![max_new; 4]);
@@ -537,6 +643,7 @@ mod tests {
             max_new_tokens: 1,
             temperature: 1.0,
             eos_token_id: None,
+            eval_sampling: None,
         };
         let eos = p_ref.generate(&prompt, &base).unwrap().token_ids[0][prompt.len()];
         let cfg_eos = GenConfig {
@@ -583,6 +690,28 @@ mod tests {
             after_cached, after_uncached,
             "cached path consumed a different amount of sampler RNG (draw-count mismatch)"
         );
+        assert_rollout_logprobs_close(&cached, &uncached);
+    }
+
+    /// The captured behavior log-probs of two equivalent rollouts must agree —
+    /// within a float tolerance, not bit-exactly: the merged (cached) and
+    /// base+`LoRA` (uncached) forwards differ by F32 reassociation of the merge.
+    fn assert_rollout_logprobs_close(cached: &Rollout, uncached: &Rollout) {
+        let c_lp = cached.rollout_logprobs.as_ref().expect("cached capture");
+        let u_lp = uncached
+            .rollout_logprobs
+            .as_ref()
+            .expect("uncached capture");
+        assert_eq!(c_lp.len(), u_lp.len());
+        for (i, (c_row, u_row)) in c_lp.iter().zip(u_lp).enumerate() {
+            assert_eq!(c_row.len(), u_row.len(), "seq {i} logprob count mismatch");
+            for (j, (c, u)) in c_row.iter().zip(u_row).enumerate() {
+                assert!(
+                    (c - u).abs() <= 1e-4,
+                    "seq {i} draw {j}: cached logprob {c} != uncached {u}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -597,6 +726,7 @@ mod tests {
             max_new_tokens: 6,
             temperature: 1.0,
             eos_token_id: None,
+            eval_sampling: None,
         };
         assert_cached_matches_uncached(&mut policy, &[1u32, 2, 3], &cfg);
     }
@@ -614,6 +744,7 @@ mod tests {
             max_new_tokens: 5,
             temperature: 1.0,
             eos_token_id: None,
+            eval_sampling: None,
         };
         assert_cached_matches_uncached(&mut policy, &[2u32, 4, 1], &cfg);
     }
@@ -633,6 +764,7 @@ mod tests {
             max_new_tokens: max_new,
             temperature: 1.0,
             eos_token_id: None,
+            eval_sampling: None,
         };
         let eos = probe.generate_uncached(&prompt, &base).unwrap().token_ids[0][prompt.len()];
         let cfg_eos = GenConfig {
@@ -640,6 +772,126 @@ mod tests {
             ..base
         };
         assert_cached_matches_uncached(&mut policy, &prompt, &cfg_eos);
+    }
+
+    /// THE R2 capture-alignment gate: every captured behavior log-prob must agree
+    /// with the scoring path's log-prob of the same (sequence, draw) — at the
+    /// policy temperature. Generation samples from `softmax(merged_logits / T)` and
+    /// scoring computes `log_softmax(uncached_logits / T)` (temperature-consistent
+    /// scoring), so on an all-F32 tiny model the two can differ only by float
+    /// reassociation of the merge. A capture indexing bug (wrong token, shifted
+    /// position) or a scoring-temperature bug shows up as a gross mismatch.
+    /// Run at T = 1.0 (the bit-identical default) and a non-trivial T = 0.7.
+    #[test]
+    fn captured_behavior_logprobs_align_with_the_scoring_path() {
+        for temperature in [1.0, 0.7] {
+            let mut policy = tiny_policy_at(temperature);
+            force_b_nonzero(&policy.trainable_vars()); // non-trivial merge
+            let cfg = GenConfig {
+                group_size: 3,
+                max_new_tokens: 4,
+                temperature,
+                eos_token_id: None,
+                eval_sampling: None,
+            };
+            let rollout = policy.generate(&[1u32, 2, 3], &cfg).unwrap();
+            let captured = rollout.rollout_logprobs.clone().expect("capture present");
+            let scored = policy
+                .token_logprobs(&rollout)
+                .unwrap()
+                .to_vec2::<f32>()
+                .unwrap();
+            for (i, row) in captured.iter().enumerate() {
+                assert_eq!(row.len(), 4, "full-width capture expected");
+                for (j, &lp) in row.iter().enumerate() {
+                    assert!(
+                        (lp - scored[i][j]).abs() <= 1e-4,
+                        "T={temperature} seq {i} draw {j}: behavior logprob {lp} != scored {}",
+                        scored[i][j]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn captured_logprob_rows_match_the_true_completion_lens_under_eos() {
+        // EOS early-stop: row i carries exactly completion_lens[i] log-probs (one
+        // per real draw) — the EOS padding was never sampled, so it has none.
+        let prompt = [1u32, 2, 3];
+        let max_new = 5usize;
+        let (mut p_ref, mut p_test) = paired_policies();
+        let base = GenConfig {
+            group_size: 4,
+            max_new_tokens: max_new,
+            temperature: 1.0,
+            eos_token_id: None,
+            eval_sampling: None,
+        };
+        let eos = p_ref.generate(&prompt, &base).unwrap().token_ids[0][prompt.len()];
+        let r = p_test
+            .generate(
+                &prompt,
+                &GenConfig {
+                    eos_token_id: Some(eos),
+                    ..base
+                },
+            )
+            .unwrap();
+        let captured = r.rollout_logprobs.as_ref().expect("capture present");
+        assert_eq!(captured.len(), r.len());
+        for (row, &len) in captured.iter().zip(&r.completion_lens) {
+            assert_eq!(row.len(), len, "one behavior logprob per real draw");
+            assert!(row.iter().all(|lp| lp.is_finite() && *lp <= 0.0));
+        }
+        assert_eq!(r.completion_lens[0], 1, "seq 0 stops at the probed EOS");
+    }
+
+    #[test]
+    fn eval_sampling_override_bypasses_the_temperature_check() {
+        // The override is the deliberate eval channel: it samples its own
+        // temperature/top-p and skips the baked-temperature equality check
+        // (cfg.temperature is documented as ignored). A mismatched
+        // cfg.temperature that would bail on the training path must not bail
+        // here.
+        let mut policy = tiny_policy();
+        let cfg = GenConfig {
+            group_size: 3,
+            max_new_tokens: 4,
+            temperature: 123.0, // would bail without the override
+            eos_token_id: None,
+            eval_sampling: Some(crate::policy::EvalSampling {
+                temperature: 0.5,
+                top_p: Some(0.9),
+            }),
+        };
+        let before = policy.sampler_state().unwrap();
+        let r = policy.generate(&[1u32, 2, 3], &cfg).unwrap();
+        assert_eq!(r.len(), 3);
+        assert_eq!(r.completion_lens, vec![4; 3]);
+        assert!(r.rollout_logprobs.is_some(), "override path still captures");
+        assert_ne!(
+            before,
+            policy.sampler_state().unwrap(),
+            "override sampling must advance the shared RNG"
+        );
+
+        // Without the override the same mismatched temperature fails loud.
+        let train_cfg = GenConfig {
+            eval_sampling: None,
+            ..cfg
+        };
+        assert!(policy.generate(&[1u32, 2, 3], &train_cfg).is_err());
+
+        // A malformed override temperature fails loud too.
+        let bad = GenConfig {
+            eval_sampling: Some(crate::policy::EvalSampling {
+                temperature: 0.0,
+                top_p: None,
+            }),
+            ..cfg
+        };
+        assert!(policy.generate(&[1u32, 2, 3], &bad).is_err());
     }
 
     #[test]
@@ -690,6 +942,47 @@ mod tests {
                 assert!(
                     (got[gi][j] - want).abs() <= 1e-5,
                     "logp[{gi}][{j}]={} != manual {want} (pos {pos}, tgt {tgt})",
+                    got[gi][j]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn token_logprobs_at_a_non_unit_temperature_matches_a_manual_reference() {
+        // Temperature-consistent scoring: at T != 1 the log-probs must equal
+        // log_softmax(logits / T) gathered at the completion tokens — recomputed
+        // here independently of the narrow/scale/gather under test.
+        let policy = tiny_policy_at(0.7);
+        let rollout = Rollout::rectangular(vec![vec![1u32, 2, 3, 4, 5], vec![3, 1, 4, 1, 5]], 2);
+        let got = policy
+            .token_logprobs(&rollout)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+
+        let seq_len = rollout.token_ids[0].len();
+        let input_len = seq_len - 1;
+        let g = rollout.token_ids.len();
+        let mut data = Vec::new();
+        for ids in &rollout.token_ids {
+            data.extend_from_slice(&ids[..input_len]);
+        }
+        let input = Tensor::from_vec(data, (g, input_len), &Device::Cpu).unwrap();
+        let scaled = (policy.model().forward(&input).unwrap() / 0.7).unwrap();
+        let logp_full = log_softmax(&scaled, D::Minus1)
+            .unwrap()
+            .to_vec3::<f32>()
+            .unwrap();
+        let comp_len = seq_len - rollout.prompt_len;
+        for (gi, ids) in rollout.token_ids.iter().enumerate() {
+            for j in 0..comp_len {
+                let pos = rollout.prompt_len - 1 + j;
+                let tgt = ids[rollout.prompt_len + j] as usize;
+                let want = logp_full[gi][pos][tgt];
+                assert!(
+                    (got[gi][j] - want).abs() <= 1e-5,
+                    "T=0.7 logp[{gi}][{j}]={} != manual {want}",
                     got[gi][j]
                 );
             }
@@ -927,6 +1220,110 @@ mod tests {
         assert!(policy.adapter_enabled());
     }
 
+    #[test]
+    fn rollout_ratio_telemetry_is_near_one_for_an_f32_policy() {
+        // End-to-end pipeline gate for the R2 telemetry: on an all-F32 model the
+        // rollout (merged cached decode) and the scoring forward differ only by
+        // float reassociation, so the train/rollout ratio must sit hard against 1
+        // on every step — and nothing may approach the TIS cap. A capture
+        // misalignment, a temperature inconsistency, or a wiring bug shows up as
+        // a ratio visibly away from 1.
+        let mut policy = tiny_policy();
+        force_b_nonzero(&policy.trainable_vars()); // non-trivial merge
+        let prompts = vec!["abc".to_string(), "bcd".to_string()];
+        let cfg = TrainerConfig {
+            steps: 3,
+            group_size: 6,
+            max_new_tokens: 4,
+            temperature: 1.0,
+            lr: 1e-3,
+            ..TrainerConfig::default()
+        };
+        let tmp = TempDir::new();
+        let run = RunDir::create(&tmp.0, "qwen-ratio").unwrap();
+        let mut trainer = Trainer::new(cfg, &run).unwrap();
+        let history = trainer
+            .train(&mut policy, &SpreadReward, &CharCodec, &prompts)
+            .unwrap();
+        assert_eq!(history.len(), 3);
+        for m in &history {
+            assert!(
+                (m.rollout_ratio_mean - 1.0).abs() <= 1e-3,
+                "step {}: rollout_ratio_mean {} far from 1 on an F32 model",
+                m.step,
+                m.rollout_ratio_mean
+            );
+            assert!(
+                (m.rollout_ratio_max - 1.0).abs() <= 1e-3,
+                "step {}: rollout_ratio_max {} far from 1 on an F32 model",
+                m.step,
+                m.rollout_ratio_max
+            );
+            assert_eq!(
+                m.frac_rollout_ratio_capped, 0.0,
+                "step {}: no token can sit above the TIS cap on an F32 model",
+                m.step
+            );
+        }
+    }
+
+    #[test]
+    fn tis_enabled_run_completes_with_near_unit_weights() {
+        // With TIS ON against an F32 policy the weights are ~1, so the run must
+        // behave like the uncorrected one: finite metrics, real optimizer steps.
+        // (The fail-loud path for a policy WITHOUT capture is pinned in
+        // tests/toy_echo.rs; the weight math itself in trainer.rs unit tests.)
+        let mut policy = tiny_policy();
+        let prompts = vec!["abc".to_string(), "bcd".to_string()];
+        let cfg = TrainerConfig {
+            steps: 3,
+            group_size: 6,
+            max_new_tokens: 4,
+            temperature: 1.0,
+            lr: 1e-3,
+            tis: true,
+            ..TrainerConfig::default()
+        };
+        let tmp = TempDir::new();
+        let run = RunDir::create(&tmp.0, "qwen-tis").unwrap();
+        let mut trainer = Trainer::new(cfg, &run).unwrap();
+        let history = trainer
+            .train(&mut policy, &SpreadReward, &CharCodec, &prompts)
+            .unwrap();
+        assert_eq!(history.len(), 3);
+        for m in &history {
+            assert_step_metrics_ok(m);
+        }
+        assert!(
+            history.iter().any(|m| m.grad_norm > 0.0),
+            "no optimizer step ran under TIS"
+        );
+    }
+
+    #[test]
+    fn evaluate_honors_the_eval_sampling_override_end_to_end() {
+        // The held-out eval harness over a real (tiny) policy with the eval-only
+        // sampling convention: a temperature different from the baked one plus
+        // nucleus top-p must generate (no temperature bail) and produce a finite
+        // report, with the adapter flag restored.
+        let mut policy = tiny_policy();
+        let prompts = vec!["abc".to_string()];
+        let gen = GenConfig {
+            group_size: 4,
+            max_new_tokens: 3,
+            temperature: 1.0,
+            eos_token_id: None,
+            eval_sampling: Some(crate::policy::EvalSampling::default()), // T 0.6 / top-p 0.95
+        };
+        let report =
+            crate::eval::evaluate(&mut policy, &SpreadReward, &CharCodec, &prompts, &gen).unwrap();
+        assert_eq!(report.n_prompts, 1);
+        assert_eq!(report.group_size, 4);
+        assert!(report.base_reward_mean.is_finite());
+        assert!(report.adapter_reward_mean.is_finite());
+        assert!(policy.adapter_enabled(), "adapter flag restored");
+    }
+
     // ---- LlamaPolicy: the M1 second-implementor gates ------------------------
     //
     // Everything below reuses the GENERIC machinery above unchanged
@@ -1024,6 +1421,7 @@ mod tests {
             max_new_tokens: 6,
             temperature: 1.0,
             eos_token_id: None,
+            eval_sampling: None,
         };
         assert_cached_matches_uncached(&mut policy, &[1u32, 2, 3], &cfg);
     }
@@ -1039,6 +1437,7 @@ mod tests {
             max_new_tokens: 5,
             temperature: 1.0,
             eos_token_id: None,
+            eval_sampling: None,
         };
         assert_cached_matches_uncached(&mut policy, &[2u32, 4, 1], &cfg);
     }
@@ -1056,6 +1455,7 @@ mod tests {
             max_new_tokens: max_new,
             temperature: 1.0,
             eos_token_id: None,
+            eval_sampling: None,
         };
         let eos = probe.generate_uncached(&prompt, &base).unwrap().token_ids[0][prompt.len()];
         let cfg_eos = GenConfig {

@@ -112,7 +112,11 @@ pub struct TrainerConfig {
     pub group_size: usize,
     /// Maximum new tokens to generate per completion.
     pub max_new_tokens: usize,
-    /// Rollout sampling temperature. Scoring is always at temperature `1`.
+    /// Rollout sampling temperature, threaded into [`GenConfig::temperature`].
+    /// Scoring is **temperature-consistent**: an [`crate::LmPolicy`] divides its
+    /// scoring logits by its own baked temperature (TRL parity) and fails loud
+    /// if this value disagrees with it — build the policy with the same
+    /// temperature configured here.
     pub temperature: f64,
     /// Inner optimization steps per rollout. At `1` the importance ratio is
     /// exactly `1` (current log-probs equal the frozen snapshot), so the clip is
@@ -191,6 +195,37 @@ pub struct TrainerConfig {
     /// ferrl's EOS-padded rollouts cannot produce.
     #[serde(default = "default_truncation_masking")]
     pub truncation_masking: bool,
+    /// **Truncated importance sampling** (TIS) — correct the train/rollout
+    /// off-policy mismatch by multiplying each token's surrogate by the
+    /// detached weight `min(exp(logp_train − logp_rollout), tis_imp_ratio_cap)`
+    /// (see [`crate::grpo::tis_weight`]; the KL penalty stays unweighted,
+    /// matching verl). `logp_rollout` is the behavior log-prob the policy
+    /// captured at draw time
+    /// ([`Rollout::rollout_logprobs`](crate::policy::Rollout::rollout_logprobs));
+    /// a policy that captures none **fails loud** when this is on, rather than
+    /// silently training uncorrected. Default **`false`** — the metrics-first
+    /// posture: the rollout-ratio telemetry ([`Metrics::rollout_ratio_mean`]
+    /// and friends) is always reported when capture is available, and the
+    /// correction is flipped on when the observed gap warrants it (it matters
+    /// most when rollout and scoring run different numerics, e.g. a bf16
+    /// merged decode against the f32 scoring forward on a days-long run).
+    /// Token-level only: rejected together with
+    /// [`ImportanceSamplingLevel::Sequence`] (GSPO forms its ratio per
+    /// sequence; mixing the two corrections is unstudied — pick one).
+    /// `#[serde(default)]` (`false`) so an older `config.json` still
+    /// deserializes.
+    #[serde(default)]
+    pub tis: bool,
+    /// The TIS truncation cap `C` (verl's `tis_imp_ratio_cap`; `C ≈ 2` is the
+    /// studied setting). Also the threshold the
+    /// [`Metrics::frac_rollout_ratio_capped`] telemetry counts against **even
+    /// while [`tis`](Self::tis) is off** — the "how often would the correction
+    /// bind" signal that motivates flipping it on. Must be finite and `>= 1`
+    /// (a cap below `1` would down-weight exactly on-policy tokens).
+    /// `#[serde(default)]` via `default_tis_imp_ratio_cap` (`2.0`) so an older
+    /// `config.json` still deserializes.
+    #[serde(default = "default_tis_imp_ratio_cap")]
+    pub tis_imp_ratio_cap: f64,
     /// Which masked reduction to apply to the per-token objective.
     pub loss_type: LossType,
     /// How to scale group-centered rewards into advantages.
@@ -256,6 +291,12 @@ fn default_truncation_masking() -> bool {
     true
 }
 
+/// `serde` default for [`TrainerConfig::tis_imp_ratio_cap`]: `2.0` (the studied
+/// verl setting; drives the capped-fraction telemetry even with `tis` off).
+fn default_tis_imp_ratio_cap() -> f64 {
+    2.0
+}
+
 impl Default for TrainerConfig {
     fn default() -> Self {
         Self {
@@ -275,6 +316,8 @@ impl Default for TrainerConfig {
             warmup_steps: 0,
             max_grad_norm: default_max_grad_norm(),
             truncation_masking: default_truncation_masking(),
+            tis: false,
+            tis_imp_ratio_cap: default_tis_imp_ratio_cap(),
             loss_type: LossType::Dapo,
             scale_rewards: ScaleRewards::Group,
             grad_accum_steps: 1,
@@ -304,7 +347,9 @@ impl TrainerConfig {
     /// the **lower** band has the `< 1` constraint); if `adam_beta1` /
     /// `adam_beta2` is not in `[0, 1)`; if `max_grad_norm` is `Some` but not
     /// finite and `> 0` (`0` would zero every gradient — use `None` to disable
-    /// clipping); or if `checkpoint_every` is `Some(0)`.
+    /// clipping); if `checkpoint_every` is `Some(0)`; if `tis_imp_ratio_cap` is
+    /// not finite and `>= 1`; or if `tis` is combined with
+    /// [`ImportanceSamplingLevel::Sequence`] (TIS is token-level).
     pub fn validate(&self) -> Result<(), TrainerError> {
         require(
             self.mu >= 1,
@@ -362,6 +407,16 @@ impl TrainerConfig {
                 "checkpoint_every must be >= 1 when set (0 would checkpoint every step)",
             )?;
         }
+        require(
+            self.tis_imp_ratio_cap.is_finite() && self.tis_imp_ratio_cap >= 1.0,
+            "tis_imp_ratio_cap must be finite and >= 1 (a cap below 1 would down-weight \
+             exactly on-policy tokens)",
+        )?;
+        require(
+            !(self.tis && self.importance_sampling_level == ImportanceSamplingLevel::Sequence),
+            "tis is a token-level correction and cannot combine with sequence-level \
+             importance sampling (GSPO) — pick one",
+        )?;
         Ok(())
     }
 
@@ -418,12 +473,30 @@ struct InnerAgg {
 /// old / reference snapshots taken at the window's start; `advantages` is the
 /// detached `[G, 1]` column and `mask` the `[G, comp_len]` length-aware loss mask
 /// (`1` on each sequence's real completion tokens, `0` on its EOS padding).
+/// `tis_w` is the detached `[G, comp_len]` TIS weight `min(exp(logp_old −
+/// logp_rollout), C)` — present only when the correction is on **and** the
+/// rollout captured behavior log-probs (`1.0` at padding positions, which the
+/// mask removes anyway).
 struct LiveItem {
     rollout: Rollout,
     advantages: Tensor,
     logp_old: Tensor,
     logp_ref: Option<Tensor>,
     mask: Tensor,
+    tis_w: Option<Tensor>,
+}
+
+/// Masked-token rollout-ratio aggregates for one live group, computed at collect
+/// time from the captured behavior log-probs vs the trainer's own `logp_old`
+/// scoring snapshot (the train/rollout off-policy gap). `sum`/`max` are over the
+/// ratio `exp(logp_old − logp_rollout)` at the group's loss-carrying tokens;
+/// `capped` counts those above the configured TIS cap; `tokens` is the
+/// loss-carrying token count the sums normalize by.
+struct RatioStats {
+    sum: f64,
+    max: f32,
+    capped: usize,
+    tokens: usize,
 }
 
 /// Per-prompt quantities aggregated into a window's [`Metrics`] (the reward
@@ -443,6 +516,10 @@ struct PromptStat {
     /// without sampling EOS while `truncation_masking` is active).
     truncated: usize,
     degenerate: bool,
+    /// Train/rollout ratio aggregates — `None` when the policy captured no
+    /// behavior log-probs, or when the group was skipped before its `logp_old`
+    /// scoring snapshot existed (a degenerate group at `beta == 0`).
+    ratio_stats: Option<RatioStats>,
 }
 
 impl Trainer {
@@ -771,12 +848,24 @@ impl Trainer {
             max_new_tokens: self.config.max_new_tokens,
             temperature: self.config.temperature,
             eos_token_id: self.config.eos_token_id,
+            eval_sampling: None,
         };
         let rollout = policy.generate(&prompt_ids, &gen)?;
         // Validate the rollout BEFORE decoding/scoring it: completion_dims rejects
-        // an empty, ragged, or shorter-than-prompt rollout, so the decode slice
-        // `ids[prompt_len..]` cannot panic on malformed Policy output.
+        // an empty, ragged, or shorter-than-prompt rollout (and a misaligned
+        // behavior-log-prob capture), so the decode slice `ids[prompt_len..]`
+        // cannot panic on malformed Policy output.
         let (_, comp_len) = completion_dims(&rollout)?;
+        // The TIS weight is undefined without the behavior policy's probabilities;
+        // fail loud on the FIRST prompt rather than silently training uncorrected.
+        if self.config.tis && rollout.rollout_logprobs.is_none() {
+            return Err(TrainerError::Contract(
+                "tis is enabled but Policy::generate captured no rollout log-probs \
+                 (Rollout::rollout_logprobs is None) — this policy cannot supply the \
+                 behavior probabilities the correction needs"
+                    .into(),
+            ));
+        }
         // Policy::generate is contracted to return exactly `group_size` completions.
         // An underfilled rollout would otherwise become a degenerate single-item
         // group (all-zero advantages -> silently skipped); an overfilled one would
@@ -831,12 +920,13 @@ impl Trainer {
         let rewards_f64: Vec<f64> = rewards.iter().map(|&r| f64::from(r)).collect();
         let advantages = group_advantages(&rewards_f64, self.config.scale_rewards);
         let degenerate = advantages.iter().all(|a| *a == 0.0);
-        let stat = PromptStat {
+        let mut stat = PromptStat {
             completion_len: mean_completion_len(&rollout),
             completion_tokens: rollout.completion_lens.iter().sum(),
             dropped,
             truncated,
             degenerate,
+            ratio_stats: None,
             rewards,
         };
         if degenerate && self.config.beta <= 0.0 {
@@ -846,6 +936,16 @@ impl Trainer {
         // Snapshot the old / reference log-probs once (the window's "old" policy),
         // reused across the mu inner epochs.
         let logp_old = policy.token_logprobs(&rollout)?.detach();
+        // Train/rollout off-policy diagnostics + the optional TIS weight, both off
+        // the captured behavior log-probs vs the logp_old scoring snapshot.
+        let (ratio_stats, tis_w) = rollout_ratio_and_tis(
+            &rollout,
+            &logp_old,
+            &mask_rows,
+            self.config.tis_imp_ratio_cap,
+            self.config.tis,
+        )?;
+        stat.ratio_stats = ratio_stats;
         let device = logp_old.device().clone();
         let mask = mask_rows_to_tensor(&mask_rows, &device)?;
         let logp_ref = self.reference_logprobs(policy, &rollout)?;
@@ -856,6 +956,7 @@ impl Trainer {
             logp_old,
             logp_ref,
             mask,
+            tis_w,
         };
         Ok((stat, Some(item)))
     }
@@ -972,6 +1073,7 @@ impl Trainer {
             loss_type: self.config.loss_type,
             is_level: self.config.importance_sampling_level,
             dapo_norm: Some(window_tokens),
+            tis_w: item.tis_w.clone(),
         };
         let mut loss = grpo_loss(
             &logp,
@@ -1081,10 +1183,40 @@ impl Trainer {
         };
         m.kl = agg.kl;
         m.clip_ratio = agg.clip_frac;
+        // Train/rollout off-policy telemetry over the window's loss tokens.
+        let (ratio_mean, ratio_max, frac_capped) = fold_ratio_stats(stats);
+        m.rollout_ratio_mean = ratio_mean;
+        m.rollout_ratio_max = ratio_max;
+        m.frac_rollout_ratio_capped = frac_capped;
         m.grad_norm = agg.grad_norm;
         m.lr = opt.learning_rate() as f32;
         m
     }
+}
+
+/// Fold a window's per-group [`RatioStats`] into the three rollout-ratio
+/// metrics (token-weighted mean, max, capped fraction). A window with no
+/// captured loss tokens reports the neutral `(1.0, 1.0, 0.0)` — exactly
+/// on-policy, which is what the math assumes when no behavior log-probs exist.
+fn fold_ratio_stats(stats: &[PromptStat]) -> (f32, f32, f32) {
+    let mut sum = 0.0_f64;
+    let mut max = f32::NEG_INFINITY;
+    let mut capped = 0_usize;
+    let mut tokens = 0_usize;
+    for r in stats.iter().filter_map(|s| s.ratio_stats.as_ref()) {
+        sum += r.sum;
+        max = max.max(r.max);
+        capped += r.capped;
+        tokens += r.tokens;
+    }
+    if tokens == 0 {
+        return (1.0, 1.0, 0.0);
+    }
+    (
+        (sum / tokens as f64) as f32,
+        max,
+        capped as f32 / tokens as f32,
+    )
 }
 
 /// Decode each completion to text for the reward — the **real** completion tokens
@@ -1105,6 +1237,77 @@ fn decode_completions(rollout: &Rollout, tokenizer: &dyn TokenizerLike) -> Vec<S
             tokenizer.decode(&ids[start..end])
         })
         .collect()
+}
+
+/// Per-group train/rollout ratio telemetry and the optional TIS weight tensor,
+/// from the captured behavior log-probs (`rollout.rollout_logprobs`) against the
+/// trainer's own detached `logp_old` scoring snapshot.
+///
+/// Returns `(None, None)` when the policy captured nothing (the telemetry then
+/// reports its neutral defaults and no correction applies — the caller has
+/// already failed loud if `tis` demanded a capture). Otherwise the stats
+/// aggregate the ratio `exp(logp_old − logp_rollout)` over the group's
+/// **loss-carrying** tokens (`mask_rows > 0` — truncation-masked rows carry no
+/// gradient, so their mismatch is irrelevant), and `tis_w` — built only when
+/// `tis` is on — holds [`crate::grpo::tis_weight`] per token (`1.0` at padding,
+/// which the mask removes anyway), as a detached `[G, comp_len]` constant.
+/// A group whose mask kept no tokens yields `(None, tis_w)` rather than
+/// degenerate stats.
+fn rollout_ratio_and_tis(
+    rollout: &Rollout,
+    logp_old: &Tensor,
+    mask_rows: &[Vec<f64>],
+    cap: f64,
+    tis: bool,
+) -> Result<(Option<RatioStats>, Option<Tensor>), TrainerError> {
+    let Some(captured) = &rollout.rollout_logprobs else {
+        return Ok((None, None));
+    };
+    let train = logp_old.to_dtype(DType::F32)?.to_vec2::<f32>()?;
+    let comp_len = train.first().map_or(0, Vec::len);
+    let mut stats = RatioStats {
+        sum: 0.0,
+        max: f32::NEG_INFINITY,
+        capped: 0,
+        tokens: 0,
+    };
+    let mut weights = Vec::with_capacity(train.len() * comp_len);
+    for ((cap_row, train_row), mask_row) in captured.iter().zip(&train).zip(mask_rows) {
+        fold_ratio_row(cap_row, train_row, mask_row, cap, &mut stats, &mut weights);
+    }
+    let tis_w = tis
+        .then(|| Tensor::from_vec(weights, (train.len(), comp_len), logp_old.device()))
+        .transpose()?;
+    Ok(((stats.tokens > 0).then_some(stats), tis_w))
+}
+
+/// Fold one sequence's captured behavior log-probs into the running
+/// [`RatioStats`] and TIS-weight buffer (see [`rollout_ratio_and_tis`]). The
+/// capture has one entry per real draw; positions past it are EOS padding —
+/// weight `1.0`, never counted (the loss mask is `0` there by construction).
+fn fold_ratio_row(
+    cap_row: &[f32],
+    train_row: &[f32],
+    mask_row: &[f64],
+    cap: f64,
+    stats: &mut RatioStats,
+    weights: &mut Vec<f32>,
+) {
+    for (j, (&lp_train, &m)) in train_row.iter().zip(mask_row).enumerate() {
+        let Some(&lp_rollout) = cap_row.get(j) else {
+            weights.push(1.0);
+            continue;
+        };
+        let ratio = f64::from(lp_train - lp_rollout).exp();
+        weights
+            .push(crate::grpo::tis_weight(f64::from(lp_train), f64::from(lp_rollout), cap) as f32);
+        if m > 0.0 {
+            stats.sum += ratio;
+            stats.max = stats.max.max(ratio as f32);
+            stats.capped += usize::from(ratio > cap);
+            stats.tokens += 1;
+        }
+    }
 }
 
 /// The length-aware loss mask as `[G][comp_len]` `f64` rows: `1.0` on the real
@@ -1259,7 +1462,36 @@ fn completion_dims(rollout: &Rollout) -> Result<(usize, usize), TrainerError> {
         )));
     }
     validate_completion_lens(rollout, comp_len)?;
+    validate_rollout_logprobs(rollout)?;
     Ok((rollout.len(), comp_len))
+}
+
+/// Validate the optional behavior-log-prob capture: when present it must carry
+/// one row per sequence with exactly `completion_lens[i]` entries in row `i`
+/// (one log-prob per real draw) — a misaligned capture would silently pair
+/// ratios with the wrong tokens in the rollout-ratio telemetry and the TIS
+/// weights. `None` (a policy that does not capture) is always valid.
+fn validate_rollout_logprobs(rollout: &Rollout) -> Result<(), TrainerError> {
+    let Some(captured) = &rollout.rollout_logprobs else {
+        return Ok(());
+    };
+    if captured.len() != rollout.len() {
+        return Err(TrainerError::Contract(format!(
+            "rollout has {} rollout_logprob rows for {} sequences",
+            captured.len(),
+            rollout.len()
+        )));
+    }
+    for (i, (row, &len)) in captured.iter().zip(&rollout.completion_lens).enumerate() {
+        if row.len() != len {
+            return Err(TrainerError::Contract(format!(
+                "rollout_logprobs row {i} has {} entries for completion_len {len} \
+                 (one behavior log-prob per real draw)",
+                row.len()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Validate that `completion_lens` aligns with the rollout and stays within the
@@ -1465,7 +1697,10 @@ fn masked_mean_tensor(
 /// The loss-shaping knobs [`grpo_loss`] reads, bundled so the signature stays
 /// readable. `clip_eps_high` is the **effective** upper band (the caller has
 /// already resolved the `None → symmetric` default); `dapo_norm` is the
-/// accumulation window's total completion tokens (see [`masked_mean_tensor`]).
+/// accumulation window's total completion tokens (see [`masked_mean_tensor`]);
+/// `tis_w` is the detached `[G, comp_len]` TIS weight (`None` when the
+/// correction is off — token-level only, the `tis`+GSPO combination is rejected
+/// at config validation).
 struct LossCfg {
     clip_eps_low: f64,
     clip_eps_high: f64,
@@ -1473,11 +1708,15 @@ struct LossCfg {
     loss_type: LossType,
     is_level: ImportanceSamplingLevel,
     dapo_norm: Option<f64>,
+    tis_w: Option<Tensor>,
 }
 
 /// Assemble the GRPO loss for one inner step: the negative masked-mean of the
 /// per-token objective `surrogate - beta * k3_kl` (the KL term only when a
-/// reference policy is supplied). This is the **single** differentiated loss the
+/// reference policy is supplied). With `cfg.tis_w` set, the per-token surrogate
+/// is first multiplied by the detached TIS weight (truncated importance
+/// sampling — the behavior-policy correction; the KL penalty stays unweighted,
+/// matching verl). This is the **single** differentiated loss the
 /// trainer back-propagates; the trainer's inner step (`item_backward`) calls it on
 /// the live policy log-probs and the in-module finite-difference gradcheck
 /// (`gradcheck_*`) calls it on a tiny `f64` stand-in, so the gradcheck verifies
@@ -1524,6 +1763,15 @@ fn grpo_loss(
     let ratio = level_ratio(&logp_ratio, logp_old, mask, cfg.is_level)?;
     let surrogate =
         clipped_surrogate_tensor(&ratio, advantages, cfg.clip_eps_low, cfg.clip_eps_high)?;
+    // Truncated importance sampling: re-weight each token's surrogate toward the
+    // scoring distribution by the detached behavior-correction weight (the KL
+    // penalty below stays unweighted, matching verl). A detached constant — it
+    // scales the gradient, it is never differentiated through; `None` is the
+    // bit-identical off path.
+    let surrogate = match &cfg.tis_w {
+        None => surrogate,
+        Some(w) => surrogate.broadcast_mul(w)?,
+    };
     let per_token = match logp_ref {
         None => surrogate,
         Some(logp_ref) => {
@@ -1890,6 +2138,7 @@ mod tests {
             token_ids: vec![vec![5, 1, EOS, EOS], vec![5, 1, 2, 3], vec![5, 1, 2, EOS]],
             prompt_len: 1,
             completion_lens: vec![2, 3, 3],
+            rollout_logprobs: None,
         };
         let mut rows = length_mask_rows(&rollout, 3);
         let n = mask_truncated_rows(&rollout, 3, Some(EOS), &mut rows);
@@ -1907,6 +2156,7 @@ mod tests {
             token_ids: vec![vec![5, 1, 2, 3], vec![5, 1, 2, 9]],
             prompt_len: 1,
             completion_lens: vec![3, 3],
+            rollout_logprobs: None,
         };
         let mut rows = length_mask_rows(&rollout, 3);
         assert_eq!(mask_truncated_rows(&rollout, 3, None, &mut rows), 0);
@@ -1983,6 +2233,7 @@ mod tests {
                 loss_type,
                 is_level: ImportanceSamplingLevel::Token,
                 dapo_norm: None,
+                tis_w: None,
             };
             let loss = grpo_loss(logp.as_tensor(), &old, None, &adv, &mask, &cfg).unwrap();
             let v = scalar_f32(&loss).unwrap();
@@ -2020,6 +2271,7 @@ mod tests {
             loss_type: LossType::Grpo,
             is_level: ImportanceSamplingLevel::Sequence,
             dapo_norm: None,
+            tis_w: None,
         };
         let loss = grpo_loss(&logp, &logp.detach(), None, &adv, &mask, &cfg).unwrap();
         let got = scalar_f32(&loss).unwrap();
@@ -2128,11 +2380,13 @@ mod tests {
                 token_ids: vec![vec![0; 4]; 2],
                 prompt_len: 1,
                 completion_lens: vec![3, 2],
+                rollout_logprobs: None,
             },
             advantages: Tensor::from_vec(vec![0.8f32, -0.7], (2, 1), &dev).unwrap(),
             logp_old,
             logp_ref: None,
             mask: mat(&[&[1.0, 1.0, 1.0], &[1.0, 1.0, 0.0]]),
+            tis_w: None,
         };
         let (grads, _, _) = trainer
             .item_backward(&policy, &item, window_tokens)
@@ -2257,6 +2511,7 @@ mod tests {
                 loss_type: LossType::Dapo,
                 is_level: level,
                 dapo_norm: Some(4.0),
+                tis_w: None,
             };
             let old = logp.as_tensor().affine(1.0, 0.1).unwrap().detach();
             let loss = grpo_loss(logp.as_tensor(), &old, None, &adv, &mask, &cfg).unwrap();
@@ -2299,6 +2554,7 @@ mod tests {
                 loss_type: LossType::Dapo,
                 is_level: level,
                 dapo_norm: None,
+                tis_w: None,
             };
             let loss = grpo_loss(logp.as_tensor(), &old, None, &adv, &mask, &cfg).unwrap();
             let v = scalar_f32(&loss).unwrap();
@@ -2433,6 +2689,7 @@ mod tests {
             loss_type,
             is_level,
             dapo_norm: Some(c.dapo_norm),
+            tis_w: None,
         };
         let lref = (c.beta != 0.0).then_some(logp_ref);
         let got =
@@ -2579,6 +2836,7 @@ mod tests {
             token_ids: vec![vec![0u32; 5]; 3],
             prompt_len: 2,
             completion_lens: vec![1, 3, 2],
+            rollout_logprobs: None,
         };
         assert_eq!(
             length_mask_rows(&r, 3),
@@ -2593,6 +2851,7 @@ mod tests {
             token_ids: vec![vec![0u32; 5]; 2],
             prompt_len: 2,
             completion_lens: vec![3, 3],
+            rollout_logprobs: None,
         };
         assert_eq!(length_mask_rows(&full, 3), vec![vec![1.0; 3]; 2]);
     }
@@ -2605,6 +2864,7 @@ mod tests {
             token_ids: vec![vec![9, 9, 1, 2, 7], vec![9, 9, 3, 7, 7]],
             prompt_len: 2,
             completion_lens: vec![3, 1],
+            rollout_logprobs: None,
         };
         assert_eq!(
             decode_completions(&r, &JoinCodec),
@@ -2619,6 +2879,7 @@ mod tests {
             token_ids: vec![vec![0u32; 5], vec![0u32; 5]],
             prompt_len: 2,
             completion_lens: vec![1, 3],
+            rollout_logprobs: None,
         };
         assert_relative_eq!(mean_completion_len(&r), 2.0, epsilon = TOL);
         // Empty rollout => 0.0 (no divide-by-zero).
@@ -2626,6 +2887,7 @@ mod tests {
             token_ids: vec![],
             prompt_len: 0,
             completion_lens: vec![],
+            rollout_logprobs: None,
         };
         assert_relative_eq!(mean_completion_len(&e), 0.0, epsilon = TOL);
     }
@@ -2637,6 +2899,7 @@ mod tests {
             token_ids: vec![vec![0u32; 5], vec![0u32; 5]],
             prompt_len: 2,
             completion_lens: vec![1, 3],
+            rollout_logprobs: None,
         };
         assert_eq!(completion_dims(&ok).unwrap(), (2, 3));
         // Wrong number of lengths (one length for two sequences).
@@ -2644,6 +2907,7 @@ mod tests {
             token_ids: vec![vec![0u32; 5], vec![0u32; 5]],
             prompt_len: 2,
             completion_lens: vec![3],
+            rollout_logprobs: None,
         };
         assert!(matches!(
             completion_dims(&misaligned),
@@ -2654,11 +2918,255 @@ mod tests {
             token_ids: vec![vec![0u32; 5], vec![0u32; 5]],
             prompt_len: 2,
             completion_lens: vec![3, 4],
+            rollout_logprobs: None,
         };
         assert!(matches!(
             completion_dims(&overlong),
             Err(TrainerError::Contract(_))
         ));
+    }
+
+    // ---- R2: rollout-logprob capture, ratio telemetry, TIS -------------------
+
+    #[test]
+    fn completion_dims_rejects_a_misaligned_rollout_logprob_capture() {
+        // Aligned capture (row i has completion_lens[i] entries) passes.
+        let mut r = Rollout {
+            token_ids: vec![vec![0u32; 5], vec![0u32; 5]],
+            prompt_len: 2,
+            completion_lens: vec![3, 1],
+            rollout_logprobs: Some(vec![vec![-0.1, -0.2, -0.3], vec![-0.4]]),
+        };
+        assert_eq!(completion_dims(&r).unwrap(), (2, 3));
+        // A row with the wrong entry count (2 for completion_len 1) is malformed:
+        // it would pair ratios with the wrong tokens.
+        r.rollout_logprobs = Some(vec![vec![-0.1, -0.2, -0.3], vec![-0.4, -0.5]]);
+        assert!(matches!(
+            completion_dims(&r),
+            Err(TrainerError::Contract(_))
+        ));
+        // A capture with the wrong row count is malformed too.
+        r.rollout_logprobs = Some(vec![vec![-0.1, -0.2, -0.3]]);
+        assert!(matches!(
+            completion_dims(&r),
+            Err(TrainerError::Contract(_))
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_bad_tis_settings() {
+        // A sub-1 cap would down-weight exactly on-policy tokens.
+        for bad in [0.5, 0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let cfg = TrainerConfig {
+                tis_imp_ratio_cap: bad,
+                ..TrainerConfig::default()
+            };
+            assert!(cfg.validate().is_err(), "cap {bad} must be rejected");
+        }
+        // TIS is token-level: combining it with GSPO sequence-level IS is rejected.
+        let cfg = TrainerConfig {
+            tis: true,
+            importance_sampling_level: ImportanceSamplingLevel::Sequence,
+            ..TrainerConfig::default()
+        };
+        assert!(matches!(
+            cfg.validate(),
+            Err(TrainerError::InvalidConfig(_))
+        ));
+        // The supported combination validates.
+        let ok = TrainerConfig {
+            tis: true,
+            tis_imp_ratio_cap: 2.0,
+            ..TrainerConfig::default()
+        };
+        assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn r2_config_fields_default_for_old_configs_and_roundtrip() {
+        // A pre-R2 config.json fills tis (off) and the cap (2.0) from serde.
+        let cfg: TrainerConfig = serde_json::from_str(OLD_CONFIG_JSON).unwrap();
+        assert!(!cfg.tis);
+        assert_eq!(cfg.tis_imp_ratio_cap, 2.0);
+        // Non-default values survive a JSON round-trip.
+        let on = TrainerConfig {
+            tis: true,
+            tis_imp_ratio_cap: 3.5,
+            ..TrainerConfig::default()
+        };
+        let back: TrainerConfig =
+            serde_json::from_str(&serde_json::to_string(&on).unwrap()).unwrap();
+        assert!(back.tis);
+        assert_eq!(back.tis_imp_ratio_cap, 3.5);
+    }
+
+    /// The crafted capture fixture the ratio-stats tests share: 2 sequences,
+    /// completion width 3, row 1 EOS-stopped after 2 draws (so its position 2 is
+    /// padding), one ratio above the cap C = 2. Returns
+    /// `(rollout, logp_old, mask_rows)`; the per-token ratios
+    /// `exp(logp_old − logp_rollout)` are row 0 `[1, e^0.5, e^-1]`, row 1
+    /// `[e^0.7, 1, (padding)]`.
+    fn ratio_fixture() -> (Rollout, Tensor, Vec<Vec<f64>>) {
+        let logp_old = mat(&[&[-0.5, -1.0, -2.0], &[-0.3, -2.3, -0.4]]);
+        let rollout = Rollout {
+            token_ids: vec![vec![9, 9, 1, 2, 3], vec![9, 9, 4, 5, 5]],
+            prompt_len: 2,
+            completion_lens: vec![3, 2],
+            rollout_logprobs: Some(vec![vec![-0.5, -1.5, -1.0], vec![-1.0, -2.3]]),
+        };
+        // Mask: row 0 fully live; row 1 live on its 2 real tokens.
+        let mask_rows = vec![vec![1.0, 1.0, 1.0], vec![1.0, 1.0, 0.0]];
+        (rollout, logp_old, mask_rows)
+    }
+
+    /// Hand-computed ratio stats for the crafted capture, exercising the masked
+    /// accounting, the padding skip (a short captured row), and the cap count.
+    #[test]
+    fn rollout_ratio_stats_match_a_hand_computed_reference() {
+        let (rollout, logp_old, mask_rows) = ratio_fixture();
+        let (stats, _) = rollout_ratio_and_tis(&rollout, &logp_old, &mask_rows, 2.0, true).unwrap();
+        let stats = stats.expect("capture present, masked tokens > 0");
+        let r01 = 0.5f64.exp();
+        let r02 = (-1.0f64).exp();
+        let r10 = 0.7f64.exp(); // ~2.0138 -> above the cap C = 2.0
+        assert_eq!(stats.tokens, 5);
+        assert_relative_eq!(
+            stats.sum as f32,
+            (1.0 + r01 + r02 + r10 + 1.0) as f32,
+            epsilon = 1e-5
+        );
+        assert_relative_eq!(stats.max, r10 as f32, epsilon = 1e-5);
+        assert_eq!(stats.capped, 1, "exactly one ratio exceeds C = 2");
+    }
+
+    /// The TIS weight tensor for the crafted capture: the over-cap ratio
+    /// truncates to exactly C; the padding position is a neutral 1.0
+    /// (mask-removed downstream).
+    #[test]
+    fn tis_weights_match_a_hand_computed_reference() {
+        let (rollout, logp_old, mask_rows) = ratio_fixture();
+        let (_, tis_w) = rollout_ratio_and_tis(&rollout, &logp_old, &mask_rows, 2.0, true).unwrap();
+        let w = tis_w.expect("tis on").to_vec2::<f32>().unwrap();
+        let want = [
+            [1.0, 0.5f64.exp() as f32, (-1.0f64).exp() as f32],
+            [2.0, 1.0, 1.0],
+        ];
+        for (w_row, want_row) in w.iter().zip(&want) {
+            for (got, want) in w_row.iter().zip(want_row) {
+                assert_relative_eq!(got, want, epsilon = 1e-5, max_relative = 1e-5);
+            }
+        }
+    }
+
+    /// Telemetry-only mode (tis off) still reports stats but builds no weight
+    /// tensor; no capture reports nothing at all.
+    #[test]
+    fn rollout_ratio_and_tis_off_and_no_capture_modes() {
+        let (rollout, logp_old, mask_rows) = ratio_fixture();
+        let (stats_off, w_off) =
+            rollout_ratio_and_tis(&rollout, &logp_old, &mask_rows, 2.0, false).unwrap();
+        assert!(w_off.is_none());
+        assert_eq!(stats_off.expect("stats still reported").tokens, 5);
+
+        let bare = Rollout {
+            rollout_logprobs: None,
+            ..rollout
+        };
+        let (none_stats, none_w) =
+            rollout_ratio_and_tis(&bare, &logp_old, &mask_rows, 2.0, false).unwrap();
+        assert!(none_stats.is_none() && none_w.is_none());
+    }
+
+    #[test]
+    fn fold_ratio_stats_aggregates_token_weighted_and_defaults_neutral() {
+        let stat = |ratio: Option<RatioStats>| PromptStat {
+            rewards: vec![0.0],
+            completion_len: 1.0,
+            completion_tokens: 1,
+            dropped: 0,
+            truncated: 0,
+            degenerate: false,
+            ratio_stats: ratio,
+        };
+        // Two captured groups (4 + 1 tokens) and one without capture: the mean is
+        // token-weighted across the captured ones, the max is the overall max,
+        // and the capped fraction uses the same token denominator.
+        let stats = vec![
+            stat(Some(RatioStats {
+                sum: 4.4,
+                max: 1.3,
+                capped: 1,
+                tokens: 4,
+            })),
+            stat(None),
+            stat(Some(RatioStats {
+                sum: 0.6,
+                max: 0.6,
+                capped: 0,
+                tokens: 1,
+            })),
+        ];
+        let (mean, max, frac) = fold_ratio_stats(&stats);
+        assert_relative_eq!(mean, 1.0, epsilon = TOL); // (4.4 + 0.6) / 5
+        assert_relative_eq!(max, 1.3, epsilon = TOL);
+        assert_relative_eq!(frac, 0.2, epsilon = TOL); // 1 / 5
+                                                       // A window with no captured tokens reports the neutral on-policy values.
+        let (mean, max, frac) = fold_ratio_stats(&[stat(None)]);
+        assert_eq!((mean, max, frac), (1.0, 1.0, 0.0));
+    }
+
+    #[test]
+    fn tis_weight_rescales_the_surrogate_and_its_gradient() {
+        // At logp == logp_old the ratio is exactly 1 (unclipped), so the
+        // per-token surrogate is adv_i and the TIS weight multiplies it
+        // verbatim: loss = -mean_seq(mean_tok(w_ij * adv_i)) under Grpo, and
+        // d loss / d logp_ij = -w_ij * adv_i / 4 (2 seqs x 2 tokens). This pins
+        // the weight into both the VALUE and the GRADIENT — a dropped
+        // broadcast_mul fails both, an accidentally differentiated weight
+        // fails the gradient.
+        let dev = cpu();
+        let v = Var::from_tensor(
+            &Tensor::from_vec(vec![-0.2f32, -0.5, -0.9, -0.3], (2, 2), &dev).unwrap(),
+        )
+        .unwrap();
+        let old = v.as_tensor().detach();
+        let adv = Tensor::from_vec(vec![0.6f32, -0.4], (2, 1), &dev).unwrap();
+        let mask = mat(&[&[1.0, 1.0], &[1.0, 1.0]]);
+        let w = mat(&[&[1.0, 2.0], &[3.0, 1.0]]);
+        let cfg = |tis_w: Option<Tensor>| LossCfg {
+            clip_eps_low: 0.2,
+            clip_eps_high: 0.2,
+            beta: 0.0,
+            loss_type: LossType::Grpo,
+            is_level: ImportanceSamplingLevel::Token,
+            dapo_norm: None,
+            tis_w,
+        };
+
+        // Weighted loss value: -mean(0.6*(1+2)/2, -0.4*(3+1)/2) = -(0.9 - 0.8)/2.
+        let loss = grpo_loss(
+            v.as_tensor(),
+            &old,
+            None,
+            &adv,
+            &mask,
+            &cfg(Some(w.clone())),
+        )
+        .unwrap();
+        assert_relative_eq!(scalar_f32(&loss).unwrap(), -0.05, epsilon = 1e-6);
+        // The unweighted loss differs (knob-wiring: the weight is connected).
+        let plain = grpo_loss(v.as_tensor(), &old, None, &adv, &mask, &cfg(None)).unwrap();
+        assert_relative_eq!(scalar_f32(&plain).unwrap(), -0.1, epsilon = 1e-6);
+
+        // Weighted gradient: -w_ij * adv_i / 4.
+        let grads = loss.backward().unwrap();
+        let g = grads.get(v.as_tensor()).unwrap().to_vec2::<f32>().unwrap();
+        let want = [[-0.15f32, -0.3], [0.3, 0.1]];
+        for i in 0..2 {
+            for j in 0..2 {
+                assert_relative_eq!(g[i][j], want[i][j], epsilon = 1e-6);
+            }
+        }
     }
 
     #[test]
@@ -2694,6 +3202,7 @@ mod tests {
                     loss_type: LossType::Grpo,
                     is_level: ImportanceSamplingLevel::Token,
                     dapo_norm: None,
+                    tis_w: None,
                 },
             )
             .unwrap()
@@ -2752,6 +3261,7 @@ mod tests {
                 loss_type: LossType::Grpo,
                 is_level: ImportanceSamplingLevel::Token,
                 dapo_norm: None,
+                tis_w: None,
             },
         )
         .unwrap()
@@ -2994,6 +3504,7 @@ mod tests {
             loss_type,
             is_level: level,
             dapo_norm: None,
+            tis_w: None,
         };
         let loss_of = || -> f64 {
             let logp = model.logp().unwrap();
@@ -3126,6 +3637,7 @@ mod tests {
             token_ids: vec![Vec::new(); g],
             prompt_len: 0,
             completion_lens,
+            rollout_logprobs: None,
         };
         let mask_rows = length_mask_rows(&rollout, t);
         let mask_data: Vec<f64> = mask_rows.iter().flatten().copied().collect();
