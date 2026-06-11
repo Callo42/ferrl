@@ -1672,3 +1672,80 @@ fn empty_prompt_is_a_typed_error() {
         "expected a Contract error, got {err:?}"
     );
 }
+
+// ---- the detached-scoring seam (P7) -----------------------------------------
+
+/// Wraps [`EchoPolicy`], counting `Policy::token_logprobs_detached` calls —
+/// the wiring witness that the trainer routes BOTH value scorings (the
+/// `logp_old` snapshot and the KL reference) through the detached seam rather
+/// than detaching the live scoring itself. Activation checkpointing rides on
+/// exactly this routing: a value scoring through the live path would capture
+/// (and clobber) a checkpoint tape.
+struct CountingDetachedPolicy {
+    inner: EchoPolicy,
+    detached_calls: std::cell::Cell<usize>,
+}
+
+impl Policy for CountingDetachedPolicy {
+    fn generate(&mut self, p: &[u32], c: &GenConfig) -> CandleResult<Rollout> {
+        self.inner.generate(p, c)
+    }
+    fn token_logprobs(&self, r: &Rollout) -> CandleResult<Tensor> {
+        self.inner.token_logprobs(r)
+    }
+    fn token_logprobs_detached(&self, r: &Rollout) -> CandleResult<Tensor> {
+        self.detached_calls.set(self.detached_calls.get() + 1);
+        Ok(self.inner.token_logprobs(r)?.detach())
+    }
+    fn set_adapter_enabled(&mut self, e: bool) {
+        self.inner.set_adapter_enabled(e);
+    }
+    fn adapter_enabled(&self) -> bool {
+        self.inner.adapter_enabled()
+    }
+    fn trainable_vars(&self) -> Vec<Var> {
+        self.inner.trainable_vars()
+    }
+    fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+        self.inner.sampler_state()
+    }
+    fn restore_sampler_state(&mut self, s: &[u8]) -> CandleResult<()> {
+        self.inner.restore_sampler_state(s)
+    }
+}
+
+#[test]
+fn trainer_routes_value_scorings_through_the_detached_seam() {
+    let mut policy = CountingDetachedPolicy {
+        inner: EchoPolicy::new(VOCAB, VOCAB, GAMMA, 11, TEMP).unwrap(),
+        detached_calls: std::cell::Cell::new(0),
+    };
+    let steps = 3;
+    let cfg = TrainerConfig {
+        steps,
+        group_size: 4,
+        max_new_tokens: 1,
+        temperature: TEMP,
+        // beta > 0 so the KL reference is computed: every window then makes
+        // exactly TWO detached scorings (logp_old + logp_ref) — degenerate
+        // groups included (they stay live under a KL pull).
+        beta: 0.04,
+        ..TrainerConfig::default()
+    };
+    let tmp = TempDir::new("detached-seam");
+    let run = RunDir::create(tmp.path(), "echo").unwrap();
+    let mut trainer = Trainer::new(cfg, &run).unwrap();
+    trainer
+        .train(
+            &mut policy,
+            &EchoReward,
+            &CharTokenizer,
+            &echo_prompts(VOCAB),
+        )
+        .unwrap();
+    assert_eq!(
+        policy.detached_calls.get(),
+        2 * steps as usize,
+        "the trainer did not route both value scorings through token_logprobs_detached"
+    );
+}

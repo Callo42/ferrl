@@ -61,9 +61,11 @@
 //! `attention_mask == all-ones` regime where its padding-state masking and
 //! left-padded linear-attention mask are both no-ops by construction.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use candle_core::backprop::GradStore;
 use candle_core::{bail, DType, Device, Result as CandleResult, Tensor, Var, D};
 use candle_nn::kv_cache::ConcatKvCache;
 use candle_nn::ops::{sigmoid, softmax};
@@ -79,6 +81,7 @@ use crate::gdn::{
 use crate::lora::Proj;
 use crate::model::{CachedDecoder, GradModel};
 use crate::nn::{RmsNormGated, RmsNormZeroCentered};
+use crate::remat::{stitched_backward, RematTape};
 
 /// Delta-rule chunk length for training and multi-token prefill — the
 /// reference kernel default, and what the pinned oracle executes. A pure
@@ -1323,6 +1326,12 @@ pub struct Qwen3_5GradModel {
     max_position: usize,
     device: Device,
     targets: LoraTargets,
+    adapter_enabled: bool,
+    remat: bool,
+    /// The pending checkpointed-forward tape — see
+    /// [`QwenGradModel`](crate::qwen::QwenGradModel)'s field of the same name
+    /// (same contract: one tape per forward, one backward per tape, `!Sync`).
+    tape: RefCell<Option<RematTape>>,
 }
 
 impl Qwen3_5GradModel {
@@ -1433,6 +1442,9 @@ impl Qwen3_5GradModel {
             max_position: t.max_position_embeddings,
             device: vb.device().clone(),
             targets,
+            adapter_enabled: true,
+            remat: false,
+            tape: RefCell::new(None),
         })
     }
 
@@ -1451,28 +1463,128 @@ impl Qwen3_5GradModel {
     ///
     /// Returns a candle error if any tensor op fails (e.g. a shape mismatch).
     pub fn forward(&self, input_ids: &Tensor) -> CandleResult<Tensor> {
+        if self.remat {
+            return self.forward_remat(input_ids);
+        }
+        let (mut h, mask) = self.embed_and_mask(input_ids)?;
+        for layer in &self.layers {
+            h = layer.forward(&h, mask.as_ref(), &self.rot)?;
+        }
+        self.norm_and_head(&h)
+    }
+
+    /// Shared prologue of every full-sequence walk: the token embedding plus
+    /// the full causal mask (`None` at seq-len 1). The mask is built in the
+    /// ACTIVATION dtype: unlike the Llama eager path (which force-casts
+    /// scores to F32), the `qwen3_5` reference adds the mask to model-dtype
+    /// scores and upcasts only inside the softmax.
+    fn embed_and_mask(&self, input_ids: &Tensor) -> CandleResult<(Tensor, Option<Tensor>)> {
         let (b, l) = input_ids.dims2()?;
         let ids = input_ids.flatten_all()?;
-        let mut h = self
+        let h = self
             .embed
             .index_select(&ids, 0)?
             .reshape((b, l, self.hidden))?;
-        // The mask is built in the ACTIVATION dtype: unlike the Llama eager
-        // path (which force-casts scores to F32), the qwen3_5 reference adds
-        // the mask to model-dtype scores and upcasts only inside the softmax.
         let mask = if l == 1 {
             None
         } else {
             Some(causal_mask(l, h.dtype(), &self.device)?)
         };
-        for layer in &self.layers {
-            h = layer.forward(&h, mask.as_ref(), &self.rot)?;
-        }
-        let h = self.norm.forward(&h)?;
+        Ok((h, mask))
+    }
+
+    /// Shared tail of every full-sequence walk: the final norm plus the
+    /// (possibly tied) `lm_head` projection.
+    fn norm_and_head(&self, h: &Tensor) -> CandleResult<Tensor> {
+        let h = self.norm.forward(h)?;
         match &self.lm_head {
             Some(w) => frozen_linear(&h, w),
             None => frozen_linear(&h, &self.embed),
         }
+    }
+
+    /// The checkpointed forward — boundary [`Var`] per layer plus the tail;
+    /// same scheme and contract as
+    /// [`QwenGradModel`](crate::qwen::QwenGradModel)'s. Layer-type-agnostic:
+    /// a segment is one [`Qwen3_5Layer`] whichever mixer (`GatedDeltaNet` or
+    /// gated GQA) it holds — both are pure `x -> y` over the boundary.
+    fn forward_remat(&self, input_ids: &Tensor) -> CandleResult<Tensor> {
+        let (mut h, mask) = self.embed_and_mask(input_ids)?;
+        let mut tape = RematTape::new(self.adapter_enabled);
+        for layer in &self.layers {
+            let x = tape.capture(&h)?;
+            h = layer.forward(&x, mask.as_ref(), &self.rot)?;
+        }
+        let x = tape.capture(&h)?;
+        *self.tape.borrow_mut() = Some(tape);
+        self.norm_and_head(&x)
+    }
+
+    /// Detached full-sequence logits with a rolling boundary detach — same
+    /// values as [`forward`](Self::forward) at a one-layer peak footprint,
+    /// never capturing a tape. For the value-only scorings.
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if any tensor op fails.
+    pub fn forward_detached(&self, input_ids: &Tensor) -> CandleResult<Tensor> {
+        let (mut h, mask) = self.embed_and_mask(input_ids)?;
+        for layer in &self.layers {
+            h = layer.forward(&h, mask.as_ref(), &self.rot)?.detach();
+        }
+        Ok(self.norm_and_head(&h)?.detach())
+    }
+
+    /// Back-propagate a loss built from this model's logits — plain
+    /// `loss.backward()` normally, tape-stitched under
+    /// [activation checkpointing](Self::set_activation_checkpointing); same
+    /// contract as [`QwenGradModel::backward`](crate::qwen::QwenGradModel::backward).
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error on any backward failure or tape-contract
+    /// violation (no pending forward, foreign loss, adapter flipped).
+    pub fn backward(&self, loss: &Tensor) -> CandleResult<GradStore> {
+        if !self.remat {
+            return loss.backward();
+        }
+        let Some(tape) = self.tape.borrow_mut().take() else {
+            bail!(
+                "Qwen3_5GradModel::backward: activation checkpointing is on but no checkpointed \
+                 forward is pending (each forward's tape is consumed by exactly one backward)"
+            )
+        };
+        if tape.adapter_enabled() != self.adapter_enabled {
+            bail!(
+                "Qwen3_5GradModel::backward: the adapter toggle flipped between the checkpointed \
+                 forward and its backward — the recompute would rebuild different values"
+            )
+        }
+        let l = tape.first_boundary_dims().map(|d| d[1]).unwrap_or_default();
+        let mask = if l <= 1 {
+            None
+        } else {
+            Some(causal_mask(l, self.embed.dtype(), &self.device)?)
+        };
+        stitched_backward(loss, &tape, &self.trainable_vars(), |i, x| {
+            self.layers[i].forward(x, mask.as_ref(), &self.rot)
+        })
+    }
+
+    /// Turn **activation checkpointing** on or off (default: off) — same
+    /// trade and contract as
+    /// [`QwenGradModel::set_activation_checkpointing`](crate::qwen::QwenGradModel::set_activation_checkpointing).
+    pub fn set_activation_checkpointing(&mut self, on: bool) {
+        self.remat = on;
+        if !on {
+            *self.tape.borrow_mut() = None;
+        }
+    }
+
+    /// Whether activation checkpointing is currently on.
+    #[must_use]
+    pub fn activation_checkpointing(&self) -> bool {
+        self.remat
     }
 
     /// Enable/disable the `LoRA` adapter on every targeted projection
@@ -1481,6 +1593,7 @@ impl Qwen3_5GradModel {
         for layer in &mut self.layers {
             layer.set_adapter_enabled(enabled);
         }
+        self.adapter_enabled = enabled;
     }
 
     /// All trainable `LoRA` [`Var`]s in a **deterministic** order — layer-major;
@@ -1529,6 +1642,14 @@ impl GradModel for Qwen3_5GradModel {
 
     fn forward(&self, input_ids: &Tensor) -> CandleResult<Tensor> {
         Qwen3_5GradModel::forward(self, input_ids)
+    }
+
+    fn forward_detached(&self, input_ids: &Tensor) -> CandleResult<Tensor> {
+        Qwen3_5GradModel::forward_detached(self, input_ids)
+    }
+
+    fn backward(&self, loss: &Tensor) -> CandleResult<GradStore> {
+        Qwen3_5GradModel::backward(self, loss)
     }
 
     fn trainable_vars(&self) -> Vec<Var> {
@@ -2904,5 +3025,70 @@ mod tests {
         assert!(varbuilder_from_pretrained(&empty, DType::F32, &dev()).is_err());
 
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    // ---- activation checkpointing (P7) --------------------------------------
+
+    /// A fixed non-uniform probe loss over the logits — no gradient cancels
+    /// by symmetry.
+    fn probe_loss(logits: &Tensor) -> Tensor {
+        let n = logits.elem_count();
+        let w: Vec<f32> = (0..n).map(|i| ((i % 7) as f32) * 0.21 - 0.6).collect();
+        let w = Tensor::from_vec(w, logits.dims().to_vec(), logits.device()).unwrap();
+        logits.mul(&w).unwrap().sum_all().unwrap()
+    }
+
+    /// The hybrid stack under checkpointing: the segment closure must rebuild
+    /// BOTH mixer kinds (`GatedDeltaNet` and gated GQA) — the stitched
+    /// gradients must match the uncut backward on every adapter var, and a
+    /// raw `loss.backward()` after a checkpointed forward must reach none
+    /// (the tape really is cut).
+    #[test]
+    fn checkpointed_gradients_match_the_uncut_backward_across_both_mixers() {
+        let mut model = armed_model();
+        let input = ids(9);
+        let vars = model.trainable_vars();
+
+        let plain = model
+            .backward(&probe_loss(&model.forward(&input).unwrap()))
+            .unwrap();
+        model.set_activation_checkpointing(true);
+        let stitched = model
+            .backward(&probe_loss(&model.forward(&input).unwrap()))
+            .unwrap();
+
+        let mut worst = 0f32;
+        for v in &vars {
+            let a = plain.get(v).expect("var missing from the uncut store");
+            let b = stitched
+                .get(v)
+                .expect("var missing from the stitched store");
+            worst = worst.max(max_abs_diff(a, b));
+        }
+        assert!(
+            worst <= 1e-5,
+            "stitched grads diverged from the uncut backward: {worst}"
+        );
+
+        // The cut: bypassing the stitching reaches no layer var.
+        let raw = probe_loss(&model.forward(&input).unwrap())
+            .backward()
+            .unwrap();
+        assert!(
+            vars.iter().all(|v| raw.get(v).is_none()),
+            "a layer var is on the loss tape — the boundary cut is not happening"
+        );
+    }
+
+    /// Under checkpointing a value scoring must capture NO tape (it would
+    /// clobber the tape the next update backward consumes).
+    #[test]
+    fn forward_detached_captures_no_tape_under_checkpointing() {
+        let mut model = armed_model();
+        model.set_activation_checkpointing(true);
+        let _ = model.forward_detached(&ids(5)).unwrap();
+        let scalar = Tensor::zeros((), DType::F32, &dev()).unwrap();
+        let err = model.backward(&scalar).unwrap_err();
+        assert!(err.to_string().contains("no checkpointed forward"));
     }
 }

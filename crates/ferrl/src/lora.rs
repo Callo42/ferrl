@@ -420,7 +420,13 @@ impl LoraLinear {
     /// Returns a candle error if `x`'s trailing dimension does not match the
     /// base weight, or if any matmul/broadcast fails.
     pub fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
-        let base = x.broadcast_matmul(&self.base_weight.t()?)?;
+        // The frozen base path goes through `frozen_linear` (a flattened 2-D
+        // matmul) so candle's unconditional weight-gradient materialization
+        // stays `[out, in]`-shaped instead of batch-shaped — see its docs.
+        // The adapter matmuls below keep `broadcast_matmul`: the A/B factors
+        // are live Vars whose gradient *numerics* (summation order included)
+        // are pinned by the optimizer-trajectory gates.
+        let base = frozen_linear(x, &self.base_weight)?;
         let base = match &self.base_bias {
             Some(bias) => base.broadcast_add(bias)?,
             None => base,
