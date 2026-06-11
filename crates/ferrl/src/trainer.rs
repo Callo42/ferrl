@@ -2306,6 +2306,117 @@ mod tests {
         assert_relative_eq!(frac, 0.5, epsilon = TOL);
     }
 
+    // ---- REAL-TRL golden fixture (closes GOLDEN-CIRCULAR) -------------------
+
+    #[derive(serde::Deserialize)]
+    struct TrlBatch {
+        logp: Vec<Vec<f64>>,
+        logp_old: Vec<Vec<f64>>,
+        logp_ref: Vec<Vec<f64>>,
+        advantages: Vec<f64>,
+        mask: Vec<Vec<f64>>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct TrlCase {
+        loss_type: String,
+        beta: f64,
+        eps_low: f64,
+        eps_high: f64,
+        importance_sampling_level: String,
+        dapo_norm: f64,
+        loss: f64,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct TrlGolden {
+        trl_version: String,
+        torch_version: String,
+        transformers_version: String,
+        batch: TrlBatch,
+        cases: Vec<TrlCase>,
+    }
+
+    fn rows_to_tensor(rows: &[Vec<f64>]) -> Tensor {
+        let r = rows.len();
+        let c = rows[0].len();
+        let data: Vec<f32> = rows.iter().flatten().map(|&v| v as f32).collect();
+        Tensor::from_vec(data, (r, c), &cpu()).unwrap()
+    }
+
+    /// Every case in the fixture was produced by TRL 1.5.1's OWN
+    /// `GRPOTrainer._compute_loss` (not a transcription of its formulas — see
+    /// `scripts/oracle/gen_grpo_golden_trl.py`), so this is the
+    /// independent-implementation gate the `NumPy` golden cannot be: a shared
+    /// misreading of the GRPO spec between ferrl and its same-author oracle
+    /// fails here against the industry reference. 32 cases sweep
+    /// `{grpo, dr_grpo, dapo} × beta {0, 0.04} × {token, sequence} ×
+    /// eps_high {0.2, 0.28}` plus the explicit DAPO window normalizer, over a
+    /// ragged mask (lengths 3/2/1/0) with ratios straddling both clip bands.
+    #[test]
+    fn matches_trl_golden_fixture() {
+        let raw = include_str!("../tests/fixtures/grpo_golden_trl.json");
+        let g: TrlGolden = serde_json::from_str(raw).expect("TRL golden parses");
+        // The version pins make regeneration a deliberate, reviewed act: the
+        // values are a numeric contract with exactly this TRL/torch pair.
+        assert_eq!(
+            g.trl_version, "1.5.1",
+            "TRL pin drifted — regenerate deliberately"
+        );
+        assert!(g.torch_version.starts_with("2.12.0"), "{}", g.torch_version);
+        assert_eq!(g.transformers_version, "5.11.0");
+
+        let logp = rows_to_tensor(&g.batch.logp);
+        let logp_old = rows_to_tensor(&g.batch.logp_old);
+        let logp_ref = rows_to_tensor(&g.batch.logp_ref);
+        let mask = rows_to_tensor(&g.batch.mask);
+        let adv: Vec<f32> = g.batch.advantages.iter().map(|&a| a as f32).collect();
+        let n = adv.len();
+        let advantages = Tensor::from_vec(adv, (n, 1), &cpu()).unwrap();
+
+        assert_eq!(g.cases.len(), 32, "expected the full case sweep");
+        for c in &g.cases {
+            check_trl_case(c, &logp, &logp_old, &logp_ref, &advantages, &mask);
+        }
+    }
+
+    /// Replay one TRL golden case through the production `grpo_loss` and
+    /// assert agreement. Split out of `matches_trl_golden_fixture` to stay
+    /// under the cognitive-complexity bound.
+    fn check_trl_case(
+        c: &TrlCase,
+        logp: &Tensor,
+        logp_old: &Tensor,
+        logp_ref: &Tensor,
+        advantages: &Tensor,
+        mask: &Tensor,
+    ) {
+        let loss_type = match c.loss_type.as_str() {
+            "grpo" => LossType::Grpo,
+            "dr_grpo" => LossType::DrGrpo,
+            "dapo" => LossType::Dapo,
+            other => panic!("unknown loss_type {other}"),
+        };
+        let is_level = match c.importance_sampling_level.as_str() {
+            "token" => ImportanceSamplingLevel::Token,
+            "sequence" => ImportanceSamplingLevel::Sequence,
+            other => panic!("unknown level {other}"),
+        };
+        let cfg = LossCfg {
+            clip_eps_low: c.eps_low,
+            clip_eps_high: c.eps_high,
+            beta: c.beta,
+            loss_type,
+            is_level,
+            dapo_norm: Some(c.dapo_norm),
+        };
+        let lref = (c.beta != 0.0).then_some(logp_ref);
+        let got =
+            scalar_f32(&grpo_loss(logp, logp_old, lref, advantages, mask, &cfg).unwrap()).unwrap();
+        let want = c.loss as f32;
+        assert_relative_eq!(got, want, epsilon = 2e-6, max_relative = 2e-5);
+    }
+
     #[test]
     fn config_roundtrips_through_json() {
         let cfg = TrainerConfig::default();
