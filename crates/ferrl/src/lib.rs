@@ -141,6 +141,8 @@ pub use llama::{LlamaGradModel, LlamaMergedDecoder};
 #[doc(inline)]
 pub use lm_policy::{LlamaPolicy, LmPolicy, Qwen3_5Policy, QwenPolicy};
 #[doc(inline)]
+pub use lora::DenseLoraTargets;
+#[doc(inline)]
 pub use model::{CachedDecoder, GradModel};
 #[doc(inline)]
 pub use nn::{grad_coverage, GradCoverage, RmsNorm, RmsNormGated, RmsNormZeroCentered};

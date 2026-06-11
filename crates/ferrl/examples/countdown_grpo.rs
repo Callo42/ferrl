@@ -148,6 +148,10 @@ fn build_policy(dir: &Path, device: &Device) -> Result<(QwenPolicy, HfTokenizer)
         .context("load model.safetensors onto the GPU")?;
     let rank = env_parse("FERRL_CD_RANK", 16usize);
     let alpha = env_parse("FERRL_CD_ALPHA", 32.0f64);
+    // Deliberately the LEGACY q/v-only LoRA recipe (`load_with_adapter_dtype`
+    // delegates to `DenseLoraTargets::legacy()`): the P4 gate margins below were
+    // calibrated against it. Switching to `load_with_targets(industrial)` is a
+    // re-calibration, not a drop-in swap.
     let model = QwenGradModel::load_with_adapter_dtype(&cfg, &vb, rank, alpha, DType::F32)
         .context("build QwenGradModel")?;
     let seed = env_parse("FERRL_CD_SEED", 1234u64);

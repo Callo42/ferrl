@@ -120,13 +120,17 @@ pub struct CheckpointManifest {
     #[serde(default)]
     pub sampler_state: Option<Vec<u8>>,
     /// The `LoRA` recipe the adapter was trained with, as a stable canonical
-    /// string (e.g. `attn:qkvo|mlp:gud|gdn:-` — see
+    /// string (e.g. `attn:qkvo|mlp:gud` — see
+    /// [`crate::lora::DenseLoraTargets::canonical`] /
     /// [`crate::qwen35::LoraTargets::canonical`]) — recorded so a checkpoint is
     /// self-describing about *which* projections its positional tensor list
-    /// covers. Informational: the load contract stays positional
-    /// (count/shape/dtype validation against the live model). `None` for
-    /// checkpoints written before this field existed, or by a policy that does
-    /// not report a recipe. `#[serde(default)]` for back-compat.
+    /// covers. The load contract stays positional (count/shape/dtype validation
+    /// against the live model), but [`crate::Trainer::resume`] additionally
+    /// cross-checks this string against the restoring policy and fails loud on
+    /// a mismatch — count/shape/dtype cannot distinguish **shape-aliased**
+    /// recipes (e.g. `attn:qk` vs `attn:qv`). `None` for checkpoints written
+    /// before this field existed, or by a policy that does not report a recipe.
+    /// `#[serde(default)]` for back-compat.
     #[serde(default)]
     pub lora_recipe: Option<String>,
 }
@@ -315,6 +319,24 @@ pub fn load_adapter(
 ) -> Result<CheckpointManifest, CheckpointError> {
     let dir = dir.as_ref();
 
+    let manifest = read_manifest(dir)?;
+    if manifest.num_vars != vars.len() {
+        return Err(CheckpointError::Mismatch(format!(
+            "checkpoint has {} tensors but the model exposes {} trainable vars",
+            manifest.num_vars,
+            vars.len()
+        )));
+    }
+
+    load_adapter_tensors(dir, vars)?;
+    Ok(manifest)
+}
+
+/// Read and version-validate `manifest.json` from `dir` **without touching any
+/// model state** — so a caller (e.g. [`crate::Trainer::resume`]) can run
+/// pre-flight checks (the adapter-recipe cross-check) before the positional
+/// load mutates the live `Var`s.
+pub(crate) fn read_manifest(dir: &Path) -> Result<CheckpointManifest, CheckpointError> {
     let manifest_path = dir.join(MANIFEST_FILE);
     let raw = std::fs::read_to_string(&manifest_path).map_err(|e| io(&manifest_path, e))?;
     let manifest: CheckpointManifest = serde_json::from_str(&raw)?;
@@ -324,14 +346,12 @@ pub fn load_adapter(
             manifest.format_version
         )));
     }
-    if manifest.num_vars != vars.len() {
-        return Err(CheckpointError::Mismatch(format!(
-            "checkpoint has {} tensors but the model exposes {} trainable vars",
-            manifest.num_vars,
-            vars.len()
-        )));
-    }
+    Ok(manifest)
+}
 
+/// The tensor half of [`load_adapter`]: validate-then-apply `adapter.safetensors`
+/// into `vars` (all-or-nothing; see [`load_adapter`]).
+fn load_adapter_tensors(dir: &Path, vars: &[Var]) -> Result<(), CheckpointError> {
     let adapter_path = dir.join(ADAPTER_FILE);
     let loaded = candle_core::safetensors::load(&adapter_path, &Device::Cpu)?;
 
@@ -372,7 +392,7 @@ pub fn load_adapter(
     for (v, t) in vars.iter().zip(prepared.iter()) {
         v.set(t)?;
     }
-    Ok(manifest)
+    Ok(())
 }
 
 /// The result of [`load_checkpoint`]: the resume step plus any persisted optimizer and
@@ -389,6 +409,15 @@ pub struct LoadedCheckpoint {
     pub optimizer_state: Option<OptimizerState>,
     /// The opaque rollout-sampler RNG blob, if the checkpoint persisted it (v2).
     pub sampler_state: Option<Vec<u8>>,
+    /// The writing policy's canonical adapter-recipe string, if recorded (see
+    /// [`CheckpointManifest::lora_recipe`]). Surfaced so a caller can
+    /// cross-check it against the restoring policy: the positional load
+    /// validates only count/shape/dtype, which cannot distinguish
+    /// **shape-aliased** recipes (e.g. `attn:qk` vs `attn:qv` — the k and v
+    /// projections are shape-identical), so a recipe swap would otherwise
+    /// restore adapters onto the wrong projections silently.
+    /// [`crate::Trainer::resume`] fails loud on a mismatch.
+    pub lora_recipe: Option<String>,
 }
 
 /// Persist a **momentum-faithful** checkpoint (format version 2): the adapter weights,
@@ -523,6 +552,7 @@ pub fn load_checkpoint(
         step: manifest.step,
         optimizer_state,
         sampler_state: manifest.sampler_state,
+        lora_recipe: manifest.lora_recipe,
     })
 }
 

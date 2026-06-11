@@ -76,7 +76,7 @@ use crate::blocks::{
 use crate::gdn::{
     causal_depthwise_conv1d, gated_delta_rule_chunked, gated_delta_rule_recurrent, stable_softplus,
 };
-use crate::lora::LoraLinear;
+use crate::lora::Proj;
 use crate::model::{CachedDecoder, GradModel};
 use crate::nn::{RmsNormGated, RmsNormZeroCentered};
 
@@ -552,7 +552,9 @@ pub fn varbuilder_from_pretrained(
 // ---------------------------------------------------------------------------
 
 /// Which projections carry a trainable `LoRA` adapter — the configurable
-/// recipe of the M2′ design.
+/// recipe of the M2′ design. This is the **hybrid** (`qwen3_5`) recipe, with
+/// `GatedDeltaNet` opt-ins; the dense models ([`crate::qwen`],
+/// [`crate::llama`]) use [`crate::lora::DenseLoraTargets`] instead.
 ///
 /// The [`Default`] is the **industrial recipe**: attention `q,k,v,o` on the
 /// full-attention layers plus MLP `gate,up,down` on **every** layer
@@ -562,7 +564,7 @@ pub fn varbuilder_from_pretrained(
 /// the linear-attention backbone destructive, while literal all-linear trains
 /// fine at larger scales, so the knob exists but is not the default. The conv
 /// kernel, `A_log`/`dt_bias`, and every norm weight are never adapted (no
-/// framework adapts them).
+/// framework's `LoRA` recipe targets them by default).
 ///
 /// The recipe (together with the config) **determines the trainable-var
 /// order** — layer-major, fixed projection order within each layer — which is
@@ -693,71 +695,6 @@ impl LoraTargets {
                 (self.gdn_out, 'o'),
             ]),
         )
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Projection: frozen or LoRA-adapted
-// ---------------------------------------------------------------------------
-
-/// A bias-free linear projection that either stays frozen or carries the
-/// `LoRA` adapter, per the [`LoraTargets`] recipe.
-#[derive(Debug)]
-enum Proj {
-    Frozen(Tensor),
-    Lora(LoraLinear),
-}
-
-impl Proj {
-    fn load(
-        vb: &VarBuilder,
-        name: &str,
-        shape: (usize, usize),
-        adapted: bool,
-        rank: usize,
-        alpha: f64,
-        adapter_dtype: DType,
-    ) -> CandleResult<Self> {
-        let w = vb.pp(name).get(shape, "weight")?;
-        if adapted {
-            Ok(Self::Lora(LoraLinear::with_adapter_dtype(
-                w,
-                None,
-                rank,
-                alpha,
-                adapter_dtype,
-            )?))
-        } else {
-            Ok(Self::Frozen(w))
-        }
-    }
-
-    fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
-        match self {
-            Self::Frozen(w) => frozen_linear(x, w),
-            Self::Lora(l) => l.forward(x),
-        }
-    }
-
-    /// The single effective weight of the current forward (see
-    /// [`LoraLinear::merged_weight`]); a frozen projection is its own merge.
-    fn merged_weight(&self) -> CandleResult<Tensor> {
-        match self {
-            Self::Frozen(w) => Ok(w.detach()),
-            Self::Lora(l) => l.merged_weight(),
-        }
-    }
-
-    fn push_vars(&self, out: &mut Vec<Var>) {
-        if let Self::Lora(l) = self {
-            out.extend(l.trainable_vars());
-        }
-    }
-
-    fn set_enabled(&mut self, enabled: bool) {
-        if let Self::Lora(l) = self {
-            l.set_enabled(enabled);
-        }
     }
 }
 
@@ -1406,7 +1343,7 @@ impl Qwen3_5GradModel {
 
     /// Load with the default recipe but the trainable adapter held in
     /// `adapter_dtype` — the bf16-base / F32-adapter split (see
-    /// [`LoraLinear::with_adapter_dtype`]).
+    /// [`crate::lora::LoraLinear::with_adapter_dtype`]).
     ///
     /// # Errors
     ///
