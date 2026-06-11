@@ -131,13 +131,18 @@ fn fidelity(ours: &Tensor, reference: &Tensor) -> (usize, usize, f32, f32) {
     (agree, l, max_abs, max_logit)
 }
 
-/// Set every `LoRA` `B` factor (odd index) to small noise in the var's OWN
-/// dtype (the F32 masters here).
+/// Set every `LoRA` `B` factor (odd index) to small DETERMINISTIC noise in
+/// the var's OWN dtype (the F32 masters here) — a gate failure must be
+/// replayable, and CUDA `randn` is not seedable through candle.
 fn force_b_nonzero(vars: &[Var], device: &Device) {
     for (i, v) in vars.iter().enumerate() {
         if i % 2 == 1 {
             let dims = v.as_tensor().dims().to_vec();
-            let noise = Tensor::randn(0f32, 0.02f32, dims, device)
+            let n: usize = dims.iter().product();
+            let vals: Vec<f32> = (0..n)
+                .map(|e| 0.02 * ((e + i) as f32 * 0.618_034).sin())
+                .collect();
+            let noise = Tensor::from_vec(vals, dims, device)
                 .unwrap()
                 .to_dtype(v.dtype())
                 .unwrap();

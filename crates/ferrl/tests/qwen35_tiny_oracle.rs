@@ -99,7 +99,10 @@ fn load_model() -> (Qwen3_5Config, Qwen3_5GradModel) {
 }
 
 fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
-    a.broadcast_sub(b)
+    // Exact `sub` (not broadcast): a shape divergence must fail loudly, never
+    // silently broadcast into a misleadingly small scalar.
+    assert_eq!(a.dims(), b.dims(), "logit shape mismatch");
+    a.sub(b)
         .unwrap()
         .abs()
         .unwrap()
@@ -207,6 +210,33 @@ fn merged_decoder_matches_reference_cached_path() {
         let d = max_abs_diff(&got, &want);
         assert!(d <= ORACLE_TOL, "single-token decode at {t} diff {d}");
     }
+}
+
+#[test]
+fn perturbed_rms_eps_is_caught_by_the_gate() {
+    // Second perturbation axis for the vacuity guard (the rope-theta guard
+    // alone pins one axis): a wrong norm epsilon is the classic
+    // quiet-constant bug class a loose tolerance could hide. Measured on this
+    // fixture (2026-06-11): eps 1e-3 diverges by ~10 in logit space — 4
+    // orders of magnitude above ORACLE_TOL.
+    let g = golden();
+    let dir = fixture_dir();
+    let raw = std::fs::read_to_string(dir.join("config.json")).unwrap();
+    let mut json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    json["text_config"]["rms_norm_eps"] = serde_json::json!(1e-3);
+    let cfg = Qwen3_5Config::from_json_str(&json.to_string()).unwrap();
+    let vb = varbuilder_from_pretrained(&dir, DType::F32, &Device::Cpu).unwrap();
+    let model = Qwen3_5GradModel::load(&cfg, &vb, 4, 8.0).unwrap();
+
+    let case = &g["cases"]["full_b1"];
+    let ids = input_ids(case, "input_ids");
+    let want = tensor_from(case, "logits", (1, 12, 64));
+    let got = model.forward(&ids).unwrap();
+    let d = max_abs_diff(&got, &want);
+    assert!(
+        d >= PERTURBATION_FLOOR,
+        "wrong rms_norm_eps diverged only {d} — the oracle gate is going vacuous"
+    );
 }
 
 #[test]

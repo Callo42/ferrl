@@ -343,12 +343,18 @@ fn grads_of(model: &Qwen3_5GradModel, input: &Tensor) -> GradStore {
         .expect("backward")
 }
 
-/// Set every `LoRA` `B` factor (odd index in each `[A, B]` pair) nonzero.
+/// Set every `LoRA` `B` factor (odd index in each `[A, B]` pair) to small
+/// DETERMINISTIC noise (a phase-2 grad failure must be replayable — candle's
+/// CPU `randn` cannot be seeded, so build the values directly).
 fn force_b_nonzero(vars: &[Var]) {
     for (i, v) in vars.iter().enumerate() {
         if i % 2 == 1 {
             let dims = v.as_tensor().dims().to_vec();
-            v.set(&Tensor::randn(0f32, 0.02f32, dims, &Device::Cpu).unwrap())
+            let n: usize = dims.iter().product();
+            let vals: Vec<f32> = (0..n)
+                .map(|e| 0.02 * ((e + i) as f32 * 0.618_034).sin())
+                .collect();
+            v.set(&Tensor::from_vec(vals, dims, &Device::Cpu).unwrap())
                 .unwrap();
         }
     }

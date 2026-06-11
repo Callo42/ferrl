@@ -257,6 +257,12 @@ pub struct Qwen3_5Config {
     /// non-parity).
     #[serde(default)]
     pub model_type: Option<String>,
+    /// The OUTER tie flag (the multimodal wrapper's own, distinct from the
+    /// text config's). The loader keys the head choice on the text flag; a
+    /// checkpoint where the two disagree would otherwise load silently with
+    /// the wrong head, so disagreement is rejected at validation.
+    #[serde(default)]
+    pub tie_word_embeddings: Option<bool>,
     /// The text decoder config this module consumes.
     pub text_config: Qwen3_5TextConfig,
 }
@@ -301,6 +307,16 @@ impl Qwen3_5Config {
         if let Some(mt) = &self.model_type {
             if mt != "qwen3_5" {
                 bail!("qwen3_5 config: model_type {mt:?}, expected \"qwen3_5\"");
+            }
+        }
+        if let Some(outer) = self.tie_word_embeddings {
+            if outer != self.text_config.tie_word_embeddings {
+                bail!(
+                    "qwen3_5 config: outer tie_word_embeddings {outer} disagrees with \
+                     text_config.tie_word_embeddings {} — the loader keys the head on the \
+                     text flag and would silently pick the wrong head",
+                    self.text_config.tie_word_embeddings
+                );
             }
         }
         self.text_config.validate()
@@ -1367,6 +1383,7 @@ pub struct Qwen3_5GradModel {
     norm: RmsNormZeroCentered,
     rot: RotaryTables,
     hidden: usize,
+    max_position: usize,
     device: Device,
     targets: LoraTargets,
 }
@@ -1476,6 +1493,7 @@ impl Qwen3_5GradModel {
                 vb.device(),
             )?,
             hidden: t.hidden_size,
+            max_position: t.max_position_embeddings,
             device: vb.device().clone(),
             targets,
         })
@@ -1844,6 +1862,15 @@ impl MergedLayer {
 /// (rebuild after any optimizer step or adapter toggle), `offset` must equal
 /// the tokens already consumed (fail-loud), `reset_cache` starts a fresh
 /// sequence. It holds **no** [`Var`] and records no autograd tape.
+///
+/// **Error contract (hybrid-state caveat):** the offset / position / KV
+/// guards all run **before** any layer state advances, so a rejected call
+/// leaves the decoder untouched. But layer state commits layer by layer
+/// during a forward, so after any **other** mid-forward error (an allocator
+/// or device failure inside a layer) the state is unspecified — call
+/// [`reset_cache`](Self::reset_cache) before reusing the decoder; do not
+/// retry the chunk. (The generic policy builds a fresh decoder per generate
+/// call and propagates errors, so it never continues past one.)
 #[derive(Debug)]
 pub struct Qwen3_5MergedDecoder {
     embed: Tensor,
@@ -1852,6 +1879,13 @@ pub struct Qwen3_5MergedDecoder {
     norm: RmsNormZeroCentered,
     rot: RotaryTables,
     hidden: usize,
+    /// `max_position_embeddings` — enforced on `consumed + chunk_len` BEFORE
+    /// any layer state advances. Without this precheck the rope-table bound
+    /// would fire mid-stack at the first full-attention layer, AFTER the
+    /// preceding linear layers had already committed the failed chunk into
+    /// their conv/recurrent state (and an all-linear model would have no
+    /// position bound at all).
+    max_position: usize,
     device: Device,
     /// Tokens already consumed — the decoder-level offset truth (the hybrid
     /// state means no single layer cache can carry it).
@@ -1882,6 +1916,7 @@ impl Qwen3_5MergedDecoder {
             norm: model.norm.clone(),
             rot: model.rot.clone(),
             hidden: model.hidden,
+            max_position: model.max_position,
             device: model.device.clone(),
             consumed: 0,
         })
@@ -1899,9 +1934,11 @@ impl Qwen3_5MergedDecoder {
     ///
     /// # Errors
     ///
-    /// Returns a candle error if `offset != consumed`, the internal KV
-    /// cross-check fails, any tensor op fails, or `offset + chunk_len`
-    /// exceeds the rope table (on models with full-attention layers).
+    /// Returns a candle error if `offset != consumed`, if
+    /// `offset + chunk_len` exceeds `max_position_embeddings`, if the
+    /// internal KV cross-check fails (all three rejected **before** any state
+    /// advances), or if a tensor op fails (after which the state is
+    /// unspecified — `reset_cache`; see the type docs).
     pub fn forward(&mut self, input_ids: &Tensor, offset: usize) -> CandleResult<Tensor> {
         let (b, l) = input_ids.dims2()?;
         if offset != self.consumed {
@@ -1909,6 +1946,19 @@ impl Qwen3_5MergedDecoder {
                 "Qwen3_5MergedDecoder::forward: offset {offset} != consumed {} (pass offset == \
                  tokens already consumed; 0 to prefill)",
                 self.consumed
+            );
+        }
+        // Position bound, enforced BEFORE any layer mutates: inside the loop
+        // the rope-table bound would only fire at the first full-attention
+        // layer — after the preceding linear layers had already committed the
+        // chunk into their conv/recurrent state, where a contract-correct
+        // retry would silently double-consume it. (An all-linear model has no
+        // rope table; this is also its only position bound.)
+        if offset + l > self.max_position {
+            bail!(
+                "Qwen3_5MergedDecoder::forward: offset {offset} + chunk_len {l} exceeds \
+                 max_position_embeddings {} (state untouched)",
+                self.max_position
             );
         }
         // Internal invariant: the first KV layer (when one exists) must agree
@@ -2066,6 +2116,7 @@ mod tests {
     fn tiny_cfg() -> Qwen3_5Config {
         Qwen3_5Config {
             model_type: Some("qwen3_5".to_string()),
+            tie_word_embeddings: None,
             text_config: tiny_text_cfg(true),
         }
     }
@@ -2177,7 +2228,11 @@ mod tests {
     /// Cached (merged-decoder) vs uncached forward, adapter armed. The decode
     /// path crosses the chunked/recurrent kernel boundary (independent ports,
     /// PR-1 cross-checked at 5e-5 kernel-level), so its floor is the highest.
-    const MERGED_TOL: f32 = 5e-4;
+    /// Measured worst under the seeded weights (2026-06-11): prefill 3.8e-5,
+    /// chunked continuation 7.0e-5, token-by-token decode 1.2e-4 → ~8x
+    /// headroom (the std-0.5 tiny weights run hotter than the real 0.8B,
+    /// whose same trio measures 3.3e-5; planted bugs land at 4.9–12.5).
+    const MERGED_TOL: f32 = 1e-3;
 
     // ---- config validation -------------------------------------------------
 
@@ -2233,6 +2288,7 @@ mod tests {
         // The composite config also pins the model type.
         let bad = Qwen3_5Config {
             model_type: Some("qwen3".to_string()),
+            tie_word_embeddings: None,
             text_config: tiny_text_cfg(true),
         };
         assert!(bad
@@ -2442,6 +2498,7 @@ mod tests {
     fn untied_lm_head_branch_loads_and_runs() {
         let cfg = Qwen3_5Config {
             model_type: Some("qwen3_5".to_string()),
+            tie_word_embeddings: None,
             text_config: tiny_text_cfg(false),
         };
         let vb = tiny_vb(&cfg.text_config);
@@ -2544,10 +2601,27 @@ mod tests {
         model.set_adapter_enabled(true);
         let vars = model.trainable_vars();
         assert_eq!(vars.len(), 62);
-        // GDN vars: the first 10 of each linear layer's 16.
+        // GDN vars: the first 10 of each linear layer's 16. The slice is
+        // keyed to the documented mixer-first push order — pin it
+        // STRUCTURALLY by shape, so a silent push_vars reorder turns this
+        // test red instead of quietly rotating GDN vars out of the checked
+        // set (the one place a refactor could make this gate vacuous).
+        let gd = GdnDims::from_config(&tiny_text_cfg(true));
         let gdn_vars: Vec<Var> = (0..3)
             .flat_map(|l| vars[l * 16..l * 16 + 10].to_vec())
             .collect();
+        for l in 0..3 {
+            assert_eq!(
+                vars[l * 16].dims(),
+                &[2, 8],
+                "layer {l}: first var must be in_proj_qkv A [rank, hidden] — push order drifted"
+            );
+            assert_eq!(
+                vars[l * 16 + 1].dims(),
+                &[gd.conv_dim, 2],
+                "layer {l}: second var must be in_proj_qkv B [conv_dim, rank] — push order drifted"
+            );
+        }
         let g1 = backward_grads(&model);
         assert!(
             grad_coverage(&gdn_vars, &g1).unwrap().is_ok(),
@@ -2633,8 +2707,9 @@ mod tests {
         let past_a = la.narrow(1, 0, 7).unwrap();
         let past_b = lb.narrow(1, 0, 7).unwrap();
         assert!(
-            max_abs_diff(&past_a, &past_b) <= 1e-6,
-            "perturbing token 7 must not move logits at positions 0..7"
+            max_abs_diff(&past_a, &past_b) == 0.0,
+            "perturbing token 7 must not move logits at positions 0..7 (masked future \
+             contributions are exact zeros, so causality is bit-exact, not approximate)"
         );
         let last_a = la.narrow(1, 7, 1).unwrap();
         let last_b = lb.narrow(1, 7, 1).unwrap();
@@ -2730,6 +2805,46 @@ mod tests {
         fresh.forward(&prompt, 0).unwrap();
         let want = fresh.forward(&tok, 4).unwrap();
         assert!(max_abs_diff(&good, &want) == 0.0);
+    }
+
+    #[test]
+    fn max_position_overflow_is_rejected_before_state_advances() {
+        // The sweep-found hybrid hazard: without the decoder-level precheck,
+        // the rope-table bound fires at the FIRST FULL-ATTENTION layer — after
+        // the preceding linear layers already committed the failed chunk into
+        // their conv/recurrent state — so a contract-correct retry would
+        // silently double-consume it there. The precheck must reject the
+        // overflow with the state untouched: the in-bound retry must be
+        // bit-identical to a fresh decoder's. (tiny cfg max_position = 32)
+        let model = armed_model();
+        let mut dec = model.merged_decoder().unwrap();
+        let prefix = Tensor::from_vec(
+            (0..30u32).map(|i| i % 24).collect::<Vec<_>>(),
+            (1, 30),
+            &dev(),
+        )
+        .unwrap();
+        dec.forward(&prefix, 0).unwrap();
+        let over = Tensor::from_vec(vec![1u32; 5], (1, 5), &dev()).unwrap();
+        assert!(
+            dec.forward(&over, 30).is_err(),
+            "30 + 5 > 32 must be rejected"
+        );
+        let fit = Tensor::from_vec(vec![1u32, 2], (1, 2), &dev()).unwrap();
+        let good = dec.forward(&fit, 30).unwrap();
+        let mut fresh = model.merged_decoder().unwrap();
+        fresh.forward(&prefix, 0).unwrap();
+        let want = fresh.forward(&fit, 30).unwrap();
+        assert!(
+            max_abs_diff(&good, &want) == 0.0,
+            "the rejected overflow chunk must not have advanced any layer state"
+        );
+        // And the now-full decoder rejects even a single further token.
+        let one = Tensor::from_vec(vec![3u32], (1, 1), &dev()).unwrap();
+        assert!(
+            dec.forward(&one, 32).is_err(),
+            "32 + 1 > 32 must be rejected"
+        );
     }
 
     #[test]
