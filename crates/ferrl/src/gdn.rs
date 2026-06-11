@@ -349,21 +349,20 @@ fn bmm(a: &Tensor, b: &Tensor) -> CandleResult<Tensor> {
     a3.matmul(&b3)?.reshape(out_shape)
 }
 
-/// The within-chunk UT-transform inverse: `(I - A)^{-1}` for the
-/// strictly-lower `A = -(k_beta K^T (.) decay)`, `[b, h, n, c, c]`.
+/// The within-chunk UT-transform inverse: `(I - A)^{-1}` for strictly-lower
+/// `A` `[.., c, c]` — nilpotent binary doubling,
+/// `(I - A)^{-1} = sum_{k<c} A^k = prod_j (I + A^{2^j})`, `O(log c)` matmuls.
 ///
-/// `A` is strictly lower triangular, hence nilpotent (`A^c = 0`), so
-/// `(I - A)^{-1} = sum_{k<c} A^k = prod_j (I + A^{2^j})` — the binary-doubling
-/// product, `O(log c)` matmuls. The transformers reference computes the same
-/// inverse by row-wise forward substitution (`c` sequential row updates);
-/// doubling is mathematically exact (identical in exact arithmetic, only the
-/// float summation order differs) and replaces the reference loop's `O(c^2)`
-/// retained-tape row concatenations with ~`2 log2(c)` chunk-sized tensors —
-/// the difference between ~600 MiB and ~30 MiB of tape per layer at training
-/// shapes. The oracle fixture gates adjudicate the roundoff-order difference
-/// (both forms sit well inside the tolerance).
+/// ⚠ Forming the EXPLICIT inverse is not backward stable: when `(I - A)^{-1}`
+/// has large entries (the weak-decay / strong-key-coupling regime real
+/// checkpoints actually visit), the rounding error of the doubling products
+/// grows with the inverse's own magnitude — and that magnitude grows with row
+/// index, so late-chunk positions degrade most (measured on the real 0.8B: up
+/// to 1.1e-2 logit divergence by position 22, vs a flat ~5e-5 for the stable
+/// solver). Use this only for the SMALL diagonal blocks inside [`ut_solve`]
+/// (growth over `UT_SOLVE_BLOCK` rows is bounded); never on a full chunk.
 fn ut_inverse(attn: &Tensor, c: usize) -> CandleResult<Tensor> {
-    let eye = Tensor::eye(c, DType::F32, attn.device())?;
+    let eye = Tensor::eye(c, attn.dtype(), attn.device())?;
     // result = sum_{k < span} A^k, starting at span = 2 (I + A).
     let mut result = attn.broadcast_add(&eye)?;
     let mut power = attn.clone();
@@ -376,6 +375,59 @@ fn ut_inverse(attn: &Tensor, c: usize) -> CandleResult<Tensor> {
     // Any overshoot terms (span rounding past c) are A^{>=c} = 0 by
     // nilpotency, so the result is exact for every c >= 1.
     Ok(result)
+}
+
+/// Diagonal-block width for [`ut_solve`]. Small enough that the explicit
+/// block inverse's error growth stays bounded (≤ 8 substitution steps' worth);
+/// large enough that a 64-chunk solve is 8 block steps of dense matmuls, not
+/// 64 row updates.
+const UT_SOLVE_BLOCK: usize = 8;
+
+/// Solve `(I - A) X = B` for strictly-lower `A` `[.., c, c]` and
+/// `B` `[.., c, r]` — **block forward substitution**, the numerically stable
+/// replacement for multiplying by the explicit [`ut_inverse`].
+///
+/// The transformers reference solves this row by row (backward-stable
+/// substitution, but `c` sequential row updates whose autograd tape retains
+/// `O(c^2)` row concatenations — the ~600 MiB/layer problem). This does the
+/// SAME substitution at block granularity: the outer recurrence
+/// `X_i = (I - A_ii)^{-1} (B_i + sum_{k<i} A_ik X_k)` over `c/8` block rows
+/// keeps the reference's stability (errors do not compound with the inverse's
+/// magnitude), while the tiny 8x8 diagonal inverses use nilpotent doubling
+/// (exact in 3 matmuls, growth bounded by the block width). Measured on the
+/// real 0.8B: flat ~5e-5 logit parity at every position, where the explicit
+/// full-chunk inverse degraded to 1.1e-2 by position 22.
+fn ut_solve(a: &Tensor, b_rhs: &Tensor) -> CandleResult<Tensor> {
+    let c = a.dim(D::Minus1)?;
+    if a.dim(D::Minus2)? != c || b_rhs.dim(D::Minus2)? != c {
+        bail!(
+            "ut_solve: A must be [.., c, c] and B [.., c, r], got {:?} / {:?}",
+            a.dims(),
+            b_rhs.dims()
+        );
+    }
+    if c <= UT_SOLVE_BLOCK {
+        return bmm(&ut_inverse(a, c)?, b_rhs);
+    }
+    let nb = c.div_ceil(UT_SOLVE_BLOCK);
+    let mut xs: Vec<Tensor> = Vec::with_capacity(nb);
+    for bi in 0..nb {
+        let r0 = bi * UT_SOLVE_BLOCK;
+        let rw = UT_SOLVE_BLOCK.min(c - r0);
+        let a_rows = a.narrow(D::Minus2, r0, rw)?;
+        let mut rhs = b_rhs.narrow(D::Minus2, r0, rw)?.contiguous()?;
+        // rhs += sum_{k < bi} A[block i, block k] @ X[block k] — A is
+        // strictly lower, so only blocks left of the diagonal contribute.
+        for (k, xk) in xs.iter().enumerate() {
+            let c0 = k * UT_SOLVE_BLOCK;
+            let cw = UT_SOLVE_BLOCK.min(c - c0);
+            let a_ik = a_rows.narrow(D::Minus1, c0, cw)?.contiguous()?;
+            rhs = (rhs + bmm(&a_ik, xk)?)?;
+        }
+        let a_ii = a_rows.narrow(D::Minus1, r0, rw)?.contiguous()?;
+        xs.push(bmm(&ut_inverse(&a_ii, rw)?, &rhs)?);
+    }
+    Tensor::cat(&xs, D::Minus2)
 }
 
 /// The gated delta rule in the **chunked WY form** — the training/prefill
@@ -451,19 +503,23 @@ pub fn gated_delta_rule_chunked(
         .broadcast_sub(&g_cum.unsqueeze(D::Minus2)?)?;
     let decay_mask = diff.broadcast_mul(&tril)?.exp()?.broadcast_mul(&tril)?;
 
-    // UT transform: strictly-lower attn, then the forward substitution.
+    // UT transform: strictly-lower attn, then the (stable, block-wise)
+    // forward substitution applied to both right-hand sides at once.
     let strict = strict_lower_mask(c, &device)?;
     let attn = bmm(&k_beta, &key.transpose(D::Minus1, D::Minus2)?)?
         .broadcast_mul(&decay_mask)?
         .neg()?
         .broadcast_mul(&strict)?;
-    let attn_inv = ut_inverse(&attn, c)?;
-
-    let u = bmm(&attn_inv, &v_beta)?; // pseudo-values, [B, H, N, C, V]
-    let k_cumdecay = bmm(
-        &attn_inv,
-        &k_beta.broadcast_mul(&g_cum.exp()?.unsqueeze(D::Minus1)?)?,
+    let rhs = Tensor::cat(
+        &[
+            &v_beta,
+            &k_beta.broadcast_mul(&g_cum.exp()?.unsqueeze(D::Minus1)?)?,
+        ],
+        D::Minus1,
     )?;
+    let solved = ut_solve(&attn, &rhs)?;
+    let u = solved.narrow(D::Minus1, 0, v_dim)?.contiguous()?; // pseudo-values, [B, H, N, C, V]
+    let k_cumdecay = solved.narrow(D::Minus1, v_dim, k_dim)?.contiguous()?;
 
     // Inter-chunk sequential recurrence over N chunks.
     let mut state = inp.state;
@@ -1031,38 +1087,35 @@ mod tests {
     /// value-correctness gates.
     #[test]
     fn finite_difference_gradcheck_both_kernels() {
-        let (b, t, h, kd, vd) = (1usize, 3usize, 1usize, 2usize, 2usize);
+        let (b, h, kd, vd) = (1usize, 1usize, 2usize, 2usize);
         let dev = Device::Cpu;
-        // Fixed projection weights make the scalar loss generic (no symmetry).
-        let w_out = Tensor::from_vec(det(81, b * t * h * vd), (b, t, h, vd), &dev).unwrap();
-        let w_st = Tensor::from_vec(det(82, b * h * kd * vd), (b, h, kd, vd), &dev).unwrap();
 
-        let run = |chunked: bool,
-                   q: &Tensor,
-                   k: &Tensor,
-                   v: &Tensor,
-                   g: &Tensor,
-                   be: &Tensor|
-         -> (Tensor, Tensor) {
-            if chunked {
-                gated_delta_rule_chunked(q, k, v, g, be, 2, None).unwrap()
-            } else {
-                gated_delta_rule_recurrent(q, k, v, g, be, None).unwrap()
-            }
-        };
-        let loss_of = |chunked: bool,
-                       q: &Tensor,
-                       k: &Tensor,
-                       v: &Tensor,
-                       g: &Tensor,
-                       be: &Tensor|
-         -> Tensor {
-            let (out, st) = run(chunked, q, k, v, g, be);
-            ((out * &w_out).unwrap().sum_all().unwrap() + (st * &w_st).unwrap().sum_all().unwrap())
+        // (chunk_size, t): 0 = the recurrent kernel; chunk 2 keeps the FD
+        // surface tiny; chunk 12 at t = 12 crosses the `ut_solve` block
+        // boundary (c = 12 > UT_SOLVE_BLOCK = 8), putting the block forward
+        // substitution itself on the FD-checked tape.
+        for (chunk_size, t) in [(0usize, 3usize), (2, 3), (12, 12)] {
+            let chunked = chunk_size > 0;
+            // Fixed projection weights make the scalar loss generic (no
+            // symmetry).
+            let w_out = Tensor::from_vec(det(81, b * t * h * vd), (b, t, h, vd), &dev).unwrap();
+            let w_st = Tensor::from_vec(det(82, b * h * kd * vd), (b, h, kd, vd), &dev).unwrap();
+
+            let run =
+                |q: &Tensor, k: &Tensor, v: &Tensor, g: &Tensor, be: &Tensor| -> (Tensor, Tensor) {
+                    if chunked {
+                        gated_delta_rule_chunked(q, k, v, g, be, chunk_size, None).unwrap()
+                    } else {
+                        gated_delta_rule_recurrent(q, k, v, g, be, None).unwrap()
+                    }
+                };
+            let loss_of = |q: &Tensor, k: &Tensor, v: &Tensor, g: &Tensor, be: &Tensor| -> Tensor {
+                let (out, st) = run(q, k, v, g, be);
+                ((out * &w_out).unwrap().sum_all().unwrap()
+                    + (st * &w_st).unwrap().sum_all().unwrap())
                 .unwrap()
-        };
+            };
 
-        for chunked in [false, true] {
             let (q0, k0, v0, g0, b0) = det_inputs(91, b, t, h, kd, vd);
             let inputs = [&q0, &k0, &v0, &g0, &b0];
             let vars: Vec<Var> = inputs
@@ -1070,7 +1123,6 @@ mod tests {
                 .map(|x| Var::from_tensor(x).unwrap())
                 .collect();
             let loss = loss_of(
-                chunked,
                 vars[0].as_tensor(),
                 vars[1].as_tensor(),
                 vars[2].as_tensor(),
@@ -1098,7 +1150,7 @@ mod tests {
                         let args: Vec<&Tensor> = (0..5)
                             .map(|j| if j == vi { &pt } else { inputs[j] })
                             .collect();
-                        loss_of(chunked, args[0], args[1], args[2], args[3], args[4])
+                        loss_of(args[0], args[1], args[2], args[3], args[4])
                             .to_scalar::<f32>()
                             .unwrap()
                     };
@@ -1106,12 +1158,92 @@ mod tests {
                     let tol = 2e-2f32.max(0.05 * fd.abs());
                     assert!(
                         (fd - ad[ei]).abs() <= tol,
-                        "chunked={chunked} input {vi} elem {ei}: fd {fd} vs autograd {}",
+                        "chunk={chunk_size} input {vi} elem {ei}: fd {fd} vs autograd {}",
                         ad[ei]
                     );
                 }
             }
         }
+    }
+
+    #[test]
+    #[allow(clippy::print_stderr)] // the measured error gap is the calibration record
+    fn ut_solve_is_stable_where_the_explicit_inverse_degrades() {
+        // The real-0.8B regression this guards (2026-06-11): strongly-coupled
+        // keys (repeated/related tokens) under weak decay make the UT
+        // inverse's entries grow with row index; the explicit binary-doubling
+        // inverse amplifies its rounding by that magnitude (not backward
+        // stable), which surfaced as logit divergence growing exponentially
+        // along the sequence (1.1e-2 by position 22, vs flat ~5e-5 from the
+        // stable solver). This pins ut_solve against an F64 ground truth in
+        // exactly that regime — and pins the GAP, so a "simplification" back
+        // to the explicit inverse fails here before it reaches a model gate.
+        let dev = Device::Cpu;
+        let c = 24usize;
+        let kdim = 16usize;
+        // Correlated unit keys: one base direction + small noise, l2-normed —
+        // pairwise inner products ~0.9, the strong-coupling regime.
+        let base = Tensor::from_vec(det(7, kdim), (1, kdim), &dev).unwrap();
+        let noise = (Tensor::from_vec(det(8, c * kdim), (c, kdim), &dev).unwrap() * 0.3).unwrap();
+        let keys = l2norm(&base.broadcast_add(&noise).unwrap(), 1e-6).unwrap();
+        let strict = strict_lower_mask(c, &dev).unwrap();
+        let a32 = (keys.matmul(&keys.t().unwrap()).unwrap() * (-0.85))
+            .unwrap()
+            .broadcast_mul(&strict)
+            .unwrap()
+            .unsqueeze(0)
+            .unwrap(); // [1, c, c]
+        let b32 = Tensor::from_vec(det(9, c * 4), (1, c, 4), &dev).unwrap();
+        let a64 = a32.to_dtype(DType::F64).unwrap();
+        let b64 = b32.to_dtype(DType::F64).unwrap();
+
+        // F64 ground truth (the stable solver at ~2^29x the precision).
+        let truth = ut_solve(&a64, &b64).unwrap();
+        let scale: f64 = truth
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar()
+            .unwrap();
+        let rel_err = |x: &Tensor| -> f64 {
+            let d: f64 = x
+                .to_dtype(DType::F64)
+                .unwrap()
+                .broadcast_sub(&truth)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .max(0)
+                .unwrap()
+                .to_scalar()
+                .unwrap();
+            d / scale
+        };
+
+        let solve_rel = rel_err(&ut_solve(&a32, &b32).unwrap());
+        let explicit_rel = rel_err(&bmm(&ut_inverse(&a32, c).unwrap(), &b32).unwrap());
+        eprintln!(
+            "[ut_solve stability] F32-vs-F64 relative error: block solve {solve_rel:e}, \
+             explicit inverse {explicit_rel:e} (solution scale {scale:.2e})"
+        );
+        // Measured 2026-06-11: block solve ~1e-7 class, explicit inverse
+        // orders of magnitude worse in this regime. Both bounds have wide
+        // headroom; the GAP assert is the real regression tooth.
+        assert!(
+            solve_rel <= 1e-5,
+            "block forward substitution lost precision: rel {solve_rel:e}"
+        );
+        assert!(
+            solve_rel * 10.0 <= explicit_rel,
+            "the stability gap collapsed (solve {solve_rel:e} vs explicit {explicit_rel:e}) — \
+             if the explicit inverse got this accurate, this regime is no longer adversarial; \
+             rebuild the case before trusting it"
+        );
     }
 
     /// Dtype contract: bf16 in → bf16 out, state F32, both kernels — and the
