@@ -57,6 +57,12 @@
 //!   sampler RNG, so [`Trainer::resume`] continues an interrupted run **bit-exactly**;
 //! - held-out evaluation ([`eval`]) — the base model vs. the trained adapter,
 //!   mean reward over a held-out set (the P4 gate's comparison);
+//! - activation checkpointing ([`remat`]) — candle ships no checkpoint
+//!   primitive, so ferrl orchestrates layer-boundary rematerialization itself:
+//!   the checkpointed forward cuts the autograd graph at every layer boundary
+//!   and `backward` re-runs one layer at a time, stitching the full gradient
+//!   from the boundary tape (the primary single-card memory lever — opt-in via
+//!   each model's `set_activation_checkpointing`);
 //! - a CUDA driver-compatibility preflight ([`cuda_compat`]) — translates the cryptic
 //!   `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` (a build-PTX-newer-than-driver mismatch) into
 //!   an actionable rebuild/upgrade message; a no-op without the `cuda` feature;
@@ -106,6 +112,7 @@ pub mod optim;
 pub mod policy;
 pub mod qwen;
 pub mod qwen35;
+pub mod remat;
 pub mod reward;
 pub mod sampler;
 pub mod telemetry;
@@ -157,6 +164,8 @@ pub use qwen35::{
     varbuilder_from_pretrained, LayerType, LoraTargets, Qwen3_5Config, Qwen3_5GradModel,
     Qwen3_5MergedDecoder, Qwen3_5TextConfig, RopeParameters, GDN_CHUNK_SIZE,
 };
+#[doc(inline)]
+pub use remat::{stitched_backward, RematTape};
 #[doc(inline)]
 pub use reward::RewardFn;
 #[doc(inline)]

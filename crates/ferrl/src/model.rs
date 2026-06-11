@@ -22,6 +22,7 @@
 //! (position-by-position logit equivalence) by each implementor's gates; the
 //! trait only carries the obligations.
 
+use candle_core::backprop::GradStore;
 use candle_core::{Device, Result as CandleResult, Tensor, Var};
 
 /// A stateful, grad-free incremental decoder over a snapshot of a
@@ -130,6 +131,49 @@ pub trait GradModel {
     /// Returns a candle error if the merged-weight snapshot cannot be built.
     fn merged_decoder(&self) -> CandleResult<Self::Decoder>;
 
+    /// Full-sequence logits like [`forward`](Self::forward), but **detached**:
+    /// the caller wants values only (the trainer's `logp_old` / KL-reference
+    /// scoring), never a backward through them.
+    ///
+    /// The default simply detaches a plain forward. A model that supports
+    /// activation checkpointing should override it with a *rolling* detached
+    /// walk (detach the hidden state at every layer boundary), which frees
+    /// each layer's intermediates as the walk proceeds — same values
+    /// (detaching is the identity on values), a fraction of the peak memory,
+    /// and no checkpoint tape is captured.
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if any tensor op fails.
+    fn forward_detached(&self, input_ids: &Tensor) -> CandleResult<Tensor> {
+        Ok(self.forward(input_ids)?.detach())
+    }
+
+    /// Back-propagate a loss built from this model's [`forward`](Self::forward)
+    /// logits.
+    ///
+    /// The default is exactly `loss.backward()`. A model running with
+    /// **activation checkpointing** overrides this to stitch the full gradient
+    /// out of its saved boundary tape (see [`crate::remat`]): re-running each
+    /// layer inside backward and folding the segment gradients into the store,
+    /// so the returned [`GradStore`] covers every
+    /// [`trainable_vars`](Self::trainable_vars) entry exactly as an uncut
+    /// backward would (the grad-coverage canary holds either way).
+    ///
+    /// CONTRACT (checkpointing implementations): the loss must come from this
+    /// model's **most recent** checkpointed forward, with no optimizer step or
+    /// adapter toggle in between, and each forward's tape is consumed by
+    /// exactly one backward — violations must fail loud, never stitch stale
+    /// segments.
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if the backward fails, or (under checkpointing)
+    /// if the tape/loss pairing is violated.
+    fn backward(&self, loss: &Tensor) -> CandleResult<GradStore> {
+        loss.backward()
+    }
+
     /// The model's `LoRA` recipe as a stable canonical string (e.g.
     /// `attn:qkvo|mlp:gud|gdn:-`), recorded into checkpoint manifests so an
     /// adapter is self-describing about which projections its positional
@@ -143,5 +187,76 @@ pub trait GradModel {
     /// skips that check.
     fn lora_recipe(&self) -> Option<String> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::{DType, Device};
+
+    /// A minimal [`GradModel`] that relies on every provided default — the
+    /// witness that an external implementor gets working behavior for free:
+    /// `forward_detached` is a value-identical detach and `backward` is
+    /// exactly `loss.backward()`.
+    struct OneVarModel {
+        w: Var,
+        device: Device,
+    }
+
+    struct NoopDecoder;
+    impl CachedDecoder for NoopDecoder {
+        fn forward(&mut self, _input_ids: &Tensor, _offset: usize) -> CandleResult<Tensor> {
+            candle_core::bail!("the default-behavior test never decodes")
+        }
+        fn reset_cache(&mut self) {}
+    }
+
+    impl GradModel for OneVarModel {
+        type Decoder = NoopDecoder;
+        fn device(&self) -> &Device {
+            &self.device
+        }
+        fn forward(&self, input_ids: &Tensor) -> CandleResult<Tensor> {
+            let x = input_ids.to_dtype(DType::F32)?.unsqueeze(2)?;
+            x.broadcast_mul(self.w.as_tensor())
+        }
+        fn trainable_vars(&self) -> Vec<Var> {
+            vec![self.w.clone()]
+        }
+        fn set_adapter_enabled(&mut self, _enabled: bool) {}
+        fn merged_decoder(&self) -> CandleResult<NoopDecoder> {
+            Ok(NoopDecoder)
+        }
+    }
+
+    #[test]
+    fn the_provided_defaults_detach_values_and_backward_plainly() {
+        let device = Device::Cpu;
+        let w = Var::from_tensor(&Tensor::from_vec(vec![2.0f32], (1,), &device).unwrap()).unwrap();
+        let m = OneVarModel {
+            w: w.clone(),
+            device,
+        };
+        let ids = Tensor::from_vec(vec![1u32, 2, 3, 4], (2, 2), m.device()).unwrap();
+
+        // forward_detached: identical values, tape-free.
+        let live = m.forward(&ids).unwrap();
+        let det = m.forward_detached(&ids).unwrap();
+        assert_eq!(
+            det.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            live.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        );
+        let store = det.sum_all().unwrap().backward().unwrap();
+        assert!(store.get(&w).is_none(), "detached logits reached the var");
+
+        // backward: exactly loss.backward() — the var's grad is in the store.
+        let loss = live.sum_all().unwrap();
+        let grads = m.backward(&loss).unwrap();
+        assert!(
+            grads.get(&w).is_some(),
+            "default backward lost the var grad"
+        );
+        assert!(m.lora_recipe().is_none());
     }
 }

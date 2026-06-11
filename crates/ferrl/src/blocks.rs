@@ -24,13 +24,40 @@
 use candle_core::{DType, Device, Result as CandleResult, Tensor};
 
 /// `y = x Wᵀ` for a frozen weight `w` of shape `[out, in]` (candle `Linear`
-/// layout), broadcasting over the leading dims of `x`.
+/// layout); leading dims of `x` are flattened around a single 2-D matmul.
+///
+/// The flatten (rather than `broadcast_matmul`) is a **memory** fix, not a
+/// numeric one: candle's `Matmul` backward materializes a gradient for *both*
+/// arguments unconditionally — even a frozen weight — and a grad computed
+/// against a batch-broadcast weight is batch-shaped (`[b, in, out]`; at the
+/// tied lm-head that is `batch × hidden × vocab`, gigabytes per prompt) and,
+/// worse, *retained* in the returned `GradStore` because the broadcast node
+/// under it tracks no gradient and is never visited to reduce it. With the
+/// 2-D matmul the unconditional weight gradient is `[in, out]`-shaped — the
+/// `batch × seq` factor is gone. Every output element is the same
+/// dot-product over the same `in`-axis either way; values (and the `x`
+/// gradient) agree with the broadcast path up to **f32 reassociation** of the
+/// gemm's accumulation (measured ≲ 1e-7 on CPU — the same class as the
+/// P6-C merged-weight reassociation; the equivalence tests pin a tight
+/// envelope, and the cached/uncached identity gates stay *exact* because both
+/// paths share this primitive).
 ///
 /// # Errors
 ///
 /// Returns a candle error if the matmul shapes are incompatible.
 pub fn frozen_linear(x: &Tensor, w: &Tensor) -> CandleResult<Tensor> {
-    x.broadcast_matmul(&w.t()?)
+    let wt = w.t()?;
+    if x.rank() <= 2 {
+        return x.matmul(&wt);
+    }
+    let mut out_dims = x.dims().to_vec();
+    if let Some(last) = out_dims.last_mut() {
+        *last = w.dim(0)?;
+    }
+    x.contiguous()?
+        .flatten_to(x.rank() - 2)?
+        .matmul(&wt)?
+        .reshape(out_dims)
 }
 
 /// Grouped-query repeat: `[b, kv_heads, l, d] -> [b, kv_heads * n_rep, l, d]`,
@@ -232,6 +259,105 @@ pub fn causal_mask_at(
 mod tests {
     use super::*;
     use candle_core::Var;
+
+    /// The flattened matmul is the same dot-product per output element as the
+    /// broadcast path up to f32 reassociation of the gemm's accumulation —
+    /// pin a tight envelope (measured ≲ 2.4e-7 on these O(1) values), at
+    /// every rank.
+    #[test]
+    fn frozen_linear_matches_broadcast_matmul_tightly() {
+        let dev = Device::Cpu;
+        let w_data: Vec<f32> = (0..20).map(|i| i as f32 * 0.05 - 0.4).collect();
+        let w = Tensor::from_vec(w_data, (5, 4), &dev).unwrap();
+        for dims in [vec![3, 4], vec![2, 3, 4], vec![2, 2, 3, 4]] {
+            let n: usize = dims.iter().product();
+            let xv: Vec<f32> = (0..n).map(|i| i as f32 * 0.1 - 0.7).collect();
+            let x = Tensor::from_vec(xv, dims, &dev).unwrap();
+            let got: Vec<f32> = frozen_linear(&x, &w)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let want: Vec<f32> = x
+                .broadcast_matmul(&w.t().unwrap())
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            for (g, want) in got.iter().zip(&want) {
+                assert!(
+                    (g - want).abs() <= 1e-6,
+                    "rank-{} forward drifted: {g} vs {want}",
+                    x.rank()
+                );
+            }
+        }
+    }
+
+    /// The gradient that flows back into `x` is also the same dot-products
+    /// either way up to gemm reassociation — pin a tight envelope so the
+    /// flatten can never bend training beyond last-ulp noise.
+    #[test]
+    fn frozen_linear_x_gradient_matches_the_broadcast_path() {
+        let dev = Device::Cpu;
+        let w_data: Vec<f32> = (0..20).map(|i| i as f32 * 0.05 - 0.4).collect();
+        let w = Tensor::from_vec(w_data, (5, 4), &dev).unwrap();
+        let xv: Vec<f32> = (0..24).map(|i| i as f32 * 0.1 - 0.7).collect();
+        let x = Var::from_tensor(&Tensor::from_vec(xv, (2, 3, 4), &dev).unwrap()).unwrap();
+
+        let grad_of = |y: Tensor| -> Vec<f32> {
+            let store = y.sum_all().unwrap().backward().unwrap();
+            store
+                .get(&x)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap()
+        };
+        let got = grad_of(frozen_linear(&x, &w).unwrap());
+        let want = grad_of(x.broadcast_matmul(&w.t().unwrap()).unwrap());
+        for (g, want) in got.iter().zip(&want) {
+            assert!(
+                (g - want).abs() <= 1e-6,
+                "x-gradient drifted under the flatten: {g} vs {want}"
+            );
+        }
+    }
+
+    /// THE point of the flatten: candle materializes (and the store retains) a
+    /// gradient even for a frozen matmul argument, and against a broadcast
+    /// weight that gradient is batch-shaped. After the fix no retained
+    /// gradient may exceed the boundary-input size — the batch-shaped
+    /// `[b, in, out]` weight gradient (40 elements here) must be gone.
+    #[test]
+    fn frozen_linear_retains_no_batch_shaped_weight_gradient() {
+        let dev = Device::Cpu;
+        let w_data: Vec<f32> = (0..20).map(|i| i as f32 * 0.05 - 0.4).collect();
+        let w = Tensor::from_vec(w_data, (5, 4), &dev).unwrap();
+        let xv: Vec<f32> = (0..24).map(|i| i as f32 * 0.1 - 0.7).collect();
+        let x = Var::from_tensor(&Tensor::from_vec(xv, (2, 3, 4), &dev).unwrap()).unwrap();
+
+        let store = frozen_linear(&x, &w)
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .backward()
+            .unwrap();
+        let max_retained = store
+            .get_ids()
+            .filter_map(|id| store.get_id(*id))
+            .map(candle_core::Tensor::elem_count)
+            .max()
+            .unwrap();
+        assert!(
+            max_retained <= x.elem_count().max(w.elem_count()),
+            "a retained gradient has {max_retained} elements — \
+             the batch-shaped frozen-weight gradient is back"
+        );
+    }
 
     /// `rope_partial` rotates exactly the first `rot_dim` dims (matching a
     /// scalar rotate-half reference) and passes the rest through untouched.

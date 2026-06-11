@@ -12,6 +12,7 @@
 //! the surrogate can be differentiated), whereas rewards stay scalar (see
 //! [`crate::reward`]).
 
+use candle_core::backprop::GradStore;
 use candle_core::{Result as CandleResult, Tensor, Var};
 
 /// A batch of sampled completions: token ids plus the prompt length that
@@ -243,6 +244,43 @@ pub trait Policy {
     ///
     /// Returns a candle error if the forward pass fails.
     fn token_logprobs(&self, rollout: &Rollout) -> CandleResult<Tensor>;
+
+    /// [`token_logprobs`](Self::token_logprobs), but **detached** — for the
+    /// value-only scorings (the `logp_old` snapshot and the KL reference)
+    /// that are never back-propagated.
+    ///
+    /// The default detaches a plain `token_logprobs` call — identical values,
+    /// identical behavior for every existing policy. A model-backed policy
+    /// overrides it to route through a memory-light detached forward
+    /// ([`crate::GradModel::forward_detached`]), which never retains the full
+    /// activation graph and — under activation checkpointing — never captures
+    /// a boundary tape (a value scoring must not disturb the tape the next
+    /// update backward will consume).
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if the forward pass fails.
+    fn token_logprobs_detached(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+        Ok(self.token_logprobs(rollout)?.detach())
+    }
+
+    /// Back-propagate a loss built from this policy's
+    /// [`token_logprobs`](Self::token_logprobs).
+    ///
+    /// The default is exactly `loss.backward()` — what the trainer always did.
+    /// A model-backed policy forwards to [`crate::GradModel::backward`], which
+    /// under **activation checkpointing** stitches the full gradient out of
+    /// the saved boundary tape instead (see [`crate::remat`]); the returned
+    /// store covers every [`trainable_vars`](Self::trainable_vars) entry
+    /// either way (the trainer's grad-coverage canary enforces it).
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if the backward fails, or (under checkpointing)
+    /// if the loss does not pair with the most recent checkpointed forward.
+    fn backward(&self, loss: &Tensor) -> CandleResult<GradStore> {
+        loss.backward()
+    }
 
     /// Enable (`true`) or disable (`false`) the `LoRA` adapter contribution.
     ///

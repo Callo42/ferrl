@@ -948,8 +948,10 @@ impl Trainer {
         }
 
         // Snapshot the old / reference log-probs once (the window's "old" policy),
-        // reused across the mu inner epochs.
-        let logp_old = policy.token_logprobs(&rollout)?.detach();
+        // reused across the mu inner epochs. Value-only, so the detached
+        // scoring path: same values, a fraction of the activation footprint
+        // on policies that override it (no tape is built or captured).
+        let logp_old = policy.token_logprobs_detached(&rollout)?;
         // Train/rollout off-policy diagnostics + the optional TIS weight, both off
         // the captured behavior log-probs vs the logp_old scoring snapshot.
         let (ratio_stats, tis_w) = rollout_ratio_and_tis(
@@ -1120,7 +1122,10 @@ impl Trainer {
             &item.mask,
         )?;
         let kl = self.kl_metric(&logp, item.logp_ref.as_ref(), &item.mask)?;
-        let grads = loss.backward()?;
+        // Through the policy seam (default: exactly `loss.backward()`): under
+        // activation checkpointing the policy stitches the full gradient from
+        // its boundary tape — the canary downstream holds either way.
+        let grads = policy.backward(&loss)?;
         Ok((grads, kl, clip_frac))
     }
 
@@ -1154,9 +1159,10 @@ impl Trainer {
             return Ok(None);
         }
         policy.set_adapter_enabled(false);
-        let logp = policy.token_logprobs(rollout);
+        // Value-only (the reference is never trained): the detached scoring path.
+        let logp = policy.token_logprobs_detached(rollout);
         policy.set_adapter_enabled(true); // always restore.
-        Ok(Some(logp?.detach()))
+        Ok(Some(logp?))
     }
 
     /// Aggregate a window's per-prompt [`PromptStat`]s and the update's diagnostics
@@ -2422,16 +2428,32 @@ mod tests {
     /// the logp Var. This pins that each config knob actually reaches the
     /// differentiated loss — the seam a hardcoded default would sever.
     fn wire_grad(cfg: &TrainerConfig, window_tokens: f64) -> Vec<f32> {
+        let logp = wire_logp();
+        let policy = StubPolicy { logp: logp.clone() };
+        wire_grad_via(&policy, &logp, cfg, window_tokens)
+    }
+
+    fn wire_logp() -> Var {
+        Var::from_tensor(&mat(&[&[-1.0, -2.0, -0.4], &[-0.5, -0.25, -0.75]])).unwrap()
+    }
+
+    /// The fixed crafted item over `logp` (ratios straddling the clip bands,
+    /// ragged mask), driven through `item_backward` with `policy`; returns the
+    /// flat gradient of the logp Var out of the store `item_backward` returns.
+    fn wire_grad_via<P: Policy>(
+        policy: &P,
+        logp: &Var,
+        cfg: &TrainerConfig,
+        window_tokens: f64,
+    ) -> Vec<f32> {
         let dev = cpu();
         let tmp = WireTmp::new("grad");
         let run = RunDir::create(&tmp.0, "wire").unwrap();
         let trainer = Trainer::new(cfg.clone(), &run).unwrap();
-        let logp = Var::from_tensor(&mat(&[&[-1.0, -2.0, -0.4], &[-0.5, -0.25, -0.75]])).unwrap();
         // Shifts 0.22 / -0.30 straddle both bands (1.246 / 0.74); ratio != 1
         // even at mu = 1 because logp_old is crafted, not snapshotted.
         let shift = mat(&[&[0.22, -0.30, 0.05], &[0.05, 0.22, -0.30]]);
         let logp_old = logp.as_tensor().sub(&shift).unwrap().detach();
-        let policy = StubPolicy { logp: logp.clone() };
         let item = LiveItem {
             rollout: Rollout {
                 token_ids: vec![vec![0; 4]; 2],
@@ -2445,9 +2467,7 @@ mod tests {
             mask: mat(&[&[1.0, 1.0, 1.0], &[1.0, 1.0, 0.0]]),
             tis_w: None,
         };
-        let (grads, _, _) = trainer
-            .item_backward(&policy, &item, window_tokens)
-            .unwrap();
+        let (grads, _, _) = trainer.item_backward(policy, &item, window_tokens).unwrap();
         grads
             .get(logp.as_tensor())
             .expect("logp var must be in the grad store")
@@ -2472,6 +2492,59 @@ mod tests {
             a.iter().zip(b).any(|(x, y)| (x - y).abs() > 1e-7),
             "{ctx}: gradients identical — the knob never reached the loss"
         );
+    }
+
+    /// A [`StubPolicy`] whose `Policy::backward` override doubles the logp
+    /// gradient after the plain backward — the probe that proves
+    /// `item_backward` both *routes through* the policy seam and *returns the
+    /// policy's store* (a hardcoded `loss.backward()` would sever exactly
+    /// this, which is what activation checkpointing rides on).
+    struct DoublingBackwardPolicy {
+        inner: StubPolicy,
+    }
+    impl Policy for DoublingBackwardPolicy {
+        fn generate(&mut self, p: &[u32], c: &GenConfig) -> CandleResult<Rollout> {
+            self.inner.generate(p, c)
+        }
+        fn token_logprobs(&self, r: &Rollout) -> CandleResult<Tensor> {
+            self.inner.token_logprobs(r)
+        }
+        fn set_adapter_enabled(&mut self, e: bool) {
+            self.inner.set_adapter_enabled(e);
+        }
+        fn adapter_enabled(&self) -> bool {
+            self.inner.adapter_enabled()
+        }
+        fn trainable_vars(&self) -> Vec<Var> {
+            self.inner.trainable_vars()
+        }
+        fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+            self.inner.sampler_state()
+        }
+        fn restore_sampler_state(&mut self, s: &[u8]) -> CandleResult<()> {
+            self.inner.restore_sampler_state(s)
+        }
+        fn backward(&self, loss: &Tensor) -> CandleResult<GradStore> {
+            let mut store = loss.backward()?;
+            let v = &self.inner.logp;
+            let g = store
+                .remove(v)
+                .expect("the logp grad must be on the loss tape");
+            store.insert(v, (g * 2.0)?);
+            Ok(store)
+        }
+    }
+
+    #[test]
+    fn wiring_item_backward_runs_through_the_policy_backward_seam() {
+        let cfg = TrainerConfig::default();
+        let base = wire_grad(&cfg, 5.0);
+        let logp = wire_logp();
+        let policy = DoublingBackwardPolicy {
+            inner: StubPolicy { logp: logp.clone() },
+        };
+        let doubled = wire_grad_via(&policy, &logp, &cfg, 5.0);
+        assert_grads_scaled(&base, &doubled, 2.0, "policy backward seam");
     }
 
     #[test]

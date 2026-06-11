@@ -144,6 +144,71 @@ impl<M: GradModel> LmPolicy<M> {
         &self.model
     }
 
+    /// Mutable access to the wrapped model — e.g. to turn on **activation
+    /// checkpointing** after construction
+    /// (`policy.model_mut().set_activation_checkpointing(true)` on the models
+    /// that support it; see
+    /// [`QwenGradModel::set_activation_checkpointing`](crate::qwen::QwenGradModel::set_activation_checkpointing)).
+    #[must_use]
+    pub fn model_mut(&mut self) -> &mut M {
+        &mut self.model
+    }
+
+    /// The teacher-forcing scoring input: all but the last token of every
+    /// sequence, as one `[group, seq_len - 1]` tensor on the model's device.
+    ///
+    /// Precondition (the `Trainer` guarantees this via `completion_dims`): a
+    /// rectangular rollout with `prompt_len >= 1` and `comp_len >= 1`. Called
+    /// directly with `prompt_len == 0`, the scoring narrow underflows.
+    fn scoring_input(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+        let seq_len = rollout.token_ids[0].len();
+        let input_len = seq_len - 1;
+        let g = rollout.token_ids.len();
+        let mut input_data = Vec::with_capacity(g * input_len);
+        for ids in &rollout.token_ids {
+            input_data.extend_from_slice(&ids[..input_len]);
+        }
+        Tensor::from_vec(input_data, (g, input_len), self.model.device())
+    }
+
+    /// Gather the completion tokens' log-probabilities out of full-sequence
+    /// `logits` — narrow to the completion-predicting positions, upcast to
+    /// F32, divide by the rollout temperature (temperature-consistent
+    /// scoring; a guarded no-op at the `1.0` default), `log_softmax`, gather.
+    fn completion_logprobs(&self, rollout: &Rollout, logits: &Tensor) -> CandleResult<Tensor> {
+        let prompt_len = rollout.prompt_len;
+        let seq_len = rollout.token_ids[0].len();
+        let comp_len = seq_len - prompt_len;
+        let g = rollout.token_ids.len();
+
+        // The positions that predict the completion tokens are
+        // [prompt_len - 1 .. prompt_len - 1 + comp_len].
+        // Upcast just the completion-position logits (a small `[g, comp_len, vocab]`
+        // slice, NOT the full sequence) to F32 before the log-softmax, so the
+        // surrogate's log-probs keep F32 precision even when the model runs in BF16
+        // (the dtype split); the big full-sequence logits stay BF16. A no-op when the
+        // model is already F32.
+        let mut pred = logits
+            .narrow(1, prompt_len - 1, comp_len)?
+            .to_dtype(DType::F32)?;
+        // Temperature-consistent scoring (TRL parity): divide the logits by the
+        // policy's rollout temperature before the log-softmax, so the distribution
+        // being optimized IS the one the rollout sampled from. Guarded so the
+        // T = 1.0 default adds no op and stays bit-identical to the pre-R2 path.
+        if (self.temperature - 1.0).abs() > f64::EPSILON {
+            pred = (pred / self.temperature)?;
+        }
+        let logp = log_softmax(&pred, D::Minus1)?;
+
+        let mut tgt_data = Vec::with_capacity(g * comp_len);
+        for ids in &rollout.token_ids {
+            tgt_data.extend_from_slice(&ids[prompt_len..seq_len]);
+        }
+        let targets = Tensor::from_vec(tgt_data, (g, comp_len), self.model.device())?;
+        let idx = targets.unsqueeze(D::Minus1)?;
+        logp.gather(&idx, D::Minus1)?.squeeze(D::Minus1)
+    }
+
     /// The pre-P6-C **uncached** rollout: re-run the full-sequence
     /// [`GradModel::forward`] every step. Kept as the equivalence oracle for the
     /// cached [`generate`](Self::generate) — same sampler, same EOS/padding logic, so
@@ -347,55 +412,36 @@ impl<M: GradModel> Policy for LmPolicy<M> {
     }
 
     fn token_logprobs(&self, rollout: &Rollout) -> CandleResult<Tensor> {
-        // Precondition (the Trainer guarantees this via `completion_dims`): a
-        // rectangular rollout with `prompt_len >= 1` and `comp_len >= 1`. Called
-        // directly with `prompt_len == 0`, the `prompt_len - 1` narrow underflows.
-        let prompt_len = rollout.prompt_len;
-        let seq_len = rollout.token_ids[0].len();
-        let comp_len = seq_len - prompt_len;
-        let input_len = seq_len - 1;
-        let g = rollout.token_ids.len();
-        let device = self.model.device();
-
-        // Teacher forcing: forward all but the last token of every sequence.
-        let mut input_data = Vec::with_capacity(g * input_len);
-        for ids in &rollout.token_ids {
-            input_data.extend_from_slice(&ids[..input_len]);
-        }
-        let input = Tensor::from_vec(input_data, (g, input_len), device)?;
+        let input = self.scoring_input(rollout)?;
         // Same CUDA-compat translation as `generate` (see there): a no-op off the
         // `cuda` build and on the success path.
         let logits = self
             .model
             .forward(&input)
             .map_err(crate::cuda_compat::translate_ptx_error)?; // [g, input_len, vocab]
+        self.completion_logprobs(rollout, &logits)
+    }
 
-        // The positions that predict the completion tokens are
-        // [prompt_len - 1 .. prompt_len - 1 + comp_len].
-        // Upcast just the completion-position logits (a small `[g, comp_len, vocab]`
-        // slice, NOT the full sequence) to F32 before the log-softmax, so the
-        // surrogate's log-probs keep F32 precision even when the model runs in BF16
-        // (the dtype split); the big full-sequence logits stay BF16. A no-op when the
-        // model is already F32.
-        let mut pred = logits
-            .narrow(1, prompt_len - 1, comp_len)?
-            .to_dtype(DType::F32)?;
-        // Temperature-consistent scoring (TRL parity): divide the logits by the
-        // policy's rollout temperature before the log-softmax, so the distribution
-        // being optimized IS the one the rollout sampled from. Guarded so the
-        // T = 1.0 default adds no op and stays bit-identical to the pre-R2 path.
-        if (self.temperature - 1.0).abs() > f64::EPSILON {
-            pred = (pred / self.temperature)?;
-        }
-        let logp = log_softmax(&pred, D::Minus1)?;
+    fn token_logprobs_detached(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+        let input = self.scoring_input(rollout)?;
+        // The value-only scorings (logp_old / the KL reference) route through
+        // the model's detached forward: a rolling boundary detach frees each
+        // layer's intermediates as the walk proceeds, and no checkpoint tape
+        // is captured (so the tape of the NEXT update forward — the one
+        // `backward` consumes — can never be clobbered by a value scoring).
+        let logits = self
+            .model
+            .forward_detached(&input)
+            .map_err(crate::cuda_compat::translate_ptx_error)?;
+        // Already tape-free; the explicit detach states the trait contract
+        // rather than trusting every model impl.
+        Ok(self.completion_logprobs(rollout, &logits)?.detach())
+    }
 
-        let mut tgt_data = Vec::with_capacity(g * comp_len);
-        for ids in &rollout.token_ids {
-            tgt_data.extend_from_slice(&ids[prompt_len..seq_len]);
-        }
-        let targets = Tensor::from_vec(tgt_data, (g, comp_len), device)?;
-        let idx = targets.unsqueeze(D::Minus1)?;
-        logp.gather(&idx, D::Minus1)?.squeeze(D::Minus1)
+    fn backward(&self, loss: &Tensor) -> CandleResult<candle_core::backprop::GradStore> {
+        // Under activation checkpointing the model stitches the full gradient
+        // from its boundary tape; otherwise this is exactly `loss.backward()`.
+        self.model.backward(loss)
     }
 
     fn set_adapter_enabled(&mut self, enabled: bool) {
@@ -1779,5 +1825,103 @@ mod tests {
         );
         // The adapter is restored enabled after the (reference-toggling) run.
         assert!(policy.adapter_enabled());
+    }
+
+    // ---- detached scoring + checkpointed backward (P7) ----------------------
+
+    /// Force every adapter `B` nonzero so the adapter path is live in the
+    /// scored logits (at the `B = 0` init both scorings would trivially agree).
+    fn arm_policy(policy: &QwenPolicy) {
+        for v in policy.trainable_vars().iter().skip(1).step_by(2) {
+            let dims = v.as_tensor().dims().to_vec();
+            v.set(&Tensor::randn(0f32, 0.5f32, dims, &Device::Cpu).unwrap())
+                .unwrap();
+        }
+    }
+
+    fn small_rollout(policy: &mut QwenPolicy) -> Rollout {
+        let cfg = GenConfig {
+            group_size: 2,
+            max_new_tokens: 3,
+            temperature: 1.0,
+            eos_token_id: None,
+            eval_sampling: None,
+        };
+        policy.generate(&[1u32, 2, 3], &cfg).unwrap()
+    }
+
+    /// A fixed non-uniform weighted sum of the scored log-probs — the loss
+    /// stand-in for the backward-seam tests.
+    fn probe_loss_of(policy: &QwenPolicy, rollout: &Rollout) -> Tensor {
+        let logp = policy.token_logprobs(rollout).unwrap();
+        let n = logp.elem_count();
+        let w: Vec<f32> = (0..n).map(|i| ((i % 5) as f32) * 0.3 - 0.5).collect();
+        let w = Tensor::from_vec(w, logp.dims().to_vec(), &Device::Cpu).unwrap();
+        logp.mul(&w).unwrap().sum_all().unwrap()
+    }
+
+    #[test]
+    fn detached_scoring_matches_token_logprobs_and_is_tape_free() {
+        let mut policy = tiny_policy();
+        arm_policy(&policy);
+        let rollout = small_rollout(&mut policy);
+
+        let live = policy.token_logprobs(&rollout).unwrap();
+        let det = policy.token_logprobs_detached(&rollout).unwrap();
+        assert_eq!(
+            det.to_vec2::<f32>().unwrap(),
+            live.to_vec2::<f32>().unwrap(),
+            "the detached scoring drifted from token_logprobs"
+        );
+
+        // Tape-free: a backward through the detached scores reaches no var…
+        let store = det.sum_all().unwrap().backward().unwrap();
+        assert!(policy
+            .trainable_vars()
+            .iter()
+            .all(|v| store.get(v).is_none()));
+        // …while the live path IS on the tape (the comparison is non-vacuous).
+        let store = live.sum_all().unwrap().backward().unwrap();
+        assert!(policy
+            .trainable_vars()
+            .iter()
+            .any(|v| store.get(v).is_some()));
+    }
+
+    /// `Policy::backward` under activation checkpointing: full var coverage,
+    /// gradients matching the uncut run on the same instance — the
+    /// policy-level end-to-end of the remat stitch.
+    #[test]
+    fn policy_backward_stitches_under_checkpointing() {
+        let mut policy = tiny_policy();
+        arm_policy(&policy);
+        let rollout = small_rollout(&mut policy);
+        let vars = policy.trainable_vars();
+
+        let plain = policy.backward(&probe_loss_of(&policy, &rollout)).unwrap();
+        policy.model_mut().set_activation_checkpointing(true);
+        let stitched = policy.backward(&probe_loss_of(&policy, &rollout)).unwrap();
+
+        for v in &vars {
+            let a = plain.get(v).expect("var missing from the uncut store");
+            let b = stitched
+                .get(v)
+                .expect("var missing from the stitched store");
+            let diff: f32 = a
+                .sub(b)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .max(0)
+                .unwrap()
+                .to_scalar()
+                .unwrap();
+            assert!(
+                diff <= 1e-5,
+                "stitched grad diverged from the uncut backward by {diff}"
+            );
+        }
     }
 }

@@ -13,11 +13,14 @@ candle's.
 > Status: the single-GPU training stack works end-to-end and is validated on real
 > hardware — GRPO trainer (gradient accumulation, EOS/length masking,
 > momentum-faithful checkpoint/resume), manual LoRA with a bf16-base / F32-adapter
-> dtype split, a KV-cached merged-weight rollout, and a held-out eval harness.
-> Grad-bearing model forwards exist for **two architectures** — Qwen3 (dense) and
-> dense Llama-3.x — behind the `GradModel`/`CachedDecoder` trait seam, so the same
-> generic policy and trainer drive both unchanged; each forward is pinned against
-> candle's shipped forward by per-position logit-equivalence gates. Multi-GPU data
+> dtype split, a KV-cached merged-weight rollout, opt-in activation checkpointing
+> (layer-boundary rematerialization — candle ships no checkpoint primitive), and a
+> held-out eval harness. Grad-bearing model forwards exist for **three
+> architectures** — Qwen3 (dense), dense Llama-3.x, and the hybrid `qwen3_5`
+> family (GatedDeltaNet + gated GQA, i.e. Qwen3.5/3.6) — behind the
+> `GradModel`/`CachedDecoder` trait seam, so the same generic policy and trainer
+> drive all three unchanged; each forward is pinned against a reference
+> implementation by per-position logit-equivalence gates. Multi-GPU data
 > parallelism is the next track.
 
 ---
@@ -50,8 +53,9 @@ ferrl/
     │   ├── trainer.rs  eval.rs              # training loop + held-out eval harness
     │   ├── lora.rs  optim.rs  sampler.rs  checkpoint.rs
     │   ├── model.rs                         # the GradModel / CachedDecoder trait seam
-    │   ├── qwen.rs  llama.rs  blocks.rs     # the model layer (grad forwards + cached decoders)
-    │   ├── lm_policy.rs                     # Policy over any GradModel (QwenPolicy, LlamaPolicy)
+    │   ├── qwen.rs  llama.rs  qwen35.rs     # the model layer (grad forwards + cached decoders)
+    │   ├── blocks.rs  gdn.rs  remat.rs      # shared blocks, GatedDeltaNet math, activation ckpt
+    │   ├── lm_policy.rs                     # Policy over any GradModel (Qwen/Llama/Qwen3_5 Policy)
     │   └── {lib,policy,reward,nn,tokenizer,countdown,telemetry,cuda_compat}.rs
     └── tests/fixtures/grpo_golden.json      # committed oracle output
 ```
