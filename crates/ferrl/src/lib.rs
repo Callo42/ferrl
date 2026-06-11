@@ -95,6 +95,7 @@ pub mod checkpoint;
 pub mod countdown;
 pub mod cuda_compat;
 pub mod eval;
+pub mod gdn;
 pub mod grpo;
 pub mod llama;
 pub mod lm_policy;
@@ -124,6 +125,11 @@ pub use countdown::{
 pub use cuda_compat::{check_driver_compat, guard_first_kernel, translate_ptx_error, CompatReport};
 #[doc(inline)]
 pub use eval::{evaluate, EvalError, EvalReport, PromptEval};
+
+pub use gdn::{
+    causal_depthwise_conv1d, gated_delta_rule_chunked, gated_delta_rule_recurrent, l2norm,
+    stable_softplus,
+};
 #[doc(inline)]
 pub use grpo::{
     clipped_surrogate, group_advantages, k3_kl, masked_mean, zero_mask_rows, LossType,
@@ -136,7 +142,7 @@ pub use lm_policy::{LlamaPolicy, LmPolicy, QwenPolicy};
 #[doc(inline)]
 pub use model::{CachedDecoder, GradModel};
 #[doc(inline)]
-pub use nn::{grad_coverage, GradCoverage, RmsNorm};
+pub use nn::{grad_coverage, GradCoverage, RmsNorm, RmsNormGated, RmsNormZeroCentered};
 #[doc(inline)]
 pub use optim::{FerrlAdamW, OptimizerState};
 #[doc(inline)]

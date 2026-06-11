@@ -89,6 +89,112 @@ impl RmsNorm {
     }
 }
 
+/// Root-mean-square norm with **zero-centered** weights: effective scale
+/// `(1 + w)`, multiplied in F32 *before* the downcast.
+///
+/// The `qwen3_5` family stores its decoder / q-k / final norm weights
+/// zero-centered (checkpoint holds `w`, the applied scale is `1 + w`), and the
+/// reference multiplies the F32-normalized activations by `(1 + w)` **in F32**
+/// and only then casts back to the input dtype (transformers
+/// `Qwen3_5RMSNorm`; order pinned there citing PR #29402 — Llama downcasts
+/// before the scale, this family after). One model, two conventions: the
+/// `DeltaNet` gated norm is plain-`w` ([`RmsNormGated`]) — confusing them loads
+/// real checkpoints into a silently-wrong forward, so the two are distinct
+/// types. Built from differentiable composites only (grad-safe; candle's
+/// fused norm kernels have no backward).
+#[derive(Debug, Clone)]
+pub struct RmsNormZeroCentered {
+    /// Frozen zero-centered scale, shape `[hidden]` (checkpoint layout; the
+    /// applied scale is `1 + weight`).
+    weight: Tensor,
+    /// Stabilizer added to the mean-square before the rsqrt.
+    eps: f64,
+}
+
+impl RmsNormZeroCentered {
+    /// Build from the checkpoint's zero-centered `weight` and `eps`.
+    #[must_use]
+    pub fn new(weight: Tensor, eps: f64) -> Self {
+        Self { weight, eps }
+    }
+
+    /// The frozen zero-centered weight tensor (as stored, **without** the +1).
+    #[must_use]
+    pub fn weight(&self) -> &Tensor {
+        &self.weight
+    }
+
+    /// Normalize `x` (shape `[.., hidden]`) over its last dim and scale by
+    /// `(1 + weight)`: F32 throughout, downcast to `x`'s dtype only at exit.
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if `weight` does not broadcast against `x`'s
+    /// last dimension or an underlying tensor op fails.
+    pub fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
+        let xf = x.to_dtype(DType::F32)?;
+        let var = xf.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
+        let xn = xf.broadcast_div(&(var + self.eps)?.sqrt()?)?;
+        let w1 = (self.weight.to_dtype(DType::F32)? + 1.0)?;
+        xn.broadcast_mul(&w1)?.to_dtype(x.dtype())
+    }
+}
+
+/// The `DeltaNet` **gated** RMS norm: per-head `rms(x) * w * silu(gate)`,
+/// norm-before-gate, with **plain** weights.
+///
+/// Mirrors transformers `Qwen3_5RMSNormGated` exactly, including the cast
+/// choreography: normalize in F32, multiply by the plain `w` in the **input
+/// dtype** (the reference downcasts before the weight), then gate with
+/// `silu(gate)` computed in F32, and return in the input dtype. Contrast
+/// [`RmsNormZeroCentered`]: that convention is `(1 + w)` with the scale
+/// applied **before** the downcast — the `qwen3_5` checkpoint uses both, and
+/// swapping them is a silent-wrong-forward bug (pinned by the fixture gate).
+#[derive(Debug, Clone)]
+pub struct RmsNormGated {
+    /// Frozen plain scale, shape `[head_v_dim]`.
+    weight: Tensor,
+    /// Stabilizer added to the mean-square before the rsqrt.
+    eps: f64,
+}
+
+impl RmsNormGated {
+    /// Build from the checkpoint's plain `weight` and `eps`.
+    #[must_use]
+    pub fn new(weight: Tensor, eps: f64) -> Self {
+        Self { weight, eps }
+    }
+
+    /// The frozen plain weight tensor.
+    #[must_use]
+    pub fn weight(&self) -> &Tensor {
+        &self.weight
+    }
+
+    /// `rms_normalize(x) * weight * silu(gate)` over the last dim. `x` and
+    /// `gate` share shape `[.., head_v_dim]`; output is in `x`'s dtype.
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error on a shape/broadcast mismatch or if an
+    /// underlying tensor op fails.
+    pub fn forward(&self, x: &Tensor, gate: &Tensor) -> CandleResult<Tensor> {
+        let in_dtype = x.dtype();
+        let xf = x.to_dtype(DType::F32)?;
+        let var = xf.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
+        let xn = xf.broadcast_div(&(var + self.eps)?.sqrt()?)?;
+        // Reference order: downcast, THEN the plain weight in the input dtype.
+        let scaled = xn
+            .to_dtype(in_dtype)?
+            .broadcast_mul(&self.weight.to_dtype(in_dtype)?)?;
+        // Gate in F32 (silu computed on the F32 gate), output back in input dtype.
+        let gated = scaled
+            .to_dtype(DType::F32)?
+            .mul(&gate.to_dtype(DType::F32)?.silu()?)?;
+        gated.to_dtype(in_dtype)
+    }
+}
+
 /// Outcome of a grad-coverage check over trainable [`Var`]s after a backward pass.
 ///
 /// candle optimizers silently skip any `Var` missing from the [`GradStore`], so
@@ -508,5 +614,117 @@ mod tests {
             err.contains("empty") || err.contains("no trainable"),
             "empty-set message: {err}"
         );
+    }
+
+    /// Oracle dumps from transformers v5.11.0 `qwen3_5` (see `src/gdn.rs` tests;
+    /// same fixture file, the norm cases).
+    const GDN_GOLDEN: &str = include_str!("../tests/fixtures/gdn_golden.json");
+
+    fn gdn_golden() -> serde_json::Value {
+        serde_json::from_str(GDN_GOLDEN).expect("gdn golden fixture parses")
+    }
+
+    fn fixture_tensor(c: &serde_json::Value, key: &str, shape: &[usize]) -> Tensor {
+        let v: Vec<f32> = c[key]
+            .as_array()
+            .expect("fixture array")
+            .iter()
+            .map(|x| x.as_f64().expect("fixture float") as f32)
+            .collect();
+        Tensor::from_vec(v, shape, &Device::Cpu).unwrap()
+    }
+
+    fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
+        let av: Vec<f32> = a.flatten_all().unwrap().to_vec1().unwrap();
+        let bv: Vec<f32> = b.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(av.len(), bv.len());
+        av.iter()
+            .zip(&bv)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0, f32::max)
+    }
+
+    /// The zero-centered norm matches transformers `Qwen3_5RMSNorm` exactly,
+    /// and the convention is load-bearing: applying the same weights through
+    /// the plain-`w` path (the OTHER convention in this model) is visibly
+    /// wrong. One model, two norm conventions — the `qwen3_5` trap.
+    #[test]
+    fn rms_norm_zero_centered_matches_oracle_and_convention_matters() {
+        let g = gdn_golden();
+        let c = &g["cases"]["rmsnorm_zero_centered"];
+        let x = fixture_tensor(c, "x", &[2, 3, 8]);
+        let w = fixture_tensor(c, "weight", &[8]);
+        let want = fixture_tensor(c, "out", &[2, 3, 8]);
+
+        let norm = RmsNormZeroCentered::new(w.clone(), 1e-6);
+        let got = norm.forward(&x).unwrap();
+        let d = max_abs_diff(&got, &want);
+        assert!(d <= 1e-6, "zero-centered norm diff {d}");
+        assert_eq!(norm.weight().dims(), &[8]);
+
+        // Planted convention swap: plain-w on zero-centered weights (w ~ 0.1,
+        // so the scale is ~10x off) must be unmistakably wrong.
+        let plain = RmsNorm::new(w, 1e-6);
+        let wrong = plain.forward(&x).unwrap();
+        let d_wrong = max_abs_diff(&wrong, &want);
+        assert!(d_wrong > 1e-2, "convention swap must be visible: {d_wrong}");
+    }
+
+    /// The gated norm matches transformers `Qwen3_5RMSNormGated` exactly
+    /// (plain `w`, norm-before-gate, silu on the F32 gate), and the reverse
+    /// convention swap (treating its plain weights as zero-centered) is
+    /// caught.
+    #[test]
+    fn rms_norm_gated_matches_oracle_and_convention_matters() {
+        let g = gdn_golden();
+        let c = &g["cases"]["rmsnorm_gated"];
+        let x = fixture_tensor(c, "x", &[4, 8]);
+        let gate = fixture_tensor(c, "gate", &[4, 8]);
+        let w = fixture_tensor(c, "weight", &[8]);
+        let want = fixture_tensor(c, "out", &[4, 8]);
+
+        let norm = RmsNormGated::new(w.clone(), 1e-6);
+        let got = norm.forward(&x, &gate).unwrap();
+        let d = max_abs_diff(&got, &want);
+        assert!(d <= 1e-6, "gated norm diff {d}");
+        assert_eq!(norm.weight().dims(), &[8]);
+
+        // Planted convention swap: (1 + w) on plain weights (w ~ 1.0 here, so
+        // the scale is ~2x off).
+        let zc = RmsNormZeroCentered::new(w, 1e-6);
+        let wrong = zc.forward(&x).unwrap().mul(&gate.silu().unwrap()).unwrap();
+        let d_wrong = max_abs_diff(&wrong, &want);
+        assert!(d_wrong > 1e-2, "convention swap must be visible: {d_wrong}");
+    }
+
+    /// Both new norms are tape-bearing: gradients cross them to an upstream
+    /// `LoRA` adapter (the same guarantee `RmsNorm` pins for the fused-kernel
+    /// landmine).
+    #[test]
+    fn new_norms_carry_gradients_upstream() {
+        let dev = Device::Cpu;
+        let w = Tensor::from_vec(ramp(12), (4, 3), &dev).unwrap();
+        let x = Tensor::from_vec(vec![0.5f32, -0.3, 0.2], (1, 3), &dev).unwrap();
+        let weight = Tensor::from_vec(vec![0.1f32, -0.2, 0.3, 0.0], 4, &dev).unwrap();
+        let gate = Tensor::from_vec(vec![0.4f32, -0.1, 0.7, 0.2], (1, 4), &dev).unwrap();
+
+        for gated in [false, true] {
+            let lora = LoraLinear::new(w.clone(), None, 2, 8.0).unwrap();
+            let y = lora.forward(&x).unwrap();
+            let n = if gated {
+                RmsNormGated::new(weight.clone(), 1e-6)
+                    .forward(&y, &gate)
+                    .unwrap()
+            } else {
+                RmsNormZeroCentered::new(weight.clone(), 1e-6)
+                    .forward(&y)
+                    .unwrap()
+            };
+            let loss = n.sqr().unwrap().sum_all().unwrap();
+            let grads = loss.backward().unwrap();
+            let cov = grad_coverage(&lora.trainable_vars(), &grads).unwrap();
+            assert!(cov.is_covered(), "gated={gated}: {cov:?}");
+            assert!(cov.is_live(), "gated={gated}: {cov:?}");
+        }
     }
 }
