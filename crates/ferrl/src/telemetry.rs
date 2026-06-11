@@ -30,6 +30,18 @@ pub enum TelemetryError {
     /// A [`Metrics`] record could not be serialized to JSON.
     #[error("failed to serialize metrics: {0}")]
     Serialize(#[from] serde_json::Error),
+    /// [`RunDir::create`] was given a `run_id` whose directory already holds a
+    /// metrics stream — appending a fresh run to a prior run's `metrics.jsonl`
+    /// would silently interleave two runs. Use a new `run_id`, or
+    /// [`RunDir::open`] to deliberately continue the existing run (resume).
+    #[error(
+        "run directory already contains a metrics stream at {path} \
+         (duplicate run_id? use RunDir::open to resume)"
+    )]
+    DuplicateRun {
+        /// The pre-existing `metrics.jsonl`.
+        path: PathBuf,
+    },
 }
 
 impl TelemetryError {
@@ -83,18 +95,58 @@ impl RunDir {
     /// Standard subdirectory for model checkpoints.
     pub const CHECKPOINTS_DIR: &'static str = "checkpoints";
 
-    /// Create `runs_root/<run_id>/` (and its `checkpoints/` subdir).
+    /// Create `runs_root/<run_id>/` (and its `checkpoints/` subdir) for a
+    /// **fresh** run.
+    ///
+    /// Fails loud if the directory already holds a `metrics.jsonl`: the metrics
+    /// writer appends, so a duplicate `run_id` would silently interleave a new
+    /// run's stream into a prior run's file (the `RUNDIR-APPEND` hazard). To
+    /// deliberately continue an existing run — the checkpoint-resume path — use
+    /// [`open`](Self::open) instead.
     ///
     /// # Errors
     ///
-    /// Returns [`TelemetryError::Io`] if any directory cannot be created.
+    /// Returns [`TelemetryError::DuplicateRun`] if `runs_root/<run_id>/metrics.jsonl`
+    /// already exists, or [`TelemetryError::Io`] if any directory cannot be created.
     pub fn create(
         runs_root: impl AsRef<Path>,
         run_id: impl Into<String>,
     ) -> Result<Self, TelemetryError> {
         let run_id = run_id.into();
         let root = runs_root.as_ref().join(&run_id);
+        let metrics = root.join(Self::METRICS_FILE);
+        if metrics.exists() {
+            return Err(TelemetryError::DuplicateRun { path: metrics });
+        }
         fs::create_dir_all(&root).map_err(|e| TelemetryError::io(&root, e))?;
+        let ckpt = root.join(Self::CHECKPOINTS_DIR);
+        fs::create_dir_all(&ckpt).map_err(|e| TelemetryError::io(&ckpt, e))?;
+        Ok(Self { run_id, root })
+    }
+
+    /// Open the **existing** `runs_root/<run_id>/` to continue it — the
+    /// checkpoint-resume path, where appending to the prior `metrics.jsonl`
+    /// stream is exactly the intent. Creates any missing subdirectory (a
+    /// partially-materialized run dir is tolerated) but requires the run root
+    /// itself to exist, so a typo'd `run_id` fails loud instead of silently
+    /// starting an empty "resume".
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TelemetryError::Io`] if the run root does not exist or a
+    /// subdirectory cannot be created.
+    pub fn open(
+        runs_root: impl AsRef<Path>,
+        run_id: impl Into<String>,
+    ) -> Result<Self, TelemetryError> {
+        let run_id = run_id.into();
+        let root = runs_root.as_ref().join(&run_id);
+        if !root.is_dir() {
+            return Err(TelemetryError::io(
+                &root,
+                io::Error::new(io::ErrorKind::NotFound, "run directory does not exist"),
+            ));
+        }
         let ckpt = root.join(Self::CHECKPOINTS_DIR);
         fs::create_dir_all(&ckpt).map_err(|e| TelemetryError::io(&ckpt, e))?;
         Ok(Self { run_id, root })
@@ -191,6 +243,15 @@ pub struct Metrics {
     pub kl: f32,
     /// Fraction of tokens whose surrogate hit the PPO clip band.
     pub clip_ratio: f32,
+    /// Fraction of the window's completions masked out by **truncation
+    /// masking** (DAPO overlong filtering: ran to the full completion width
+    /// without sampling EOS while `truncation_masking` is on). `0` when the
+    /// knob is off or no EOS token is configured.
+    ///
+    /// `#[serde(default)]` so `metrics.jsonl` records written before this field
+    /// existed still deserialize (defaulting to `0.0`).
+    #[serde(default)]
+    pub frac_truncated: f32,
     /// Mean completion length in tokens.
     pub completion_len: f32,
     /// Number of all-pad completion rows (no valid tokens) that contributed `0`
@@ -220,6 +281,7 @@ impl Metrics {
             frac_reward_zero_std: 0.0,
             kl: 0.0,
             clip_ratio: 0.0,
+            frac_truncated: 0.0,
             completion_len: 0.0,
             dropped_rows: 0,
             grad_norm: 0.0,
@@ -256,6 +318,7 @@ impl Metrics {
             &mut m.frac_reward_zero_std,
             &mut m.kl,
             &mut m.clip_ratio,
+            &mut m.frac_truncated,
             &mut m.completion_len,
             &mut m.grad_norm,
             &mut m.lr,
@@ -365,6 +428,48 @@ mod tests {
     }
 
     #[test]
+    fn rundir_create_rejects_a_duplicate_run_id() {
+        // A second create() at the same run_id would append a fresh run into the
+        // prior run's metrics.jsonl — the guard turns that into a loud error.
+        let tmp = TempDir::new("dup");
+        let rd = RunDir::create(tmp.path(), "run-001").unwrap();
+        let mut w = rd.metrics_writer().unwrap();
+        w.append(&Metrics::at_step(0)).unwrap();
+        drop(w);
+        let err = RunDir::create(tmp.path(), "run-001").unwrap_err();
+        assert!(
+            matches!(err, TelemetryError::DuplicateRun { .. }),
+            "got {err:?}"
+        );
+        // A run dir with no metrics stream yet (created, never trained) is fine
+        // to re-create — only an existing stream is guarded.
+        RunDir::create(tmp.path(), "run-002").unwrap();
+        RunDir::create(tmp.path(), "run-002").unwrap();
+    }
+
+    #[test]
+    fn rundir_open_continues_an_existing_run_and_rejects_a_missing_one() {
+        let tmp = TempDir::new("open");
+        let rd = RunDir::create(tmp.path(), "run-001").unwrap();
+        let mut w = rd.metrics_writer().unwrap();
+        w.append(&Metrics::at_step(0)).unwrap();
+        drop(w);
+
+        // open() reopens the same layout; its writer appends to the stream.
+        let reopened = RunDir::open(tmp.path(), "run-001").unwrap();
+        assert_eq!(reopened.root(), rd.root());
+        let mut w = reopened.metrics_writer().unwrap();
+        w.append(&Metrics::at_step(1)).unwrap();
+        drop(w);
+        let raw = std::fs::read_to_string(reopened.metrics_path()).unwrap();
+        assert_eq!(raw.lines().count(), 2, "open() must continue the stream");
+
+        // A typo'd run_id fails loud rather than starting an empty "resume".
+        let err = RunDir::open(tmp.path(), "run-nope").unwrap_err();
+        assert!(matches!(err, TelemetryError::Io { .. }), "got {err:?}");
+    }
+
+    #[test]
     fn write_config_roundtrips() {
         #[derive(Serialize, Deserialize, PartialEq, Debug)]
         struct Cfg {
@@ -435,6 +540,7 @@ mod tests {
             frac_reward_zero_std: 0.125,
             kl: 0.02,
             clip_ratio: 0.1,
+            frac_truncated: 0.0625,
             completion_len: 42.0,
             dropped_rows: 3,
             grad_norm: 1.23,
@@ -467,6 +573,7 @@ mod tests {
         m.grad_norm = f32::INFINITY;
         m.reward_mean = f32::NEG_INFINITY;
         m.kl = f32::NAN;
+        m.frac_truncated = f32::NAN;
         w.append(&m).unwrap();
         drop(w);
 
@@ -475,6 +582,7 @@ mod tests {
         assert_eq!(back.grad_norm, f32::MAX);
         assert_eq!(back.reward_mean, f32::MIN);
         assert_eq!(back.kl, 0.0);
+        assert_eq!(back.frac_truncated, 0.0);
     }
 
     #[test]

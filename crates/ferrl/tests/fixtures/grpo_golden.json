@@ -66,32 +66,58 @@
     {
       "ratio": 1.0,
       "advantage": 0.5,
-      "clip_eps": 0.2,
+      "eps_low": 0.2,
+      "eps_high": 0.2,
       "value": 0.5
     },
     {
       "ratio": 1.5,
       "advantage": 0.5,
-      "clip_eps": 0.2,
+      "eps_low": 0.2,
+      "eps_high": 0.2,
       "value": 0.6
     },
     {
       "ratio": 1.5,
       "advantage": -0.5,
-      "clip_eps": 0.2,
+      "eps_low": 0.2,
+      "eps_high": 0.2,
       "value": -0.75
     },
     {
       "ratio": 0.5,
       "advantage": -0.5,
-      "clip_eps": 0.2,
+      "eps_low": 0.2,
+      "eps_high": 0.2,
       "value": -0.4
     },
     {
       "ratio": 0.8,
       "advantage": 0.5,
-      "clip_eps": 0.2,
+      "eps_low": 0.2,
+      "eps_high": 0.2,
       "value": 0.4
+    },
+    {
+      "ratio": 1.25,
+      "advantage": 0.5,
+      "eps_low": 0.2,
+      "eps_high": 0.28,
+      "value": 0.625
+    },
+    {
+      "ratio": 1.5,
+      "advantage": 0.5,
+      "eps_low": 0.2,
+      "eps_high": 0.28,
+      "value": 0.64
+    },
+    {
+      "ratio": 0.5,
+      "advantage": -0.5,
+      "eps_low": 0.2,
+      "eps_high": 0.28,
+      "value": -0.4
     }
   ],
   "masked_mean": {
@@ -123,6 +149,72 @@
     "num_seq": 2,
     "max_len": 3,
     "grpo": 3.25,
-    "dr_grpo": 2.5
-  }
+    "dr_grpo": 2.5,
+    "dapo": 3.0
+  },
+  "sequence_log_ratio": [
+    {
+      "logp": [
+        -1.0,
+        -2.0,
+        -0.4
+      ],
+      "logp_old": [
+        -1.2,
+        -1.6,
+        -1.0
+      ],
+      "mask": [
+        1.0,
+        1.0,
+        0.0
+      ],
+      "value": -0.09999999999999998
+    },
+    {
+      "logp": [
+        -0.5,
+        -0.25
+      ],
+      "logp_old": [
+        -0.5,
+        -0.25
+      ],
+      "mask": [
+        1.0,
+        1.0
+      ],
+      "value": 0.0
+    },
+    {
+      "logp": [
+        -3.0,
+        -1.0
+      ],
+      "logp_old": [
+        -1.0,
+        -2.0
+      ],
+      "mask": [
+        1.0,
+        1.0
+      ],
+      "value": -0.5
+    },
+    {
+      "logp": [
+        5.0,
+        -3.0
+      ],
+      "logp_old": [
+        0.0,
+        0.0
+      ],
+      "mask": [
+        0.0,
+        0.0
+      ],
+      "value": 0.0
+    }
+  ]
 }

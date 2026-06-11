@@ -16,9 +16,12 @@ Formulas mirror TRL's ``GRPOTrainer`` / the DeepSeekMath paper:
 * group-normalized advantages  A_i = (r_i - mean_g) / (std_g + eps), eps = 1e-4
   (scale="group", default); A_i = r_i - mean_g (scale="none", Dr.GRPO-recommended)
 * k3 (Schulman) KL estimator   k3 = exp(d) - d - 1  where d = logp_ref - logp
-* per-token clipped surrogate  min(ratio * A, clip(ratio, 1-e, 1+e) * A)
+* per-token clipped surrogate  min(ratio * A, clip(ratio, 1-e_low, 1+e_high) * A)
+  (asymmetric bands per DAPO clip-higher; symmetric when e_low == e_high)
 * masked mean reductions        "grpo"   -> mean over max(valid tokens, 1) per-seq
                                 "dr_grpo"-> sum / (num_seq * max_len)  (Dr.GRPO)
+                                "dapo"   -> sum / max(total active tokens, 1)
+* sequence log-ratio (GSPO)     (sum_t m_t * (logp_t - old_t)) / max(sum_t m_t, 1)
 
 Output is committed at ``crates/ferrl/tests/fixtures/grpo_golden.json`` and loaded
 verbatim by ``grpo::tests::matches_golden_fixture``. **Requires NumPy** to
@@ -54,10 +57,17 @@ def k3_kl(logp: float, logp_ref: float) -> float:
     return math.exp(d) - d - 1.0
 
 
-def clipped_surrogate(ratio: float, adv: float, clip_eps: float) -> float:
+def clipped_surrogate(ratio: float, adv: float, eps_low: float, eps_high: float) -> float:
     unclipped = ratio * adv
-    clipped = max(1.0 - clip_eps, min(1.0 + clip_eps, ratio)) * adv
+    clipped = max(1.0 - eps_low, min(1.0 + eps_high, ratio)) * adv
     return min(unclipped, clipped)
+
+
+def sequence_log_ratio(logp: list[float], logp_old: list[float], mask: list[float]) -> float:
+    """GSPO per-sequence log-ratio: masked mean of per-token log-ratios."""
+    denom = max(sum(mask), 1.0)
+    num = sum((lp - lo) * m for lp, lo, m in zip(logp, logp_old, mask) if m > 0.0)
+    return num / denom
 
 
 def group_entry(rewards: list[float]) -> dict:
@@ -81,14 +91,26 @@ def main() -> None:
         (0.0, -0.25),
     ]
 
-    # ratio / advantage / clip scenario for the surrogate.
-    clip_eps = 0.2
+    # ratio / advantage / clip-band scenarios for the surrogate. The symmetric
+    # 0.2/0.2 rows are the classic PPO cases; the 0.2/0.28 rows pin DAPO
+    # clip-higher (only the upper band widens).
     surrogate_cases = [
-        (1.0, 0.5),    # ratio == 1, no clip
-        (1.5, 0.5),    # ratio above 1+eps, positive adv -> clipped
-        (1.5, -0.5),   # ratio above 1+eps, negative adv -> unclipped is smaller
-        (0.5, -0.5),   # ratio below 1-eps, negative adv -> clipped
-        (0.8, 0.5),    # ratio below 1-eps, positive adv -> unclipped is smaller
+        (1.0, 0.5, 0.2, 0.2),    # ratio == 1, no clip
+        (1.5, 0.5, 0.2, 0.2),    # ratio above 1+eps, positive adv -> clipped
+        (1.5, -0.5, 0.2, 0.2),   # ratio above 1+eps, negative adv -> unclipped is smaller
+        (0.5, -0.5, 0.2, 0.2),   # ratio below 1-eps, negative adv -> clipped
+        (0.8, 0.5, 0.2, 0.2),    # ratio below 1-eps, positive adv -> unclipped is smaller
+        (1.25, 0.5, 0.2, 0.28),  # inside the widened upper band -> unclipped
+        (1.5, 0.5, 0.2, 0.28),   # above the widened upper band -> clipped at 1.28
+        (0.5, -0.5, 0.2, 0.28),  # lower band untouched by eps_high -> clipped at 0.8
+    ]
+
+    # GSPO sequence-level log-ratio cases (logp, logp_old, mask).
+    seq_log_ratio_cases = [
+        ([-1.0, -2.0, -0.4], [-1.2, -1.6, -1.0], [1.0, 1.0, 0.0]),
+        ([-0.5, -0.25], [-0.5, -0.25], [1.0, 1.0]),      # identical -> 0
+        ([-3.0, -1.0], [-1.0, -2.0], [1.0, 1.0]),        # mixed signs
+        ([5.0, -3.0], [0.0, 0.0], [0.0, 0.0]),           # all-pad -> 0 (clamp)
     ]
 
     # masked-mean scenario: 2 sequences, padded to max_len = 3.
@@ -116,6 +138,9 @@ def main() -> None:
     total = sum(v * m for row, mrow in zip(per_token, mask) for v, m in zip(row, mrow))
     masked_mean_dr_grpo = total / (num_seq * max_len)
 
+    # dapo: sum of all valid contributions / max(total active tokens, 1).
+    masked_mean_dapo = total / max(valid, 1.0)
+
     fixture = {
         "_comment": "Golden GRPO math oracle (NumPy ddof=1). Regenerate via scripts/gen_golden.py.",
         "eps_std": EPS_STD,
@@ -128,10 +153,11 @@ def main() -> None:
             {
                 "ratio": r,
                 "advantage": a,
-                "clip_eps": clip_eps,
-                "value": clipped_surrogate(r, a, clip_eps),
+                "eps_low": el,
+                "eps_high": eh,
+                "value": clipped_surrogate(r, a, el, eh),
             }
-            for (r, a) in surrogate_cases
+            for (r, a, el, eh) in surrogate_cases
         ],
         "masked_mean": {
             "per_token": per_token,
@@ -141,7 +167,17 @@ def main() -> None:
             "max_len": max_len,
             "grpo": masked_mean_grpo,
             "dr_grpo": masked_mean_dr_grpo,
+            "dapo": masked_mean_dapo,
         },
+        "sequence_log_ratio": [
+            {
+                "logp": lp,
+                "logp_old": lo,
+                "mask": m,
+                "value": sequence_log_ratio(lp, lo, m),
+            }
+            for (lp, lo, m) in seq_log_ratio_cases
+        ],
     }
 
     json.dump(fixture, sys.stdout, indent=2)

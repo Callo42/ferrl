@@ -129,4 +129,16 @@ pub trait GradModel {
     ///
     /// Returns a candle error if the merged-weight snapshot cannot be built.
     fn merged_decoder(&self) -> CandleResult<Self::Decoder>;
+
+    /// The model's `LoRA` recipe as a stable canonical string (e.g.
+    /// `attn:qkvo|mlp:gud|gdn:-`), recorded into checkpoint manifests so an
+    /// adapter is self-describing about which projections its positional
+    /// tensor list covers (see
+    /// [`crate::checkpoint::CheckpointManifest::lora_recipe`]). Defaults to
+    /// `None` (a model that predates recipes, or has none to report) —
+    /// informational only, never load-bearing for the positional checkpoint
+    /// contract.
+    fn lora_recipe(&self) -> Option<String> {
+        None
+    }
 }

@@ -542,6 +542,12 @@ impl GradModel for LlamaGradModel {
     fn merged_decoder(&self) -> CandleResult<LlamaMergedDecoder> {
         LlamaGradModel::merged_decoder(self)
     }
+
+    fn lora_recipe(&self) -> Option<String> {
+        // Legacy q/v-only recipe, hard-wired (LoraTargets retrofit tracked as
+        // R1 follow-up); recorded honestly in checkpoint manifests.
+        Some("attn:qv|mlp:-".to_string())
+    }
 }
 
 /// One dense-Llama attention block over **merged** weights with an incremental

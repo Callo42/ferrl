@@ -459,6 +459,13 @@ impl GradModel for QwenGradModel {
     fn merged_decoder(&self) -> CandleResult<MergedDecoder> {
         QwenGradModel::merged_decoder(self)
     }
+
+    fn lora_recipe(&self) -> Option<String> {
+        // This model hard-wires the legacy q/v-only recipe (the configurable
+        // `LoraTargets` retrofit is tracked R1 follow-up work); the manifest
+        // string records that fact honestly.
+        Some("attn:qv|mlp:-".to_string())
+    }
 }
 
 /// `y = x Wᵀ (+ bias)` for a merged projection weight `w` (`[out, in]`) and an

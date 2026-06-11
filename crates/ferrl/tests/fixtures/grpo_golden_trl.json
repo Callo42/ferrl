@@ -1,0 +1,392 @@
+{
+  "_comment": "REAL-TRL GRPO loss golden: produced by TRL's GRPOTrainer._compute_loss over the shared crafted batch below. Regenerate via scripts/oracle/gen_grpo_golden_trl.py in the pinned ferrl-oracle env.",
+  "trl_version": "1.5.1",
+  "torch_version": "2.12.0+cpu",
+  "transformers_version": "5.11.0",
+  "batch": {
+    "logp": [
+      [
+        -1.0,
+        -2.0,
+        -0.4
+      ],
+      [
+        -0.5,
+        -0.25,
+        -9.0
+      ],
+      [
+        -1.5,
+        -7.0,
+        -8.0
+      ],
+      [
+        -2.0,
+        -2.0,
+        -2.0
+      ]
+    ],
+    "logp_old": [
+      [
+        -1.3,
+        -2.05,
+        -0.10000000000000003
+      ],
+      [
+        -0.2,
+        -0.3,
+        -9.0
+      ],
+      [
+        -1.8,
+        -7.0,
+        -8.0
+      ],
+      [
+        -2.05,
+        -2.05,
+        -2.05
+      ]
+    ],
+    "logp_ref": [
+      [
+        -0.9,
+        -1.9,
+        -0.30000000000000004
+      ],
+      [
+        -0.4,
+        -0.15,
+        -8.9
+      ],
+      [
+        -1.4,
+        -6.9,
+        -7.9
+      ],
+      [
+        -1.9,
+        -1.9,
+        -1.9
+      ]
+    ],
+    "advantages": [
+      0.8,
+      -0.7,
+      0.5,
+      -0.4
+    ],
+    "mask": [
+      [
+        1.0,
+        1.0,
+        1.0
+      ],
+      [
+        1.0,
+        1.0,
+        0.0
+      ],
+      [
+        1.0,
+        0.0,
+        0.0
+      ],
+      [
+        0.0,
+        0.0,
+        0.0
+      ]
+    ]
+  },
+  "cases": [
+    {
+      "loss_type": "grpo",
+      "beta": 0.0,
+      "eps_low": 0.2,
+      "eps_high": 0.2,
+      "importance_sampling_level": "token",
+      "dapo_norm": 6.0,
+      "loss": -0.1874864002042807
+    },
+    {
+      "loss_type": "grpo",
+      "beta": 0.0,
+      "eps_low": 0.2,
+      "eps_high": 0.28,
+      "importance_sampling_level": "token",
+      "dapo_norm": 6.0,
+      "loss": -0.20281973353761407
+    },
+    {
+      "loss_type": "grpo",
+      "beta": 0.0,
+      "eps_low": 0.2,
+      "eps_high": 0.2,
+      "importance_sampling_level": "sequence",
+      "dapo_norm": 6.0,
+      "loss": -0.19892430812494805
+    },
+    {
+      "loss_type": "grpo",
+      "beta": 0.0,
+      "eps_low": 0.2,
+      "eps_high": 0.28,
+      "importance_sampling_level": "sequence",
+      "dapo_norm": 6.0,
+      "loss": -0.20892430812494805
+    },
+    {
+      "loss_type": "grpo",
+      "beta": 0.04,
+      "eps_low": 0.2,
+      "eps_high": 0.2,
+      "importance_sampling_level": "token",
+      "dapo_norm": 6.0,
+      "loss": -0.18733127266201124
+    },
+    {
+      "loss_type": "grpo",
+      "beta": 0.04,
+      "eps_low": 0.2,
+      "eps_high": 0.28,
+      "importance_sampling_level": "token",
+      "dapo_norm": 6.0,
+      "loss": -0.20266460599534458
+    },
+    {
+      "loss_type": "grpo",
+      "beta": 0.04,
+      "eps_low": 0.2,
+      "eps_high": 0.2,
+      "importance_sampling_level": "sequence",
+      "dapo_norm": 6.0,
+      "loss": -0.19876918058267856
+    },
+    {
+      "loss_type": "grpo",
+      "beta": 0.04,
+      "eps_low": 0.2,
+      "eps_high": 0.28,
+      "importance_sampling_level": "sequence",
+      "dapo_norm": 6.0,
+      "loss": -0.20876918058267857
+    },
+    {
+      "loss_type": "dr_grpo",
+      "beta": 0.0,
+      "eps_low": 0.2,
+      "eps_high": 0.2,
+      "importance_sampling_level": "token",
+      "dapo_norm": 6.0,
+      "loss": -0.14148180718191472
+    },
+    {
+      "loss_type": "dr_grpo",
+      "beta": 0.0,
+      "eps_low": 0.2,
+      "eps_high": 0.28,
+      "importance_sampling_level": "token",
+      "dapo_norm": 6.0,
+      "loss": -0.1501484738485814
+    },
+    {
+      "loss_type": "dr_grpo",
+      "beta": 0.0,
+      "eps_low": 0.2,
+      "eps_high": 0.2,
+      "importance_sampling_level": "sequence",
+      "dapo_norm": 6.0,
+      "loss": -0.1504032941090494
+    },
+    {
+      "loss_type": "dr_grpo",
+      "beta": 0.0,
+      "eps_low": 0.2,
+      "eps_high": 0.28,
+      "importance_sampling_level": "sequence",
+      "dapo_norm": 6.0,
+      "loss": -0.15373662744238273
+    },
+    {
+      "loss_type": "dr_grpo",
+      "beta": 0.04,
+      "eps_low": 0.2,
+      "eps_high": 0.2,
+      "importance_sampling_level": "token",
+      "dapo_norm": 6.0,
+      "loss": -0.14137838882040174
+    },
+    {
+      "loss_type": "dr_grpo",
+      "beta": 0.04,
+      "eps_low": 0.2,
+      "eps_high": 0.28,
+      "importance_sampling_level": "token",
+      "dapo_norm": 6.0,
+      "loss": -0.1500450554870684
+    },
+    {
+      "loss_type": "dr_grpo",
+      "beta": 0.04,
+      "eps_low": 0.2,
+      "eps_high": 0.2,
+      "importance_sampling_level": "sequence",
+      "dapo_norm": 6.0,
+      "loss": -0.15029987574753645
+    },
+    {
+      "loss_type": "dr_grpo",
+      "beta": 0.04,
+      "eps_low": 0.2,
+      "eps_high": 0.28,
+      "importance_sampling_level": "sequence",
+      "dapo_norm": 6.0,
+      "loss": -0.15363320908086978
+    },
+    {
+      "loss_type": "dapo",
+      "beta": 0.0,
+      "eps_low": 0.2,
+      "eps_high": 0.2,
+      "importance_sampling_level": "token",
+      "dapo_norm": 6.0,
+      "loss": -0.28296361436382944
+    },
+    {
+      "loss_type": "dapo",
+      "beta": 0.0,
+      "eps_low": 0.2,
+      "eps_high": 0.2,
+      "importance_sampling_level": "token",
+      "dapo_norm": 20.0,
+      "loss": -0.08488908430914884
+    },
+    {
+      "loss_type": "dapo",
+      "beta": 0.0,
+      "eps_low": 0.2,
+      "eps_high": 0.28,
+      "importance_sampling_level": "token",
+      "dapo_norm": 6.0,
+      "loss": -0.3002969476971628
+    },
+    {
+      "loss_type": "dapo",
+      "beta": 0.0,
+      "eps_low": 0.2,
+      "eps_high": 0.28,
+      "importance_sampling_level": "token",
+      "dapo_norm": 20.0,
+      "loss": -0.09008908430914883
+    },
+    {
+      "loss_type": "dapo",
+      "beta": 0.0,
+      "eps_low": 0.2,
+      "eps_high": 0.2,
+      "importance_sampling_level": "sequence",
+      "dapo_norm": 6.0,
+      "loss": -0.3008065882180988
+    },
+    {
+      "loss_type": "dapo",
+      "beta": 0.0,
+      "eps_low": 0.2,
+      "eps_high": 0.2,
+      "importance_sampling_level": "sequence",
+      "dapo_norm": 20.0,
+      "loss": -0.09024197646542964
+    },
+    {
+      "loss_type": "dapo",
+      "beta": 0.0,
+      "eps_low": 0.2,
+      "eps_high": 0.28,
+      "importance_sampling_level": "sequence",
+      "dapo_norm": 6.0,
+      "loss": -0.30747325488476546
+    },
+    {
+      "loss_type": "dapo",
+      "beta": 0.0,
+      "eps_low": 0.2,
+      "eps_high": 0.28,
+      "importance_sampling_level": "sequence",
+      "dapo_norm": 20.0,
+      "loss": -0.09224197646542964
+    },
+    {
+      "loss_type": "dapo",
+      "beta": 0.04,
+      "eps_low": 0.2,
+      "eps_high": 0.2,
+      "importance_sampling_level": "token",
+      "dapo_norm": 6.0,
+      "loss": -0.2827567776408035
+    },
+    {
+      "loss_type": "dapo",
+      "beta": 0.04,
+      "eps_low": 0.2,
+      "eps_high": 0.2,
+      "importance_sampling_level": "token",
+      "dapo_norm": 20.0,
+      "loss": -0.08482703329224103
+    },
+    {
+      "loss_type": "dapo",
+      "beta": 0.04,
+      "eps_low": 0.2,
+      "eps_high": 0.28,
+      "importance_sampling_level": "token",
+      "dapo_norm": 6.0,
+      "loss": -0.3000901109741368
+    },
+    {
+      "loss_type": "dapo",
+      "beta": 0.04,
+      "eps_low": 0.2,
+      "eps_high": 0.28,
+      "importance_sampling_level": "token",
+      "dapo_norm": 20.0,
+      "loss": -0.09002703329224104
+    },
+    {
+      "loss_type": "dapo",
+      "beta": 0.04,
+      "eps_low": 0.2,
+      "eps_high": 0.2,
+      "importance_sampling_level": "sequence",
+      "dapo_norm": 6.0,
+      "loss": -0.3005997514950729
+    },
+    {
+      "loss_type": "dapo",
+      "beta": 0.04,
+      "eps_low": 0.2,
+      "eps_high": 0.2,
+      "importance_sampling_level": "sequence",
+      "dapo_norm": 20.0,
+      "loss": -0.09017992544852187
+    },
+    {
+      "loss_type": "dapo",
+      "beta": 0.04,
+      "eps_low": 0.2,
+      "eps_high": 0.28,
+      "importance_sampling_level": "sequence",
+      "dapo_norm": 6.0,
+      "loss": -0.30726641816173955
+    },
+    {
+      "loss_type": "dapo",
+      "beta": 0.04,
+      "eps_low": 0.2,
+      "eps_high": 0.28,
+      "importance_sampling_level": "sequence",
+      "dapo_norm": 20.0,
+      "loss": -0.09217992544852187
+    }
+  ]
+}

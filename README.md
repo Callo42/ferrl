@@ -151,9 +151,12 @@ The fixture schema (consumed verbatim by the Rust test):
                 "advantages_unscaled": [..] }],// A_i = r_i - mean (ScaleRewards::None)
   "k3_kl":  [ { "logp", "logp_ref", "kl" } ],          // exp(d) - d - 1
   "clipped_surrogate": [ { "ratio", "advantage",
-                           "clip_eps", "value" } ],     // min(rA, clip(r)·A)
+                           "eps_low", "eps_high",
+                           "value" } ],                 // min(rA, clip(r)·A), asym bands
   "masked_mean": { "per_token"[S][T], "mask"[S][T],
-                   "grpo", "dr_grpo" }                  // the two reductions
+                   "grpo", "dr_grpo", "dapo" },         // the three reductions
+  "sequence_log_ratio": [ { "logp"[T], "logp_old"[T],
+                            "mask"[T], "value" } ]      // GSPO per-sequence log-ratio
 }
 ```
 
@@ -162,10 +165,12 @@ Formulas (per token, with `std` the *sample* / ddof=1 standard deviation):
 ```
 advantage_i      = (r_i - mean(r)) / (std(r) + eps)          # eps = 1e-4
 ratio            = exp(logp - old_logp)
-clipped_surrogate= min( ratio * adv, clip(ratio, 1-e, 1+e) * adv )
+clipped_surrogate= min( ratio * adv, clip(ratio, 1-e_low, 1+e_high) * adv )
 k3_kl            = exp(d) - d - 1,   d = ref_logp - logp      # >= 0
 masked_mean(grpo)   = mean_seq( sum_t v·m / max(sum_t m, 1) )  # all-pad row -> 0 (TRL clamp)
 masked_mean(drgrpo) = sum_all(v·m) / (num_seq · max_len)       # Dr.GRPO; requires max_len >= 1
+masked_mean(dapo)   = sum_all(v·m) / max(sum_all(m), 1)        # DAPO active-token normalizer
+seq_log_ratio       = sum_t m·(logp-old) / max(sum_t m, 1)     # GSPO sequence-level ratio (log)
 ```
 
 ---
@@ -179,8 +184,8 @@ runs/<run_id>/
 ├── config.json       # the full resolved run config
 ├── metrics.jsonl     # one JSON object per step:
 │                     #   step, reward_mean, reward_std, frac_reward_zero_std,
-│                     #   kl, clip_ratio, completion_len, dropped_rows,
-│                     #   grad_norm, lr
+│                     #   kl, clip_ratio, frac_truncated, completion_len,
+│                     #   dropped_rows, grad_norm, lr
 ├── checkpoints/      # LoRA checkpoints
 └── run.log           # human-readable log
 ```

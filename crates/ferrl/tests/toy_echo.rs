@@ -71,6 +71,24 @@ impl EchoPolicy {
         let base = Tensor::zeros((vocab, vocab), DType::F32, &device)?;
         // alpha = rank so the update scale (alpha / rank) is 1.
         let lora = LoraLinear::new(base, None, rank, rank as f64)?;
+        // Make the adapter init DETERMINISTIC: LoraLinear's A factor comes from
+        // Var::randn, and candle's CPU backend draws that from the thread-local
+        // OS-entropy RNG (CPU set_seed is unsupported) — so every test process
+        // would otherwise train from a different initialization, and the
+        // calibrated trend-gate margins flake run-to-run. Overwrite A with a
+        // small seeded hash-fill at the same ~0.02 scale (B stays zero-init, so
+        // the adapter is still a no-op at start).
+        let a = &lora.trainable_vars()[0];
+        let (r, c) = a.as_tensor().dims2()?;
+        let fill: Vec<f32> = (0..r * c)
+            .map(|i| {
+                let z = (i as u64)
+                    .wrapping_mul(2_654_435_761)
+                    .wrapping_add(seed.wrapping_mul(40_503));
+                ((z % 1000) as f32 / 1000.0 - 0.5) * 0.04
+            })
+            .collect();
+        a.set(&Tensor::from_vec(fill, (r, c), &device)?)?;
         // A constant gamma > 1 lifts the post-norm logit scale so the softmax can
         // become peaky enough for the reward to approach 1.
         let gamma = Tensor::ones(vocab, DType::F32, &device)?.affine(gamma_scale, 0.0)?;
@@ -517,6 +535,11 @@ fn gate_reward_trends_up() {
         max_new_tokens: 1,
         temperature: TEMP,
         lr: 0.05,
+        // Trend-gate calibration pin: these margins were calibrated WITHOUT
+        // global-norm clipping (pre-R1); the R1 default Some(1.0) binds on this
+        // toy's early gradients and shifts the trajectory toward the margin.
+        // Clipping has its own dedicated unit + integration coverage.
+        max_grad_norm: None,
         ..TrainerConfig::default()
     };
     let tmp = TempDir::new("reward-up");
@@ -590,7 +613,390 @@ fn eos_padded_rollout_trains_with_length_aware_mask() {
             m.completion_len,
             m.step
         );
+        // Lengths 1 and 2 never reach the width-3 boundary, so the default-ON
+        // truncation masking has nothing to mask here.
+        assert_eq!(m.frac_truncated, 0.0, "no row is full-width");
+        assert_eq!(m.dropped_rows, 0);
     }
+}
+
+#[test]
+fn truncation_masking_masks_full_width_rows_end_to_end() {
+    // Rows alternate real lengths 3 (the FULL width) and 2. The EOS id is set
+    // outside the echo policy's vocab, so no full-width row can ever end in EOS:
+    // with truncation_masking ON (the default), exactly half of every group is
+    // deterministically truncated -> masked out of the loss, surfaced via
+    // frac_truncated AND dropped_rows, while the run still steps cleanly on the
+    // surviving length-2 rows (the canary tolerates the zeroed rows).
+    let inner = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 11, TEMP).unwrap();
+    let mut policy = EosPaddedEchoPolicy {
+        inner,
+        real_lens: vec![3, 2],
+        pad: 0,
+    };
+    let prompts = echo_prompts(VOCAB);
+    let cfg = TrainerConfig {
+        steps: 4,
+        group_size: 8,
+        max_new_tokens: 3,
+        temperature: TEMP,
+        eos_token_id: Some(VOCAB as u32), // unsampleable -> full-width == truncated
+        lr: 0.05,
+        ..TrainerConfig::default()
+    };
+    let tmp = TempDir::new("truncation-mask");
+    let run = RunDir::create(tmp.path(), "echo").unwrap();
+    let mut trainer = Trainer::new(cfg, &run).unwrap();
+    let history = trainer
+        .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
+        .unwrap();
+    assert_eq!(history.len(), 4);
+    for m in &history {
+        assert!(
+            (m.frac_truncated - 0.5).abs() < 1e-6,
+            "half the group is full-width without EOS: frac_truncated={} at step {}",
+            m.frac_truncated,
+            m.step
+        );
+        assert_eq!(m.dropped_rows, 4, "masked rows must surface as dropped");
+        assert!(m.reward_mean.is_finite() && m.grad_norm.is_finite());
+    }
+}
+
+#[test]
+fn truncation_masking_off_keeps_full_width_rows() {
+    // The same half-truncated scenario with the knob OFF: nothing is masked
+    // or dropped — the rows train on their raw verifier rewards as before.
+    let inner = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 11, TEMP).unwrap();
+    let mut policy = EosPaddedEchoPolicy {
+        inner,
+        real_lens: vec![3, 2],
+        pad: 0,
+    };
+    let prompts = echo_prompts(VOCAB);
+    let cfg_off = TrainerConfig {
+        steps: 4,
+        group_size: 8,
+        max_new_tokens: 3,
+        temperature: TEMP,
+        eos_token_id: Some(VOCAB as u32),
+        truncation_masking: false,
+        lr: 0.05,
+        ..TrainerConfig::default()
+    };
+    let tmp = TempDir::new("truncation-mask-off");
+    let run_off = RunDir::create(tmp.path(), "echo-off").unwrap();
+    let mut trainer_off = Trainer::new(cfg_off, &run_off).unwrap();
+    let history_off = trainer_off
+        .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
+        .unwrap();
+    for m in &history_off {
+        assert_eq!(m.frac_truncated, 0.0);
+        assert_eq!(m.dropped_rows, 0);
+    }
+}
+
+#[test]
+fn warmup_ramps_the_reported_lr_then_holds() {
+    // warmup_steps = 3 over lr 0.03: metrics must report 0.01, 0.02, 0.03, 0.03…
+    // (the effective lr the optimizer stepped with — `Metrics::lr` reads the live
+    // optimizer, so this pins the wiring, not just the schedule function).
+    let mut policy = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 5, TEMP).unwrap();
+    let prompts = echo_prompts(VOCAB);
+    let cfg = TrainerConfig {
+        steps: 5,
+        group_size: 8,
+        max_new_tokens: 1,
+        temperature: TEMP,
+        lr: 0.03,
+        warmup_steps: 3,
+        ..TrainerConfig::default()
+    };
+    let tmp = TempDir::new("warmup");
+    let run = RunDir::create(tmp.path(), "echo").unwrap();
+    let mut trainer = Trainer::new(cfg, &run).unwrap();
+    let history = trainer
+        .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
+        .unwrap();
+    let want = [0.01f32, 0.02, 0.03, 0.03, 0.03];
+    for (m, w) in history.iter().zip(want) {
+        assert!(
+            (m.lr - w).abs() < 1e-7,
+            "step {}: lr {} != {}",
+            m.step,
+            m.lr,
+            w
+        );
+    }
+}
+
+/// A reward that scores every completion identically — every group is
+/// degenerate (`frac_reward_zero_std == 1`), the pure-KL regime.
+struct ConstReward;
+
+impl RewardFn for ConstReward {
+    fn reward(&self, _prompt: &str, _completion: &str) -> f32 {
+        1.0
+    }
+}
+
+/// Flat per-step snapshot of a policy's trainable vars.
+fn weights_of(policy: &EchoPolicy) -> Vec<f32> {
+    policy
+        .trainable_vars()
+        .iter()
+        .flat_map(|v| {
+            v.as_tensor()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        })
+        .collect()
+}
+
+/// Force the adapter non-no-op (B starts zero, making adapter == reference and
+/// the k3 KL gradient identically zero at d == 0): set B to small VARIED
+/// values — a constant B would make every row of `B·A` identical, so the
+/// logits stay uniform across the vocab and still equal the reference.
+fn arm_adapter(policy: &EchoPolicy) {
+    let b = &policy.trainable_vars()[1];
+    let (r, c) = b.as_tensor().dims2().unwrap();
+    let fill: Vec<f32> = (0..r * c)
+        .map(|i| ((i * 37 % 11) as f32 / 11.0 - 0.5) * 0.2)
+        .collect();
+    b.set(&Tensor::from_vec(fill, (r, c), &Device::Cpu).unwrap())
+        .unwrap();
+}
+
+#[test]
+fn degenerate_groups_still_feel_the_kl_pull_when_beta_positive() {
+    // TRL keeps every completion in the batch: a zero-advantage (degenerate)
+    // group contributes no surrogate but its KL term still pulls toward the
+    // reference. With a constant reward EVERY group is degenerate, so under
+    // beta > 0 the run must still take real optimizer steps...
+    let mut policy = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 23, TEMP).unwrap();
+    arm_adapter(&policy);
+    let before = weights_of(&policy);
+    let prompts = echo_prompts(VOCAB);
+    let cfg = TrainerConfig {
+        steps: 3,
+        group_size: 8,
+        max_new_tokens: 2,
+        temperature: TEMP,
+        beta: 0.05,
+        lr: 0.05,
+        ..TrainerConfig::default()
+    };
+    let tmp = TempDir::new("degenerate-kl");
+    let run = RunDir::create(tmp.path(), "echo").unwrap();
+    let mut trainer = Trainer::new(cfg, &run).unwrap();
+    let history = trainer
+        .train(&mut policy, &ConstReward, &CharTokenizer, &prompts)
+        .unwrap();
+    for m in &history {
+        assert!(
+            (m.frac_reward_zero_std - 1.0).abs() < 1e-6,
+            "premise: every group must be degenerate"
+        );
+    }
+    assert!(
+        history.iter().any(|m| m.grad_norm > 0.0),
+        "beta > 0: degenerate groups must still carry the KL gradient"
+    );
+    assert_ne!(weights_of(&policy), before, "weights must move under KL");
+
+    // ...and with beta == 0 the same setup is a pure no-op (the legacy skip).
+    let mut policy0 = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 23, TEMP).unwrap();
+    arm_adapter(&policy0);
+    let before0 = weights_of(&policy0);
+    let cfg0 = TrainerConfig {
+        steps: 3,
+        group_size: 8,
+        max_new_tokens: 2,
+        temperature: TEMP,
+        beta: 0.0,
+        lr: 0.05,
+        ..TrainerConfig::default()
+    };
+    let run0 = RunDir::create(tmp.path(), "echo-beta0").unwrap();
+    let mut trainer0 = Trainer::new(cfg0, &run0).unwrap();
+    let history0 = trainer0
+        .train(&mut policy0, &ConstReward, &CharTokenizer, &prompts)
+        .unwrap();
+    assert!(history0.iter().all(|m| m.grad_norm == 0.0));
+    assert_eq!(weights_of(&policy0), before0, "beta == 0 stays a no-op");
+}
+
+#[test]
+fn grad_clip_binds_and_reports_the_preclip_norm() {
+    // Same seed, clipping off vs a tiny max norm: step-0 reported grad_norm is
+    // the PRE-clip norm (identical across arms), while the trajectories — and
+    // so the final weights — must differ because the clipped arm stepped with
+    // rescaled gradients.
+    let run_with = |max: Option<f64>, tag: &str| {
+        let mut policy = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 31, TEMP).unwrap();
+        let prompts = echo_prompts(VOCAB);
+        let cfg = TrainerConfig {
+            steps: 1,
+            group_size: 16,
+            max_new_tokens: 1,
+            temperature: TEMP,
+            lr: 0.05,
+            max_grad_norm: max,
+            ..TrainerConfig::default()
+        };
+        let tmp = TempDir::new(tag);
+        let run = RunDir::create(tmp.path(), "echo").unwrap();
+        let mut trainer = Trainer::new(cfg, &run).unwrap();
+        let history = trainer
+            .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
+            .unwrap();
+        (history[0].grad_norm, weights_of(&policy))
+    };
+    let (norm_off, w_off) = run_with(None, "clip-off");
+    let (norm_on, w_on) = run_with(Some(1e-3), "clip-on");
+    assert!(
+        norm_off > 1e-3,
+        "premise: the unclipped norm must exceed the tiny max ({norm_off})"
+    );
+    assert!(
+        (norm_off - norm_on).abs() < 1e-6,
+        "grad_norm must report the PRE-clip norm: off={norm_off} on={norm_on}"
+    );
+    assert_ne!(
+        w_off, w_on,
+        "the clipped step must move the weights differently"
+    );
+}
+
+#[test]
+fn adam_betas_reach_the_optimizer() {
+    // Same seed, beta2 0.999 vs 0.5 over two real steps: the second-moment
+    // decay changes the second update, so the final weights must differ.
+    let run_with = |beta2: f64, tag: &str| {
+        let mut policy = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 37, TEMP).unwrap();
+        let prompts = echo_prompts(VOCAB);
+        let cfg = TrainerConfig {
+            steps: 2,
+            group_size: 16,
+            max_new_tokens: 1,
+            temperature: TEMP,
+            lr: 0.05,
+            adam_beta2: beta2,
+            ..TrainerConfig::default()
+        };
+        let tmp = TempDir::new(tag);
+        let run = RunDir::create(tmp.path(), "echo").unwrap();
+        let mut trainer = Trainer::new(cfg, &run).unwrap();
+        trainer
+            .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
+            .unwrap();
+        weights_of(&policy)
+    };
+    let w_default = run_with(0.999, "beta2-default");
+    let w_low = run_with(0.5, "beta2-low");
+    assert_ne!(w_default, w_low, "adam_beta2 must reach the optimizer");
+}
+
+#[test]
+fn truncation_masking_changes_the_training_signal() {
+    // Same seed, masking ON vs OFF over the half-truncated scenario: the
+    // masked rows carry gradient when OFF, so the final weights must differ —
+    // pinning that the truncation zeroing reaches the DIFFERENTIATED mask, not
+    // just the telemetry.
+    let run_with = |masking: bool, tag: &str| {
+        let inner = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 41, TEMP).unwrap();
+        let mut policy = EosPaddedEchoPolicy {
+            inner,
+            real_lens: vec![3, 2],
+            pad: 0,
+        };
+        let prompts = echo_prompts(VOCAB);
+        let cfg = TrainerConfig {
+            steps: 2,
+            group_size: 8,
+            max_new_tokens: 3,
+            temperature: TEMP,
+            eos_token_id: Some(VOCAB as u32),
+            truncation_masking: masking,
+            lr: 0.05,
+            ..TrainerConfig::default()
+        };
+        let tmp = TempDir::new(tag);
+        let run = RunDir::create(tmp.path(), "echo").unwrap();
+        let mut trainer = Trainer::new(cfg, &run).unwrap();
+        trainer
+            .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
+            .unwrap();
+        weights_of(&policy.inner)
+    };
+    let w_on = run_with(true, "trunc-signal-on");
+    let w_off = run_with(false, "trunc-signal-off");
+    assert_ne!(w_on, w_off, "masking must change the differentiated loss");
+}
+
+/// Wraps [`EchoPolicy`] reporting a `LoRA` recipe, to pin the
+/// `Policy::lora_recipe -> checkpoint manifest` wiring end-to-end.
+struct RecipePolicy {
+    inner: EchoPolicy,
+}
+
+impl Policy for RecipePolicy {
+    fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
+        self.inner.generate(prompt, cfg)
+    }
+    fn token_logprobs(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+        self.inner.token_logprobs(rollout)
+    }
+    fn set_adapter_enabled(&mut self, enabled: bool) {
+        self.inner.set_adapter_enabled(enabled);
+    }
+    fn adapter_enabled(&self) -> bool {
+        self.inner.adapter_enabled()
+    }
+    fn trainable_vars(&self) -> Vec<Var> {
+        self.inner.trainable_vars()
+    }
+    fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+        self.inner.sampler_state()
+    }
+    fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
+        self.inner.restore_sampler_state(state)
+    }
+    fn lora_recipe(&self) -> Option<String> {
+        Some("attn:qv|mlp:-".to_string())
+    }
+}
+
+#[test]
+fn trainer_records_the_policy_recipe_in_the_checkpoint_manifest() {
+    let inner = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 43, TEMP).unwrap();
+    let mut policy = RecipePolicy { inner };
+    let prompts = echo_prompts(VOCAB);
+    let cfg = TrainerConfig {
+        steps: 1,
+        group_size: 8,
+        max_new_tokens: 1,
+        temperature: TEMP,
+        lr: 0.05,
+        checkpoint_every: Some(1),
+        ..TrainerConfig::default()
+    };
+    let tmp = TempDir::new("recipe-manifest");
+    let run = RunDir::create(tmp.path(), "echo").unwrap();
+    let mut trainer = Trainer::new(cfg, &run).unwrap();
+    trainer
+        .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
+        .unwrap();
+    let manifest_raw =
+        std::fs::read_to_string(run.checkpoints_dir().join("step-1/manifest.json")).unwrap();
+    let manifest: serde_json::Value = serde_json::from_str(&manifest_raw).unwrap();
+    assert_eq!(
+        manifest["lora_recipe"].as_str(),
+        Some("attn:qv|mlp:-"),
+        "the policy's recipe must land in the manifest"
+    );
 }
 
 #[test]
@@ -626,6 +1032,9 @@ fn gate_dr_grpo_paper_config_learns() {
         lr: 0.1,
         loss_type: LossType::DrGrpo,
         scale_rewards: ScaleRewards::None,
+        // Trend-gate calibration pin (see gate_reward_trends_up): margins were
+        // calibrated without global-norm clipping; keep this trajectory as-is.
+        max_grad_norm: None,
         ..TrainerConfig::default()
     };
     let tmp = TempDir::new("drgrpo-paper");
@@ -674,6 +1083,10 @@ fn gate_grad_accum_effective_batch_learns() {
         steps: 500,
         group_size: 4,
         grad_accum_steps: 8,
+        // Trend-gate calibration pin (see gate_reward_trends_up): margins were
+        // calibrated without global-norm clipping; keep this trajectory as-is.
+        max_grad_norm: None,
+
         max_new_tokens: 1,
         temperature: TEMP,
         lr: 0.05,
@@ -730,6 +1143,10 @@ fn gate_grad_accum_two_prompt_window() {
         steps: 500,
         group_size: 4,
         grad_accum_steps: 2,
+        // Trend-gate calibration pin (see gate_reward_trends_up): margins were
+        // calibrated without global-norm clipping; keep this trajectory as-is.
+        max_grad_norm: None,
+
         max_new_tokens: 1,
         temperature: TEMP,
         lr: 0.05,
@@ -809,6 +1226,10 @@ fn interrupted_run_resumes_bit_identically() {
         max_new_tokens: 1,
         temperature: TEMP,
         lr: 0.05,
+        // Interrupt INSIDE the warmup ramp: the resumed arm must re-enter the
+        // lr schedule at the same effective lr the uninterrupted arm used
+        // (lr_at is a pure function of the outer step), or bit-exactness breaks.
+        warmup_steps: INTERRUPT_AT + 2,
         checkpoint_every: Some(INTERRUPT_AT), // a v2 checkpoint lands at INTERRUPT_AT (and the final step)
         ..TrainerConfig::default()
     };

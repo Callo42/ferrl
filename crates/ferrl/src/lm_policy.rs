@@ -310,6 +310,10 @@ impl<M: GradModel> Policy for LmPolicy<M> {
         self.sampler = GrpoSampler::from_state_bytes(state)?;
         Ok(())
     }
+
+    fn lora_recipe(&self) -> Option<String> {
+        self.model.lora_recipe()
+    }
 }
 
 #[cfg(test)]
