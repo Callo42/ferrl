@@ -573,6 +573,7 @@ mod tests {
         m.grad_norm = f32::INFINITY;
         m.reward_mean = f32::NEG_INFINITY;
         m.kl = f32::NAN;
+        m.frac_truncated = f32::NAN;
         w.append(&m).unwrap();
         drop(w);
 
@@ -581,6 +582,7 @@ mod tests {
         assert_eq!(back.grad_norm, f32::MAX);
         assert_eq!(back.reward_mean, f32::MIN);
         assert_eq!(back.kl, 0.0);
+        assert_eq!(back.frac_truncated, 0.0);
     }
 
     #[test]

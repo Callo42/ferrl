@@ -30,11 +30,12 @@
 //!   batch's active-token count. The Dr.GRPO *paper* algorithm is
 //!   `LossType::DrGrpo` **plus** [`ScaleRewards::None`].
 //!
-//! Non-finite inputs are handled defensively (this is *stronger* than TRL's
-//! mainline path, which propagates `NaN` through `mean`/`std`): a `NaN`/`±∞`
-//! reward is dropped from its group's mean/std and given a `0` advantage — note
-//! `±∞ → 0`, unlike `torch.nan_to_num`, which maps `±∞` to finite extremes — so
-//! one bad completion cannot poison the group. In [`masked_mean`] a value in a
+//! Non-finite inputs are handled defensively — a **deliberate divergence** from
+//! TRL's mainline path (which `nansum`s an all-NaN reward row to `0.0` and then
+//! propagates any remaining `NaN` through the plain `mean`/`std`): here a
+//! `NaN`/`±∞` reward is dropped from its group's mean/std and given a `0`
+//! advantage — note `±∞ → 0`, unlike `torch.nan_to_num`, which maps `±∞` to
+//! finite extremes — so one bad completion cannot poison the group. In [`masked_mean`] a value in a
 //! masked-out position is ignored (so `0 · ∞` cannot leak `NaN`) and an all-pad
 //! row contributes `0` to either reduction. Masks must be finite and
 //! non-negative and rows must have width `≥ 1`; violations are caller bugs and
@@ -172,10 +173,10 @@ pub fn sequence_log_ratio(logp: &[f64], logp_old: &[f64], mask: &[f64]) -> f64 {
 /// Returns `(mean, std)`. The std divides by `n - 1` where `n` counts only the
 /// finite entries. For **all-finite** input this matches candle's `Tensor::var`
 /// and `numpy.std(ddof=1)`. Non-finite entries (`NaN`, `±∞`) are *all* skipped so
-/// one bad reward cannot poison the group: this coincides with TRL's `nanstd`
-/// only for `NaN`, and is deliberately *stronger* for `±∞` (which both `nanstd`
-/// and a raw `Tensor::var` would propagate). Fewer than two finite entries give
-/// std `0` (no `0/0`), and none gives `(0, 0)`.
+/// one bad reward cannot poison the group — a deliberate hardening over TRL's
+/// mainline reward path, whose plain `.std()` would propagate them (TRL's
+/// `nanstd` runs only on its non-default multi-reward aggregation path). Fewer
+/// than two finite entries give std `0` (no `0/0`), and none gives `(0, 0)`.
 #[must_use]
 fn mean_std(xs: &[f64]) -> (f64, f64) {
     let finite: Vec<f64> = xs.iter().copied().filter(|x| x.is_finite()).collect();

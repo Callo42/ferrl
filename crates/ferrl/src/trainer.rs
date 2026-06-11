@@ -36,8 +36,11 @@
 //! backstops a genuinely dead wiring (reward would never rise).
 //!
 //! A *degenerate* group — every completion scored identically, so all advantages
-//! are zero (`frac_reward_zero_std == 1`) — carries no learning signal and is a
-//! GRPO no-op: the trainer performs no update for that step (and runs no canary).
+//! are zero (`frac_reward_zero_std == 1`) — carries no surrogate signal. With
+//! `beta == 0` it is a GRPO no-op: the trainer performs no update for that step
+//! (and runs no canary). With `beta > 0` it stays **live** — the KL penalty still
+//! pulls the group toward the reference (TRL keeps every completion in the batch),
+//! only the surrogate contribution is zero.
 
 use std::path::{Path, PathBuf};
 
@@ -179,7 +182,13 @@ pub struct TrainerConfig {
     /// reported as [`Metrics::frac_truncated`]. **Inert when
     /// [`eos_token_id`](Self::eos_token_id) is `None`** (without an EOS no
     /// completion can terminate, so masking would zero every row).
-    /// `#[serde(default)]` via `default_truncation_masking` (`true`).
+    /// `#[serde(default)]` via `default_truncation_masking` (`true`) —
+    /// **including for older `config.json` files** (like clipping, this is a
+    /// correctness guard, not a behavior an old config opted out of; a pre-R1
+    /// run with an EOS token resumes with masking active). Detection assumes
+    /// the single-EOS rollout contract ([`crate::policy::GenConfig`]): TRL
+    /// additionally treats a trailing *pad* token as terminated, a state
+    /// ferrl's EOS-padded rollouts cannot produce.
     #[serde(default = "default_truncation_masking")]
     pub truncation_masking: bool,
     /// Which masked reduction to apply to the per-token objective.
@@ -447,6 +456,15 @@ impl Trainer {
     /// written or the metrics file cannot be opened.
     pub fn new(config: TrainerConfig, run: &RunDir) -> Result<Self, TrainerError> {
         config.validate()?;
+        // Not a validation error (a short smoke run of a long-run config is
+        // legitimate), but loud: such a run trains entirely inside the ramp.
+        if config.warmup_steps >= config.steps && config.warmup_steps > 0 {
+            tracing::warn!(
+                warmup_steps = config.warmup_steps,
+                steps = config.steps,
+                "warmup_steps >= steps: the run never reaches the configured lr"
+            );
+        }
         run.write_config(&config)?;
         let writer = run.metrics_writer()?;
         Ok(Self {
@@ -778,8 +796,14 @@ impl Trainer {
 
         // Group-normalized advantages (scalar oracle). A group whose advantages are
         // all exactly zero — no reward spread, or non-finite rewards forced to a 0
-        // advantage — carries no gradient, so it is a no-op (no snapshot, no update,
-        // no canary), exactly as the single-prompt path skipped it.
+        // advantage — carries no SURROGATE gradient. With `beta == 0` (no KL term)
+        // it is therefore a complete no-op and is skipped (no snapshot, no update,
+        // no canary). With `beta > 0` it must stay LIVE: TRL keeps every
+        // completion in the batch, and the KL penalty still pulls a
+        // zero-advantage group toward the reference (its surrogate contributes
+        // exactly 0 — the zero-advantage guard in the clipped surrogate — but the
+        // k3 term carries gradient). Skipping it would silently drop that
+        // regularization, diverging from TRL whenever rewards saturate mid-run.
         let rewards_f64: Vec<f64> = rewards.iter().map(|&r| f64::from(r)).collect();
         let advantages = group_advantages(&rewards_f64, self.config.scale_rewards);
         let degenerate = advantages.iter().all(|a| *a == 0.0);
@@ -791,7 +815,7 @@ impl Trainer {
             degenerate,
             rewards,
         };
-        if degenerate {
+        if degenerate && self.config.beta <= 0.0 {
             return Ok((stat, None));
         }
 
@@ -940,7 +964,8 @@ impl Trainer {
         // the configured level over the same padding-substituted log-probs the
         // loss uses, so the clip-fraction metric reports the ratio the surrogate
         // actually clipped.
-        let logp_sub = substitute_padding(&logp, &item.logp_old, &item.mask)?;
+        let logp_diag = logp.detach();
+        let logp_sub = substitute_padding(&logp_diag, &item.logp_old, &item.mask)?;
         let ratio = level_ratio(
             &logp_sub,
             &item.logp_old,
@@ -962,8 +987,9 @@ impl Trainer {
     /// Mean masked k3 KL for the step's metrics — the diagnostic counterpart of the
     /// KL penalty [`grpo_loss`] folds into the differentiated objective. Returns `0`
     /// when no reference policy is active (`beta == 0`, so `logp_ref` is `None`).
-    /// Reduced with this item's own mask (`dapo_norm: None` — the single-batch
-    /// form); the diagnostic needs no window-level normalizer.
+    /// Always the masked **token mean** `Σ(kl·mask) / max(Σmask, 1)` — TRL's
+    /// `masked_batch_mean` — independent of the configured loss reduction (the
+    /// loss normalizer shapes the gradient, not the diagnostic).
     fn kl_metric(
         &self,
         logp: &Tensor,
@@ -974,7 +1000,7 @@ impl Trainer {
             return Ok(0.0);
         };
         let kl = k3_kl_tensor(logp, logp_ref)?;
-        scalar_f32(&masked_mean_tensor(&kl, mask, self.config.loss_type, None)?)
+        scalar_f32(&masked_mean_tensor(&kl, mask, LossType::Dapo, None)?)
     }
 
     /// Reference (adapter-disabled) log-probs, restoring the adapter before any
@@ -1262,8 +1288,11 @@ fn reward_stats(rewards: &[f32]) -> (f32, f32) {
     (mean, var.sqrt())
 }
 
-/// The importance ratio `exp(logp - logp_old)`. At `mu = 1` the snapshot equals
-/// the current log-probs, so this is exactly `1`.
+/// The raw importance ratio `exp(logp - logp_old)`. At `mu = 1` the snapshot
+/// equals the current log-probs, so this is exactly `1`. Test-only reference:
+/// the production path goes through [`level_ratio`], whose Token arm is this
+/// plus the overflow-capping clamp (bit-identical for any sane log-ratio).
+#[cfg(test)]
 fn importance_ratio(logp: &Tensor, logp_old: &Tensor) -> CandleResult<Tensor> {
     logp.broadcast_sub(logp_old)?.exp()
 }
@@ -1290,20 +1319,37 @@ fn substitute_padding(logp: &Tensor, logp_old: &Tensor, mask: &Tensor) -> Candle
 /// `logp` is expected padding-substituted (see [`substitute_padding`]) so a
 /// divergent padding log-prob can neither overflow the token-level `exp` nor
 /// poison the sequence-level masked sum.
+///
+/// The log-ratio is clamped to `±RATIO_LOG_CAP` **before** the `exp`: f32 `exp`
+/// overflows to `+inf` near 88.7, and while every downstream consumer keeps the
+/// loss *value* finite (the clip band / zero-advantage guard), `exp`'s backward
+/// multiplies the upstream gradient by its own output — `0 · inf = NaN` — so an
+/// overflowed ratio poisons every parameter gradient and aborts the run via the
+/// canary even when the loss is finite. Clamping the *argument* keeps forward
+/// values bit-identical for any `|log-ratio| < 60` (astronomically beyond the
+/// `~±0.3` clip band where the surrogate already saturates) and makes the
+/// gradient exactly the clip-saturated `0` beyond the cap.
 fn level_ratio(
     logp: &Tensor,
     logp_old: &Tensor,
     mask: &Tensor,
     level: ImportanceSamplingLevel,
 ) -> CandleResult<Tensor> {
+    /// See the function docs: keeps `exp` (and its backward) finite in f32.
+    const RATIO_LOG_CAP: f64 = 60.0;
     match level {
-        ImportanceSamplingLevel::Token => importance_ratio(logp, logp_old),
+        ImportanceSamplingLevel::Token => logp
+            .broadcast_sub(logp_old)?
+            .clamp(-RATIO_LOG_CAP, RATIO_LOG_CAP)?
+            .exp(),
         ImportanceSamplingLevel::Sequence => {
             let log_ratio = logp.broadcast_sub(logp_old)?;
             let num = log_ratio.broadcast_mul(mask)?.sum_keepdim(D::Minus1)?;
             let denom_raw = mask.sum_keepdim(D::Minus1)?;
             let denom = denom_raw.maximum(&Tensor::ones_like(&denom_raw)?)?;
-            num.broadcast_div(&denom)?.exp()
+            num.broadcast_div(&denom)?
+                .clamp(-RATIO_LOG_CAP, RATIO_LOG_CAP)?
+                .exp()
         }
     }
 }
@@ -1368,12 +1414,16 @@ fn masked_mean_tensor(
     match loss_type {
         LossType::Grpo => {
             let per_seq_sum = masked.sum(D::Minus1)?;
-            let denom = mask
-                .sum(D::Minus1)?
-                .maximum(&Tensor::ones_like(&mask.sum(D::Minus1)?)?)?;
+            let mask_sums = mask.sum(D::Minus1)?;
+            let denom = mask_sums.maximum(&Tensor::ones_like(&mask_sums)?)?;
             per_seq_sum.broadcast_div(&denom)?.mean(0)
         }
         LossType::DrGrpo => {
+            // The denominator uses the mask WIDTH as the Dr.GRPO constant.
+            // Equivalent to TRL's `B * max_completion_length` only because
+            // ferrl rollouts are always right-padded to the fixed
+            // `max_new_tokens` width; a future width-trimming rollout would
+            // have to thread the configured maximum in here explicitly.
             let (num_seq, max_len) = mask.dims2()?;
             let total = masked.sum_all()?;
             total.affine(1.0 / (num_seq as f64 * max_len as f64), 0.0)
@@ -1462,10 +1512,13 @@ fn grpo_loss(
     masked_mean_tensor(&per_token, mask, cfg.loss_type, cfg.dapo_norm)?.neg()
 }
 
-/// Fraction of valid tokens whose surrogate `min` selected the clipped term.
-/// `ratio` may be per-token `[G, comp_len]` or per-sequence `[G, 1]` (the GSPO
-/// level — broadcast against the mask, so a clipped sequence counts each of its
-/// valid tokens, mirroring TRL's masked batch mean of the clip indicator).
+/// Fraction of the batch whose surrogate `min` selected the clipped term.
+///
+/// For a per-token ratio (`[G, comp_len]`) this is the masked token mean of the
+/// clip indicator; for a per-sequence ratio (`[G, 1]`, the GSPO level) it is the
+/// **plain mean over sequences** — mirroring TRL's `masked_batch_mean`, which
+/// special-cases the `(B, 1)` shape to `x.mean()` (a clipped sequence counts
+/// once, not once per token).
 fn clip_fraction(
     ratio: &Tensor,
     advantages: &Tensor,
@@ -1478,6 +1531,9 @@ fn clip_fraction(
         .clamp(1.0 - eps_low, 1.0 + eps_high)?
         .broadcast_mul(advantages)?;
     let was_clipped = clipped.lt(&unclipped)?.to_dtype(DType::F32)?;
+    if ratio.dims2()?.1 == 1 {
+        return scalar_f32(&was_clipped.mean_all()?);
+    }
     let num = scalar_f32(&was_clipped.broadcast_mul(mask)?.sum_all()?)?;
     let den = scalar_f32(&mask.sum_all()?)?;
     Ok(if den > 0.0 { num / den } else { 0.0 })
@@ -1498,11 +1554,15 @@ fn scale_var_grads(vars: &[Var], store: &mut GradStore, scale: f64) -> CandleRes
 
 /// Global L2 norm over the trainable vars' gradients (pre-clip). Vars absent
 /// from the store contribute `0` (the canary has already guaranteed coverage).
+/// Each square-sum is accumulated in **f64**: an f32 `sqr` overflows to `inf`
+/// for elements above ~1.8e19, and an `inf` norm would turn the clip factor
+/// `max / norm` into a silent all-zero gradient scale.
 fn global_grad_norm(vars: &[Var], grads: &GradStore) -> CandleResult<f64> {
     let mut sq = 0.0;
     for v in vars {
         if let Some(g) = grads.get(v.as_tensor()) {
-            sq += f64::from(scalar_f32(&g.sqr()?.sum_all()?)?);
+            let g64 = g.to_dtype(DType::F64)?;
+            sq += g64.sqr()?.sum_all()?.to_scalar::<f64>()?;
         }
     }
     Ok(sq.sqrt())
@@ -1558,6 +1618,19 @@ mod tests {
         for (i, &a) in advs.iter().enumerate() {
             for (j, &rt) in ratios.iter().enumerate() {
                 let want = clipped_surrogate(rt, a, eps, eps) as f32;
+                assert_relative_eq!(got[i][j], want, epsilon = TOL);
+            }
+        }
+        // Clip-higher pass: ratio 1.25 sits between the symmetric edge (1.2)
+        // and the widened edge (1.28), so a band swap or ignored eps_high
+        // produces a different surrogate at that cell.
+        let ratio = mat(&[&[1.25, 1.5, 0.5], &[1.25, 1.5, 0.5]]);
+        let got = clipped_surrogate_tensor(&ratio, &adv, 0.2, 0.28).unwrap();
+        let got = got.to_vec2::<f32>().unwrap();
+        let ratios = [1.25f64, 1.5, 0.5];
+        for (i, &a) in advs.iter().enumerate() {
+            for (j, &rt) in ratios.iter().enumerate() {
+                let want = clipped_surrogate(rt, a, 0.2, 0.28) as f32;
                 assert_relative_eq!(got[i][j], want, epsilon = TOL);
             }
         }
@@ -1959,6 +2032,278 @@ mod tests {
         );
         // The absent var stays absent (no phantom entry materialized).
         assert!(store.get(dead.as_tensor()).is_none());
+    }
+
+    // ---- trainer wiring: config knobs reach the differentiated loss ---------
+
+    /// A unique temp dir for in-module Trainer construction, removed on drop.
+    struct WireTmp(std::path::PathBuf);
+    impl WireTmp {
+        fn new(tag: &str) -> Self {
+            let mut p = std::env::temp_dir();
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            p.push(format!("ferrl-wire-{tag}-{}-{nanos}", std::process::id()));
+            std::fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+    }
+    impl Drop for WireTmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A minimal Policy whose `token_logprobs` returns a fixed Var-backed
+    /// tensor — `item_backward` only needs that method, so the wiring tests
+    /// drive the REAL config→loss path with a fully crafted gradient surface.
+    struct StubPolicy {
+        logp: Var,
+    }
+    impl Policy for StubPolicy {
+        fn generate(&mut self, _p: &[u32], _c: &GenConfig) -> CandleResult<Rollout> {
+            unreachable!("wiring tests never roll out")
+        }
+        fn token_logprobs(&self, _r: &Rollout) -> CandleResult<Tensor> {
+            Ok(self.logp.as_tensor().clone())
+        }
+        fn set_adapter_enabled(&mut self, _e: bool) {}
+        fn adapter_enabled(&self) -> bool {
+            true
+        }
+        fn trainable_vars(&self) -> Vec<Var> {
+            vec![self.logp.clone()]
+        }
+        fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+            Ok(Vec::new())
+        }
+        fn restore_sampler_state(&mut self, _s: &[u8]) -> CandleResult<()> {
+            Ok(())
+        }
+    }
+
+    /// Run `item_backward` under `cfg` over a fixed crafted item (ratios
+    /// straddling the clip bands, ragged mask) and return the flat gradient of
+    /// the logp Var. This pins that each config knob actually reaches the
+    /// differentiated loss — the seam a hardcoded default would sever.
+    fn wire_grad(cfg: &TrainerConfig, window_tokens: f64) -> Vec<f32> {
+        let dev = cpu();
+        let tmp = WireTmp::new("grad");
+        let run = RunDir::create(&tmp.0, "wire").unwrap();
+        let trainer = Trainer::new(cfg.clone(), &run).unwrap();
+        let logp = Var::from_tensor(&mat(&[&[-1.0, -2.0, -0.4], &[-0.5, -0.25, -0.75]])).unwrap();
+        // Shifts 0.22 / -0.30 straddle both bands (1.246 / 0.74); ratio != 1
+        // even at mu = 1 because logp_old is crafted, not snapshotted.
+        let shift = mat(&[&[0.22, -0.30, 0.05], &[0.05, 0.22, -0.30]]);
+        let logp_old = logp.as_tensor().sub(&shift).unwrap().detach();
+        let policy = StubPolicy { logp: logp.clone() };
+        let item = LiveItem {
+            rollout: Rollout {
+                token_ids: vec![vec![0; 4]; 2],
+                prompt_len: 1,
+                completion_lens: vec![3, 2],
+            },
+            advantages: Tensor::from_vec(vec![0.8f32, -0.7], (2, 1), &dev).unwrap(),
+            logp_old,
+            logp_ref: None,
+            mask: mat(&[&[1.0, 1.0, 1.0], &[1.0, 1.0, 0.0]]),
+        };
+        let (grads, _, _) = trainer
+            .item_backward(&policy, &item, window_tokens)
+            .unwrap();
+        grads
+            .get(logp.as_tensor())
+            .expect("logp var must be in the grad store")
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    }
+
+    fn assert_grads_scaled(base: &[f32], scaled: &[f32], factor: f32, ctx: &str) {
+        for (b, s) in base.iter().zip(scaled) {
+            assert_relative_eq!(b * factor, s, epsilon = 1e-6, max_relative = 1e-5);
+        }
+        assert!(
+            base.iter().any(|g| g.abs() > 1e-8),
+            "{ctx}: baseline gradient is all-zero — the comparison is vacuous"
+        );
+    }
+
+    fn assert_grads_differ(a: &[f32], b: &[f32], ctx: &str) {
+        assert!(
+            a.iter().zip(b).any(|(x, y)| (x - y).abs() > 1e-7),
+            "{ctx}: gradients identical — the knob never reached the loss"
+        );
+    }
+
+    #[test]
+    fn wiring_dapo_window_normalizer_scales_the_gradient() {
+        // Doubling the window's token total must exactly halve the gradient —
+        // and the trainer must pass the WINDOW total, not the item's mask sum.
+        let cfg = TrainerConfig::default(); // loss_type: Dapo
+        let g1 = wire_grad(&cfg, 5.0);
+        let g2 = wire_grad(&cfg, 10.0);
+        assert_grads_scaled(&g1, &g2, 0.5, "dapo window normalizer");
+    }
+
+    #[test]
+    fn wiring_grpo_keeps_the_accum_scale_and_dapo_skips_it() {
+        // Grpo at grad_accum_steps 2 halves the per-item gradient (the 1/accum
+        // scale); Dapo must NOT add that scale on top of its window normalizer.
+        let grpo1 = wire_grad(
+            &TrainerConfig {
+                loss_type: LossType::Grpo,
+                ..TrainerConfig::default()
+            },
+            5.0,
+        );
+        let grpo2 = wire_grad(
+            &TrainerConfig {
+                loss_type: LossType::Grpo,
+                grad_accum_steps: 2,
+                ..TrainerConfig::default()
+            },
+            5.0,
+        );
+        assert_grads_scaled(&grpo1, &grpo2, 0.5, "grpo 1/accum scale");
+        let dapo1 = wire_grad(&TrainerConfig::default(), 5.0);
+        let dapo2 = wire_grad(
+            &TrainerConfig {
+                grad_accum_steps: 2,
+                ..TrainerConfig::default()
+            },
+            5.0,
+        );
+        assert_grads_scaled(&dapo1, &dapo2, 1.0, "dapo must skip the accum scale");
+    }
+
+    #[test]
+    fn wiring_clip_eps_high_reaches_the_loss() {
+        // The crafted ratios include 1.246 cells with positive advantage:
+        // clipped at symmetric 0.2, unclipped at clip-higher 0.28 — so the
+        // configured upper band must change the gradient.
+        let sym = wire_grad(&TrainerConfig::default(), 5.0);
+        let asym = wire_grad(
+            &TrainerConfig {
+                clip_eps_high: Some(0.28),
+                ..TrainerConfig::default()
+            },
+            5.0,
+        );
+        assert_grads_differ(&sym, &asym, "clip_eps_high");
+    }
+
+    #[test]
+    fn wiring_importance_sampling_level_reaches_the_loss() {
+        let token = wire_grad(&TrainerConfig::default(), 5.0);
+        let seq = wire_grad(
+            &TrainerConfig {
+                importance_sampling_level: ImportanceSamplingLevel::Sequence,
+                ..TrainerConfig::default()
+            },
+            5.0,
+        );
+        assert_grads_differ(&token, &seq, "importance_sampling_level");
+    }
+
+    // ---- masking / overflow corners ----------------------------------------
+
+    #[test]
+    fn all_masked_live_item_yields_present_zero_grads_not_canary_abort() {
+        // A live item whose mask is entirely zero (every completion truncation-
+        // masked) must produce PRESENT all-zero gradients — candle's where_cond
+        // backward visits the unselected branch — so the trainer takes the
+        // documented no-signal skip instead of a canary abort. Pinned here
+        // because the guarantee rests on candle internals (a candle bump that
+        // prunes zero subgraphs would turn ladder runs into 2 a.m. aborts).
+        for level in [
+            ImportanceSamplingLevel::Token,
+            ImportanceSamplingLevel::Sequence,
+        ] {
+            let logp = Var::from_tensor(&mat(&[&[-1.0, -2.0], &[-0.5, -0.25]])).unwrap();
+            let adv = Tensor::from_vec(vec![0.8f32, -0.7], (2, 1), &cpu()).unwrap();
+            let mask = mat(&[&[0.0, 0.0], &[0.0, 0.0]]);
+            let cfg = LossCfg {
+                clip_eps_low: 0.2,
+                clip_eps_high: 0.2,
+                beta: 0.0,
+                loss_type: LossType::Dapo,
+                is_level: level,
+                dapo_norm: Some(4.0),
+            };
+            let old = logp.as_tensor().affine(1.0, 0.1).unwrap().detach();
+            let loss = grpo_loss(logp.as_tensor(), &old, None, &adv, &mask, &cfg).unwrap();
+            let v = scalar_f32(&loss).unwrap();
+            assert_eq!(v, 0.0, "{level:?}: all-masked loss must be exactly 0");
+            let grads = loss.backward().unwrap();
+            let g = grads
+                .get(logp.as_tensor())
+                .unwrap_or_else(|| panic!("{level:?}: grad entry ABSENT — canary would abort"))
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            assert!(
+                g.iter().all(|x| *x == 0.0),
+                "{level:?}: all-masked grads must be exactly zero, got {g:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn overflowing_log_ratio_keeps_gradients_finite() {
+        // A kept position whose log-ratio exceeds f32 exp's overflow point
+        // (~88.7) used to poison every gradient with NaN through exp's
+        // backward (grad · exp_output = 0 · inf) even though the loss value
+        // stayed finite. The RATIO_LOG_CAP clamp must keep both the loss and
+        // the gradient finite, at both levels.
+        for level in [
+            ImportanceSamplingLevel::Token,
+            ImportanceSamplingLevel::Sequence,
+        ] {
+            let logp = Var::from_tensor(&mat(&[&[-0.5, 99.5]])).unwrap();
+            let old = mat(&[&[-0.55, -0.5]]); // log-ratio [0.05, 100.0]
+            let adv = Tensor::from_vec(vec![0.7f32], (1, 1), &cpu()).unwrap();
+            let mask = mat(&[&[1.0, 1.0]]);
+            let cfg = LossCfg {
+                clip_eps_low: 0.2,
+                clip_eps_high: 0.2,
+                beta: 0.0,
+                loss_type: LossType::Dapo,
+                is_level: level,
+                dapo_norm: None,
+            };
+            let loss = grpo_loss(logp.as_tensor(), &old, None, &adv, &mask, &cfg).unwrap();
+            let v = scalar_f32(&loss).unwrap();
+            assert!(v.is_finite(), "{level:?}: loss must stay finite, got {v}");
+            let grads = loss.backward().unwrap();
+            let g = grads
+                .get(logp.as_tensor())
+                .expect("grad present")
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            assert!(
+                g.iter().all(|x| x.is_finite()),
+                "{level:?}: overflowed ratio leaked NaN into the gradient: {g:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn clip_fraction_sequence_shape_counts_sequences_not_tokens() {
+        // TRL's masked_batch_mean special-cases the (B, 1) sequence-level shape
+        // to a plain mean over sequences: one clipped sequence of length 3 out
+        // of [3, 1] valid tokens is 1/2, not 3/4.
+        let ratio = Tensor::from_vec(vec![1.5f32, 1.0], (2, 1), &cpu()).unwrap();
+        let adv = Tensor::from_vec(vec![0.5f32, 0.5], (2, 1), &cpu()).unwrap();
+        let mask = mat(&[&[1.0, 1.0, 1.0], &[1.0, 0.0, 0.0]]);
+        let frac = clip_fraction(&ratio, &adv, 0.2, 0.2, &mask).unwrap();
+        assert_relative_eq!(frac, 0.5, epsilon = TOL);
     }
 
     #[test]
@@ -2469,6 +2814,7 @@ mod tests {
         loss_type: LossType,
         beta: f64,
         level: ImportanceSamplingLevel,
+        eps_high: f64,
         shift: &Tensor,
         adv: &Tensor,
         mask: &Tensor,
@@ -2508,7 +2854,7 @@ mod tests {
 
         let cfg = LossCfg {
             clip_eps_low: EPS,
-            clip_eps_high: EPS,
+            clip_eps_high: eps_high,
             beta,
             loss_type,
             is_level: level,
@@ -2580,7 +2926,44 @@ mod tests {
             (4, 3), &dev,
         ).unwrap();
         let ctx = format!("uniform-mask, loss_type={loss_type:?}, beta={beta}, level={level:?}");
-        run_gradcheck_with(loss_type, beta, level, &shift, &adv, &mask, &ctx);
+        run_gradcheck_with(loss_type, beta, level, 0.2, &shift, &adv, &mask, &ctx);
+    }
+
+    /// Gradcheck with the DAPO **clip-higher** band (eps 0.2 / 0.28): shifts at
+    /// `0.22` put ratios ≈ 1.246 *between* the symmetric edge (1.2) and the
+    /// widened edge (1.28), so the asymmetric upper band genuinely changes
+    /// which surrogate branch is differentiated — a band swap or an ignored
+    /// `eps_high` moves the analytic gradient off the numeric one.
+    fn run_gradcheck_clip_higher(loss_type: LossType, beta: f64) {
+        let dev = cpu();
+        #[rustfmt::skip]
+        let shift = Tensor::from_vec(
+            vec![0.22, 0.05, 0.10,
+                 -0.30, 0.22, 0.10,
+                 0.05, 0.30, 0.10,
+                 0.22, -0.30, 0.10f64],
+            (4, 3), &dev,
+        ).unwrap();
+        let adv = Tensor::from_vec(vec![0.8, -0.7, 0.5, -0.4f64], (4, 1), &dev).unwrap();
+        #[rustfmt::skip]
+        let mask = Tensor::from_vec(
+            vec![1.0, 1.0, 0.0,
+                 1.0, 1.0, 0.0,
+                 1.0, 1.0, 0.0,
+                 1.0, 1.0, 0.0f64],
+            (4, 3), &dev,
+        ).unwrap();
+        let ctx = format!("clip-higher 0.2/0.28, loss_type={loss_type:?}, beta={beta}");
+        run_gradcheck_with(
+            loss_type,
+            beta,
+            ImportanceSamplingLevel::Token,
+            0.28,
+            &shift,
+            &adv,
+            &mask,
+            &ctx,
+        );
     }
 
     /// Shared driver for a ragged-mask gradcheck. Builds the `[G, T]` loss mask from
@@ -2618,6 +3001,7 @@ mod tests {
             loss_type,
             beta,
             ImportanceSamplingLevel::Token,
+            0.2,
             shift,
             adv,
             &mask,
@@ -2770,5 +3154,15 @@ mod tests {
         // Sequence-level ratio under the DAPO reduction with KL active — the
         // GSPO-recipe combination closest to a real MoE-era run.
         run_gradcheck_level(LossType::Dapo, 0.1, ImportanceSamplingLevel::Sequence);
+    }
+
+    #[test]
+    fn gradcheck_clip_higher_dapo_no_kl() {
+        run_gradcheck_clip_higher(LossType::Dapo, 0.0);
+    }
+
+    #[test]
+    fn gradcheck_clip_higher_grpo_with_kl() {
+        run_gradcheck_clip_higher(LossType::Grpo, 0.1);
     }
 }

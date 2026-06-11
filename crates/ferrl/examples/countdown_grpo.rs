@@ -208,6 +208,14 @@ fn build_trainer_config(eos_token_id: Option<u32>) -> TrainerConfig {
         beta: env_parse("FERRL_CD_BETA", 0.0f64),
         checkpoint_every: Some(env_parse("FERRL_CD_CKPT", 50u64)),
         eos_token_id,
+        // Calibration pin: this gate's margins (FERRL_CD_MARGIN, reward-trend,
+        // beats-base) were established on the pre-R1 recipe — classic Grpo
+        // reduction, no clipping, no truncation masking. Keep that trajectory
+        // until the margins are deliberately recalibrated on the modern
+        // recipe (the 0.8B PoC ladder runs the R1 defaults instead).
+        loss_type: ferrl::LossType::Grpo,
+        max_grad_norm: None,
+        truncation_masking: false,
         ..TrainerConfig::default()
     }
 }
@@ -259,7 +267,14 @@ fn main() -> Result<()> {
     );
 
     let out = env_parse("FERRL_CD_OUT", "/tmp/ferrl-runs".to_string());
-    let run = RunDir::create(Path::new(&out), "countdown-grpo").context("create run dir")?;
+    // Unique run id per invocation: RunDir::create now fails loud on a
+    // duplicate run_id (appending to a prior run's metrics stream), and this
+    // example is routinely re-run after a missed gate.
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let run_id = format!("countdown-grpo-{stamp}");
+    let run = RunDir::create(Path::new(&out), &run_id).context("create run dir")?;
     let mut trainer = Trainer::new(tcfg, &run)?;
     let history = trainer.train(&mut policy, &reward, &tok, &train_prompts)?;
 

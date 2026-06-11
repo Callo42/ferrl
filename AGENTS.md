@@ -33,8 +33,10 @@ autograd, GPU, and the base model forward to [candle](https://github.com/hugging
 - candle's fused `RmsNorm`/`LayerNorm` have **no backward** — use
   `candle_nn::ops::rms_norm_slow` on any gradient-bearing path.
 - candle optimizers **silently skip** parameters absent from the gradient store —
-  assert a grad-coverage canary (every trainable adapter `Var` receives a nonzero
-  gradient) after `backward()`.
+  assert a grad-coverage canary after `backward()`: every trainable adapter `Var`
+  must be **present with a finite gradient** (an absent entry or a non-finite
+  value aborts; an all-zero gradient is a legitimate no-signal state — e.g. a
+  fully clipped step or an all-masked window — and skips the optimizer step).
 - The shipped Qwen forward is inference-shaped (`&mut self` KV-cache); the training
   update needs a separate uncached, full-sequence, gradient-bearing forward.
 - The build toolkit's **PTX ISA** must be `<=` the runtime NVIDIA driver's maximum, or

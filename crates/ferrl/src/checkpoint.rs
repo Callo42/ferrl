@@ -38,10 +38,14 @@
 //! ## Crash atomicity
 //!
 //! Both writers stage the whole checkpoint into a sibling temp directory
-//! (`<dir>.tmp-<pid>`) and publish it with a single `rename` — so a reader of the
-//! published path can never observe a half-written checkpoint, even on a crash
-//! mid-write (the manifest-last ordering inside the stage is belt-and-braces on
-//! top). Re-writing an existing checkpoint path replaces it as a unit.
+//! (`<dir>.tmp-<pid>`) and publish it with a single `rename` — so the published
+//! path never holds a *partial* checkpoint (the manifest-last ordering inside
+//! the stage is belt-and-braces on top). Replacing an existing checkpoint
+//! renames the old directory aside first and removes it only after the new one
+//! is published, so at every instant the prior **or** the new complete
+//! checkpoint exists on disk (a crash can at worst leave the prior one under
+//! `<dir>.old-<pid>`, recoverable by hand). Stale `.tmp-*`/`.old-*` siblings
+//! from crashed processes are swept by the next write to the same path.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -156,26 +160,65 @@ fn stage_path(dir: &Path) -> PathBuf {
     dir.with_file_name(name)
 }
 
-/// Prepare an empty staging directory for `dir`, clearing any stale leftover.
+/// Prepare an empty staging directory for `dir`, sweeping any stale `.tmp-*` /
+/// `.old-*` sibling left behind by a crashed process (the pid suffix makes a
+/// live collision impossible, so anything matching is garbage).
 fn prepare_stage(dir: &Path) -> Result<PathBuf, CheckpointError> {
+    sweep_stale_siblings(dir)?;
     let stage = stage_path(dir);
-    if stage.exists() {
-        std::fs::remove_dir_all(&stage).map_err(|e| io(&stage, e))?;
-    }
     std::fs::create_dir_all(&stage).map_err(|e| io(&stage, e))?;
     Ok(stage)
 }
 
-/// Publish a fully-written `stage` at `dir` with a single `rename`, replacing
-/// any prior checkpoint at that path as a unit. The published path therefore
-/// only ever holds a complete checkpoint or nothing — a crash mid-write leaves
-/// the stage behind (cleared by the next write) and the prior checkpoint, if
-/// any, intact up to the final replace.
+/// Remove every `<name>.tmp-*` / `<name>.old-*` sibling of `dir` — leftovers
+/// from interrupted writes by this or any dead process. Best-effort per entry
+/// is NOT enough here (a stale dir at this pid's own stage path must go), so
+/// failures surface.
+fn sweep_stale_siblings(dir: &Path) -> Result<(), CheckpointError> {
+    let Some(parent) = dir.parent() else {
+        return Ok(());
+    };
+    let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
+        return Ok(());
+    };
+    if !parent.exists() {
+        return Ok(());
+    }
+    let entries = std::fs::read_dir(parent).map_err(|e| io(parent, e))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| io(parent, e))?;
+        let fname = entry.file_name();
+        let Some(fname) = fname.to_str() else {
+            continue;
+        };
+        let stale = fname
+            .strip_prefix(name)
+            .is_some_and(|rest| rest.starts_with(".tmp-") || rest.starts_with(".old-"));
+        if stale {
+            std::fs::remove_dir_all(entry.path()).map_err(|e| io(entry.path(), e))?;
+        }
+    }
+    Ok(())
+}
+
+/// Publish a fully-written `stage` at `dir`. A prior checkpoint is renamed
+/// aside (never deleted before the new one is in place): old -> `.old-<pid>`,
+/// stage -> `dir`, then the aside copy is removed. At every instant the path
+/// set holds the prior or the new complete checkpoint, so a crash anywhere in
+/// this sequence loses nothing (at worst the prior survives under the aside
+/// name, swept by the next write).
 fn commit_stage(stage: &Path, dir: &Path) -> Result<(), CheckpointError> {
-    if dir.exists() {
-        std::fs::remove_dir_all(dir).map_err(|e| io(dir, e))?;
+    let mut aside_name = dir.file_name().unwrap_or_default().to_os_string();
+    aside_name.push(format!(".old-{}", std::process::id()));
+    let aside = dir.with_file_name(aside_name);
+    let had_prior = dir.exists();
+    if had_prior {
+        std::fs::rename(dir, &aside).map_err(|e| io(dir, e))?;
     }
     std::fs::rename(stage, dir).map_err(|e| io(stage, e))?;
+    if had_prior {
+        std::fs::remove_dir_all(&aside).map_err(|e| io(&aside, e))?;
+    }
     Ok(())
 }
 
@@ -845,6 +888,34 @@ mod tests {
         save_checkpoint(&dir, &vars, &make_opt_state(), &[2u8], 5, None).unwrap();
         let again = load_checkpoint(&dir, &vars).unwrap();
         assert_eq!(again.sampler_state, Some(vec![2u8]));
+    }
+
+    #[test]
+    fn failed_staged_write_leaves_the_prior_checkpoint_intact() {
+        // The Err branch of write_staged: a mid-write failure must leave the
+        // previously published checkpoint untouched and clean up its stage.
+        let tmp = TempDir::new("staged-err");
+        let dir = tmp.path().join("step-3");
+        let vars = make_vars();
+        save_checkpoint(&dir, &vars, &make_opt_state(), &[7u8], 3, None).unwrap();
+        let before = snapshot(&vars);
+
+        let err = write_staged(&dir, |stage| {
+            // Leave a partial artifact in the stage, then fail.
+            std::fs::write(stage.join("partial.bin"), b"half").unwrap();
+            Err(CheckpointError::Mismatch("synthetic failure".into()))
+        })
+        .unwrap_err();
+        assert!(matches!(err, CheckpointError::Mismatch(_)), "got {err:?}");
+
+        // Prior checkpoint still loads bit-identically; no stage litter.
+        clobber(&vars);
+        let loaded = load_checkpoint(&dir, &vars).unwrap();
+        assert_eq!(loaded.step, 3);
+        assert_eq!(loaded.sampler_state, Some(vec![7u8]));
+        assert_eq!(snapshot(&vars), before);
+        let stage = dir.with_file_name(format!("step-3.tmp-{}", std::process::id()));
+        assert!(!stage.exists(), "failed stage must be cleaned up");
     }
 
     #[test]
