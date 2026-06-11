@@ -14,15 +14,17 @@
 //! Training needs an **uncached, tape-bearing** full-sequence forward
 //! ([`GradModel::forward`]) whose backward reaches every
 //! [`trainable_vars`](GradModel::trainable_vars) entry; rollout wants a
-//! **KV-cached, tape-free** incremental decoder
+//! **stateful, tape-free** incremental decoder
 //! ([`GradModel::merged_decoder`] → [`CachedDecoder`]) over a snapshot of the
-//! *same* effective weights. The two are pinned equal (position-by-position
-//! logit equivalence) by each implementor's gates; the trait only carries the
-//! obligations.
+//! *same* effective weights. What the decoder's state *is* belongs to the
+//! implementor — a KV cache for pure-attention models, conv + recurrent state
+//! matrices for linear-attention hybrids. The two forwards are pinned equal
+//! (position-by-position logit equivalence) by each implementor's gates; the
+//! trait only carries the obligations.
 
 use candle_core::{Device, Result as CandleResult, Tensor, Var};
 
-/// A KV-cached, grad-free incremental decoder over a snapshot of a
+/// A stateful, grad-free incremental decoder over a snapshot of a
 /// [`GradModel`]'s effective weights.
 ///
 /// Obtained from [`GradModel::merged_decoder`]; consumed by the generic
@@ -31,16 +33,16 @@ use candle_core::{Device, Result as CandleResult, Tensor, Var};
 pub trait CachedDecoder {
     /// Logits `[batch, chunk_len, vocab]` for `input_ids` (`[batch, chunk_len]`,
     /// `u32`) placed at absolute positions `[offset, offset + chunk_len)`,
-    /// appending to the KV cache.
+    /// advancing the decoder state.
     ///
     /// CONTRACT:
     /// - **Every position is returned** (the caller narrows to the last for
     ///   sampling), matching [`GradModel::forward`]'s full-sequence shape.
-    /// - `offset` **must equal the number of tokens already cached** — it
+    /// - `offset` **must equal the number of tokens already consumed** — it
     ///   positions `RoPE` and sizes the causal mask, and a single-token decode
     ///   builds no mask, so a desync would *silently* corrupt the logits rather
     ///   than trip a shape error. An implementation must **fail loud** on a
-    ///   mismatch (return an error, leaving the cache untouched), never decode at
+    ///   mismatch (return an error, leaving the state untouched), never decode at
     ///   the wrong position.
     /// - The output is **tape-free**: no autograd graph is recorded; calling
     ///   `backward` through it must be impossible by construction (the decoder
@@ -48,12 +50,12 @@ pub trait CachedDecoder {
     ///
     /// # Errors
     ///
-    /// Returns a candle error if `offset` does not equal the cached sequence
-    /// length, if any tensor op fails, or if `offset + chunk_len` exceeds the
-    /// model's maximum position.
+    /// Returns a candle error if `offset` does not equal the number of tokens
+    /// already consumed, if any tensor op fails, or if `offset + chunk_len`
+    /// exceeds the model's maximum position.
     fn forward(&mut self, input_ids: &Tensor, offset: usize) -> CandleResult<Tensor>;
 
-    /// Clear the KV cache so the decoder can start a fresh sequence.
+    /// Clear the decoder state so the decoder can start a fresh sequence.
     ///
     /// CONTRACT: after `reset_cache`, the next [`forward`](Self::forward) must
     /// use `offset == 0`, and a replayed sequence must reproduce the same logits

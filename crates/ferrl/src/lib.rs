@@ -105,6 +105,7 @@ pub mod nn;
 pub mod optim;
 pub mod policy;
 pub mod qwen;
+pub mod qwen35;
 pub mod reward;
 pub mod sampler;
 pub mod telemetry;
@@ -138,7 +139,7 @@ pub use grpo::{
 #[doc(inline)]
 pub use llama::{LlamaGradModel, LlamaMergedDecoder};
 #[doc(inline)]
-pub use lm_policy::{LlamaPolicy, LmPolicy, QwenPolicy};
+pub use lm_policy::{LlamaPolicy, LmPolicy, Qwen3_5Policy, QwenPolicy};
 #[doc(inline)]
 pub use model::{CachedDecoder, GradModel};
 #[doc(inline)]
@@ -149,6 +150,11 @@ pub use optim::{FerrlAdamW, OptimizerState};
 pub use policy::Policy;
 #[doc(inline)]
 pub use qwen::{MergedDecoder, QwenGradModel};
+#[doc(inline)]
+pub use qwen35::{
+    varbuilder_from_pretrained, LayerType, LoraTargets, Qwen3_5Config, Qwen3_5GradModel,
+    Qwen3_5MergedDecoder, Qwen3_5TextConfig, RopeParameters, GDN_CHUNK_SIZE,
+};
 #[doc(inline)]
 pub use reward::RewardFn;
 #[doc(inline)]

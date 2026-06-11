@@ -76,6 +76,13 @@ pub type QwenPolicy = LmPolicy<QwenGradModel>;
 /// [`LlamaGradModel`](crate::llama::LlamaGradModel) with zero policy changes.
 pub type LlamaPolicy = LmPolicy<crate::llama::LlamaGradModel>;
 
+/// The policy over the hybrid `qwen3_5` (Qwen3.5 / Qwen3.6) model — the third
+/// [`LmPolicy`] instantiation, and the first whose decoder state is not purely
+/// KV-shaped (conv + delta-rule recurrent state on the linear-attention
+/// layers); the generic policy drives it through the same
+/// [`CachedDecoder`](crate::model::CachedDecoder) contract with zero changes.
+pub type Qwen3_5Policy = LmPolicy<crate::qwen35::Qwen3_5GradModel>;
+
 // Elide the sampler's RNG state and the heavy model fields; show the inspectable
 // scalars. (`GrpoSampler` is `Debug`, but the raw RNG words add only noise.)
 impl<M: GradModel + std::fmt::Debug> std::fmt::Debug for LmPolicy<M> {
