@@ -91,6 +91,10 @@ def conv_case(with_ctx: bool) -> dict:
 
 
 def main() -> None:
+    # The fixtures are a numeric contract: refuse to regenerate under
+    # anything but the pinned oracle stack (see setup_env.sh).
+    assert transformers.__version__ == "5.11.0", transformers.__version__
+    assert torch.__version__.startswith("2.12.0"), torch.__version__
     torch.manual_seed(SEED)
     cases = {
         # Recurrent vs chunked, with and without an initial state. t=130

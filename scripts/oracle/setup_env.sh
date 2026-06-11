@@ -6,12 +6,18 @@
 # logit/fixture dumps need no GPU and the CPU path is deterministic.
 #
 # Run on the login node:  bash scripts/oracle/setup_env.sh
+# Override CONDA_ROOT if conda is not installed at ~/miniconda3.
 set -euo pipefail
 
-CONDA_ROOT="$HOME/private/homefile/miniconda3"
+CONDA_ROOT="${CONDA_ROOT:-$HOME/miniconda3}"
 ENV_NAME="ferrl-oracle"
 TRANSFORMERS_PIN="5.11.0"
+TORCH_PIN="2.12.0"
 
+if [ ! -f "$CONDA_ROOT/etc/profile.d/conda.sh" ]; then
+    echo "error: no conda at CONDA_ROOT=$CONDA_ROOT (set CONDA_ROOT to your conda install)" >&2
+    exit 1
+fi
 # shellcheck disable=SC1091
 source "$CONDA_ROOT/etc/profile.d/conda.sh"
 
@@ -26,11 +32,14 @@ conda activate "$ENV_NAME"
 
 python -m pip install --upgrade pip
 
-# Prefer the CPU-only torch wheel; fall back to the PyPI build if the PyTorch
-# index is unreachable from the cluster.
-if ! python -m pip install --index-url https://download.pytorch.org/whl/cpu "torch==2.*"; then
+# torch is pinned exactly: the fixtures are a numeric contract, and a torch
+# bump can shift the reference numerics — regeneration under a different
+# version must be a deliberate, reviewed act (the Rust gates assert both
+# pins from the fixture metadata). Prefer the CPU-only wheel; fall back to
+# the PyPI build if the PyTorch index is unreachable.
+if ! python -m pip install --index-url https://download.pytorch.org/whl/cpu "torch==$TORCH_PIN"; then
     echo "download.pytorch.org unreachable; falling back to PyPI torch"
-    python -m pip install "torch==2.*"
+    python -m pip install "torch==$TORCH_PIN"
 fi
 
 python -m pip install "transformers==$TRANSFORMERS_PIN" safetensors modelscope
@@ -43,6 +52,7 @@ from transformers.models.qwen3_5 import modeling_qwen3_5 as m
 print("torch", torch.__version__)
 print("transformers", transformers.__version__)
 assert transformers.__version__ == "5.11.0", transformers.__version__
+assert torch.__version__.startswith("2.12.0"), torch.__version__
 for fn in ("torch_chunk_gated_delta_rule", "torch_recurrent_gated_delta_rule"):
     assert hasattr(m, fn), f"missing {fn} in qwen3_5 modeling"
 print("qwen3_5 reference kernels present")

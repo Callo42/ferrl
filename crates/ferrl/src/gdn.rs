@@ -522,6 +522,13 @@ mod tests {
             g["meta"]["transformers"], "5.11.0",
             "fixture regenerated under an unexpected transformers version"
         );
+        // torch is part of the numeric contract too (the reference kernels
+        // run on its CPU stack) — "+cpu" suffix tolerated, 2.12.0 required.
+        let torch = g["meta"]["torch"].as_str().expect("fixture torch version");
+        assert!(
+            torch.starts_with("2.12.0"),
+            "fixture regenerated under an unexpected torch version: {torch}"
+        );
         g
     }
 
