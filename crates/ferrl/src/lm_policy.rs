@@ -80,7 +80,7 @@ pub type LlamaPolicy = LmPolicy<crate::llama::LlamaGradModel>;
 /// [`LmPolicy`] instantiation, and the first whose decoder state is not purely
 /// KV-shaped (conv + delta-rule recurrent state on the linear-attention
 /// layers); the generic policy drives it through the same
-/// [`CachedDecoder`](crate::model::CachedDecoder) contract with zero changes.
+/// [`CachedDecoder`] contract with zero changes.
 pub type Qwen3_5Policy = LmPolicy<crate::qwen35::Qwen3_5GradModel>;
 
 // Elide the sampler's RNG state and the heavy model fields; show the inspectable
