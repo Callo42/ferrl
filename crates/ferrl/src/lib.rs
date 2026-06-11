@@ -28,10 +28,16 @@
 //! - a grad-bearing, uncached `Qwen3` forward ([`qwen`]) — the trainable update
 //!   path, weight-identical to candle's shipped (no-grad) forward; the first
 //!   [`GradModel`] implementor;
+//! - a grad-bearing, uncached dense Llama-3.x forward ([`llama`]) — the second
+//!   [`GradModel`] implementor (plain GQA / rotate-half `RoPE` with optional
+//!   llama3 scaling / `SwiGLU`, no QK-norm, no biases), weight-identical to
+//!   candle's shipped `llama::Llama` and pinned to it by the same per-position
+//!   equivalence oracle — the witness that swapping the model is a bounded,
+//!   gated exercise;
 //! - a [`Policy`] over any [`GradModel`] ([`lm_policy`]) — [`LmPolicy`] wraps a
 //!   grad forward as the trainer's policy seam, with KV-cached, adapter-aware
-//!   rollout; [`QwenPolicy`] is its Qwen3 instantiation, so the same `Trainer`
-//!   drives Qwen3 as the P2 toy;
+//!   rollout; [`QwenPolicy`] and [`LlamaPolicy`] are its instantiations, so the
+//!   same `Trainer` drives Qwen3, Llama, and the P2 toy unchanged;
 //! - a ferrl-owned rollout sampler ([`sampler`]) — [`GrpoSampler`] reproduces
 //!   candle's temperature multinomial sampling on a `serde`-serializable
 //!   `Xoshiro256PlusPlus`, so the rollout RNG can be captured and restored for
@@ -90,6 +96,7 @@ pub mod countdown;
 pub mod cuda_compat;
 pub mod eval;
 pub mod grpo;
+pub mod llama;
 pub mod lm_policy;
 pub mod lora;
 pub mod model;
@@ -123,7 +130,9 @@ pub use grpo::{
     ScaleRewards, GROUP_STD_EPS,
 };
 #[doc(inline)]
-pub use lm_policy::{LmPolicy, QwenPolicy};
+pub use llama::{LlamaGradModel, LlamaMergedDecoder};
+#[doc(inline)]
+pub use lm_policy::{LlamaPolicy, LmPolicy, QwenPolicy};
 #[doc(inline)]
 pub use model::{CachedDecoder, GradModel};
 #[doc(inline)]

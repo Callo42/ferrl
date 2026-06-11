@@ -10,9 +10,15 @@ math, autograd, GPU, and model code** to candle (`candle-core`, `candle-nn`,
 `candle-transformers`). We do not reimplement autodiff or kernels; we orchestrate
 candle's.
 
-> Status: early. The first commit lands the well-tested pure GRPO math and its
-> correctness oracle, plus thin documented stubs for the reward, policy, and LoRA
-> layers. Model forward, rollout, and the trainer follow.
+> Status: the single-GPU training stack works end-to-end and is validated on real
+> hardware — GRPO trainer (gradient accumulation, EOS/length masking,
+> momentum-faithful checkpoint/resume), manual LoRA with a bf16-base / F32-adapter
+> dtype split, a KV-cached merged-weight rollout, and a held-out eval harness.
+> Grad-bearing model forwards exist for **two architectures** — Qwen3 (dense) and
+> dense Llama-3.x — behind the `GradModel`/`CachedDecoder` trait seam, so the same
+> generic policy and trainer drive both unchanged; each forward is pinned against
+> candle's shipped forward by per-position logit-equivalence gates. Multi-GPU data
+> parallelism is the next track.
 
 ---
 
@@ -39,8 +45,15 @@ ferrl/
 ├── scripts/gen_golden.py      # the Python GRPO oracle (regenerates the fixture)
 ├── .github/workflows/ci.yml   # CPU-only CI gate
 └── crates/ferrl/
-    ├── src/{lib,grpo,telemetry,reward,policy,lora}.rs
-    └── tests/fixtures/grpo_golden.json   # committed oracle output
+    ├── src/
+    │   ├── grpo.rs                          # GRPO math (advantages, k3 KL, surrogate)
+    │   ├── trainer.rs  eval.rs              # training loop + held-out eval harness
+    │   ├── lora.rs  optim.rs  sampler.rs  checkpoint.rs
+    │   ├── model.rs                         # the GradModel / CachedDecoder trait seam
+    │   ├── qwen.rs  llama.rs  blocks.rs     # the model layer (grad forwards + cached decoders)
+    │   ├── lm_policy.rs                     # Policy over any GradModel (QwenPolicy, LlamaPolicy)
+    │   └── {lib,policy,reward,nn,tokenizer,countdown,telemetry,cuda_compat}.rs
+    └── tests/fixtures/grpo_golden.json      # committed oracle output
 ```
 
 ---
@@ -73,14 +86,20 @@ Because ferrl no longer owns autodiff, correctness is pinned against references:
    `scripts/gen_golden.py`. The Rust test `grpo::tests::matches_golden_fixture`
    loads it and asserts agreement (scaled **and** unscaled advantages). See
    [Oracle](#oracle--golden-fixture).
-2. **Model forward vs candle's shipped forward** — *planned*, with the model layer.
+2. **Model forward vs candle's shipped forward** — per-position logit-equivalence
+   gates load our grad-bearing forward and candle's shipped one from the **same**
+   weights and compare at **every** position, for both Qwen3 and dense Llama-3.x
+   (tiny seeded CPU configs in CI; a real-weights Qwen3-0.6B gate runs manually on
+   GPU). The cached merged-weight decoders are pinned the same way against both the
+   uncached forwards and candle's shipped KV-cached path.
 3. **Grad-coverage canary** (`lora::tests::grad_coverage_canary_contract`) — guards a
    real footgun: candle optimizers **silently skip** any parameter missing from the
    `GradStore`. The contract is init-dependent: at standard zero-`B` init only `B`
    is guaranteed a non-zero gradient (`A`'s is legitimately ~0); after a non-zero-`B`
    step **both** `A` and `B` must be present and non-zero.
-4. **End-to-end finite-difference gradcheck** of the loss w.r.t. the LoRA params —
-   *planned*, with the trainer.
+4. **End-to-end finite-difference gradcheck** of the exact production GRPO loss
+   w.r.t. the LoRA params (both clip branches × both advantage signs, k3 KL, masked
+   and ragged completion masks, both reductions), hermetic in f64.
 
 ---
 

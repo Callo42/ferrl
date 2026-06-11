@@ -70,6 +70,12 @@ pub struct LmPolicy<M: GradModel> {
 /// instantiation (and the name every pre-M1 call site uses).
 pub type QwenPolicy = LmPolicy<QwenGradModel>;
 
+/// The policy over a dense Llama-3.x model — the second [`LmPolicy`]
+/// instantiation, and the witness that the [`GradModel`] seam is real: the same
+/// generic policy (and through it the same `Trainer`) drives
+/// [`LlamaGradModel`](crate::llama::LlamaGradModel) with zero policy changes.
+pub type LlamaPolicy = LmPolicy<crate::llama::LlamaGradModel>;
+
 // Elide the sampler's RNG state and the heavy model fields; show the inspectable
 // scalars. (`GrpoSampler` is `Debug`, but the raw RNG words add only noise.)
 impl<M: GradModel + std::fmt::Debug> std::fmt::Debug for LmPolicy<M> {
@@ -538,8 +544,13 @@ mod tests {
     /// reproduce the uncached oracle's token stream **and** consume an identical
     /// amount of sampler RNG (same draw count — which the RNG-state equality proves,
     /// since each draw advances the RNG a fixed amount regardless of the token). Runs
-    /// both paths from the *same* saved sampler state on one policy.
-    fn assert_cached_matches_uncached(policy: &mut QwenPolicy, prompt: &[u32], cfg: &GenConfig) {
+    /// both paths from the *same* saved sampler state on one policy. Generic
+    /// over the model — the Llama gates below reuse it verbatim.
+    fn assert_cached_matches_uncached<M: GradModel>(
+        policy: &mut LmPolicy<M>,
+        prompt: &[u32],
+        cfg: &GenConfig,
+    ) {
         let start = policy.sampler_state().unwrap();
         let cached = policy.generate(prompt, cfg).unwrap();
         let after_cached = policy.sampler_state().unwrap();
@@ -900,6 +911,184 @@ mod tests {
         assert!(
             history.iter().any(|m| m.grad_norm > 0.0),
             "no AdamW step ran — the Qwen backward path was never exercised"
+        );
+        // The adapter is restored enabled after the (reference-toggling) run.
+        assert!(policy.adapter_enabled());
+    }
+
+    // ---- LlamaPolicy: the M1 second-implementor gates ------------------------
+    //
+    // Everything below reuses the GENERIC machinery above unchanged
+    // (`assert_cached_matches_uncached`, `force_b_nonzero`, the codec/reward/
+    // trainer scaffold) — only the model construction is Llama-specific. That
+    // reuse IS the point: it witnesses that the `GradModel` seam, not the test
+    // code, carries the architecture difference.
+
+    use crate::llama::LlamaGradModel;
+    use candle_transformers::models::llama::Config as LlamaConfig;
+
+    /// A tiny dense-Llama config (2 layers, 2 Q / 1 KV head → real GQA, derived
+    /// `head_dim` 4) — the same scaffold llama.rs's tests use.
+    fn llama_tiny_cfg() -> LlamaConfig {
+        LlamaConfig {
+            hidden_size: 8,
+            intermediate_size: 16,
+            vocab_size: 16,
+            num_hidden_layers: 2,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            use_flash_attn: false,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10000.0,
+            bos_token_id: None,
+            eos_token_id: None,
+            rope_scaling: None,
+            max_position_embeddings: 32,
+            tie_word_embeddings: true,
+        }
+    }
+
+    /// Random weights matching the llama dotted tensor names (tied head → no
+    /// `lm_head.weight`; no QK-norm tensors, no biases).
+    fn llama_weight_map(cfg: &LlamaConfig) -> HashMap<String, Tensor> {
+        let d = Device::Cpu;
+        let mut t: HashMap<String, Tensor> = HashMap::new();
+        let mut put = |name: &str, dims: &[usize]| {
+            t.insert(
+                name.to_string(),
+                Tensor::randn(0f32, 0.2f32, dims.to_vec(), &d).unwrap(),
+            );
+        };
+        let h = cfg.hidden_size;
+        let i = cfg.intermediate_size;
+        let head_dim = cfg.hidden_size / cfg.num_attention_heads;
+        let qo = cfg.num_attention_heads * head_dim;
+        let kvo = cfg.num_key_value_heads * head_dim;
+        put("model.embed_tokens.weight", &[cfg.vocab_size, h]);
+        put("model.norm.weight", &[h]);
+        for l in 0..cfg.num_hidden_layers {
+            let p = format!("model.layers.{l}");
+            put(&format!("{p}.input_layernorm.weight"), &[h]);
+            put(&format!("{p}.post_attention_layernorm.weight"), &[h]);
+            put(&format!("{p}.self_attn.q_proj.weight"), &[qo, h]);
+            put(&format!("{p}.self_attn.k_proj.weight"), &[kvo, h]);
+            put(&format!("{p}.self_attn.v_proj.weight"), &[kvo, h]);
+            put(&format!("{p}.self_attn.o_proj.weight"), &[h, qo]);
+            put(&format!("{p}.mlp.gate_proj.weight"), &[i, h]);
+            put(&format!("{p}.mlp.up_proj.weight"), &[i, h]);
+            put(&format!("{p}.mlp.down_proj.weight"), &[h, i]);
+        }
+        t
+    }
+
+    fn llama_tiny_policy() -> LlamaPolicy {
+        let cfg = llama_tiny_cfg();
+        let vb = VarBuilder::from_tensors(llama_weight_map(&cfg), DType::F32, &Device::Cpu);
+        let model = LlamaGradModel::load(&cfg, &vb, 2, 4.0).unwrap();
+        LlamaPolicy::new(model, 7, 1.0)
+    }
+
+    /// Two Llama policies sharing the SAME base weights and sampler seed (the
+    /// same determinism device as [`paired_policies`] — see there for why).
+    fn llama_paired_policies() -> (LlamaPolicy, LlamaPolicy) {
+        let cfg = llama_tiny_cfg();
+        let weights = llama_weight_map(&cfg);
+        let build = || {
+            let vb = VarBuilder::from_tensors(weights.clone(), DType::F32, &Device::Cpu);
+            let model = LlamaGradModel::load(&cfg, &vb, 2, 4.0).unwrap();
+            LlamaPolicy::new(model, 7, 1.0)
+        };
+        (build(), build())
+    }
+
+    #[test]
+    fn llama_cached_generate_matches_uncached_adapter_on() {
+        // Armed adapter (B != 0): the cached path must reproduce the
+        // ADAPTER-AWARE uncached stream, not merely the base one.
+        let mut policy = llama_tiny_policy();
+        force_b_nonzero(&policy.trainable_vars());
+        assert!(policy.adapter_enabled());
+        let cfg = GenConfig {
+            group_size: 4,
+            max_new_tokens: 6,
+            temperature: 1.0,
+            eos_token_id: None,
+        };
+        assert_cached_matches_uncached(&mut policy, &[1u32, 2, 3], &cfg);
+    }
+
+    #[test]
+    fn llama_cached_generate_matches_uncached_adapter_off() {
+        // The eval path: adapter disabled => the snapshot is the pure base model.
+        let mut policy = llama_tiny_policy();
+        force_b_nonzero(&policy.trainable_vars()); // armed, but...
+        policy.set_adapter_enabled(false); // ...disabled => base only
+        let cfg = GenConfig {
+            group_size: 3,
+            max_new_tokens: 5,
+            temperature: 1.0,
+            eos_token_id: None,
+        };
+        assert_cached_matches_uncached(&mut policy, &[2u32, 4, 1], &cfg);
+    }
+
+    #[test]
+    fn llama_cached_generate_matches_uncached_with_eos() {
+        // EOS early-stop + right-pad identical between paths, with matching
+        // sampler-RNG consumption (same deterministic paired-probe pattern as
+        // the Qwen gate).
+        let prompt = [1u32, 2, 3];
+        let max_new = 5usize;
+        let (mut probe, mut policy) = llama_paired_policies();
+        let base = GenConfig {
+            group_size: 4,
+            max_new_tokens: max_new,
+            temperature: 1.0,
+            eos_token_id: None,
+        };
+        let eos = probe.generate_uncached(&prompt, &base).unwrap().token_ids[0][prompt.len()];
+        let cfg_eos = GenConfig {
+            eos_token_id: Some(eos),
+            ..base
+        };
+        assert_cached_matches_uncached(&mut policy, &prompt, &cfg_eos);
+    }
+
+    #[test]
+    fn llama_drives_a_grpo_step_through_the_trainer_on_cpu() {
+        // THE M1 extended reusability gate: the SAME `Trainer` (and the same
+        // codec + reward scaffold) that drives the P2 echo toy and the Qwen
+        // policy drives `LmPolicy<LlamaGradModel>` UNCHANGED — rollout via the
+        // Llama merged decoder, reward, advantages, backward THROUGH the Llama
+        // forward, grad-coverage canary, FerrlAdamW. `grad_norm > 0` witnesses
+        // a real optimizer step (no learning-curve assertion — the platform-
+        // dependence lesson); beta > 0 routes the adapter-disabled KL reference
+        // forward through the Llama path too.
+        let mut policy = llama_tiny_policy();
+        let prompts = vec!["abc".to_string(), "bcd".to_string()];
+        let cfg = TrainerConfig {
+            steps: 4,
+            group_size: 6,
+            max_new_tokens: 4,
+            temperature: 1.0,
+            beta: 0.02,
+            lr: 1e-3,
+            ..TrainerConfig::default()
+        };
+        let tmp = TempDir::new();
+        let run = RunDir::create(&tmp.0, "llama-cpu").unwrap();
+        let mut trainer = Trainer::new(cfg, &run).unwrap();
+        let history = trainer
+            .train(&mut policy, &SpreadReward, &CharCodec, &prompts)
+            .unwrap();
+
+        assert_eq!(history.len(), 4);
+        for m in &history {
+            assert_step_metrics_ok(m);
+        }
+        assert!(
+            history.iter().any(|m| m.grad_norm > 0.0),
+            "no AdamW step ran — the Llama backward path was never exercised"
         );
         // The adapter is restored enabled after the (reference-toggling) run.
         assert!(policy.adapter_enabled());
