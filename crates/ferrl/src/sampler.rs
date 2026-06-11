@@ -140,16 +140,23 @@ impl GrpoSampler {
     ///
     /// # Errors
     ///
-    /// Returns a candle error if a tensor op fails, if `top_p` is not in
-    /// `(0, 1]`, or if the (filtered) probabilities are not a valid categorical
-    /// distribution (e.g. all-zero or non-finite weights, which `WeightedIndex`
-    /// rejects) — the same failure modes as candle's sampler.
+    /// Returns a candle error if a tensor op fails, if `temperature` is not
+    /// finite and `> 0`, if `top_p` is not in `(0, 1]`, or if the (filtered)
+    /// probabilities are not a valid categorical distribution (e.g. all-zero or
+    /// non-finite weights, which `WeightedIndex` rejects) — the same failure
+    /// modes as candle's sampler.
     pub fn sample_with(
         &mut self,
         logits: &Tensor,
         temperature: f64,
         top_p: Option<f64>,
     ) -> CandleResult<(u32, f32)> {
+        // Fail loud on a malformed temperature, mirroring the top_p validation: a
+        // negative one would silently sample the INVERTED distribution, and 0/NaN
+        // only surface as an opaque WeightedIndex error downstream.
+        if !temperature.is_finite() || temperature <= 0.0 {
+            candle_core::bail!("temperature must be finite and > 0, got {temperature}");
+        }
         let logits = logits.to_dtype(DType::F32)?;
         let logits = (&logits / temperature)?;
         let mut prs: Vec<f32> = candle_nn::ops::softmax_last_dim(&logits)?.to_vec1()?;
@@ -179,14 +186,22 @@ fn nucleus_filter(prs: &mut [f32], top_p: f64) -> CandleResult<()> {
     if !top_p.is_finite() || top_p <= 0.0 || top_p > 1.0 {
         candle_core::bail!("top_p must be in (0, 1], got {top_p}");
     }
+    // `1.0` means keep everything — exactly, not "until the cumulative crosses
+    // 1": an f64 cum of f32 probs can exceed 1 before the last token (rounding),
+    // which would zero a genuinely sampleable tail and falsify the documented
+    // `Some(1.0) == None` equivalence.
+    if top_p >= 1.0 {
+        return Ok(());
+    }
     let mut idx: Vec<usize> = (0..prs.len()).collect();
-    idx.sort_by(|&a, &b| {
-        prs[b]
-            .partial_cmp(&prs[a])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    // `total_cmp`, not `partial_cmp`: a NaN probability (e.g. all `-inf` logits)
+    // must not hand `sort_by` a broken total order (which may PANIC since Rust
+    // 1.81); under the total order NaN just sorts to one end, the cumulative
+    // goes NaN, the keep-all fallback engages, and `WeightedIndex` then rejects
+    // the weights with the same error the unfiltered path reports.
+    idx.sort_by(|&a, &b| prs[b].total_cmp(&prs[a]));
     let mut cum = 0.0_f64;
-    // Fallback: keep everything (top_p == 1.0 may never cross an f32 sum < 1).
+    // Fallback: keep everything (defensive — reachable only via NaN, see above).
     let mut keep = idx.len();
     for (rank, &i) in idx.iter().enumerate() {
         cum += f64::from(prs[i]);
@@ -342,8 +357,11 @@ mod tests {
     /// returned log-prob is renormalized over that nucleus.
     #[test]
     fn top_p_samples_only_the_nucleus_and_renormalizes_the_logprob() {
-        // p = [0.5, 0.3, 0.15, 0.05] via logits = ln(p): cum after 2 tokens is
-        // 0.8, so top_p = 0.8 keeps exactly {0, 1} (crossing token included).
+        // p = [0.5, 0.3, 0.15, 0.05] via logits = ln(p): the cumulative after 2
+        // tokens is 0.8, so top_p = 0.75 — strictly BETWEEN the rank-1 (0.5) and
+        // rank-2 (0.8) cumulatives, not on the float boundary — keeps exactly
+        // {0, 1} (the crossing token included), regardless of libm ln/exp
+        // rounding in the round-trip.
         let p = [0.5f32, 0.3, 0.15, 0.05];
         let logits = Tensor::from_vec(
             p.iter().map(|x| x.ln()).collect::<Vec<f32>>(),
@@ -353,8 +371,9 @@ mod tests {
         .unwrap();
         let mut s = GrpoSampler::new(5, 1.0);
         for _ in 0..64 {
-            let (tok, lp) = s.sample_with(&logits, 1.0, Some(0.8)).unwrap();
+            let (tok, lp) = s.sample_with(&logits, 1.0, Some(0.75)).unwrap();
             assert!(tok < 2, "token {tok} sampled outside the nucleus {{0, 1}}");
+            // The renormalization mass is the KEPT mass (0.5 + 0.3), not top_p.
             let want = (p[tok as usize] / 0.8).ln();
             assert!(
                 (lp - want).abs() <= 1e-4,
@@ -363,15 +382,18 @@ mod tests {
         }
     }
 
-    /// `top_p = 1.0` keeps every token: the draw stream is bit-identical to the
-    /// unfiltered path from the same seed (the keep-all fallback, since an f32
-    /// probability sum may never reach exactly 1.0).
+    /// `top_p = 1.0` keeps every token — exactly (the `>= 1.0` early return),
+    /// so the draw stream is bit-identical to the unfiltered path from the same
+    /// seed. Skewed logits on purpose: a long low-probability tail is the case
+    /// where an f64 cumulative of f32 probs can cross 1.0 *early* and a naive
+    /// filter would zero genuinely sampleable tokens.
     #[test]
     fn top_p_one_is_identical_to_no_filter() {
-        let logits = Tensor::from_vec(vec![0f32; 64], 64, &Device::Cpu).unwrap();
+        let skewed: Vec<f32> = (0..64).map(|i| -(i as f32) * 0.25).collect();
+        let logits = Tensor::from_vec(skewed, 64, &Device::Cpu).unwrap();
         let mut a = GrpoSampler::new(7, 1.0);
         let mut b = GrpoSampler::new(7, 1.0);
-        for _ in 0..16 {
+        for _ in 0..32 {
             let (ta, la) = a.sample_with(&logits, 1.0, None).unwrap();
             let (tb, lb) = b.sample_with(&logits, 1.0, Some(1.0)).unwrap();
             assert_eq!(ta, tb, "top_p = 1.0 changed the draw stream");
@@ -391,6 +413,32 @@ mod tests {
                 "top_p = {bad} must be rejected"
             );
         }
+    }
+
+    /// A malformed temperature fails loud: a negative one would silently sample
+    /// the inverted distribution, 0/NaN an opaque downstream error.
+    #[test]
+    fn malformed_temperature_is_rejected() {
+        let logits = Tensor::from_vec(vec![0f32; 8], 8, &Device::Cpu).unwrap();
+        let mut s = GrpoSampler::new(1, 1.0);
+        for bad in [0.0, -0.7, f64::NAN, f64::INFINITY] {
+            assert!(
+                s.sample_with(&logits, bad, None).is_err(),
+                "temperature = {bad} must be rejected"
+            );
+        }
+    }
+
+    /// Non-finite probabilities on the NUCLEUS path must return an error like
+    /// the unfiltered path does — not hand `sort_by` a broken total order
+    /// (which may panic): all `-inf` logits softmax to NaN; `total_cmp` keeps
+    /// the sort lawful and `WeightedIndex` then rejects the weights.
+    #[test]
+    fn non_finite_probs_error_rather_than_panic_under_top_p() {
+        let logits = Tensor::from_vec(vec![f32::NEG_INFINITY; 8], 8, &Device::Cpu).unwrap();
+        let mut s = GrpoSampler::new(1, 1.0);
+        assert!(s.sample_with(&logits, 1.0, None).is_err());
+        assert!(s.sample_with(&logits, 1.0, Some(0.5)).is_err());
     }
 
     /// Different seeds diverge (the RNG is actually seeded, not constant).

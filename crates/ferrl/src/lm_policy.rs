@@ -151,6 +151,10 @@ impl<M: GradModel> LmPolicy<M> {
     /// consumption exactly. Test-only; the production path is `generate`.
     #[cfg(test)]
     fn generate_uncached(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
+        // Resolve the sampling parameters exactly as `generate` does, so the
+        // oracle also covers the eval-override decode path (a cached-vs-uncached
+        // gate with `eval_sampling: Some(..)` compares the same distribution).
+        let (temperature, top_p) = self.resolve_sampling(cfg)?;
         let device = self.model.device().clone();
         let prompt_len = prompt.len();
         let width = prompt_len + cfg.max_new_tokens;
@@ -166,7 +170,7 @@ impl<M: GradModel> LmPolicy<M> {
                 let input = Tensor::from_vec(ids.clone(), (1, len), &device)?;
                 let logits = self.model.forward(&input)?;
                 let last = logits.i((0, len - 1))?;
-                let (next, logprob) = self.sampler.sample_with(&last, self.temperature, None)?;
+                let (next, logprob) = self.sampler.sample_with(&last, temperature, top_p)?;
                 ids.push(next);
                 logprobs.push(logprob);
                 if cfg.eos_token_id == Some(next) {
@@ -205,6 +209,14 @@ impl<M: GradModel> LmPolicy<M> {
                         "eval_sampling.temperature must be finite and > 0, got {}",
                         eval.temperature
                     );
+                }
+                // Validate top_p HERE, not first at draw time inside the sampler:
+                // by then the O(params) merged-weight build and the prompt prefill
+                // have already been paid for a config that was never valid.
+                if let Some(p) = eval.top_p {
+                    if !p.is_finite() || p <= 0.0 || p > 1.0 {
+                        candle_core::bail!("eval_sampling.top_p must be in (0, 1], got {p}");
+                    }
                 }
                 Ok((eval.temperature, eval.top_p))
             }
@@ -404,7 +416,22 @@ impl<M: GradModel> Policy for LmPolicy<M> {
     }
 
     fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
-        self.sampler = GrpoSampler::from_state_bytes(state)?;
+        let restored = GrpoSampler::from_state_bytes(state)?;
+        // The blob bakes the temperature it was checkpointed at. This policy
+        // scores (and samples) at ITS OWN temperature, so a mismatched blob is a
+        // cross-run restore the trait contract promises to fail loud on — the
+        // restored RNG would otherwise continue a token stream the scorer
+        // doesn't score (pre-R2 the blob's temperature silently won; post-R2 the
+        // policy's silently would — neither is acceptable, so reject).
+        if (restored.temperature() - self.temperature).abs() > f64::EPSILON {
+            candle_core::bail!(
+                "sampler state was checkpointed at temperature {} but this policy runs at {}; \
+                 rebuild the policy with the checkpoint's temperature to resume it",
+                restored.temperature(),
+                self.temperature
+            );
+        }
+        self.sampler = restored;
         Ok(())
     }
 
@@ -882,16 +909,113 @@ mod tests {
             ..cfg
         };
         assert!(policy.generate(&[1u32, 2, 3], &train_cfg).is_err());
+    }
 
-        // A malformed override temperature fails loud too.
+    #[test]
+    fn malformed_eval_override_fails_before_decoding() {
+        // A malformed override temperature or top_p fails loud — BEFORE the
+        // merged-decoder build (resolve_sampling validates both).
+        let mut policy = tiny_policy();
+        let base = GenConfig {
+            group_size: 2,
+            max_new_tokens: 2,
+            temperature: 1.0,
+            eos_token_id: None,
+            eval_sampling: None,
+        };
         let bad = GenConfig {
             eval_sampling: Some(crate::policy::EvalSampling {
                 temperature: 0.0,
                 top_p: None,
             }),
-            ..cfg
+            ..base
         };
         assert!(policy.generate(&[1u32, 2, 3], &bad).is_err());
+        let bad_p = GenConfig {
+            eval_sampling: Some(crate::policy::EvalSampling {
+                temperature: 0.6,
+                top_p: Some(1.5),
+            }),
+            ..base
+        };
+        assert!(policy.generate(&[1u32, 2, 3], &bad_p).is_err());
+    }
+
+    #[test]
+    fn eval_override_values_actually_reach_the_sampler() {
+        // The mutation-killer for the override plumbing: a resolve_sampling that
+        // validates but then samples the TRAINING parameters passes the no-bail
+        // test above — this one it cannot pass. With top_p so small that only
+        // the argmax survives, every draw's nucleus is a single token, so every
+        // captured behavior log-prob is EXACTLY ln(p/p) = 0.0 and every group
+        // member decodes the identical greedy stream. Without the override
+        // plumbed, the full-softmax probabilities over a 16-token vocab make
+        // every log-prob strictly negative.
+        let mut policy = tiny_policy();
+        let cfg = GenConfig {
+            group_size: 3,
+            max_new_tokens: 4,
+            temperature: 1.0,
+            eos_token_id: None,
+            eval_sampling: Some(crate::policy::EvalSampling {
+                temperature: 0.5,
+                top_p: Some(1e-6),
+            }),
+        };
+        let r = policy.generate(&[1u32, 2, 3], &cfg).unwrap();
+        let captured = r.rollout_logprobs.as_ref().expect("capture present");
+        for (i, row) in captured.iter().enumerate() {
+            for (j, &lp) in row.iter().enumerate() {
+                assert_eq!(
+                    lp, 0.0,
+                    "seq {i} draw {j}: argmax-nucleus logprob must be exactly 0, got {lp} \
+                     (override top_p did not reach the sampler?)"
+                );
+            }
+        }
+        assert!(
+            r.token_ids.iter().all(|ids| ids == &r.token_ids[0]),
+            "argmax-nucleus decoding must be greedy-deterministic across the group"
+        );
+    }
+
+    #[test]
+    fn cached_generate_matches_uncached_under_the_eval_override() {
+        // The override decode path gets the same cached-vs-uncached equivalence
+        // gate as the training path: same token stream, same RNG consumption,
+        // logprobs within merge-reassociation tolerance (the uncached oracle
+        // resolves the override exactly like generate does).
+        let mut policy = tiny_policy();
+        force_b_nonzero(&policy.trainable_vars());
+        let cfg = GenConfig {
+            group_size: 3,
+            max_new_tokens: 5,
+            temperature: 1.0,
+            eos_token_id: None,
+            eval_sampling: Some(crate::policy::EvalSampling {
+                temperature: 0.7,
+                top_p: Some(0.9),
+            }),
+        };
+        assert_cached_matches_uncached(&mut policy, &[2u32, 4, 1], &cfg);
+    }
+
+    #[test]
+    fn restore_rejects_a_mismatched_sampler_temperature() {
+        // The blob bakes the temperature it was checkpointed at; restoring it
+        // into a policy scoring at a DIFFERENT temperature must fail loud (the
+        // Policy trait's documented contract) instead of silently continuing a
+        // token stream the scorer doesn't score.
+        let mut policy = tiny_policy(); // T = 1.0
+        let foreign = GrpoSampler::new(5, 0.7).to_state_bytes().unwrap();
+        let err = policy.restore_sampler_state(&foreign).unwrap_err();
+        assert!(
+            err.to_string().contains("temperature"),
+            "expected a temperature-mismatch error, got: {err}"
+        );
+        // A matching-temperature blob restores fine.
+        let matching = GrpoSampler::new(5, 1.0).to_state_bytes().unwrap();
+        policy.restore_sampler_state(&matching).unwrap();
     }
 
     #[test]
@@ -1247,24 +1371,42 @@ mod tests {
             .unwrap();
         assert_eq!(history.len(), 3);
         for m in &history {
-            assert!(
-                (m.rollout_ratio_mean - 1.0).abs() <= 1e-3,
-                "step {}: rollout_ratio_mean {} far from 1 on an F32 model",
-                m.step,
-                m.rollout_ratio_mean
-            );
-            assert!(
-                (m.rollout_ratio_max - 1.0).abs() <= 1e-3,
-                "step {}: rollout_ratio_max {} far from 1 on an F32 model",
-                m.step,
-                m.rollout_ratio_max
-            );
-            assert_eq!(
-                m.frac_rollout_ratio_capped, 0.0,
-                "step {}: no token can sit above the TIS cap on an F32 model",
-                m.step
-            );
+            assert_on_policy_ratio_metrics(m);
         }
+    }
+
+    /// Per-step assertions for an all-F32 (reassociation-only) run: ratio
+    /// mean/max hard against 1, the drift meter against 0, nothing capped, and
+    /// the telemetry not dark.
+    fn assert_on_policy_ratio_metrics(m: &crate::telemetry::Metrics) {
+        assert!(
+            (m.rollout_ratio_mean - 1.0).abs() <= 1e-3,
+            "step {}: rollout_ratio_mean {} far from 1 on an F32 model",
+            m.step,
+            m.rollout_ratio_mean
+        );
+        assert!(
+            (m.rollout_ratio_max - 1.0).abs() <= 1e-3,
+            "step {}: rollout_ratio_max {} far from 1 on an F32 model",
+            m.step,
+            m.rollout_ratio_max
+        );
+        assert_eq!(
+            m.frac_rollout_ratio_capped, 0.0,
+            "step {}: no token can sit above the TIS cap on an F32 model",
+            m.step
+        );
+        assert!(
+            m.rollout_logratio_mean.abs() <= 1e-3,
+            "step {}: drift meter {} far from 0 on an F32 model",
+            m.step,
+            m.rollout_logratio_mean
+        );
+        assert!(
+            m.rollout_capture_tokens > 0,
+            "step {}: telemetry must not be dark — the policy captures",
+            m.step
+        );
     }
 
     #[test]
@@ -1297,6 +1439,140 @@ mod tests {
         assert!(
             history.iter().any(|m| m.grad_norm > 0.0),
             "no optimizer step ran under TIS"
+        );
+    }
+
+    /// A [`Policy`] wrapper that shifts every captured behavior log-prob DOWN
+    /// by a constant `delta` — claiming the rollout assigned `e^delta`-times
+    /// less mass to each token than it actually did — so the train/rollout
+    /// ratio is `e^delta` (× merge-reassociation noise) at every loss token by
+    /// construction: a deterministic off-policy injection for the end-to-end
+    /// TIS / telemetry gates.
+    struct ShiftedCapture<P: Policy> {
+        inner: P,
+        delta: f32,
+    }
+
+    impl<P: Policy> Policy for ShiftedCapture<P> {
+        fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
+            let mut r = self.inner.generate(prompt, cfg)?;
+            if let Some(rows) = &mut r.rollout_logprobs {
+                for row in rows {
+                    for lp in row {
+                        *lp -= self.delta;
+                    }
+                }
+            }
+            Ok(r)
+        }
+        fn token_logprobs(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+            self.inner.token_logprobs(rollout)
+        }
+        fn set_adapter_enabled(&mut self, enabled: bool) {
+            self.inner.set_adapter_enabled(enabled);
+        }
+        fn adapter_enabled(&self) -> bool {
+            self.inner.adapter_enabled()
+        }
+        fn trainable_vars(&self) -> Vec<Var> {
+            self.inner.trainable_vars()
+        }
+        fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+            self.inner.sampler_state()
+        }
+        fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
+            self.inner.restore_sampler_state(state)
+        }
+        fn lora_recipe(&self) -> Option<String> {
+            self.inner.lora_recipe()
+        }
+    }
+
+    /// Per-run assertions for the δ-shifted capture: ratio mean at e^δ (and
+    /// NOT e^{−δ} — the direction pin), the drift meter at +δ, every loss
+    /// token above the cap, telemetry not dark.
+    fn assert_shifted_ratio_metrics(m: &crate::telemetry::Metrics, delta: f32) {
+        assert!(
+            (m.rollout_ratio_mean - 2.0).abs() <= 2e-3,
+            "ratio mean {} != e^ln2 = 2 (direction/magnitude)",
+            m.rollout_ratio_mean
+        );
+        assert!(
+            (m.rollout_logratio_mean - delta).abs() <= 1e-3,
+            "drift meter {} != +ln2",
+            m.rollout_logratio_mean
+        );
+        assert_eq!(
+            m.frac_rollout_ratio_capped, 1.0,
+            "every token sits above the cap by construction"
+        );
+        assert!(m.rollout_capture_tokens > 0);
+    }
+
+    #[test]
+    fn tis_and_ratio_telemetry_verified_end_to_end_with_a_shifted_capture() {
+        // δ-shifted capture ⇒ every loss token's ratio is e^δ ≈ 2; with cap
+        // C = 1.5 < e^δ, EVERY token caps. Through Trainer::train this pins:
+        //   (1) the ratio DIRECTION (a swapped exp(b−a) would read e^{−δ} = ½);
+        //   (2) the log-ratio drift meter (≈ +δ);
+        //   (3) the capped-fraction wiring (≡ 1.0) and the token count;
+        //   (4) the TIS weight reaching the GRADIENT: uniformly capped weights
+        //       make the first step's pre-clip grad_norm exactly C × the
+        //       tis-off run's (paired policies ⇒ identical rollouts/logp_old).
+        // A dropped `tis_w` (the one-line mutant), a swapped ratio, or a
+        // disconnected capped-fraction all redden this test.
+        let delta = std::f64::consts::LN_2;
+        let cap = 1.5_f64;
+        let (p_a, p_b) = paired_policies();
+        // paired_policies shares the BASE weights and sampler seed, but each
+        // policy draws its own random LoRA A factors — invisible to the forward
+        // at B = 0 (so rollouts/logp_old still match), yet dL/dB ∝ A, so the
+        // grad-norm comparison below needs the adapters synced too.
+        for (va, vb) in p_a.trainable_vars().iter().zip(p_b.trainable_vars()) {
+            vb.set(va.as_tensor()).unwrap();
+        }
+        let mut off = ShiftedCapture {
+            inner: p_a,
+            delta: delta as f32,
+        };
+        let mut on = ShiftedCapture {
+            inner: p_b,
+            delta: delta as f32,
+        };
+        let prompts = vec!["abc".to_string(), "bcd".to_string()];
+        let cfg = |tis: bool| TrainerConfig {
+            steps: 1,
+            group_size: 6,
+            max_new_tokens: 4,
+            temperature: 1.0,
+            lr: 1e-3,
+            tis,
+            tis_imp_ratio_cap: cap,
+            ..TrainerConfig::default()
+        };
+        let tmp = TempDir::new();
+        let run_off = RunDir::create(&tmp.0, "tis-off").unwrap();
+        let m_off = Trainer::new(cfg(false), &run_off)
+            .unwrap()
+            .train(&mut off, &SpreadReward, &CharCodec, &prompts)
+            .unwrap()
+            .remove(0);
+        let run_on = RunDir::create(&tmp.0, "tis-on").unwrap();
+        let m_on = Trainer::new(cfg(true), &run_on)
+            .unwrap()
+            .train(&mut on, &SpreadReward, &CharCodec, &prompts)
+            .unwrap()
+            .remove(0);
+
+        for m in [&m_off, &m_on] {
+            assert_shifted_ratio_metrics(m, delta as f32);
+        }
+        // (4) the weight scales the gradient.
+        assert!(m_off.grad_norm > 0.0, "tis-off run must take a real step");
+        let scale = m_on.grad_norm / m_off.grad_norm;
+        assert!(
+            (f64::from(scale) - cap).abs() <= 1e-3,
+            "grad_norm scaled by {scale}, want exactly the cap {cap}"
         );
     }
 

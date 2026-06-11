@@ -38,12 +38,19 @@ pub struct Rollout {
     /// draw; EOS padding was never sampled, so it carries no log-prob).
     ///
     /// `None` when the policy does not capture them (toy/test policies;
-    /// [`Rollout::rectangular`] always sets `None`). When present, the trainer
-    /// compares them against its own scoring forward to surface the
-    /// rollout-vs-train mismatch (the off-policy gap a cached/merged — possibly
-    /// bf16 — decode path opens against the f32 uncached scoring forward) as
-    /// ratio telemetry, and optionally corrects the surrogate with truncated
-    /// importance sampling (TIS).
+    /// [`Rollout::rectangular`] always sets `None`; capturing policies construct
+    /// via [`Rollout::new`]). When present, the trainer compares them against
+    /// its own scoring forward to surface the rollout-vs-train mismatch (the
+    /// off-policy gap a cached/merged — possibly bf16 — decode path opens
+    /// against the f32 uncached scoring forward) as ratio telemetry, and
+    /// optionally corrects the surrogate with truncated importance sampling
+    /// (TIS).
+    ///
+    /// Precision note: the captured value is `ln(p / Σp)` over the sampler's
+    /// f32 probabilities — the exact distribution `WeightedIndex` drew from —
+    /// which differs from an f32 `log_softmax` recomputation by the rounding of
+    /// the probability sum (~1e-5 over a real vocab). Don't over-interpret
+    /// sub-1e-5 ratio readings.
     pub rollout_logprobs: Option<Vec<Vec<f32>>>,
 }
 
@@ -70,6 +77,28 @@ impl Rollout {
         }
     }
 
+    /// Construct a rollout from all of its parts — the constructor for policies
+    /// that capture behavior log-probs (or stop sequences early), so an external
+    /// [`Policy`] implementor never needs a struct literal and a future field
+    /// addition is not automatically a source break for it. `rollout_logprobs`,
+    /// when `Some`, must carry one row per sequence with exactly
+    /// `completion_lens[i]` entries in row `i` (the trainer validates this and
+    /// fails loud on a mismatch).
+    #[must_use]
+    pub fn new(
+        token_ids: Vec<Vec<u32>>,
+        prompt_len: usize,
+        completion_lens: Vec<usize>,
+        rollout_logprobs: Option<Vec<Vec<f32>>>,
+    ) -> Self {
+        Self {
+            token_ids,
+            prompt_len,
+            completion_lens,
+            rollout_logprobs,
+        }
+    }
+
     /// Number of sequences in the rollout.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -93,8 +122,11 @@ impl Rollout {
 /// temperature ≈ 0.6 with nucleus top-p 0.95 for avg@k sampled pass@1), so the
 /// override is a separate, explicit field rather than a relaxation of that
 /// check: setting it says "I know this is not the training distribution."
-/// Nucleus (top-p) filtering can **only** enter generation through here —
-/// training rollouts structurally stay untruncated.
+/// For [`crate::LmPolicy`] (and any conforming [`Policy`] — see the
+/// [`Policy::generate`] contract), nucleus (top-p) filtering can **only**
+/// enter generation through here — training rollouts structurally stay
+/// untruncated. A policy that ignores sampling parameters samples its own
+/// distribution regardless; eval reports over such a policy reflect that.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EvalSampling {
     /// Eval softmax temperature (must be finite and `> 0`).
@@ -184,6 +216,16 @@ impl Default for GenConfig {
 /// "old" is just an adapter-on snapshot frozen in time.
 pub trait Policy {
     /// Sample `cfg.group_size` completions for `prompt` under `cfg`.
+    ///
+    /// Implementations that sample SHOULD honor
+    /// [`cfg.eval_sampling`](GenConfig::eval_sampling) (sample the override's
+    /// temperature/top-p) or return an error — silently ignoring it makes an
+    /// eval caller believe the eval convention applied when it did not.
+    /// [`crate::LmPolicy`] honors it; a toy/test policy that ignores sampling
+    /// parameters entirely is consistent with this (it ignores `temperature`
+    /// too — its "distribution" has no knobs to override). Policies that can
+    /// cheaply report per-draw probabilities SHOULD also fill
+    /// [`Rollout::rollout_logprobs`]; `None` is always valid.
     ///
     /// # Errors
     ///
@@ -316,5 +358,23 @@ mod tests {
         // policies built through it must never claim behavior log-probs.
         let r = Rollout::rectangular(vec![vec![1, 2, 3]], 1);
         assert_eq!(r.rollout_logprobs, None);
+    }
+
+    #[test]
+    fn new_carries_every_part_verbatim() {
+        // The full-args constructor for capturing implementors: everything
+        // lands as passed, no recomputation.
+        let r = Rollout::new(
+            vec![vec![1, 2, 3, 4], vec![1, 2, 5, 5]],
+            2,
+            vec![2, 1],
+            Some(vec![vec![-0.5, -1.0], vec![-0.25]]),
+        );
+        assert_eq!(r.prompt_len, 2);
+        assert_eq!(r.completion_lens, vec![2, 1]);
+        assert_eq!(
+            r.rollout_logprobs,
+            Some(vec![vec![-0.5, -1.0], vec![-0.25]])
+        );
     }
 }

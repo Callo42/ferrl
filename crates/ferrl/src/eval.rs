@@ -238,9 +238,10 @@ fn mean_reward<P: Policy, R: RewardFn>(
 /// Reject a malformed rollout the same way the trainer's `completion_dims` does, so
 /// eval and train agree on what a valid `Policy::generate` returns: exactly
 /// `group_size` completions, a non-empty prompt context, every sequence at least as
-/// long as the prompt (so the completion slice is well-defined), and a
+/// long as the prompt (so the completion slice is well-defined), a
 /// `completion_lens` that aligns with the sequences and stays within each one's
-/// completion span (it drives the length-aware decode). It does **not** require
+/// completion span (it drives the length-aware decode), and — when present — a
+/// behavior-log-prob capture aligned with those lengths. It does **not** require
 /// rectangular completions — eval scores each sequence independently, so the length
 /// bound is per-sequence rather than a shared width.
 fn validate_rollout(rollout: &Rollout, group_size: usize) -> Result<(), EvalError> {
@@ -267,6 +268,35 @@ fn validate_rollout(rollout: &Rollout, group_size: usize) -> Result<(), EvalErro
         )));
     }
     validate_completion_lens(rollout, group_size)?;
+    validate_rollout_logprobs(rollout)?;
+    Ok(())
+}
+
+/// Validate the optional behavior-log-prob capture (one row per sequence, row
+/// `i` with exactly `completion_lens[i]` entries), mirroring the trainer's
+/// check so eval and train keep agreeing on what a valid `Policy::generate`
+/// returns. Eval itself never reads the capture today, but accepting a
+/// misaligned one here would silently re-open the hole for any future eval
+/// consumer.
+fn validate_rollout_logprobs(rollout: &Rollout) -> Result<(), EvalError> {
+    let Some(captured) = &rollout.rollout_logprobs else {
+        return Ok(());
+    };
+    if captured.len() != rollout.len() {
+        return Err(EvalError::Contract(format!(
+            "rollout has {} rollout_logprob rows for {} sequences",
+            captured.len(),
+            rollout.len()
+        )));
+    }
+    for (i, (row, &len)) in captured.iter().zip(&rollout.completion_lens).enumerate() {
+        if row.len() != len {
+            return Err(EvalError::Contract(format!(
+                "rollout_logprobs row {i} has {} entries for completion_len {len}",
+                row.len()
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -577,6 +607,29 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, EvalError::Contract(_)), "got {err:?}");
         assert!(policy.adapter_enabled(), "flag not restored after error");
+    }
+
+    #[test]
+    fn misaligned_rollout_logprob_capture_is_a_contract_error() {
+        // Mirrors the trainer's capture validation, so eval and train keep
+        // agreeing on what a valid Policy::generate returns.
+        let mut ok = Rollout::rectangular(vec![vec![5, 1, 2], vec![5, 3, 4]], 1);
+        ok.rollout_logprobs = Some(vec![vec![-0.1, -0.2], vec![-0.3, -0.4]]);
+        assert!(validate_rollout(&ok, 2).is_ok());
+        // Row 1 has one entry for completion_len 2.
+        let mut bad_row = ok.clone();
+        bad_row.rollout_logprobs = Some(vec![vec![-0.1, -0.2], vec![-0.3]]);
+        assert!(matches!(
+            validate_rollout(&bad_row, 2),
+            Err(EvalError::Contract(_))
+        ));
+        // One capture row for two sequences.
+        let mut bad_count = ok.clone();
+        bad_count.rollout_logprobs = Some(vec![vec![-0.1, -0.2]]);
+        assert!(matches!(
+            validate_rollout(&bad_count, 2),
+            Err(EvalError::Contract(_))
+        ));
     }
 
     #[test]

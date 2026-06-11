@@ -204,11 +204,18 @@ pub struct TrainerConfig {
     /// ([`Rollout::rollout_logprobs`](crate::policy::Rollout::rollout_logprobs));
     /// a policy that captures none **fails loud** when this is on, rather than
     /// silently training uncorrected. Default **`false`** — the metrics-first
-    /// posture: the rollout-ratio telemetry ([`Metrics::rollout_ratio_mean`]
-    /// and friends) is always reported when capture is available, and the
-    /// correction is flipped on when the observed gap warrants it (it matters
-    /// most when rollout and scoring run different numerics, e.g. a bf16
-    /// merged decode against the f32 scoring forward on a days-long run).
+    /// posture: the rollout-ratio telemetry is always reported when capture is
+    /// available, and the correction is flipped on when the observed gap
+    /// warrants it (it matters most when rollout and scoring run different
+    /// numerics, e.g. a bf16 merged decode against the f32 scoring forward on
+    /// a days-long run). Read the **gap** off
+    /// [`Metrics::rollout_logratio_mean`] (a KL-style drift meter),
+    /// [`Metrics::rollout_ratio_max`], and
+    /// [`Metrics::frac_rollout_ratio_capped`] — NOT off
+    /// [`Metrics::rollout_ratio_mean`], whose expectation is exactly `1` under
+    /// arbitrary drift (see its docs) — and check
+    /// [`Metrics::rollout_capture_tokens`] `> 0` first (the telemetry can be
+    /// dark).
     /// Token-level only: rejected together with
     /// [`ImportanceSamplingLevel::Sequence`] (GSPO forms its ratio per
     /// sequence; mixing the two corrections is unstudied — pick one).
@@ -493,8 +500,15 @@ struct LiveItem {
 /// `capped` counts those above the configured TIS cap; `tokens` is the
 /// loss-carrying token count the sums normalize by.
 struct RatioStats {
+    /// Σ ratio over loss tokens (the unit-mean health statistic).
     sum: f64,
-    max: f32,
+    /// Σ (`logp_old` − `logp_rollout`) over loss tokens — the drift
+    /// accumulator: its token mean estimates −KL(rollout ‖ train), `0` iff
+    /// on-policy.
+    log_sum: f64,
+    /// Max ratio, kept in f64 so a huge-but-finite outlier is not saturated to
+    /// `inf` by an early f32 cast (the metric write still sanitizes).
+    max: f64,
     capped: usize,
     tokens: usize,
 }
@@ -1184,39 +1198,62 @@ impl Trainer {
         m.kl = agg.kl;
         m.clip_ratio = agg.clip_frac;
         // Train/rollout off-policy telemetry over the window's loss tokens.
-        let (ratio_mean, ratio_max, frac_capped) = fold_ratio_stats(stats);
-        m.rollout_ratio_mean = ratio_mean;
-        m.rollout_ratio_max = ratio_max;
-        m.frac_rollout_ratio_capped = frac_capped;
+        let folded = fold_ratio_stats(stats);
+        m.rollout_ratio_mean = folded.ratio_mean;
+        m.rollout_logratio_mean = folded.logratio_mean;
+        m.rollout_ratio_max = folded.ratio_max;
+        m.frac_rollout_ratio_capped = folded.frac_capped;
+        m.rollout_capture_tokens = folded.tokens;
         m.grad_norm = agg.grad_norm;
         m.lr = opt.learning_rate() as f32;
         m
     }
 }
 
-/// Fold a window's per-group [`RatioStats`] into the three rollout-ratio
-/// metrics (token-weighted mean, max, capped fraction). A window with no
-/// captured loss tokens reports the neutral `(1.0, 1.0, 0.0)` — exactly
-/// on-policy, which is what the math assumes when no behavior log-probs exist.
-fn fold_ratio_stats(stats: &[PromptStat]) -> (f32, f32, f32) {
+/// A window's folded rollout-ratio telemetry (see [`fold_ratio_stats`]).
+struct FoldedRatios {
+    ratio_mean: f32,
+    logratio_mean: f32,
+    ratio_max: f32,
+    frac_capped: f32,
+    tokens: u32,
+}
+
+/// Fold a window's per-group [`RatioStats`] into the rollout-ratio metrics
+/// (token-weighted ratio and log-ratio means, max, capped fraction, and the
+/// captured-token count). A window with no captured loss tokens reports the
+/// neutral values (`1.0` ratios, `0.0` log-ratio/fraction) with `tokens == 0`
+/// — the count is what distinguishes "measured on-policy" from "telemetry
+/// dark" (no capture, or every group degenerate at `beta == 0`).
+fn fold_ratio_stats(stats: &[PromptStat]) -> FoldedRatios {
     let mut sum = 0.0_f64;
-    let mut max = f32::NEG_INFINITY;
+    let mut log_sum = 0.0_f64;
+    let mut max = f64::NEG_INFINITY;
     let mut capped = 0_usize;
     let mut tokens = 0_usize;
     for r in stats.iter().filter_map(|s| s.ratio_stats.as_ref()) {
         sum += r.sum;
+        log_sum += r.log_sum;
         max = max.max(r.max);
         capped += r.capped;
         tokens += r.tokens;
     }
     if tokens == 0 {
-        return (1.0, 1.0, 0.0);
+        return FoldedRatios {
+            ratio_mean: 1.0,
+            logratio_mean: 0.0,
+            ratio_max: 1.0,
+            frac_capped: 0.0,
+            tokens: 0,
+        };
     }
-    (
-        (sum / tokens as f64) as f32,
-        max,
-        capped as f32 / tokens as f32,
-    )
+    FoldedRatios {
+        ratio_mean: (sum / tokens as f64) as f32,
+        logratio_mean: (log_sum / tokens as f64) as f32,
+        ratio_max: max as f32,
+        frac_capped: capped as f32 / tokens as f32,
+        tokens: tokens.min(u32::MAX as usize) as u32,
+    }
 }
 
 /// Decode each completion to text for the reward — the **real** completion tokens
@@ -1264,10 +1301,24 @@ fn rollout_ratio_and_tis(
         return Ok((None, None));
     };
     let train = logp_old.to_dtype(DType::F32)?.to_vec2::<f32>()?;
-    let comp_len = train.first().map_or(0, Vec::len);
+    // The rollout (and its capture) is validated by `completion_dims`; the score
+    // tensor is the policy's own output and is NOT — a misshapen
+    // `token_logprobs` would otherwise silently zip-truncate into wrong-token
+    // pairings here (and a wrong-shaped `tis_w` would surface only at the
+    // broadcast, or with `tis` off never at all).
+    let comp_len = mask_rows.first().map_or(0, Vec::len);
+    if train.len() != mask_rows.len() || train.iter().any(|row| row.len() != comp_len) {
+        return Err(TrainerError::Contract(format!(
+            "Policy::token_logprobs returned a [{}, {}] tensor for a [{}, {comp_len}] rollout",
+            train.len(),
+            train.first().map_or(0, Vec::len),
+            mask_rows.len()
+        )));
+    }
     let mut stats = RatioStats {
         sum: 0.0,
-        max: f32::NEG_INFINITY,
+        log_sum: 0.0,
+        max: f64::NEG_INFINITY,
         capped: 0,
         tokens: 0,
     };
@@ -1285,6 +1336,11 @@ fn rollout_ratio_and_tis(
 /// [`RatioStats`] and TIS-weight buffer (see [`rollout_ratio_and_tis`]). The
 /// capture has one entry per real draw; positions past it are EOS padding —
 /// weight `1.0`, never counted (the loss mask is `0` there by construction).
+/// The log-ratio is formed once in f64 and feeds the ratio, the drift
+/// accumulator, AND the TIS weight (`min(exp, cap)` —
+/// [`crate::grpo::tis_weight`]'s formula with shared rounding, so the
+/// capped-count telemetry and the actual truncation can never disagree by an
+/// ulp at the cap).
 fn fold_ratio_row(
     cap_row: &[f32],
     train_row: &[f32],
@@ -1298,12 +1354,13 @@ fn fold_ratio_row(
             weights.push(1.0);
             continue;
         };
-        let ratio = f64::from(lp_train - lp_rollout).exp();
-        weights
-            .push(crate::grpo::tis_weight(f64::from(lp_train), f64::from(lp_rollout), cap) as f32);
+        let log_ratio = f64::from(lp_train) - f64::from(lp_rollout);
+        let ratio = log_ratio.exp();
+        weights.push(ratio.min(cap) as f32);
         if m > 0.0 {
             stats.sum += ratio;
-            stats.max = stats.max.max(ratio as f32);
+            stats.log_sum += log_ratio;
+            stats.max = stats.max.max(ratio);
             stats.capped += usize::from(ratio > cap);
             stats.tokens += 1;
         }
@@ -3020,7 +3077,8 @@ mod tests {
     }
 
     /// Hand-computed ratio stats for the crafted capture, exercising the masked
-    /// accounting, the padding skip (a short captured row), and the cap count.
+    /// accounting, the padding skip (a short captured row), the cap count, and
+    /// the log-ratio drift accumulator.
     #[test]
     fn rollout_ratio_stats_match_a_hand_computed_reference() {
         let (rollout, logp_old, mask_rows) = ratio_fixture();
@@ -3030,13 +3088,29 @@ mod tests {
         let r02 = (-1.0f64).exp();
         let r10 = 0.7f64.exp(); // ~2.0138 -> above the cap C = 2.0
         assert_eq!(stats.tokens, 5);
-        assert_relative_eq!(
-            stats.sum as f32,
-            (1.0 + r01 + r02 + r10 + 1.0) as f32,
-            epsilon = 1e-5
-        );
-        assert_relative_eq!(stats.max, r10 as f32, epsilon = 1e-5);
+        assert_relative_eq!(stats.sum, 1.0 + r01 + r02 + r10 + 1.0, max_relative = 1e-6);
+        // The drift accumulator: Σ log-ratios = 0 + 0.5 − 1 + 0.7 + 0 = 0.2.
+        assert_relative_eq!(stats.log_sum, 0.2, epsilon = 1e-6);
+        assert_relative_eq!(stats.max, r10, max_relative = 1e-6);
         assert_eq!(stats.capped, 1, "exactly one ratio exceeds C = 2");
+    }
+
+    #[test]
+    fn rollout_ratio_and_tis_rejects_a_misshapen_score_tensor() {
+        // The score tensor is the policy's own output and is otherwise
+        // unvalidated: a wrong-shaped token_logprobs must become a loud
+        // Contract error, not a silent zip-truncation into wrong-token pairs.
+        let (rollout, _, mask_rows) = ratio_fixture();
+        let wrong_rows = mat(&[&[-0.5, -1.0, -2.0]]); // 1 row for 2 sequences
+        assert!(matches!(
+            rollout_ratio_and_tis(&rollout, &wrong_rows, &mask_rows, 2.0, false),
+            Err(TrainerError::Contract(_))
+        ));
+        let wrong_cols = mat(&[&[-0.5, -1.0], &[-0.3, -2.3]]); // width 2 for 3
+        assert!(matches!(
+            rollout_ratio_and_tis(&rollout, &wrong_cols, &mask_rows, 2.0, false),
+            Err(TrainerError::Contract(_))
+        ));
     }
 
     /// The TIS weight tensor for the crafted capture: the over-cap ratio
@@ -3088,12 +3162,13 @@ mod tests {
             degenerate: false,
             ratio_stats: ratio,
         };
-        // Two captured groups (4 + 1 tokens) and one without capture: the mean is
-        // token-weighted across the captured ones, the max is the overall max,
-        // and the capped fraction uses the same token denominator.
+        // Two captured groups (4 + 1 tokens) and one without capture: the means
+        // are token-weighted across the captured ones, the max is the overall
+        // max, and the capped fraction / token count share the denominator.
         let stats = vec![
             stat(Some(RatioStats {
                 sum: 4.4,
+                log_sum: 0.2,
                 max: 1.3,
                 capped: 1,
                 tokens: 4,
@@ -3101,18 +3176,28 @@ mod tests {
             stat(None),
             stat(Some(RatioStats {
                 sum: 0.6,
+                log_sum: 0.3,
                 max: 0.6,
                 capped: 0,
                 tokens: 1,
             })),
         ];
-        let (mean, max, frac) = fold_ratio_stats(&stats);
-        assert_relative_eq!(mean, 1.0, epsilon = TOL); // (4.4 + 0.6) / 5
-        assert_relative_eq!(max, 1.3, epsilon = TOL);
-        assert_relative_eq!(frac, 0.2, epsilon = TOL); // 1 / 5
-                                                       // A window with no captured tokens reports the neutral on-policy values.
-        let (mean, max, frac) = fold_ratio_stats(&[stat(None)]);
-        assert_eq!((mean, max, frac), (1.0, 1.0, 0.0));
+        let f = fold_ratio_stats(&stats);
+        // (4.4 + 0.6) / 5; (0.2 + 0.3) / 5; max; 1 / 5 — exactly representable.
+        assert_eq!(
+            (f.ratio_mean, f.logratio_mean, f.ratio_max, f.frac_capped),
+            (1.0, 0.1, 1.3, 0.2)
+        );
+        assert_eq!(f.tokens, 5);
+        // A window with no captured tokens reports the neutral on-policy values
+        // and a ZERO token count — the disambiguator between "measured
+        // on-policy" and "telemetry dark".
+        let f = fold_ratio_stats(&[stat(None)]);
+        assert_eq!(
+            (f.ratio_mean, f.logratio_mean, f.ratio_max, f.frac_capped),
+            (1.0, 0.0, 1.0, 0.0)
+        );
+        assert_eq!(f.tokens, 0);
     }
 
     #[test]

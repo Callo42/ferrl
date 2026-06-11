@@ -216,7 +216,11 @@ fn build_trainer_config(eos_token_id: Option<u32>) -> TrainerConfig {
         // beats-base) were established on the pre-R1 recipe — classic Grpo
         // reduction, no clipping, no truncation masking. Keep that trajectory
         // until the margins are deliberately recalibrated on the modern
-        // recipe (the 0.8B PoC ladder runs the R1 defaults instead).
+        // recipe (the 0.8B PoC ladder runs the R1 defaults instead). R2 note:
+        // at the FERRL_CD_TEMP=1.0 default, scoring is bit-identical to the
+        // calibrated runs; a non-1.0 temperature now also rescales scoring
+        // (temperature-consistent scoring) — a deliberate recipe change, so
+        // re-calibrate before leaning on the margins at another temperature.
         loss_type: ferrl::LossType::Grpo,
         max_grad_norm: None,
         truncation_masking: false,
