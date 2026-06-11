@@ -194,6 +194,16 @@ pub trait Policy {
     ///
     /// Returns a candle error if `state` is not a valid blob for this policy's sampler.
     fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()>;
+
+    /// The policy's `LoRA` recipe as a stable canonical string, recorded into
+    /// checkpoint manifests (see
+    /// [`crate::checkpoint::CheckpointManifest::lora_recipe`]). Informational —
+    /// the checkpoint load contract stays positional. Defaulted (`None`) so toy
+    /// / test policies need not implement it; model-backed policies forward
+    /// their [`crate::GradModel::lora_recipe`].
+    fn lora_recipe(&self) -> Option<String> {
+        None
+    }
 }
 
 #[cfg(test)]

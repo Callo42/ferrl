@@ -517,6 +517,11 @@ fn gate_reward_trends_up() {
         max_new_tokens: 1,
         temperature: TEMP,
         lr: 0.05,
+        // Trend-gate calibration pin: these margins were calibrated WITHOUT
+        // global-norm clipping (pre-R1); the R1 default Some(1.0) binds on this
+        // toy's early gradients and shifts the trajectory toward the margin.
+        // Clipping has its own dedicated unit + integration coverage.
+        max_grad_norm: None,
         ..TrainerConfig::default()
     };
     let tmp = TempDir::new("reward-up");
@@ -590,6 +595,120 @@ fn eos_padded_rollout_trains_with_length_aware_mask() {
             m.completion_len,
             m.step
         );
+        // Lengths 1 and 2 never reach the width-3 boundary, so the default-ON
+        // truncation masking has nothing to mask here.
+        assert_eq!(m.frac_truncated, 0.0, "no row is full-width");
+        assert_eq!(m.dropped_rows, 0);
+    }
+}
+
+#[test]
+fn truncation_masking_masks_full_width_rows_end_to_end() {
+    // Rows alternate real lengths 3 (the FULL width) and 2. The EOS id is set
+    // outside the echo policy's vocab, so no full-width row can ever end in EOS:
+    // with truncation_masking ON (the default), exactly half of every group is
+    // deterministically truncated -> masked out of the loss, surfaced via
+    // frac_truncated AND dropped_rows, while the run still steps cleanly on the
+    // surviving length-2 rows (the canary tolerates the zeroed rows).
+    let inner = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 11, TEMP).unwrap();
+    let mut policy = EosPaddedEchoPolicy {
+        inner,
+        real_lens: vec![3, 2],
+        pad: 0,
+    };
+    let prompts = echo_prompts(VOCAB);
+    let cfg = TrainerConfig {
+        steps: 4,
+        group_size: 8,
+        max_new_tokens: 3,
+        temperature: TEMP,
+        eos_token_id: Some(VOCAB as u32), // unsampleable -> full-width == truncated
+        lr: 0.05,
+        ..TrainerConfig::default()
+    };
+    let tmp = TempDir::new("truncation-mask");
+    let run = RunDir::create(tmp.path(), "echo").unwrap();
+    let mut trainer = Trainer::new(cfg, &run).unwrap();
+    let history = trainer
+        .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
+        .unwrap();
+    assert_eq!(history.len(), 4);
+    for m in &history {
+        assert!(
+            (m.frac_truncated - 0.5).abs() < 1e-6,
+            "half the group is full-width without EOS: frac_truncated={} at step {}",
+            m.frac_truncated,
+            m.step
+        );
+        assert_eq!(m.dropped_rows, 4, "masked rows must surface as dropped");
+        assert!(m.reward_mean.is_finite() && m.grad_norm.is_finite());
+    }
+}
+
+#[test]
+fn truncation_masking_off_keeps_full_width_rows() {
+    // The same half-truncated scenario with the knob OFF: nothing is masked
+    // or dropped — the rows train on their raw verifier rewards as before.
+    let inner = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 11, TEMP).unwrap();
+    let mut policy = EosPaddedEchoPolicy {
+        inner,
+        real_lens: vec![3, 2],
+        pad: 0,
+    };
+    let prompts = echo_prompts(VOCAB);
+    let cfg_off = TrainerConfig {
+        steps: 4,
+        group_size: 8,
+        max_new_tokens: 3,
+        temperature: TEMP,
+        eos_token_id: Some(VOCAB as u32),
+        truncation_masking: false,
+        lr: 0.05,
+        ..TrainerConfig::default()
+    };
+    let tmp = TempDir::new("truncation-mask-off");
+    let run_off = RunDir::create(tmp.path(), "echo-off").unwrap();
+    let mut trainer_off = Trainer::new(cfg_off, &run_off).unwrap();
+    let history_off = trainer_off
+        .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
+        .unwrap();
+    for m in &history_off {
+        assert_eq!(m.frac_truncated, 0.0);
+        assert_eq!(m.dropped_rows, 0);
+    }
+}
+
+#[test]
+fn warmup_ramps_the_reported_lr_then_holds() {
+    // warmup_steps = 3 over lr 0.03: metrics must report 0.01, 0.02, 0.03, 0.03…
+    // (the effective lr the optimizer stepped with — `Metrics::lr` reads the live
+    // optimizer, so this pins the wiring, not just the schedule function).
+    let mut policy = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 5, TEMP).unwrap();
+    let prompts = echo_prompts(VOCAB);
+    let cfg = TrainerConfig {
+        steps: 5,
+        group_size: 8,
+        max_new_tokens: 1,
+        temperature: TEMP,
+        lr: 0.03,
+        warmup_steps: 3,
+        ..TrainerConfig::default()
+    };
+    let tmp = TempDir::new("warmup");
+    let run = RunDir::create(tmp.path(), "echo").unwrap();
+    let mut trainer = Trainer::new(cfg, &run).unwrap();
+    let history = trainer
+        .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
+        .unwrap();
+    let want = [0.01f32, 0.02, 0.03, 0.03, 0.03];
+    for (m, w) in history.iter().zip(want) {
+        assert!(
+            (m.lr - w).abs() < 1e-7,
+            "step {}: lr {} != {}",
+            m.step,
+            m.lr,
+            w
+        );
     }
 }
 
@@ -626,6 +745,9 @@ fn gate_dr_grpo_paper_config_learns() {
         lr: 0.1,
         loss_type: LossType::DrGrpo,
         scale_rewards: ScaleRewards::None,
+        // Trend-gate calibration pin (see gate_reward_trends_up): margins were
+        // calibrated without global-norm clipping; keep this trajectory as-is.
+        max_grad_norm: None,
         ..TrainerConfig::default()
     };
     let tmp = TempDir::new("drgrpo-paper");
@@ -674,6 +796,10 @@ fn gate_grad_accum_effective_batch_learns() {
         steps: 500,
         group_size: 4,
         grad_accum_steps: 8,
+        // Trend-gate calibration pin (see gate_reward_trends_up): margins were
+        // calibrated without global-norm clipping; keep this trajectory as-is.
+        max_grad_norm: None,
+
         max_new_tokens: 1,
         temperature: TEMP,
         lr: 0.05,
@@ -730,6 +856,10 @@ fn gate_grad_accum_two_prompt_window() {
         steps: 500,
         group_size: 4,
         grad_accum_steps: 2,
+        // Trend-gate calibration pin (see gate_reward_trends_up): margins were
+        // calibrated without global-norm clipping; keep this trajectory as-is.
+        max_grad_norm: None,
+
         max_new_tokens: 1,
         temperature: TEMP,
         lr: 0.05,

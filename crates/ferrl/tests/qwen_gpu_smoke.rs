@@ -460,7 +460,7 @@ fn qwen_checkpoint_roundtrip_and_eval_on_gpu() {
 
     // Save from GPU (-> CPU safetensors), load back onto the GPU into dst.
     let tmp = TempDir::new();
-    save_adapter(&tmp.0, &src.trainable_vars(), 0).expect("save adapter from GPU");
+    save_adapter(&tmp.0, &src.trainable_vars(), 0, None).expect("save adapter from GPU");
     let manifest = load_adapter(&tmp.0, &dst.trainable_vars()).expect("load adapter onto GPU");
     assert_eq!(manifest.num_vars, src.trainable_vars().len());
     let logp_dst = dst

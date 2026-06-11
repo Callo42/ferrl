@@ -213,7 +213,7 @@ fn adapter_round_trips_into_a_fresh_model() {
 
     // Save src's adapter, load it into dst, and the forwards must now agree.
     let tmp = TempDir::new("roundtrip");
-    save_adapter(tmp.path(), &src.trainable_vars(), 0).unwrap();
+    save_adapter(tmp.path(), &src.trainable_vars(), 0, None).unwrap();
     let manifest = load_adapter(tmp.path(), &dst.trainable_vars()).unwrap();
     assert_eq!(manifest.num_vars, src.trainable_vars().len());
 
@@ -336,7 +336,7 @@ fn llama_adapter_round_trips_into_a_fresh_model() {
 
     // Save src's adapter, load it into dst: forwards must now agree bit-for-bit.
     let tmp = TempDir::new("llama-roundtrip");
-    save_adapter(tmp.path(), &src.trainable_vars(), 0).unwrap();
+    save_adapter(tmp.path(), &src.trainable_vars(), 0, None).unwrap();
     let manifest = load_adapter(tmp.path(), &dst.trainable_vars()).unwrap();
     assert_eq!(manifest.num_vars, src.trainable_vars().len());
 

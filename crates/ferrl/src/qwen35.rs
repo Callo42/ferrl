@@ -1605,6 +1605,10 @@ impl GradModel for Qwen3_5GradModel {
     fn merged_decoder(&self) -> CandleResult<Qwen3_5MergedDecoder> {
         Qwen3_5GradModel::merged_decoder(self)
     }
+
+    fn lora_recipe(&self) -> Option<String> {
+        Some(self.targets.canonical())
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -34,6 +34,14 @@
 //! the adapter was persisted, [`load_checkpoint`] returns no optimizer/sampler state and
 //! a resume falls back to fresh momentum + the policy's current RNG. The manifest is
 //! always written **last** within a checkpoint directory, as the commit marker.
+//!
+//! ## Crash atomicity
+//!
+//! Both writers stage the whole checkpoint into a sibling temp directory
+//! (`<dir>.tmp-<pid>`) and publish it with a single `rename` — so a reader of the
+//! published path can never observe a half-written checkpoint, even on a crash
+//! mid-write (the manifest-last ordering inside the stage is belt-and-braces on
+//! top). Re-writing an existing checkpoint path replaces it as a unit.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -107,6 +115,16 @@ pub struct CheckpointManifest {
     /// was persisted.
     #[serde(default)]
     pub sampler_state: Option<Vec<u8>>,
+    /// The `LoRA` recipe the adapter was trained with, as a stable canonical
+    /// string (e.g. `attn:qkvo|mlp:gud|gdn:-` — see
+    /// [`crate::qwen35::LoraTargets::canonical`]) — recorded so a checkpoint is
+    /// self-describing about *which* projections its positional tensor list
+    /// covers. Informational: the load contract stays positional
+    /// (count/shape/dtype validation against the live model). `None` for
+    /// checkpoints written before this field existed, or by a policy that does
+    /// not report a recipe. `#[serde(default)]` for back-compat.
+    #[serde(default)]
+    pub lora_recipe: Option<String>,
 }
 
 /// Tensor key for the `i`-th trainable var, zero-padded so lexical order matches
@@ -129,50 +147,105 @@ fn io(path: impl Into<PathBuf>, source: std::io::Error) -> CheckpointError {
     }
 }
 
+/// The sibling staging directory for an atomic checkpoint write:
+/// `<dir>.tmp-<pid>` (pid-suffixed so a stale stage from a dead process can
+/// never be confused with this one's).
+fn stage_path(dir: &Path) -> PathBuf {
+    let mut name = dir.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".tmp-{}", std::process::id()));
+    dir.with_file_name(name)
+}
+
+/// Prepare an empty staging directory for `dir`, clearing any stale leftover.
+fn prepare_stage(dir: &Path) -> Result<PathBuf, CheckpointError> {
+    let stage = stage_path(dir);
+    if stage.exists() {
+        std::fs::remove_dir_all(&stage).map_err(|e| io(&stage, e))?;
+    }
+    std::fs::create_dir_all(&stage).map_err(|e| io(&stage, e))?;
+    Ok(stage)
+}
+
+/// Publish a fully-written `stage` at `dir` with a single `rename`, replacing
+/// any prior checkpoint at that path as a unit. The published path therefore
+/// only ever holds a complete checkpoint or nothing — a crash mid-write leaves
+/// the stage behind (cleared by the next write) and the prior checkpoint, if
+/// any, intact up to the final replace.
+fn commit_stage(stage: &Path, dir: &Path) -> Result<(), CheckpointError> {
+    if dir.exists() {
+        std::fs::remove_dir_all(dir).map_err(|e| io(dir, e))?;
+    }
+    std::fs::rename(stage, dir).map_err(|e| io(stage, e))?;
+    Ok(())
+}
+
+/// Run `write` against a staging directory for `dir`, committing on success and
+/// best-effort cleaning the stage on failure (so an aborted write does not
+/// strand a half-built directory next to the real checkpoints).
+fn write_staged(
+    dir: &Path,
+    write: impl FnOnce(&Path) -> Result<(), CheckpointError>,
+) -> Result<(), CheckpointError> {
+    let stage = prepare_stage(dir)?;
+    match write(&stage) {
+        Ok(()) => commit_stage(&stage, dir),
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&stage);
+            Err(e)
+        }
+    }
+}
+
 /// Persist `vars` (the trainable `LoRA` factors) and a manifest to `dir`.
 ///
 /// Writes `dir/adapter.safetensors` and `dir/manifest.json`, creating `dir` (and
 /// parents) if needed. `step` is recorded as the number of completed optimizer
-/// steps — the index a resume should continue from. Each tensor is moved to the
+/// steps — the index a resume should continue from; `lora_recipe` (if given) is
+/// recorded verbatim so the checkpoint is self-describing about its adapter
+/// recipe (see [`CheckpointManifest::lora_recipe`]). Each tensor is moved to the
 /// CPU and made contiguous before serialization, so this works for vars living on
 /// any device.
 ///
-/// The adapter tensors are written **first** and the manifest **last**, and
-/// [`load_adapter`] reads the manifest first — so a crash mid-write leaves the
-/// manifest absent and the load fails cleanly rather than reading a truncated
-/// adapter. Each checkpoint lives in its own directory, so a failed (or re-run)
-/// write never corrupts a *prior* checkpoint. (The two writes are not atomic as a
-/// unit; a fully crash-safe temp-dir+rename is a possible later hardening.)
+/// The write is **crash-atomic**: everything is staged into a sibling temp
+/// directory and published at `dir` with a single `rename` (see the module
+/// docs), with the manifest written last inside the stage as belt-and-braces.
+/// Re-writing an existing `dir` replaces it as a unit.
 ///
 /// # Errors
 ///
-/// Returns [`CheckpointError`] if `dir` cannot be created, a tensor cannot be
-/// moved to CPU / serialized, or the manifest cannot be written.
-pub fn save_adapter(dir: impl AsRef<Path>, vars: &[Var], step: u64) -> Result<(), CheckpointError> {
-    let dir = dir.as_ref();
-    std::fs::create_dir_all(dir).map_err(|e| io(dir, e))?;
+/// Returns [`CheckpointError`] if the staging directory cannot be created, a
+/// tensor cannot be moved to CPU / serialized, the manifest cannot be written,
+/// or the final rename fails.
+pub fn save_adapter(
+    dir: impl AsRef<Path>,
+    vars: &[Var],
+    step: u64,
+    lora_recipe: Option<&str>,
+) -> Result<(), CheckpointError> {
+    let recipe = lora_recipe.map(str::to_owned);
+    write_staged(dir.as_ref(), |stage| {
+        let mut tensors: HashMap<String, Tensor> = HashMap::with_capacity(vars.len());
+        for (i, v) in vars.iter().enumerate() {
+            // CPU + contiguous so a CUDA-resident adapter serializes the same way.
+            let t = v.as_tensor().to_device(&Device::Cpu)?.contiguous()?;
+            tensors.insert(var_key(i), t);
+        }
+        candle_core::safetensors::save(&tensors, stage.join(ADAPTER_FILE))?;
 
-    let mut tensors: HashMap<String, Tensor> = HashMap::with_capacity(vars.len());
-    for (i, v) in vars.iter().enumerate() {
-        // CPU + contiguous so a CUDA-resident adapter serializes the same way.
-        let t = v.as_tensor().to_device(&Device::Cpu)?.contiguous()?;
-        tensors.insert(var_key(i), t);
-    }
-    let adapter_path = dir.join(ADAPTER_FILE);
-    candle_core::safetensors::save(&tensors, &adapter_path)?;
-
-    let manifest = CheckpointManifest {
-        format_version: 1,
-        step,
-        num_vars: vars.len(),
-        optimizer_step_t: None,
-        optimizer_num_vars: None,
-        sampler_state: None,
-    };
-    let manifest_path = dir.join(MANIFEST_FILE);
-    let json = serde_json::to_string_pretty(&manifest)?;
-    std::fs::write(&manifest_path, json).map_err(|e| io(&manifest_path, e))?;
-    Ok(())
+        let manifest = CheckpointManifest {
+            format_version: 1,
+            step,
+            num_vars: vars.len(),
+            optimizer_step_t: None,
+            optimizer_num_vars: None,
+            sampler_state: None,
+            lora_recipe: recipe,
+        };
+        let manifest_path = stage.join(MANIFEST_FILE);
+        let json = serde_json::to_string_pretty(&manifest)?;
+        std::fs::write(&manifest_path, json).map_err(|e| io(&manifest_path, e))?;
+        Ok(())
+    })
 }
 
 /// Restore a checkpoint from `dir` into `vars`, in place.
@@ -280,64 +353,72 @@ pub struct LoadedCheckpoint {
 ///
 /// Writes `adapter.safetensors`, `optimizer.safetensors`, and (last, as the commit
 /// marker) `manifest.json`. The optimizer moments are keyed by parameter index; the
-/// optimizer step counter and the `sampler_state` blob live in the manifest. Each tensor
-/// is moved to the CPU and made contiguous first, so a CUDA-resident run checkpoints the
-/// same way. Restored as a unit by [`load_checkpoint`] + [`crate::Trainer::resume`].
+/// optimizer step counter, the `sampler_state` blob, and the `lora_recipe` string live
+/// in the manifest. Each tensor is moved to the CPU and made contiguous first, so a
+/// CUDA-resident run checkpoints the same way. Restored as a unit by
+/// [`load_checkpoint`] + [`crate::Trainer::resume`].
 ///
 /// `sampler_state` is the opaque blob from [`crate::Policy::sampler_state`]; it is stored
-/// verbatim and only the policy interprets it on restore.
+/// verbatim and only the policy interprets it on restore. `lora_recipe` is the policy's
+/// canonical adapter-recipe string (see [`CheckpointManifest::lora_recipe`]).
+///
+/// The write is **crash-atomic** via the same stage-then-rename as
+/// [`save_adapter`] (see the module docs).
 ///
 /// # Errors
 ///
-/// Returns [`CheckpointError`] if `dir` cannot be created, a tensor cannot be moved to
-/// CPU / serialized, or the manifest cannot be written.
+/// Returns [`CheckpointError`] if the staging directory cannot be created, a tensor
+/// cannot be moved to CPU / serialized, the manifest cannot be written, or the final
+/// rename fails.
 pub fn save_checkpoint(
     dir: impl AsRef<Path>,
     vars: &[Var],
     opt_state: &OptimizerState,
     sampler_state: &[u8],
     step: u64,
+    lora_recipe: Option<&str>,
 ) -> Result<(), CheckpointError> {
-    let dir = dir.as_ref();
-    std::fs::create_dir_all(dir).map_err(|e| io(dir, e))?;
+    let recipe = lora_recipe.map(str::to_owned);
+    write_staged(dir.as_ref(), |stage| {
+        // Adapter weights (identical to the v1 layout).
+        let mut adapter: HashMap<String, Tensor> = HashMap::with_capacity(vars.len());
+        for (i, v) in vars.iter().enumerate() {
+            let t = v.as_tensor().to_device(&Device::Cpu)?.contiguous()?;
+            adapter.insert(var_key(i), t);
+        }
+        candle_core::safetensors::save(&adapter, stage.join(ADAPTER_FILE))?;
 
-    // Adapter weights (identical to the v1 layout).
-    let mut adapter: HashMap<String, Tensor> = HashMap::with_capacity(vars.len());
-    for (i, v) in vars.iter().enumerate() {
-        let t = v.as_tensor().to_device(&Device::Cpu)?.contiguous()?;
-        adapter.insert(var_key(i), t);
-    }
-    candle_core::safetensors::save(&adapter, dir.join(ADAPTER_FILE))?;
+        // Optimizer moments: `m.<i>` / `v.<i>`, CPU + contiguous.
+        let n = opt_state.first_moments.len();
+        let mut moments: HashMap<String, Tensor> = HashMap::with_capacity(n * 2);
+        for i in 0..n {
+            let m = opt_state.first_moments[i]
+                .to_device(&Device::Cpu)?
+                .contiguous()?;
+            let v = opt_state.second_moments[i]
+                .to_device(&Device::Cpu)?
+                .contiguous()?;
+            moments.insert(moment_key("m", i), m);
+            moments.insert(moment_key("v", i), v);
+        }
+        candle_core::safetensors::save(&moments, stage.join(OPTIMIZER_FILE))?;
 
-    // Optimizer moments: `m.<i>` / `v.<i>`, CPU + contiguous.
-    let n = opt_state.first_moments.len();
-    let mut moments: HashMap<String, Tensor> = HashMap::with_capacity(n * 2);
-    for i in 0..n {
-        let m = opt_state.first_moments[i]
-            .to_device(&Device::Cpu)?
-            .contiguous()?;
-        let v = opt_state.second_moments[i]
-            .to_device(&Device::Cpu)?
-            .contiguous()?;
-        moments.insert(moment_key("m", i), m);
-        moments.insert(moment_key("v", i), v);
-    }
-    candle_core::safetensors::save(&moments, dir.join(OPTIMIZER_FILE))?;
-
-    // Manifest LAST — the commit marker (a crash before it leaves the load failing
-    // cleanly rather than reading partial state).
-    let manifest = CheckpointManifest {
-        format_version: FORMAT_VERSION,
-        step,
-        num_vars: vars.len(),
-        optimizer_step_t: Some(opt_state.step_t),
-        optimizer_num_vars: Some(n),
-        sampler_state: Some(sampler_state.to_vec()),
-    };
-    let manifest_path = dir.join(MANIFEST_FILE);
-    let json = serde_json::to_string_pretty(&manifest)?;
-    std::fs::write(&manifest_path, json).map_err(|e| io(&manifest_path, e))?;
-    Ok(())
+        // Manifest LAST — the commit marker (a crash before it leaves the load failing
+        // cleanly rather than reading partial state).
+        let manifest = CheckpointManifest {
+            format_version: FORMAT_VERSION,
+            step,
+            num_vars: vars.len(),
+            optimizer_step_t: Some(opt_state.step_t),
+            optimizer_num_vars: Some(n),
+            sampler_state: Some(sampler_state.to_vec()),
+            lora_recipe: recipe,
+        };
+        let manifest_path = stage.join(MANIFEST_FILE);
+        let json = serde_json::to_string_pretty(&manifest)?;
+        std::fs::write(&manifest_path, json).map_err(|e| io(&manifest_path, e))?;
+        Ok(())
+    })
 }
 
 /// Restore a checkpoint from `dir` into `vars`, returning the resume step and any
@@ -465,7 +546,7 @@ mod tests {
         let tmp = TempDir::new("roundtrip");
         let vars = make_vars();
         let original = snapshot(&vars);
-        save_adapter(tmp.path(), &vars, 7).unwrap();
+        save_adapter(tmp.path(), &vars, 7, None).unwrap();
 
         // Clobber the vars, then load them back.
         for v in &vars {
@@ -492,7 +573,7 @@ mod tests {
         let tmp = TempDir::new("alias");
         let src = make_vars();
         let saved = snapshot(&src);
-        save_adapter(tmp.path(), &src, 3).unwrap();
+        save_adapter(tmp.path(), &src, 3, None).unwrap();
 
         let dst = make_vars();
         for v in &dst {
@@ -507,7 +588,7 @@ mod tests {
     fn load_rejects_wrong_var_count() {
         let tmp = TempDir::new("count");
         let vars = make_vars();
-        save_adapter(tmp.path(), &vars, 1).unwrap();
+        save_adapter(tmp.path(), &vars, 1, None).unwrap();
         let just_one = vec![vars[0].clone()];
         let err = load_adapter(tmp.path(), &just_one).unwrap_err();
         assert!(matches!(err, CheckpointError::Mismatch(_)), "got {err:?}");
@@ -517,7 +598,7 @@ mod tests {
     fn load_rejects_shape_mismatch() {
         let tmp = TempDir::new("shape");
         let vars = make_vars();
-        save_adapter(tmp.path(), &vars, 1).unwrap();
+        save_adapter(tmp.path(), &vars, 1, None).unwrap();
         // Same count, but the first var has a different shape.
         let bad = vec![
             Var::from_tensor(&Tensor::zeros((3, 3), DType::F32, &Device::Cpu).unwrap()).unwrap(),
@@ -536,7 +617,7 @@ mod tests {
         // overwritten var 0 (all-or-nothing — validate every tensor before any set).
         let tmp = TempDir::new("partial");
         let vars = make_vars(); // shapes [2,3] and [4,2]
-        save_adapter(tmp.path(), &vars, 1).unwrap();
+        save_adapter(tmp.path(), &vars, 1, None).unwrap();
 
         let ones0 = Tensor::ones((2, 3), DType::F32, &Device::Cpu).unwrap();
         let dst0 = Var::from_tensor(&ones0).unwrap();
@@ -569,7 +650,7 @@ mod tests {
     fn load_rejects_dtype_mismatch() {
         let tmp = TempDir::new("dtype");
         let vars = make_vars(); // F32
-        save_adapter(tmp.path(), &vars, 1).unwrap();
+        save_adapter(tmp.path(), &vars, 1, None).unwrap();
         // Same count and shapes, but the first target var is F64.
         let a64 = Tensor::zeros((2, 3), DType::F64, &Device::Cpu).unwrap();
         let bad = vec![Var::from_tensor(&a64).unwrap(), vars[1].clone()];
@@ -584,7 +665,7 @@ mod tests {
     fn load_rejects_unknown_format_version() {
         let tmp = TempDir::new("version");
         let vars = make_vars();
-        save_adapter(tmp.path(), &vars, 1).unwrap();
+        save_adapter(tmp.path(), &vars, 1, None).unwrap();
         // Rewrite the manifest with a future format version.
         let bumped = CheckpointManifest {
             format_version: FORMAT_VERSION + 1,
@@ -593,6 +674,7 @@ mod tests {
             optimizer_step_t: None,
             optimizer_num_vars: None,
             sampler_state: None,
+            lora_recipe: None,
         };
         std::fs::write(
             tmp.path().join(MANIFEST_FILE),
@@ -623,6 +705,7 @@ mod tests {
             optimizer_step_t: Some(40),
             optimizer_num_vars: Some(8),
             sampler_state: Some(vec![1, 2, 3, 4]),
+            lora_recipe: Some("attn:qv|mlp:-".to_string()),
         };
         let j = serde_json::to_string(&m).unwrap();
         let back: CheckpointManifest = serde_json::from_str(&j).unwrap();
@@ -694,7 +777,7 @@ mod tests {
         let tmp = TempDir::new("v2-adapter");
         let vars = make_vars();
         let adapter = snapshot(&vars);
-        save_checkpoint(tmp.path(), &vars, &make_opt_state(), &[9u8, 8, 7], 13).unwrap();
+        save_checkpoint(tmp.path(), &vars, &make_opt_state(), &[9u8, 8, 7], 13, None).unwrap();
         clobber(&vars);
         let loaded = load_checkpoint(tmp.path(), &vars).unwrap();
         assert_eq!(loaded.step, 13);
@@ -711,7 +794,15 @@ mod tests {
         let vars = make_vars();
         let opt = make_opt_state();
         let sampler_blob = vec![9u8, 8, 7, 6, 5];
-        save_checkpoint(tmp.path(), &vars, &opt, &sampler_blob, 13).unwrap();
+        save_checkpoint(
+            tmp.path(),
+            &vars,
+            &opt,
+            &sampler_blob,
+            13,
+            Some("attn:qkvo|mlp:gud|gdn:-"),
+        )
+        .unwrap();
         let loaded = load_checkpoint(tmp.path(), &vars).unwrap();
         let os = loaded
             .optimizer_state
@@ -727,12 +818,74 @@ mod tests {
     }
 
     #[test]
+    fn save_is_staged_and_replaces_a_prior_checkpoint_as_a_unit() {
+        let tmp = TempDir::new("atomic");
+        let dir = tmp.path().join("step-5");
+        let vars = make_vars();
+
+        // Seed the published path with junk simulating a stale/partial write.
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("garbage.bin"), b"partial").unwrap();
+        // And a stale stage from a "dead" prior attempt of this same pid.
+        let stage = dir.with_file_name(format!("step-5.tmp-{}", std::process::id()));
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(stage.join("leftover"), b"x").unwrap();
+
+        save_checkpoint(&dir, &vars, &make_opt_state(), &[1u8], 5, None).unwrap();
+
+        // The publish replaced the prior directory as a unit: the junk is gone,
+        // the checkpoint is complete and loadable, and no stage dir remains.
+        assert!(!dir.join("garbage.bin").exists(), "stale content survived");
+        assert!(!stage.exists(), "stage dir must not survive a commit");
+        let loaded = load_checkpoint(&dir, &vars).unwrap();
+        assert_eq!(loaded.step, 5);
+
+        // Re-writing the same path succeeds and stays complete (the in-place
+        // overwrite path a periodic checkpointer hits on a re-run).
+        save_checkpoint(&dir, &vars, &make_opt_state(), &[2u8], 5, None).unwrap();
+        let again = load_checkpoint(&dir, &vars).unwrap();
+        assert_eq!(again.sampler_state, Some(vec![2u8]));
+    }
+
+    #[test]
+    fn lora_recipe_round_trips_and_defaults_to_none() {
+        let tmp = TempDir::new("recipe");
+        let vars = make_vars();
+        let dir_v2 = tmp.path().join("v2");
+        save_checkpoint(
+            &dir_v2,
+            &vars,
+            &make_opt_state(),
+            &[0u8],
+            3,
+            Some("attn:qkvo|mlp:gud|gdn:-"),
+        )
+        .unwrap();
+        let manifest = load_adapter(&dir_v2, &vars).unwrap();
+        assert_eq!(
+            manifest.lora_recipe.as_deref(),
+            Some("attn:qkvo|mlp:gud|gdn:-")
+        );
+
+        // v1 adapter path records it too when given...
+        let dir_v1 = tmp.path().join("v1");
+        save_adapter(&dir_v1, &vars, 1, Some("attn:qv|mlp:-")).unwrap();
+        let m1 = load_adapter(&dir_v1, &vars).unwrap();
+        assert_eq!(m1.lora_recipe.as_deref(), Some("attn:qv|mlp:-"));
+
+        // ...and a manifest without the field (pre-R1 checkpoint) loads as None.
+        let j = r#"{"format_version":1,"step":7,"num_vars":2}"#;
+        let m: CheckpointManifest = serde_json::from_str(j).unwrap();
+        assert_eq!(m.lora_recipe, None);
+    }
+
+    #[test]
     fn load_checkpoint_on_a_v1_adapter_only_yields_no_optimizer_or_sampler() {
         // A v1 checkpoint (save_adapter) loads through load_checkpoint with no optimizer
         // or sampler state — the documented fresh-momentum fallback.
         let tmp = TempDir::new("v1-via-checkpoint");
         let vars = make_vars();
-        save_adapter(tmp.path(), &vars, 4).unwrap();
+        save_adapter(tmp.path(), &vars, 4, None).unwrap();
         let loaded = load_checkpoint(tmp.path(), &vars).unwrap();
         assert_eq!(loaded.step, 4);
         assert!(
