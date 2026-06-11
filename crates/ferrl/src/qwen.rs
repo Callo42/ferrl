@@ -6,7 +6,7 @@
 //! *update* path: a full-sequence, uncached forward over the **same loaded
 //! weights**, expressed entirely in grad-bearing ops, with a manual `LoRA` adapter
 //! on `q_proj`/`v_proj`. It is **also** the (uncached) **rollout** forward used by
-//! [`crate::qwen_policy`] — the only *adapter-aware* forward; candle's shipped
+//! [`crate::lm_policy`] — the only *adapter-aware* forward; candle's shipped
 //! cached forward carries no adapter, so a fast merged-weight rollout is a later
 //! optimization.
 //!
@@ -37,76 +37,10 @@ use candle_nn::rotary_emb::rope_slow;
 use candle_nn::{Activation, VarBuilder};
 use candle_transformers::models::qwen3::Config;
 
+use crate::blocks::{causal_mask, causal_mask_at, frozen_linear, repeat_kv, RotaryTables};
 use crate::lora::LoraLinear;
+use crate::model::{CachedDecoder, GradModel};
 use crate::nn::RmsNorm;
-
-/// `y = x Wᵀ` for a frozen weight `w` of shape `[out, in]` (candle `Linear`
-/// layout), broadcasting over the leading dims of `x`.
-fn frozen_linear(x: &Tensor, w: &Tensor) -> CandleResult<Tensor> {
-    x.broadcast_matmul(&w.t()?)
-}
-
-/// Grouped-query repeat: `[b, kv_heads, l, d] -> [b, kv_heads * n_rep, l, d]`,
-/// each kv head repeated `n_rep` times consecutively (matching candle's
-/// `repeat_kv`). Pure `expand`+`reshape`, so it carries gradient.
-fn repeat_kv(x: &Tensor, n_rep: usize) -> CandleResult<Tensor> {
-    if n_rep == 1 {
-        return Ok(x.clone());
-    }
-    let (b, kv_heads, l, d) = x.dims4()?;
-    x.unsqueeze(2)?
-        .broadcast_as((b, kv_heads, n_rep, l, d))?
-        .contiguous()?
-        .reshape((b, kv_heads * n_rep, l, d))
-}
-
-/// Precomputed `RoPE` `cos`/`sin` tables, each `[max_pos, head_dim / 2]` (the
-/// half-width `rope_slow` expects). Built exactly as candle's
-/// `Qwen3RotaryEmbedding::new`.
-#[derive(Debug, Clone)]
-struct RotaryTables {
-    cos: Tensor,
-    sin: Tensor,
-}
-
-impl RotaryTables {
-    fn new(cfg: &Config, dtype: DType, device: &Device) -> CandleResult<Self> {
-        let dim = cfg.head_dim;
-        let max_pos = cfg.max_position_embeddings;
-        let inv_freq: Vec<f32> = (0..dim)
-            .step_by(2)
-            .map(|i| 1f32 / cfg.rope_theta.powf(i as f64 / dim as f64) as f32)
-            .collect();
-        let inv_freq_len = inv_freq.len();
-        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), device)?;
-        let t = Tensor::arange(0u32, max_pos as u32, device)?
-            .to_dtype(DType::F32)?
-            .reshape((max_pos, 1))?;
-        let freqs = t.matmul(&inv_freq)?;
-        // Match the model dtype (shipped Qwen3RotaryEmbedding casts here too) so
-        // rope_slow's broadcast_mul against q/k does not dtype-mismatch at bf16.
-        Ok(Self {
-            cos: freqs.cos()?.to_dtype(dtype)?,
-            sin: freqs.sin()?.to_dtype(dtype)?,
-        })
-    }
-
-    /// `cos`/`sin` narrowed to the first `seq_len` positions (offset 0).
-    fn slice(&self, seq_len: usize) -> CandleResult<(Tensor, Tensor)> {
-        self.slice_at(0, seq_len)
-    }
-
-    /// `cos`/`sin` narrowed to the `seq_len` positions starting at absolute
-    /// position `offset` — the cached-decode generalization of [`slice`](Self::slice),
-    /// matching candle's `Qwen3RotaryEmbedding::apply` (`cos.narrow(0, offset, seq_len)`).
-    /// At `offset == 0` it is exactly [`slice`](Self::slice).
-    fn slice_at(&self, offset: usize, seq_len: usize) -> CandleResult<(Tensor, Tensor)> {
-        Ok((
-            self.cos.narrow(0, offset, seq_len)?,
-            self.sin.narrow(0, offset, seq_len)?,
-        ))
-    }
-}
 
 /// One Qwen3 attention block. `q_proj`/`v_proj` carry the `LoRA` adapter; the
 /// rest are frozen. Replicates candle's `Qwen3Attention::forward` with the three
@@ -404,7 +338,15 @@ impl QwenGradModel {
                 vb.pp("model.norm").get(h, "weight")?,
                 cfg.rms_norm_eps as f32,
             ),
-            rot: RotaryTables::new(cfg, vb.dtype(), vb.device())?,
+            // Plain scalars, not the Config: the tables are architecture-neutral
+            // (crate::blocks) and the dtype cast matches the shipped rotary embedding.
+            rot: RotaryTables::new(
+                cfg.head_dim,
+                cfg.rope_theta,
+                cfg.max_position_embeddings,
+                vb.dtype(),
+                vb.device(),
+            )?,
             hidden: h,
             device: vb.device().clone(),
             dtype: vb.dtype(),
@@ -429,7 +371,7 @@ impl QwenGradModel {
         let mask = if l == 1 {
             None
         } else {
-            Some(self.causal_mask(l)?)
+            Some(causal_mask(l, self.dtype, &self.device)?)
         };
         for layer in &self.layers {
             h = layer.forward(&h, mask.as_ref(), &self.rot)?;
@@ -488,17 +430,32 @@ impl QwenGradModel {
     pub fn merged_decoder(&self) -> CandleResult<MergedDecoder> {
         MergedDecoder::from_model(self)
     }
+}
 
-    /// Additive causal mask `[1, 1, l, l]` (`0` on/below the diagonal, `-inf`
-    /// above), matching candle's `Model::causal_mask` at offset 0.
-    fn causal_mask(&self, l: usize) -> CandleResult<Tensor> {
-        let mut data = Vec::with_capacity(l * l);
-        for i in 0..l {
-            for j in 0..l {
-                data.push(if j <= i { 0f32 } else { f32::NEG_INFINITY });
-            }
-        }
-        Tensor::from_vec(data, (1, 1, l, l), &self.device)?.to_dtype(self.dtype)
+/// The [`GradModel`] seam over [`QwenGradModel`]: pure delegation to the
+/// inherent methods above (which stay public — the trait adds a generic
+/// surface, it does not replace the concrete one).
+impl GradModel for QwenGradModel {
+    type Decoder = MergedDecoder;
+
+    fn device(&self) -> &Device {
+        QwenGradModel::device(self)
+    }
+
+    fn forward(&self, input_ids: &Tensor) -> CandleResult<Tensor> {
+        QwenGradModel::forward(self, input_ids)
+    }
+
+    fn trainable_vars(&self) -> Vec<Var> {
+        QwenGradModel::trainable_vars(self)
+    }
+
+    fn set_adapter_enabled(&mut self, enabled: bool) {
+        QwenGradModel::set_adapter_enabled(self, enabled);
+    }
+
+    fn merged_decoder(&self) -> CandleResult<MergedDecoder> {
+        QwenGradModel::merged_decoder(self)
     }
 }
 
@@ -751,7 +708,7 @@ impl MergedDecoder {
         let mask = if l == 1 {
             None
         } else {
-            Some(self.causal_mask(l, offset)?)
+            Some(causal_mask_at(offset, l, self.dtype, &self.device)?)
         };
         for layer in &mut self.layers {
             h = layer.forward(&h, offset, mask.as_ref(), &self.rot)?;
@@ -770,25 +727,18 @@ impl MergedDecoder {
             layer.attn.cache.reset();
         }
     }
+}
 
-    /// Additive causal mask `[1, 1, chunk_len, offset + chunk_len]` for a chunk of
-    /// `chunk_len` queries at absolute positions `[offset, offset + chunk_len)`
-    /// against `offset + chunk_len` keys: `0` where query `i` (absolute `i+offset`)
-    /// may attend to key `j` (`j <= i + offset`), `-inf` above. Matches candle's
-    /// `Model::causal_mask(b, tgt, offset, None)`.
-    fn causal_mask(&self, chunk_len: usize, offset: usize) -> CandleResult<Tensor> {
-        let total = offset + chunk_len;
-        let mut data = Vec::with_capacity(chunk_len * total);
-        for i in 0..chunk_len {
-            for j in 0..total {
-                data.push(if j <= i + offset {
-                    0f32
-                } else {
-                    f32::NEG_INFINITY
-                });
-            }
-        }
-        Tensor::from_vec(data, (1, 1, chunk_len, total), &self.device)?.to_dtype(self.dtype)
+/// The [`CachedDecoder`] seam over [`MergedDecoder`]: pure delegation to the
+/// inherent methods above (which carry the offset fail-loud guard and the
+/// cache-lifecycle contract the trait requires).
+impl CachedDecoder for MergedDecoder {
+    fn forward(&mut self, input_ids: &Tensor, offset: usize) -> CandleResult<Tensor> {
+        MergedDecoder::forward(self, input_ids, offset)
+    }
+
+    fn reset_cache(&mut self) {
+        MergedDecoder::reset_cache(self);
     }
 }
 

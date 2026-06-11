@@ -1,31 +1,34 @@
-//! A [`Policy`] over the real Qwen3 model.
+//! A [`Policy`] over any [`GradModel`].
 //!
-//! [`QwenPolicy`] bridges the grad-bearing [`QwenGradModel`] forward (the update
-//! path) to the trainer's [`Policy`] seam, so the *same* [`Trainer`] that drives
-//! the P2 echo toy drives Qwen3-0.6B-Base unchanged. It is the production
-//! counterpart of the in-test `EchoPolicy`.
+//! [`LmPolicy`] bridges a grad-bearing model forward (the update path) to the
+//! trainer's [`Policy`] seam, generically over the [`GradModel`] /
+//! [`CachedDecoder`] traits — so the *same*
+//! [`Trainer`] that drives the P2 echo toy drives any real model unchanged.
+//! [`QwenPolicy`] (= `LmPolicy<QwenGradModel>`) is the production instantiation
+//! over Qwen3-0.6B-Base.
 //!
 //! ## Generation is KV-cached over merged weights, and adapter-aware
 //!
-//! [`generate`](QwenPolicy::generate) snapshots the policy's **current** effective
-//! weights into a [`MergedDecoder`](crate::qwen::MergedDecoder) — the `LoRA` adapter
-//! folded into the base (`W + scale·BA` when enabled, plain `W` when disabled, so the
-//! eval adapter-off path samples the frozen base) — and decodes incrementally over a
-//! KV cache: **O(L) per token** instead of the uncached forward's O(L²). The rollout
-//! is still drawn from the *current* policy at every step (candle's shipped
-//! `ModelForCausalLM` carries no adapter, so it could only sample the frozen base —
-//! the merge is what makes a cached **adapter-aware** rollout possible). The merged
-//! decoder is a tape-detached value snapshot, rebuilt every `generate` call, so it
-//! always reflects the latest optimizer step. **Scoring is unaffected** — the
-//! grad-bearing [`token_logprobs`](QwenPolicy::token_logprobs) and the KL reference
-//! forward still run the uncached [`QwenGradModel::forward`] (the cache holds no tape).
+//! [`generate`](LmPolicy::generate) snapshots the policy's **current** effective
+//! weights into a cached decoder ([`GradModel::merged_decoder`]) — the `LoRA`
+//! adapter folded into the base (`W + scale·BA` when enabled, plain `W` when
+//! disabled, so the eval adapter-off path samples the frozen base) — and decodes
+//! incrementally over a KV cache: **O(L) per token** instead of the uncached
+//! forward's O(L²). The rollout is still drawn from the *current* policy at every
+//! step (candle's shipped cached forwards carry no adapter, so they could only
+//! sample the frozen base — the merge is what makes a cached **adapter-aware**
+//! rollout possible). The merged decoder is a tape-detached value snapshot,
+//! rebuilt every `generate` call, so it always reflects the latest optimizer
+//! step. **Scoring is unaffected** — the grad-bearing
+//! [`token_logprobs`](LmPolicy::token_logprobs) and the KL reference forward
+//! still run the uncached [`GradModel::forward`] (the cache holds no tape).
 //! The cached and uncached rollouts are equivalent up to F32 reassociation of the
-//! merge (CI-gated: identical token stream **and** identical sampler-RNG consumption
-//! on a tiny model); the bf16-merge faithfulness is a manual GPU gate.
+//! merge (CI-gated: identical token stream **and** identical sampler-RNG
+//! consumption on a tiny model); the bf16-merge faithfulness is a manual GPU gate.
 //!
 //! ## Rectangular rollouts
 //!
-//! [`generate`](QwenPolicy::generate) always emits a **fixed** width of
+//! [`generate`](LmPolicy::generate) always emits a **fixed** width of
 //! `max_new_tokens` completion tokens per sequence, so every sequence in a group
 //! has the same length — the rectangular shape the [`Trainer`] requires (it rejects
 //! ragged rollouts, and a fixed width keeps Dr.GRPO's token denominator constant).
@@ -36,7 +39,7 @@
 //! records each true length so the padding can be masked out of the loss downstream.
 //! With `eos_token_id == None` no sequence stops early, every completion is the full
 //! width, and the rollout is bit-identical to the legacy behavior. Scoring
-//! ([`token_logprobs`](QwenPolicy::token_logprobs)) is teacher-forced: forward all
+//! ([`token_logprobs`](LmPolicy::token_logprobs)) is teacher-forced: forward all
 //! but the last token, read the positions that predict the completion tokens, and
 //! gather their log-probabilities.
 //!
@@ -45,28 +48,33 @@
 use candle_core::{DType, IndexOp, Result as CandleResult, Tensor, Var, D};
 use candle_nn::ops::log_softmax;
 
+use crate::model::{CachedDecoder, GradModel};
 use crate::policy::{GenConfig, Policy, Rollout};
 use crate::qwen::QwenGradModel;
 use crate::sampler::GrpoSampler;
 
-/// A [`Policy`] backed by the grad-bearing [`QwenGradModel`].
+/// A [`Policy`] backed by any grad-bearing [`GradModel`].
 ///
-/// Construct it from a loaded model with [`QwenPolicy::new`]; the device and dtype
-/// follow the model's — all-F32, or the bf16-base / F32-adapter split (see
+/// Construct it from a loaded model with [`LmPolicy::new`]; the device and dtype
+/// follow the model's — all-F32, or a bf16-base / F32-adapter split (see
 /// [`QwenGradModel::load_with_adapter_dtype`](crate::qwen::QwenGradModel::load_with_adapter_dtype)),
 /// whose BF16 logits the scoring path upcasts to F32 for the surrogate.
-pub struct QwenPolicy {
-    model: QwenGradModel,
+pub struct LmPolicy<M: GradModel> {
+    model: M,
     sampler: GrpoSampler,
     temperature: f64,
     enabled: bool,
 }
 
+/// The production policy over the real Qwen3 model — the first [`LmPolicy`]
+/// instantiation (and the name every pre-M1 call site uses).
+pub type QwenPolicy = LmPolicy<QwenGradModel>;
+
 // Elide the sampler's RNG state and the heavy model fields; show the inspectable
 // scalars. (`GrpoSampler` is `Debug`, but the raw RNG words add only noise.)
-impl std::fmt::Debug for QwenPolicy {
+impl<M: GradModel + std::fmt::Debug> std::fmt::Debug for LmPolicy<M> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("QwenPolicy")
+        f.debug_struct("LmPolicy")
             .field("model", &self.model)
             .field("temperature", &self.temperature)
             .field("enabled", &self.enabled)
@@ -74,8 +82,8 @@ impl std::fmt::Debug for QwenPolicy {
     }
 }
 
-impl QwenPolicy {
-    /// Wrap a loaded [`QwenGradModel`] as a policy, seeding the rollout sampler.
+impl<M: GradModel> LmPolicy<M> {
+    /// Wrap a loaded [`GradModel`] as a policy, seeding the rollout sampler.
     ///
     /// `temperature` is the rollout sampling temperature, fixed for this policy's
     /// lifetime: the [`GrpoSampler`] bakes it in (as candle's `LogitsProcessor`
@@ -85,7 +93,7 @@ impl QwenPolicy {
     /// same value through. Scoring is always at temperature 1. The adapter starts
     /// enabled (the trainer toggles it off for the KL reference forward).
     #[must_use]
-    pub fn new(model: QwenGradModel, seed: u64, temperature: f64) -> Self {
+    pub fn new(model: M, seed: u64, temperature: f64) -> Self {
         let sampler = GrpoSampler::new(seed, temperature);
         Self {
             model,
@@ -98,12 +106,12 @@ impl QwenPolicy {
     /// The wrapped grad-bearing model — e.g. to inspect its device or (later) save
     /// the trained adapter.
     #[must_use]
-    pub fn model(&self) -> &QwenGradModel {
+    pub fn model(&self) -> &M {
         &self.model
     }
 
     /// The pre-P6-C **uncached** rollout: re-run the full-sequence
-    /// [`QwenGradModel::forward`] every step. Kept as the equivalence oracle for the
+    /// [`GradModel::forward`] every step. Kept as the equivalence oracle for the
     /// cached [`generate`](Self::generate) — same sampler, same EOS/padding logic, so
     /// a per-token-identical cached path must reproduce its token stream and RNG
     /// consumption exactly. Test-only; the production path is `generate`.
@@ -141,13 +149,13 @@ impl QwenPolicy {
     }
 }
 
-impl Policy for QwenPolicy {
+impl<M: GradModel> Policy for LmPolicy<M> {
     fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
         // The sampler's temperature is fixed at construction (see `new`); fail loud
         // rather than silently sampling at a different cfg.temperature.
         if (cfg.temperature - self.temperature).abs() > f64::EPSILON {
             candle_core::bail!(
-                "QwenPolicy was built with temperature {} but generate was called \
+                "LmPolicy was built with temperature {} but generate was called \
                  with cfg.temperature {}; rebuild the policy to change it",
                 self.temperature,
                 cfg.temperature
@@ -777,7 +785,7 @@ mod tests {
         assert_eq!(policy.trainable_vars().len(), 2 * 4);
         // The manual Debug impl elides the non-Debug sampler.
         let dbg = format!("{policy:?}");
-        assert!(dbg.contains("QwenPolicy") && dbg.contains(".."));
+        assert!(dbg.contains("LmPolicy") && dbg.contains(".."));
     }
 
     // ---- end-to-end: QwenPolicy through the real Trainer (CPU) --------------
