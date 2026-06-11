@@ -51,7 +51,9 @@ use crate::blocks::frozen_linear;
 /// var-order note below).
 ///
 /// Norm weights, the embedding, and the (tied or untied) `lm_head` are never
-/// adapted — no framework adapts them.
+/// adapted — no framework's `LoRA` recipe targets them by default (frameworks
+/// that train them at all do it full-rank, peft-`modules_to_save`-style, a
+/// different mechanism than an adapter).
 ///
 /// The recipe (together with the config) **determines the trainable-var
 /// order** — layer-major, fixed projection order within each layer

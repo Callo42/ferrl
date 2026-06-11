@@ -546,14 +546,21 @@ impl Trainer {
     /// falls back to a fresh [`FerrlAdamW`] and the policy's current sampler (a faithful
     /// continuation, not a bit-exact replay — exactly like [`train_from`](Self::train_from)).
     ///
-    /// `policy` must be the same architecture the checkpoint was written from: the
-    /// adapter load and the optimizer-moment load each validate count/shape/dtype and
-    /// fail loud otherwise, and a malformed sampler blob fails loud too.
+    /// `policy` must be the same architecture AND adapter recipe the checkpoint was
+    /// written from: the adapter load and the optimizer-moment load each validate
+    /// count/shape/dtype, the manifest's `lora_recipe` string is cross-checked against
+    /// [`Policy::lora_recipe`] **before** any model state is touched (count/shape/dtype
+    /// cannot distinguish shape-aliased recipes — e.g. `attn:qk` vs `attn:qv`, whose
+    /// k/v projections are shape-identical — so a recipe swap would otherwise restore
+    /// adapters onto the wrong projections silently), and a malformed sampler blob
+    /// fails loud too. A checkpoint or policy without a recorded recipe skips the
+    /// recipe check (pre-recipe checkpoints stay loadable).
     ///
     /// # Errors
     ///
     /// Returns [`TrainerError`] if the checkpoint cannot be read or does not match
-    /// `policy`, or if a training step fails (as [`train`](Self::train)).
+    /// `policy` (count/shape/dtype or adapter recipe), or if a training step fails
+    /// (as [`train`](Self::train)).
     ///
     /// # Panics
     ///
@@ -566,6 +573,23 @@ impl Trainer {
         tokenizer: &dyn TokenizerLike,
         prompts: &[String],
     ) -> Result<Vec<Metrics>, TrainerError> {
+        let checkpoint_dir = checkpoint_dir.as_ref();
+        // Recipe pre-flight BEFORE the positional load mutates the live vars:
+        // count/shape/dtype validation cannot distinguish shape-aliased recipes
+        // (k/v and gate/up projections are shape-identical), so a mismatch here
+        // would land trained adapters on the wrong projections silently.
+        let manifest = crate::checkpoint::read_manifest(checkpoint_dir)?;
+        if let (Some(saved), Some(current)) = (&manifest.lora_recipe, policy.lora_recipe()) {
+            if *saved != current {
+                return Err(TrainerError::Checkpoint(
+                    crate::checkpoint::CheckpointError::Mismatch(format!(
+                        "checkpoint adapter recipe {saved:?} does not match the policy's \
+                         {current:?} (the positional load cannot catch a shape-aliased \
+                         recipe swap — load with the recipe the checkpoint records)"
+                    )),
+                ));
+            }
+        }
         let vars = policy.trainable_vars();
         let loaded = crate::checkpoint::load_checkpoint(checkpoint_dir, &vars)?;
         // Restore the sampler RNG (v2). A v1 checkpoint carries none → keep the policy's

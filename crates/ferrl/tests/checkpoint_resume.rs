@@ -20,8 +20,9 @@ use candle_transformers::models::qwen3::Config;
 
 use ferrl::policy::{GenConfig, Rollout};
 use ferrl::{
-    evaluate, load_adapter, save_adapter, EvalReport, LlamaGradModel, LlamaPolicy, Policy,
-    QwenGradModel, QwenPolicy, RewardFn, RunDir, TokenizerLike, Trainer, TrainerConfig,
+    evaluate, load_adapter, save_adapter, DenseLoraTargets, EvalReport, LlamaGradModel,
+    LlamaPolicy, Policy, QwenGradModel, QwenPolicy, RewardFn, RunDir, TokenizerLike, Trainer,
+    TrainerConfig,
 };
 
 const RANK: usize = 2;
@@ -483,4 +484,115 @@ fn assert_finite_report(report: &EvalReport) {
         .per_prompt
         .iter()
         .all(|p| p.base_mean.is_finite() && p.adapter_mean.is_finite()));
+}
+
+/// A `QwenPolicy` over `vb` with an explicit [`DenseLoraTargets`] recipe.
+fn policy_with_targets(vb: &VarBuilder, cfg: &Config, targets: DenseLoraTargets) -> QwenPolicy {
+    QwenPolicy::new(
+        QwenGradModel::load_with_targets(cfg, vb, RANK, ALPHA, DType::F32, targets).unwrap(),
+        SEED,
+        1.0,
+    )
+}
+
+#[test]
+fn industrial_recipe_round_trips_through_a_trainer_checkpoint() {
+    // The recipe-aware checkpoint chain end-to-end: an industrial-recipe
+    // policy (14 vars/layer) trains with a periodic checkpoint, the manifest
+    // records the canonical recipe string, and a FRESH industrial policy
+    // resumes through `Trainer::resume` (the recipe pre-flight matches, the
+    // positional restore covers all seven projections per layer).
+    let cfg = tiny_cfg();
+    let vb = tiny_vb(&cfg);
+    let mut policy = policy_with_targets(&vb, &cfg, DenseLoraTargets::industrial());
+    assert_eq!(policy.trainable_vars().len(), cfg.num_hidden_layers * 14);
+    let prompts = vec!["abc".to_string(), "bcd".to_string()];
+
+    let tmp = TempDir::new("industrial");
+    let run = RunDir::create(tmp.path(), "qwen-industrial").unwrap();
+    let ckpt_root = run.checkpoints_dir();
+    let mut trainer = Trainer::new(ckpt_train_cfg(Some(2)), &run).unwrap();
+    trainer
+        .train(&mut policy, &SpreadReward, &CharCodec, &prompts)
+        .unwrap();
+
+    // The manifest is recipe-self-describing.
+    let raw = std::fs::read_to_string(ckpt_root.join("step-2").join("manifest.json")).unwrap();
+    let manifest: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(manifest["lora_recipe"].as_str(), Some("attn:qkvo|mlp:gud"));
+
+    // A fresh industrial policy passes the recipe pre-flight and resumes.
+    let mut resumed = policy_with_targets(&vb, &cfg, DenseLoraTargets::industrial());
+    let run2 = RunDir::create(tmp.path(), "qwen-industrial-resume").unwrap();
+    let mut trainer2 = Trainer::new(ckpt_train_cfg(None), &run2).unwrap();
+    let history = trainer2
+        .resume(
+            ckpt_root.join("step-2"),
+            &mut resumed,
+            &SpreadReward,
+            &CharCodec,
+            &prompts,
+        )
+        .unwrap();
+    assert_eq!(history.len(), 2, "resume runs the remaining 2 of 4 steps");
+    assert!(history.iter().all(|m| m.grad_norm.is_finite()));
+}
+
+#[test]
+fn resume_rejects_a_shape_aliased_recipe_swap() {
+    // `attn:qk` and `attn:qv` produce IDENTICAL positional shape sequences
+    // (k_proj and v_proj are both `[kv_out, hidden]`), so the count/shape/dtype
+    // validation cannot tell them apart — only the manifest recipe cross-check
+    // can. Train+checkpoint under qk, resume under qv: must fail loud, and
+    // BEFORE any var is overwritten.
+    let cfg = tiny_cfg();
+    let vb = tiny_vb(&cfg);
+    let qk = DenseLoraTargets {
+        attn_q: true,
+        attn_k: true,
+        attn_v: false,
+        attn_o: false,
+        mlp_gate: false,
+        mlp_up: false,
+        mlp_down: false,
+    };
+    let qv = DenseLoraTargets {
+        attn_k: false,
+        attn_v: true,
+        ..qk
+    };
+    let mut policy = policy_with_targets(&vb, &cfg, qk);
+    let prompts = vec!["abc".to_string(), "bcd".to_string()];
+
+    let tmp = TempDir::new("alias");
+    let run = RunDir::create(tmp.path(), "qwen-alias").unwrap();
+    let ckpt_root = run.checkpoints_dir();
+    let mut trainer = Trainer::new(ckpt_train_cfg(Some(2)), &run).unwrap();
+    trainer
+        .train(&mut policy, &SpreadReward, &CharCodec, &prompts)
+        .unwrap();
+
+    let mut wrong = policy_with_targets(&vb, &cfg, qv);
+    let before = snapshot(&wrong);
+    let run2 = RunDir::create(tmp.path(), "qwen-alias-resume").unwrap();
+    let mut trainer2 = Trainer::new(ckpt_train_cfg(None), &run2).unwrap();
+    let err = trainer2
+        .resume(
+            ckpt_root.join("step-2"),
+            &mut wrong,
+            &SpreadReward,
+            &CharCodec,
+            &prompts,
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("recipe"),
+        "expected a recipe-mismatch rejection, got: {err}"
+    );
+    // The pre-flight fired BEFORE the positional load: nothing was overwritten.
+    assert_eq!(
+        snapshot(&wrong),
+        before,
+        "a rejected resume must leave the policy untouched"
+    );
 }

@@ -552,7 +552,9 @@ pub fn varbuilder_from_pretrained(
 // ---------------------------------------------------------------------------
 
 /// Which projections carry a trainable `LoRA` adapter — the configurable
-/// recipe of the M2′ design.
+/// recipe of the M2′ design. This is the **hybrid** (`qwen3_5`) recipe, with
+/// `GatedDeltaNet` opt-ins; the dense models ([`crate::qwen`],
+/// [`crate::llama`]) use [`crate::lora::DenseLoraTargets`] instead.
 ///
 /// The [`Default`] is the **industrial recipe**: attention `q,k,v,o` on the
 /// full-attention layers plus MLP `gate,up,down` on **every** layer
@@ -562,7 +564,7 @@ pub fn varbuilder_from_pretrained(
 /// the linear-attention backbone destructive, while literal all-linear trains
 /// fine at larger scales, so the knob exists but is not the default. The conv
 /// kernel, `A_log`/`dt_bias`, and every norm weight are never adapted (no
-/// framework adapts them).
+/// framework's `LoRA` recipe targets them by default).
 ///
 /// The recipe (together with the config) **determines the trainable-var
 /// order** — layer-major, fixed projection order within each layer — which is

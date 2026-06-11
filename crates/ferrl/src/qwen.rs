@@ -1951,4 +1951,42 @@ mod tests {
             "industrial-recipe cached decode diverged from uncached forward: {worst}"
         );
     }
+
+    #[test]
+    fn merged_decoder_disabled_industrial_snapshots_pure_base() {
+        // The adapter-OFF half of the industrial gate: every projection
+        // adapted and ARMED but DISABLED — the merged snapshot must be the
+        // pure base model (the GRPO reference policy), proving merged_weight
+        // respects the toggle on all seven folds, not just legacy q/v.
+        let cfg = tiny_cfg();
+        let vb = tiny_vb(&cfg);
+        let mut model = QwenGradModel::load_with_targets(
+            &cfg,
+            &vb,
+            2,
+            4.0,
+            DType::F32,
+            DenseLoraTargets::industrial(),
+        )
+        .unwrap();
+        arm_adapter(&model);
+        model.set_adapter_enabled(false);
+
+        let seq = 6;
+        let input = ids(seq);
+        let base = uncached_base_logits(&cfg, &vb, &input);
+        let mut dec = model.merged_decoder().unwrap();
+        let mut worst = 0f32;
+        for t in 0..seq {
+            let tok = input.narrow(1, t, 1).unwrap();
+            worst = worst.max(max_abs_diff(
+                &dec.forward(&tok, t).unwrap(),
+                &base.narrow(1, t, 1).unwrap(),
+            ));
+        }
+        assert!(
+            worst <= 1e-4,
+            "disabled-industrial cached decode diverged from the pure base: {worst}"
+        );
+    }
 }
