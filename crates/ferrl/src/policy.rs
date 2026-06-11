@@ -274,6 +274,15 @@ pub trait Policy {
     /// store covers every [`trainable_vars`](Self::trainable_vars) entry
     /// either way (the trainer's grad-coverage canary enforces it).
     ///
+    /// **Wrapper policies:** a policy that delegates `token_logprobs` to an
+    /// inner policy MUST delegate `backward` (and
+    /// [`token_logprobs_detached`](Self::token_logprobs_detached)) too. With a
+    /// checkpointing inner policy, inheriting this default would run a plain
+    /// `loss.backward()` over the cut tape — every layer var absent. The
+    /// trainer's grad-coverage canary aborts that run (loud, not silent), but
+    /// the failure reads as "var absent from the grad store", not as the
+    /// missing delegation it actually is.
+    ///
     /// # Errors
     ///
     /// Returns a candle error if the backward fails, or (under checkpointing)

@@ -1924,4 +1924,91 @@ mod tests {
             );
         }
     }
+
+    /// The tape-preservation invariant, in the order that would clobber it: a
+    /// LIVE scoring captures the tape, a value scoring runs AFTER it, and the
+    /// live loss must still stitch. Kills the mutant where
+    /// `token_logprobs_detached` routes through the tape-capturing `forward`
+    /// (which would silently replace the pending tape — and with it the whole
+    /// memory feature): under that mutant the backward below fails loud with
+    /// the foreign-loss error.
+    #[test]
+    fn a_value_scoring_does_not_disturb_the_pending_tape() {
+        let mut policy = tiny_policy();
+        arm_policy(&policy);
+        let rollout = small_rollout(&mut policy);
+        policy.model_mut().set_activation_checkpointing(true);
+
+        let loss = probe_loss_of(&policy, &rollout); // live: captures the tape
+        let _ = policy.token_logprobs_detached(&rollout).unwrap(); // must not touch it
+        let grads = policy.backward(&loss).unwrap(); // must still stitch
+        for v in policy.trainable_vars() {
+            assert!(
+                grads.get(&v).is_some(),
+                "the stitched store lost a var — the value scoring disturbed the tape"
+            );
+        }
+    }
+
+    /// The full trainer loop with checkpointing ON equals the loop with it
+    /// OFF: paired policies (shared base weights + sampler seed, adapter vars
+    /// synced — independently drawn `A` factors are invisible to the forward
+    /// at `B = 0` but `dL/dB ∝ A`, the R2 lesson), identical config with
+    /// `mu = 2` inner epochs and `beta > 0` (so the detached `logp_old` + KL
+    /// reference scorings and the repeated live-forward/backward tape
+    /// pairings all run through the real `Trainer`), then the trained vars
+    /// must agree within float tolerance.
+    #[test]
+    fn trainer_with_checkpointing_matches_without_end_to_end() {
+        let (mut off, mut on) = paired_policies();
+        for (va, vb) in off.trainable_vars().iter().zip(on.trainable_vars()) {
+            vb.set(va.as_tensor()).unwrap();
+        }
+        on.model_mut().set_activation_checkpointing(true);
+
+        let cfg = TrainerConfig {
+            steps: 2,
+            group_size: 4,
+            max_new_tokens: 3,
+            temperature: 1.0,
+            beta: 0.02,
+            mu: 2,
+            lr: 1e-3,
+            ..TrainerConfig::default()
+        };
+        let prompts = vec!["abc".to_string(), "bcd".to_string()];
+        let run_one = |policy: &mut QwenPolicy, tag: &str| {
+            let tmp = TempDir::new();
+            let run = RunDir::create(&tmp.0, tag).unwrap();
+            let mut trainer = Trainer::new(cfg.clone(), &run).unwrap();
+            let history = trainer
+                .train(policy, &SpreadReward, &CharCodec, &prompts)
+                .unwrap();
+            assert!(
+                history.iter().any(|m| m.grad_norm > 0.0),
+                "{tag}: no real update ran — the comparison would be vacuous"
+            );
+        };
+        run_one(&mut off, "remat-off");
+        run_one(&mut on, "remat-on");
+
+        for (va, vb) in off.trainable_vars().iter().zip(on.trainable_vars()) {
+            let diff: f32 = va
+                .as_tensor()
+                .sub(vb.as_tensor())
+                .unwrap()
+                .abs()
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .max(0)
+                .unwrap()
+                .to_scalar()
+                .unwrap();
+            assert!(
+                diff <= 1e-5,
+                "trained vars diverged between checkpointing on/off: {diff}"
+            );
+        }
+    }
 }

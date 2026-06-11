@@ -3079,4 +3079,16 @@ mod tests {
             "a layer var is on the loss tape — the boundary cut is not happening"
         );
     }
+
+    /// Under checkpointing a value scoring must capture NO tape (it would
+    /// clobber the tape the next update backward consumes).
+    #[test]
+    fn forward_detached_captures_no_tape_under_checkpointing() {
+        let mut model = armed_model();
+        model.set_activation_checkpointing(true);
+        let _ = model.forward_detached(&ids(5)).unwrap();
+        let scalar = Tensor::zeros((), DType::F32, &dev()).unwrap();
+        let err = model.backward(&scalar).unwrap_err();
+        assert!(err.to_string().contains("no checkpointed forward"));
+    }
 }

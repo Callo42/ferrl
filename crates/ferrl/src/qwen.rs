@@ -2346,4 +2346,78 @@ mod tests {
         let err = model.backward(&scalar).unwrap_err();
         assert!(err.to_string().contains("no checkpointed forward"));
     }
+
+    /// Toggling checkpointing OFF drops a pending tape (a stale tape must not
+    /// survive a mode flip and get stitched later).
+    #[test]
+    fn toggling_checkpointing_off_drops_the_pending_tape() {
+        let cfg = tiny_cfg();
+        let mut model = QwenGradModel::load(&cfg, &tiny_vb(&cfg), 2, 4.0).unwrap();
+        model.set_activation_checkpointing(true);
+        let loss = probe_loss(&model.forward(&ids(4)).unwrap()); // captures a tape
+        model.set_activation_checkpointing(false);
+        model.set_activation_checkpointing(true);
+        let err = model.backward(&loss).unwrap_err();
+        assert!(
+            err.to_string().contains("no checkpointed forward"),
+            "the mode flip kept a stale tape alive: {err}"
+        );
+    }
+
+    /// Stitched == uncut on a batch > 1 input: the mask-length derivation
+    /// from the boundary dims must read the SEQ axis (`dims[1]`), which a
+    /// batch-1 fixture cannot distinguish from a batch read.
+    #[test]
+    fn checkpointed_gradients_match_at_batch_two() {
+        let cfg = tiny_cfg();
+        let mut model = QwenGradModel::load(&cfg, &tiny_vb(&cfg), 2, 4.0).unwrap();
+        arm_adapter(&model);
+        let v: Vec<u32> = (0..12u32).map(|i| i % 5).collect();
+        let input = Tensor::from_vec(v, (2, 6), &dev()).unwrap();
+        let vars = model.trainable_vars();
+
+        let plain = model
+            .backward(&probe_loss(&model.forward(&input).unwrap()))
+            .unwrap();
+        model.set_activation_checkpointing(true);
+        let stitched = model
+            .backward(&probe_loss(&model.forward(&input).unwrap()))
+            .unwrap();
+        assert_var_grads_close(&plain, &stitched, &vars);
+    }
+
+    /// The minimal shapes: a single-token sequence (the `mask == None` branch
+    /// of the checkpointed forward AND of the backward's mask rebuild) and a
+    /// single-layer stack (one segment — the reverse loop's boundary case).
+    #[test]
+    fn checkpointed_gradients_match_at_minimal_shapes() {
+        // seq_len 1 on the standard 2-layer fixture.
+        let cfg = tiny_cfg();
+        let mut model = QwenGradModel::load(&cfg, &tiny_vb(&cfg), 2, 4.0).unwrap();
+        arm_adapter(&model);
+        let vars = model.trainable_vars();
+        let plain = model
+            .backward(&probe_loss(&model.forward(&ids(1)).unwrap()))
+            .unwrap();
+        model.set_activation_checkpointing(true);
+        let stitched = model
+            .backward(&probe_loss(&model.forward(&ids(1)).unwrap()))
+            .unwrap();
+        assert_var_grads_close(&plain, &stitched, &vars);
+
+        // A single-layer model (segments == 1).
+        let mut cfg = tiny_cfg();
+        cfg.num_hidden_layers = 1;
+        let mut model = QwenGradModel::load(&cfg, &tiny_vb(&cfg), 2, 4.0).unwrap();
+        arm_adapter(&model);
+        let vars = model.trainable_vars();
+        let plain = model
+            .backward(&probe_loss(&model.forward(&ids(4)).unwrap()))
+            .unwrap();
+        model.set_activation_checkpointing(true);
+        let stitched = model
+            .backward(&probe_loss(&model.forward(&ids(4)).unwrap()))
+            .unwrap();
+        assert_var_grads_close(&plain, &stitched, &vars);
+    }
 }
