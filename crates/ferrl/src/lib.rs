@@ -133,7 +133,7 @@ pub use gdn::{
 };
 #[doc(inline)]
 pub use grpo::{
-    clipped_surrogate, group_advantages, k3_kl, masked_mean, zero_mask_rows, LossType,
+    clipped_surrogate, group_advantages, k3_kl, masked_mean, tis_weight, zero_mask_rows, LossType,
     ScaleRewards, GROUP_STD_EPS,
 };
 #[doc(inline)]
@@ -149,7 +149,7 @@ pub use nn::{grad_coverage, GradCoverage, RmsNorm, RmsNormGated, RmsNormZeroCent
 #[doc(inline)]
 pub use optim::{FerrlAdamW, OptimizerState};
 #[doc(inline)]
-pub use policy::Policy;
+pub use policy::{EvalSampling, Policy};
 #[doc(inline)]
 pub use qwen::{MergedDecoder, QwenGradModel};
 #[doc(inline)]

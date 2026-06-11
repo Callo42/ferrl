@@ -11,17 +11,31 @@
 //! Qwen policy are evaluated by identical code, and the adapter toggle is the same
 //! seam the trainer uses for the KL reference.
 //!
-//! ## Sampling, not greedy
+//! ## Sampling, not greedy — avg@k
 //!
 //! Generation goes through [`Policy::generate`] — the policy's own (seeded)
 //! sampler — so the reported means are Monte-Carlo estimates of `E[reward]` under
-//! each policy at the rollout temperature, averaged over `group_size` samples per
-//! prompt. Base and adapter draw from different points of the sampler's RNG
-//! stream, so with a small `group_size` the comparison carries sampling variance;
+//! each policy, averaged over `group_size` samples per prompt: **avg@k** with
+//! `k = group_size`. For a 0/1 verifier reward each per-prompt mean is the
+//! k-sample estimate of *sampled pass@1* — the standard held-out RL eval
+//! quantity. Base and adapter draw from different points of the sampler's RNG
+//! stream, so with a small `k` the comparison carries sampling variance;
 //! pass a `group_size` large enough to resolve the gap you care about. `evaluate`
 //! advances the policy's sampler, and restores the adapter-enabled flag to its
 //! prior state before returning — on success, on a returned error, or on a panic
 //! (an RAII guard).
+//!
+//! ## Eval-only sampling parameters
+//!
+//! The convention samples eval at a *different* distribution than training
+//! (temperature ≈ 0.6 with nucleus top-p 0.95, vs the untruncated training
+//! temperature): set [`GenConfig::eval_sampling`] — e.g.
+//! `Some(EvalSampling::default())` — on the config passed in. That override is
+//! the **only** channel through which top-p reaches the sampler, so training
+//! rollouts structurally stay untruncated; without it, eval samples exactly the
+//! policy's training distribution, as before.
+//!
+//! [`EvalSampling`]: crate::policy::EvalSampling
 //!
 //! ## EOS / length-aware scoring
 //!
@@ -49,7 +63,8 @@ pub struct PromptEval {
 pub struct EvalReport {
     /// Number of held-out prompts evaluated.
     pub n_prompts: usize,
-    /// Completions sampled per prompt, for each of base and adapter.
+    /// Completions sampled per prompt, for each of base and adapter — the `k`
+    /// of the avg@k estimates below.
     pub group_size: usize,
     /// Mean over prompts of the per-prompt base-model mean reward.
     pub base_reward_mean: f32,
@@ -99,7 +114,10 @@ pub enum EvalError {
 /// `gen` drives [`Policy::generate`]. For a [`crate::QwenPolicy`], `gen.temperature`
 /// **must** equal the temperature the policy was built with — that policy bakes its
 /// sampler temperature and rejects a mismatch — otherwise generation returns an
-/// error surfaced here as [`EvalError::Candle`].
+/// error surfaced here as [`EvalError::Candle`]. To sample the eval convention
+/// instead (temperature ≈ 0.6, top-p 0.95) set `gen.eval_sampling` (see
+/// [`crate::policy::EvalSampling`]); the override deliberately bypasses that
+/// temperature check and is the only path that enables nucleus filtering.
 ///
 /// # Errors
 ///
@@ -220,9 +238,10 @@ fn mean_reward<P: Policy, R: RewardFn>(
 /// Reject a malformed rollout the same way the trainer's `completion_dims` does, so
 /// eval and train agree on what a valid `Policy::generate` returns: exactly
 /// `group_size` completions, a non-empty prompt context, every sequence at least as
-/// long as the prompt (so the completion slice is well-defined), and a
+/// long as the prompt (so the completion slice is well-defined), a
 /// `completion_lens` that aligns with the sequences and stays within each one's
-/// completion span (it drives the length-aware decode). It does **not** require
+/// completion span (it drives the length-aware decode), and — when present — a
+/// behavior-log-prob capture aligned with those lengths. It does **not** require
 /// rectangular completions — eval scores each sequence independently, so the length
 /// bound is per-sequence rather than a shared width.
 fn validate_rollout(rollout: &Rollout, group_size: usize) -> Result<(), EvalError> {
@@ -249,6 +268,35 @@ fn validate_rollout(rollout: &Rollout, group_size: usize) -> Result<(), EvalErro
         )));
     }
     validate_completion_lens(rollout, group_size)?;
+    validate_rollout_logprobs(rollout)?;
+    Ok(())
+}
+
+/// Validate the optional behavior-log-prob capture (one row per sequence, row
+/// `i` with exactly `completion_lens[i]` entries), mirroring the trainer's
+/// check so eval and train keep agreeing on what a valid `Policy::generate`
+/// returns. Eval itself never reads the capture today, but accepting a
+/// misaligned one here would silently re-open the hole for any future eval
+/// consumer.
+fn validate_rollout_logprobs(rollout: &Rollout) -> Result<(), EvalError> {
+    let Some(captured) = &rollout.rollout_logprobs else {
+        return Ok(());
+    };
+    if captured.len() != rollout.len() {
+        return Err(EvalError::Contract(format!(
+            "rollout has {} rollout_logprob rows for {} sequences",
+            captured.len(),
+            rollout.len()
+        )));
+    }
+    for (i, (row, &len)) in captured.iter().zip(&rollout.completion_lens).enumerate() {
+        if row.len() != len {
+            return Err(EvalError::Contract(format!(
+                "rollout_logprobs row {i} has {} entries for completion_len {len}",
+                row.len()
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -391,6 +439,7 @@ mod tests {
             max_new_tokens,
             temperature: 1.0,
             eos_token_id: None,
+            eval_sampling: None,
         }
     }
 
@@ -455,6 +504,7 @@ mod tests {
                 token_ids,
                 prompt_len: prompt.len(),
                 completion_lens,
+                rollout_logprobs: None,
             })
         }
         fn token_logprobs(&self, _rollout: &Rollout) -> CandleResult<Tensor> {
@@ -557,6 +607,29 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, EvalError::Contract(_)), "got {err:?}");
         assert!(policy.adapter_enabled(), "flag not restored after error");
+    }
+
+    #[test]
+    fn misaligned_rollout_logprob_capture_is_a_contract_error() {
+        // Mirrors the trainer's capture validation, so eval and train keep
+        // agreeing on what a valid Policy::generate returns.
+        let mut ok = Rollout::rectangular(vec![vec![5, 1, 2], vec![5, 3, 4]], 1);
+        ok.rollout_logprobs = Some(vec![vec![-0.1, -0.2], vec![-0.3, -0.4]]);
+        assert!(validate_rollout(&ok, 2).is_ok());
+        // Row 1 has one entry for completion_len 2.
+        let mut bad_row = ok.clone();
+        bad_row.rollout_logprobs = Some(vec![vec![-0.1, -0.2], vec![-0.3]]);
+        assert!(matches!(
+            validate_rollout(&bad_row, 2),
+            Err(EvalError::Contract(_))
+        ));
+        // One capture row for two sequences.
+        let mut bad_count = ok.clone();
+        bad_count.rollout_logprobs = Some(vec![vec![-0.1, -0.2]]);
+        assert!(matches!(
+            validate_rollout(&bad_count, 2),
+            Err(EvalError::Contract(_))
+        ));
     }
 
     #[test]

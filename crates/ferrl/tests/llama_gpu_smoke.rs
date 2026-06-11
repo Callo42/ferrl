@@ -377,6 +377,7 @@ fn llama_merged_decoder_bf16_faithfulness_on_gpu() {
         max_new_tokens: 16,
         temperature: 1.0,
         eos_token_id: None,
+        eval_sampling: None,
     };
     let seq = policy
         .generate(&prompt_ids, &gcfg)

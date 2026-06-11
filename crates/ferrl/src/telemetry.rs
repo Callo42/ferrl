@@ -254,6 +254,58 @@ pub struct Metrics {
     pub frac_truncated: f32,
     /// Mean completion length in tokens.
     pub completion_len: f32,
+    /// Masked token mean of the **train/rollout importance ratio**
+    /// `exp(logp_train − logp_rollout)` over the window's loss-carrying tokens,
+    /// where `logp_train` is the trainer's own (detached, temperature-consistent)
+    /// scoring of the rollout and `logp_rollout` the behavior log-prob the
+    /// sampler captured at draw time
+    /// ([`Rollout::rollout_logprobs`](crate::policy::Rollout::rollout_logprobs)).
+    ///
+    /// **This is a sampling-health indicator, not a drift meter**: tokens are
+    /// drawn from the rollout distribution, so the ratio's *expectation* is
+    /// exactly `1` under **arbitrary** drift (`E[π_train/π_rollout] = Σ π_train
+    /// = 1` — both are normalized). A mean away from `1` therefore signals
+    /// estimator noise / a heavy upper tail, NOT how large the gap is; read the
+    /// gap off [`rollout_logratio_mean`](Self::rollout_logratio_mean),
+    /// [`rollout_ratio_max`](Self::rollout_ratio_max), and
+    /// [`frac_rollout_ratio_capped`](Self::frac_rollout_ratio_capped). Reported
+    /// whenever the policy captures rollout log-probs — independent of whether
+    /// the TIS *correction* is enabled; check
+    /// [`rollout_capture_tokens`](Self::rollout_capture_tokens) to distinguish
+    /// a measured `1.0` from no data at all (`1.0` is also the
+    /// `#[serde(default)]` for older records).
+    #[serde(default = "default_rollout_ratio")]
+    pub rollout_ratio_mean: f32,
+    /// Masked token mean of the **log**-ratio `logp_train − logp_rollout` — the
+    /// actual drift meter: its expectation is `−KL(rollout ‖ train)`, which is
+    /// `0` iff the rollout was exactly on-policy and strictly negative (in
+    /// expectation) under any drift. Watch this (together with the max and the
+    /// capped fraction) to decide when to flip
+    /// [`TrainerConfig::tis`](crate::trainer::TrainerConfig::tis) on. `0.0`
+    /// when no capture is available (also the `#[serde(default)]`).
+    #[serde(default)]
+    pub rollout_logratio_mean: f32,
+    /// Maximum train/rollout importance ratio over the window's loss-carrying
+    /// tokens — the outlier detector (a single far-off-policy token can destabilize
+    /// an update long before any mean moves). `1.0` when no capture is available.
+    #[serde(default = "default_rollout_ratio")]
+    pub rollout_ratio_max: f32,
+    /// Fraction of the window's loss-carrying tokens whose train/rollout ratio
+    /// exceeded [`TrainerConfig::tis_imp_ratio_cap`](crate::trainer::TrainerConfig::tis_imp_ratio_cap)
+    /// — the tokens TIS truncates when enabled, and *would* truncate when not
+    /// (the "flip the correction on when the gap shows" signal). `0` when no
+    /// capture is available.
+    #[serde(default)]
+    pub frac_rollout_ratio_capped: f32,
+    /// Number of loss-carrying tokens the window's rollout-ratio telemetry was
+    /// computed over. **`0` means the telemetry is dark** — the policy captured
+    /// no behavior log-probs, or every captured group was skipped before its
+    /// scoring snapshot existed (degenerate at `beta == 0`) — and the ratio
+    /// fields then carry their neutral values rather than measurements; an
+    /// operator watching the gap should treat `0` as "not monitored", not
+    /// "healthy". `#[serde(default)]` (`0`) for older records.
+    #[serde(default)]
+    pub rollout_capture_tokens: u32,
     /// Number of all-pad completion rows (no valid tokens) that contributed `0`
     /// to the loss this step. Such rows are tolerated rather than fatal (see
     /// [`crate::grpo::masked_mean`] / [`crate::grpo::zero_mask_rows`]); recorded
@@ -269,9 +321,17 @@ pub struct Metrics {
     pub lr: f32,
 }
 
+/// `serde` default for the rollout-ratio metrics: `1.0` (exactly on-policy —
+/// what the math assumes when no behavior log-probs were captured, and what
+/// records written before these fields existed implicitly assumed).
+fn default_rollout_ratio() -> f32 {
+    1.0
+}
+
 impl Metrics {
     /// A zeroed record at the given step — convenient for tests and for steps
-    /// where a particular quantity is not yet available.
+    /// where a particular quantity is not yet available. (The rollout-ratio
+    /// fields default to their neutral `1.0`, not `0`.)
     #[must_use]
     pub fn at_step(step: u64) -> Self {
         Self {
@@ -283,6 +343,11 @@ impl Metrics {
             clip_ratio: 0.0,
             frac_truncated: 0.0,
             completion_len: 0.0,
+            rollout_ratio_mean: 1.0,
+            rollout_logratio_mean: 0.0,
+            rollout_ratio_max: 1.0,
+            frac_rollout_ratio_capped: 0.0,
+            rollout_capture_tokens: 0,
             dropped_rows: 0,
             grad_norm: 0.0,
             lr: 0.0,
@@ -320,6 +385,10 @@ impl Metrics {
             &mut m.clip_ratio,
             &mut m.frac_truncated,
             &mut m.completion_len,
+            &mut m.rollout_ratio_mean,
+            &mut m.rollout_logratio_mean,
+            &mut m.rollout_ratio_max,
+            &mut m.frac_rollout_ratio_capped,
             &mut m.grad_norm,
             &mut m.lr,
         ] {
@@ -542,6 +611,11 @@ mod tests {
             clip_ratio: 0.1,
             frac_truncated: 0.0625,
             completion_len: 42.0,
+            rollout_ratio_mean: 1.015625,
+            rollout_logratio_mean: -0.0625,
+            rollout_ratio_max: 2.5,
+            frac_rollout_ratio_capped: 0.03125,
+            rollout_capture_tokens: 96,
             dropped_rows: 3,
             grad_norm: 1.23,
             lr: 5e-6,
@@ -554,12 +628,26 @@ mod tests {
     #[test]
     fn metrics_deserializes_old_log_without_new_fields() {
         // A pre-PR#3 metrics.jsonl line lacks frac_reward_zero_std and dropped_rows;
-        // #[serde(default)] must let it deserialize (defaulting both to 0).
+        // #[serde(default)] must let it deserialize (defaulting both to 0). The R2
+        // rollout-ratio fields default to their NEUTRAL values: ratios to 1.0
+        // (on-policy — what an old record implicitly assumed), the capped
+        // fraction to 0.
         let old = r#"{"step":3,"reward_mean":1.0,"reward_std":0.5,"kl":0.01,"clip_ratio":0.2,"completion_len":10.0,"grad_norm":1.0,"lr":1e-5}"#;
         let m: Metrics = serde_json::from_str(old).unwrap();
-        assert_eq!(m.step, 3);
-        assert_eq!(m.frac_reward_zero_std, 0.0);
-        assert_eq!(m.dropped_rows, 0);
+        assert_eq!(
+            (m.step, m.frac_reward_zero_std, m.dropped_rows),
+            (3, 0.0, 0)
+        );
+        assert_eq!(
+            (
+                m.rollout_ratio_mean,
+                m.rollout_logratio_mean,
+                m.rollout_ratio_max,
+                m.frac_rollout_ratio_capped,
+                m.rollout_capture_tokens,
+            ),
+            (1.0, 0.0, 1.0, 0.0, 0)
+        );
     }
 
     #[test]
@@ -574,6 +662,7 @@ mod tests {
         m.reward_mean = f32::NEG_INFINITY;
         m.kl = f32::NAN;
         m.frac_truncated = f32::NAN;
+        m.rollout_ratio_max = f32::INFINITY; // an overflowed exp() telemetry value
         w.append(&m).unwrap();
         drop(w);
 
@@ -583,6 +672,7 @@ mod tests {
         assert_eq!(back.reward_mean, f32::MIN);
         assert_eq!(back.kl, 0.0);
         assert_eq!(back.frac_truncated, 0.0);
+        assert_eq!(back.rollout_ratio_max, f32::MAX);
     }
 
     #[test]

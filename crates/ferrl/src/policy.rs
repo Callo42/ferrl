@@ -30,6 +30,28 @@ pub struct Rollout {
     /// full completion width for every sequence (see [`Rollout::rectangular`]); a
     /// per-element value is in `0..=comp_len`.
     pub completion_lens: Vec<usize>,
+    /// Per-token **behavior-policy** log-probabilities of the sampled completion
+    /// tokens — the probability each token was *actually drawn with* (the rollout
+    /// path's logits at the sampling temperature, nucleus-renormalized when top-p
+    /// is active), captured by the sampler at draw time. Row `i` has exactly
+    /// [`completion_lens`](Self::completion_lens)`[i]` entries (one per real
+    /// draw; EOS padding was never sampled, so it carries no log-prob).
+    ///
+    /// `None` when the policy does not capture them (toy/test policies;
+    /// [`Rollout::rectangular`] always sets `None`; capturing policies construct
+    /// via [`Rollout::new`]). When present, the trainer compares them against
+    /// its own scoring forward to surface the rollout-vs-train mismatch (the
+    /// off-policy gap a cached/merged — possibly bf16 — decode path opens
+    /// against the f32 uncached scoring forward) as ratio telemetry, and
+    /// optionally corrects the surrogate with truncated importance sampling
+    /// (TIS).
+    ///
+    /// Precision note: the captured value is `ln(p / Σp)` over the sampler's
+    /// f32 probabilities — the exact distribution `WeightedIndex` drew from —
+    /// which differs from an f32 `log_softmax` recomputation by the rounding of
+    /// the probability sum (~1e-5 over a real vocab). Don't over-interpret
+    /// sub-1e-5 ratio readings.
+    pub rollout_logprobs: Option<Vec<Vec<f32>>>,
 }
 
 impl Rollout {
@@ -51,6 +73,29 @@ impl Rollout {
             token_ids,
             prompt_len,
             completion_lens,
+            rollout_logprobs: None,
+        }
+    }
+
+    /// Construct a rollout from all of its parts — the constructor for policies
+    /// that capture behavior log-probs (or stop sequences early), so an external
+    /// [`Policy`] implementor never needs a struct literal and a future field
+    /// addition is not automatically a source break for it. `rollout_logprobs`,
+    /// when `Some`, must carry one row per sequence with exactly
+    /// `completion_lens[i]` entries in row `i` (the trainer validates this and
+    /// fails loud on a mismatch).
+    #[must_use]
+    pub fn new(
+        token_ids: Vec<Vec<u32>>,
+        prompt_len: usize,
+        completion_lens: Vec<usize>,
+        rollout_logprobs: Option<Vec<Vec<f32>>>,
+    ) -> Self {
+        Self {
+            token_ids,
+            prompt_len,
+            completion_lens,
+            rollout_logprobs,
         }
     }
 
@@ -67,6 +112,41 @@ impl Rollout {
     }
 }
 
+/// **Eval-only** sampling parameters, the deliberate override channel for
+/// [`GenConfig::eval_sampling`].
+///
+/// Training rollouts must sample at the policy's own (baked, scoring-consistent)
+/// temperature — [`crate::LmPolicy`] fails loud on a mismatched
+/// [`GenConfig::temperature`] precisely to catch a drifted config. Held-out
+/// evaluation legitimately wants *different* sampling (the 2026 convention:
+/// temperature ≈ 0.6 with nucleus top-p 0.95 for avg@k sampled pass@1), so the
+/// override is a separate, explicit field rather than a relaxation of that
+/// check: setting it says "I know this is not the training distribution."
+/// For [`crate::LmPolicy`] (and any conforming [`Policy`] — see the
+/// [`Policy::generate`] contract), nucleus (top-p) filtering can **only**
+/// enter generation through here — training rollouts structurally stay
+/// untruncated. A policy that ignores sampling parameters samples its own
+/// distribution regardless; eval reports over such a policy reflect that.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EvalSampling {
+    /// Eval softmax temperature (must be finite and `> 0`).
+    pub temperature: f64,
+    /// Optional nucleus filter: keep the smallest top-probability set whose
+    /// cumulative mass reaches this value (in `(0, 1]`; the crossing token is
+    /// included), renormalize, and sample from it. `None` disables filtering.
+    pub top_p: Option<f64>,
+}
+
+impl Default for EvalSampling {
+    /// The 2026 eval convention: temperature `0.6`, nucleus top-p `0.95`.
+    fn default() -> Self {
+        Self {
+            temperature: 0.6,
+            top_p: Some(0.95),
+        }
+    }
+}
+
 /// Sampling controls for [`Policy::generate`].
 #[derive(Debug, Clone, Copy)]
 pub struct GenConfig {
@@ -74,7 +154,9 @@ pub struct GenConfig {
     pub group_size: usize,
     /// Maximum number of new tokens to generate.
     pub max_new_tokens: usize,
-    /// Softmax temperature; `1.0` is unscaled.
+    /// Softmax temperature; `1.0` is unscaled. Ignored when
+    /// [`eval_sampling`](Self::eval_sampling) is set (the override carries its
+    /// own temperature).
     pub temperature: f64,
     /// End-of-sequence token. When `Some(id)`, a sampled `id` ends that sequence's
     /// completion early (the EOS token is **kept** — the recorded length is
@@ -85,6 +167,12 @@ pub struct GenConfig {
     /// is bit-identical to the legacy no-early-stop behavior. A [`Policy`] backed by
     /// a model with no EOS token (e.g. a base model) leaves this `None`.
     pub eos_token_id: Option<u32>,
+    /// Eval-only sampling override (see [`EvalSampling`]). `None` (the default,
+    /// and what the trainer always passes) samples at
+    /// [`temperature`](Self::temperature) with no nucleus filtering, exactly the
+    /// legacy behavior; `Some` deliberately samples the eval distribution
+    /// instead. The held-out eval harness is the intended setter.
+    pub eval_sampling: Option<EvalSampling>,
 }
 
 impl Default for GenConfig {
@@ -94,6 +182,7 @@ impl Default for GenConfig {
             max_new_tokens: 256,
             temperature: 1.0,
             eos_token_id: None,
+            eval_sampling: None,
         }
     }
 }
@@ -127,6 +216,16 @@ impl Default for GenConfig {
 /// "old" is just an adapter-on snapshot frozen in time.
 pub trait Policy {
     /// Sample `cfg.group_size` completions for `prompt` under `cfg`.
+    ///
+    /// Implementations that sample SHOULD honor
+    /// [`cfg.eval_sampling`](GenConfig::eval_sampling) (sample the override's
+    /// temperature/top-p) or return an error — silently ignoring it makes an
+    /// eval caller believe the eval convention applied when it did not.
+    /// [`crate::LmPolicy`] honors it; a toy/test policy that ignores sampling
+    /// parameters entirely is consistent with this (it ignores `temperature`
+    /// too — its "distribution" has no knobs to override). Policies that can
+    /// cheaply report per-draw probabilities SHOULD also fill
+    /// [`Rollout::rollout_logprobs`]; `None` is always valid.
     ///
     /// # Errors
     ///
@@ -242,5 +341,40 @@ mod tests {
         assert_eq!(c.temperature, 1.0);
         // The default disables EOS early-stop, preserving legacy full-width rollouts.
         assert_eq!(c.eos_token_id, None);
+        // No eval override by default: training-path sampling, no nucleus filter.
+        assert_eq!(c.eval_sampling, None);
+    }
+
+    #[test]
+    fn eval_sampling_default_is_the_2026_convention() {
+        let e = EvalSampling::default();
+        assert_eq!(e.temperature, 0.6);
+        assert_eq!(e.top_p, Some(0.95));
+    }
+
+    #[test]
+    fn rectangular_captures_no_rollout_logprobs() {
+        // The convenience constructor is the no-capture path by contract: toy
+        // policies built through it must never claim behavior log-probs.
+        let r = Rollout::rectangular(vec![vec![1, 2, 3]], 1);
+        assert_eq!(r.rollout_logprobs, None);
+    }
+
+    #[test]
+    fn new_carries_every_part_verbatim() {
+        // The full-args constructor for capturing implementors: everything
+        // lands as passed, no recomputation.
+        let r = Rollout::new(
+            vec![vec![1, 2, 3, 4], vec![1, 2, 5, 5]],
+            2,
+            vec![2, 1],
+            Some(vec![vec![-0.5, -1.0], vec![-0.25]]),
+        );
+        assert_eq!(r.prompt_len, 2);
+        assert_eq!(r.completion_lens, vec![2, 1]);
+        assert_eq!(
+            r.rollout_logprobs,
+            Some(vec![vec![-0.5, -1.0], vec![-0.25]])
+        );
     }
 }

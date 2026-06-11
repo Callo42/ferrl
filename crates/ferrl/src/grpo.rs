@@ -273,6 +273,30 @@ pub fn clipped_surrogate(ratio: f64, advantage: f64, eps_low: f64, eps_high: f64
     unclipped.min(clipped)
 }
 
+/// Truncated-importance-sampling (TIS) weight for a single token:
+/// `min(exp(logp_train - logp_rollout), cap)`.
+///
+/// `logp_train` is the trainer's own (detached) scoring of the rollout token —
+/// the "old" log-prob the surrogate's denominator uses — and `logp_rollout` the
+/// behavior log-prob the sampler recorded at draw time
+/// ([`Rollout::rollout_logprobs`](crate::policy::Rollout::rollout_logprobs)).
+/// When the rollout path and the scoring path diverge (a bf16 merged decode vs
+/// the f32 uncached scoring forward is the studied case), the sampled tokens are
+/// drawn from a distribution that is not the one being optimized; multiplying
+/// each token's surrogate by this weight re-weights the batch toward the scoring
+/// distribution (importance sampling), and the `cap` (`C ≈ 2` in the literature;
+/// verl's `tis_imp_ratio_cap`) truncates the unbounded-variance tail. A
+/// perfectly on-policy token (`logp_train == logp_rollout`) gets weight
+/// `min(1, cap)`, so a `cap >= 1` leaves an on-policy batch untouched.
+///
+/// The trainer applies the weight to the **surrogate only** (the KL penalty is
+/// left unweighted, matching verl), as a detached constant — it scales the
+/// gradient, it is not differentiated through.
+#[must_use]
+pub fn tis_weight(logp_train: f64, logp_rollout: f64, cap: f64) -> f64 {
+    (logp_train - logp_rollout).exp().min(cap)
+}
+
 /// Mask-weighted reduction of a per-token objective, dispatched on [`LossType`].
 ///
 /// `values` and `mask` are row-major `[num_sequences][max_len]` matrices of the
@@ -476,6 +500,19 @@ mod tests {
         for a in adv {
             assert_relative_eq!(a, 0.0, epsilon = TOL);
         }
+    }
+
+    #[test]
+    fn tis_weight_is_the_truncated_importance_ratio() {
+        // On-policy token: ratio exp(0) = 1, untouched by a cap >= 1.
+        assert_relative_eq!(tis_weight(-1.5, -1.5, 2.0), 1.0, epsilon = TOL);
+        // Off-policy below the cap: the raw ratio passes through.
+        assert_relative_eq!(tis_weight(-1.0, -1.5, 2.0), 0.5_f64.exp(), epsilon = TOL);
+        // Off-policy above the cap: truncated to exactly C.
+        assert_relative_eq!(tis_weight(-0.5, -2.0, 2.0), 2.0, epsilon = TOL);
+        // The other direction (train assigns LESS mass than the rollout did)
+        // is never truncated — only the heavy upper tail is.
+        assert_relative_eq!(tis_weight(-2.0, -0.5, 2.0), (-1.5_f64).exp(), epsilon = TOL);
     }
 
     #[test]

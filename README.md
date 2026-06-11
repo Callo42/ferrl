@@ -185,7 +185,9 @@ runs/<run_id>/
 ├── metrics.jsonl     # one JSON object per step:
 │                     #   step, reward_mean, reward_std, frac_reward_zero_std,
 │                     #   kl, clip_ratio, frac_truncated, completion_len,
-│                     #   dropped_rows, grad_norm, lr
+│                     #   rollout_ratio_mean, rollout_logratio_mean,
+│                     #   rollout_ratio_max, frac_rollout_ratio_capped,
+│                     #   rollout_capture_tokens, dropped_rows, grad_norm, lr
 ├── checkpoints/      # LoRA checkpoints
 └── run.log           # human-readable log
 ```
