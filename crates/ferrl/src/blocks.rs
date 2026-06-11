@@ -147,6 +147,45 @@ impl RotaryTables {
     }
 }
 
+/// Partial rotate-half `RoPE`: rotate only the first `rot_dim` dims of each
+/// head, pass dims `rot_dim..` through untouched.
+///
+/// `x` is `[b, heads, l, head_dim]`; `cos`/`sin` are `[l, rot_dim / 2]` (e.g.
+/// a [`RotaryTables`] built with `head_dim = rot_dim` — table width is just
+/// `len(inv_freq)`, so the partial case is a narrower table, sliced as usual).
+/// The `qwen3_5` family uses `partial_rotary_factor 0.25` (64 of 256 head
+/// dims, theta 1e7); its interleaved M-`RoPE` reduces exactly to this standard
+/// 1-D rotate-half rope for text-only inputs (the reference expands text
+/// positions to three identical T/H/W rows → the section interleave
+/// overwrites entries with identical values, an exact no-op). At `rot_dim == head_dim`
+/// this is exactly `rope_slow` (the grad-safe rope — the fused `rope*` kernels
+/// have no backward and must never appear in a training forward).
+///
+/// # Errors
+///
+/// Returns a candle error if `rot_dim` is zero, odd, or exceeds `head_dim`,
+/// or if an underlying tensor op fails.
+pub fn rope_partial(
+    x: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    rot_dim: usize,
+) -> CandleResult<Tensor> {
+    let (_b, _h, _l, head_dim) = x.dims4()?;
+    if rot_dim == 0 || rot_dim % 2 != 0 || rot_dim > head_dim {
+        candle_core::bail!(
+            "rope_partial: rot_dim {rot_dim} must be a nonzero even number <= head_dim {head_dim}"
+        );
+    }
+    if rot_dim == head_dim {
+        return candle_nn::rotary_emb::rope_slow(&x.contiguous()?, cos, sin);
+    }
+    let x_rot = x.narrow(candle_core::D::Minus1, 0, rot_dim)?.contiguous()?;
+    let x_pass = x.narrow(candle_core::D::Minus1, rot_dim, head_dim - rot_dim)?;
+    let rotated = candle_nn::rotary_emb::rope_slow(&x_rot, cos, sin)?;
+    Tensor::cat(&[&rotated, &x_pass.contiguous()?], candle_core::D::Minus1)
+}
+
 /// Additive causal mask `[1, 1, l, l]` (`0` on/below the diagonal, `-inf`
 /// above), matching candle's `Model::causal_mask` at offset 0 — the
 /// full-sequence (uncached) mask.
@@ -187,4 +226,164 @@ pub fn causal_mask_at(
         }
     }
     Tensor::from_vec(data, (1, 1, chunk_len, total), device)?.to_dtype(dtype)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::Var;
+
+    /// `rope_partial` rotates exactly the first `rot_dim` dims (matching a
+    /// scalar rotate-half reference) and passes the rest through untouched.
+    #[test]
+    fn rope_partial_rotates_head_and_passes_tail() {
+        let dev = Device::Cpu;
+        let (b, h, l, d, rot) = (1usize, 1usize, 2usize, 8usize, 4usize);
+        let theta = 100.0f64;
+        let tables = RotaryTables::new(rot, theta, 4, DType::F32, &dev).unwrap();
+        let (cos, sin) = tables.slice(l).unwrap();
+
+        let xv: Vec<f32> = (0..b * h * l * d).map(|i| i as f32 * 0.1 - 0.7).collect();
+        let x = Tensor::from_vec(xv.clone(), (b, h, l, d), &dev).unwrap();
+        let y = rope_partial(&x, &cos, &sin, rot).unwrap();
+        let yv: Vec<f32> = y.flatten_all().unwrap().to_vec1().unwrap();
+
+        // Scalar rotate-half reference on the first `rot` dims of each position.
+        let half = rot / 2;
+        for pos in 0..l {
+            let inv_freq: Vec<f64> = (0..rot)
+                .step_by(2)
+                .map(|i| 1.0 / theta.powf(i as f64 / rot as f64))
+                .collect();
+            for j in 0..half {
+                let angle = pos as f64 * inv_freq[j];
+                let (c, s) = (angle.cos() as f32, angle.sin() as f32);
+                let base = pos * d;
+                let x1 = xv[base + j];
+                let x2 = xv[base + half + j];
+                let want1 = x1 * c - x2 * s;
+                let want2 = x2 * c + x1 * s;
+                assert!(
+                    (yv[base + j] - want1).abs() < 1e-5,
+                    "pos {pos} dim {j}: {} vs {want1}",
+                    yv[base + j]
+                );
+                assert!(
+                    (yv[base + half + j] - want2).abs() < 1e-5,
+                    "pos {pos} dim {}: {} vs {want2}",
+                    half + j,
+                    yv[base + half + j]
+                );
+            }
+            // Pass-through tail is bit-identical.
+            for j in rot..d {
+                assert_eq!(yv[pos * d + j], xv[pos * d + j], "pos {pos} dim {j}");
+            }
+        }
+    }
+
+    /// Full-width `rope_partial` equals `rope_slow` (the degenerate case), and
+    /// gradients cross the partial rope to an upstream Var on BOTH regions.
+    #[test]
+    fn rope_partial_full_width_and_grad_flow() {
+        let dev = Device::Cpu;
+        let (b, h, l, d) = (1usize, 2usize, 3usize, 4usize);
+        let tables = RotaryTables::new(d, 10_000.0, 8, DType::F32, &dev).unwrap();
+        let (cos, sin) = tables.slice(l).unwrap();
+        let xv: Vec<f32> = (0..b * h * l * d)
+            .map(|i| (i as f32 * 0.37).sin())
+            .collect();
+        let x = Tensor::from_vec(xv, (b, h, l, d), &dev).unwrap();
+
+        let full = rope_partial(&x, &cos, &sin, d).unwrap();
+        let slow = candle_nn::rotary_emb::rope_slow(&x, &cos, &sin).unwrap();
+        let dv: Vec<f32> = (full - slow)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert!(
+            dv.iter().all(|v| *v < 1e-6),
+            "full-width must equal rope_slow"
+        );
+
+        // Grad flow through the partial case: every input position receives
+        // gradient (rotated region via cos/sin, pass-through via identity).
+        let tables2 = RotaryTables::new(2, 10_000.0, 8, DType::F32, &dev).unwrap();
+        let (cos2, sin2) = tables2.slice(l).unwrap();
+        let xv2 = Var::from_tensor(&x).unwrap();
+        let y = rope_partial(xv2.as_tensor(), &cos2, &sin2, 2).unwrap();
+        let loss = y.sqr().unwrap().sum_all().unwrap();
+        let grads = loss.backward().unwrap();
+        let gx = grads
+            .get(xv2.as_tensor())
+            .expect("rope_partial grad present");
+        let gv: Vec<f32> = gx.flatten_all().unwrap().to_vec1().unwrap();
+        assert!(gv.iter().all(|v| v.is_finite()));
+        assert!(gv.iter().filter(|v| **v != 0.0).count() > gv.len() / 2);
+    }
+
+    /// Fail-loud on invalid `rot_dim`.
+    #[test]
+    fn rope_partial_rejects_bad_rot_dim() {
+        let dev = Device::Cpu;
+        let tables = RotaryTables::new(4, 10_000.0, 8, DType::F32, &dev).unwrap();
+        let (cos, sin) = tables.slice(2).unwrap();
+        let x = Tensor::zeros((1, 1, 2, 8), DType::F32, &dev).unwrap();
+        assert!(rope_partial(&x, &cos, &sin, 0).is_err());
+        assert!(rope_partial(&x, &cos, &sin, 3).is_err());
+        assert!(rope_partial(&x, &cos, &sin, 10).is_err());
+    }
+
+    /// THE rope oracle gate: `RotaryTables::new` + `rope_partial` against a
+    /// dump of the ACTUAL transformers `qwen3_5` rotary path
+    /// (`Qwen3_5TextRotaryEmbedding` + `apply_rotary_pos_emb`) at the real
+    /// geometry — `head_dim` 256, `rotary_dim` 64, theta 1e7, text-only 1-D
+    /// positions. Unlike the scalar reference above (which shares this
+    /// module's conventions and can't catch a shared misunderstanding), this
+    /// pins the exponent base (over `rot_dim`, not `head_dim`), the
+    /// rotate-half pairing, the partial split, AND the prose claim that the
+    /// interleaved M-`RoPE` is an exact no-op for text.
+    #[test]
+    fn rope_partial_matches_transformers_oracle_at_qwen35_geometry() {
+        let golden: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/gdn_golden.json"))
+                .expect("gdn golden fixture parses");
+        let c = &golden["cases"]["rope_text_qwen35_geometry"];
+        assert!(!c.is_null(), "rope fixture case present");
+        let l = c["l"].as_u64().unwrap() as usize;
+        let head_dim = c["head_dim"].as_u64().unwrap() as usize;
+        let rot_dim = c["rot_dim"].as_u64().unwrap() as usize;
+        let theta = c["rope_theta"].as_f64().unwrap();
+        let dev = Device::Cpu;
+        let load = |key: &str| -> Tensor {
+            let v: Vec<f32> = c[key]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_f64().unwrap() as f32)
+                .collect();
+            Tensor::from_vec(v, (1, 1, l, head_dim), &dev).unwrap()
+        };
+        let tables = RotaryTables::new(rot_dim, theta, 64, DType::F32, &dev).unwrap();
+        let (cos, sin) = tables.slice(l).unwrap();
+        for (inp, out) in [("q", "q_out"), ("k", "k_out")] {
+            let x = load(inp);
+            let want = load(out);
+            let got = rope_partial(&x, &cos, &sin, rot_dim).unwrap();
+            let diff: Vec<f32> = (got - &want)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let max = diff.iter().fold(0.0f32, |a, b| a.max(*b));
+            assert!(max <= 1e-5, "{inp}: rope oracle diff {max}");
+        }
+    }
 }
