@@ -73,6 +73,13 @@
 //!   sigmoid-gated shared expert), grad-bearing and oracle-pinned, wired into
 //!   [`qwen35`]'s feed-forward layer menu so the same `Qwen3_5GradModel`
 //!   loads both the dense and the `MoE` family members (M3′);
+//! - the data-parallel communication seam ([`comm`]) — the [`Comm`] trait
+//!   (rank identity + sum-reductions) the trainer all-reduces its accumulated
+//!   gradients through, keeping every rank's weights in bitwise lockstep;
+//!   [`SoloComm`] is the world-1 default (the single-rank path stays
+//!   bit-identical to the pre-DP trainer) and [`LocalComm`] runs an N-thread
+//!   single-process world for the CPU-testable DP equivalence oracle (the
+//!   NCCL multi-GPU implementation is the planned `--features nccl` follow-up);
 //! - a CUDA driver-compatibility preflight ([`cuda_compat`]) — translates the cryptic
 //!   `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` (a build-PTX-newer-than-driver mismatch) into
 //!   an actionable rebuild/upgrade message; a no-op without the `cuda` feature;
@@ -108,6 +115,7 @@
 
 pub mod blocks;
 pub mod checkpoint;
+pub mod comm;
 pub mod countdown;
 pub mod cuda_compat;
 pub mod eval;
@@ -136,6 +144,8 @@ pub use checkpoint::{
     load_adapter, load_checkpoint, save_adapter, save_checkpoint, CheckpointError,
     CheckpointManifest, LoadedCheckpoint,
 };
+#[doc(inline)]
+pub use comm::{Comm, CommError, LocalComm, SoloComm};
 #[doc(inline)]
 pub use countdown::{
     build_prompt, generate_dataset, parse_problem_from_prompt, CountdownConfig, CountdownProblem,
