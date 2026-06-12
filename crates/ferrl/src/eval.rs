@@ -122,7 +122,9 @@ pub enum EvalError {
 /// # Errors
 ///
 /// Returns [`EvalError::Contract`] if `prompts` is empty; if a prompt encodes to zero
-/// tokens; if a policy returns a malformed rollout (wrong completion count, no prompt
+/// tokens; if the policy cannot disable its adapter (a full-fine-tuning policy has no
+/// frozen base to compare against — the comparison would be the policy vs. itself);
+/// if a policy returns a malformed rollout (wrong completion count, no prompt
 /// context, a sequence shorter than the prompt, or a `completion_lens` that does not
 /// align with the sequences); or if a [`RewardFn`] returns a reward count that does
 /// not match the number of completions; or [`EvalError::Candle`] if generation fails
@@ -141,6 +143,19 @@ pub fn evaluate<P: Policy, R: RewardFn>(
     // and on a panic — via the guard's Drop.
     let prior = policy.adapter_enabled();
     let guard = AdapterRestore { policy, prior };
+    // A policy that cannot disable its adapter (full fine-tuning: the base
+    // weights ARE the trained weights) would make base-vs-trained a
+    // comparison of the policy against itself — fail loud instead of
+    // reporting a meaningless zero gap.
+    guard.policy.set_adapter_enabled(false);
+    if guard.policy.adapter_enabled() {
+        return Err(EvalError::Contract(
+            "the policy cannot disable its adapter (full fine-tuning mode?) — the \
+             base-vs-trained comparison is unavailable; evaluate against a separately \
+             loaded base policy instead"
+                .into(),
+        ));
+    }
     let per_prompt = score_all(guard.policy, reward_fn, tokenizer, prompts, gen)?;
 
     let n = per_prompt.len();
@@ -481,11 +496,14 @@ mod tests {
     /// `pad` token repeated to `max_new_tokens`, recording the true (short) length in
     /// `completion_lens` — the shape EOS early-stop produces. The pad token is chosen
     /// to inflate the reward if it were (wrongly) scored, so a passing test proves the
-    /// length-aware decode excludes it. It ignores the adapter flag (base == adapter),
-    /// isolating the decode behavior.
+    /// length-aware decode excludes it. Generation ignores the adapter flag (base ==
+    /// adapter), isolating the decode behavior — but the flag itself is tracked
+    /// honestly, because the harness pre-checks toggleability and fails loud on a
+    /// policy that cannot disable its adapter.
     struct EosPaddedPolicy {
         real: Vec<u32>,
         pad: u32,
+        enabled: bool,
     }
     impl Policy for EosPaddedPolicy {
         fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
@@ -510,9 +528,11 @@ mod tests {
         fn token_logprobs(&self, _rollout: &Rollout) -> CandleResult<Tensor> {
             Tensor::zeros((1, 1), DType::F32, &Device::Cpu)
         }
-        fn set_adapter_enabled(&mut self, _enabled: bool) {}
+        fn set_adapter_enabled(&mut self, enabled: bool) {
+            self.enabled = enabled;
+        }
         fn adapter_enabled(&self) -> bool {
-            true
+            self.enabled
         }
         fn trainable_vars(&self) -> Vec<Var> {
             vec![]
@@ -534,6 +554,7 @@ mod tests {
         let mut policy = EosPaddedPolicy {
             real: vec![1],
             pad: 9,
+            enabled: true,
         };
         let prompts = vec!["5".to_string()];
         let cfg = GenConfig {
@@ -559,8 +580,9 @@ mod tests {
         )
         .unwrap();
 
-        // One prompt: off (base), on (adapter), then restore to prior (true).
-        assert_eq!(*policy.toggles.borrow(), vec![false, true, true]);
+        // The toggleability pre-check (off), then per prompt: off (base),
+        // on (adapter), then restore to prior (true).
+        assert_eq!(*policy.toggles.borrow(), vec![false, false, true, true]);
         assert!(policy.adapter_enabled(), "adapter flag not restored");
     }
 
@@ -589,6 +611,58 @@ mod tests {
         let mut policy = ScriptedPolicy::new(0, 1);
         let err = evaluate(&mut policy, &DigitSumReward, &DigitCodec, &[], &gen(2, 2)).unwrap_err();
         assert!(matches!(err, EvalError::Contract(_)), "got {err:?}");
+    }
+
+    /// A policy whose adapter cannot be disabled — the full-fine-tuning shape
+    /// (`set_adapter_enabled` is a no-op that stays enabled). The harness must
+    /// fail loud BEFORE any generation: a base-vs-trained report over such a
+    /// policy would be the policy compared against itself.
+    struct UntoggleablePolicy;
+    impl Policy for UntoggleablePolicy {
+        fn generate(&mut self, _prompt: &[u32], _cfg: &GenConfig) -> CandleResult<Rollout> {
+            unreachable!("the toggleability pre-check must bail before any generation")
+        }
+
+        fn token_logprobs(&self, _rollout: &Rollout) -> CandleResult<Tensor> {
+            Tensor::zeros((1, 1), DType::F32, &Device::Cpu)
+        }
+
+        fn set_adapter_enabled(&mut self, _enabled: bool) {}
+
+        fn adapter_enabled(&self) -> bool {
+            true
+        }
+
+        fn trainable_vars(&self) -> Vec<Var> {
+            vec![]
+        }
+
+        fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+            Ok(Vec::new())
+        }
+
+        fn restore_sampler_state(&mut self, _state: &[u8]) -> CandleResult<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn an_untoggleable_adapter_is_a_loud_contract_error() {
+        let mut policy = UntoggleablePolicy;
+        let prompts = vec!["5".to_string()];
+        let err = evaluate(
+            &mut policy,
+            &DigitSumReward,
+            &DigitCodec,
+            &prompts,
+            &gen(2, 2),
+        )
+        .unwrap_err();
+        assert!(matches!(err, EvalError::Contract(_)), "got {err:?}");
+        assert!(
+            format!("{err}").contains("cannot disable its adapter"),
+            "got: {err}"
+        );
     }
 
     #[test]

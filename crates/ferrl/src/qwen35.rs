@@ -650,6 +650,24 @@ pub fn varbuilder_from_pretrained(
     dtype: DType,
     device: &Device,
 ) -> CandleResult<VarBuilder<'static>> {
+    Ok(VarBuilder::from_tensors(
+        tensors_from_pretrained(dir, device)?,
+        dtype,
+        device,
+    ))
+}
+
+/// The raw checkpoint tensor map behind [`varbuilder_from_pretrained`] —
+/// same directory layouts, same buffered load — for entry points that build
+/// their own backend over it ([`Qwen3_5GradModel::load_full_ft`]).
+///
+/// # Errors
+///
+/// As [`varbuilder_from_pretrained`].
+pub fn tensors_from_pretrained(
+    dir: impl AsRef<Path>,
+    device: &Device,
+) -> CandleResult<HashMap<String, Tensor>> {
     let dir = dir.as_ref();
     let index_path = dir.join("model.safetensors.index.json");
     let single_path = dir.join("model.safetensors");
@@ -680,7 +698,7 @@ pub fn varbuilder_from_pretrained(
         let shard = candle_core::safetensors::load(&file, device)?;
         tensors.extend(shard);
     }
-    Ok(VarBuilder::from_tensors(tensors, dtype, device))
+    Ok(tensors)
 }
 
 // ---------------------------------------------------------------------------
@@ -837,6 +855,87 @@ impl LoraTargets {
             ]),
         )
     }
+
+    /// No projection targeted (`attn:-|mlp:-|gdn:-`). The `LoRA` loaders
+    /// reject it (an adapter recipe that trains nothing); it is the recipe a
+    /// **full fine-tuning** model records in
+    /// [`lora_targets`](Qwen3_5GradModel::lora_targets) — full-FT trains
+    /// every base weight and carries no adapters at all.
+    #[must_use]
+    pub fn none() -> Self {
+        Self {
+            attn_q: false,
+            attn_k: false,
+            attn_v: false,
+            attn_o: false,
+            mlp_gate: false,
+            mlp_up: false,
+            mlp_down: false,
+            gdn_qkv: false,
+            gdn_z: false,
+            gdn_b: false,
+            gdn_a: false,
+            gdn_out: false,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Load mode (LoRA vs full fine-tuning)
+// ---------------------------------------------------------------------------
+
+/// How a load builds its trainable surface: the `LoRA` recipe (the default
+/// mode) or the full-fine-tuning var registry. Threaded through every layer
+/// loader so the projection sites stay single-sourced.
+enum LoadMode<'a> {
+    /// Adapter mode: frozen base weights, `LoRA` factors per `targets`.
+    Lora {
+        rank: usize,
+        alpha: f64,
+        adapter_dtype: DType,
+        targets: LoraTargets,
+    },
+    /// Full fine-tuning: every base weight is a registry [`Var`]'s inner
+    /// tensor (the `vb` is registry-backed); no adapters anywhere.
+    FullFt {
+        /// The registry the backend fills; the sparse loader also registers
+        /// its packed expert tensors here explicitly.
+        registry: &'a crate::full_ft::VarRegistry,
+    },
+}
+
+impl LoadMode<'_> {
+    /// Load one projection: adapter-wrapped per the recipe in `Lora` mode,
+    /// plain `Frozen` in `FullFt` mode — where the "frozen" tensor is the
+    /// registry var's inner tensor, trainable straight through
+    /// [`frozen_linear`](crate::blocks::frozen_linear) (which never detaches
+    /// its weight).
+    fn proj(
+        &self,
+        vb: &VarBuilder,
+        name: &str,
+        shape: (usize, usize),
+        select: fn(&LoraTargets) -> bool,
+    ) -> CandleResult<Proj> {
+        match self {
+            Self::Lora {
+                rank,
+                alpha,
+                adapter_dtype,
+                targets,
+            } => Proj::load(
+                vb,
+                name,
+                shape,
+                select(targets),
+                *rank,
+                *alpha,
+                *adapter_dtype,
+            ),
+            // rank/alpha/dtype are dead on the unadapted path.
+            Self::FullFt { .. } => Proj::load(vb, name, shape, false, 1, 1.0, DType::F32),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -928,9 +1027,13 @@ fn gdn_kernel_inputs(
         .reshape((b, l, dims.num_v_heads, dims.head_v))?;
     // beta in the activation dtype (the kernel upcasts); g ALWAYS in F32 —
     // the reference `.float()`s both factors (an fp16 A_log.exp() can be
-    // -inf), and crate::gdn's contract requires the F32 log-decay.
+    // -inf), and crate::gdn's contract requires the F32 log-decay. The casts
+    // live HERE, at use time, not at load: a load-time cast of a trainable
+    // (full-FT) var would freeze its load value into derived storage.
+    let a_log = a_log.to_dtype(DType::F32)?;
+    let dt_bias = dt_bias.to_dtype(DType::F32)?;
     let beta = sigmoid(b_in)?;
-    let g = stable_softplus(&a_in.to_dtype(DType::F32)?.broadcast_add(dt_bias)?)?
+    let g = stable_softplus(&a_in.to_dtype(DType::F32)?.broadcast_add(&dt_bias)?)?
         .broadcast_mul(&a_log.exp()?)?
         .neg()?;
     let rep = dims.gva_rep();
@@ -955,12 +1058,18 @@ struct Qwen3_5GatedDeltaNet {
     in_proj_z: Proj,
     in_proj_b: Proj,
     in_proj_a: Proj,
-    /// Depthwise conv taps `[conv_dim, kernel]` (the checkpoint's
-    /// `[conv_dim, 1, kernel]` squeezed).
+    /// Depthwise conv taps, stored in the checkpoint's `[conv_dim, 1, kernel]`
+    /// layout **as fetched** and squeezed per forward — a load-time squeeze
+    /// would still share storage today (contiguous reshape), but the
+    /// store-as-fetched rule is what keeps every full-FT weight var-backed by
+    /// construction, not by a layout accident.
     conv_weight: Tensor,
-    /// `[num_v_heads]`, **F32** (the reference computes `g` in fp32 always).
+    /// `[num_v_heads]`, stored **as loaded** (the vb dtype); cast to F32 at
+    /// use ([`gdn_kernel_inputs`] — the reference computes `g` in fp32
+    /// always). A load-time cast would go stale under full-FT updates.
     a_log: Tensor,
-    /// `[num_v_heads]`, **F32** (added to the fp32 `a` projection).
+    /// `[num_v_heads]`, stored **as loaded**; cast to F32 at use (added to
+    /// the fp32 `a` projection).
     dt_bias: Tensor,
     /// Plain-`w` gated norm over `head_v` (weight in the activation dtype —
     /// the PR-1 convention pin).
@@ -970,40 +1079,23 @@ struct Qwen3_5GatedDeltaNet {
 }
 
 impl Qwen3_5GatedDeltaNet {
-    fn load(
-        cfg: &Qwen3_5TextConfig,
-        vb: &VarBuilder,
-        targets: LoraTargets,
-        rank: usize,
-        alpha: f64,
-        adapter_dtype: DType,
-    ) -> CandleResult<Self> {
+    fn load(cfg: &Qwen3_5TextConfig, vb: &VarBuilder, mode: &LoadMode) -> CandleResult<Self> {
         let dims = GdnDims::from_config(cfg);
         let h = cfg.hidden_size;
-        let proj = |name: &str, out: usize, adapted: bool| {
-            Proj::load(vb, name, (out, h), adapted, rank, alpha, adapter_dtype)
-        };
         Ok(Self {
-            in_proj_qkv: proj("in_proj_qkv", dims.conv_dim, targets.gdn_qkv)?,
-            in_proj_z: proj("in_proj_z", dims.value_dim, targets.gdn_z)?,
-            in_proj_b: proj("in_proj_b", dims.num_v_heads, targets.gdn_b)?,
-            in_proj_a: proj("in_proj_a", dims.num_v_heads, targets.gdn_a)?,
+            in_proj_qkv: mode.proj(vb, "in_proj_qkv", (dims.conv_dim, h), |t| t.gdn_qkv)?,
+            in_proj_z: mode.proj(vb, "in_proj_z", (dims.value_dim, h), |t| t.gdn_z)?,
+            in_proj_b: mode.proj(vb, "in_proj_b", (dims.num_v_heads, h), |t| t.gdn_b)?,
+            in_proj_a: mode.proj(vb, "in_proj_a", (dims.num_v_heads, h), |t| t.gdn_a)?,
+            // Stored AS FETCHED (no squeeze, no cast) — the full-FT
+            // storage-sharing contract; see the field docs.
             conv_weight: vb
                 .pp("conv1d")
-                .get((dims.conv_dim, 1, dims.kernel), "weight")?
-                .squeeze(1)?,
-            a_log: vb.get(dims.num_v_heads, "A_log")?.to_dtype(DType::F32)?,
-            dt_bias: vb.get(dims.num_v_heads, "dt_bias")?.to_dtype(DType::F32)?,
+                .get((dims.conv_dim, 1, dims.kernel), "weight")?,
+            a_log: vb.get(dims.num_v_heads, "A_log")?,
+            dt_bias: vb.get(dims.num_v_heads, "dt_bias")?,
             norm: RmsNormGated::new(vb.pp("norm").get(dims.head_v, "weight")?, cfg.rms_norm_eps),
-            out_proj: Proj::load(
-                vb,
-                "out_proj",
-                (h, dims.value_dim),
-                targets.gdn_out,
-                rank,
-                alpha,
-                adapter_dtype,
-            )?,
+            out_proj: mode.proj(vb, "out_proj", (h, dims.value_dim), |t| t.gdn_out)?,
             dims,
         })
     }
@@ -1019,8 +1111,10 @@ impl Qwen3_5GatedDeltaNet {
         let a_in = self.in_proj_a.forward(x)?;
 
         // Causal depthwise conv + SiLU over q‖k‖v only (z/b/a bypass it).
+        // The taps squeeze [conv_dim, 1, kernel] -> [conv_dim, kernel] HERE
+        // (a view; grads flow through it to the full-FT var).
         let conv_in = mixed.transpose(1, 2)?.contiguous()?;
-        let conv_out = causal_depthwise_conv1d(&conv_in, &self.conv_weight, None)?;
+        let conv_out = causal_depthwise_conv1d(&conv_in, &self.conv_weight.squeeze(1)?, None)?;
         let mixed = conv_out.silu()?.transpose(1, 2)?.contiguous()?;
 
         let inp = gdn_kernel_inputs(&self.dims, &mixed, &b_in, &a_in, &self.a_log, &self.dt_bias)?;
@@ -1172,55 +1266,16 @@ struct Qwen3_5Attention {
 }
 
 impl Qwen3_5Attention {
-    fn load(
-        cfg: &Qwen3_5TextConfig,
-        vb: &VarBuilder,
-        targets: LoraTargets,
-        rank: usize,
-        alpha: f64,
-        adapter_dtype: DType,
-    ) -> CandleResult<Self> {
+    fn load(cfg: &Qwen3_5TextConfig, vb: &VarBuilder, mode: &LoadMode) -> CandleResult<Self> {
         let dims = AttnDims::from_config(cfg);
         let h = cfg.hidden_size;
         let kv_out = dims.num_kv_heads * dims.head_dim;
         let attn_out = dims.num_heads * dims.head_dim;
         Ok(Self {
-            q_proj: Proj::load(
-                vb,
-                "q_proj",
-                (attn_out * 2, h),
-                targets.attn_q,
-                rank,
-                alpha,
-                adapter_dtype,
-            )?,
-            k_proj: Proj::load(
-                vb,
-                "k_proj",
-                (kv_out, h),
-                targets.attn_k,
-                rank,
-                alpha,
-                adapter_dtype,
-            )?,
-            v_proj: Proj::load(
-                vb,
-                "v_proj",
-                (kv_out, h),
-                targets.attn_v,
-                rank,
-                alpha,
-                adapter_dtype,
-            )?,
-            o_proj: Proj::load(
-                vb,
-                "o_proj",
-                (h, attn_out),
-                targets.attn_o,
-                rank,
-                alpha,
-                adapter_dtype,
-            )?,
+            q_proj: mode.proj(vb, "q_proj", (attn_out * 2, h), |t| t.attn_q)?,
+            k_proj: mode.proj(vb, "k_proj", (kv_out, h), |t| t.attn_k)?,
+            v_proj: mode.proj(vb, "v_proj", (kv_out, h), |t| t.attn_v)?,
+            o_proj: mode.proj(vb, "o_proj", (h, attn_out), |t| t.attn_o)?,
             q_norm: RmsNormZeroCentered::new(
                 vb.pp("q_norm").get(dims.head_dim, "weight")?,
                 cfg.rms_norm_eps,
@@ -1293,41 +1348,14 @@ impl Qwen3_5Mlp {
         cfg: &Qwen3_5TextConfig,
         inner: usize,
         vb: &VarBuilder,
-        targets: LoraTargets,
-        rank: usize,
-        alpha: f64,
-        adapter_dtype: DType,
+        mode: &LoadMode,
     ) -> CandleResult<Self> {
         let h = cfg.hidden_size;
         let i = inner;
         Ok(Self {
-            gate_proj: Proj::load(
-                vb,
-                "gate_proj",
-                (i, h),
-                targets.mlp_gate,
-                rank,
-                alpha,
-                adapter_dtype,
-            )?,
-            up_proj: Proj::load(
-                vb,
-                "up_proj",
-                (i, h),
-                targets.mlp_up,
-                rank,
-                alpha,
-                adapter_dtype,
-            )?,
-            down_proj: Proj::load(
-                vb,
-                "down_proj",
-                (h, i),
-                targets.mlp_down,
-                rank,
-                alpha,
-                adapter_dtype,
-            )?,
+            gate_proj: mode.proj(vb, "gate_proj", (i, h), |t| t.mlp_gate)?,
+            up_proj: mode.proj(vb, "up_proj", (i, h), |t| t.mlp_up)?,
+            down_proj: mode.proj(vb, "down_proj", (h, i), |t| t.mlp_down)?,
         })
     }
 
@@ -1382,6 +1410,9 @@ impl FeedForward {
         }
     }
 
+    // The LoRA-mode positional walk (adapter factors only — the sparse arm
+    // contributes the shared expert's); full-FT bypasses it entirely via
+    // the registry order.
     fn push_vars(&self, out: &mut Vec<Var>) {
         match self {
             Self::Dense(mlp) => mlp.push_vars(out),
@@ -1391,28 +1422,36 @@ impl FeedForward {
 }
 
 /// The sparse `MoE` feed-forward (grad side): the oracle-pinned [`crate::moe`]
-/// kernels over FROZEN routed weights, plus an adapter-aware shared expert.
+/// kernels over the routed weights, plus an adapter-aware shared expert.
 ///
-/// Trainability is the locked `MoE`-`LoRA` policy (GSPO lock, 2026-06-12): the
-/// router, the packed routed experts, and the scalar sigmoid gate are frozen —
-/// adapting the router would make routing non-stationary during training
-/// (precisely the instability sequence-level importance sampling exists to
-/// dampen), and per-expert adapters on the packed 3-D weights are
-/// out-of-recipe. [`LoraTargets`]' `mlp_*` flags bind the SHARED expert's
-/// projections (the always-on `SwiGLU`), the sparse layer's counterpart of the
-/// dense MLP.
+/// Trainability in `LoRA` mode is the locked `MoE`-`LoRA` policy (GSPO lock,
+/// 2026-06-12): the router, the packed routed experts, and the scalar sigmoid
+/// gate are frozen — adapting the router would make routing non-stationary
+/// during training (precisely the instability sequence-level importance
+/// sampling exists to dampen), and per-expert adapters on the packed 3-D
+/// weights are out-of-recipe. [`LoraTargets`]' `mlp_*` flags bind the SHARED
+/// expert's projections (the always-on `SwiGLU`), the sparse layer's
+/// counterpart of the dense MLP.
+///
+/// In **full-FT** mode every tensor here is a registry var's inner tensor —
+/// the router (and everything else) trains, which is exactly why GSPO
+/// (sequence-level importance sampling) is the locked recipe for `MoE`
+/// full-FT runs.
 #[derive(Debug)]
 struct Qwen3_5SparseMoe {
-    /// Router weight `[E, hidden]`, frozen.
+    /// Router weight `[E, hidden]` (frozen in `LoRA` mode).
     router: Tensor,
-    /// Packed per-expert gate+up `[E, 2·moe_inter, hidden]`, frozen.
+    /// Packed per-expert gate+up `[E, 2·moe_inter, hidden]` (frozen in
+    /// `LoRA` mode; ONE registry var in full-FT).
     gate_up: Tensor,
-    /// Per-expert down `[E, hidden, moe_inter]`, frozen.
+    /// Per-expert down `[E, hidden, moe_inter]` (frozen in `LoRA` mode; ONE
+    /// registry var in full-FT).
     down: Tensor,
     /// The shared expert — adapter-aware, width
     /// `shared_expert_intermediate_size`.
     shared: Qwen3_5Mlp,
-    /// The shared expert's sigmoid gate `[1, hidden]`, frozen.
+    /// The shared expert's sigmoid gate `[1, hidden]` (frozen in `LoRA`
+    /// mode).
     shared_gate: Tensor,
     top_k: usize,
 }
@@ -1422,10 +1461,7 @@ impl Qwen3_5SparseMoe {
         cfg: &Qwen3_5TextConfig,
         moe: MoeDims,
         vb: &VarBuilder,
-        targets: LoraTargets,
-        rank: usize,
-        alpha: f64,
-        adapter_dtype: DType,
+        mode: &LoadMode,
     ) -> CandleResult<Self> {
         let h = cfg.hidden_size;
         let m = moe.moe_intermediate_size;
@@ -1446,18 +1482,31 @@ impl Qwen3_5SparseMoe {
             gate_up_rows.push(Tensor::cat(&[&gate, &up], 0)?); // [2m, h]
             down_rows.push(evb.pp("down_proj").get((h, m), "weight")?); // [h, m]
         }
+        let gate_up = Tensor::stack(&gate_up_rows, 0)?; // [E, 2m, h]
+        let down = Tensor::stack(&down_rows, 0)?; // [E, h, m]
+                                                  // Full-FT registers each PACKED tensor as ONE var: the backend's
+                                                  // exclude rule passed the per-expert fetches through raw, because
+                                                  // packing from per-expert vars would leave these tensors stale
+                                                  // load-time derivations (`cat`/`stack` copy storage — the `Var::set`
+                                                  // contract in [`crate::full_ft`]). Hit-expert gradients land on the
+                                                  // packed var through the kernel's index/narrow autograd, zeros
+                                                  // elsewhere, so the grad-coverage canary stays satisfiable.
+        let (gate_up, down) = match mode {
+            LoadMode::Lora { .. } => (gate_up, down),
+            LoadMode::FullFt { registry } => (
+                registry.register(&format!("{}.gate_up_packed", experts.prefix()), &gate_up)?,
+                registry.register(&format!("{}.down_packed", experts.prefix()), &down)?,
+            ),
+        };
         Ok(Self {
             router: vb.pp("gate").get((moe.num_experts, h), "weight")?,
-            gate_up: Tensor::stack(&gate_up_rows, 0)?, // [E, 2m, h]
-            down: Tensor::stack(&down_rows, 0)?,       // [E, h, m]
+            gate_up,
+            down,
             shared: Qwen3_5Mlp::load(
                 cfg,
                 moe.shared_expert_intermediate_size,
                 &vb.pp("shared_expert"),
-                targets,
-                rank,
-                alpha,
-                adapter_dtype,
+                mode,
             )?,
             shared_gate: vb.pp("shared_expert_gate").get((1, h), "weight")?,
             top_k: moe.top_k,
@@ -1524,28 +1573,17 @@ impl Qwen3_5Layer {
         cfg: &Qwen3_5TextConfig,
         kind: LayerType,
         vb: &VarBuilder,
-        targets: LoraTargets,
-        rank: usize,
-        alpha: f64,
-        adapter_dtype: DType,
+        mode: &LoadMode,
     ) -> CandleResult<Self> {
         let mixer = match kind {
             LayerType::LinearAttention => Mixer::Linear(Qwen3_5GatedDeltaNet::load(
                 cfg,
                 &vb.pp("linear_attn"),
-                targets,
-                rank,
-                alpha,
-                adapter_dtype,
+                mode,
             )?),
-            LayerType::FullAttention => Mixer::Full(Qwen3_5Attention::load(
-                cfg,
-                &vb.pp("self_attn"),
-                targets,
-                rank,
-                alpha,
-                adapter_dtype,
-            )?),
+            LayerType::FullAttention => {
+                Mixer::Full(Qwen3_5Attention::load(cfg, &vb.pp("self_attn"), mode)?)
+            }
         };
         let mlp_vb = vb.pp("mlp");
         let mlp = match cfg.moe() {
@@ -1557,25 +1595,9 @@ impl Qwen3_5Layer {
                             .to_string(),
                     )
                 })?;
-                FeedForward::Dense(Qwen3_5Mlp::load(
-                    cfg,
-                    inner,
-                    &mlp_vb,
-                    targets,
-                    rank,
-                    alpha,
-                    adapter_dtype,
-                )?)
+                FeedForward::Dense(Qwen3_5Mlp::load(cfg, inner, &mlp_vb, mode)?)
             }
-            Some(moe) => FeedForward::Sparse(Qwen3_5SparseMoe::load(
-                cfg,
-                moe,
-                &mlp_vb,
-                targets,
-                rank,
-                alpha,
-                adapter_dtype,
-            )?),
+            Some(moe) => FeedForward::Sparse(Qwen3_5SparseMoe::load(cfg, moe, &mlp_vb, mode)?),
         };
         Ok(Self {
             ln1: RmsNormZeroCentered::new(
@@ -1636,9 +1658,13 @@ impl Qwen3_5Layer {
 ///
 /// Loaded from the same safetensors as the HF reference (the
 /// `model.language_model.*` multimodal layout every family checkpoint ships);
-/// vision/MTP tensors are never requested. The base weights are frozen
-/// [`Tensor`]s; only the `LoRA` factors are trainable [`Var`]s, in a
-/// deterministic layer-major order (the positional checkpoint contract).
+/// vision/MTP tensors are never requested. In the default (`LoRA`) mode the
+/// base weights are frozen [`Tensor`]s and only the `LoRA` factors are
+/// trainable [`Var`]s, in a deterministic layer-major order (the positional
+/// checkpoint contract). In **full fine-tuning** mode
+/// ([`load_full_ft`](Self::load_full_ft)) every base weight is a trainable
+/// var's inner tensor and there are no adapters at all — same forward, same
+/// order convention (the model's own load order).
 #[derive(Debug)]
 pub struct Qwen3_5GradModel {
     embed: Tensor,
@@ -1652,6 +1678,10 @@ pub struct Qwen3_5GradModel {
     targets: LoraTargets,
     adapter_enabled: bool,
     remat: bool,
+    /// `Some` iff loaded via [`load_full_ft`](Self::load_full_ft): every base
+    /// weight var in registry (load) order — the full-FT positional
+    /// checkpoint contract. Doubles as the mode flag.
+    full_ft_vars: Option<Vec<Var>>,
     /// The pending checkpointed-forward tape — see
     /// [`QwenGradModel`](crate::qwen::QwenGradModel)'s field of the same name
     /// (same contract: one tape per forward, one backward per tape, `!Sync`).
@@ -1709,12 +1739,116 @@ impl Qwen3_5GradModel {
         targets: LoraTargets,
     ) -> CandleResult<Self> {
         cfg.validate()?;
+        // LoRA-mode-only bail: a full-FT load trains every base weight and
+        // carries the deliberately empty recipe instead.
         if !targets.any() {
             bail!(
                 "Qwen3_5GradModel: LoraTargets selects no projection — the model would have \
                  no trainable parameters"
             );
         }
+        Self::load_inner(
+            cfg,
+            vb,
+            &LoadMode::Lora {
+                rank,
+                alpha,
+                adapter_dtype,
+                targets,
+            },
+        )
+    }
+
+    /// Load in **full fine-tuning** mode: every base weight the load fetches
+    /// becomes a trainable [`Var`] (via the internal `full_ft` var-registry
+    /// `VarBuilder` backend, built over `tensors` — pass the checkpoint map
+    /// from [`tensors_from_pretrained`]); there are no adapters. `LoRA` stays
+    /// the default mode — this is the opt-in.
+    ///
+    /// Contract notes (each gated):
+    /// - [`trainable_vars`](Self::trainable_vars) returns the registry in
+    ///   **load order** — the positional checkpoint contract;
+    ///   [`lora_recipe`](GradModel::lora_recipe) reports `"full-ft"` (plus
+    ///   the feed-forward menu tag), so a resume cross-check catches a
+    ///   `LoRA`↔full-FT checkpoint confusion loudly.
+    /// - On `MoE` members the packed routed tensors are ONE var each and the
+    ///   **router trains too** — full-FT moves routing during training, which
+    ///   is exactly why GSPO (sequence-level importance sampling) is the
+    ///   pinned recipe for `MoE` runs (the M3′ lock).
+    /// - [`merged_decoder`](Self::merged_decoder) **deep-copies** every
+    ///   weight (one full-model copy per rebuild): the vars' storage mutates
+    ///   in place under optimizer steps, so a storage-sharing snapshot would
+    ///   silently track them.
+    /// - [`set_adapter_enabled`](Self::set_adapter_enabled) is a no-op (there
+    ///   is no frozen base policy); the eval base-vs-trained comparison is
+    ///   unavailable and fails loud in [`crate::eval::evaluate`].
+    /// - Activation checkpointing is **not yet supported** in this mode (the
+    ///   forward fails loud; see
+    ///   [`set_activation_checkpointing`](Self::set_activation_checkpointing)).
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if the config fails validation, a tensor is
+    /// missing or mis-shaped, or a var allocation fails.
+    pub fn load_full_ft(
+        cfg: &Qwen3_5Config,
+        tensors: HashMap<String, Tensor>,
+        dtype: DType,
+        device: &Device,
+    ) -> CandleResult<Self> {
+        cfg.validate()?;
+        // Sub-F32 vars would also be the OPTIMIZER's dtype (`FerrlAdamW`
+        // mints its moments at each var's dtype — in LoRA mode the trainable
+        // factors had their own `adapter_dtype`, so this is the first mode
+        // where the model dtype reaches Adam). At bf16 the second-moment
+        // increment ((1−β₂) = 1e-3 of a squared grad) quantizes to zero once
+        // `v` is established, and `eps` vanishes next to `√v̂` — the update
+        // silently degrades. Until a bf16-forward / F32-master-weight split
+        // exists (flagged follow-up, GPU phase), full-FT trains at F32+:
+        // pass `DType::F32` — the backend casts a bf16 checkpoint map on
+        // fetch.
+        if dtype.size_in_bytes() < DType::F32.size_in_bytes() {
+            bail!(
+                "Qwen3_5GradModel::load_full_ft: {dtype:?} vars would also be the \
+                 optimizer's dtype, and Adam's second-moment update quantizes to zero \
+                 below F32 — load with DType::F32 (the backend casts a bf16 checkpoint \
+                 on fetch); a bf16-forward / F32-master split is a flagged follow-up"
+            );
+        }
+        let (vb, registry) = crate::full_ft::registry_varbuilder(
+            tensors,
+            dtype,
+            device,
+            // Per-expert checkpoint tensors pass through raw: the sparse
+            // loader packs them and registers the packed tensors itself.
+            |name| name.contains(".mlp.experts."),
+        );
+        let mut model = Self::load_inner(
+            cfg,
+            &vb,
+            &LoadMode::FullFt {
+                registry: &registry,
+            },
+        )?;
+        let vars = registry.vars()?;
+        if vars.is_empty() {
+            bail!("Qwen3_5GradModel::load_full_ft: the load registered no trainable vars");
+        }
+        model.full_ft_vars = Some(vars);
+        Ok(model)
+    }
+
+    /// Whether this model was loaded in full-fine-tuning mode.
+    #[must_use]
+    pub fn is_full_ft(&self) -> bool {
+        self.full_ft_vars.is_some()
+    }
+
+    /// The shared load walk (both modes). Fetch order is deterministic —
+    /// embed, (untied head), layers 0..N (mixer, feed-forward, then the two
+    /// layer norms), final norm — and in full-FT mode that order **is** the
+    /// positional checkpoint contract.
+    fn load_inner(cfg: &Qwen3_5Config, vb: &VarBuilder, mode: &LoadMode) -> CandleResult<Self> {
         let t = &cfg.text_config;
         let root = vb.pp(CKPT_PREFIX);
         let embed = root
@@ -1734,15 +1868,7 @@ impl Qwen3_5GradModel {
         let layers_vb = root.pp("layers");
         let mut layers = Vec::with_capacity(t.num_hidden_layers);
         for (i, kind) in kinds.iter().enumerate() {
-            layers.push(Qwen3_5Layer::load(
-                t,
-                *kind,
-                &layers_vb.pp(i),
-                targets,
-                rank,
-                alpha,
-                adapter_dtype,
-            )?);
+            layers.push(Qwen3_5Layer::load(t, *kind, &layers_vb.pp(i), mode)?);
         }
         Ok(Self {
             embed,
@@ -1765,15 +1891,21 @@ impl Qwen3_5GradModel {
             hidden: t.hidden_size,
             max_position: t.max_position_embeddings,
             device: vb.device().clone(),
-            targets,
+            targets: match mode {
+                LoadMode::Lora { targets, .. } => *targets,
+                LoadMode::FullFt { .. } => LoraTargets::none(),
+            },
             adapter_enabled: true,
             remat: false,
+            full_ft_vars: None,
             tape: RefCell::new(None),
         })
     }
 
     /// The [`LoraTargets`] recipe this model was loaded with (for logging and
-    /// checkpoint metadata — see [`LoraTargets::canonical`]).
+    /// checkpoint metadata — see [`LoraTargets::canonical`]). A full-FT model
+    /// reports [`LoraTargets::none`] here (it has no adapters); its mode
+    /// string lives in [`lora_recipe`](GradModel::lora_recipe) (`"full-ft"`).
     #[must_use]
     pub fn lora_targets(&self) -> LoraTargets {
         self.targets
@@ -1870,6 +2002,19 @@ impl Qwen3_5GradModel {
         input_ids: &Tensor,
         window: Option<(usize, usize)>,
     ) -> CandleResult<Tensor> {
+        // Full-FT × checkpointing is not wired yet: the boundary tape starts
+        // AFTER the embedding lookup, and `stitched_backward` discards the
+        // first boundary's cotangent — the embedding gradient would be
+        // silently dropped (and in LoRA mode never existed to drop). Fail
+        // loud rather than train wrong. Flagged follow-up: return the final
+        // cotangent and fold it through an embedding re-lookup.
+        if self.is_full_ft() {
+            bail!(
+                "Qwen3_5GradModel: activation checkpointing is not supported in full \
+                 fine-tuning mode yet — the boundary tape would silently drop the \
+                 embedding gradient. Turn checkpointing off for full-FT runs."
+            );
+        }
         let (mut h, mask) = self.embed_and_mask(input_ids)?;
         let mut tape = RematTape::new(self.adapter_enabled);
         for layer in &self.layers {
@@ -1962,6 +2107,10 @@ impl Qwen3_5GradModel {
     /// Turn **activation checkpointing** on or off (default: off) — same
     /// trade and contract as
     /// [`QwenGradModel::set_activation_checkpointing`](crate::qwen::QwenGradModel::set_activation_checkpointing).
+    ///
+    /// **Full-FT caveat:** checkpointing is not yet supported in full
+    /// fine-tuning mode — the next grad-bearing forward fails loud (see
+    /// [`load_full_ft`](Self::load_full_ft)).
     pub fn set_activation_checkpointing(&mut self, on: bool) {
         self.remat = on;
         if !on {
@@ -1977,20 +2126,38 @@ impl Qwen3_5GradModel {
 
     /// Enable/disable the `LoRA` adapter on every targeted projection
     /// (disabled == the frozen base model == the GRPO reference policy).
+    ///
+    /// **No-op in full-FT mode** (per the [`GradModel`] contract): there are
+    /// no adapters and no frozen base policy to toggle back to, so the flag
+    /// stays `true` — callers that need the toggle (eval's base-vs-trained
+    /// comparison) observe it did not take and fail loud.
     pub fn set_adapter_enabled(&mut self, enabled: bool) {
+        if self.is_full_ft() {
+            self.adapter_enabled = true;
+            return;
+        }
         for layer in &mut self.layers {
             layer.set_adapter_enabled(enabled);
         }
         self.adapter_enabled = enabled;
     }
 
-    /// All trainable `LoRA` [`Var`]s in a **deterministic** order — layer-major;
-    /// within a layer the mixer's projections first (`q,k,v,o` /
-    /// `in_proj_qkv,z,b,a,out_proj`), then the MLP's (`gate,up,down`); each
-    /// adapted projection contributes `[A, B]`. The order is a pure function
-    /// of (config, [`LoraTargets`]) — the positional checkpoint contract.
+    /// All trainable [`Var`]s in a **deterministic** order — the positional
+    /// checkpoint contract.
+    ///
+    /// `LoRA` mode: layer-major; within a layer the mixer's projections first
+    /// (`q,k,v,o` / `in_proj_qkv,z,b,a,out_proj`), then the MLP's
+    /// (`gate,up,down`); each adapted projection contributes `[A, B]`. A pure
+    /// function of (config, [`LoraTargets`]).
+    ///
+    /// Full-FT mode: every base weight var, in registry (= load) order — a
+    /// pure function of the config alone (see
+    /// [`load_full_ft`](Self::load_full_ft)).
     #[must_use]
     pub fn trainable_vars(&self) -> Vec<Var> {
+        if let Some(vars) = &self.full_ft_vars {
+            return vars.clone();
+        }
         let mut vars = Vec::new();
         for layer in &self.layers {
             layer.push_vars(&mut vars);
@@ -2076,17 +2243,49 @@ impl GradModel for Qwen3_5GradModel {
         // (the mlp flags bind the layer MLP vs the shared expert), so the
         // manifest cross-check must see the menu to catch a dense-vs-MoE
         // checkpoint confusion. Dense models keep the historical string.
+        // Full-FT reports its mode instead of a targets string — the same
+        // cross-check then catches a LoRA↔full-FT checkpoint confusion.
         let menu = match self.layers.first().map(|l| &l.mlp) {
             Some(FeedForward::Sparse(_)) => "|ffn:moe",
             _ => "",
         };
+        if self.is_full_ft() {
+            return Some(format!("full-ft{menu}"));
+        }
         Some(format!("{}{menu}", self.targets.canonical()))
+    }
+
+    fn has_adapters(&self) -> bool {
+        !self.is_full_ft()
     }
 }
 
 // ---------------------------------------------------------------------------
 // Merged (cached, grad-free) decoder
 // ---------------------------------------------------------------------------
+
+/// Snapshot a non-projection weight for the merged decoder: a cheap
+/// storage-sharing `clone()` in `LoRA` mode (the tensor is frozen — it can
+/// never change under it), a **fresh-storage deep copy** in full-FT mode
+/// (the tensor is a trainable var's inner storage, mutated in place by every
+/// optimizer step — a share would silently track training instead of
+/// snapshotting a value; the mutation gate pins this).
+fn snap(w: &Tensor, full_ft: bool) -> CandleResult<Tensor> {
+    if full_ft {
+        Ok(w.copy()?.detach())
+    } else {
+        Ok(w.clone())
+    }
+}
+
+/// [`snap`] for a [`Proj`]: the adapter-merging snapshot, deep in full-FT.
+fn snap_proj(p: &Proj, full_ft: bool) -> CandleResult<Tensor> {
+    if full_ft {
+        p.merged_weight_deep()
+    } else {
+        p.merged_weight()
+    }
+}
 
 /// A `GatedDeltaNet` layer over merged weights with its recurrent state — the
 /// grad-free mirror of [`Qwen3_5GatedDeltaNet`].
@@ -2115,17 +2314,21 @@ struct MergedGdn {
 }
 
 impl MergedGdn {
-    fn from_layer(l: &Qwen3_5GatedDeltaNet) -> CandleResult<Self> {
+    fn from_layer(l: &Qwen3_5GatedDeltaNet, full_ft: bool) -> CandleResult<Self> {
         Ok(Self {
-            in_qkv_w: l.in_proj_qkv.merged_weight()?,
-            in_z_w: l.in_proj_z.merged_weight()?,
-            in_b_w: l.in_proj_b.merged_weight()?,
-            in_a_w: l.in_proj_a.merged_weight()?,
-            conv_weight: l.conv_weight.clone(),
-            a_log: l.a_log.clone(),
-            dt_bias: l.dt_bias.clone(),
-            norm: l.norm.clone(),
-            out_w: l.out_proj.merged_weight()?,
+            in_qkv_w: snap_proj(&l.in_proj_qkv, full_ft)?,
+            in_z_w: snap_proj(&l.in_proj_z, full_ft)?,
+            in_b_w: snap_proj(&l.in_proj_b, full_ft)?,
+            in_a_w: snap_proj(&l.in_proj_a, full_ft)?,
+            conv_weight: snap(&l.conv_weight, full_ft)?,
+            a_log: snap(&l.a_log, full_ft)?,
+            dt_bias: snap(&l.dt_bias, full_ft)?,
+            norm: if full_ft {
+                l.norm.deep_copy()?
+            } else {
+                l.norm.clone()
+            },
+            out_w: snap_proj(&l.out_proj, full_ft)?,
             dims: l.dims,
             conv_state: None,
             s_state: None,
@@ -2155,10 +2358,13 @@ impl MergedGdn {
         // oldest column was the "current token" of the previous step and is
         // outside every new window); the new cache is the last `kernel`
         // columns of [cached, new] — left-zero-padded at a fresh start.
+        // Taps squeeze [conv_dim, 1, kernel] -> [conv_dim, kernel], mirroring
+        // the grad side's per-forward view.
+        let conv_w = self.conv_weight.squeeze(1)?;
         let (conv_out, new_conv_state) = match &self.conv_state {
             Some(cs) => {
                 let ctx = cs.narrow(D::Minus1, 1, dims.kernel - 1)?.contiguous()?;
-                let out = causal_depthwise_conv1d(&conv_in, &self.conv_weight, Some(&ctx))?;
+                let out = causal_depthwise_conv1d(&conv_in, &conv_w, Some(&ctx))?;
                 let cat = Tensor::cat(&[cs, &conv_in], D::Minus1)?;
                 let w = cat.dim(D::Minus1)?;
                 let ncs = cat
@@ -2167,7 +2373,7 @@ impl MergedGdn {
                 (out, ncs)
             }
             None => {
-                let out = causal_depthwise_conv1d(&conv_in, &self.conv_weight, None)?;
+                let out = causal_depthwise_conv1d(&conv_in, &conv_w, None)?;
                 let ncs = if l >= dims.kernel {
                     conv_in
                         .narrow(D::Minus1, l - dims.kernel, dims.kernel)?
@@ -2225,14 +2431,22 @@ struct MergedAttention {
 }
 
 impl MergedAttention {
-    fn from_layer(l: &Qwen3_5Attention) -> CandleResult<Self> {
+    fn from_layer(l: &Qwen3_5Attention, full_ft: bool) -> CandleResult<Self> {
         Ok(Self {
-            q_w: l.q_proj.merged_weight()?,
-            k_w: l.k_proj.merged_weight()?,
-            v_w: l.v_proj.merged_weight()?,
-            o_w: l.o_proj.merged_weight()?,
-            q_norm: l.q_norm.clone(),
-            k_norm: l.k_norm.clone(),
+            q_w: snap_proj(&l.q_proj, full_ft)?,
+            k_w: snap_proj(&l.k_proj, full_ft)?,
+            v_w: snap_proj(&l.v_proj, full_ft)?,
+            o_w: snap_proj(&l.o_proj, full_ft)?,
+            q_norm: if full_ft {
+                l.q_norm.deep_copy()?
+            } else {
+                l.q_norm.clone()
+            },
+            k_norm: if full_ft {
+                l.k_norm.deep_copy()?
+            } else {
+                l.k_norm.clone()
+            },
             dims: l.dims,
             cache: ConcatKvCache::new(2),
         })
@@ -2289,11 +2503,11 @@ struct MergedMlp {
 }
 
 impl MergedMlp {
-    fn from_layer(l: &Qwen3_5Mlp) -> CandleResult<Self> {
+    fn from_layer(l: &Qwen3_5Mlp, full_ft: bool) -> CandleResult<Self> {
         Ok(Self {
-            gate_w: l.gate_proj.merged_weight()?,
-            up_w: l.up_proj.merged_weight()?,
-            down_w: l.down_proj.merged_weight()?,
+            gate_w: snap_proj(&l.gate_proj, full_ft)?,
+            up_w: snap_proj(&l.up_proj, full_ft)?,
+            down_w: snap_proj(&l.down_proj, full_ft)?,
         })
     }
 
@@ -2312,15 +2526,17 @@ enum MergedFeedForward {
 }
 
 impl MergedFeedForward {
-    fn from_layer(ff: &FeedForward) -> CandleResult<Self> {
+    fn from_layer(ff: &FeedForward, full_ft: bool) -> CandleResult<Self> {
         Ok(match ff {
-            FeedForward::Dense(mlp) => Self::Dense(MergedMlp::from_layer(mlp)?),
+            FeedForward::Dense(mlp) => Self::Dense(MergedMlp::from_layer(mlp, full_ft)?),
             FeedForward::Sparse(moe) => Self::Sparse(MergedSparseMoe {
-                router: moe.router.clone(),
-                gate_up: moe.gate_up.clone(),
-                down: moe.down.clone(),
-                shared: MergedMlp::from_layer(&moe.shared)?,
-                shared_gate: moe.shared_gate.clone(),
+                // In full-FT the routed side (router + packed experts) and
+                // the sigmoid gate are vars too — the deep snap covers them.
+                router: snap(&moe.router, full_ft)?,
+                gate_up: snap(&moe.gate_up, full_ft)?,
+                down: snap(&moe.down, full_ft)?,
+                shared: MergedMlp::from_layer(&moe.shared, full_ft)?,
+                shared_gate: snap(&moe.shared_gate, full_ft)?,
                 top_k: moe.top_k,
             }),
         })
@@ -2432,24 +2648,46 @@ impl Qwen3_5MergedDecoder {
     /// Snapshot a [`Qwen3_5GradModel`]'s current effective weights. Private —
     /// callers go through [`Qwen3_5GradModel::merged_decoder`].
     fn from_model(model: &Qwen3_5GradModel) -> CandleResult<Self> {
+        // Full-FT: every weight is a trainable var's storage — the snapshot
+        // deep-copies (one full-model copy per rebuild, the documented cost)
+        // so an optimizer step cannot mutate a built decoder under the
+        // rollout. LoRA mode keeps the cheap storage-sharing clones of the
+        // frozen tensors.
+        let full_ft = model.is_full_ft();
         let mut layers = Vec::with_capacity(model.layers.len());
         for layer in &model.layers {
             let mixer = match &layer.mixer {
-                Mixer::Linear(gdn) => MergedMixer::Linear(MergedGdn::from_layer(gdn)?),
-                Mixer::Full(attn) => MergedMixer::Full(MergedAttention::from_layer(attn)?),
+                Mixer::Linear(gdn) => MergedMixer::Linear(MergedGdn::from_layer(gdn, full_ft)?),
+                Mixer::Full(attn) => MergedMixer::Full(MergedAttention::from_layer(attn, full_ft)?),
             };
             layers.push(MergedLayer {
-                ln1: layer.ln1.clone(),
+                ln1: if full_ft {
+                    layer.ln1.deep_copy()?
+                } else {
+                    layer.ln1.clone()
+                },
                 mixer,
-                ln2: layer.ln2.clone(),
-                mlp: MergedFeedForward::from_layer(&layer.mlp)?,
+                ln2: if full_ft {
+                    layer.ln2.deep_copy()?
+                } else {
+                    layer.ln2.clone()
+                },
+                mlp: MergedFeedForward::from_layer(&layer.mlp, full_ft)?,
             });
         }
         Ok(Self {
-            embed: model.embed.clone(),
-            lm_head: model.lm_head.clone(),
+            embed: snap(&model.embed, full_ft)?,
+            lm_head: model
+                .lm_head
+                .as_ref()
+                .map(|w| snap(w, full_ft))
+                .transpose()?,
             layers,
-            norm: model.norm.clone(),
+            norm: if full_ft {
+                model.norm.deep_copy()?
+            } else {
+                model.norm.clone()
+            },
             rot: model.rot.clone(),
             hidden: model.hidden,
             max_position: model.max_position,
@@ -3563,7 +3801,10 @@ mod tests {
     fn probe_loss(logits: &Tensor) -> Tensor {
         let n = logits.elem_count();
         let w: Vec<f32> = (0..n).map(|i| ((i % 7) as f32) * 0.21 - 0.6).collect();
-        let w = Tensor::from_vec(w, logits.dims().to_vec(), logits.device()).unwrap();
+        let w = Tensor::from_vec(w, logits.dims().to_vec(), logits.device())
+            .unwrap()
+            .to_dtype(logits.dtype())
+            .unwrap();
         logits.mul(&w).unwrap().sum_all().unwrap()
     }
 
@@ -4005,5 +4246,419 @@ mod tests {
             ))
             .unwrap();
         assert_grads_match(&g_narrow, &stitched, &vars, 1e-5);
+    }
+
+    // ---- full fine-tuning (PR-E) ---------------------------------------------
+
+    fn tiny_full_ft_model() -> Qwen3_5GradModel {
+        let cfg = tiny_cfg();
+        Qwen3_5GradModel::load_full_ft(&cfg, weight_map(&cfg.text_config), DType::F32, &dev())
+            .unwrap()
+    }
+
+    fn tiny_full_ft_moe_model() -> Qwen3_5GradModel {
+        let cfg = tiny_moe_cfg();
+        Qwen3_5GradModel::load_full_ft(&cfg, weight_map(&cfg.text_config), DType::F32, &dev())
+            .unwrap()
+    }
+
+    /// The full-FT positional contract: every base weight registers, in load
+    /// order. Tiny dense tied: embed(1) + 3 linear layers × (`GatedDeltaNet`
+    /// 9 + MLP 3 + 2 layer norms) + the full layer (attn 4 + q/k norms 2 +
+    /// MLP 3 + 2 layer norms) + final norm = 55.
+    #[test]
+    fn full_ft_registers_every_base_weight_in_load_order() {
+        let model = tiny_full_ft_model();
+        assert!(model.is_full_ft());
+        let vars = model.trainable_vars();
+        assert_eq!(vars.len(), 55, "dense tied var count");
+        assert_eq!(vars[0].dims(), &[24, 8], "vars[0] must be the embedding");
+        // Layer 0 (GatedDeltaNet): conv taps and A_log at positions 5/6 —
+        // stored in the on-disk [conv_dim, 1, kernel] layout, as fetched.
+        assert_eq!(vars[5].dims(), &[32, 1, 4], "vars[5] must be the conv taps");
+        assert_eq!(vars[6].dims(), &[4], "vars[6] must be A_log");
+    }
+
+    /// The recipe surface of the mode: `lora_recipe` reports `"full-ft"` (the
+    /// manifest cross-check's mode guard) and `lora_targets` is the empty
+    /// recipe (there are no adapters).
+    #[test]
+    fn full_ft_recipe_reports_the_mode() {
+        let model = tiny_full_ft_model();
+        assert_eq!(
+            GradModel::lora_recipe(&model).as_deref(),
+            Some("full-ft"),
+            "the manifest cross-check must see the mode"
+        );
+        assert!(
+            !model.lora_targets().any(),
+            "full-FT records the empty adapter recipe"
+        );
+    }
+
+    /// An untied head is one more registered var (position 1, after embed).
+    #[test]
+    fn full_ft_untied_head_joins_the_registry() {
+        let untied_cfg = Qwen3_5Config {
+            model_type: Some("qwen3_5".to_string()),
+            tie_word_embeddings: None,
+            text_config: tiny_text_cfg(false),
+        };
+        let untied = Qwen3_5GradModel::load_full_ft(
+            &untied_cfg,
+            weight_map(&untied_cfg.text_config),
+            DType::F32,
+            &dev(),
+        )
+        .unwrap();
+        let vars = untied.trainable_vars();
+        assert_eq!(vars.len(), 56, "untied adds lm_head");
+        assert_eq!(vars[1].dims(), &[24, 8], "vars[1] must be the untied head");
+    }
+
+    /// `MoE` full-FT: each layer's feed-forward contributes 7 vars (packed
+    /// `gate_up` + packed `down` + router + shared g/u/d + shared gate) — the
+    /// packed routed tensors as ONE var each (per-expert vars would leave the
+    /// packed forward tensors stale under `Var::set`) — for 71 total, and the
+    /// recipe carries the menu.
+    #[test]
+    fn full_ft_moe_packs_each_routed_tensor_as_one_var() {
+        let moe = tiny_full_ft_moe_model();
+        let moe_vars = moe.trainable_vars();
+        assert_eq!(moe_vars.len(), 71, "MoE tied var count");
+        // Layer 0 feed-forward: the packed tensors register first (E=4, m=6,
+        // h=8 — all axes distinct, so a packing transpose cannot alias).
+        assert_eq!(
+            moe_vars[10].dims(),
+            &[4, 12, 8],
+            "packed gate_up [E, 2m, h] must be one var"
+        );
+        assert_eq!(
+            moe_vars[11].dims(),
+            &[4, 8, 6],
+            "packed down [E, h, m] must be one var"
+        );
+        assert_eq!(
+            GradModel::lora_recipe(&moe).as_deref(),
+            Some("full-ft|ffn:moe"),
+            "the MoE menu must ride the full-FT recipe"
+        );
+    }
+
+    /// Two identically configured loads must produce the same var order with
+    /// the same values — the positional checkpoint contract is a pure
+    /// function of the config.
+    #[test]
+    fn full_ft_var_order_is_reproducible_across_loads() {
+        let (a, b) = (tiny_full_ft_moe_model(), tiny_full_ft_moe_model());
+        let (va, vb) = (a.trainable_vars(), b.trainable_vars());
+        assert_eq!(va.len(), vb.len());
+        for (i, (x, y)) in va.iter().zip(&vb).enumerate() {
+            assert_eq!(x.dims(), y.dims(), "var {i}: shape order drifted");
+            assert_eq!(
+                max_abs_diff(x.as_tensor(), y.as_tensor()),
+                0.0,
+                "var {i}: value order drifted — the positional contract broke"
+            );
+        }
+    }
+
+    /// Full-FT must not perturb the forward (same weights ⇒ logits identical
+    /// to a `LoRA`-mode load of the same map — zero-B adapters are exact
+    /// no-ops), and after one backward EVERY var must hold a finite, nonzero
+    /// gradient: the canary against candle optimizers silently skipping
+    /// grad-less params, now over the whole model — embed, conv taps,
+    /// `A_log`/`dt_bias`, every norm, and on `MoE` the router, the packed
+    /// experts (hit-expert rows), and the sigmoid gate.
+    #[test]
+    fn full_ft_forward_matches_lora_mode_and_grads_reach_every_var() {
+        for (full, lora, tag) in [
+            (tiny_full_ft_model(), tiny_model(), "dense"),
+            (tiny_full_ft_moe_model(), tiny_moe_model(), "moe"),
+        ] {
+            let input = ids(9);
+            let got = full.forward(&input).unwrap();
+            let want = lora.forward(&input).unwrap();
+            assert_eq!(
+                max_abs_diff(&got, &want),
+                0.0,
+                "{tag}: the full-FT forward diverged from the same weights"
+            );
+
+            let vars = full.trainable_vars();
+            let grads = full.backward(&probe_loss(&got)).unwrap();
+            let cov = grad_coverage(&vars, &grads).unwrap();
+            assert_eq!(
+                cov.present, cov.total,
+                "{tag}: a var is missing from the grad store"
+            );
+            assert_eq!(cov.nonfinite, 0, "{tag}: non-finite gradient");
+            assert_eq!(
+                cov.nonzero, cov.total,
+                "{tag}: a var got an all-zero gradient"
+            );
+        }
+    }
+
+    /// Central-difference gradcheck on the full-FT hazard weights: the GDN
+    /// conv taps and `A_log` (both had load-time transforms before this mode,
+    /// and the conv kernel had only ever run with frozen weights) plus an
+    /// embedding entry (`index_select` backward + the tied head). F64
+    /// end-to-end; each probe at the var's max-|grad| entry with a
+    /// non-vacuity floor (near-zero entries measure CPU-dependent
+    /// cancellation, not the gradient — the runner-pool lesson).
+    #[test]
+    #[allow(clippy::print_stderr)] // the measured rel is the calibration record
+    fn full_ft_backward_passes_a_finite_difference_gradcheck() {
+        let cfg = tiny_cfg();
+        let map_f64: HashMap<String, Tensor> = weight_map(&cfg.text_config)
+            .into_iter()
+            .map(|(k, t)| (k, t.to_dtype(DType::F64).unwrap()))
+            .collect();
+        let model = Qwen3_5GradModel::load_full_ft(&cfg, map_f64, DType::F64, &dev()).unwrap();
+        let input = ids(5);
+        let vars = model.trainable_vars();
+
+        let grads = model
+            .backward(&probe_loss(&model.forward(&input).unwrap()))
+            .unwrap();
+
+        // The FD noise floor here is NOT F64 cancellation: the qwen3_5
+        // forward pins several internals to F32 by reference convention (both
+        // norm flavors normalize in F32; the GDN `g` factor is always F32),
+        // so even an F64-loaded model has an F32-quantized loss surface.
+        // Measured on the embed probe: rel 4.1e-4 at eps 1e-5 vs 2.6e-2 at
+        // eps 1e-6 — ∝ 1/eps, quantization noise, not truncation; a smaller
+        // analytic gradient sits proportionally higher in it. At eps 1e-4 the
+        // dev-host floor is embed 2.8e-4 / conv 4.7e-4 / A_log 4.0e-3. This
+        // noise is F32 reassociation — the class the runner pool spreads
+        // ~10x — so the gate is 3e-2: ~7x above the measured worst and ~17x
+        // below the smallest real-bug signal (a missing tied-head/lookup
+        // path or a wrong factor is rel ≳ 0.5).
+        let eps = 1e-4f64;
+        for (var, tag) in [
+            (&vars[0], "embed"),
+            (&vars[5], "conv taps"),
+            (&vars[6], "A_log"),
+        ] {
+            let dims = var.dims().to_vec();
+            let g = grads
+                .get(var)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f64>()
+                .unwrap();
+            let k = (0..g.len())
+                .max_by(|&a, &b| g[a].abs().total_cmp(&g[b].abs()))
+                .unwrap();
+            let analytic = g[k];
+            assert!(
+                analytic.abs() > 1e-6,
+                "{tag}: strongest gradient entry {analytic} is inside the FD noise floor — \
+                 the probe is vacuous"
+            );
+            let orig: Vec<f64> = var.as_tensor().flatten_all().unwrap().to_vec1().unwrap();
+            let loss_at = |delta: f64| -> f64 {
+                let mut bent = orig.clone();
+                bent[k] += delta;
+                var.set(&Tensor::from_vec(bent, dims.clone(), &dev()).unwrap())
+                    .unwrap();
+                probe_loss(&model.forward(&input).unwrap())
+                    .to_scalar::<f64>()
+                    .unwrap()
+            };
+            let numeric = (loss_at(eps) - loss_at(-eps)) / (2.0 * eps);
+            loss_at(0.0); // restore the entry
+            let rel = (analytic - numeric).abs() / analytic.abs().max(1e-8);
+            eprintln!("[full-FT FD] {tag} probe {k}: analytic={analytic:e}, rel={rel:e}");
+            assert!(
+                rel <= 3e-2,
+                "{tag}: FD gradcheck failed: analytic={analytic}, numeric={numeric}, rel={rel}"
+            );
+        }
+    }
+
+    /// Full-FT merged decoders are PURE value copies (no adapter fold): the
+    /// cached walk must match the uncached forward within the merged
+    /// envelope, on both menus.
+    #[test]
+    fn full_ft_merged_decoder_matches_the_uncached_forward() {
+        for (model, tag) in [
+            (tiny_full_ft_model(), "dense"),
+            (tiny_full_ft_moe_model(), "moe"),
+        ] {
+            let input = ids(7);
+            let uncached = model.forward(&input).unwrap();
+            let mut dec = model.merged_decoder().unwrap();
+            let cached = dec.forward(&input, 0).unwrap();
+            let d = max_abs_diff(&uncached, &cached);
+            assert!(d <= MERGED_TOL, "{tag}: merged diverged by {d}");
+        }
+    }
+
+    /// THE deep-copy mutation gate: an optimizer step after the decoder is
+    /// built must NOT change the decoder's output — `Var::set` mutates
+    /// storage in place, so a storage-sharing "snapshot" would silently track
+    /// training mid-rollout — and a decoder REBUILT from the stepped weights
+    /// must differ (the vacuity guard: the step really displaced the model).
+    /// Runs on both menus: the `MoE` arm additionally pins the packed-expert
+    /// / router / sigmoid-gate deep copies.
+    #[test]
+    fn full_ft_merged_decoder_is_a_value_snapshot_not_a_storage_alias() {
+        use crate::optim::FerrlAdamW;
+        use candle_nn::{Optimizer, ParamsAdamW};
+        for (model, tag) in [
+            (tiny_full_ft_model(), "dense"),
+            (tiny_full_ft_moe_model(), "moe"),
+        ] {
+            let input = ids(7);
+            let mut dec = model.merged_decoder().unwrap();
+            let before = dec.forward(&input, 0).unwrap();
+
+            let vars = model.trainable_vars();
+            let w0 = vars[0].as_tensor().copy().unwrap();
+            let grads = model
+                .backward(&probe_loss(&model.forward(&input).unwrap()))
+                .unwrap();
+            let mut opt = FerrlAdamW::new(
+                vars.clone(),
+                ParamsAdamW {
+                    lr: 1e-2,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            opt.step(&grads).unwrap();
+            assert!(
+                max_abs_diff(&w0, vars[0].as_tensor()) > 0.0,
+                "{tag}: the optimizer step did not move the weights — the gate is vacuous"
+            );
+
+            dec.reset_cache();
+            let after = dec.forward(&input, 0).unwrap();
+            assert_eq!(
+                max_abs_diff(&before, &after),
+                0.0,
+                "{tag}: the merged decoder tracked an optimizer step — a snapshot weight \
+                 shares storage with a trainable var"
+            );
+
+            let mut rebuilt = model.merged_decoder().unwrap();
+            let moved = rebuilt.forward(&input, 0).unwrap();
+            assert!(
+                max_abs_diff(&before, &moved) > 0.0,
+                "{tag}: the rebuilt decoder shows no displacement — the step changed nothing \
+                 the decoder can see"
+            );
+        }
+    }
+
+    /// Full-FT has no adapters: the toggle is a no-op (the flag stays true,
+    /// the forward unchanged) and the trait reports it — the seam eval's
+    /// fail-loud base-vs-trained check stands on.
+    #[test]
+    fn full_ft_has_no_adapters_and_ignores_the_toggle() {
+        let mut model = tiny_full_ft_model();
+        assert!(!GradModel::has_adapters(&model));
+        let input = ids(5);
+        let before = model.forward(&input).unwrap();
+        model.set_adapter_enabled(false);
+        assert!(
+            model.adapter_enabled,
+            "the flag must stay true (the eval detection contract)"
+        );
+        let after = model.forward(&input).unwrap();
+        assert_eq!(max_abs_diff(&before, &after), 0.0);
+    }
+
+    /// Full-FT × activation checkpointing fails loud at the grad forward (the
+    /// boundary tape would silently drop the embedding gradient — flagged
+    /// follow-up), and turning checkpointing back off recovers.
+    #[test]
+    fn full_ft_rejects_activation_checkpointing_loudly() {
+        let mut model = tiny_full_ft_model();
+        model.set_activation_checkpointing(true);
+        let err = model.forward(&ids(4)).unwrap_err();
+        assert!(
+            err.to_string().contains("not supported in full"),
+            "got: {err}"
+        );
+        model.set_activation_checkpointing(false);
+        model.forward(&ids(4)).unwrap();
+    }
+
+    /// The v2 positional checkpoint mechanism works unchanged over the
+    /// full-FT registry order: save, displace every var, load restores
+    /// bit-exactly, and the manifest carries the `"full-ft"` recipe the
+    /// trainer's resume cross-check guards on.
+    #[test]
+    fn full_ft_checkpoint_round_trips_positionally() {
+        // Both menus: the MoE arm puts the packed 3-D vars (and the trained
+        // router) through the positional save/load path too.
+        round_trip_full_ft(&tiny_full_ft_model(), "full-ft", "dense");
+        round_trip_full_ft(&tiny_full_ft_moe_model(), "full-ft|ffn:moe", "moe");
+    }
+
+    fn round_trip_full_ft(model: &Qwen3_5GradModel, want_recipe: &str, tag: &str) {
+        let vars = model.trainable_vars();
+        let dir =
+            std::env::temp_dir().join(format!("ferrl-full-ft-ckpt-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let recipe = GradModel::lora_recipe(model);
+        crate::checkpoint::save_adapter(&dir, &vars, 3, recipe.as_deref()).unwrap();
+
+        let originals: Vec<Tensor> = vars.iter().map(|v| v.as_tensor().copy().unwrap()).collect();
+        for v in &vars {
+            v.set(&(v.as_tensor() * 2.0).unwrap()).unwrap();
+        }
+        let manifest = crate::checkpoint::load_adapter(&dir, &vars).unwrap();
+        assert_eq!(manifest.lora_recipe.as_deref(), Some(want_recipe), "{tag}");
+        assert_eq!(manifest.num_vars, vars.len(), "{tag}");
+        for (i, (v, orig)) in vars.iter().zip(&originals).enumerate() {
+            assert_eq!(
+                max_abs_diff(v.as_tensor(), orig),
+                0.0,
+                "{tag}: var {i} did not restore bit-exactly"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Sub-F32 full-FT loads are rejected loudly: the var dtype is also the
+    /// optimizer's, and Adam's second-moment update quantizes to zero below
+    /// F32 (the silent-degradation class — see `load_full_ft`).
+    #[test]
+    fn full_ft_rejects_sub_f32_dtypes_loudly() {
+        let cfg = tiny_cfg();
+        for dtype in [DType::BF16, DType::F16] {
+            let err =
+                Qwen3_5GradModel::load_full_ft(&cfg, weight_map(&cfg.text_config), dtype, &dev())
+                    .unwrap_err();
+            assert!(
+                err.to_string().contains("below F32"),
+                "{dtype:?}: got {err}"
+            );
+        }
+    }
+
+    /// The policy-level toggle guard (the seam eval and the trainer's KL
+    /// pre-checks stand on): an `LmPolicy` over a full-FT model must refuse
+    /// to lower its adapter flag — `set_adapter_enabled(false)` takes no
+    /// effect and `adapter_enabled()` stays true. Without this, a caller
+    /// observing the flag would believe it scored the frozen base while
+    /// scoring the live policy.
+    #[test]
+    fn full_ft_policy_toggle_cannot_lower_the_flag() {
+        use crate::policy::Policy;
+        let mut policy = crate::lm_policy::LmPolicy::new(tiny_full_ft_model(), 7, 1.0);
+        assert!(policy.adapter_enabled());
+        policy.set_adapter_enabled(false);
+        assert!(
+            policy.adapter_enabled(),
+            "the policy lowered its flag with no adapters to disable — eval/trainer \
+             guards would silently score the live policy as the base"
+        );
     }
 }

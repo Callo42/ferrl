@@ -112,7 +112,20 @@ pub trait GradModel {
     /// policy (no second model copy). Affects both [`forward`](Self::forward)
     /// and any *subsequently built* [`merged_decoder`](Self::merged_decoder);
     /// an already-built decoder is a snapshot and does **not** see the flip.
+    /// A model without adapters ([`has_adapters`](Self::has_adapters) ==
+    /// `false`) must treat this as a no-op and keep reporting enabled.
     fn set_adapter_enabled(&mut self, enabled: bool);
+
+    /// Whether this model carries toggleable adapters (the `LoRA` modes —
+    /// the default). A **full fine-tuning** model has none: the base weights
+    /// ARE the trained weights, so there is no frozen base policy to toggle
+    /// back to, and [`set_adapter_enabled`](Self::set_adapter_enabled) is a
+    /// no-op. Callers that depend on the toggle (the eval base-vs-trained
+    /// comparison) must check this — or observe that the toggle did not
+    /// take — and fail loud rather than compare a policy against itself.
+    fn has_adapters(&self) -> bool {
+        true
+    }
 
     /// Snapshot the **current** effective weights into a KV-cached, grad-free
     /// [`CachedDecoder`] for fast incremental rollout.

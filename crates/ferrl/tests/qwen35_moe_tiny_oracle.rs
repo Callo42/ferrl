@@ -15,7 +15,9 @@
 //! regenerate only when the oracle pin moves).
 
 use candle_core::{DType, Device, Tensor};
-use ferrl::{varbuilder_from_pretrained, MoeDims, Qwen3_5Config, Qwen3_5GradModel};
+use ferrl::{
+    tensors_from_pretrained, varbuilder_from_pretrained, MoeDims, Qwen3_5Config, Qwen3_5GradModel,
+};
 use std::path::PathBuf;
 
 /// Our fp32 forward vs the reference's fp32 logits, per position. Measured
@@ -179,6 +181,36 @@ fn uncached_forward_matches_reference_logits() {
             "{case_name}: degenerate oracle logits ({scale})"
         );
     }
+}
+
+/// The full-fine-tuning load over the `MoE` fixture: value-transparent (same
+/// reference parity as the `LoRA`-mode load) with the per-expert checkpoint
+/// tensors packed into single 3-D vars (the structural full-FT `MoE`
+/// contract — per-expert vars would leave the packed forward tensors stale
+/// under optimizer updates).
+#[test]
+fn full_ft_load_matches_reference_logits() {
+    let g = golden();
+    let dir = fixture_dir();
+    let cfg = Qwen3_5Config::from_json_file(dir.join("config.json")).unwrap();
+    let tensors = tensors_from_pretrained(&dir, &Device::Cpu).unwrap();
+    let model = Qwen3_5GradModel::load_full_ft(&cfg, tensors, DType::F32, &Device::Cpu).unwrap();
+    assert!(model.is_full_ft());
+    // E=8, m=6, h=16: one [8, 12, 16] gate_up var and one [8, 16, 6] down
+    // var per layer — packed, not per-expert.
+    let vars = model.trainable_vars();
+    let packed_gate_up = vars.iter().filter(|v| v.dims() == [8, 12, 16]).count();
+    let packed_down = vars.iter().filter(|v| v.dims() == [8, 16, 6]).count();
+    assert_eq!(packed_gate_up, 4, "one packed gate_up var per layer");
+    assert_eq!(packed_down, 4, "one packed down var per layer");
+
+    let case = &g["cases"]["full_b1"];
+    let ids = input_ids(case, "input_ids");
+    let (b, l) = ids.dims2().unwrap();
+    let want = tensor_from(case, "logits", (b, l, 64));
+    let got = model.forward(&ids).unwrap();
+    let d = max_abs_diff(&got, &want);
+    assert!(d <= ORACLE_TOL, "full-FT forward vs reference diff {d}");
 }
 
 #[test]

@@ -510,6 +510,15 @@ impl<M: GradModel> Policy for LmPolicy<M> {
     }
 
     fn set_adapter_enabled(&mut self, enabled: bool) {
+        // A model without adapters (full fine-tuning) cannot be toggled: the
+        // flag stays true, so callers that need the toggle (eval's
+        // base-vs-trained comparison) observe it did not take and fail loud
+        // instead of silently comparing the policy against itself.
+        if !self.model.has_adapters() {
+            self.model.set_adapter_enabled(true);
+            self.enabled = true;
+            return;
+        }
         self.model.set_adapter_enabled(enabled);
         self.enabled = enabled;
     }
