@@ -68,6 +68,13 @@ use crate::policy::{GenConfig, Policy, Rollout};
 use crate::qwen::QwenGradModel;
 use crate::sampler::GrpoSampler;
 
+/// Scoring positions processed per chunk by the log-softmax/gather stage —
+/// bounds the F32 upcast + softmax buffers to `[group, SCORING_CHUNK, vocab]`
+/// at a time (chunking over positions is exact: the softmax reduces over the
+/// vocab axis only). 128 keeps the chunk small relative to any real
+/// completion window while adding no measurable overhead on tiny CI shapes.
+const SCORING_CHUNK: usize = 128;
+
 /// A [`Policy`] backed by any grad-bearing [`GradModel`].
 ///
 /// Construct it from a loaded model with [`LmPolicy::new`]; the device and dtype
@@ -159,7 +166,10 @@ impl<M: GradModel> LmPolicy<M> {
     ///
     /// Precondition (the `Trainer` guarantees this via `completion_dims`): a
     /// rectangular rollout with `prompt_len >= 1` and `comp_len >= 1`. Called
-    /// directly with `prompt_len == 0`, the scoring narrow underflows.
+    /// directly with `prompt_len == 0`, the scoring window underflows (a
+    /// debug-profile panic at the subtraction in
+    /// [`scoring_window`](Self::scoring_window); in release, a loud narrow
+    /// error in the model tail).
     fn scoring_input(&self, rollout: &Rollout) -> CandleResult<Tensor> {
         let seq_len = rollout.token_ids[0].len();
         let input_len = seq_len - 1;
@@ -171,34 +181,55 @@ impl<M: GradModel> LmPolicy<M> {
         Tensor::from_vec(input_data, (g, input_len), self.model.device())
     }
 
-    /// Gather the completion tokens' log-probabilities out of full-sequence
-    /// `logits` — narrow to the completion-predicting positions, upcast to
-    /// F32, divide by the rollout temperature (temperature-consistent
-    /// scoring; a guarded no-op at the `1.0` default), `log_softmax`, gather.
-    fn completion_logprobs(&self, rollout: &Rollout, logits: &Tensor) -> CandleResult<Tensor> {
+    /// The completion-predicting scoring window of a rectangular rollout:
+    /// `(start, len)` along the scoring input's sequence axis — positions
+    /// `[prompt_len - 1 .. prompt_len - 1 + comp_len]` are the ones whose
+    /// next-token distributions score the completion tokens.
+    fn scoring_window(rollout: &Rollout) -> (usize, usize) {
+        let seq_len = rollout.token_ids[0].len();
+        (rollout.prompt_len - 1, seq_len - rollout.prompt_len)
+    }
+
+    /// Gather the completion tokens' log-probabilities out of the **already
+    /// narrowed** window logits `pred` (`[g, comp_len, vocab]`, the
+    /// [`scoring_window`](Self::scoring_window) positions — guarded, fail-loud):
+    /// upcast to F32, divide by the rollout temperature
+    /// (temperature-consistent scoring; a guarded no-op at the `1.0` default),
+    /// `log_softmax`, gather. Both production call sites pass
+    /// [`SCORING_CHUNK`]; tests pass tiny chunks to force multi-chunk runs on
+    /// small rollouts.
+    ///
+    /// Chunking bounds the F32 expansion: the upcast + `log_softmax` buffers
+    /// exist for one `[g, chunk, vocab]` slice at a time instead of the whole
+    /// window — on the detached scorings each chunk's intermediates are freed
+    /// as the loop advances. `log_softmax` reduces over the vocab axis only
+    /// and `gather` is positionwise, so chunking over positions is exact: the
+    /// concatenated result is identical to the unchunked one.
+    fn completion_logprobs_chunked(
+        &self,
+        rollout: &Rollout,
+        pred: &Tensor,
+        chunk: usize,
+    ) -> CandleResult<Tensor> {
         let prompt_len = rollout.prompt_len;
         let seq_len = rollout.token_ids[0].len();
         let comp_len = seq_len - prompt_len;
         let g = rollout.token_ids.len();
-
-        // The positions that predict the completion tokens are
-        // [prompt_len - 1 .. prompt_len - 1 + comp_len].
-        // Upcast just the completion-position logits (a small `[g, comp_len, vocab]`
-        // slice, NOT the full sequence) to F32 before the log-softmax, so the
-        // surrogate's log-probs keep F32 precision even when the model runs in BF16
-        // (the dtype split); the big full-sequence logits stay BF16. A no-op when the
-        // model is already F32.
-        let mut pred = logits
-            .narrow(1, prompt_len - 1, comp_len)?
-            .to_dtype(DType::F32)?;
-        // Temperature-consistent scoring (TRL parity): divide the logits by the
-        // policy's rollout temperature before the log-softmax, so the distribution
-        // being optimized IS the one the rollout sampled from. Guarded so the
-        // T = 1.0 default adds no op and stays bit-identical to the pre-R2 path.
-        if (self.temperature - 1.0).abs() > f64::EPSILON {
-            pred = (pred / self.temperature)?;
+        // Fail-loud preconditions: the type system cannot enforce that `pred`
+        // is the narrowed window (full-width logits would gather positions
+        // 0..comp_len — silently wrong values), and a zero-length window would
+        // otherwise surface as an obscure empty-cat error.
+        if comp_len == 0 {
+            candle_core::bail!("completion_logprobs: zero-length completion window");
         }
-        let logp = log_softmax(&pred, D::Minus1)?;
+        let (pg, pw, _vocab) = pred.dims3()?;
+        if pg != g || pw != comp_len {
+            candle_core::bail!(
+                "completion_logprobs: pred must be the narrowed scoring window \
+                 [{g}, {comp_len}, vocab], got {:?}",
+                pred.dims()
+            );
+        }
 
         let mut tgt_data = Vec::with_capacity(g * comp_len);
         for ids in &rollout.token_ids {
@@ -206,7 +237,33 @@ impl<M: GradModel> LmPolicy<M> {
         }
         let targets = Tensor::from_vec(tgt_data, (g, comp_len), self.model.device())?;
         let idx = targets.unsqueeze(D::Minus1)?;
-        logp.gather(&idx, D::Minus1)?.squeeze(D::Minus1)
+
+        let chunk = chunk.max(1);
+        let mut parts = Vec::with_capacity(comp_len.div_ceil(chunk));
+        let mut pos = 0;
+        while pos < comp_len {
+            let n = chunk.min(comp_len - pos);
+            // Upcast one chunk of window logits to F32 before the log-softmax,
+            // so the surrogate's log-probs keep F32 precision even when the
+            // model runs in BF16 (the dtype split); the model-dtype window
+            // logits are the only full-window tensor.
+            let mut p = pred.narrow(1, pos, n)?.to_dtype(DType::F32)?;
+            // Temperature-consistent scoring (TRL parity): divide the logits
+            // by the policy's rollout temperature before the log-softmax, so
+            // the distribution being optimized IS the one the rollout sampled
+            // from. Guarded so the T = 1.0 default adds no op and stays
+            // bit-identical to the pre-R2 path.
+            if (self.temperature - 1.0).abs() > f64::EPSILON {
+                p = (p / self.temperature)?;
+            }
+            let logp = log_softmax(&p, D::Minus1)?;
+            let part = logp
+                .gather(&idx.narrow(1, pos, n)?.contiguous()?, D::Minus1)?
+                .squeeze(D::Minus1)?;
+            parts.push(part);
+            pos += n;
+        }
+        Tensor::cat(&parts, 1)
     }
 
     /// The pre-P6-C **uncached** rollout: re-run the full-sequence
@@ -413,29 +470,37 @@ impl<M: GradModel> Policy for LmPolicy<M> {
 
     fn token_logprobs(&self, rollout: &Rollout) -> CandleResult<Tensor> {
         let input = self.scoring_input(rollout)?;
-        // Same CUDA-compat translation as `generate` (see there): a no-op off the
-        // `cuda` build and on the success path.
-        let logits = self
+        let (start, len) = Self::scoring_window(rollout);
+        // The NARROWED forward: the full-width `[g, input_len, vocab]` logits
+        // never materialize — the model applies its head to the
+        // completion-predicting window alone. Same CUDA-compat translation as
+        // `generate` (see there): a no-op off the `cuda` build and on the
+        // success path.
+        let pred = self
             .model
-            .forward(&input)
-            .map_err(crate::cuda_compat::translate_ptx_error)?; // [g, input_len, vocab]
-        self.completion_logprobs(rollout, &logits)
+            .forward_narrowed(&input, start, len)
+            .map_err(crate::cuda_compat::translate_ptx_error)?; // [g, comp_len, vocab]
+        self.completion_logprobs_chunked(rollout, &pred, SCORING_CHUNK)
     }
 
     fn token_logprobs_detached(&self, rollout: &Rollout) -> CandleResult<Tensor> {
         let input = self.scoring_input(rollout)?;
+        let (start, len) = Self::scoring_window(rollout);
         // The value-only scorings (logp_old / the KL reference) route through
-        // the model's detached forward: a rolling boundary detach frees each
-        // layer's intermediates as the walk proceeds, and no checkpoint tape
-        // is captured (so the tape of the NEXT update forward — the one
+        // the model's narrowed detached forward: a rolling boundary detach
+        // frees each layer's intermediates as the walk proceeds, the head is
+        // applied to the scoring window alone, and no checkpoint tape is
+        // captured (so the tape of the NEXT update forward — the one
         // `backward` consumes — can never be clobbered by a value scoring).
-        let logits = self
+        let pred = self
             .model
-            .forward_detached(&input)
+            .forward_detached_narrowed(&input, start, len)
             .map_err(crate::cuda_compat::translate_ptx_error)?;
         // Already tape-free; the explicit detach states the trait contract
         // rather than trusting every model impl.
-        Ok(self.completion_logprobs(rollout, &logits)?.detach())
+        Ok(self
+            .completion_logprobs_chunked(rollout, &pred, SCORING_CHUNK)?
+            .detach())
     }
 
     fn backward(&self, loss: &Tensor) -> CandleResult<candle_core::backprop::GradStore> {
@@ -1886,6 +1951,74 @@ mod tests {
             .trainable_vars()
             .iter()
             .any(|v| store.get(v).is_some()));
+    }
+
+    /// Chunking the log-softmax/gather stage over positions is exact: the
+    /// softmax reduces over the vocab axis only and the gather is
+    /// positionwise, so every chunk size — degenerate ones included — matches
+    /// an INDEPENDENTLY computed unchunked reference (full-window log-softmax
+    /// then per-position lookup), and so does the public scoring path. The
+    /// handcrafted rollout has position-distinct completion tokens, so a
+    /// gather reading the wrong chunk's targets cannot pass. Also pins the
+    /// new fail-loud preconditions: full-width (un-narrowed) pred and a
+    /// zero-length window are rejected, not silently mis-scored.
+    #[test]
+    fn chunked_scoring_is_identical_across_chunk_sizes() {
+        let policy = tiny_policy();
+        arm_policy(&policy);
+        let rollout = Rollout::rectangular(vec![vec![1, 2, 3, 4, 5, 6], vec![3, 1, 2, 6, 4, 5]], 3);
+        let input = policy.scoring_input(&rollout).unwrap();
+        let (start, len) = QwenPolicy::scoring_window(&rollout);
+        let pred = policy.model().forward_narrowed(&input, start, len).unwrap();
+
+        let logp = log_softmax(&pred.to_dtype(DType::F32).unwrap(), D::Minus1).unwrap();
+        let mut reference: Vec<Vec<f32>> = Vec::new();
+        for (gi, ids) in rollout.token_ids.iter().enumerate() {
+            let row = ids[rollout.prompt_len..]
+                .iter()
+                .enumerate()
+                .map(|(pi, &t)| {
+                    logp.get(gi)
+                        .unwrap()
+                        .get(pi)
+                        .unwrap()
+                        .get(t as usize)
+                        .unwrap()
+                        .to_scalar::<f32>()
+                        .unwrap()
+                })
+                .collect();
+            reference.push(row);
+        }
+
+        for chunk in [0usize, 1, 2, 64, usize::MAX] {
+            let got = policy
+                .completion_logprobs_chunked(&rollout, &pred, chunk)
+                .unwrap()
+                .to_vec2::<f32>()
+                .unwrap();
+            assert_eq!(got, reference, "chunk size {chunk} diverged");
+        }
+        // The public scoring path agrees too (it fixes SCORING_CHUNK).
+        let public = policy
+            .token_logprobs(&rollout)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+        assert_eq!(public, reference);
+
+        // Fail-loud preconditions: full-width pred is rejected…
+        let full = policy.model().forward(&input).unwrap();
+        let err = policy
+            .completion_logprobs_chunked(&rollout, &full, 64)
+            .unwrap_err();
+        assert!(err.to_string().contains("narrowed scoring window"));
+        // …and so is a zero-length completion window.
+        let empty = Rollout::rectangular(vec![vec![1, 2, 3], vec![4, 5, 6]], 3);
+        let err = policy
+            .completion_logprobs_chunked(&empty, &pred, 64)
+            .unwrap_err();
+        assert!(err.to_string().contains("zero-length"));
     }
 
     /// `Policy::backward` under activation checkpointing: full var coverage,

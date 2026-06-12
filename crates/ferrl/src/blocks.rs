@@ -23,6 +23,20 @@
 
 use candle_core::{DType, Device, Result as CandleResult, Tensor};
 
+/// Narrow `h` (`[batch, seq, ..]`) to `window = (start, len)` along the
+/// sequence dim; `None` is the identity (a shallow clone). The shared helper
+/// behind every model's narrowed scoring forward.
+///
+/// # Errors
+///
+/// Returns a candle error if the window exceeds the sequence.
+pub(crate) fn windowed(h: &Tensor, window: Option<(usize, usize)>) -> CandleResult<Tensor> {
+    match window {
+        None => Ok(h.clone()),
+        Some((start, len)) => h.narrow(1, start, len),
+    }
+}
+
 /// `y = x Wᵀ` for a frozen weight `w` of shape `[out, in]` (candle `Linear`
 /// layout); leading dims of `x` are flattened around a single 2-D matmul.
 ///
