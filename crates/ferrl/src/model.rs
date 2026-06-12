@@ -149,6 +149,66 @@ pub trait GradModel {
         Ok(self.forward(input_ids)?.detach())
     }
 
+    /// Logits for a **window** of `len` positions starting at `start` — the
+    /// narrowed (memory-lean) scoring forward.
+    ///
+    /// The default is `forward(input_ids).narrow(1, start, len)`: identical
+    /// values, no memory win. A model should override it to run the full layer
+    /// stack (attention needs the whole prefix) but apply the final norm + LM
+    /// head to the window alone, so the full-width `[batch, seq, vocab]`
+    /// logits — usually the single biggest activation of a scoring forward —
+    /// never materialize. The trainer's scoring paths only ever read the
+    /// completion-predicting window; everything outside it is wasted work and
+    /// peak memory.
+    ///
+    /// CONTRACT: same tape semantics as [`forward`](Self::forward) — tape-
+    /// bearing, and under activation checkpointing it captures the boundary
+    /// tape exactly like `forward` (the next [`backward`](Self::backward)
+    /// consumes it). On CPU, values and trainable-var gradients must equal
+    /// the default's exactly (positions outside the window contribute exact
+    /// zeros through the narrow adjoint; the in-crate gates pin this). On
+    /// CUDA the head gemm's row count changes, and shape-dependent kernel
+    /// selection may reassociate the accumulation — values can differ at ulp
+    /// level from the default's (the same accepted class as the merged-weight
+    /// reassociation); training math stays self-consistent because every
+    /// scoring path uses the same narrowed route. Frozen-weight gradient
+    /// values may reassociate on any device (retained but never consumed).
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if the window exceeds the sequence or any
+    /// tensor op fails.
+    fn forward_narrowed(
+        &self,
+        input_ids: &Tensor,
+        start: usize,
+        len: usize,
+    ) -> CandleResult<Tensor> {
+        self.forward(input_ids)?.narrow(1, start, len)
+    }
+
+    /// The detached variant of [`forward_narrowed`](Self::forward_narrowed),
+    /// for the value-only scorings (`logp_old`, the KL reference): same window
+    /// semantics, no autograd tape. An overriding implementation must never
+    /// capture a checkpoint tape; the provided default inherits
+    /// [`forward_detached`](Self::forward_detached)'s softness (its own
+    /// default routes through the tape-capturing `forward`), so a
+    /// checkpointing model must override BOTH detached methods — as every
+    /// in-crate model does.
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if the window exceeds the sequence or any
+    /// tensor op fails.
+    fn forward_detached_narrowed(
+        &self,
+        input_ids: &Tensor,
+        start: usize,
+        len: usize,
+    ) -> CandleResult<Tensor> {
+        self.forward_detached(input_ids)?.narrow(1, start, len)
+    }
+
     /// Back-propagate a loss built from this model's [`forward`](Self::forward)
     /// logits.
     ///
@@ -258,5 +318,41 @@ mod tests {
             "default backward lost the var grad"
         );
         assert!(m.lora_recipe().is_none());
+    }
+
+    #[test]
+    fn the_provided_narrowed_defaults_are_forward_plus_narrow() {
+        let device = Device::Cpu;
+        let w = Var::from_tensor(&Tensor::from_vec(vec![2.0f32], (1,), &device).unwrap()).unwrap();
+        let m = OneVarModel {
+            w: w.clone(),
+            device,
+        };
+        let ids = Tensor::from_vec(vec![1u32, 2, 3, 4, 5, 6], (2, 3), m.device()).unwrap();
+
+        let reference = m.forward(&ids).unwrap().narrow(1, 1, 2).unwrap();
+        let narrowed = m.forward_narrowed(&ids, 1, 2).unwrap();
+        assert_eq!(narrowed.dims(), reference.dims());
+        assert_eq!(
+            narrowed.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            reference.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        );
+        // The narrowed default is tape-bearing (it routes through `forward`)…
+        let grads = m
+            .backward(&narrowed.sum_all().unwrap())
+            .expect("backward through the narrowed default");
+        assert!(grads.get(&w).is_some(), "narrowed default lost the tape");
+
+        // …and the detached variant is value-identical but tape-free.
+        let det = m.forward_detached_narrowed(&ids, 1, 2).unwrap();
+        assert_eq!(
+            det.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            reference.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        );
+        let store = det.sum_all().unwrap().backward().unwrap();
+        assert!(store.get(&w).is_none(), "detached narrowed reached the var");
+
+        // An out-of-range window fails loud instead of clamping.
+        assert!(m.forward_narrowed(&ids, 2, 2).is_err());
     }
 }

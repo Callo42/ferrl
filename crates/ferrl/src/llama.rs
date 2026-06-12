@@ -78,7 +78,9 @@ use candle_nn::rotary_emb::rope_slow;
 use candle_nn::{Activation, VarBuilder};
 use candle_transformers::models::llama::{Config, Llama3RopeConfig, Llama3RopeType};
 
-use crate::blocks::{causal_mask, causal_mask_at, frozen_linear, repeat_kv, RotaryTables};
+use crate::blocks::{
+    causal_mask, causal_mask_at, frozen_linear, repeat_kv, windowed, RotaryTables,
+};
 use crate::lora::{DenseLoraTargets, Proj};
 use crate::model::{CachedDecoder, GradModel};
 use crate::nn::RmsNorm;
@@ -606,14 +608,42 @@ impl LlamaGradModel {
     ///
     /// Returns a candle error if any tensor op fails (e.g. a shape mismatch).
     pub fn forward(&self, input_ids: &Tensor) -> CandleResult<Tensor> {
+        self.forward_window(input_ids, None)
+    }
+
+    /// The narrowed scoring forward: the full layer walk with the final
+    /// norm + head applied to the `(start, len)` window alone — same scheme
+    /// and contract as
+    /// [`QwenGradModel::forward_narrowed`](crate::qwen::QwenGradModel::forward_narrowed).
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if the window exceeds the sequence or any
+    /// tensor op fails.
+    pub fn forward_narrowed(
+        &self,
+        input_ids: &Tensor,
+        start: usize,
+        len: usize,
+    ) -> CandleResult<Tensor> {
+        self.forward_window(input_ids, Some((start, len)))
+    }
+
+    /// The shared tape-bearing walk behind [`forward`](Self::forward) and
+    /// [`forward_narrowed`](Self::forward_narrowed).
+    fn forward_window(
+        &self,
+        input_ids: &Tensor,
+        window: Option<(usize, usize)>,
+    ) -> CandleResult<Tensor> {
         if self.remat {
-            return self.forward_remat(input_ids);
+            return self.forward_remat(input_ids, window);
         }
         let (mut h, mask) = self.embed_and_mask(input_ids)?;
         for layer in &self.layers {
             h = layer.forward(&h, mask.as_ref(), &self.rot)?;
         }
-        self.norm_and_head(&h)
+        self.norm_and_head(&h, window)
     }
 
     /// Shared prologue of every full-sequence walk: the token embedding plus
@@ -635,10 +665,13 @@ impl LlamaGradModel {
         Ok((h, mask))
     }
 
-    /// Shared tail of every full-sequence walk: the final norm plus the
-    /// (possibly tied) `lm_head` projection.
-    fn norm_and_head(&self, h: &Tensor) -> CandleResult<Tensor> {
-        let h = self.norm.forward(h)?;
+    /// Shared tail of every walk: narrow to the `window` FIRST (this is the
+    /// memory lever — the head must only ever see the window), then the final
+    /// norm plus the (possibly tied) `lm_head` projection. The narrow lives
+    /// inside this seam deliberately, so no caller can reorder it after the
+    /// head and silently rematerialize full-width logits.
+    fn norm_and_head(&self, h: &Tensor, window: Option<(usize, usize)>) -> CandleResult<Tensor> {
+        let h = self.norm.forward(&windowed(h, window)?)?;
         match &self.lm_head {
             Some(w) => frozen_linear(&h, w),
             None => frozen_linear(&h, &self.embed),
@@ -647,8 +680,13 @@ impl LlamaGradModel {
 
     /// The checkpointed forward — boundary [`Var`] per layer plus the tail;
     /// same scheme and contract as
-    /// [`QwenGradModel`](crate::qwen::QwenGradModel)'s.
-    fn forward_remat(&self, input_ids: &Tensor) -> CandleResult<Tensor> {
+    /// [`QwenGradModel`](crate::qwen::QwenGradModel)'s, including the
+    /// loss-tape window narrow (the tail boundary stays full-width).
+    fn forward_remat(
+        &self,
+        input_ids: &Tensor,
+        window: Option<(usize, usize)>,
+    ) -> CandleResult<Tensor> {
         let (mut h, mask) = self.embed_and_mask(input_ids)?;
         let mut tape = RematTape::new(self.adapter_enabled);
         for layer in &self.layers {
@@ -657,7 +695,7 @@ impl LlamaGradModel {
         }
         let x = tape.capture(&h)?;
         *self.tape.borrow_mut() = Some(tape);
-        self.norm_and_head(&x)
+        self.norm_and_head(&x, window)
     }
 
     /// Detached full-sequence logits with a rolling boundary detach — same
@@ -668,11 +706,38 @@ impl LlamaGradModel {
     ///
     /// Returns a candle error if any tensor op fails.
     pub fn forward_detached(&self, input_ids: &Tensor) -> CandleResult<Tensor> {
+        self.forward_detached_window(input_ids, None)
+    }
+
+    /// The narrowed detached scoring forward: rolling boundary detach plus
+    /// the windowed tail (see [`GradModel::forward_detached_narrowed`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if the window exceeds the sequence or any
+    /// tensor op fails.
+    pub fn forward_detached_narrowed(
+        &self,
+        input_ids: &Tensor,
+        start: usize,
+        len: usize,
+    ) -> CandleResult<Tensor> {
+        self.forward_detached_window(input_ids, Some((start, len)))
+    }
+
+    /// The shared detached walk behind
+    /// [`forward_detached`](Self::forward_detached) and
+    /// [`forward_detached_narrowed`](Self::forward_detached_narrowed).
+    fn forward_detached_window(
+        &self,
+        input_ids: &Tensor,
+        window: Option<(usize, usize)>,
+    ) -> CandleResult<Tensor> {
         let (mut h, mask) = self.embed_and_mask(input_ids)?;
         for layer in &self.layers {
             h = layer.forward(&h, mask.as_ref(), &self.rot)?.detach();
         }
-        Ok(self.norm_and_head(&h)?.detach())
+        Ok(self.norm_and_head(&h, window)?.detach())
     }
 
     /// Back-propagate a loss built from this model's logits — plain
@@ -793,6 +858,24 @@ impl GradModel for LlamaGradModel {
 
     fn forward_detached(&self, input_ids: &Tensor) -> CandleResult<Tensor> {
         LlamaGradModel::forward_detached(self, input_ids)
+    }
+
+    fn forward_narrowed(
+        &self,
+        input_ids: &Tensor,
+        start: usize,
+        len: usize,
+    ) -> CandleResult<Tensor> {
+        LlamaGradModel::forward_narrowed(self, input_ids, start, len)
+    }
+
+    fn forward_detached_narrowed(
+        &self,
+        input_ids: &Tensor,
+        start: usize,
+        len: usize,
+    ) -> CandleResult<Tensor> {
+        LlamaGradModel::forward_detached_narrowed(self, input_ids, start, len)
     }
 
     fn backward(&self, loss: &Tensor) -> CandleResult<GradStore> {
@@ -2324,6 +2407,75 @@ mod tests {
         let mut model = LlamaGradModel::load(&cfg, &tiny_vb(&cfg), 2, 4.0).unwrap();
         model.set_activation_checkpointing(true);
         let _ = model.forward_detached(&ids(4)).unwrap();
+        let scalar = Tensor::zeros((), DType::F32, &dev()).unwrap();
+        let err = model.backward(&scalar).unwrap_err();
+        assert!(err.to_string().contains("no checkpointed forward"));
+    }
+
+    /// Every adapter var must appear in BOTH stores, with gradients within
+    /// `tol` of each other (`0.0` = exact).
+    fn assert_grads_match(a: &GradStore, b: &GradStore, vars: &[Var], tol: f32) {
+        for (k, v) in vars.iter().enumerate() {
+            let ga = a.get(v).expect("var missing from the first store");
+            let gb = b.get(v).expect("var missing from the second store");
+            let d = max_abs_diff(ga, gb);
+            assert!(d <= tol, "var {k}: grads diverged by {d}");
+        }
+    }
+
+    /// The narrowed scoring forward on the second architecture: values and
+    /// adapter gradients exactly match `forward` + narrow (plain and
+    /// checkpointed), and the narrowed detached walk captures no tape.
+    #[test]
+    fn narrowed_forward_matches_the_full_walk_exactly() {
+        let cfg = tiny_cfg();
+        let mut model = LlamaGradModel::load(&cfg, &tiny_vb(&cfg), 2, 4.0).unwrap();
+        arm_adapter(&model);
+        let input = ids(6);
+        let (start, len) = (2, 3);
+        let vars = model.trainable_vars();
+
+        let full = model
+            .forward(&input)
+            .unwrap()
+            .narrow(1, start, len)
+            .unwrap();
+        // UFCS: dispatch through the TRAIT, so the `impl GradModel`
+        // delegation bodies are exercised, not just the inherent methods.
+        let narrowed = GradModel::forward_narrowed(&model, &input, start, len).unwrap();
+        assert_eq!(full.dims(), narrowed.dims());
+        assert_eq!(
+            max_abs_diff(&full, &narrowed),
+            0.0,
+            "narrowed values diverged"
+        );
+        let detached = GradModel::forward_detached_narrowed(&model, &input, start, len).unwrap();
+        assert_eq!(
+            max_abs_diff(&full, &detached),
+            0.0,
+            "detached values diverged"
+        );
+
+        let g_full = model.backward(&probe_loss(&full)).unwrap();
+        let g_narrow = model.backward(&probe_loss(&narrowed)).unwrap();
+        assert_grads_match(&g_full, &g_narrow, &vars, 0.0);
+        // Non-vacuity: the probe produces real gradients.
+        assert!(vars.iter().any(|v| {
+            let g = g_full.get(v).unwrap();
+            max_abs_diff(g, &g.zeros_like().unwrap()) > 1e-6
+        }));
+
+        // Checkpointed: the narrow rides the loss tape; the stitch matches.
+        model.set_activation_checkpointing(true);
+        let stitched = model
+            .backward(&probe_loss(
+                &model.forward_narrowed(&input, start, len).unwrap(),
+            ))
+            .unwrap();
+        assert_grads_match(&g_narrow, &stitched, &vars, 1e-5);
+
+        // The narrowed detached walk captures no tape.
+        let _ = model.forward_detached_narrowed(&input, start, len).unwrap();
         let scalar = Tensor::zeros((), DType::F32, &dev()).unwrap();
         let err = model.backward(&scalar).unwrap_err();
         assert!(err.to_string().contains("no checkpointed forward"));
