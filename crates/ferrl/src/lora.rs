@@ -231,6 +231,24 @@ impl Proj {
         }
     }
 
+    /// [`merged_weight`](Self::merged_weight) with a **fresh-storage**
+    /// guarantee — the full-fine-tuning merged-decoder variant. The ordinary
+    /// `Frozen` merge arm returns a `detach()`, which SHARES storage with the
+    /// base weight; when that weight is a trainable var's inner tensor
+    /// (full-FT), a merged decoder built from the share would silently track
+    /// optimizer updates instead of snapshotting a value. The `Lora` arm
+    /// already materializes fresh storage (base + scale·B·A).
+    ///
+    /// # Errors
+    ///
+    /// As [`merged_weight`](Self::merged_weight), plus a copy failure.
+    pub(crate) fn merged_weight_deep(&self) -> CandleResult<Tensor> {
+        match self {
+            Self::Frozen(w) => Ok(w.copy()?.detach()),
+            Self::Lora(_) => self.merged_weight(),
+        }
+    }
+
     /// Append this projection's trainable [`Var`]s (`[A, B]` when adapted,
     /// nothing when frozen) — the positional-order building block.
     pub(crate) fn push_vars(&self, out: &mut Vec<Var>) {

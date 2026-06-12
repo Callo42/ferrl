@@ -124,6 +124,22 @@ impl RmsNormZeroCentered {
         &self.weight
     }
 
+    /// A value snapshot with **fresh storage**, off any autograd tape — the
+    /// full-fine-tuning merged-decoder building block. A plain `clone()`
+    /// SHARES storage with the source, so when the weight is a trainable
+    /// var's inner tensor the clone would silently track optimizer updates
+    /// (`Var::set` mutates storage in place) instead of snapshotting a value.
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if the underlying copy fails.
+    pub fn deep_copy(&self) -> CandleResult<Self> {
+        Ok(Self {
+            weight: self.weight.copy()?.detach(),
+            eps: self.eps,
+        })
+    }
+
     /// Normalize `x` (shape `[.., hidden]`) over its last dim and scale by
     /// `(1 + weight)`: F32 throughout, downcast to `x`'s dtype only at exit.
     ///
@@ -169,6 +185,19 @@ impl RmsNormGated {
     #[must_use]
     pub fn weight(&self) -> &Tensor {
         &self.weight
+    }
+
+    /// A value snapshot with **fresh storage**, off any autograd tape — see
+    /// [`RmsNormZeroCentered::deep_copy`] for the full-fine-tuning rationale.
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if the underlying copy fails.
+    pub fn deep_copy(&self) -> CandleResult<Self> {
+        Ok(Self {
+            weight: self.weight.copy()?.detach(),
+            eps: self.eps,
+        })
     }
 
     /// `rms_normalize(x) * weight * silu(gate)` over the last dim. `x` and

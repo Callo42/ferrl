@@ -14,7 +14,7 @@
 //! regenerate only when the oracle pin moves).
 
 use candle_core::{DType, Device, Tensor};
-use ferrl::{varbuilder_from_pretrained, Qwen3_5Config, Qwen3_5GradModel};
+use ferrl::{tensors_from_pretrained, varbuilder_from_pretrained, Qwen3_5Config, Qwen3_5GradModel};
 use std::path::PathBuf;
 
 /// Our fp32 forward vs the reference's fp32 logits, per position.
@@ -158,6 +158,30 @@ fn uncached_forward_matches_reference_logits() {
             "{case_name}: degenerate oracle logits ({scale})"
         );
     }
+}
+
+/// The full-fine-tuning load over the same fixture must be value-transparent:
+/// the registry backend wraps every weight in a var WITHOUT perturbing the
+/// forward — identical reference parity to the `LoRA`-mode load above.
+#[test]
+fn full_ft_load_matches_reference_logits() {
+    let g = golden();
+    let dir = fixture_dir();
+    let cfg = Qwen3_5Config::from_json_file(dir.join("config.json")).unwrap();
+    let tensors = tensors_from_pretrained(&dir, &Device::Cpu).unwrap();
+    let model = Qwen3_5GradModel::load_full_ft(&cfg, tensors, DType::F32, &Device::Cpu).unwrap();
+    assert!(model.is_full_ft());
+    assert!(
+        !model.trainable_vars().is_empty(),
+        "full-FT must register the base weights as vars"
+    );
+    let case = &g["cases"]["full_b1"];
+    let ids = input_ids(case, "input_ids");
+    let (b, l) = ids.dims2().unwrap();
+    let want = tensor_from(case, "logits", (b, l, 64));
+    let got = model.forward(&ids).unwrap();
+    let d = max_abs_diff(&got, &want);
+    assert!(d <= ORACLE_TOL, "full-FT forward vs reference diff {d}");
 }
 
 #[test]

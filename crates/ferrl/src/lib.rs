@@ -17,6 +17,11 @@
 //!   shaped, exact [`CountdownReward`] (the P4 task);
 //! - the [`policy`] abstraction over generation and per-token log-probabilities;
 //! - a manual `LoRA` adapter ([`lora`]);
+//! - the **full fine-tuning opt-in** (`full_ft`, internal) — a `Var`-registry
+//!   `VarBuilder` backend that wraps every base weight a load fetches in a
+//!   trainable `Var`, in deterministic load order (the positional checkpoint
+//!   contract); `LoRA` stays the default, and the mode is entered per model
+//!   ([`Qwen3_5GradModel::load_full_ft`](qwen35::Qwen3_5GradModel::load_full_ft));
 //! - grad-safe building blocks and the grad-coverage canary ([`nn`]);
 //! - the model-generality seam ([`model`]) — the [`GradModel`] / [`CachedDecoder`]
 //!   traits: the entire surface a model must provide (grad-bearing full-sequence
@@ -106,6 +111,7 @@ pub mod checkpoint;
 pub mod countdown;
 pub mod cuda_compat;
 pub mod eval;
+mod full_ft;
 pub mod gdn;
 pub mod grpo;
 pub mod llama;
@@ -169,8 +175,9 @@ pub use policy::{EvalSampling, Policy};
 pub use qwen::{MergedDecoder, QwenGradModel};
 #[doc(inline)]
 pub use qwen35::{
-    varbuilder_from_pretrained, LayerType, LoraTargets, MoeDims, Qwen3_5Config, Qwen3_5GradModel,
-    Qwen3_5MergedDecoder, Qwen3_5TextConfig, RopeParameters, GDN_CHUNK_SIZE,
+    tensors_from_pretrained, varbuilder_from_pretrained, LayerType, LoraTargets, MoeDims,
+    Qwen3_5Config, Qwen3_5GradModel, Qwen3_5MergedDecoder, Qwen3_5TextConfig, RopeParameters,
+    GDN_CHUNK_SIZE,
 };
 #[doc(inline)]
 pub use remat::{stitched_backward, RematTape};
