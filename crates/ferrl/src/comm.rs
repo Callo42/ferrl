@@ -27,7 +27,12 @@
 //! contributing zeros). [`LocalComm`] converts the failure modes this contract
 //! leaves open into loud errors: a shape/count mismatch fails the collective
 //! on every rank, and a peer that never arrives trips a timeout instead of a
-//! silent hang.
+//! silent hang. Rounds carry no operation identity, though (NCCL's collectives
+//! are equally untagged): if ranks ever disagree on *which* collective a round
+//! is — same types, different call sites — the values are summed together and
+//! consumed until the eventual desync trips a timeout, so the same-sequence
+//! discipline is the caller's load-bearing obligation, not something the
+//! communicator can fully check.
 //!
 //! ## Implementations
 //!
@@ -107,7 +112,9 @@ pub trait Comm: std::fmt::Debug + Send {
     /// # Errors
     ///
     /// Returns [`CommError`] on a contribution mismatch, a peer timeout, a
-    /// poisoned world, or a failed tensor op.
+    /// poisoned world, or a failed tensor op. On error the contents of
+    /// `tensors` are unspecified (an implementation may have consumed them) —
+    /// the world is dead at that point and the gradients in flight with it.
     fn all_reduce_sum(&self, tensors: &mut Vec<Tensor>) -> Result<(), CommError>;
 
     /// Sum of `value` across all ranks (in rank order), returned to every rank.
@@ -145,6 +152,41 @@ impl Comm for SoloComm {
     }
 }
 
+/// The world-level kill switch: set on the FIRST collective failure of any
+/// kind (mismatch, timeout, a peer panicking mid-protocol) and checked by
+/// every collective on entry — shared by the tensor and scalar rendezvous of
+/// a world, so a dead world is dead for **every** operation type, not just
+/// the one that failed.
+#[derive(Default)]
+struct PoisonCell(Mutex<Option<String>>);
+
+impl PoisonCell {
+    /// Record the first failure (later failures keep the original message).
+    fn set(&self, msg: &str) {
+        let mut slot = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.is_none() {
+            *slot = Some(msg.to_owned());
+        }
+    }
+
+    fn get(&self) -> Option<String> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn check(&self) -> Result<(), CommError> {
+        match self.get() {
+            Some(msg) => Err(CommError::Poisoned(msg)),
+            None => Ok(()),
+        }
+    }
+}
+
 /// One round of a rendezvous: the slot table plus the barrier bookkeeping.
 struct Round<T> {
     /// One contribution slot per rank, drained by the combiner.
@@ -153,42 +195,50 @@ struct Round<T> {
     arrived: usize,
     /// Ranks that have collected this round's outcome.
     departed: usize,
-    /// Bumped when a round fully drains; lets a fast rank re-entering for the
-    /// next round wait out laggards of the previous one.
-    generation: u64,
     /// The combined result (or the combine failure), present from the last
-    /// arrival until the last departure.
+    /// arrival until the last departure — its presence is also what makes a
+    /// fast rank re-entering for the next round wait out the laggards of the
+    /// previous one (see `wait_round_open`).
     outcome: Option<Result<T, String>>,
-    /// Set on the first failure (mismatch or timeout); terminal — every
-    /// current and future participant fails fast.
-    poisoned: Option<String>,
 }
 
 /// A reusable N-thread rendezvous: every participant deposits a value, the
 /// last arrival combines all of them in rank order, and every participant
-/// collects the combined result. Failures poison the rendezvous permanently.
+/// collects the combined result. Failures poison the whole world permanently
+/// (via the shared [`PoisonCell`]).
 struct Rendezvous<T> {
     world: usize,
     timeout: Duration,
+    poison: Arc<PoisonCell>,
     state: Mutex<Round<T>>,
     cv: Condvar,
 }
 
 impl<T: Clone> Rendezvous<T> {
-    fn new(world: usize, timeout: Duration) -> Self {
+    fn new(world: usize, timeout: Duration, poison: Arc<PoisonCell>) -> Self {
         Self {
             world,
             timeout,
+            poison,
             state: Mutex::new(Round {
                 slots: (0..world).map(|_| None).collect(),
                 arrived: 0,
                 departed: 0,
-                generation: 0,
                 outcome: None,
-                poisoned: None,
             }),
             cv: Condvar::new(),
         }
+    }
+
+    /// Lock the round state, converting a poisoned mutex — a peer rank
+    /// PANICKED while holding it, leaving the protocol state unreliable —
+    /// into a world poison + loud error instead of a panic storm.
+    fn lock_round(&self) -> Result<MutexGuard<'_, Round<T>>, CommError> {
+        self.state.lock().map_err(|_| {
+            let msg = "a peer rank panicked inside a collective on this world";
+            self.poison.set(msg);
+            CommError::Poisoned(msg.to_owned())
+        })
     }
 
     /// Deposit `value` for `rank`, rendezvous with the other ranks, and return
@@ -199,8 +249,9 @@ impl<T: Clone> Rendezvous<T> {
         value: T,
         combine: &dyn Fn(Vec<T>) -> Result<T, String>,
     ) -> Result<T, CommError> {
+        self.poison.check()?;
         let deadline = Instant::now() + self.timeout;
-        let mut s = self.state.lock().expect("rendezvous mutex poisoned");
+        let mut s = self.lock_round()?;
         s = self.wait_round_open(s, deadline)?;
         debug_assert!(s.slots[rank].is_none(), "rank deposited twice in a round");
         s.slots[rank] = Some(value);
@@ -213,7 +264,7 @@ impl<T: Clone> Rendezvous<T> {
                 .collect();
             let outcome = combine(vals);
             if let Err(msg) = &outcome {
-                s.poisoned = Some(msg.clone());
+                self.poison.set(msg);
             }
             s.outcome = Some(outcome);
             self.cv.notify_all();
@@ -230,7 +281,6 @@ impl<T: Clone> Rendezvous<T> {
             s.arrived = 0;
             s.departed = 0;
             s.outcome = None;
-            s.generation = s.generation.wrapping_add(1);
             self.cv.notify_all();
         }
         drop(s);
@@ -245,8 +295,8 @@ impl<T: Clone> Rendezvous<T> {
         deadline: Instant,
     ) -> Result<MutexGuard<'a, Round<T>>, CommError> {
         loop {
-            if let Some(msg) = &s.poisoned {
-                return Err(CommError::Poisoned(msg.clone()));
+            if let Some(msg) = self.poison.get() {
+                return Err(CommError::Poisoned(msg));
             }
             if s.outcome.is_none() {
                 return Ok(s);
@@ -265,15 +315,15 @@ impl<T: Clone> Rendezvous<T> {
             if s.outcome.is_some() {
                 return Ok(s);
             }
-            if let Some(msg) = &s.poisoned {
-                return Err(CommError::Poisoned(msg.clone()));
+            if let Some(msg) = self.poison.get() {
+                return Err(CommError::Poisoned(msg));
             }
             s = self.wait_or_poison(s, deadline)?;
         }
     }
 
-    /// One bounded condvar wait; on deadline expiry, poison the rendezvous
-    /// (waking every peer into a loud failure) and return the timeout error.
+    /// One bounded condvar wait; on deadline expiry, poison the world (waking
+    /// every peer into a loud failure) and return the timeout error.
     fn wait_or_poison<'a>(
         &'a self,
         s: MutexGuard<'a, Round<T>>,
@@ -281,20 +331,20 @@ impl<T: Clone> Rendezvous<T> {
     ) -> Result<MutexGuard<'a, Round<T>>, CommError> {
         let now = Instant::now();
         if now >= deadline {
-            let mut s = s;
             let msg = format!(
                 "a peer rank did not reach the collective within {:?} — it most \
                  likely aborted before entering it",
                 self.timeout
             );
-            s.poisoned = Some(msg.clone());
+            self.poison.set(&msg);
             self.cv.notify_all();
             return Err(CommError::Timeout(msg));
         }
-        let (s, _) = self
-            .cv
-            .wait_timeout(s, deadline - now)
-            .expect("rendezvous mutex poisoned");
+        let (s, _) = self.cv.wait_timeout(s, deadline - now).map_err(|_| {
+            let msg = "a peer rank panicked inside a collective on this world";
+            self.poison.set(msg);
+            CommError::Poisoned(msg.to_owned())
+        })?;
         Ok(s)
     }
 }
@@ -357,8 +407,12 @@ impl LocalComm {
     #[must_use]
     pub fn world_with_timeout(world_size: usize, timeout: Duration) -> Vec<Self> {
         assert!(world_size > 0, "a world needs at least one rank");
-        let tensors = Arc::new(Rendezvous::new(world_size, timeout));
-        let scalars = Arc::new(Rendezvous::new(world_size, timeout));
+        // ONE poison cell for the whole world, shared by both rendezvous:
+        // a failure in either operation type kills the other too (the
+        // "dead world" contract is per WORLD, not per collective kind).
+        let poison = Arc::new(PoisonCell::default());
+        let tensors = Arc::new(Rendezvous::new(world_size, timeout, Arc::clone(&poison)));
+        let scalars = Arc::new(Rendezvous::new(world_size, timeout, poison));
         (0..world_size)
             .map(|rank| Self {
                 rank,
@@ -634,6 +688,46 @@ mod tests {
         let second = run(2);
         assert_eq!(first, second, "arrival order must not change the sum");
         assert!(first.iter().all(|&x| x == first[0]));
+        // Pin the CANONICAL rank-order left fold, not just any deterministic
+        // order: (big + tiny) + tiny stays `big` (each tiny is below the ulp),
+        // while a reversed fold yields big + 2 — a reverse-order combine is
+        // equally arrival-independent and only this catches it.
+        assert_eq!(
+            first[0],
+            (big + tiny) + tiny,
+            "the reduction must fold in ascending rank order"
+        );
+    }
+
+    #[test]
+    fn poison_crosses_collective_types() {
+        // The poison cell is per WORLD, not per rendezvous: after a TENSOR
+        // collective fails, a SCALAR collective on the same world must fail
+        // fast as Poisoned — not silently succeed on a half-dead world.
+        let comms = LocalComm::world(2);
+        let errs: Vec<CommError> = std::thread::scope(|s| {
+            let handles: Vec<_> = comms
+                .into_iter()
+                .map(|comm| {
+                    s.spawn(move || {
+                        let mut ts = if comm.rank() == 0 {
+                            vec![t(&[1.0, 2.0])]
+                        } else {
+                            vec![t(&[1.0, 2.0, 3.0])]
+                        };
+                        comm.all_reduce_sum(&mut ts).unwrap_err();
+                        comm.all_reduce_scalar_sum(1.0).unwrap_err()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for e in errs {
+            assert!(
+                matches!(e, CommError::Poisoned(_)),
+                "a scalar collective after a tensor failure must be Poisoned, got {e:?}"
+            );
+        }
     }
 
     #[test]

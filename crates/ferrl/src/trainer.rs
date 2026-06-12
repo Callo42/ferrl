@@ -587,14 +587,18 @@ impl Trainer {
     ///
     /// Per-rank weights stay in bitwise lockstep (same start + all-reduced
     /// gradients + same optimizer arithmetic). Metrics: `kl`, `clip_ratio`
-    /// and `grad_norm` are **global** (reduced); reward/length statistics
-    /// describe the rank's **local shard**. Checkpoints are written by rank 0
-    /// only — to resume, every rank loads rank 0's checkpoint directory
-    /// (weights and optimizer moments are rank-identical by lockstep; the
-    /// rollout-sampler RNG blob is rank 0's, so a resumed run with a
-    /// *stochastic* policy is a faithful continuation rather than a bit-exact
-    /// replay of what the uninterrupted world would have sampled on the
-    /// nonzero ranks — bit-exact across a DP resume needs per-rank sampler
+    /// and `grad_norm` are **global** (reduced); everything else —
+    /// reward/length statistics, `frac_reward_zero_std`, `dropped_rows`,
+    /// `frac_truncated`, and the `rollout_*` off-policy telemetry — describes
+    /// the rank's **local shard**. Checkpoints are written by rank 0 only —
+    /// to resume, every rank loads rank 0's checkpoint directory (weights and
+    /// optimizer moments are rank-identical by lockstep; the rollout-sampler
+    /// RNG blob is rank 0's, so a resumed run with a *stochastic* policy is a
+    /// faithful continuation rather than a bit-exact replay of what the
+    /// uninterrupted world would have sampled on the nonzero ranks — and
+    /// since every rank restores the SAME blob, ranks seeded differently for
+    /// rollout diversity become stream-correlated from the resume point on.
+    /// Bit-exact, diversity-preserving DP resume needs per-rank sampler
     /// state, a planned follow-up of the multi-process phase).
     ///
     /// # Errors
@@ -1212,11 +1216,14 @@ impl Trainer {
     }
 
     /// The per-epoch DP collective sequence (world > 1 only): all-reduce-sum
-    /// the accumulated per-var gradients (a `None` slot — an empty or
-    /// partially-covering local shard — contributes zeros, since the
-    /// collective contract is a uniform tensor count/shape on every rank),
-    /// then globalize the coverage verdict and the kl/clip diagnostic sums.
-    /// On return every `acc` slot holds the **global** gradient sum; `covered`
+    /// the accumulated per-var gradients (a `None` slot — an empty local
+    /// shard, or a var no local backward reached — contributes zeros, since
+    /// the collective contract is a uniform tensor count/shape on every rank;
+    /// an uncovered var that *some* local backwards did reach still reduces
+    /// its partial sum, which is exactly why the globalized verdict below
+    /// must abort every rank before that poisoned sum is stepped on), then
+    /// globalize the coverage verdict and the kl/clip diagnostic sums. On
+    /// return every `acc` slot holds the **global** gradient sum; `covered`
     /// keeps its local meaning so the canary still reports rank-local detail.
     fn reduce_epoch(
         &self,

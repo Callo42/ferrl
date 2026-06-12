@@ -30,6 +30,8 @@
 use candle_core::{DType, Device, Result as CandleResult, Tensor, Var, D};
 use candle_nn::ops::log_softmax;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use ferrl::lora::LoraLinear;
 use ferrl::nn::RmsNorm;
@@ -37,8 +39,8 @@ use ferrl::policy::{GenConfig, Policy, Rollout};
 use ferrl::telemetry::RunDir;
 use ferrl::trainer::{TokenizerLike, Trainer, TrainerConfig};
 use ferrl::{
-    tensors_from_pretrained, varbuilder_from_pretrained, Comm, LocalComm, LossType, Metrics,
-    Qwen3_5Config, Qwen3_5GradModel, Qwen3_5Policy, RewardFn, SoloComm,
+    tensors_from_pretrained, varbuilder_from_pretrained, Comm, CommError, LocalComm, LossType,
+    Metrics, Qwen3_5Config, Qwen3_5GradModel, Qwen3_5Policy, RewardFn, SoloComm,
 };
 
 const VOCAB: usize = 5;
@@ -181,6 +183,94 @@ impl RewardFn for EchoOrFlatReward {
     }
 }
 
+/// [`ScriptedPolicy`] plus one extra trainable var that reaches the loss only
+/// when `wired` — mimicking, e.g., a never-routed expert on one rank. The var
+/// COUNT matches across ranks (the collective contract holds; the unwired
+/// rank's reduce slot carries zeros) but the unwired rank's backward never
+/// covers it, which must abort the whole world in lockstep.
+struct GatedExtraPolicy {
+    inner: ScriptedPolicy,
+    extra: Var,
+    wired: bool,
+}
+
+impl GatedExtraPolicy {
+    fn new(seed: u64, wired: bool) -> Self {
+        Self {
+            inner: ScriptedPolicy::new(seed).unwrap(),
+            extra: Var::zeros(1, DType::F32, &Device::Cpu).unwrap(),
+            wired,
+        }
+    }
+}
+
+impl Policy for GatedExtraPolicy {
+    fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
+        self.inner.generate(prompt, cfg)
+    }
+
+    fn token_logprobs(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+        let logp = self.inner.token_logprobs(rollout)?;
+        if self.wired {
+            // A zero-valued additive touch: the scores are unchanged (the
+            // ranks' losses stay identical) but the var joins the graph, so
+            // only the wired rank's backward covers it.
+            logp.broadcast_add(self.extra.as_tensor())
+        } else {
+            Ok(logp)
+        }
+    }
+
+    fn set_adapter_enabled(&mut self, enabled: bool) {
+        self.inner.set_adapter_enabled(enabled);
+    }
+
+    fn adapter_enabled(&self) -> bool {
+        self.inner.adapter_enabled()
+    }
+
+    fn trainable_vars(&self) -> Vec<Var> {
+        let mut vars = self.inner.trainable_vars();
+        vars.push(self.extra.clone());
+        vars
+    }
+
+    fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+        self.inner.sampler_state()
+    }
+
+    fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
+        self.inner.restore_sampler_state(state)
+    }
+}
+
+/// A world-1 spy counting collective invocations — the oracle for the
+/// "world-1 issues no collectives" guard discipline.
+#[derive(Debug)]
+struct SpyComm {
+    calls: Arc<AtomicUsize>,
+}
+
+impl Comm for SpyComm {
+    fn rank(&self) -> usize {
+        0
+    }
+
+    fn world_size(&self) -> usize {
+        1
+    }
+
+    fn all_reduce_sum(&self, _tensors: &mut Vec<Tensor>) -> Result<(), CommError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn all_reduce_scalar_sum(&self, value: f64) -> Result<f64, CommError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Ok(value)
+    }
+}
+
 // ---- harness ----------------------------------------------------------------
 
 struct TempDir(PathBuf);
@@ -303,6 +393,30 @@ fn assert_lockstep(ranks: &[RankRun], what: &str) {
     }
 }
 
+/// The pre-clip global `grad_norm` must agree per step between a sharded and
+/// a single run (modulo reassociation). This is the scale oracle the weight
+/// envelope CANNOT be: `AdamW`'s m̂/√v̂ cancels a uniform gradient-scale error
+/// and global-norm clipping is bitwise invariant to power-of-2 scales, so a
+/// missed `world` divisor or a localized Dapo normalizer (both exact 2x)
+/// leaves the final weights untouched — but the reported pre-clip norm sees
+/// the 2x directly (found by the PR-F mutation sweep: M2/M3 survived the
+/// weight envelope alone).
+fn assert_grad_norms_match(world: &[Metrics], single: &[Metrics], what: &str) {
+    assert_eq!(world.len(), single.len(), "{what}: step counts differ");
+    for (i, (w, s)) in world.iter().zip(single).enumerate() {
+        let diff = (f64::from(w.grad_norm) - f64::from(s.grad_norm)).abs();
+        let scale = f64::from(s.grad_norm).abs().max(1e-12);
+        assert!(
+            diff / scale < 1e-3,
+            "{what}: step {i} grad_norm diverged — sharded {} vs single {} (a \
+             uniform gradient-scale error, e.g. a missed world divisor or a \
+             local normalizer?)",
+            w.grad_norm,
+            s.grad_norm
+        );
+    }
+}
+
 // ---- gate 1: sharded vs single, measured envelope ---------------------------
 
 /// World-2 at per-rank accumulation 2 vs single-rank at accumulation 4: the
@@ -332,6 +446,7 @@ fn world2_matches_single_run_within_the_reassociation_envelope_grpo() {
         envelope < 1e-5,
         "sharded run left the reassociation envelope: {envelope:.3e}"
     );
+    assert_grad_norms_match(&ranks[0].1, &single.1, "grpo envelope");
     // Vacuity guard: training actually moved the weights.
     let init = var_bits(&ScriptedPolicy::new(SEED).unwrap());
     assert!(max_abs_diff(&single.0, &init) > 0.0, "no training signal");
@@ -367,6 +482,41 @@ fn world2_matches_single_run_within_the_reassociation_envelope_dapo() {
         envelope < 1e-5,
         "sharded run left the reassociation envelope: {envelope:.3e}"
     );
+    // The scale oracle: a LOCAL window_tokens normalizer is an exact 2x the
+    // weight envelope cannot see (AdamW cancels it) but the norm does.
+    assert_grad_norms_match(&ranks[0].1, &single.1, "dapo envelope");
+    // Vacuity guard: training actually moved the weights.
+    let init = var_bits(&ScriptedPolicy::new(SEED).unwrap());
+    assert!(max_abs_diff(&single.0, &init) > 0.0, "no training signal");
+}
+
+/// The wraparound case: 5 prompts under a global window of 4, so windows wrap
+/// mod len and shards straddle the boundary — the union-of-shards ≡
+/// single-run-window identity must hold for ANY prompt count, not just exact
+/// fits (the multiset identity under the shared `mod len` cycling).
+#[test]
+#[allow(clippy::print_stderr)] // the measured envelope is the calibration record
+fn world2_matches_single_run_when_the_prompt_cycle_wraps() {
+    let tmp = TempDir::new("env-wrap");
+    let cfg2 = TrainerConfig {
+        grad_accum_steps: 2,
+        ..scripted_cfg()
+    };
+    let cfg1 = TrainerConfig {
+        grad_accum_steps: 4,
+        ..scripted_cfg()
+    };
+    let prompts: Vec<String> = ["a", "b", "c", "d", "b"].map(String::from).to_vec();
+    let ranks = run_scripted_world(tmp.path(), 2, &cfg2, &prompts);
+    let single = run_scripted_single(tmp.path(), &cfg1, &prompts);
+    assert_lockstep(&ranks, "wraparound envelope");
+    let envelope = max_abs_diff(&ranks[0].0, &single.0);
+    eprintln!("measured wraparound sharded-vs-single envelope: {envelope:.3e}");
+    assert!(
+        envelope < 1e-5,
+        "sharded run left the reassociation envelope: {envelope:.3e}"
+    );
+    assert_grad_norms_match(&ranks[0].1, &single.1, "wraparound envelope");
 }
 
 // ---- gate 3: world-1 is byte-for-byte the legacy path ------------------------
@@ -448,6 +598,121 @@ fn an_all_degenerate_local_shard_neither_deadlocks_nor_diverges() {
             .iter()
             .all(|m| (m.frac_reward_zero_std - 1.0).abs() < f32::EPSILON),
         "rank 0's shard is degenerate every window"
+    );
+    // The zeros oracle: a single-rank run at accum 2 consumes the identical
+    // global window ('e' degenerate + 'a' live) with the identical loss scale
+    // and live count, so the empty shard's contribution must be EXACTLY zeros
+    // — folding anything else in (the PR-F mutation sweep's M6 planted the
+    // weights themselves) diverges from this reference immediately, while
+    // lockstep alone stays green (both ranks share the corrupted sum).
+    let single = run_scripted_single(
+        tmp.path(),
+        &TrainerConfig {
+            grad_accum_steps: 2,
+            ..cfg
+        },
+        &prompts,
+    );
+    let envelope = max_abs_diff(&ranks[0].0, &single.0);
+    assert!(
+        envelope < 1e-5,
+        "the empty shard contributed something non-zero to the reduce: {envelope:.3e}"
+    );
+    assert_grad_norms_match(&ranks[0].1, &single.1, "degenerate local shard");
+}
+
+/// A var that some rank's backward never covers must abort EVERY rank, fast
+/// and in lockstep: the locally-uncovered rank via the grad-coverage canary,
+/// its peers via the globalized verdict — NOT a 300s timeout (a half-stepped
+/// world or a stalled collective is exactly what the global uncovered count
+/// exists to prevent; the PR-F mutation sweep's M8 showed no other gate
+/// exercises a partially-covering rank).
+#[test]
+fn an_uncovered_var_on_one_rank_aborts_every_rank_in_lockstep() {
+    let tmp = TempDir::new("uncovered-peer");
+    let cfg = TrainerConfig {
+        steps: 1,
+        mu: 1,
+        beta: 0.0,
+        grad_accum_steps: 1,
+        ..scripted_cfg()
+    };
+    let prompts = ["a", "b"].map(String::from).to_vec();
+    let comms = LocalComm::world(2);
+    let errs: Vec<(usize, String)> = std::thread::scope(|s| {
+        let handles: Vec<_> = comms
+            .into_iter()
+            .map(|comm| {
+                let cfg = cfg.clone();
+                let prompts = prompts.clone();
+                let base = tmp.path();
+                s.spawn(move || {
+                    let rank = comm.rank();
+                    // Rank 1 wires the extra var into its loss; rank 0 does
+                    // not — same var COUNT on both ranks (the collective
+                    // contract holds), but rank 0's backward never covers it.
+                    let mut policy = GatedExtraPolicy::new(SEED, rank == 1);
+                    let run = RunDir::create(base, format!("rank{rank}")).unwrap();
+                    let mut trainer = Trainer::with_comm(cfg, &run, comm).unwrap();
+                    let err = trainer
+                        .train(&mut policy, &EchoOrFlatReward, &CharTokenizer, &prompts)
+                        .unwrap_err();
+                    (rank, err.to_string())
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for (rank, msg) in &errs {
+        assert!(
+            !msg.contains("timeout"),
+            "rank {rank} must abort promptly, not stall into a timeout: {msg}"
+        );
+        if *rank == 0 {
+            // The locally-uncovered rank reports the canary's own detail.
+            assert!(
+                !msg.contains("peer rank"),
+                "rank 0 should fail its OWN canary, got: {msg}"
+            );
+        } else {
+            assert!(
+                msg.contains("peer rank"),
+                "rank 1 must abort on the peer's verdict, got: {msg}"
+            );
+        }
+    }
+}
+
+/// The world-1 path must issue ZERO collective calls — the byte-for-byte
+/// legacy-path promise is the `world_size() > 1` guard discipline, and the
+/// weight-bits trio gate alone cannot see a guard regression (an identity
+/// reduce keeps the weights bitwise; the PR-F mutation sweep's M9).
+#[test]
+fn world_one_training_issues_no_collective_calls() {
+    let tmp = TempDir::new("spy");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let spy = SpyComm {
+        calls: Arc::clone(&calls),
+    };
+    let mut policy = ScriptedPolicy::new(SEED).unwrap();
+    let run = RunDir::create(tmp.path(), "spy").unwrap();
+    let cfg = TrainerConfig {
+        grad_accum_steps: 2,
+        ..scripted_cfg()
+    };
+    let mut trainer = Trainer::with_comm(cfg, &run, spy).unwrap();
+    trainer
+        .train(
+            &mut policy,
+            &EchoOrFlatReward,
+            &CharTokenizer,
+            &live_prompts(),
+        )
+        .unwrap();
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        0,
+        "the world-1 path entered a collective — a world > 1 guard regressed"
     );
 }
 
