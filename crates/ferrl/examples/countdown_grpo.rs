@@ -10,6 +10,10 @@
 //! library (`cargo llvm-cov` skips `examples/`). The CI-tested task logic it drives
 //! lives in `src/countdown.rs`.
 //!
+//! This harness deliberately pins the **pre-R1 recipe** its gate margins were
+//! calibrated on (see `build_trainer_config`). The goal-gate **ladder** runs the
+//! modern recipe instead — see the sibling `countdown_grpo_qwen35` harness.
+//!
 //! # EOS / length masking (P6-A)
 //!
 //! The run is EOS-aware: each sampled completion stops at the model's
