@@ -55,6 +55,7 @@ ferrl/
     │   ├── model.rs                         # the GradModel / CachedDecoder trait seam
     │   ├── qwen.rs  llama.rs  qwen35.rs     # the model layer (grad forwards + cached decoders)
     │   ├── blocks.rs  gdn.rs  remat.rs      # shared blocks, GatedDeltaNet math, activation ckpt
+    │   ├── moe.rs                           # qwen3.5/3.6 sparse-MoE kernels (router/experts, M3′)
     │   ├── lm_policy.rs                     # Policy over any GradModel (Qwen/Llama/Qwen3_5 Policy)
     │   └── {lib,policy,reward,nn,tokenizer,countdown,telemetry,cuda_compat}.rs
     └── tests/fixtures/grpo_golden.json      # committed oracle output

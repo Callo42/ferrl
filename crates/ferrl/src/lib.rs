@@ -63,6 +63,9 @@
 //!   and `backward` re-runs one layer at a time, stitching the full gradient
 //!   from the boundary tape (the primary single-card memory lever — opt-in via
 //!   each model's `set_activation_checkpointing`);
+//! - `MoE` primitives ([`moe`]) — the qwen3.5/3.6 sparse layer's kernels
+//!   (top-k router with unconditional renorm, packed-weight experts, the
+//!   sigmoid-gated shared expert), grad-bearing and oracle-pinned (M3′);
 //! - a CUDA driver-compatibility preflight ([`cuda_compat`]) — translates the cryptic
 //!   `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` (a build-PTX-newer-than-driver mismatch) into
 //!   an actionable rebuild/upgrade message; a no-op without the `cuda` feature;
@@ -107,6 +110,7 @@ pub mod llama;
 pub mod lm_policy;
 pub mod lora;
 pub mod model;
+pub mod moe;
 pub mod nn;
 pub mod optim;
 pub mod policy;
@@ -151,6 +155,8 @@ pub use lm_policy::{LlamaPolicy, LmPolicy, Qwen3_5Policy, QwenPolicy};
 pub use lora::DenseLoraTargets;
 #[doc(inline)]
 pub use model::{CachedDecoder, GradModel};
+#[doc(inline)]
+pub use moe::{moe_experts, sparse_moe_block, topk_router, SparseMoeWeights};
 #[doc(inline)]
 pub use nn::{grad_coverage, GradCoverage, RmsNorm, RmsNormGated, RmsNormZeroCentered};
 #[doc(inline)]
