@@ -7,7 +7,12 @@
 //! depthwise conv — see [`crate::gdn`]) and **gated GQA full attention** (a
 //! doubled `q_proj` whose per-head output halves are `[query | gate]`, QK-norm
 //! before partial-rotary `RoPE`, and a `sigmoid(gate)` on the attention
-//! output). candle-transformers 0.10.2 ships **no** `qwen3_5`/`qwen3_next`
+//! output). Orthogonally, the family has a SECOND layer menu — the
+//! feed-forward slot: dense members (`model_type: "qwen3_5"`) run a plain
+//! `SwiGLU` MLP, `MoE` members (`"qwen3_5_moe"`, e.g. 35B-A3B) the sparse
+//! block ([`crate::moe`]: top-k routed experts + a sigmoid-gated shared
+//! expert) in EVERY layer — the per-layer dense/sparse knobs are deleted in
+//! this family. One architecture, both menus, the same [`GradModel`]. candle-transformers 0.10.2 ships **no** `qwen3_5`/`qwen3_next`
 //! support at all, so unlike [`crate::qwen`]/[`crate::llama`] there is no
 //! shipped forward to pin against — the reference oracle is HF transformers
 //! (pinned `v5.11.0`) instead, via committed tiny-config fixtures and staged
@@ -175,8 +180,11 @@ pub struct Qwen3_5TextConfig {
     pub vocab_size: usize,
     /// Residual stream width.
     pub hidden_size: usize,
-    /// `SwiGLU` MLP inner width.
-    pub intermediate_size: usize,
+    /// `SwiGLU` MLP inner width — dense members only. The `MoE` members
+    /// DELETE this field (every layer is sparse); exactly one of this and the
+    /// [`num_experts`](Self::num_experts) quartet is present (validated).
+    #[serde(default)]
+    pub intermediate_size: Option<usize>,
     /// Decoder layer count.
     pub num_hidden_layers: usize,
     /// Full-attention query head count.
@@ -241,6 +249,40 @@ pub struct Qwen3_5TextConfig {
     /// `"float32"` and anything else is rejected.
     #[serde(default = "default_mamba_ssm_dtype")]
     pub mamba_ssm_dtype: String,
+    /// Routed expert count — `MoE` members only (`qwen3_5_moe`, where EVERY
+    /// layer's feed-forward is sparse). Present iff the other three `MoE`
+    /// fields are (validated); dense members carry none of the four.
+    #[serde(default)]
+    pub num_experts: Option<usize>,
+    /// Experts consulted per token (the router's top-k).
+    #[serde(default)]
+    pub num_experts_per_tok: Option<usize>,
+    /// Per-routed-expert `SwiGLU` inner width.
+    #[serde(default)]
+    pub moe_intermediate_size: Option<usize>,
+    /// The always-on shared expert's `SwiGLU` inner width.
+    #[serde(default)]
+    pub shared_expert_intermediate_size: Option<usize>,
+    /// Router-logit emission for the aux load-balancing loss — a
+    /// pretraining-time concern outside the reference's eager forward (and
+    /// outside RL fine-tuning, which never requests it). Shipped configs
+    /// carry `false`; `true` is rejected rather than silently ignored.
+    #[serde(default)]
+    pub output_router_logits: bool,
+}
+
+/// The resolved sparse feed-forward geometry of an `MoE` member (see
+/// [`Qwen3_5TextConfig::moe`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MoeDims {
+    /// Routed expert count `E`.
+    pub num_experts: usize,
+    /// Experts consulted per token (top-k).
+    pub top_k: usize,
+    /// Per-routed-expert `SwiGLU` inner width.
+    pub moe_intermediate_size: usize,
+    /// The shared expert's `SwiGLU` inner width.
+    pub shared_expert_intermediate_size: usize,
 }
 
 fn default_hidden_act() -> String {
@@ -308,8 +350,23 @@ impl Qwen3_5Config {
     /// [`Qwen3_5TextConfig::validate`]).
     pub fn validate(&self) -> CandleResult<()> {
         if let Some(mt) = &self.model_type {
-            if mt != "qwen3_5" {
-                bail!("qwen3_5 config: model_type {mt:?}, expected \"qwen3_5\"");
+            if mt != "qwen3_5" && mt != "qwen3_5_moe" {
+                bail!(
+                    "qwen3_5 config: model_type {mt:?}, expected \"qwen3_5\" (dense) or \
+                     \"qwen3_5_moe\" (sparse)"
+                );
+            }
+            // The family tag and the feed-forward menu must agree — a dense
+            // tag with MoE fields (or vice versa) is a foreign or hand-edited
+            // config, not a member of either branch.
+            let sparse_tag = mt == "qwen3_5_moe";
+            let sparse_cfg = self.text_config.num_experts.is_some();
+            if sparse_tag != sparse_cfg {
+                bail!(
+                    "qwen3_5 config: model_type {mt:?} disagrees with the feed-forward \
+                     fields (num_experts {:?})",
+                    self.text_config.num_experts
+                );
             }
         }
         if let Some(outer) = self.tie_word_embeddings {
@@ -347,6 +404,22 @@ impl Qwen3_5TextConfig {
         }
     }
 
+    /// The sparse feed-forward geometry when this config is an `MoE` member
+    /// (`num_experts` present), `None` for dense members.
+    ///
+    /// Total by construction: returns `Some` only when ALL four `MoE` fields
+    /// are present; [`validate`](Self::validate) enforces all-or-nothing, so
+    /// on a validated config `moe().is_some() == num_experts.is_some()`.
+    #[must_use]
+    pub fn moe(&self) -> Option<MoeDims> {
+        Some(MoeDims {
+            num_experts: self.num_experts?,
+            top_k: self.num_experts_per_tok?,
+            moe_intermediate_size: self.moe_intermediate_size?,
+            shared_expert_intermediate_size: self.shared_expert_intermediate_size?,
+        })
+    }
+
     /// The number of rotated dims per full-attention head:
     /// `head_dim * partial_rotary_factor` (64 shipped).
     #[must_use]
@@ -368,7 +441,6 @@ impl Qwen3_5TextConfig {
         for (name, v) in [
             ("vocab_size", self.vocab_size),
             ("hidden_size", self.hidden_size),
-            ("intermediate_size", self.intermediate_size),
             ("num_hidden_layers", self.num_hidden_layers),
             ("num_attention_heads", self.num_attention_heads),
             ("num_key_value_heads", self.num_key_value_heads),
@@ -383,6 +455,66 @@ impl Qwen3_5TextConfig {
             if v == 0 {
                 bail!("qwen3_5 config: {name} must be > 0");
             }
+        }
+        // The feed-forward menu: dense members carry intermediate_size and
+        // none of the MoE quartet; MoE members carry the complete quartet and
+        // NO intermediate_size (the family deletes it — every layer sparse).
+        // Anything mixed is a foreign config, not a member of either branch.
+        match (self.intermediate_size, self.num_experts) {
+            (Some(_), Some(_)) => bail!(
+                "qwen3_5 config: both intermediate_size and num_experts present — the MoE \
+                 members delete intermediate_size; this is not a member of either branch"
+            ),
+            (None, None) => bail!(
+                "qwen3_5 config: neither intermediate_size (dense) nor num_experts (MoE) \
+                 present"
+            ),
+            (Some(0), None) => bail!("qwen3_5 config: intermediate_size must be > 0"),
+            (Some(_), None) => {
+                for (name, v) in [
+                    ("num_experts_per_tok", self.num_experts_per_tok),
+                    ("moe_intermediate_size", self.moe_intermediate_size),
+                    (
+                        "shared_expert_intermediate_size",
+                        self.shared_expert_intermediate_size,
+                    ),
+                ] {
+                    if v.is_some() {
+                        bail!(
+                            "qwen3_5 config: dense member (intermediate_size present) carries \
+                             the MoE field {name}"
+                        );
+                    }
+                }
+            }
+            (None, Some(experts)) => {
+                let Some(moe) = self.moe() else {
+                    bail!(
+                        "qwen3_5 config: num_experts present but the MoE quartet is \
+                         incomplete (need num_experts_per_tok, moe_intermediate_size, \
+                         shared_expert_intermediate_size)"
+                    );
+                };
+                if experts == 0 {
+                    bail!("qwen3_5 config: num_experts must be > 0");
+                }
+                if moe.top_k == 0 || moe.top_k > experts {
+                    bail!(
+                        "qwen3_5 config: num_experts_per_tok {} must be in 1..={experts}",
+                        moe.top_k
+                    );
+                }
+                if moe.moe_intermediate_size == 0 || moe.shared_expert_intermediate_size == 0 {
+                    bail!("qwen3_5 config: MoE intermediate sizes must be > 0");
+                }
+            }
+        }
+        if self.output_router_logits {
+            bail!(
+                "qwen3_5 config: output_router_logits=true unsupported (the aux \
+                 load-balancing loss is a pretraining concern; this forward is the eager \
+                 path RL fine-tuning uses, which never emits router logits)"
+            );
         }
         if self.hidden_act != "silu" {
             bail!(
@@ -428,7 +560,8 @@ impl Qwen3_5TextConfig {
         }
         if !self.mlp_only_layers.is_empty() {
             bail!(
-                "qwen3_5 config: non-empty mlp_only_layers {:?} unsupported (dense family only)",
+                "qwen3_5 config: non-empty mlp_only_layers {:?} unsupported (deleted in \
+                 both family branches — the MoE members are sparse in every layer)",
                 self.mlp_only_layers
             );
         }
@@ -585,11 +718,16 @@ pub struct LoraTargets {
     pub attn_v: bool,
     /// Full-attention `o_proj`.
     pub attn_o: bool,
-    /// MLP `gate_proj` (all layers).
+    /// MLP `gate_proj` (all layers). On `MoE` members this binds the SHARED
+    /// expert's `gate_proj` — the router, the packed routed experts, and the
+    /// scalar sigmoid gate are never adaptable (the locked `MoE`-`LoRA`
+    /// policy: adapting the router makes routing non-stationary during
+    /// training, and per-expert adapters on packed 3-D weights are
+    /// out-of-recipe).
     pub mlp_gate: bool,
-    /// MLP `up_proj` (all layers).
+    /// MLP `up_proj` (all layers; shared expert on `MoE` members).
     pub mlp_up: bool,
-    /// MLP `down_proj` (all layers).
+    /// MLP `down_proj` (all layers; shared expert on `MoE` members).
     pub mlp_down: bool,
     /// `GatedDeltaNet` fused `in_proj_qkv` (opt-in; see the type docs).
     pub gdn_qkv: bool,
@@ -1148,8 +1286,12 @@ struct Qwen3_5Mlp {
 }
 
 impl Qwen3_5Mlp {
+    /// `inner` is the `SwiGLU` width: `intermediate_size` for a dense layer's
+    /// MLP, `shared_expert_intermediate_size` for a sparse layer's shared
+    /// expert (the two callers).
     fn load(
         cfg: &Qwen3_5TextConfig,
+        inner: usize,
         vb: &VarBuilder,
         targets: LoraTargets,
         rank: usize,
@@ -1157,7 +1299,7 @@ impl Qwen3_5Mlp {
         adapter_dtype: DType,
     ) -> CandleResult<Self> {
         let h = cfg.hidden_size;
-        let i = cfg.intermediate_size;
+        let i = inner;
         Ok(Self {
             gate_proj: Proj::load(
                 vb,
@@ -1216,14 +1358,165 @@ enum Mixer {
     Full(Qwen3_5Attention),
 }
 
-/// One decoder layer: pre-norm mixer + pre-norm `SwiGLU`, both residual,
+/// A layer's feed-forward slot — the SECOND layer menu (M3′): the dense
+/// members run a plain `SwiGLU` MLP, the `MoE` members the sparse block, in
+/// EVERY layer (the family deletes the per-layer dense/sparse knobs).
+#[derive(Debug)]
+enum FeedForward {
+    Dense(Qwen3_5Mlp),
+    Sparse(Qwen3_5SparseMoe),
+}
+
+impl FeedForward {
+    fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
+        match self {
+            Self::Dense(mlp) => mlp.forward(x),
+            Self::Sparse(moe) => moe.forward(x),
+        }
+    }
+
+    fn set_adapter_enabled(&mut self, enabled: bool) {
+        match self {
+            Self::Dense(mlp) => mlp.set_adapter_enabled(enabled),
+            Self::Sparse(moe) => moe.shared.set_adapter_enabled(enabled),
+        }
+    }
+
+    fn push_vars(&self, out: &mut Vec<Var>) {
+        match self {
+            Self::Dense(mlp) => mlp.push_vars(out),
+            Self::Sparse(moe) => moe.shared.push_vars(out),
+        }
+    }
+}
+
+/// The sparse `MoE` feed-forward (grad side): the oracle-pinned [`crate::moe`]
+/// kernels over FROZEN routed weights, plus an adapter-aware shared expert.
+///
+/// Trainability is the locked `MoE`-`LoRA` policy (GSPO lock, 2026-06-12): the
+/// router, the packed routed experts, and the scalar sigmoid gate are frozen —
+/// adapting the router would make routing non-stationary during training
+/// (precisely the instability sequence-level importance sampling exists to
+/// dampen), and per-expert adapters on the packed 3-D weights are
+/// out-of-recipe. [`LoraTargets`]' `mlp_*` flags bind the SHARED expert's
+/// projections (the always-on `SwiGLU`), the sparse layer's counterpart of the
+/// dense MLP.
+#[derive(Debug)]
+struct Qwen3_5SparseMoe {
+    /// Router weight `[E, hidden]`, frozen.
+    router: Tensor,
+    /// Packed per-expert gate+up `[E, 2·moe_inter, hidden]`, frozen.
+    gate_up: Tensor,
+    /// Per-expert down `[E, hidden, moe_inter]`, frozen.
+    down: Tensor,
+    /// The shared expert — adapter-aware, width
+    /// `shared_expert_intermediate_size`.
+    shared: Qwen3_5Mlp,
+    /// The shared expert's sigmoid gate `[1, hidden]`, frozen.
+    shared_gate: Tensor,
+    top_k: usize,
+}
+
+impl Qwen3_5SparseMoe {
+    fn load(
+        cfg: &Qwen3_5TextConfig,
+        moe: MoeDims,
+        vb: &VarBuilder,
+        targets: LoraTargets,
+        rank: usize,
+        alpha: f64,
+        adapter_dtype: DType,
+    ) -> CandleResult<Self> {
+        let h = cfg.hidden_size;
+        let m = moe.moe_intermediate_size;
+        // The CHECKPOINT layout is per-expert split linears
+        // (`experts.{i}.gate_proj/up_proj/down_proj.weight`) — transformers
+        // converts to/from the packed in-memory tensors at load/save
+        // (`core_model_loading`: MergeModulelist(dim=0) + Concatenate(dim=1),
+        // gate first). The same packing here: [e, 0..m, :] = gate_e,
+        // [e, m.., :] = up_e — the orientation the kernel's `chunk(2)`
+        // semantics (and its oracle gates) pin.
+        let experts = vb.pp("experts");
+        let mut gate_up_rows = Vec::with_capacity(moe.num_experts);
+        let mut down_rows = Vec::with_capacity(moe.num_experts);
+        for e in 0..moe.num_experts {
+            let evb = experts.pp(e);
+            let gate = evb.pp("gate_proj").get((m, h), "weight")?;
+            let up = evb.pp("up_proj").get((m, h), "weight")?;
+            gate_up_rows.push(Tensor::cat(&[&gate, &up], 0)?); // [2m, h]
+            down_rows.push(evb.pp("down_proj").get((h, m), "weight")?); // [h, m]
+        }
+        Ok(Self {
+            router: vb.pp("gate").get((moe.num_experts, h), "weight")?,
+            gate_up: Tensor::stack(&gate_up_rows, 0)?, // [E, 2m, h]
+            down: Tensor::stack(&down_rows, 0)?,       // [E, h, m]
+            shared: Qwen3_5Mlp::load(
+                cfg,
+                moe.shared_expert_intermediate_size,
+                &vb.pp("shared_expert"),
+                targets,
+                rank,
+                alpha,
+                adapter_dtype,
+            )?,
+            shared_gate: vb.pp("shared_expert_gate").get((1, h), "weight")?,
+            top_k: moe.top_k,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
+        // The shared expert runs adapter-aware on the layer geometry; the
+        // composition itself is shared with the merged decoder.
+        let shared = self.shared.forward(x)?;
+        sparse_ffn_compose(
+            x,
+            &self.router,
+            &self.gate_up,
+            &self.down,
+            &shared,
+            &self.shared_gate,
+            self.top_k,
+        )
+    }
+}
+
+/// The sparse feed-forward composition both decoders share: routed experts
+/// (the [`crate::moe`] kernels) plus the sigmoid-gated `shared_out`, over
+/// `x`/`shared_out` of shape `[batch, seq, hidden]`.
+///
+/// Faithful to `Qwen3_5MoeSparseMoeBlock.forward` with the shared-expert
+/// `SwiGLU` factored out to the caller (it is the adapter-aware half on the
+/// grad side and the merged half in the cached decoder; the reference
+/// computes it on the same flattened tokens — `frozen_linear`/`LoRA` matmuls
+/// flatten leading dims identically).
+fn sparse_ffn_compose(
+    x: &Tensor,
+    router: &Tensor,
+    gate_up: &Tensor,
+    down: &Tensor,
+    shared_out: &Tensor,
+    shared_gate: &Tensor,
+    top_k: usize,
+) -> CandleResult<Tensor> {
+    let (b, t, h) = x.dims3()?;
+    let flat = x.reshape((b * t, h))?;
+    let (_logits, scores, indices) = crate::moe::topk_router(&flat, router, top_k)?;
+    let routed = crate::moe::moe_experts(&flat, gate_up, down, &indices, &scores)?;
+    let gate = sigmoid(&flat.matmul(&shared_gate.t()?)?)?; // [n, 1]
+    let shared = shared_out.reshape((b * t, h))?;
+    let out = (routed + gate.broadcast_mul(&shared)?)?;
+    out.reshape((b, t, h))
+}
+
+/// One decoder layer: pre-norm mixer + pre-norm feed-forward (dense `SwiGLU`
+/// or the sparse `MoE` block, per the config's family branch), both residual,
 /// zero-centered norms.
 #[derive(Debug)]
 struct Qwen3_5Layer {
     ln1: RmsNormZeroCentered,
     mixer: Mixer,
     ln2: RmsNormZeroCentered,
-    mlp: Qwen3_5Mlp,
+    mlp: FeedForward,
 }
 
 impl Qwen3_5Layer {
@@ -1254,6 +1547,36 @@ impl Qwen3_5Layer {
                 adapter_dtype,
             )?),
         };
+        let mlp_vb = vb.pp("mlp");
+        let mlp = match cfg.moe() {
+            None => {
+                let inner = cfg.intermediate_size.ok_or_else(|| {
+                    candle_core::Error::Msg(
+                        "qwen3_5 layer: dense member without intermediate_size (validate \
+                         the config before loading)"
+                            .to_string(),
+                    )
+                })?;
+                FeedForward::Dense(Qwen3_5Mlp::load(
+                    cfg,
+                    inner,
+                    &mlp_vb,
+                    targets,
+                    rank,
+                    alpha,
+                    adapter_dtype,
+                )?)
+            }
+            Some(moe) => FeedForward::Sparse(Qwen3_5SparseMoe::load(
+                cfg,
+                moe,
+                &mlp_vb,
+                targets,
+                rank,
+                alpha,
+                adapter_dtype,
+            )?),
+        };
         Ok(Self {
             ln1: RmsNormZeroCentered::new(
                 vb.pp("input_layernorm").get(cfg.hidden_size, "weight")?,
@@ -1265,7 +1588,7 @@ impl Qwen3_5Layer {
                     .get(cfg.hidden_size, "weight")?,
                 cfg.rms_norm_eps,
             ),
-            mlp: Qwen3_5Mlp::load(cfg, &vb.pp("mlp"), targets, rank, alpha, adapter_dtype)?,
+            mlp,
         })
     }
 
@@ -1296,7 +1619,8 @@ impl Qwen3_5Layer {
     }
 
     /// Var order within the layer: mixer projections first (in their fixed
-    /// order), then the MLP's.
+    /// order), then the feed-forward's (the dense MLP's, or on sparse layers
+    /// the shared expert's — same gate/up/down order).
     fn push_vars(&self, out: &mut Vec<Var>) {
         match &self.mixer {
             Mixer::Linear(gdn) => gdn.push_vars(out),
@@ -1747,7 +2071,16 @@ impl GradModel for Qwen3_5GradModel {
     }
 
     fn lora_recipe(&self) -> Option<String> {
-        Some(self.targets.canonical())
+        // The feed-forward menu is part of the recipe: a dense and an MoE
+        // model with aliasing widths produce positionally IDENTICAL var lists
+        // (the mlp flags bind the layer MLP vs the shared expert), so the
+        // manifest cross-check must see the menu to catch a dense-vs-MoE
+        // checkpoint confusion. Dense models keep the historical string.
+        let menu = match self.layers.first().map(|l| &l.mlp) {
+            Some(FeedForward::Sparse(_)) => "|ffn:moe",
+            _ => "",
+        };
+        Some(format!("{}{menu}", self.targets.canonical()))
     }
 }
 
@@ -1944,7 +2277,7 @@ struct MergedLayer {
     ln1: RmsNormZeroCentered,
     mixer: MergedMixer,
     ln2: RmsNormZeroCentered,
-    mlp: MergedMlp,
+    mlp: MergedFeedForward,
 }
 
 /// `SwiGLU` MLP over merged weights.
@@ -1968,6 +2301,65 @@ impl MergedMlp {
         let lhs = frozen_linear(x, &self.gate_w)?.silu()?;
         let rhs = frozen_linear(x, &self.up_w)?;
         frozen_linear(&lhs.mul(&rhs)?, &self.down_w)
+    }
+}
+
+/// The merged feed-forward menu — the cached twin of [`FeedForward`].
+#[derive(Debug)]
+enum MergedFeedForward {
+    Dense(MergedMlp),
+    Sparse(MergedSparseMoe),
+}
+
+impl MergedFeedForward {
+    fn from_layer(ff: &FeedForward) -> CandleResult<Self> {
+        Ok(match ff {
+            FeedForward::Dense(mlp) => Self::Dense(MergedMlp::from_layer(mlp)?),
+            FeedForward::Sparse(moe) => Self::Sparse(MergedSparseMoe {
+                router: moe.router.clone(),
+                gate_up: moe.gate_up.clone(),
+                down: moe.down.clone(),
+                shared: MergedMlp::from_layer(&moe.shared)?,
+                shared_gate: moe.shared_gate.clone(),
+                top_k: moe.top_k,
+            }),
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
+        match self {
+            Self::Dense(mlp) => mlp.forward(x),
+            Self::Sparse(moe) => moe.forward(x),
+        }
+    }
+}
+
+/// The sparse `MoE` feed-forward over merged weights: the routed side is
+/// frozen (identical tensors to the grad side); only the shared expert
+/// carries merged adapter weights. Stateless — routing is per-token, so the
+/// cached decoder needs no `MoE` state.
+#[derive(Debug)]
+struct MergedSparseMoe {
+    router: Tensor,
+    gate_up: Tensor,
+    down: Tensor,
+    shared: MergedMlp,
+    shared_gate: Tensor,
+    top_k: usize,
+}
+
+impl MergedSparseMoe {
+    fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
+        let shared = self.shared.forward(x)?;
+        sparse_ffn_compose(
+            x,
+            &self.router,
+            &self.gate_up,
+            &self.down,
+            &shared,
+            &self.shared_gate,
+            self.top_k,
+        )
     }
 }
 
@@ -2050,7 +2442,7 @@ impl Qwen3_5MergedDecoder {
                 ln1: layer.ln1.clone(),
                 mixer,
                 ln2: layer.ln2.clone(),
-                mlp: MergedMlp::from_layer(&layer.mlp)?,
+                mlp: MergedFeedForward::from_layer(&layer.mlp)?,
             });
         }
         Ok(Self {
@@ -2221,7 +2613,7 @@ mod tests {
         Qwen3_5TextConfig {
             vocab_size: 24,
             hidden_size: 8,
-            intermediate_size: 16,
+            intermediate_size: Some(16),
             num_hidden_layers: 4,
             num_attention_heads: 2,
             num_key_value_heads: 1,
@@ -2254,6 +2646,30 @@ mod tests {
             mlp_only_layers: vec![],
             attn_output_gate: true,
             mamba_ssm_dtype: "float32".to_string(),
+            num_experts: None,
+            num_experts_per_tok: None,
+            moe_intermediate_size: None,
+            shared_expert_intermediate_size: None,
+            output_router_logits: false,
+        }
+    }
+
+    /// The sparse twin of [`tiny_text_cfg`]: same mixers/geometry, the
+    /// feed-forward slot switched to 4 routed experts top-3 + a shared expert
+    /// (widths 6 ≠ 10 — swaps cannot alias). Deliberately top-3 where the
+    /// committed fixture is top-2: a `top_k` hardcode or copy-omission on
+    /// EITHER decoder side is observationally identical to correct code when
+    /// every test geometry shares one k — diversifying k across the two
+    /// suites kills that mutant class (the merged decoder is the SAMPLING
+    /// path; a silent k drift there would bias every importance ratio).
+    fn tiny_moe_text_cfg(tie: bool) -> Qwen3_5TextConfig {
+        Qwen3_5TextConfig {
+            intermediate_size: None,
+            num_experts: Some(4),
+            num_experts_per_tok: Some(3),
+            moe_intermediate_size: Some(6),
+            shared_expert_intermediate_size: Some(10),
+            ..tiny_text_cfg(tie)
         }
     }
 
@@ -2262,6 +2678,14 @@ mod tests {
             model_type: Some("qwen3_5".to_string()),
             tie_word_embeddings: None,
             text_config: tiny_text_cfg(true),
+        }
+    }
+
+    fn tiny_moe_cfg() -> Qwen3_5Config {
+        Qwen3_5Config {
+            model_type: Some("qwen3_5_moe".to_string()),
+            tie_word_embeddings: None,
+            text_config: tiny_moe_text_cfg(true),
         }
     }
 
@@ -2312,18 +2736,34 @@ mod tests {
                     put(&format!("{q}.k_norm.weight"), &[ad.head_dim]);
                 }
             }
-            put(
-                &format!("{p}.mlp.gate_proj.weight"),
-                &[cfg.intermediate_size, h],
-            );
-            put(
-                &format!("{p}.mlp.up_proj.weight"),
-                &[cfg.intermediate_size, h],
-            );
-            put(
-                &format!("{p}.mlp.down_proj.weight"),
-                &[h, cfg.intermediate_size],
-            );
+            match cfg.moe() {
+                None => {
+                    let i = cfg.intermediate_size.unwrap();
+                    put(&format!("{p}.mlp.gate_proj.weight"), &[i, h]);
+                    put(&format!("{p}.mlp.up_proj.weight"), &[i, h]);
+                    put(&format!("{p}.mlp.down_proj.weight"), &[h, i]);
+                }
+                Some(moe) => {
+                    let (e, m, s) = (
+                        moe.num_experts,
+                        moe.moe_intermediate_size,
+                        moe.shared_expert_intermediate_size,
+                    );
+                    put(&format!("{p}.mlp.gate.weight"), &[e, h]);
+                    // The checkpoint layout: per-expert split linears (the
+                    // loader packs them).
+                    for x in 0..e {
+                        let q = format!("{p}.mlp.experts.{x}");
+                        put(&format!("{q}.gate_proj.weight"), &[m, h]);
+                        put(&format!("{q}.up_proj.weight"), &[m, h]);
+                        put(&format!("{q}.down_proj.weight"), &[h, m]);
+                    }
+                    put(&format!("{p}.mlp.shared_expert.gate_proj.weight"), &[s, h]);
+                    put(&format!("{p}.mlp.shared_expert.up_proj.weight"), &[s, h]);
+                    put(&format!("{p}.mlp.shared_expert.down_proj.weight"), &[h, s]);
+                    put(&format!("{p}.mlp.shared_expert_gate.weight"), &[1, h]);
+                }
+            }
         }
         if !cfg.tie_word_embeddings {
             let mut rng2 = Xoshiro256PlusPlus::seed_from_u64(WEIGHT_SEED ^ 0x77);
@@ -3248,5 +3688,322 @@ mod tests {
         let scalar = Tensor::zeros((), DType::F32, &dev()).unwrap();
         let err = model.backward(&scalar).unwrap_err();
         assert!(err.to_string().contains("no checkpointed forward"));
+    }
+
+    // ---- the sparse feed-forward menu (M3' PR-2) -----------------------------
+
+    fn tiny_moe_model() -> Qwen3_5GradModel {
+        let cfg = tiny_moe_cfg();
+        let vb = tiny_vb(&cfg.text_config);
+        Qwen3_5GradModel::load(&cfg, &vb, 2, 4.0).unwrap()
+    }
+
+    fn armed_moe_model() -> Qwen3_5GradModel {
+        let mut model = tiny_moe_model();
+        force_b_nonzero(&model.trainable_vars());
+        model.set_adapter_enabled(true);
+        model
+    }
+
+    #[test]
+    fn moe_config_menu_validation_is_fail_loud() {
+        let assert_rejects = |mutate: &dyn Fn(&mut Qwen3_5Config), needle: &str| {
+            let mut c = tiny_moe_cfg();
+            mutate(&mut c);
+            let err = c.validate().expect_err(needle).to_string();
+            assert!(
+                err.contains(needle),
+                "error {err:?} should mention {needle:?}"
+            );
+        };
+        // Both menus at once / neither.
+        assert_rejects(
+            &|c| c.text_config.intermediate_size = Some(16),
+            "both intermediate_size and num_experts",
+        );
+        assert_rejects(
+            &|c| {
+                c.model_type = Some("qwen3_5".to_string());
+                c.text_config.num_experts = None;
+                c.text_config.num_experts_per_tok = None;
+                c.text_config.moe_intermediate_size = None;
+                c.text_config.shared_expert_intermediate_size = None;
+            },
+            "neither intermediate_size",
+        );
+        // An incomplete quartet — each optional field's absence individually.
+        assert_rejects(&|c| c.text_config.num_experts_per_tok = None, "incomplete");
+        assert_rejects(
+            &|c| c.text_config.moe_intermediate_size = None,
+            "incomplete",
+        );
+        assert_rejects(
+            &|c| c.text_config.shared_expert_intermediate_size = None,
+            "incomplete",
+        );
+        // Top-k out of range, both ends.
+        assert_rejects(
+            &|c| c.text_config.num_experts_per_tok = Some(5),
+            "num_experts_per_tok",
+        );
+        assert_rejects(
+            &|c| c.text_config.num_experts_per_tok = Some(0),
+            "num_experts_per_tok",
+        );
+        // The aux-loss switch this forward does not implement.
+        assert_rejects(
+            &|c| c.text_config.output_router_logits = true,
+            "output_router_logits",
+        );
+        // A dense member carrying a stray MoE field — each field individually.
+        type Mutation = fn(&mut Qwen3_5Config);
+        let stray: [(&str, Mutation); 3] = [
+            ("num_experts_per_tok", |c| {
+                c.text_config.num_experts_per_tok = Some(2);
+            }),
+            ("moe_intermediate_size", |c| {
+                c.text_config.moe_intermediate_size = Some(6);
+            }),
+            ("shared_expert_intermediate_size", |c| {
+                c.text_config.shared_expert_intermediate_size = Some(10);
+            }),
+        ];
+        for (needle, mutate) in stray {
+            let mut c = tiny_cfg();
+            mutate(&mut c);
+            let err = c.validate().expect_err(needle).to_string();
+            assert!(
+                err.contains(needle),
+                "error {err:?} should mention {needle:?}"
+            );
+        }
+        // The family tag and the menu must agree, both directions.
+        assert_rejects(&|c| c.model_type = Some("qwen3_5".to_string()), "disagrees");
+        {
+            let mut c = tiny_cfg();
+            c.model_type = Some("qwen3_5_moe".to_string());
+            let err = c.validate().expect_err("tag/menu disagreement").to_string();
+            assert!(err.contains("disagrees"), "{err:?}");
+        }
+        // The valid sparse config passes, and the dims resolve — all four
+        // values distinct, so any cross-field mapping in `moe()` fails here.
+        let c = tiny_moe_cfg();
+        c.validate().unwrap();
+        assert_eq!(
+            c.text_config.moe().unwrap(),
+            MoeDims {
+                num_experts: 4,
+                top_k: 3,
+                moe_intermediate_size: 6,
+                shared_expert_intermediate_size: 10,
+            }
+        );
+        assert!(tiny_cfg().text_config.moe().is_none());
+    }
+
+    /// The locked MoE-LoRA policy is STRUCTURAL: the trainable-var count on
+    /// the sparse model equals the dense formula (mixer projections + the
+    /// shared expert's three — nothing for the router, the packed experts, or
+    /// the sigmoid gate), every var is a 2-D adapter factor, gradients reach
+    /// the full set, and on the linear-attention layers (where the industrial
+    /// recipe adapts no mixer projection) the shared expert's adapters are
+    /// the ONLY trainable surface — a nonzero gradient there proves the
+    /// sigmoid-gated shared path is both adapted and grad-reached.
+    #[test]
+    fn moe_lora_grads_flow_and_the_routed_side_stays_frozen() {
+        let model = armed_moe_model();
+        let vars = model.trainable_vars();
+        // Same formula as the dense tiny model: 3 linear layers x 3 (shared
+        // expert) + the full layer's q,k,v,o + 3; 2 vars per projection.
+        assert_eq!(vars.len(), (3 * 3 + 7) * 2);
+        assert!(
+            vars.iter().all(|v| v.dims().len() == 2),
+            "a non-2-D trainable var — a packed routed weight leaked into the adapter set"
+        );
+
+        let logits = model.forward(&ids(9)).unwrap();
+        assert_eq!(logits.dims(), &[1, 9, 24]);
+        let grads = model.backward(&probe_loss(&logits)).unwrap();
+        let cov = grad_coverage(&vars, &grads).unwrap();
+        assert!(cov.is_ok(), "grad coverage: {cov:?}");
+
+        // Layer 0 is linear-attention: under the industrial recipe its ONLY
+        // adapters are the shared expert's (gate, up, down — vars 0..6).
+        let shared_a = &vars[0];
+        let g = grads.get(shared_a).expect("shared-expert A missing");
+        assert!(
+            max_abs_diff(g, &g.zeros_like().unwrap()) > 1e-8,
+            "no gradient reached the shared expert through the sigmoid-gated path"
+        );
+    }
+
+    /// The manifest recipe string carries the feed-forward menu: a dense and
+    /// an `MoE` model with aliasing widths produce positionally IDENTICAL var
+    /// lists (the mlp flags bind the layer MLP vs the shared expert), so the
+    /// checkpoint cross-check must see the menu to catch a dense-vs-MoE
+    /// confusion. Dense models keep the historical string (back-compat).
+    #[test]
+    fn moe_lora_recipe_string_carries_the_menu() {
+        assert_eq!(
+            GradModel::lora_recipe(&tiny_moe_model()).as_deref(),
+            Some("attn:qkvo|mlp:gud|gdn:-|ffn:moe")
+        );
+        assert_eq!(
+            GradModel::lora_recipe(&tiny_model()).as_deref(),
+            Some("attn:qkvo|mlp:gud|gdn:-"),
+            "the dense recipe string must stay historical (manifest back-compat)"
+        );
+    }
+
+    /// Adapter semantics through the sparse menu: zero-B init is a no-op
+    /// (enabled == disabled exactly); a trained B changes the output and the
+    /// toggle restores the base.
+    #[test]
+    fn moe_adapter_toggle_flows_through_the_shared_expert() {
+        let mut fresh = tiny_moe_model();
+        let input = ids(7);
+        let on = fresh.forward(&input).unwrap();
+        fresh.set_adapter_enabled(false);
+        let off = fresh.forward(&input).unwrap();
+        assert_eq!(max_abs_diff(&on, &off), 0.0, "zero-B init must be a no-op");
+
+        let mut armed = armed_moe_model();
+        let trained = armed.forward(&input).unwrap();
+        armed.set_adapter_enabled(false);
+        let base = armed.forward(&input).unwrap();
+        assert!(
+            max_abs_diff(&trained, &base) > 1e-6,
+            "a trained B must change the sparse forward"
+        );
+        assert_eq!(
+            max_abs_diff(&base, &off),
+            0.0,
+            "disabling the adapter must restore the base model exactly"
+        );
+    }
+
+    /// The cached merged decoder over the sparse menu: prefill, the
+    /// multi-token continuation at an offset, and token-by-token decode all
+    /// match the uncached forward (routing is per-token, so the `MoE` slot is
+    /// stateless across the cache boundary — this gate pins exactly that).
+    #[test]
+    fn moe_merged_decoder_matches_uncached() {
+        let model = armed_moe_model();
+        let full = ids(9);
+        let uncached = model.forward(&full).unwrap();
+
+        // Vacuity guard: the armed adapters must displace the forward by
+        // MORE than the envelope below (measured ~3e-1, ~120x MERGED_TOL),
+        // or the merged comparison would not bind adapter FOLDING at all —
+        // a merged decoder built from base weights would pass.
+        let base = tiny_moe_model().forward(&full).unwrap();
+        assert!(
+            max_abs_diff(&uncached, &base) > MERGED_TOL,
+            "armed adapters inside the merged envelope — the folding gate went vacuous"
+        );
+
+        let mut dec = model.merged_decoder().unwrap();
+        let prefill = dec.forward(&full, 0).unwrap();
+        let d = max_abs_diff(&uncached, &prefill);
+        assert!(d <= MERGED_TOL, "sparse prefill vs uncached diff {d}");
+
+        for p in [1usize, 4] {
+            let mut dec = model.merged_decoder().unwrap();
+            let head = full.narrow(1, 0, p).unwrap();
+            let rest = full.narrow(1, p, 9 - p).unwrap();
+            let first = dec.forward(&head, 0).unwrap();
+            let second = dec.forward(&rest, p).unwrap();
+            let cached = Tensor::cat(&[first, second], 1).unwrap();
+            let d = max_abs_diff(&uncached, &cached);
+            assert!(d <= MERGED_TOL, "sparse split at {p}: diff {d}");
+        }
+
+        let mut dec = model.merged_decoder().unwrap();
+        let mut steps = Vec::new();
+        for t in 0..9 {
+            let tok = full.narrow(1, t, 1).unwrap();
+            steps.push(dec.forward(&tok, t).unwrap());
+        }
+        let stepped = Tensor::cat(&steps, 1).unwrap();
+        let d = max_abs_diff(&uncached, &stepped);
+        assert!(d <= MERGED_TOL, "sparse token-by-token decode diff {d}");
+    }
+
+    /// P7 over the sparse menu: the checkpointed segment closure must rebuild
+    /// the `MoE` feed-forward (host-side routing recomputes deterministically
+    /// in the re-run); stitched gradients match the uncut backward, the
+    /// boundary cut holds, and a detached walk captures no tape.
+    #[test]
+    fn moe_checkpointed_gradients_match_the_uncut_backward() {
+        let mut model = armed_moe_model();
+        let input = ids(9);
+        let vars = model.trainable_vars();
+
+        let plain = model
+            .backward(&probe_loss(&model.forward(&input).unwrap()))
+            .unwrap();
+        model.set_activation_checkpointing(true);
+        let stitched = model
+            .backward(&probe_loss(&model.forward(&input).unwrap()))
+            .unwrap();
+        assert_grads_match(&plain, &stitched, &vars, 1e-5);
+        // Non-vacuity: real gradients flow.
+        assert!(vars.iter().any(|v| {
+            let g = plain.get(v).unwrap();
+            max_abs_diff(g, &g.zeros_like().unwrap()) > 1e-6
+        }));
+
+        // A detached walk captures no tape (the stitched backward above
+        // consumed the pending one).
+        let _ = model.forward_detached(&ids(5)).unwrap();
+        let scalar = Tensor::zeros((), DType::F32, &dev()).unwrap();
+        let err = model.backward(&scalar).unwrap_err();
+        assert!(err.to_string().contains("no checkpointed forward"));
+
+        // The cut: bypassing the stitching reaches no layer var.
+        let raw = probe_loss(&model.forward(&input).unwrap())
+            .backward()
+            .unwrap();
+        assert!(
+            vars.iter().all(|v| raw.get(v).is_none()),
+            "a layer var is on the loss tape — the boundary cut is not happening"
+        );
+    }
+
+    /// The narrowed scoring forward (PR-B) over the sparse menu: routing runs
+    /// full-width in the layer walk (the narrow folds into norm-and-head
+    /// AFTER the layers), so values and adapter gradients must match
+    /// `forward` + narrow exactly, plain and checkpointed.
+    #[test]
+    fn moe_narrowed_forward_matches_the_full_walk() {
+        let mut model = armed_moe_model();
+        let input = ids(9);
+        let (start, len) = (3, 4);
+        let vars = model.trainable_vars();
+
+        let full = model
+            .forward(&input)
+            .unwrap()
+            .narrow(1, start, len)
+            .unwrap();
+        let narrowed = GradModel::forward_narrowed(&model, &input, start, len).unwrap();
+        assert_eq!(full.dims(), narrowed.dims());
+        assert_eq!(
+            max_abs_diff(&full, &narrowed),
+            0.0,
+            "narrowed values diverged"
+        );
+
+        let g_full = model.backward(&probe_loss(&full)).unwrap();
+        let g_narrow = model.backward(&probe_loss(&narrowed)).unwrap();
+        assert_grads_match(&g_full, &g_narrow, &vars, 0.0);
+
+        model.set_activation_checkpointing(true);
+        let stitched = model
+            .backward(&probe_loss(
+                &model.forward_narrowed(&input, start, len).unwrap(),
+            ))
+            .unwrap();
+        assert_grads_match(&g_narrow, &stitched, &vars, 1e-5);
     }
 }

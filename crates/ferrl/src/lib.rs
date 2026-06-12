@@ -65,7 +65,9 @@
 //!   each model's `set_activation_checkpointing`);
 //! - `MoE` primitives ([`moe`]) — the qwen3.5/3.6 sparse layer's kernels
 //!   (top-k router with unconditional renorm, packed-weight experts, the
-//!   sigmoid-gated shared expert), grad-bearing and oracle-pinned (M3′);
+//!   sigmoid-gated shared expert), grad-bearing and oracle-pinned, wired into
+//!   [`qwen35`]'s feed-forward layer menu so the same `Qwen3_5GradModel`
+//!   loads both the dense and the `MoE` family members (M3′);
 //! - a CUDA driver-compatibility preflight ([`cuda_compat`]) — translates the cryptic
 //!   `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` (a build-PTX-newer-than-driver mismatch) into
 //!   an actionable rebuild/upgrade message; a no-op without the `cuda` feature;
@@ -167,7 +169,7 @@ pub use policy::{EvalSampling, Policy};
 pub use qwen::{MergedDecoder, QwenGradModel};
 #[doc(inline)]
 pub use qwen35::{
-    varbuilder_from_pretrained, LayerType, LoraTargets, Qwen3_5Config, Qwen3_5GradModel,
+    varbuilder_from_pretrained, LayerType, LoraTargets, MoeDims, Qwen3_5Config, Qwen3_5GradModel,
     Qwen3_5MergedDecoder, Qwen3_5TextConfig, RopeParameters, GDN_CHUNK_SIZE,
 };
 #[doc(inline)]
