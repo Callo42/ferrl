@@ -41,6 +41,18 @@
 //! (and runs no canary). With `beta > 0` it stays **live** — the KL penalty still
 //! pulls the group toward the reference (TRL keeps every completion in the batch),
 //! only the surrogate contribution is zero.
+//!
+//! # Data parallelism
+//!
+//! [`Trainer::with_comm`] runs the same loop as one rank of a data-parallel
+//! world (see [`crate::comm`]): each rank consumes its own shard of every
+//! window's prompts, folds its local gradients, and **all-reduce-sums** them
+//! before the canary — everything downstream of the reduce (canary, clip,
+//! optimizer step) runs on the identical global gradient on every rank, so the
+//! ranks' weights stay in **bitwise lockstep**. All normalizers go global
+//! (per-item scale `1 / (grad_accum_steps · world)`, the DAPO token normalizer
+//! and the degenerate-window decision all-reduced), checkpoints are written by
+//! rank 0 only, and the world-1 path is byte-for-byte the pre-DP trainer.
 
 use std::path::{Path, PathBuf};
 
@@ -50,6 +62,7 @@ use candle_nn::optim::ParamsAdamW;
 use candle_nn::Optimizer;
 use serde::{Deserialize, Serialize};
 
+use crate::comm::{Comm, SoloComm};
 use crate::grpo::{
     group_advantages, zero_mask_rows, ImportanceSamplingLevel, LossType, ScaleRewards,
 };
@@ -81,6 +94,10 @@ pub enum TrainerError {
     /// Writing a periodic adapter checkpoint failed.
     #[error(transparent)]
     Checkpoint(#[from] crate::checkpoint::CheckpointError),
+    /// A data-parallel collective failed (contribution mismatch, a peer rank
+    /// timing out, or a poisoned world) — see [`crate::comm`].
+    #[error(transparent)]
+    Comm(#[from] crate::comm::CommError),
 }
 
 /// Bridges prompt / completion text and token ids for the trainer.
@@ -465,6 +482,10 @@ pub struct Trainer {
     config: TrainerConfig,
     writer: MetricsWriter,
     checkpoints_dir: PathBuf,
+    /// The data-parallel collective seam ([`SoloComm`] for a single-rank run).
+    /// Every call site is guarded on `world_size() > 1`, so the world-1 path
+    /// is byte-for-byte the pre-DP trainer.
+    comm: Box<dyn Comm>,
 }
 
 /// Per-inner-step quantities folded into the step's [`Metrics`].
@@ -546,6 +567,48 @@ impl Trainer {
     /// rejects `config`, or [`TrainerError::Telemetry`] if the config cannot be
     /// written or the metrics file cannot be opened.
     pub fn new(config: TrainerConfig, run: &RunDir) -> Result<Self, TrainerError> {
+        Self::with_comm(config, run, SoloComm)
+    }
+
+    /// Open a trainer as **one rank of a data-parallel world** (see
+    /// [`crate::comm`]). [`new`](Self::new) is exactly this with [`SoloComm`].
+    ///
+    /// Every rank of the world runs the same training entry point
+    /// ([`train`](Self::train) / [`resume`](Self::resume)) with the **same
+    /// config, the same prompt list, and identically initialized policy
+    /// weights** (same checkpoint or same seed); each rank owns its **own**
+    /// `run` directory (the config and metrics writes would otherwise
+    /// collide). `config.grad_accum_steps` is the **per-rank** accumulation
+    /// count: window `step` consumes the `grad_accum_steps × world_size`
+    /// prompts starting at `step × grad_accum_steps × world_size` (mod len),
+    /// rank `r` taking the `r`-th contiguous slice — the union across ranks
+    /// is exactly the window a single-rank run with the global accumulation
+    /// count would consume.
+    ///
+    /// Per-rank weights stay in bitwise lockstep (same start + all-reduced
+    /// gradients + same optimizer arithmetic). Metrics: `kl`, `clip_ratio`
+    /// and `grad_norm` are **global** (reduced); everything else —
+    /// reward/length statistics, `frac_reward_zero_std`, `dropped_rows`,
+    /// `frac_truncated`, and the `rollout_*` off-policy telemetry — describes
+    /// the rank's **local shard**. Checkpoints are written by rank 0 only —
+    /// to resume, every rank loads rank 0's checkpoint directory (weights and
+    /// optimizer moments are rank-identical by lockstep; the rollout-sampler
+    /// RNG blob is rank 0's, so a resumed run with a *stochastic* policy is a
+    /// faithful continuation rather than a bit-exact replay of what the
+    /// uninterrupted world would have sampled on the nonzero ranks — and
+    /// since every rank restores the SAME blob, ranks seeded differently for
+    /// rollout diversity become stream-correlated from the resume point on.
+    /// Bit-exact, diversity-preserving DP resume needs per-rank sampler
+    /// state, a planned follow-up of the multi-process phase).
+    ///
+    /// # Errors
+    ///
+    /// As [`new`](Self::new).
+    pub fn with_comm(
+        config: TrainerConfig,
+        run: &RunDir,
+        comm: impl Comm + 'static,
+    ) -> Result<Self, TrainerError> {
         config.validate()?;
         // Not a validation error (a short smoke run of a long-run config is
         // legitimate), but loud: such a run trains entirely inside the ramp.
@@ -562,6 +625,7 @@ impl Trainer {
             config,
             writer,
             checkpoints_dir: run.checkpoints_dir(),
+            comm: Box::new(comm),
         })
     }
 
@@ -781,13 +845,20 @@ impl Trainer {
         vars: &[Var],
     ) -> Result<Metrics, TrainerError> {
         let accum = self.config.grad_accum_steps;
+        let world = self.comm.world_size();
         let mut stats = Vec::with_capacity(accum);
         let mut live = Vec::with_capacity(accum);
         for j in 0..accum {
-            // Continuous prompt cycling across windows: window `step` consumes prompts
-            // `step*accum .. step*accum + accum` (mod len), so a resume at window
-            // `start_step` continues the order an uninterrupted run would have seen.
-            let idx = (step as usize * accum + j) % prompts.len();
+            // Continuous prompt cycling across windows: window `step` consumes the
+            // `accum × world` prompts starting at `step*accum*world` (mod len),
+            // rank `r` taking the contiguous slice at offset `r*accum` — so a
+            // resume at window `start_step` continues the order an uninterrupted
+            // run would have seen, and the union of the ranks' shards is exactly
+            // the window a single-rank run at the global accumulation count
+            // consumes (the DP sharding contract the equivalence oracle pins).
+            // At world 1 this is the legacy `step*accum + j`.
+            let idx =
+                (step as usize * accum * world + self.comm.rank() * accum + j) % prompts.len();
             let (stat, item) = self.collect_prompt(policy, reward_fn, tokenizer, &prompts[idx])?;
             stats.push(stat);
             if let Some(item) = item {
@@ -798,19 +869,33 @@ impl Trainer {
         // EOS-inclusive lengths) over EVERY prompt — degenerate groups and
         // truncation-masked completions included, exactly TRL's
         // `num_items_in_batch` (their masking zeroes the loss mask but the
-        // length total is taken from the raw completions). Clamped to >= 1 so
-        // a pathological all-empty window yields 0, not 0/0.
-        let window_tokens = stats
-            .iter()
-            .map(|s| s.completion_tokens)
-            .sum::<usize>()
-            .max(1) as f64;
+        // length total is taken from the raw completions). Under DP the
+        // normalizer is the GLOBAL window's total (TRL's `num_items_in_batch`
+        // is batch-global), summed across ranks BEFORE the inner epochs.
+        // Clamped to >= 1 so a pathological all-empty window yields 0, not 0/0
+        // (raw local sums reduce first — clamping locally would overcount).
+        let local_tokens = stats.iter().map(|s| s.completion_tokens).sum::<usize>();
+        let window_tokens = if world > 1 {
+            self.comm
+                .all_reduce_scalar_sum(local_tokens as f64)?
+                .max(1.0)
+        } else {
+            local_tokens.max(1) as f64
+        };
         // A window with no live prompts (every group degenerate) is a GRPO no-op: no
-        // update, no canary — mirroring the single-prompt degenerate skip.
-        let agg = if live.is_empty() {
+        // update, no canary — mirroring the single-prompt degenerate skip. Under DP
+        // the decision must be GLOBAL: a rank whose local shard is all-degenerate
+        // still has to enter the inner epochs' collectives (contributing zeros)
+        // while any peer holds live items — a local skip would deadlock the world.
+        let n_live_global = if world > 1 {
+            self.comm.all_reduce_scalar_sum(live.len() as f64)?
+        } else {
+            live.len() as f64
+        };
+        let agg = if n_live_global == 0.0 {
             InnerAgg::default()
         } else {
-            self.update_window(policy, &live, vars, opt, window_tokens)?
+            self.update_window(policy, &live, vars, opt, window_tokens, n_live_global)?
         };
         Ok(self.build_window_metrics(step, &stats, &agg, opt))
     }
@@ -831,6 +916,14 @@ impl Trainer {
         opt: &FerrlAdamW,
         policy: &P,
     ) -> Result<(), TrainerError> {
+        // Under DP, rank 0 writes the world's checkpoint: the weights and the
+        // optimizer moments are rank-identical by the lockstep invariant, so
+        // N copies would be redundant (and a shared run dir would race). See
+        // `with_comm` for the resume contract (every rank loads rank 0's
+        // checkpoint; the sampler blob is rank 0's).
+        if self.comm.rank() != 0 {
+            return Ok(());
+        }
         let Some(every) = self.config.checkpoint_every else {
             return Ok(());
         };
@@ -1003,7 +1096,11 @@ impl Trainer {
     /// Run the `mu` inner epochs over a window's live items, each epoch accumulating
     /// every live prompt's gradient into one `AdamW` step. The last epoch's
     /// diagnostics land in the window's metrics. `window_tokens` is the window's
-    /// total completion-token count (the DAPO normalizer, constant across epochs).
+    /// total completion-token count (the DAPO normalizer, constant across epochs;
+    /// global under DP) and `n_live_global` the world's live-item count (the
+    /// kl/clip-mean divisor; `live.len()` at world 1). Under DP every rank runs
+    /// these epochs — `live` may be empty on a rank whose shard was
+    /// all-degenerate; it participates in the collectives with zeros.
     fn update_window<P: Policy>(
         &self,
         policy: &P,
@@ -1011,19 +1108,27 @@ impl Trainer {
         vars: &[Var],
         opt: &mut FerrlAdamW,
         window_tokens: f64,
+        n_live_global: f64,
     ) -> Result<InnerAgg, TrainerError> {
         let mut agg = InnerAgg::default();
         for _ in 0..self.config.mu {
-            agg = self.accumulate_step(policy, live, vars, opt, window_tokens)?;
+            agg = self.accumulate_step(policy, live, vars, opt, window_tokens, n_live_global)?;
         }
         Ok(agg)
     }
 
     /// One inner epoch: forward+backward each live prompt, fold its trainable-var
-    /// gradients into a running sum, run the grad-coverage canary on the accumulated
-    /// gradient, then take one optimizer step. Only one prompt's grad forward is held
-    /// at a time (the accumulator keeps just the small per-var sums), so the window's
-    /// peak memory is a single group's.
+    /// gradients into a running sum (all-reduce-summed across ranks under DP),
+    /// run the grad-coverage canary on the accumulated gradient, then take one
+    /// optimizer step. Only one prompt's grad forward is held at a time (the
+    /// accumulator keeps just the small per-var sums), so the window's peak
+    /// memory is a single group's.
+    ///
+    /// Under DP the collective sequence per epoch is fixed — gradient reduce,
+    /// uncovered count, kl sum, clip sum — and runs unconditionally on every
+    /// rank **before** any early return, so every later decision (canary, the
+    /// no-signal skip) is a pure function of global state and the ranks act in
+    /// lockstep.
     fn accumulate_step<P: Policy>(
         &self,
         policy: &P,
@@ -1031,8 +1136,8 @@ impl Trainer {
         vars: &[Var],
         opt: &mut FerrlAdamW,
         window_tokens: f64,
+        n_live_global: f64,
     ) -> Result<InnerAgg, TrainerError> {
-        let n_live = live.len() as f32;
         let mut acc: Vec<Option<Tensor>> = vec![None; vars.len()];
         let mut covered = vec![true; vars.len()];
         let mut container: Option<GradStore> = None;
@@ -1045,18 +1150,42 @@ impl Trainer {
             fold_var_grads(vars, &grads, &mut acc, &mut covered)?;
             container = Some(grads);
         }
+        let (kl, clip_frac, uncovered_global) = if self.comm.world_size() > 1 {
+            self.reduce_epoch(vars, &mut acc, &covered, sum_kl, sum_clip, n_live_global)?
+        } else {
+            (
+                sum_kl / n_live_global as f32,
+                sum_clip / n_live_global as f32,
+                0.0,
+            )
+        };
         // Reuse the last backward's store as the optimizer container, overwriting its
         // trainable-var entries with the accumulated sums (and dropping any var absent
-        // from some prompt so the canary catches the silent-skip).
-        let mut store =
-            combine_into_store(vars, container.expect("live is non-empty"), &acc, &covered);
+        // from some prompt so the canary catches the silent-skip). A rank whose local
+        // shard is empty (DP, all-degenerate shard) has no backward to reuse — candle
+        // exposes no public `GradStore` constructor, so mint one from a throwaway
+        // one-node backward (its stray entry is harmless: only var entries are read
+        // downstream).
+        let store = match container {
+            Some(store) => store,
+            None => empty_grad_store(vars)?,
+        };
+        let mut store = combine_into_store(vars, store, &acc, &covered);
         let cov = grad_coverage(vars, &store)?;
-        let kl = sum_kl / n_live;
-        let clip_frac = sum_clip / n_live;
         // Fatal: a missing var (candle's silent-skip landmine — an absent grad entry)
         // or a non-finite accumulated gradient (a blowup).
         if !cov.is_covered() || cov.nonfinite > 0 {
             cov.clone().into_result()?;
+        }
+        // The canary verdict is global under DP: a var missing from a PEER rank's
+        // backward poisons the reduced sum every rank just stepped from, so a rank
+        // that is locally covered must abort too — in lockstep with the rank that
+        // reports the detail above.
+        if uncovered_global > 0.0 {
+            return Err(TrainerError::Contract(format!(
+                "grad-coverage canary failed on a peer rank ({uncovered_global} uncovered \
+                 var-gradients across the world) — aborting in lockstep"
+            )));
         }
         if !cov.is_live() {
             // Covered + finite + all-zero accumulated gradient: no usable signal this
@@ -1086,18 +1215,62 @@ impl Trainer {
         })
     }
 
+    /// The per-epoch DP collective sequence (world > 1 only): all-reduce-sum
+    /// the accumulated per-var gradients (a `None` slot — an empty local
+    /// shard, or a var no local backward reached — contributes zeros, since
+    /// the collective contract is a uniform tensor count/shape on every rank;
+    /// an uncovered var that *some* local backwards did reach still reduces
+    /// its partial sum, which is exactly why the globalized verdict below
+    /// must abort every rank before that poisoned sum is stepped on), then
+    /// globalize the coverage verdict and the kl/clip diagnostic sums. On
+    /// return every `acc` slot holds the **global** gradient sum; `covered`
+    /// keeps its local meaning so the canary still reports rank-local detail.
+    fn reduce_epoch(
+        &self,
+        vars: &[Var],
+        acc: &mut [Option<Tensor>],
+        covered: &[bool],
+        sum_kl: f32,
+        sum_clip: f32,
+        n_live_global: f64,
+    ) -> Result<(f32, f32, f64), TrainerError> {
+        let mut flat = Vec::with_capacity(vars.len());
+        for (i, v) in vars.iter().enumerate() {
+            flat.push(match &acc[i] {
+                Some(g) => g.clone(),
+                None => v.as_tensor().zeros_like()?,
+            });
+        }
+        self.comm.all_reduce_sum(&mut flat)?;
+        for (slot, g) in acc.iter_mut().zip(flat) {
+            *slot = Some(g);
+        }
+        let uncovered_local = covered.iter().filter(|c| !**c).count() as f64;
+        let uncovered_global = self.comm.all_reduce_scalar_sum(uncovered_local)?;
+        let kl_global = self.comm.all_reduce_scalar_sum(f64::from(sum_kl))?;
+        let clip_global = self.comm.all_reduce_scalar_sum(f64::from(sum_clip))?;
+        Ok((
+            (kl_global / n_live_global) as f32,
+            (clip_global / n_live_global) as f32,
+            uncovered_global,
+        ))
+    }
+
     /// Forward + backward one live prompt: the single `grpo_loss` plus its scalar
     /// diagnostics (clip fraction, mean k3 KL). Returns the backward's
     /// [`GradStore`] and the diagnostics.
     ///
     /// **Accumulation scaling differs by loss type.** For `Grpo` / `DrGrpo` the
-    /// loss is scaled by `1 / grad_accum_steps` (so the folded window gradient is
-    /// the per-prompt mean — TRL divides those reductions by the accumulation
-    /// step count the same way); the scale is skipped at `grad_accum_steps == 1`,
-    /// keeping that path bit-identical (no extra affine node). For `Dapo` the
-    /// per-item reduction *already* divides by the **window's** total completion
-    /// tokens (TRL's `num_items_in_batch` normalizer), so summing the items is
-    /// the complete normalization and no extra scale applies.
+    /// loss is scaled by `1 / (grad_accum_steps · world_size)` (so the reduced
+    /// window gradient is the **global** per-prompt mean — TRL divides those
+    /// reductions by the accumulation step count the same way, and under DP
+    /// the mean runs over every rank's items); the scale is skipped when that
+    /// product is `1`, keeping the single-prompt single-rank path bit-identical
+    /// (no extra affine node). For `Dapo` the per-item reduction *already*
+    /// divides by the **global window's** total completion tokens (TRL's
+    /// `num_items_in_batch` normalizer, all-reduced in `run_window`), so
+    /// summing the items across ranks is the complete normalization and no
+    /// extra scale applies.
     fn item_backward<P: Policy>(
         &self,
         policy: &P,
@@ -1122,8 +1295,9 @@ impl Trainer {
             &item.mask,
             &cfg,
         )?;
-        if self.config.grad_accum_steps > 1 && self.config.loss_type != LossType::Dapo {
-            loss = loss.affine(1.0 / self.config.grad_accum_steps as f64, 0.0)?;
+        let global_items = self.config.grad_accum_steps * self.comm.world_size();
+        if global_items > 1 && self.config.loss_type != LossType::Dapo {
+            loss = loss.affine(1.0 / global_items as f64, 0.0)?;
         }
         // Scalar diagnostics, off the differentiated path. The ratio is formed at
         // the configured level over the same padding-substituted log-probs the
@@ -1502,6 +1676,19 @@ fn combine_into_store(
         }
     }
     store
+}
+
+/// A [`GradStore`] with no trainable-var entries, for a rank whose local shard
+/// produced no backward (DP, all-degenerate shard). candle exposes no public
+/// `GradStore` constructor, so this runs a throwaway one-node backward over a
+/// temporary scalar [`Var`]; the two stray entries it leaves (the temporary's
+/// ids) are harmless — only trainable-var entries are read downstream.
+fn empty_grad_store(vars: &[Var]) -> CandleResult<GradStore> {
+    let device = vars
+        .first()
+        .map_or(Device::Cpu, |v| v.as_tensor().device().clone());
+    let tmp = Var::zeros(1, DType::F32, &device)?;
+    tmp.as_tensor().sum_all()?.backward()
 }
 
 /// The scalar group advantages as a detached `[G, 1]` tensor (broadcast over the
