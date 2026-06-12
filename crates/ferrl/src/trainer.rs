@@ -711,6 +711,29 @@ impl Trainer {
         prompts: &[String],
     ) -> Result<Vec<Metrics>, TrainerError> {
         assert!(!prompts.is_empty(), "train: no prompts");
+        // The KL reference (`beta > 0`) IS the adapter-disabled policy
+        // (`reference_logprobs` toggles the adapter off to score it). A policy
+        // that cannot disable its adapter — full fine-tuning: the base weights
+        // ARE the trained weights — would silently make `logp_ref` the live
+        // policy itself: bit-identical to `logp_old`, the KL-to-base penalty
+        // degenerating to a window-anchored proximal term that reports a
+        // near-zero `kl` metric and pulls toward nothing. Fail loud instead:
+        // full-FT runs take `beta = 0` (no frozen reference exists to pull
+        // toward; a base-anchored KL needs a separately loaded base policy,
+        // which this trainer does not model).
+        if self.config.beta > 0.0 {
+            policy.set_adapter_enabled(false);
+            let toggleable = !policy.adapter_enabled();
+            policy.set_adapter_enabled(true);
+            if !toggleable {
+                return Err(TrainerError::Contract(
+                    "beta > 0 needs the adapter-disabled reference policy, but this policy \
+                     cannot disable its adapter (full fine-tuning mode?) — train with \
+                     beta = 0, or use a LoRA recipe for KL-regularized runs"
+                        .into(),
+                ));
+            }
+        }
         let vars = policy.trainable_vars();
         let params = ParamsAdamW {
             lr: self.config.lr,

@@ -1,15 +1,21 @@
 //! Full fine-tuning end-to-end gates (PR-E).
 //!
-//! The REAL `Trainer` over the committed tiny dense fixture with EVERY base
-//! weight trainable: (1) updates genuinely run and move the base weights;
-//! (2) the momentum-faithful resume continues a full-FT checkpoint, and the
-//! manifest's `"full-ft"` recipe makes the resume cross-check REJECT a `LoRA`
-//! policy against it loudly (a positional load would land base weights on
-//! adapter factors silently — count/shape checks cannot catch every aliasing);
-//! (3) the eval harness fails loud on the unavailable base-vs-trained
-//! comparison instead of comparing the policy against itself.
+//! The REAL `Trainer` over the committed tiny fixtures with EVERY base
+//! weight trainable: (1) updates genuinely run and move the base weights
+//! (`beta = 0` — full-FT has no toggleable frozen reference, and the trainer
+//! REJECTS `beta > 0` loudly, gated below); (2) the momentum-faithful resume
+//! continues a full-FT checkpoint, and the manifest's `"full-ft"` recipe
+//! makes the resume cross-check REJECT a `LoRA` policy against it loudly (a
+//! positional load would land base weights on adapter factors silently —
+//! count/shape checks cannot catch every aliasing); (3) the eval harness
+//! fails loud on the unavailable base-vs-trained comparison instead of
+//! comparing the policy against itself; (4) the locked `MoE` full-FT recipe
+//! — GSPO sequence-level importance sampling — trains and resumes over the
+//! `MoE` fixture (the packed 3-D vars and the trained router crossing the
+//! real checkpoint path).
 
 use candle_core::{DType, Device, Tensor};
+use ferrl::grpo::ImportanceSamplingLevel;
 use ferrl::policy::GenConfig;
 use ferrl::{
     evaluate, tensors_from_pretrained, varbuilder_from_pretrained, EvalError, Policy,
@@ -20,6 +26,10 @@ use std::path::PathBuf;
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny_qwen35")
+}
+
+fn moe_fixture_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny_qwen35_moe")
 }
 
 /// A char-level codec over the fixture's 64-token vocabulary.
@@ -49,12 +59,15 @@ impl RewardFn for SpreadReward {
     }
 }
 
-fn full_ft_policy(seed: u64) -> Qwen3_5Policy {
-    let dir = fixture_dir();
+fn full_ft_policy_from(dir: &PathBuf, seed: u64) -> Qwen3_5Policy {
     let cfg = Qwen3_5Config::from_json_file(dir.join("config.json")).unwrap();
-    let tensors = tensors_from_pretrained(&dir, &Device::Cpu).unwrap();
+    let tensors = tensors_from_pretrained(dir, &Device::Cpu).unwrap();
     let model = Qwen3_5GradModel::load_full_ft(&cfg, tensors, DType::F32, &Device::Cpu).unwrap();
     Qwen3_5Policy::new(model, seed, 1.0)
+}
+
+fn full_ft_policy(seed: u64) -> Qwen3_5Policy {
+    full_ft_policy_from(&fixture_dir(), seed)
 }
 
 fn lora_policy(seed: u64) -> Qwen3_5Policy {
@@ -85,7 +98,9 @@ fn train_cfg() -> TrainerConfig {
         group_size: 4,
         max_new_tokens: 3,
         temperature: 1.0,
-        beta: 0.02,
+        // Full-FT has no toggleable frozen reference, so `beta > 0` is a
+        // loud trainer error (gated below) — full-FT runs train at beta 0.
+        beta: 0.0,
         mu: 2,
         lr: 1e-3,
         checkpoint_every: Some(1),
@@ -186,6 +201,81 @@ fn lora_resume_is_rejected(tmp: &TempDir, step1: &std::path::Path, prompts: &[St
     assert!(
         err.to_string().contains("does not match"),
         "expected the recipe cross-check, got: {err}"
+    );
+}
+
+/// The KL reference (`beta > 0`) is the adapter-DISABLED policy — which a
+/// full-FT policy cannot produce: `logp_ref` would silently be the live
+/// policy itself (bit-identical to `logp_old`, the KL penalty a sham
+/// reporting near-zero `kl`). The trainer must reject it loudly at entry,
+/// before any rollout.
+#[test]
+fn full_ft_with_kl_beta_is_a_loud_contract_error() {
+    let mut policy = full_ft_policy(13);
+    let tmp = TempDir::new("kl-guard");
+    let run = RunDir::create(&tmp.0, "full-ft-kl").unwrap();
+    let cfg = TrainerConfig {
+        beta: 0.02,
+        ..train_cfg()
+    };
+    let mut trainer = Trainer::new(cfg, &run).unwrap();
+    let err = trainer
+        .train(&mut policy, &SpreadReward, &ByteCodec, &["abc".to_string()])
+        .unwrap_err();
+    assert!(matches!(err, TrainerError::Contract(_)), "got {err:?}");
+    assert!(
+        err.to_string().contains("cannot disable its adapter"),
+        "got: {err}"
+    );
+}
+
+/// The locked `MoE` full-FT recipe end-to-end: GSPO (sequence-level
+/// importance sampling) over the `MoE` fixture with every base weight —
+/// router and packed experts included — trainable; then a momentum-faithful
+/// resume from the step-1 checkpoint (the packed 3-D vars crossing the real
+/// `save_checkpoint`/`load_checkpoint` path with the
+/// `"full-ft|ffn:moe"` recipe cross-check).
+#[test]
+fn full_ft_gspo_moe_training_runs_and_resumes() {
+    let dir = moe_fixture_dir();
+    let mut policy = full_ft_policy_from(&dir, 7);
+    let cfg = TrainerConfig {
+        importance_sampling_level: ImportanceSamplingLevel::Sequence,
+        ..train_cfg()
+    };
+    let prompts = vec!["abc".to_string(), "bcd".to_string()];
+
+    let tmp = TempDir::new("gspo-moe");
+    let run = RunDir::create(&tmp.0, "full-ft-gspo-moe").unwrap();
+    let mut trainer = Trainer::new(cfg.clone(), &run).unwrap();
+    let history = trainer
+        .train(&mut policy, &SpreadReward, &ByteCodec, &prompts)
+        .unwrap();
+    assert!(
+        history
+            .iter()
+            .any(|m| m.grad_norm > 0.0 && m.grad_norm.is_finite()),
+        "no real GSPO update ran"
+    );
+
+    let step1 = run.checkpoints_dir().join("step-1");
+    assert!(step1.is_dir(), "expected the step-1 checkpoint");
+    let mut resumed_policy = full_ft_policy_from(&dir, 7);
+    let run2 = RunDir::create(&tmp.0, "full-ft-gspo-moe-resume").unwrap();
+    let mut trainer2 = Trainer::new(cfg, &run2).unwrap();
+    let resumed = trainer2
+        .resume(
+            &step1,
+            &mut resumed_policy,
+            &SpreadReward,
+            &ByteCodec,
+            &prompts,
+        )
+        .unwrap();
+    assert_eq!(
+        resumed.len(),
+        1,
+        "resume from step-1 should run step 2 only"
     );
 }
 

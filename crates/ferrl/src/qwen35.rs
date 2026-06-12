@@ -1410,6 +1410,9 @@ impl FeedForward {
         }
     }
 
+    // The LoRA-mode positional walk (adapter factors only — the sparse arm
+    // contributes the shared expert's); full-FT bypasses it entirely via
+    // the registry order.
     fn push_vars(&self, out: &mut Vec<Var>) {
         match self {
             Self::Dense(mlp) => mlp.push_vars(out),
@@ -1419,28 +1422,36 @@ impl FeedForward {
 }
 
 /// The sparse `MoE` feed-forward (grad side): the oracle-pinned [`crate::moe`]
-/// kernels over FROZEN routed weights, plus an adapter-aware shared expert.
+/// kernels over the routed weights, plus an adapter-aware shared expert.
 ///
-/// Trainability is the locked `MoE`-`LoRA` policy (GSPO lock, 2026-06-12): the
-/// router, the packed routed experts, and the scalar sigmoid gate are frozen —
-/// adapting the router would make routing non-stationary during training
-/// (precisely the instability sequence-level importance sampling exists to
-/// dampen), and per-expert adapters on the packed 3-D weights are
-/// out-of-recipe. [`LoraTargets`]' `mlp_*` flags bind the SHARED expert's
-/// projections (the always-on `SwiGLU`), the sparse layer's counterpart of the
-/// dense MLP.
+/// Trainability in `LoRA` mode is the locked `MoE`-`LoRA` policy (GSPO lock,
+/// 2026-06-12): the router, the packed routed experts, and the scalar sigmoid
+/// gate are frozen — adapting the router would make routing non-stationary
+/// during training (precisely the instability sequence-level importance
+/// sampling exists to dampen), and per-expert adapters on the packed 3-D
+/// weights are out-of-recipe. [`LoraTargets`]' `mlp_*` flags bind the SHARED
+/// expert's projections (the always-on `SwiGLU`), the sparse layer's
+/// counterpart of the dense MLP.
+///
+/// In **full-FT** mode every tensor here is a registry var's inner tensor —
+/// the router (and everything else) trains, which is exactly why GSPO
+/// (sequence-level importance sampling) is the locked recipe for `MoE`
+/// full-FT runs.
 #[derive(Debug)]
 struct Qwen3_5SparseMoe {
-    /// Router weight `[E, hidden]`, frozen.
+    /// Router weight `[E, hidden]` (frozen in `LoRA` mode).
     router: Tensor,
-    /// Packed per-expert gate+up `[E, 2·moe_inter, hidden]`, frozen.
+    /// Packed per-expert gate+up `[E, 2·moe_inter, hidden]` (frozen in
+    /// `LoRA` mode; ONE registry var in full-FT).
     gate_up: Tensor,
-    /// Per-expert down `[E, hidden, moe_inter]`, frozen.
+    /// Per-expert down `[E, hidden, moe_inter]` (frozen in `LoRA` mode; ONE
+    /// registry var in full-FT).
     down: Tensor,
     /// The shared expert — adapter-aware, width
     /// `shared_expert_intermediate_size`.
     shared: Qwen3_5Mlp,
-    /// The shared expert's sigmoid gate `[1, hidden]`, frozen.
+    /// The shared expert's sigmoid gate `[1, hidden]` (frozen in `LoRA`
+    /// mode).
     shared_gate: Tensor,
     top_k: usize,
 }
@@ -1786,6 +1797,24 @@ impl Qwen3_5GradModel {
         device: &Device,
     ) -> CandleResult<Self> {
         cfg.validate()?;
+        // Sub-F32 vars would also be the OPTIMIZER's dtype (`FerrlAdamW`
+        // mints its moments at each var's dtype — in LoRA mode the trainable
+        // factors had their own `adapter_dtype`, so this is the first mode
+        // where the model dtype reaches Adam). At bf16 the second-moment
+        // increment ((1−β₂) = 1e-3 of a squared grad) quantizes to zero once
+        // `v` is established, and `eps` vanishes next to `√v̂` — the update
+        // silently degrades. Until a bf16-forward / F32-master-weight split
+        // exists (flagged follow-up, GPU phase), full-FT trains at F32+:
+        // pass `DType::F32` — the backend casts a bf16 checkpoint map on
+        // fetch.
+        if dtype.size_in_bytes() < DType::F32.size_in_bytes() {
+            bail!(
+                "Qwen3_5GradModel::load_full_ft: {dtype:?} vars would also be the \
+                 optimizer's dtype, and Adam's second-moment update quantizes to zero \
+                 below F32 — load with DType::F32 (the backend casts a bf16 checkpoint \
+                 on fetch); a bf16-forward / F32-master split is a flagged follow-up"
+            );
+        }
         let (vb, registry) = crate::full_ft::registry_varbuilder(
             tensors,
             dtype,
@@ -4565,12 +4594,19 @@ mod tests {
     /// trainer's resume cross-check guards on.
     #[test]
     fn full_ft_checkpoint_round_trips_positionally() {
-        let model = tiny_full_ft_model();
+        // Both menus: the MoE arm puts the packed 3-D vars (and the trained
+        // router) through the positional save/load path too.
+        round_trip_full_ft(&tiny_full_ft_model(), "full-ft", "dense");
+        round_trip_full_ft(&tiny_full_ft_moe_model(), "full-ft|ffn:moe", "moe");
+    }
+
+    fn round_trip_full_ft(model: &Qwen3_5GradModel, want_recipe: &str, tag: &str) {
         let vars = model.trainable_vars();
-        let dir = std::env::temp_dir().join(format!("ferrl-full-ft-ckpt-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("ferrl-full-ft-ckpt-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
-        let recipe = GradModel::lora_recipe(&model);
+        let recipe = GradModel::lora_recipe(model);
         crate::checkpoint::save_adapter(&dir, &vars, 3, recipe.as_deref()).unwrap();
 
         let originals: Vec<Tensor> = vars.iter().map(|v| v.as_tensor().copy().unwrap()).collect();
@@ -4578,15 +4614,51 @@ mod tests {
             v.set(&(v.as_tensor() * 2.0).unwrap()).unwrap();
         }
         let manifest = crate::checkpoint::load_adapter(&dir, &vars).unwrap();
-        assert_eq!(manifest.lora_recipe.as_deref(), Some("full-ft"));
-        assert_eq!(manifest.num_vars, vars.len());
+        assert_eq!(manifest.lora_recipe.as_deref(), Some(want_recipe), "{tag}");
+        assert_eq!(manifest.num_vars, vars.len(), "{tag}");
         for (i, (v, orig)) in vars.iter().zip(&originals).enumerate() {
             assert_eq!(
                 max_abs_diff(v.as_tensor(), orig),
                 0.0,
-                "var {i} did not restore bit-exactly"
+                "{tag}: var {i} did not restore bit-exactly"
             );
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Sub-F32 full-FT loads are rejected loudly: the var dtype is also the
+    /// optimizer's, and Adam's second-moment update quantizes to zero below
+    /// F32 (the silent-degradation class — see `load_full_ft`).
+    #[test]
+    fn full_ft_rejects_sub_f32_dtypes_loudly() {
+        let cfg = tiny_cfg();
+        for dtype in [DType::BF16, DType::F16] {
+            let err =
+                Qwen3_5GradModel::load_full_ft(&cfg, weight_map(&cfg.text_config), dtype, &dev())
+                    .unwrap_err();
+            assert!(
+                err.to_string().contains("below F32"),
+                "{dtype:?}: got {err}"
+            );
+        }
+    }
+
+    /// The policy-level toggle guard (the seam eval and the trainer's KL
+    /// pre-checks stand on): an `LmPolicy` over a full-FT model must refuse
+    /// to lower its adapter flag — `set_adapter_enabled(false)` takes no
+    /// effect and `adapter_enabled()` stays true. Without this, a caller
+    /// observing the flag would believe it scored the frozen base while
+    /// scoring the live policy.
+    #[test]
+    fn full_ft_policy_toggle_cannot_lower_the_flag() {
+        use crate::policy::Policy;
+        let mut policy = crate::lm_policy::LmPolicy::new(tiny_full_ft_model(), 7, 1.0);
+        assert!(policy.adapter_enabled());
+        policy.set_adapter_enabled(false);
+        assert!(
+            policy.adapter_enabled(),
+            "the policy lowered its flag with no adapters to disable — eval/trainer \
+             guards would silently score the live policy as the base"
+        );
     }
 }
