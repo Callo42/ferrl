@@ -2373,10 +2373,17 @@ mod tests {
     /// path crosses the chunked/recurrent kernel boundary (independent ports,
     /// PR-1 cross-checked at 5e-5 kernel-level), so its floor is the highest.
     /// Measured worst under the seeded weights (2026-06-11): prefill 3.8e-5,
-    /// chunked continuation 7.0e-5, token-by-token decode 1.2e-4 → ~8x
-    /// headroom (the std-0.5 tiny weights run hotter than the real 0.8B,
-    /// whose same trio measures 3.3e-5; planted bugs land at 4.9–12.5).
-    const MERGED_TOL: f32 = 1e-3;
+    /// chunked continuation 7.0e-5, token-by-token decode 1.2e-4 (the
+    /// std-0.5 tiny weights run hotter than the real 0.8B, whose same trio
+    /// measures 3.3e-5; planted bugs land at 4.9e-3–12.5e-3). GitHub's
+    /// runner pool (2026-06-12) measured honest cross-host excursions of
+    /// 1.14e-3 (continuation) and 1.04e-3 (decode) — different runs, same
+    /// binary content, different failures: the pool mixes CPU generations
+    /// whose gemm reassociation differs ~10x from the dev host on this
+    /// kernel boundary. Envelope sits at the geometric midpoint between the
+    /// worst honest excursion (2.2x below) and the nearest planted bug
+    /// (~2x above).
+    const MERGED_TOL: f32 = 2.5e-3;
 
     // ---- config validation -------------------------------------------------
 

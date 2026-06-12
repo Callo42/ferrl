@@ -2405,9 +2405,16 @@ mod tests {
 
     /// The P7 gate's finite-difference half, in f64 end-to-end (the trainer
     /// gradcheck convention) so central differences are sharp: the stitched
-    /// analytic gradient matches `(L(θ+ε) − L(θ−ε)) / 2ε` on sampled entries
-    /// of the first and last adapter vars (deepest and shallowest stitch).
+    /// analytic gradient matches `(L(θ+ε) − L(θ−ε)) / 2ε` on the
+    /// strongest entry (max |gradient|) of the first and last adapter vars
+    /// (deepest and shallowest stitch). The probe entry must sit far above
+    /// the FD noise floor: central differences on a near-zero entry measure
+    /// loss-evaluation cancellation (`|L|·εmach/2ε`, CPU-dependent — GitHub's
+    /// runner pool measured rel 8.3e-5 on a 4.3e-8-magnitude entry where the
+    /// dev host passes 1e-5), not the gradient. Stitching bugs — the class
+    /// this gate exists for — are O(1) relative on the strongest entry.
     #[test]
+    #[allow(clippy::print_stderr)] // the measured rel is the calibration record
     fn checkpointed_backward_passes_a_finite_difference_gradcheck() {
         let cfg = tiny_cfg();
         let map_f64: HashMap<String, Tensor> = weight_map(&cfg)
@@ -2432,11 +2439,21 @@ mod tests {
 
         let eps = 1e-5f64;
         for var in [&vars[0], vars.last().unwrap()] {
-            let analytic = grads.get(var).unwrap().to_vec2::<f64>().unwrap()[0][0];
+            let g = grads.get(var).unwrap().to_vec2::<f64>().unwrap();
+            let (r, c) = (0..g.len())
+                .flat_map(|i| (0..g[i].len()).map(move |j| (i, j)))
+                .max_by(|a, b| g[a.0][a.1].abs().total_cmp(&g[b.0][b.1].abs()))
+                .unwrap();
+            let analytic = g[r][c];
+            assert!(
+                analytic.abs() > 1e-6,
+                "strongest gradient entry {analytic} is inside the FD noise floor — \
+                 the probe is vacuous; re-seed the armed vars"
+            );
             let orig = var.as_tensor().to_vec2::<f64>().unwrap();
             let loss_at = |delta: f64, model: &QwenGradModel| -> f64 {
                 let mut bent = orig.clone();
-                bent[0][0] += delta;
+                bent[r][c] += delta;
                 let rows = bent.len();
                 let cols = bent[0].len();
                 let flat: Vec<f64> = bent.into_iter().flatten().collect();
@@ -2453,6 +2470,7 @@ mod tests {
             let numeric = (loss_at(eps, &model) - loss_at(-eps, &model)) / (2.0 * eps);
             loss_at(0.0, &model); // restore the entry
             let rel = (analytic - numeric).abs() / analytic.abs().max(1e-8);
+            eprintln!("[FD gradcheck] probe ({r},{c}): analytic={analytic:e}, rel={rel:e}");
             assert!(
                 rel <= 1e-5,
                 "FD gradcheck failed: analytic={analytic}, numeric={numeric}, rel={rel}"
