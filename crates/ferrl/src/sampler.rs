@@ -36,7 +36,7 @@ use candle_core::{DType, Result as CandleResult, Tensor};
 use rand::distr::weighted::WeightedIndex;
 use rand::distr::Distribution;
 use rand::rngs::Xoshiro256PlusPlus;
-use rand::SeedableRng;
+use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 
 /// Temperature multinomial sampling on a ferrl-owned, serializable RNG.
@@ -71,6 +71,43 @@ impl GrpoSampler {
     #[must_use]
     pub fn temperature(&self) -> f64 {
         self.temperature
+    }
+
+    /// Fork `n` independent per-row RNG substreams for one batched rollout.
+    ///
+    /// Draws `n` `u64` sub-seeds from this sampler's RNG — advancing the parent
+    /// by **exactly `n` draws**, regardless of how many tokens each substream
+    /// later consumes — and seeds one child [`GrpoSampler`] per sub-seed (each
+    /// carrying this sampler's temperature). Every group row then draws **only**
+    /// from its own child, so the sampled token stream is invariant to decode
+    /// order: a batched group decode (draws interleaved across rows, one step at
+    /// a time) and a sequential one (each row drained in turn) consume the same
+    /// per-row substreams and therefore produce bit-identical sequences.
+    ///
+    /// Advancing the parent by a *fixed* `n` — rather than the variable
+    /// per-token draw count, which `WeightedIndex` rejection sampling makes
+    /// content-dependent — keeps checkpoint/resume faithful: after a `generate`
+    /// call the parent's RNG position is a function of the call count and the
+    /// per-call group sizes alone, so a resumed run re-forks identical
+    /// substreams. (A future data-parallel variant will instead seed each child
+    /// from a *global* row index, making the rollout invariant to world size and
+    /// shard layout too — the flagged per-rank-sampler item; the per-row fork
+    /// architecture here is what reduces that to a seed-source swap.)
+    ///
+    /// `seed_from_u64` runs each sub-seed through `SplitMix64`, so the children's
+    /// full 256-bit states are well separated even though the sub-seeds are
+    /// drawn in sequence.
+    #[must_use]
+    pub fn fork_substreams(&mut self, n: usize) -> Vec<GrpoSampler> {
+        (0..n)
+            .map(|_| {
+                let sub_seed = self.rng.next_u64();
+                GrpoSampler {
+                    rng: Xoshiro256PlusPlus::seed_from_u64(sub_seed),
+                    temperature: self.temperature,
+                }
+            })
+            .collect()
     }
 
     /// Serialize the full sampler state (RNG state + temperature) to an opaque byte
@@ -450,5 +487,72 @@ mod tests {
         let sa: Vec<u32> = (0..32).map(|_| a.sample(&logits).unwrap()).collect();
         let sb: Vec<u32> = (0..32).map(|_| b.sample(&logits).unwrap()).collect();
         assert_ne!(sa, sb, "distinct seeds should produce distinct streams");
+    }
+
+    /// `fork_substreams(n)` advances the parent by EXACTLY `n` RNG draws —
+    /// independent of anything the children later sample. This fixed,
+    /// content-independent advance is what keeps checkpoint/resume faithful: the
+    /// parent's post-`generate` position is a pure function of the call's group
+    /// size, not of how many tokens (EOS early-stops, rejection-sampling draws)
+    /// the rollout consumed. Pin it against `n` manual `next_u64` draws on a clone.
+    #[test]
+    fn fork_substreams_advances_parent_by_exactly_n() {
+        let mut forked = GrpoSampler::new(123, 0.7);
+        let mut manual = forked.clone();
+        let children = forked.fork_substreams(4);
+        assert_eq!(children.len(), 4);
+        for _ in 0..4 {
+            let _ = manual.rng.next_u64();
+        }
+        assert_eq!(
+            serde_json::to_vec(&forked).unwrap(),
+            serde_json::to_vec(&manual).unwrap(),
+            "fork_substreams must advance the parent by exactly n u64 draws"
+        );
+    }
+
+    /// Each forked child is an independent substream (distinct sub-seed →
+    /// distinct stream) and carries the parent's temperature. Distinct streams
+    /// are what make a batched group decode actually explore — were the children
+    /// aliased, every group member would decode the identical completion.
+    #[test]
+    fn fork_substreams_children_are_independent_and_carry_temperature() {
+        let logits = Tensor::from_vec(vec![0f32; 64], 64, &Device::Cpu).unwrap();
+        let mut parent = GrpoSampler::new(7, 0.7);
+        let mut children = parent.fork_substreams(3);
+        let streams: Vec<Vec<u32>> = children
+            .iter_mut()
+            .map(|c| {
+                assert_eq!(
+                    c.temperature(),
+                    0.7,
+                    "child must carry the parent temperature"
+                );
+                (0..12).map(|_| c.sample(&logits).unwrap()).collect()
+            })
+            .collect();
+        assert_ne!(streams[0], streams[1], "substreams 0 and 1 must differ");
+        assert_ne!(streams[1], streams[2], "substreams 1 and 2 must differ");
+        assert_ne!(streams[0], streams[2], "substreams 0 and 2 must differ");
+    }
+
+    /// Forking is deterministic: two equally-seeded parents fork children with
+    /// bit-identical streams — the property that makes a batched decode
+    /// reproducible and equal to the sequential oracle from the same seed.
+    #[test]
+    fn fork_substreams_is_deterministic() {
+        let logits = Tensor::from_vec(vec![0f32; 64], 64, &Device::Cpu).unwrap();
+        let draw = |seed: u64| -> Vec<Vec<u32>> {
+            let mut p = GrpoSampler::new(seed, 1.0);
+            p.fork_substreams(3)
+                .iter_mut()
+                .map(|c| (0..10).map(|_| c.sample(&logits).unwrap()).collect())
+                .collect()
+        };
+        assert_eq!(
+            draw(99),
+            draw(99),
+            "same seed must fork identical substreams"
+        );
     }
 }

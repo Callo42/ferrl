@@ -3614,6 +3614,171 @@ mod tests {
         }
     }
 
+    /// The group>1 rollout path: `LmPolicy::generate` decodes every group row as
+    /// ONE batch over the merged decoder, each row sampling its own divergent
+    /// token stream. A correct `GatedDeltaNet` conv/recurrent state must keep the
+    /// rows independent, so a batched decode of `g` DISTINCT streams must equal
+    /// `g` separate batch-1 decodes. This gates cross-row state leakage in the
+    /// linear-attention mixer (standard attention/MLP are trivially
+    /// row-independent; the per-row causal conv + delta-rule recurrence are the
+    /// risk). Tolerance is `MERGED_TOL` — the same cross-host gemm-reassociation
+    /// floor the batch-1 cached gates use; a leak lands far above it.
+    fn assert_batched_decode_matches_per_row(model: &Qwen3_5GradModel) {
+        let g = 3usize;
+        let len = 9usize;
+        let prefill = 5usize;
+        let d = dev();
+        // `g` distinct token streams (different progressions mod the tiny vocab).
+        let rows: Vec<Vec<u32>> = (0..g)
+            .map(|r| {
+                (0..len)
+                    .map(|i| ((i * 7 + r * 5 + 3) % 24) as u32)
+                    .collect()
+            })
+            .collect();
+
+        // Reference: each row decoded ALONE at batch 1 (prefill, then 1 token/step).
+        let mut want_rows = Vec::with_capacity(g);
+        for row in &rows {
+            let mut dec = model.merged_decoder().unwrap();
+            let full = Tensor::from_vec(row.clone(), (1, len), &d).unwrap();
+            let mut got = vec![dec
+                .forward(&full.narrow(1, 0, prefill).unwrap(), 0)
+                .unwrap()];
+            for t in prefill..len {
+                got.push(dec.forward(&full.narrow(1, t, 1).unwrap(), t).unwrap());
+            }
+            want_rows.push(Tensor::cat(&got, 1).unwrap()); // [1, len, vocab]
+        }
+        let want = Tensor::cat(&want_rows, 0).unwrap(); // [g, len, vocab]
+
+        // Under test: all `g` rows decoded together as one batch, same prefill+steps.
+        let mut dec = model.merged_decoder().unwrap();
+        let pre: Vec<u32> = rows.iter().flat_map(|r| r[..prefill].to_vec()).collect();
+        let mut got = vec![dec
+            .forward(&Tensor::from_vec(pre, (g, prefill), &d).unwrap(), 0)
+            .unwrap()];
+        for t in prefill..len {
+            let step: Vec<u32> = rows.iter().map(|r| r[t]).collect();
+            got.push(
+                dec.forward(&Tensor::from_vec(step, (g, 1), &d).unwrap(), t)
+                    .unwrap(),
+            );
+        }
+        let batched = Tensor::cat(&got, 1).unwrap(); // [g, len, vocab]
+
+        let diff = max_abs_diff(&want, &batched);
+        assert!(
+            diff <= MERGED_TOL,
+            "batched group decode diverged from per-row single decode: {diff}"
+        );
+    }
+
+    #[test]
+    fn batched_decode_equals_per_row_single_decode_dense() {
+        assert_batched_decode_matches_per_row(&armed_model());
+    }
+
+    #[test]
+    fn batched_decode_equals_per_row_single_decode_moe() {
+        assert_batched_decode_matches_per_row(&armed_moe_model());
+    }
+
+    /// The RETIREMENT path on the `GatedDeltaNet` batch: `LmPolicy::generate` keeps
+    /// an EOS-retired row in the batch, feeding it the EOS pad each later step while
+    /// its siblings keep decoding. A correct per-row conv/recurrent state must make
+    /// that pad feed invisible to the still-active rows. Here row 0 "retires" at a
+    /// decode step (fed a fixed pad id thereafter) while the sibling rows decode their
+    /// real tokens; each ACTIVE row's batched logits must still match its batch-1
+    /// reference (within `MERGED_TOL`). A cross-row leak from the retired row's pad
+    /// feed lands far above it — this is the full-width
+    /// `assert_batched_decode_matches_per_row` extended to the pad-feed path the
+    /// batched rollout actually exercises under early EOS.
+    #[allow(clippy::cognitive_complexity)]
+    fn assert_active_rows_unaffected_by_retirement(model: &Qwen3_5GradModel) {
+        let g = 3usize;
+        let len = 9usize;
+        let prefill = 4usize;
+        let retire_row = 0usize;
+        let retire_at = 6usize; // > prefill: row 0 is fed `pad` only during decode
+        let pad = 23u32; // an arbitrary in-vocab id (tiny vocab = 24) — the EOS pad
+        let dv = dev();
+        let rows: Vec<Vec<u32>> = (0..g)
+            .map(|r| {
+                (0..len)
+                    .map(|i| ((i * 7 + r * 5 + 3) % 24) as u32)
+                    .collect()
+            })
+            .collect();
+
+        // Reference: each ACTIVE row decoded ALONE at batch 1 with its REAL tokens.
+        let want: Vec<Option<Tensor>> = rows
+            .iter()
+            .enumerate()
+            .map(|(r, row)| {
+                if r == retire_row {
+                    return None;
+                }
+                let mut dec = model.merged_decoder().unwrap();
+                let full = Tensor::from_vec(row.clone(), (1, len), &dv).unwrap();
+                let mut got = vec![dec
+                    .forward(&full.narrow(1, 0, prefill).unwrap(), 0)
+                    .unwrap()];
+                for t in prefill..len {
+                    got.push(dec.forward(&full.narrow(1, t, 1).unwrap(), t).unwrap());
+                }
+                Some(Tensor::cat(&got, 1).unwrap())
+            })
+            .collect();
+
+        // Batched: row 0 retires at `retire_at` (fed `pad` after); siblings real
+        // throughout. `retire_at > prefill`, so the prefill is all real tokens.
+        let mut dec = model.merged_decoder().unwrap();
+        let pre: Vec<u32> = rows.iter().flat_map(|r| r[..prefill].to_vec()).collect();
+        let mut got = vec![dec
+            .forward(&Tensor::from_vec(pre, (g, prefill), &dv).unwrap(), 0)
+            .unwrap()];
+        for t in prefill..len {
+            let step: Vec<u32> = rows
+                .iter()
+                .enumerate()
+                .map(|(r, row)| {
+                    if r == retire_row && t >= retire_at {
+                        pad
+                    } else {
+                        row[t]
+                    }
+                })
+                .collect();
+            got.push(
+                dec.forward(&Tensor::from_vec(step, (g, 1), &dv).unwrap(), t)
+                    .unwrap(),
+            );
+        }
+        let batched = Tensor::cat(&got, 1).unwrap(); // [g, len, vocab]
+
+        // Each ACTIVE row must match its batch-1 reference despite row 0's pad feed.
+        for (r, slot) in want.iter().enumerate() {
+            if let Some(reference) = slot {
+                let diff = max_abs_diff(reference, &batched.narrow(0, r, 1).unwrap());
+                assert!(
+                    diff <= MERGED_TOL,
+                    "active row {r} perturbed by the retired row's EOS-pad feed: {diff}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn retired_row_pad_feed_does_not_perturb_active_rows_dense() {
+        assert_active_rows_unaffected_by_retirement(&armed_model());
+    }
+
+    #[test]
+    fn retired_row_pad_feed_does_not_perturb_active_rows_moe() {
+        assert_active_rows_unaffected_by_retirement(&armed_moe_model());
+    }
+
     #[test]
     fn offset_mismatch_is_rejected_and_state_untouched() {
         let model = armed_model();
