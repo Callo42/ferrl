@@ -34,8 +34,8 @@
 //! at a time — rollout is 80–90 % of RL wall-clock, and the old per-sequence
 //! loop left a ~`group_size`× throughput factor unbatched. To keep the sampled
 //! stream invariant to that batching, each row draws from its **own** RNG
-//! substream forked from the policy sampler
-//! ([`GrpoSampler::fork_substreams`](crate::sampler::GrpoSampler::fork_substreams)):
+//! substream forked from the policy sampler by global row index
+//! ([`GrpoSampler::fork_substreams_at`](crate::sampler::GrpoSampler::fork_substreams_at)):
 //! a row's tokens depend only on its substream, never on whether the group is
 //! decoded together or one row at a time. That invariance is what the CI
 //! batch-invariance gates check, in two regimes. For the **dense-attention**
@@ -296,8 +296,8 @@ impl<M: GradModel> LmPolicy<M> {
     }
 
     /// The **sequential, uncached** rollout oracle: fork the SAME per-row
-    /// substreams [`generate`](Self::generate) forks (advancing the policy
-    /// sampler by exactly `group_size`), then decode each row independently at
+    /// substreams [`generate`](Self::generate) forks (at global row base 0), then
+    /// decode each row independently at
     /// batch 1 by re-running the full-sequence [`GradModel::forward`] every step.
     /// Because each row draws only from its own substream, this sequential decode
     /// reproduces the batched, cached `generate` **bit-for-bit** — same token
@@ -319,11 +319,11 @@ impl<M: GradModel> LmPolicy<M> {
         let device = self.model.device().clone();
         let prompt_len = prompt.len();
         let width = prompt_len + cfg.max_new_tokens;
-        // Fork the per-row substreams in the same order `generate` does (advancing
-        // the policy sampler by exactly `group_size`); row r is driven solely by its
-        // own substream, so decoding sequentially here vs batched there cannot change
-        // the sampled stream.
-        let mut substreams = self.sampler.fork_substreams(cfg.group_size);
+        // Fork the per-row substreams exactly as `generate` does at base 0 (each row
+        // seeded by its global index); row r is driven solely by its own substream, so
+        // decoding sequentially here vs batched in `generate` cannot change the sampled
+        // stream.
+        let mut substreams = self.sampler.fork_substreams_at(0, cfg.group_size);
         let mut token_ids = Vec::with_capacity(cfg.group_size);
         let mut completion_lens = Vec::with_capacity(cfg.group_size);
         let mut rollout_logprobs = Vec::with_capacity(cfg.group_size);
@@ -516,6 +516,17 @@ fn batched_group_decode<D: CachedDecoder>(
 
 impl<M: GradModel> Policy for LmPolicy<M> {
     fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
+        // The `global_row_base = 0` convenience; the trainer drives the
+        // world-invariant path through `generate_at`.
+        self.generate_at(prompt, cfg, 0)
+    }
+
+    fn generate_at(
+        &mut self,
+        prompt: &[u32],
+        cfg: &GenConfig,
+        global_row_base: u64,
+    ) -> CandleResult<Rollout> {
         let (temperature, top_p) = self.resolve_sampling(cfg)?;
         let device = self.model.device().clone();
         let prompt_len = prompt.len();
@@ -529,12 +540,15 @@ impl<M: GradModel> Policy for LmPolicy<M> {
             .model
             .merged_decoder()
             .map_err(crate::cuda_compat::translate_ptx_error)?;
-        // Per-row independent RNG substreams (advances the policy sampler by exactly
-        // `group_size`): each row draws ONLY from its own substream, so the sampled
-        // stream is invariant to decode order — this batched decode and the sequential
-        // `generate_uncached` oracle produce bit-identical groups. See
-        // `GrpoSampler::fork_substreams`.
-        let mut substreams = self.sampler.fork_substreams(cfg.group_size);
+        // Per-row independent RNG substreams seeded by GLOBAL row index
+        // (`global_row_base + row`): each row draws ONLY from its own substream, so
+        // the sampled stream is invariant both to decode order (this batched decode
+        // and the sequential `generate_uncached` oracle produce bit-identical groups)
+        // AND to data-parallel shard layout (a world-W run reproduces the
+        // single-process draws). See `GrpoSampler::fork_substreams_at`.
+        let mut substreams = self
+            .sampler
+            .fork_substreams_at(global_row_base, cfg.group_size);
         let (token_ids, completion_lens, rollout_logprobs) = batched_group_decode(
             &mut decoder,
             &mut substreams,
@@ -745,6 +759,40 @@ mod tests {
         (build(), build())
     }
 
+    /// `generate_at` forks its substreams from the GLOBAL row base via `&self`,
+    /// drawing nothing from the policy sampler, so a given global index's rollout
+    /// is a pure function of `(run seed, global index)` — independent of what
+    /// other rollouts (other prompts, other data-parallel ranks) run before it.
+    /// That call-order independence on a shared-seed policy IS the world-size /
+    /// shard-layout invariance: rank `r`'s prompt at global index `g` samples
+    /// exactly what a single-process run would at `g` (the DP rollout-invariance
+    /// property closed by global-index seeding).
+    #[test]
+    fn generate_at_rollout_is_invariant_to_call_order() {
+        let mut policy = tiny_policy();
+        let cfg = GenConfig {
+            group_size: 3,
+            max_new_tokens: 5,
+            temperature: 1.0,
+            eos_token_id: None,
+            eval_sampling: None,
+        };
+        let prompt = [1u32, 2, 3];
+        let base = 8u64 * cfg.group_size as u64; // global prompt index 8
+        let first = policy.generate_at(&prompt, &cfg, base).unwrap().token_ids;
+        // Interleave unrelated rollouts, as other ranks / other prompts would...
+        let _ = policy.generate_at(&prompt, &cfg, 0).unwrap();
+        let _ = policy
+            .generate_at(&[2u32, 1], &cfg, 50 * cfg.group_size as u64)
+            .unwrap();
+        // ...the global-index-8 rollout is byte-for-byte unchanged.
+        let again = policy.generate_at(&prompt, &cfg, base).unwrap().token_ids;
+        assert_eq!(
+            first, again,
+            "generate_at(g) must not depend on intervening rollouts (shard-invariant)"
+        );
+    }
+
     #[test]
     fn generate_returns_rectangular_group() {
         let mut policy = tiny_policy();
@@ -932,10 +980,11 @@ mod tests {
     }
 
     /// The P6-C cached-rollout equivalence gate: the cached [`generate`] must
-    /// reproduce the uncached oracle's token stream **and** consume an identical
-    /// amount of sampler RNG (same draw count — which the RNG-state equality proves,
-    /// since each draw advances the RNG a fixed amount regardless of the token). Runs
-    /// both paths from the *same* saved sampler state on one policy. Generic
+    /// reproduce the uncached oracle's token stream bit-for-bit. Both paths fork
+    /// per-row substreams from the same global indices (base 0), so the streams must
+    /// match; and since global-index forking is a pure `&self` operation, neither
+    /// path mutates the parent sampler — both leave it at the saved start state.
+    /// Runs both paths from the *same* saved sampler state on one policy. Generic
     /// over the model — the Llama gates below reuse it verbatim.
     fn assert_cached_matches_uncached<M: GradModel>(
         policy: &mut LmPolicy<M>,
@@ -959,14 +1008,19 @@ mod tests {
             "cached rollout completion_lens diverged from the uncached oracle"
         );
         assert_eq!(cached.prompt_len, uncached.prompt_len);
-        // Under the per-row-substream design both paths advance the POLICY sampler
-        // by exactly `group_size` (the single `fork_substreams` call); the per-token
-        // draws happen on the child substreams. So this pins that the fixed-n parent
-        // advance matches (also covered by `fork_substreams_advances_parent_by_exactly_n`);
+        // Under the global-index per-row-substream design, forking is a pure
+        // function of the parent's fixed seed (`fork_substreams_at` takes `&self`),
+        // so NEITHER path advances the policy sampler — both leave it byte-for-byte
+        // at `start`. That zero-mutation is what makes resume re-derive identical
+        // substreams from the run seed alone (no per-row RNG state to capture);
         // per-row draw-count parity is what the `token_ids` equality above proves.
         assert_eq!(
-            after_cached, after_uncached,
-            "cached and uncached paths advanced the policy sampler differently"
+            after_cached, start,
+            "cached generate must not mutate the policy sampler (global-index forking is pure)"
+        );
+        assert_eq!(
+            after_uncached, start,
+            "uncached generate must not mutate the policy sampler (global-index forking is pure)"
         );
         assert_rollout_logprobs_close(&cached, &uncached);
     }
@@ -1148,10 +1202,13 @@ mod tests {
         assert_eq!(r.len(), 3);
         assert_eq!(r.completion_lens, vec![4; 3]);
         assert!(r.rollout_logprobs.is_some(), "override path still captures");
-        assert_ne!(
+        // Global-index seeding forks substreams via `&self`, so generate — the
+        // override path included — does NOT mutate the shared sampler; that purity
+        // is the resume guarantee (the run seed alone re-derives every draw).
+        assert_eq!(
             before,
             policy.sampler_state().unwrap(),
-            "override sampling must advance the shared RNG"
+            "override sampling must not mutate the shared sampler (global-index forking is pure)"
         );
 
         // Without the override the same mismatched temperature fails loud.
@@ -1706,7 +1763,15 @@ mod tests {
 
     impl<P: Policy> Policy for ShiftedCapture<P> {
         fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
-            let mut r = self.inner.generate(prompt, cfg)?;
+            self.generate_at(prompt, cfg, 0)
+        }
+        fn generate_at(
+            &mut self,
+            prompt: &[u32],
+            cfg: &GenConfig,
+            global_row_base: u64,
+        ) -> CandleResult<Rollout> {
+            let mut r = self.inner.generate_at(prompt, cfg, global_row_base)?;
             if let Some(rows) = &mut r.rollout_logprobs {
                 for row in rows {
                     for lp in row {

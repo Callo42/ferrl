@@ -10,9 +10,12 @@
 //!    impossible *by construction* and the gate is a measured reassociation
 //!    envelope (the `frozen_linear` / P6-C class). The policies here are
 //!    **deterministic** (scripted rollouts that are a pure function of the
-//!    prompt, real `LoRA` gradients): a stream sampler cannot reproduce the
-//!    single run's draws across a different sharding, so determinism is what
-//!    isolates the envelope to gradient arithmetic alone.
+//!    prompt, real `LoRA` gradients) — a deliberate simplification that isolates
+//!    the envelope to gradient arithmetic alone. (A *stochastic* sampler is now
+//!    shard-invariant too: substreams seed from the **global row index**, so a
+//!    world-W rollout reproduces the single-process draws — gated directly in
+//!    `sampler` / `lm_policy`. These gradient gates keep deterministic rollouts
+//!    only to keep the arithmetic the sole variable.)
 //! 2. **Ranks ≡ each other, bitwise.** Whatever the rollouts, every rank steps
 //!    from the identical reduced gradient, so the world's weights stay in
 //!    bitwise lockstep — gated on the REAL tiny-qwen3.5 fixture in BOTH
@@ -25,7 +28,10 @@
 //! (the rank participates with zeros — the live-count decision is global);
 //! an all-degenerate **global** window is skipped by every rank in lockstep;
 //! and checkpointing is rank-0-only, with a DP resume continuing bit-exactly
-//! (deterministic policies, so the rank-0 sampler-blob caveat is moot).
+//! (deterministic policies here; and under global-index seeding the rank-0
+//! sampler-blob is anyway sufficient — a stochastic resume re-derives every
+//! rank's per-row draws from the restored run seed and the recomputed global
+//! index, with no per-rank RNG state to capture).
 
 use candle_core::{DType, Device, Result as CandleResult, Tensor, Var, D};
 use candle_nn::ops::log_softmax;

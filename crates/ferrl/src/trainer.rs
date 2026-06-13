@@ -592,14 +592,14 @@ impl Trainer {
     /// `frac_truncated`, and the `rollout_*` off-policy telemetry — describes
     /// the rank's **local shard**. Checkpoints are written by rank 0 only —
     /// to resume, every rank loads rank 0's checkpoint directory (weights and
-    /// optimizer moments are rank-identical by lockstep; the rollout-sampler
-    /// RNG blob is rank 0's, so a resumed run with a *stochastic* policy is a
-    /// faithful continuation rather than a bit-exact replay of what the
-    /// uninterrupted world would have sampled on the nonzero ranks — and
-    /// since every rank restores the SAME blob, ranks seeded differently for
-    /// rollout diversity become stream-correlated from the resume point on.
-    /// Bit-exact, diversity-preserving DP resume needs per-rank sampler
-    /// state, a planned follow-up of the multi-process phase).
+    /// optimizer moments are rank-identical by lockstep; rank 0's rollout-sampler
+    /// RNG blob is now SUFFICIENT for a bit-exact stochastic resume. Under
+    /// global-index substream seeding every rank shares one `base_seed` and a
+    /// row's draws are a pure function of `(base_seed, global row index)`
+    /// ([`Policy::generate_at`]), so a resumed run re-derives every rank's exact
+    /// rollout from the restored seed and the recomputed step — rollout diversity
+    /// comes from the global index, not per-rank seeds, so no per-rank sampler
+    /// state is needed (this closed the former per-rank-sampler follow-up)).
     ///
     /// # Errors
     ///
@@ -857,9 +857,20 @@ impl Trainer {
             // the window a single-rank run at the global accumulation count
             // consumes (the DP sharding contract the equivalence oracle pins).
             // At world 1 this is the legacy `step*accum + j`.
-            let idx =
-                (step as usize * accum * world + self.comm.rank() * accum + j) % prompts.len();
-            let (stat, item) = self.collect_prompt(policy, reward_fn, tokenizer, &prompts[idx])?;
+            // The prompt's GLOBAL ordinal in the flattened rollout stream — the same
+            // for a given (step, window position) regardless of world size / rank, so
+            // seeding the rollout by it (in `collect_prompt`) makes a world-W run
+            // reproduce the single-process draws. `idx` (mod len) selects which prompt;
+            // `g` (unbounded) seeds it, so re-cycling the dataset across windows still
+            // gives fresh per-window rollout RNG.
+            let local = self.comm.rank() * accum + j;
+            // `g` (u64, the seed base) and `idx` (usize) use the same plain
+            // arithmetic; for any real run neither overflows, so they stay
+            // consistent by construction.
+            let g = step * (accum * world) as u64 + local as u64;
+            let idx = (step as usize * (accum * world) + local) % prompts.len();
+            let (stat, item) =
+                self.collect_prompt(policy, reward_fn, tokenizer, &prompts[idx], g)?;
             stats.push(stat);
             if let Some(item) = item {
                 live.push(item);
@@ -959,6 +970,7 @@ impl Trainer {
         reward_fn: &R,
         tokenizer: &dyn TokenizerLike,
         prompt: &str,
+        global_prompt_index: u64,
     ) -> Result<(PromptStat, Option<LiveItem>), TrainerError> {
         // Rollout with the adapter on, then score it.
         policy.set_adapter_enabled(true);
@@ -980,7 +992,12 @@ impl Trainer {
             eos_token_id: self.config.eos_token_id,
             eval_sampling: None,
         };
-        let rollout = policy.generate(&prompt_ids, &gen)?;
+        // Seed the rollout's per-row substreams from this prompt's GLOBAL row base
+        // (its ordinal in the flattened world-global stream × group_size), so the
+        // sampled tokens are invariant to the data-parallel shard layout and a resume
+        // re-derives them — see `Policy::generate_at`.
+        let global_row_base = global_prompt_index.wrapping_mul(self.config.group_size as u64);
+        let rollout = policy.generate_at(&prompt_ids, &gen, global_row_base)?;
         // Validate the rollout BEFORE decoding/scoring it: completion_dims rejects
         // an empty, ragged, or shorter-than-prompt rollout (and a misaligned
         // behavior-log-prob capture), so the decode slice `ids[prompt_len..]`
