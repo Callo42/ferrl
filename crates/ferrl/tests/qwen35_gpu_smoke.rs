@@ -3,9 +3,10 @@
 //! The CPU suites validate the hybrid forward at F32, where the fp32
 //! boundaries the reference mandates (delta-rule state/gates, attention
 //! softmax) are same-dtype casts — op-free clones, structurally absent from
-//! the graph. These gates run the **real** `Qwen3.5-0.8B-Base` checkpoint at
-//! **bf16 on CUDA**, where every one of those boundaries becomes a real
-//! `ToDType` node and the candle CUDA bf16 kernels actually execute:
+//! the graph. These gates run a **real, staged** dense qwen3.5/3.6 checkpoint
+//! (0.8B / 9B / 27B …, read from its `config.json`) at **bf16 on CUDA**, where
+//! every one of those boundaries becomes a real `ToDType` node and the candle
+//! CUDA bf16 kernels actually execute:
 //!
 //! 1. **bf16 logit fidelity vs the fp32 transformers dump**
 //!    (`qwen35_bf16_forward_matches_reference_on_gpu`): argmax agreement +
@@ -47,7 +48,7 @@ const ALPHA: f64 = 16.0;
 
 fn weights_dir() -> PathBuf {
     PathBuf::from(std::env::var("FERRL_QWEN35_WEIGHTS").expect(
-        "set FERRL_QWEN35_WEIGHTS to the Qwen3.5-0.8B-Base asset directory to run the GPU smoke",
+        "set FERRL_QWEN35_WEIGHTS to a staged dense qwen3.5/3.6 asset directory to run the GPU smoke",
     ))
 }
 
@@ -169,6 +170,20 @@ fn branch_split(cfg: &Qwen3_5Config, vars: &[Var]) -> (Vec<Var>, Vec<Var>) {
     (attn, mlp)
 }
 
+/// The default-recipe `LoRA` var count for a *dense* member, derived from the
+/// staged config: MLP (3 projections) on every layer + attention (4
+/// projections) on the full-attention layers, 2 vars (A, B) per projection.
+/// The config-driven generalization of the old 0.8B-hardcoded `(24*3 + 6*4)*2`
+/// (192 on 0.8B, 256 on 9B), so the gate scales to 9B/27B without an edit.
+fn expected_default_var_count(cfg: &Qwen3_5Config) -> usize {
+    let kinds = cfg.text_config.resolved_layer_types();
+    let n_full = kinds
+        .iter()
+        .filter(|k| **k == LayerType::FullAttention)
+        .count();
+    (kinds.len() * 3 + n_full * 4) * 2
+}
+
 /// A reward that spreads across distinct completions (position-weighted so
 /// byte-multiset collisions don't collapse the group).
 struct SpreadReward;
@@ -204,12 +219,12 @@ impl Drop for TempDir {
 }
 
 #[test]
-#[ignore = "needs the staged 0.8B checkpoint + oracle dumps + a CUDA build/GPU"]
+#[ignore = "needs a staged dense qwen3.5/3.6 checkpoint + oracle dumps + a CUDA build/GPU"]
 #[allow(clippy::print_stderr)] // a manual gate: the printed agreement/diff numbers are the deliverable
 fn qwen35_bf16_forward_matches_reference_on_gpu() {
     // Gate 1: bf16 GPU logits vs the fp32 transformers dump — crossing
     // implementation, device, and dtype at once. The envelope is set by
-    // bf16's ~2^-8 relative rounding over 24 hybrid layers; a broken fp32
+    // bf16's ~2^-8 relative rounding over the model's hybrid layers; a broken fp32
     // boundary (state kept in bf16, softmax in bf16) or a CUDA-kernel-family
     // break lands comparable to the logit scale.
     let t0 = Instant::now();
@@ -250,7 +265,7 @@ fn qwen35_bf16_forward_matches_reference_on_gpu() {
 }
 
 #[test]
-#[ignore = "needs the staged 0.8B checkpoint + oracle dumps + a CUDA build/GPU"]
+#[ignore = "needs a staged dense qwen3.5/3.6 checkpoint + oracle dumps + a CUDA build/GPU"]
 fn qwen35_bf16_dtype_split_grads_on_gpu() {
     // Gate 2: the ToDType backward. Under bf16, the delta-rule F32
     // state/gate boundaries, the softmax round-trip, AND the adapter's
@@ -261,7 +276,7 @@ fn qwen35_bf16_dtype_split_grads_on_gpu() {
     let mut model = load_bf16(&device);
     model.set_adapter_enabled(true);
     let vars = model.trainable_vars();
-    assert_eq!(vars.len(), (24 * 3 + 6 * 4) * 2);
+    assert_eq!(vars.len(), expected_default_var_count(&cfg));
     let (attn_vars, mlp_vars) = branch_split(&cfg, &vars);
 
     let dump = load_oracle();
@@ -327,7 +342,7 @@ fn qwen35_bf16_dtype_split_grads_on_gpu() {
 }
 
 #[test]
-#[ignore = "needs the staged 0.8B checkpoint + oracle dumps + a CUDA build/GPU"]
+#[ignore = "needs a staged dense qwen3.5/3.6 checkpoint + oracle dumps + a CUDA build/GPU"]
 #[allow(clippy::print_stderr)] // a manual gate: the printed agreement/diff numbers are the deliverable
 fn qwen35_merged_decoder_bf16_faithfulness_on_gpu() {
     // Gate 3: bf16 merged-STATE fidelity. The hybrid decoder's state is not
@@ -402,7 +417,7 @@ fn qwen35_merged_decoder_bf16_faithfulness_on_gpu() {
 }
 
 #[test]
-#[ignore = "needs the staged 0.8B checkpoint + oracle dumps + a CUDA build/GPU"]
+#[ignore = "needs a staged dense qwen3.5/3.6 checkpoint + oracle dumps + a CUDA build/GPU"]
 fn qwen35_policy_grpo_smoke_on_gpu() {
     // Gate 4: one short GRPO run driving `Qwen3_5Policy` through the UNCHANGED
     // generic `Trainer` on CUDA — cached hybrid rollout -> reward ->
