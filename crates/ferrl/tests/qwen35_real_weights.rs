@@ -1,12 +1,16 @@
 //! Real-weights M2′ gates for the `qwen3_5` forward (`#[ignore]`d).
 //!
-//! These scale the committed tiny-oracle gates to the **real**
-//! `Qwen3.5-0.8B-Base` checkpoint. candle ships no `qwen3_5`, so the
-//! reference is the pinned transformers oracle itself: fp32 per-position
-//! logits dumped on the cluster by `scripts/oracle/dump_qwen35_real_logits.py`
-//! (`ferrl-oracle` env — transformers 5.11.0, CPU torch 2.12.0), staged next
-//! to the checkpoint, never committed (the 248 320-wide vocab rules out JSON
-//! fixtures). Run by hand with both staged:
+//! These scale the committed tiny-oracle gates to a **real, staged** qwen3.5/3.6
+//! **dense** checkpoint. candle ships no `qwen3_5`, so the reference is the
+//! pinned transformers oracle itself: fp32 per-position logits dumped on the
+//! cluster by `scripts/oracle/dump_qwen35_real_logits.py` (`ferrl-oracle` env —
+//! transformers 5.11.0, CPU torch 2.12.0), staged next to the checkpoint, never
+//! committed (the 248 320-wide vocab rules out JSON fixtures).
+//!
+//! The gate is **geometry-agnostic**: it reads the staged `config.json` and
+//! validates whatever dense family member the env vars point at (0.8B / 9B /
+//! 27B …) against that checkpoint's *paired* oracle dump. Run by hand with a
+//! member and its dump both staged (0.8B shown):
 //!
 //! ```text
 //! FERRL_QWEN35_WEIGHTS=/path/to/qwen3_5-0.8b-base \
@@ -14,13 +18,17 @@
 //!     cargo test -p ferrl --test qwen35_real_weights -- --ignored --test-threads=1
 //! ```
 //!
-//! `--test-threads=1` keeps at most one f32 copy of the 0.8B weights resident.
+//! `--test-threads=1` keeps at most one f32 copy of the weights resident — the
+//! larger the member, the more this matters.
 //!
-//! What this exercises that the tiny gates cannot: the real geometry (24
-//! layers 3:1, 16==16 delta-rule heads → NO GVA broadcast, 8Q/2KV `head_dim`
-//! 256, partial rotary 64/256 at theta 1e7, the 248 320-row tied embedding
-//! head), the real single-shard-with-index checkpoint layout, and the real
-//! tokenizer.
+//! What this exercises that the tiny gates cannot: the real geometry and the
+//! real single- / multi-shard-with-index checkpoint layout and tokenizer. The
+//! size-specific traps differ across the family and are read from the config,
+//! not hardcoded — e.g. the 0.8B is a tied-embedding model with 16==16
+//! delta-rule heads (NO GVA broadcast) over 24 layers 3:1, whereas the 9B is
+//! untied with 32/16 delta-rule heads (GVA broadcast active) over 32 layers —
+//! both at `head_dim` 256 with partial rotary 64/256. The forward-equivalence
+//! assertions catch any parity break on whichever member is staged.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -57,8 +65,8 @@ const MERGED_TOL: f32 = 1e-3;
 
 fn weights_dir() -> PathBuf {
     PathBuf::from(std::env::var("FERRL_QWEN35_WEIGHTS").expect(
-        "set FERRL_QWEN35_WEIGHTS to the Qwen3.5-0.8B-Base asset directory \
-         (config.json + model.safetensors.index.json + shards + tokenizer.json) \
+        "set FERRL_QWEN35_WEIGHTS to a staged dense qwen3.5/3.6 asset directory \
+         (config.json + model.safetensors[.index.json] + shards + tokenizer.json) \
          to run the ignored real-weights gates",
     ))
 }
@@ -87,45 +95,53 @@ fn oracle_ids(dump: &HashMap<String, Tensor>, i: usize) -> Vec<u32> {
         .unwrap()
 }
 
-/// Assert `cfg` really is the 0.8B-Base geometry — the parity-relevant traps.
-fn assert_0_8b_shape(cfg: &Qwen3_5Config) {
-    let t = &cfg.text_config;
-    assert_eq!(
-        (
-            t.hidden_size,
-            t.num_hidden_layers,
-            t.num_attention_heads,
-            t.num_key_value_heads,
-            t.head_dim,
-            t.vocab_size,
-        ),
-        (1024, 24, 8, 2, 256, 248_320),
-        "not the Qwen3.5-0.8B-Base geometry"
+/// Guard that the staged checkpoint is a member this gate can validate: a
+/// **dense** qwen3.5/3.6 family member.
+///
+/// `Qwen3_5Config::from_json_file` already fails loud on any structurally
+/// invalid or non-family config — `model_type`, head divisibility, rotary
+/// integrality, the outer/text tie-flag agreement, the dense-vs-`MoE` field
+/// menu — so the size-specific geometry the old per-size guard pinned (hidden
+/// size, layer/head counts, the tie flag, the GVA ratio) is both redundant for
+/// correctness and *wrong* for 9B/27B (untied head, GVA broadcast, more
+/// layers). What stays gate-specific is the **dense**
+/// assumption: the var-count formula and `branch_split` below count 3 MLP
+/// projections per layer, which holds only for dense members — the `MoE`
+/// family (M3′ track) has its own gate. The forward-equivalence assertions
+/// then bind the run to whatever member is staged, against its paired oracle
+/// dump.
+fn assert_dense_family_member(cfg: &Qwen3_5Config) {
+    assert!(
+        cfg.text_config.moe().is_none(),
+        "this gate validates the DENSE qwen3.5/3.6 forward, but the staged checkpoint is an \
+         MoE member (num_experts present) — use the MoE gate instead"
     );
-    assert_eq!(t.rotary_dim(), 64);
-    assert!(t.tie_word_embeddings);
-    // 16 == 16: no GVA broadcast on the real model (the tiny fixture covers
-    // the broadcast; here the ratio must resolve to 1).
-    assert_eq!(t.linear_num_value_heads, 16);
-    assert_eq!(t.linear_num_key_heads, 16);
-    assert_0_8b_layer_pattern(cfg);
+    assert_eq!(
+        cfg.text_config.resolved_layer_types().len(),
+        cfg.text_config.num_hidden_layers,
+        "resolved layer-type count must equal num_hidden_layers"
+    );
 }
 
-/// The 3:1 layer pattern half of [`assert_0_8b_shape`].
-fn assert_0_8b_layer_pattern(cfg: &Qwen3_5Config) {
+/// The default-recipe `LoRA` var count for a *dense* member, derived from the
+/// staged config: MLP (3 projections) on every layer + attention (4
+/// projections) on the full-attention layers, 2 vars (A, B) per projection.
+/// The config-driven generalization of the old 0.8B-hardcoded
+/// `(24*3 + 6*4)*2` — it resolves to 192 on the 0.8B (24 layers, 6 full), 256
+/// on the 9B (32 layers, 8 full), and to 27B without an edit.
+fn expected_default_var_count(cfg: &Qwen3_5Config) -> usize {
     let kinds = cfg.text_config.resolved_layer_types();
-    assert_eq!(kinds.len(), 24);
-    let full = kinds
+    let n_full = kinds
         .iter()
         .filter(|k| **k == LayerType::FullAttention)
         .count();
-    assert_eq!(full, 6);
+    (kinds.len() * 3 + n_full * 4) * 2
 }
 
 fn load_model() -> (Qwen3_5Config, Qwen3_5GradModel) {
     let dir = weights_dir();
     let cfg = Qwen3_5Config::from_json_file(dir.join("config.json")).expect("parse config.json");
-    assert_0_8b_shape(&cfg);
+    assert_dense_family_member(&cfg);
     // f32 upcast on load (bf16 on disk); the bf16 path is the GPU gate.
     let vb = varbuilder_from_pretrained(&dir, DType::F32, &Device::Cpu).expect("load weights");
     let model = Qwen3_5GradModel::load(&cfg, &vb, RANK, ALPHA).expect("build model");
@@ -151,7 +167,7 @@ fn max_abs(a: &Tensor, b: &Tensor) -> f32 {
 }
 
 #[test]
-#[ignore = "needs the staged 0.8B checkpoint + oracle dumps (FERRL_QWEN35_WEIGHTS/_ORACLE)"]
+#[ignore = "needs a staged dense qwen3.5/3.6 checkpoint + oracle dumps (FERRL_QWEN35_WEIGHTS/_ORACLE)"]
 #[allow(clippy::print_stderr)] // a manual gate: the measured worst divergence is the deliverable
 fn real_forward_matches_reference_every_position() {
     let (_cfg, mut model) = load_model();
@@ -205,7 +221,7 @@ fn real_forward_matches_reference_every_position() {
 }
 
 #[test]
-#[ignore = "needs the staged 0.8B checkpoint + oracle dumps (FERRL_QWEN35_WEIGHTS/_ORACLE)"]
+#[ignore = "needs a staged dense qwen3.5/3.6 checkpoint + oracle dumps (FERRL_QWEN35_WEIGHTS/_ORACLE)"]
 #[allow(clippy::print_stderr)] // a manual gate: the measured worst divergence is the deliverable
 fn real_merged_decoder_matches_uncached() {
     // Prefill -> multi-token continuation at an offset -> single-token decode,
@@ -243,14 +259,15 @@ fn real_merged_decoder_matches_uncached() {
 }
 
 #[test]
-#[ignore = "needs the staged 0.8B checkpoint + oracle dumps (FERRL_QWEN35_WEIGHTS/_ORACLE)"]
+#[ignore = "needs a staged dense qwen3.5/3.6 checkpoint + oracle dumps (FERRL_QWEN35_WEIGHTS/_ORACLE)"]
 fn real_lora_grads_flow_through_qwen35_backward() {
     let (cfg, mut model) = load_model();
     model.set_adapter_enabled(true);
     let vars = model.trainable_vars();
-    // Default recipe: MLP (3 projs) on all 24 layers + attention (4 projs) on
-    // the 6 full layers; 2 vars per projection.
-    assert_eq!(vars.len(), (24 * 3 + 6 * 4) * 2);
+    // Default recipe: MLP (3 projs) on every layer + attention (4 projs) on the
+    // full-attention layers; 2 vars per projection. Derived from the staged
+    // config so it holds for any dense member (192 on 0.8B, 256 on 9B).
+    assert_eq!(vars.len(), expected_default_var_count(&cfg));
     let (attn_vars, mlp_vars) = branch_split(&cfg, &vars);
 
     let dump = load_oracle();
@@ -284,7 +301,7 @@ fn real_lora_grads_flow_through_qwen35_backward() {
 }
 
 #[test]
-#[ignore = "needs the staged 0.8B checkpoint + oracle dumps (FERRL_QWEN35_WEIGHTS/_ORACLE)"]
+#[ignore = "needs a staged dense qwen3.5/3.6 checkpoint + oracle dumps (FERRL_QWEN35_WEIGHTS/_ORACLE)"]
 fn real_tokenizer_round_trips_and_matches_dump() {
     let dir = weights_dir();
     let tok = HfTokenizer::from_file(dir.join("tokenizer.json")).expect("load tokenizer");
@@ -306,7 +323,11 @@ fn real_tokenizer_round_trips_and_matches_dump() {
             oracle_ids(&dump, i),
             "tokenizer ids diverge from the reference dump for {prompt:?}"
         );
-        assert!(our_ids.iter().all(|&id| id < 248_320));
+        let vocab = meta["cases"][i]["vocab"].as_u64().unwrap();
+        assert!(
+            our_ids.iter().all(|&id| u64::from(id) < vocab),
+            "tokenizer produced an id outside the {vocab}-wide vocab"
+        );
         assert_eq!(tok.decode(&our_ids), prompt, "round-trip failed");
     }
 }
