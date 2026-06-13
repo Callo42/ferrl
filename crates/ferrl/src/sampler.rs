@@ -162,9 +162,24 @@ impl GrpoSampler {
     ///
     /// Returns a candle error if `bytes` is not a valid serialized [`GrpoSampler`]
     /// (fail-loud: a malformed or mismatched checkpoint RNG blob aborts the restore
-    /// rather than silently re-seeding).
+    /// rather than silently re-seeding) — including a **pre-v3** sampler blob (one
+    /// with no `base_seed`): under global-index seeding the run seed is what
+    /// re-derives the rollout, and a pre-v3 checkpoint never stored it, so such a
+    /// blob cannot be resumed bit-exactly and is rejected with a clear message.
     pub fn from_state_bytes(bytes: &[u8]) -> CandleResult<Self> {
-        serde_json::from_slice(bytes).map_err(candle_core::Error::wrap)
+        // Detect a pre-v3 blob ({rng, temperature} only, no base_seed) and fail with
+        // a deliberate, actionable error instead of an opaque serde "missing field".
+        let value: serde_json::Value =
+            serde_json::from_slice(bytes).map_err(candle_core::Error::wrap)?;
+        if value.get("base_seed").is_none() {
+            candle_core::bail!(
+                "sampler state predates checkpoint format v3 (global-index seeding): the blob \
+                 carries no base_seed, so the run seed needed to re-derive the rollout was never \
+                 stored — this checkpoint cannot be resumed bit-exactly. Re-start the run; its \
+                 new checkpoints are v3 and self-contained."
+            );
+        }
+        serde_json::from_value(value).map_err(candle_core::Error::wrap)
     }
 
     /// Sample one token id from a 1-D `[vocab]` `logits` tensor.
@@ -631,6 +646,25 @@ mod tests {
             draw(original),
             draw(restored),
             "a restored sampler must fork identical substreams (base_seed survives round-trip)"
+        );
+    }
+
+    /// A pre-v3 sampler blob ({rng, temperature}, no `base_seed`) is rejected with a
+    /// clear, deliberate error — the global-index-seeding format change is visible,
+    /// not an opaque serde "missing field" failure and not a silent re-seed.
+    #[test]
+    fn pre_v3_blob_without_base_seed_is_rejected_clearly() {
+        // Synthesize an old blob by dropping base_seed from a current serialization.
+        let blob = GrpoSampler::new(7, 1.0).to_state_bytes().unwrap();
+        let mut v: serde_json::Value = serde_json::from_slice(&blob).unwrap();
+        v.as_object_mut().unwrap().remove("base_seed");
+        let old_blob = serde_json::to_vec(&v).unwrap();
+        let err = GrpoSampler::from_state_bytes(&old_blob)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("base_seed") && err.contains("v3"),
+            "a pre-v3 blob must be rejected with a clear message, got: {err}"
         );
     }
 }
