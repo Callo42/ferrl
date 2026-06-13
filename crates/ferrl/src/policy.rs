@@ -233,6 +233,40 @@ pub trait Policy {
     /// Returns a candle error if the forward pass or sampling fails.
     fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout>;
 
+    /// Like [`generate`](Self::generate), but seeds the rollout's per-row RNG
+    /// substreams from an explicit **global row base** — the index of this
+    /// prompt's first completion in the *flattened, world-global* rollout stream.
+    /// A sampling policy seeds row `i` of the group from `global_row_base + i`,
+    /// so the sampled tokens are invariant to how the global batch is sharded
+    /// across a data-parallel world (a world-W run reproduces the single-process
+    /// draws) and are recomputable on resume.
+    ///
+    /// The default **ignores** `global_row_base` and calls
+    /// [`generate`](Self::generate) — correct for a deterministic / non-sampling
+    /// policy, whose rollout does not depend on RNG. A policy that samples
+    /// (e.g. [`crate::LmPolicy`]) overrides this to thread the base into its
+    /// sampler, and its [`generate`](Self::generate) becomes the
+    /// `global_row_base = 0` convenience.
+    ///
+    /// **Wrapper policies:** a policy that delegates [`generate`](Self::generate)
+    /// to an inner policy MUST override this to delegate `generate_at` too —
+    /// inheriting the default would route through the wrapper's own `generate`
+    /// and silently drop the base (every prompt seeded from 0), exactly the
+    /// world-size-variance the base removes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if the forward pass or sampling fails.
+    fn generate_at(
+        &mut self,
+        prompt: &[u32],
+        cfg: &GenConfig,
+        global_row_base: u64,
+    ) -> CandleResult<Rollout> {
+        let _ = global_row_base;
+        self.generate(prompt, cfg)
+    }
+
     /// Per-token log-probabilities of `rollout`'s completion tokens under the
     /// current parameters, as a differentiable [`Tensor`].
     ///

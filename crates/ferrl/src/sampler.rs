@@ -36,7 +36,7 @@ use candle_core::{DType, Result as CandleResult, Tensor};
 use rand::distr::weighted::WeightedIndex;
 use rand::distr::Distribution;
 use rand::rngs::Xoshiro256PlusPlus;
-use rand::{Rng, SeedableRng};
+use rand::SeedableRng;
 use serde::{Deserialize, Serialize};
 
 /// Temperature multinomial sampling on a ferrl-owned, serializable RNG.
@@ -50,6 +50,29 @@ use serde::{Deserialize, Serialize};
 pub struct GrpoSampler {
     rng: Xoshiro256PlusPlus,
     temperature: f64,
+    /// The fixed run seed, retained separately from the evolving [`rng`](Self::rng)
+    /// so substreams can be forked from a **global row index** rather than the
+    /// parent's RNG draw count (see
+    /// [`fork_substreams_at`](Self::fork_substreams_at)). This is what makes a
+    /// rollout invariant to data-parallel world size / shard layout and
+    /// recomputable on resume — the per-row stream is a pure function of
+    /// `(base_seed, global_row_index)`, never of where the row was sharded.
+    base_seed: u64,
+}
+
+/// Deterministically mix the fixed run seed with a global row index into a
+/// well-separated sub-seed, so substream `g` is a pure function of
+/// `(base_seed, g)` — independent of how rows are sharded across a data-parallel
+/// world, of decode order, and of any evolving parent RNG state.
+fn substream_seed(base_seed: u64, global_index: u64) -> u64 {
+    // A SplitMix64 finalizer over `base_seed` advanced by the golden-ratio-strided
+    // index: adjacent indices land in distant state, and the consumer's
+    // `seed_from_u64` runs a second SplitMix64 to expand this to the full 256-bit
+    // Xoshiro state — the same expansion the old sequential-draw scheme relied on.
+    let mut z = base_seed.wrapping_add(global_index.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 impl GrpoSampler {
@@ -64,6 +87,7 @@ impl GrpoSampler {
         Self {
             rng: Xoshiro256PlusPlus::seed_from_u64(seed),
             temperature,
+            base_seed: seed,
         }
     }
 
@@ -73,38 +97,44 @@ impl GrpoSampler {
         self.temperature
     }
 
-    /// Fork `n` independent per-row RNG substreams for one batched rollout.
+    /// Fork `n` independent per-row RNG substreams for one rollout, seeded from a
+    /// **global row index** (`global_row_base .. global_row_base + n`).
     ///
-    /// Draws `n` `u64` sub-seeds from this sampler's RNG — advancing the parent
-    /// by **exactly `n` draws**, regardless of how many tokens each substream
-    /// later consumes — and seeds one child [`GrpoSampler`] per sub-seed (each
-    /// carrying this sampler's temperature). Every group row then draws **only**
-    /// from its own child, so the sampled token stream is invariant to decode
-    /// order: a batched group decode (draws interleaved across rows, one step at
-    /// a time) and a sequential one (each row drained in turn) consume the same
-    /// per-row substreams and therefore produce bit-identical sequences.
+    /// Substream `i` is seeded from `substream_seed(self.base_seed,
+    /// global_row_base + i)` — a pure function of the **fixed run seed** and the
+    /// global row index, drawing **nothing** from the parent's evolving RNG
+    /// (hence `&self`, not `&mut self`). Each group row then draws **only** from
+    /// its own child (carrying this sampler's temperature), which gives three
+    /// invariances at once:
     ///
-    /// Advancing the parent by a *fixed* `n` — rather than the variable
-    /// per-token draw count, which `WeightedIndex` rejection sampling makes
-    /// content-dependent — keeps checkpoint/resume faithful: after a `generate`
-    /// call the parent's RNG position is a function of the call count and the
-    /// per-call group sizes alone, so a resumed run re-forks identical
-    /// substreams. (A future data-parallel variant will instead seed each child
-    /// from a *global* row index, making the rollout invariant to world size and
-    /// shard layout too — the flagged per-rank-sampler item; the per-row fork
-    /// architecture here is what reduces that to a seed-source swap.)
+    /// - **Decode order:** a batched group decode (draws interleaved across rows)
+    ///   and a sequential one (each row drained in turn) consume the same per-row
+    ///   substreams → bit-identical sequences (the PR-A property, preserved).
+    /// - **World size / shard layout:** the caller passes each row's *global*
+    ///   index in the flattened rollout stream, so a row gets the identical
+    ///   substream no matter which data-parallel rank decodes it or how the global
+    ///   batch is sharded — a world-W run reproduces the single-process draws.
+    /// - **Resume:** the seed depends only on `(base_seed, global_row_index)`,
+    ///   both recomputable after a restart (the run seed is restored with the
+    ///   sampler; the global index is a pure function of the resumed step), so a
+    ///   resumed run re-forks identical substreams **without** capturing any
+    ///   evolving per-row RNG state.
     ///
-    /// `seed_from_u64` runs each sub-seed through `SplitMix64`, so the children's
-    /// full 256-bit states are well separated even though the sub-seeds are
-    /// drawn in sequence.
+    /// `seed_from_u64` runs each sub-seed through a further `SplitMix64`, so the
+    /// children's full 256-bit states stay well separated even for adjacent
+    /// global indices.
     #[must_use]
-    pub fn fork_substreams(&mut self, n: usize) -> Vec<GrpoSampler> {
+    pub fn fork_substreams_at(&self, global_row_base: u64, n: usize) -> Vec<GrpoSampler> {
         (0..n)
-            .map(|_| {
-                let sub_seed = self.rng.next_u64();
+            .map(|i| {
+                let global_index = global_row_base.wrapping_add(i as u64);
                 GrpoSampler {
-                    rng: Xoshiro256PlusPlus::seed_from_u64(sub_seed),
+                    rng: Xoshiro256PlusPlus::seed_from_u64(substream_seed(
+                        self.base_seed,
+                        global_index,
+                    )),
                     temperature: self.temperature,
+                    base_seed: self.base_seed,
                 }
             })
             .collect()
@@ -132,9 +162,24 @@ impl GrpoSampler {
     ///
     /// Returns a candle error if `bytes` is not a valid serialized [`GrpoSampler`]
     /// (fail-loud: a malformed or mismatched checkpoint RNG blob aborts the restore
-    /// rather than silently re-seeding).
+    /// rather than silently re-seeding) — including a **pre-v3** sampler blob (one
+    /// with no `base_seed`): under global-index seeding the run seed is what
+    /// re-derives the rollout, and a pre-v3 checkpoint never stored it, so such a
+    /// blob cannot be resumed bit-exactly and is rejected with a clear message.
     pub fn from_state_bytes(bytes: &[u8]) -> CandleResult<Self> {
-        serde_json::from_slice(bytes).map_err(candle_core::Error::wrap)
+        // Detect a pre-v3 blob ({rng, temperature} only, no base_seed) and fail with
+        // a deliberate, actionable error instead of an opaque serde "missing field".
+        let value: serde_json::Value =
+            serde_json::from_slice(bytes).map_err(candle_core::Error::wrap)?;
+        if value.get("base_seed").is_none() {
+            candle_core::bail!(
+                "sampler state predates checkpoint format v3 (global-index seeding): the blob \
+                 carries no base_seed, so the run seed needed to re-derive the rollout was never \
+                 stored — this checkpoint cannot be resumed bit-exactly. Re-start the run; its \
+                 new checkpoints are v3 and self-contained."
+            );
+        }
+        serde_json::from_value(value).map_err(candle_core::Error::wrap)
     }
 
     /// Sample one token id from a 1-D `[vocab]` `logits` tensor.
@@ -489,37 +534,63 @@ mod tests {
         assert_ne!(sa, sb, "distinct seeds should produce distinct streams");
     }
 
-    /// `fork_substreams(n)` advances the parent by EXACTLY `n` RNG draws —
-    /// independent of anything the children later sample. This fixed,
-    /// content-independent advance is what keeps checkpoint/resume faithful: the
-    /// parent's post-`generate` position is a pure function of the call's group
-    /// size, not of how many tokens (EOS early-stops, rejection-sampling draws)
-    /// the rollout consumed. Pin it against `n` manual `next_u64` draws on a clone.
+    /// `fork_substreams_at` draws NOTHING from the parent — each child is a pure
+    /// function of the parent's fixed `base_seed` and a global index (hence
+    /// `&self`). Forking must therefore leave the parent's serialized state
+    /// byte-for-byte unchanged, which is what lets a checkpoint capture just the
+    /// run seed and a resume re-derive identical substreams.
     #[test]
-    fn fork_substreams_advances_parent_by_exactly_n() {
-        let mut forked = GrpoSampler::new(123, 0.7);
-        let mut manual = forked.clone();
-        let children = forked.fork_substreams(4);
+    fn fork_substreams_at_does_not_mutate_parent() {
+        let forked = GrpoSampler::new(123, 0.7);
+        let before = serde_json::to_vec(&forked).unwrap();
+        let children = forked.fork_substreams_at(0, 4);
         assert_eq!(children.len(), 4);
-        for _ in 0..4 {
-            let _ = manual.rng.next_u64();
-        }
         assert_eq!(
+            before,
             serde_json::to_vec(&forked).unwrap(),
-            serde_json::to_vec(&manual).unwrap(),
-            "fork_substreams must advance the parent by exactly n u64 draws"
+            "fork_substreams_at must not advance/mutate the parent"
         );
     }
 
-    /// Each forked child is an independent substream (distinct sub-seed →
+    /// World-size / shard-layout invariance: a row's substream is keyed by its
+    /// GLOBAL index, so however the global batch is sliced across forks (one big
+    /// fork vs. per-shard forks at the matching base offsets), each global index
+    /// yields the identical stream. This is what makes a data-parallel rollout
+    /// reproduce the single-process draws.
+    #[test]
+    fn fork_substreams_at_is_invariant_to_shard_layout() {
+        let logits = Tensor::from_vec(vec![0f32; 64], 64, &Device::Cpu).unwrap();
+        let parent = GrpoSampler::new(42, 1.0);
+        // One process forks all 4 global rows at once...
+        let single: Vec<Vec<u32>> = parent
+            .fork_substreams_at(0, 4)
+            .iter_mut()
+            .map(|c| (0..10).map(|_| c.sample(&logits).unwrap()).collect())
+            .collect();
+        // ...vs. two "ranks" each forking 2 rows at their global base offset.
+        let mut sharded: Vec<Vec<u32>> = Vec::new();
+        for base in [0u64, 2] {
+            sharded.extend(parent.fork_substreams_at(base, 2).iter_mut().map(|c| {
+                (0..10)
+                    .map(|_| c.sample(&logits).unwrap())
+                    .collect::<Vec<u32>>()
+            }));
+        }
+        assert_eq!(
+            single, sharded,
+            "global-index seeding must be invariant to shard layout"
+        );
+    }
+
+    /// Each forked child is an independent substream (distinct global index →
     /// distinct stream) and carries the parent's temperature. Distinct streams
     /// are what make a batched group decode actually explore — were the children
     /// aliased, every group member would decode the identical completion.
     #[test]
     fn fork_substreams_children_are_independent_and_carry_temperature() {
         let logits = Tensor::from_vec(vec![0f32; 64], 64, &Device::Cpu).unwrap();
-        let mut parent = GrpoSampler::new(7, 0.7);
-        let mut children = parent.fork_substreams(3);
+        let parent = GrpoSampler::new(7, 0.7);
+        let mut children = parent.fork_substreams_at(0, 3);
         let streams: Vec<Vec<u32>> = children
             .iter_mut()
             .map(|c| {
@@ -537,14 +608,14 @@ mod tests {
     }
 
     /// Forking is deterministic: two equally-seeded parents fork children with
-    /// bit-identical streams — the property that makes a batched decode
-    /// reproducible and equal to the sequential oracle from the same seed.
+    /// bit-identical streams at the same global base — the property that makes a
+    /// batched decode reproducible and equal to the sequential oracle.
     #[test]
     fn fork_substreams_is_deterministic() {
         let logits = Tensor::from_vec(vec![0f32; 64], 64, &Device::Cpu).unwrap();
         let draw = |seed: u64| -> Vec<Vec<u32>> {
-            let mut p = GrpoSampler::new(seed, 1.0);
-            p.fork_substreams(3)
+            let p = GrpoSampler::new(seed, 1.0);
+            p.fork_substreams_at(5, 3)
                 .iter_mut()
                 .map(|c| (0..10).map(|_| c.sample(&logits).unwrap()).collect())
                 .collect()
@@ -553,6 +624,47 @@ mod tests {
             draw(99),
             draw(99),
             "same seed must fork identical substreams"
+        );
+    }
+
+    /// Resume faithfulness under global-index seeding: a sampler restored from
+    /// its serialized state forks bit-identical substreams at any global base —
+    /// the run seed survives the round-trip, so a resumed run re-derives the
+    /// exact rollout from the seed alone, with no per-row RNG state to capture.
+    #[test]
+    fn state_round_trip_preserves_global_index_forks() {
+        let logits = Tensor::from_vec(vec![0f32; 64], 64, &Device::Cpu).unwrap();
+        let original = GrpoSampler::new(123, 0.7);
+        let restored = GrpoSampler::from_state_bytes(&original.to_state_bytes().unwrap()).unwrap();
+        let draw = |s: GrpoSampler| -> Vec<Vec<u32>> {
+            s.fork_substreams_at(40, 3)
+                .iter_mut()
+                .map(|c| (0..8).map(|_| c.sample(&logits).unwrap()).collect())
+                .collect()
+        };
+        assert_eq!(
+            draw(original),
+            draw(restored),
+            "a restored sampler must fork identical substreams (base_seed survives round-trip)"
+        );
+    }
+
+    /// A pre-v3 sampler blob ({rng, temperature}, no `base_seed`) is rejected with a
+    /// clear, deliberate error — the global-index-seeding format change is visible,
+    /// not an opaque serde "missing field" failure and not a silent re-seed.
+    #[test]
+    fn pre_v3_blob_without_base_seed_is_rejected_clearly() {
+        // Synthesize an old blob by dropping base_seed from a current serialization.
+        let blob = GrpoSampler::new(7, 1.0).to_state_bytes().unwrap();
+        let mut v: serde_json::Value = serde_json::from_slice(&blob).unwrap();
+        v.as_object_mut().unwrap().remove("base_seed");
+        let old_blob = serde_json::to_vec(&v).unwrap();
+        let err = GrpoSampler::from_state_bytes(&old_blob)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("base_seed") && err.contains("v3"),
+            "a pre-v3 blob must be rejected with a clear message, got: {err}"
         );
     }
 }

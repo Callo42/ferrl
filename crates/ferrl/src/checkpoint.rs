@@ -24,13 +24,16 @@
 //!   path): just the trainable weights + the step count. This is the legacy
 //!   **format version 1** layout, and is what [`crate::eval`] loads.
 //! - [`save_checkpoint`] / [`load_checkpoint`] — a **momentum-faithful** checkpoint
-//!   (**format version 2**): the adapter weights *plus* the optimizer moments
+//!   (**format version 2/3**): the adapter weights *plus* the optimizer moments
 //!   ([`crate::optim::FerrlAdamW`]'s `m`/`v`/`step_t`) *plus* the rollout sampler RNG
 //!   blob ([`crate::sampler::GrpoSampler`], whose state is `serde`-serializable). This
 //!   is what lets [`crate::Trainer::resume`] continue an interrupted run **bit-exactly**
-//!   — the same machine produces the identical post-resume trajectory.
+//!   — the same machine produces the identical post-resume trajectory. **v3** adds the
+//!   run `base_seed` to the sampler blob (global-index substream seeding), making a
+//!   resume self-contained; a pre-v3 sampler blob has no `base_seed` and is rejected on
+//!   restore (a v2 momentum-faithful checkpoint is not resumable — fail-loud, not silent).
 //!
-//! A v1 checkpoint still loads (both readers accept format versions `1..=2`); when only
+//! A v1 checkpoint still loads (both readers accept format versions `1..=3`); when only
 //! the adapter was persisted, [`load_checkpoint`] returns no optimizer/sampler state and
 //! a resume falls back to fresh momentum + the policy's current RNG. The manifest is
 //! always written **last** within a checkpoint directory, as the commit marker.
@@ -62,8 +65,15 @@ const OPTIMIZER_FILE: &str = "optimizer.safetensors";
 /// Filename of the checkpoint manifest within a checkpoint directory.
 const MANIFEST_FILE: &str = "manifest.json";
 /// On-disk checkpoint layout version; bumped on an incompatible format change. v1 =
-/// adapter only; v2 = adapter + optimizer moments + sampler RNG (momentum-faithful).
-const FORMAT_VERSION: u32 = 2;
+/// adapter only; v2 = adapter + optimizer moments + sampler RNG (momentum-faithful);
+/// v3 = v2 with the sampler blob now carrying the run `base_seed` (global-index
+/// substream seeding — see [`crate::sampler::GrpoSampler`]). v3 checkpoints are
+/// self-contained: the seed that re-derives the rollout travels in the blob, so a
+/// resume is bit-exact regardless of how the policy is reconstructed. A pre-v3
+/// sampler blob lacks `base_seed`, so it cannot be resumed bit-exactly; restoring
+/// one fails loud (see [`crate::sampler::GrpoSampler::from_state_bytes`]) rather
+/// than silently re-seeding. (v1/v2 adapter weights still load for eval.)
+const FORMAT_VERSION: u32 = 3;
 /// Lowest on-disk format version this build can read. Older (v1, adapter-only)
 /// checkpoints still load — a resume then falls back to fresh momentum.
 const MIN_FORMAT_VERSION: u32 = 1;
@@ -99,7 +109,7 @@ pub enum CheckpointError {
 /// defaulting to `None` (the fresh-momentum-on-resume fallback).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckpointManifest {
-    /// On-disk format version (validated against `1..=2` by [`load_adapter`]).
+    /// On-disk format version (validated against `1..=3` by [`load_adapter`]).
     pub format_version: u32,
     /// Number of optimizer steps completed before this checkpoint was written —
     /// the step index a resumed run should continue from
@@ -497,9 +507,12 @@ pub fn save_checkpoint(
 /// persisted optimizer / sampler state for a momentum-faithful resume.
 ///
 /// Loads the adapter weights into `vars` exactly as [`load_adapter`] (same
-/// all-or-nothing shape/dtype/count validation and `1..=2` version check). For a **v2**
-/// checkpoint it additionally reads the optimizer moments (the manifest records how
-/// many) and the sampler RNG blob; for a **v1** checkpoint both come back `None`.
+/// all-or-nothing shape/dtype/count validation and `1..=3` version check). For a **v2
+/// or v3** checkpoint it additionally reads the optimizer moments (the manifest records
+/// how many) and the sampler RNG blob; for a **v1** checkpoint both come back `None`.
+/// Restoring a pre-v3 sampler blob fails loud at
+/// [`crate::sampler::GrpoSampler::from_state_bytes`] (no `base_seed`) rather than
+/// silently re-seeding — a v2 momentum-faithful checkpoint is therefore not resumable.
 ///
 /// The optimizer moments are **not** validated against `vars` here — the optimizer
 /// filters to float parameters, so [`crate::optim::FerrlAdamW::load_state`] validates

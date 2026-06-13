@@ -18,12 +18,14 @@
 //! each policy, averaged over `group_size` samples per prompt: **avg@k** with
 //! `k = group_size`. For a 0/1 verifier reward each per-prompt mean is the
 //! k-sample estimate of *sampled pass@1* — the standard held-out RL eval
-//! quantity. Base and adapter draw from different points of the sampler's RNG
-//! stream, so with a small `k` the comparison carries sampling variance;
-//! pass a `group_size` large enough to resolve the gap you care about. `evaluate`
-//! advances the policy's sampler, and restores the adapter-enabled flag to its
-//! prior state before returning — on success, on a returned error, or on a panic
-//! (an RAII guard).
+//! quantity. Base and adapter draw from the SAME per-prompt substreams (each
+//! prompt seeds from its position in the eval set), so the comparison is paired
+//! — same RNG, only the adapter differs — which lowers its variance; still pass
+//! a `group_size` large enough to resolve the gap you care about. Under
+//! global-index seeding `evaluate` does NOT advance the policy's sampler (each
+//! rollout forks its substreams purely from the run seed), and it restores the
+//! adapter-enabled flag to its prior state before returning — on success, on a
+//! returned error, or on a panic (an RAII guard).
 //!
 //! ## Eval-only sampling parameters
 //!
@@ -192,17 +194,22 @@ fn score_all<P: Policy, R: RewardFn>(
     gen: &GenConfig,
 ) -> Result<Vec<PromptEval>, EvalError> {
     let mut per_prompt = Vec::with_capacity(prompts.len());
-    for prompt in prompts {
+    for (idx, prompt) in prompts.iter().enumerate() {
         let ids = tokenizer.encode(prompt);
         if ids.is_empty() {
             return Err(EvalError::Contract(format!(
                 "prompt encoded to zero tokens: {prompt:?}"
             )));
         }
+        // Seed each prompt's eval rollouts from a distinct global row base (its
+        // position in the eval set), so under the global-index seeding every
+        // held-out prompt draws independently rather than all sharing base 0. Base
+        // and adapter share the per-prompt base — a controlled, same-RNG comparison.
+        let base = (idx as u64).wrapping_mul(gen.group_size as u64);
         policy.set_adapter_enabled(false);
-        let base_mean = mean_reward(policy, reward_fn, tokenizer, prompt, &ids, gen)?;
+        let base_mean = mean_reward(policy, reward_fn, tokenizer, prompt, &ids, gen, base)?;
         policy.set_adapter_enabled(true);
-        let adapter_mean = mean_reward(policy, reward_fn, tokenizer, prompt, &ids, gen)?;
+        let adapter_mean = mean_reward(policy, reward_fn, tokenizer, prompt, &ids, gen, base)?;
         per_prompt.push(PromptEval {
             base_mean,
             adapter_mean,
@@ -219,8 +226,9 @@ fn mean_reward<P: Policy, R: RewardFn>(
     prompt: &str,
     prompt_ids: &[u32],
     gen: &GenConfig,
+    global_row_base: u64,
 ) -> Result<f32, EvalError> {
-    let rollout = policy.generate(prompt_ids, gen)?;
+    let rollout = policy.generate_at(prompt_ids, gen, global_row_base)?;
     validate_rollout(&rollout, gen.group_size)?;
     let completions: Vec<String> = rollout
         .token_ids
