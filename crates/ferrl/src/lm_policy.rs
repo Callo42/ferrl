@@ -26,6 +26,35 @@
 //! merge (CI-gated: identical token stream **and** identical sampler-RNG
 //! consumption on a tiny model); the bf16-merge faithfulness is a manual GPU gate.
 //!
+//! ## The group is decoded as one batch, with per-row RNG substreams
+//!
+//! [`generate`](LmPolicy::generate) decodes all `group_size` sequences in a
+//! single **batched** pass over the shared merged decoder (prefill `[group,
+//! prompt_len]`, then one `[group, 1]` step per token) rather than one sequence
+//! at a time — rollout is 80–90 % of RL wall-clock, and the old per-sequence
+//! loop left a ~`group_size`× throughput factor unbatched. To keep the sampled
+//! stream invariant to that batching, each row draws from its **own** RNG
+//! substream forked from the policy sampler
+//! ([`GrpoSampler::fork_substreams`](crate::sampler::GrpoSampler::fork_substreams)):
+//! a row's tokens depend only on its substream, never on whether the group is
+//! decoded together or one row at a time. That invariance is what the CI
+//! batch-invariance gates check, in two regimes. For the **dense-attention**
+//! models (Qwen3, Llama) the cached merged decode equals the uncached forward
+//! bit-exactly on CPU, so the sequential, uncached `generate_uncached` oracle
+//! (test-only) reproduces the batched path **token-for-token**
+//! (`cached_generate_matches_uncached*`). The **Qwen3.5 `GatedDeltaNet`** family
+//! decodes through a recurrent/conv cache whose cached path and the uncached
+//! *chunked* forward agree only within a tolerance (an algorithm difference
+//! independent of batching), so its batch-invariance is gated directly at the
+//! decoder level — a batched decode equals the per-row decodes within that
+//! tolerance, including with a retired row fed the EOS pad
+//! (`qwen35::assert_batched_decode_matches_per_row` and the retirement test).
+//!
+//! A row that samples EOS retires — drawing no further tokens, so its captured
+//! behavior log-probs stay one-per-real-token — but stays in the batch, fed the
+//! EOS pad so every layer's cache advances in lockstep, until all rows retire or
+//! the fixed width is reached.
+//!
 //! ## Rectangular rollouts
 //!
 //! [`generate`](LmPolicy::generate) always emits a **fixed** width of
@@ -266,11 +295,21 @@ impl<M: GradModel> LmPolicy<M> {
         Tensor::cat(&parts, 1)
     }
 
-    /// The pre-P6-C **uncached** rollout: re-run the full-sequence
-    /// [`GradModel::forward`] every step. Kept as the equivalence oracle for the
-    /// cached [`generate`](Self::generate) — same sampler, same EOS/padding logic, so
-    /// a per-token-identical cached path must reproduce its token stream and RNG
-    /// consumption exactly. Test-only; the production path is `generate`.
+    /// The **sequential, uncached** rollout oracle: fork the SAME per-row
+    /// substreams [`generate`](Self::generate) forks (advancing the policy
+    /// sampler by exactly `group_size`), then decode each row independently at
+    /// batch 1 by re-running the full-sequence [`GradModel::forward`] every step.
+    /// Because each row draws only from its own substream, this sequential decode
+    /// reproduces the batched, cached `generate` **bit-for-bit** — same token
+    /// stream, same EOS/padding, same RNG consumption — so it is at once the
+    /// KV-cache faithfulness oracle (cached == uncached) and the batch-invariance
+    /// oracle (batched == sequential). That bit-exactness holds for the
+    /// **dense-attention** models this is instantiated on (Qwen3, Llama), where the
+    /// cached merged decode equals the uncached forward exactly on CPU; the Qwen3.5
+    /// `GatedDeltaNet` family is batch-invariance-gated at the decoder level instead
+    /// (see [`crate::qwen35`]), since its cached recurrent decode and uncached
+    /// chunked forward differ by an algorithm-level tolerance unrelated to batching.
+    /// Test-only; the production path is `generate`.
     #[cfg(test)]
     fn generate_uncached(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
         // Resolve the sampling parameters exactly as `generate` does, so the
@@ -280,10 +319,15 @@ impl<M: GradModel> LmPolicy<M> {
         let device = self.model.device().clone();
         let prompt_len = prompt.len();
         let width = prompt_len + cfg.max_new_tokens;
+        // Fork the per-row substreams in the same order `generate` does (advancing
+        // the policy sampler by exactly `group_size`); row r is driven solely by its
+        // own substream, so decoding sequentially here vs batched there cannot change
+        // the sampled stream.
+        let mut substreams = self.sampler.fork_substreams(cfg.group_size);
         let mut token_ids = Vec::with_capacity(cfg.group_size);
         let mut completion_lens = Vec::with_capacity(cfg.group_size);
         let mut rollout_logprobs = Vec::with_capacity(cfg.group_size);
-        for _ in 0..cfg.group_size {
+        for sub in &mut substreams {
             let mut ids = prompt.to_vec();
             let mut logprobs = Vec::with_capacity(cfg.max_new_tokens);
             let mut comp_len = cfg.max_new_tokens;
@@ -292,7 +336,7 @@ impl<M: GradModel> LmPolicy<M> {
                 let input = Tensor::from_vec(ids.clone(), (1, len), &device)?;
                 let logits = self.model.forward(&input)?;
                 let last = logits.i((0, len - 1))?;
-                let (next, logprob) = self.sampler.sample_with(&last, temperature, top_p)?;
+                let (next, logprob) = sub.sample_with(&last, temperature, top_p)?;
                 ids.push(next);
                 logprobs.push(logprob);
                 if cfg.eos_token_id == Some(next) {
@@ -357,70 +401,117 @@ impl<M: GradModel> LmPolicy<M> {
     }
 }
 
-/// Decode one group member on the shared cached decoder: reset the cache,
-/// prefill the prompt, then sample up to `cfg.max_new_tokens` tokens at the
-/// resolved `(temperature, top_p)` — EOS-inclusive early stop, right-padded
-/// back to the fixed rectangular width — capturing each draw's behavior
-/// log-prob. Returns `(ids, behavior_logprobs, completion_len)`; `ids` is the
-/// full fixed-width row, `behavior_logprobs` has exactly `completion_len`
-/// entries (one per real draw).
-fn sample_one_sequence<D: CachedDecoder>(
-    sampler: &mut GrpoSampler,
+/// The raw rollout of [`batched_group_decode`]: per-row token ids (rectangular),
+/// per-row EOS-inclusive completion lengths, and per-row behavior log-probs. A named
+/// alias so the trait method and helper share one signature (and clippy's
+/// `type_complexity` stays quiet).
+type GroupDecode = (Vec<Vec<u32>>, Vec<usize>, Vec<Vec<f32>>);
+
+/// Decode an entire GRPO group as one batch over the shared cached decoder.
+///
+/// Prefill the shared prompt for all `group_size` rows, then each step sample one
+/// token per still-active row from that row's own substream and feed the batch
+/// forward in lockstep. A row that samples EOS retires — drawing no further tokens,
+/// so its captured behavior log-probs stay one-per-real-token — but stays in the
+/// batch fed the EOS pad until every row retires or the fixed width is reached.
+/// Returns the rectangular `token_ids`, the per-row EOS-inclusive `completion_lens`,
+/// and the per-row behavior log-probs.
+///
+/// `allow(cognitive_complexity)`: the prefill + per-step + per-row decode is one
+/// cohesive loop; splitting the per-row body out would thread ~ten pieces of per-row
+/// state and trip `too_many_arguments` for no readability gain. Kept out of
+/// [`LmPolicy::generate`] so that trait method stays thin.
+#[allow(clippy::cognitive_complexity)]
+fn batched_group_decode<D: CachedDecoder>(
     decoder: &mut D,
+    substreams: &mut [GrpoSampler],
     prompt: &[u32],
     cfg: &GenConfig,
     (temperature, top_p): (f64, Option<f64>),
     device: &candle_core::Device,
-) -> CandleResult<(Vec<u32>, Vec<f32>, usize)> {
+) -> CandleResult<GroupDecode> {
+    let g = cfg.group_size;
     let prompt_len = prompt.len();
     // The fixed rectangular width every sequence is padded/grown to.
     let width = prompt_len + cfg.max_new_tokens;
-    decoder.reset_cache();
-    let mut ids = prompt.to_vec();
-    let mut logprobs = Vec::with_capacity(cfg.max_new_tokens);
-    // Real completion tokens, counting up to and INCLUDING the first EOS.
-    // Stays `max_new_tokens` unless an EOS early-stop overwrites it below.
-    let mut comp_len = cfg.max_new_tokens;
-    // Prefill the prompt (offset 0); its last position predicts token 1.
-    let prompt_input = Tensor::from_vec(prompt.to_vec(), (1, prompt_len), device)?;
+    // EOS pad: a stopped row is right-padded back to `width` with the EOS it sampled
+    // (== cfg.eos_token_id), and once retired a row is FED this same id each later
+    // step so the batch stays rectangular while the cache advances. Never used when
+    // eos is None (no row stops; every row is full width), so 0 is an inert fallback.
+    let pad = cfg.eos_token_id.unwrap_or(0);
+
+    // Prefill the shared prompt for all `g` rows at offset 0 (the prompt is identical
+    // across the group, so one broadcast prefill serves every row); its last position
+    // predicts each row's first token.
+    let mut prompt_data = Vec::with_capacity(g * prompt_len);
+    for _ in 0..g {
+        prompt_data.extend_from_slice(prompt);
+    }
+    let prompt_input = Tensor::from_vec(prompt_data, (g, prompt_len), device)?;
     let logits = decoder
         .forward(&prompt_input, 0)
         .map_err(crate::cuda_compat::translate_ptx_error)?;
-    let mut last = logits.i((0, prompt_len - 1))?;
+    let mut last = logits.i((.., prompt_len - 1))?; // [g, vocab]
+
+    let mut token_ids: Vec<Vec<u32>> = (0..g).map(|_| prompt.to_vec()).collect();
+    // Behavior-policy log-probs, one per real draw: the sampler computes the full
+    // sampling distribution anyway, so capturing the drawn token's log-prob is free —
+    // see `Rollout::rollout_logprobs`.
+    let mut rollout_logprobs: Vec<Vec<f32>> = (0..g)
+        .map(|_| Vec::with_capacity(cfg.max_new_tokens))
+        .collect();
+    // Real completion tokens per row, counting up to and INCLUDING the first EOS;
+    // stays `max_new_tokens` unless an EOS early-stop overwrites it below.
+    let mut completion_lens = vec![cfg.max_new_tokens; g];
+    let mut active = vec![true; g];
     let mut offset = prompt_len;
+
     for step in 0..cfg.max_new_tokens {
-        let (next, logprob) = sampler.sample_with(&last, temperature, top_p)?;
-        ids.push(next);
-        logprobs.push(logprob);
-        // EOS-inclusive early stop: keep the EOS token, record the true
-        // length, and stop generating this sequence. With `eos_token_id ==
-        // None` this never fires, so the loop runs the full `max_new_tokens`.
-        if cfg.eos_token_id == Some(next) {
-            comp_len = step + 1;
-            // Right-pad the stopped sequence back to the fixed width so the
-            // group stays rectangular. The pad value is the EOS token itself:
-            // guaranteed in-vocab (it was just sampled) and masked out of the
-            // loss / ignored by length-aware decoding.
-            ids.resize(width, next);
+        // Sample each still-active row from its OWN substream; a retired row draws
+        // nothing (so its log-prob count stays == completion_lens[r], one per real
+        // token) and is fed the EOS pad to keep the batch rectangular.
+        let mut feed: Vec<u32> = Vec::with_capacity(g);
+        for r in 0..g {
+            if active[r] {
+                let row_logits = last.i(r)?; // [vocab]
+                let (next, logprob) = substreams[r].sample_with(&row_logits, temperature, top_p)?;
+                token_ids[r].push(next);
+                rollout_logprobs[r].push(logprob);
+                // EOS-inclusive early stop: keep the EOS token, record the true
+                // length, retire the row. With `eos_token_id == None` this never
+                // fires, so every row runs the full `max_new_tokens`.
+                if cfg.eos_token_id == Some(next) {
+                    completion_lens[r] = step + 1;
+                    active[r] = false;
+                }
+                feed.push(next);
+            } else {
+                feed.push(pad);
+            }
+        }
+        // Every row retired (all sampled EOS): nothing left to decode.
+        if active.iter().all(|&a| !a) {
             break;
         }
-        // Feed the just-sampled token to advance the cache and get the next
-        // step's logits — unless this was the final step (no further token to
-        // predict), which keeps the sampler-draw count exactly `comp_len`.
+        // Advance the cache with the just-sampled tokens to get the next step's logits
+        // — unless this was the final step (no further token to predict), which keeps
+        // each substream's draw count exactly completion_lens[r].
         if step + 1 < cfg.max_new_tokens {
-            let tok = Tensor::from_vec(vec![next], (1, 1), device)?;
+            let tok = Tensor::from_vec(feed, (g, 1), device)?;
             let logits = decoder
                 .forward(&tok, offset)
                 .map_err(crate::cuda_compat::translate_ptx_error)?;
-            last = logits.i((0, 0))?;
+            last = logits.i((.., 0))?; // [g, vocab]
             offset += 1;
         }
     }
-    // (`logprobs.len() == comp_len` — one per real draw — is pinned by the
-    // capture-alignment tests rather than a debug_assert, which would tip this
-    // function over the cognitive-complexity bound.)
-    debug_assert_eq!(ids.len(), width, "rollout row is not the fixed width");
-    Ok((ids, logprobs, comp_len))
+
+    // Right-pad every retired row back to the fixed width with the EOS pad; full-width
+    // rows (no early stop) are already `width` and unchanged.
+    for row in &mut token_ids {
+        row.resize(width, pad);
+    }
+    Ok((token_ids, completion_lens, rollout_logprobs))
 }
 
 impl<M: GradModel> Policy for LmPolicy<M> {
@@ -429,34 +520,29 @@ impl<M: GradModel> Policy for LmPolicy<M> {
         let device = self.model.device().clone();
         let prompt_len = prompt.len();
         // One KV-cached decoder snapshots the CURRENT merged weights (adapter folded
-        // in, toggle respected) for the whole call; `reset_cache` starts each group
-        // member on a fresh sequence. The first GPU kernel JIT happens building the
-        // merged weights / in the first forward, so translate a driver-too-old PTX
-        // mismatch (`CUDA_ERROR_UNSUPPORTED_PTX_VERSION`) into an actionable
-        // rebuild/upgrade message — a no-op off the `cuda` build and on the success path.
+        // in, toggle respected); the batch dimension carries all group members at
+        // once. The first GPU kernel JIT happens building the merged weights / in the
+        // first forward, so translate a driver-too-old PTX mismatch
+        // (`CUDA_ERROR_UNSUPPORTED_PTX_VERSION`) into an actionable rebuild/upgrade
+        // message — a no-op off the `cuda` build and on the success path.
         let mut decoder = self
             .model
             .merged_decoder()
             .map_err(crate::cuda_compat::translate_ptx_error)?;
-        let mut token_ids = Vec::with_capacity(cfg.group_size);
-        let mut completion_lens = Vec::with_capacity(cfg.group_size);
-        // Behavior-policy log-probs, one per draw: the sampler computes the full
-        // sampling distribution anyway, so capturing the drawn token's log-prob
-        // is free — see `Rollout::rollout_logprobs`.
-        let mut rollout_logprobs = Vec::with_capacity(cfg.group_size);
-        for _ in 0..cfg.group_size {
-            let (ids, logprobs, comp_len) = sample_one_sequence(
-                &mut self.sampler,
-                &mut decoder,
-                prompt,
-                cfg,
-                (temperature, top_p),
-                &device,
-            )?;
-            token_ids.push(ids);
-            completion_lens.push(comp_len);
-            rollout_logprobs.push(logprobs);
-        }
+        // Per-row independent RNG substreams (advances the policy sampler by exactly
+        // `group_size`): each row draws ONLY from its own substream, so the sampled
+        // stream is invariant to decode order — this batched decode and the sequential
+        // `generate_uncached` oracle produce bit-identical groups. See
+        // `GrpoSampler::fork_substreams`.
+        let mut substreams = self.sampler.fork_substreams(cfg.group_size);
+        let (token_ids, completion_lens, rollout_logprobs) = batched_group_decode(
+            &mut decoder,
+            &mut substreams,
+            prompt,
+            cfg,
+            (temperature, top_p),
+            &device,
+        )?;
         // Built directly (not via `Rollout::rectangular`) so `completion_lens` carries
         // the true per-sequence lengths; under `eos_token_id == None` every entry is
         // `max_new_tokens` and this equals the rectangular construction exactly.
@@ -779,6 +865,46 @@ mod tests {
     }
 
     #[test]
+    fn generate_breaks_when_every_row_retires_before_max_new() {
+        // The all-rows-retired early `break` in `batched_group_decode`: greedy
+        // (argmax-nucleus) decoding is RNG-independent, so every group row samples
+        // the IDENTICAL first token; configuring THAT token as the EOS retires every
+        // row at step 0, firing the break before `max_new_tokens`. Pins that the
+        // break leaves a correct rectangular rollout (all completion_lens == 1, every
+        // row padded to the fixed width) and that the batched path still matches the
+        // sequential oracle under a wholesale early stop.
+        let mut policy = tiny_policy();
+        let greedy = crate::policy::EvalSampling {
+            temperature: 0.5,
+            top_p: Some(1e-6),
+        };
+        let probe = GenConfig {
+            group_size: 3,
+            max_new_tokens: 4,
+            temperature: 1.0,
+            eos_token_id: None,
+            eval_sampling: Some(greedy),
+        };
+        // The shared greedy first token every row draws at step 0.
+        let first = policy.generate(&[1u32, 2, 3], &probe).unwrap().token_ids[0][3];
+        let cfg = GenConfig {
+            eos_token_id: Some(first),
+            ..probe
+        };
+        // Batched == sequential under a wholesale early stop (token stream + RNG).
+        assert_cached_matches_uncached(&mut policy, &[1u32, 2, 3], &cfg);
+        let r = policy.generate(&[1u32, 2, 3], &cfg).unwrap();
+        assert_eq!(r.completion_lens, vec![1; 3], "every row retires at step 0");
+        for ids in &r.token_ids {
+            assert_eq!(
+                ids.len(),
+                3 + 4,
+                "rectangular width preserved after the break"
+            );
+        }
+    }
+
+    #[test]
     fn generate_eos_at_the_max_new_tokens_one_boundary() {
         // max_new_tokens == 1 with an EOS sampled at the only step: comp_len == 1 ==
         // max_new (the resize is a no-op — no double-handling) and each row is exactly
@@ -833,9 +959,14 @@ mod tests {
             "cached rollout completion_lens diverged from the uncached oracle"
         );
         assert_eq!(cached.prompt_len, uncached.prompt_len);
+        // Under the per-row-substream design both paths advance the POLICY sampler
+        // by exactly `group_size` (the single `fork_substreams` call); the per-token
+        // draws happen on the child substreams. So this pins that the fixed-n parent
+        // advance matches (also covered by `fork_substreams_advances_parent_by_exactly_n`);
+        // per-row draw-count parity is what the `token_ids` equality above proves.
         assert_eq!(
             after_cached, after_uncached,
-            "cached path consumed a different amount of sampler RNG (draw-count mismatch)"
+            "cached and uncached paths advanced the policy sampler differently"
         );
         assert_rollout_logprobs_close(&cached, &uncached);
     }
