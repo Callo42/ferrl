@@ -979,14 +979,26 @@ impl Trainer {
             // and we save a final checkpoint at this completed step and stop
             // cleanly so a requeued run picks up here via `resume_latest`. (May
             // re-write the cadence checkpoint just written above — idempotent.)
+            // The poll itself runs every step on every rank (lockstep), but the
+            // stop-early decision keys on `completed`/`total`, which are identical
+            // across ranks — so the whole world stops or continues together.
             if self.preempt_requested()? {
                 let completed = step + 1;
-                self.write_checkpoint(completed, &vars, &opt, policy)?;
-                tracing::warn!(
-                    completed_steps = completed,
-                    "preemption requested: checkpointed and stopping early"
-                );
-                return Ok((history, RunStop::Preempted));
+                // A preemption that arrives only after the FINAL step is moot: the
+                // loop already ran every configured step, so the run is Completed.
+                // Stopping early here (writing a step==total checkpoint and
+                // returning Preempted) would make the launcher skip held-out
+                // eval/gate, and a requeue would then resume_latest from that
+                // checkpoint, run ZERO steps, and gate on an EMPTY history. Only
+                // stop early — and report Preempted — when work actually remains.
+                if completed < total {
+                    self.write_checkpoint(completed, &vars, &opt, policy)?;
+                    tracing::warn!(
+                        completed_steps = completed,
+                        "preemption requested: checkpointed and stopping early"
+                    );
+                    return Ok((history, RunStop::Preempted));
+                }
             }
         }
         Ok((history, RunStop::Completed))

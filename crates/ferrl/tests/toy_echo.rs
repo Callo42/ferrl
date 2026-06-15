@@ -1562,6 +1562,41 @@ fn resume_latest_surfaces_preemption_stop() {
 }
 
 #[test]
+fn preemption_after_the_final_step_reports_completed() {
+    // A flag that is still set when the LAST configured step finishes must NOT turn a
+    // finished run into RunStop::Preempted: the loop ran every step, so the run is
+    // Completed. Otherwise the launcher would skip eval/gate, and a requeue would
+    // resume_latest from a step==total checkpoint, run ZERO steps, and gate on an empty
+    // history. `steps == 1` makes the only step the final one, so the post-step poll
+    // sees completed == total with the flag set.
+    let prompts = echo_prompts(VOCAB);
+    let cfg = TrainerConfig {
+        steps: 1,
+        group_size: 16,
+        max_new_tokens: 1,
+        temperature: TEMP,
+        lr: 0.05,
+        ..TrainerConfig::default()
+    };
+    let tmp = TempDir::new("preempt-final-step");
+    let flag = Arc::new(AtomicBool::new(true));
+    let mut policy = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 7, TEMP).unwrap();
+    let run = RunDir::create(tmp.path(), "echo").unwrap();
+    let mut trainer = Trainer::new(cfg, &run)
+        .unwrap()
+        .with_preemption_flag(Arc::clone(&flag));
+    let (hist, stop) = trainer
+        .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
+        .unwrap();
+    assert_eq!(
+        stop,
+        RunStop::Completed,
+        "a flag still set when the final step finishes must report Completed, not Preempted"
+    );
+    assert_eq!(hist.len(), 1, "every configured step ran");
+}
+
+#[test]
 fn gate_canary_holds_on_every_real_update() {
     // The canary is a hard error (missing var / non-finite gradient) on every real
     // update, so a completed run with many real updates proves it held on all of
