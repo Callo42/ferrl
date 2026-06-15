@@ -51,10 +51,15 @@
 //!   orchestration) is in the default build and CI-tested against an in-memory
 //!   mock (the `nccl` submodule).
 //!
-//! Reductions are **deterministic**: contributions are combined in rank order
-//! (slot 0 + slot 1 + …), independent of thread arrival order, so a reduced
-//! value is a pure function of the ranks' contributions. Note the reduced
-//! tensors returned to different ranks may share storage — treat them as
+//! The invariant the trait guarantees — and all the trainer needs — is that
+//! every rank receives **rank-identical** reduced values (same reduced gradient
+//! on every rank ⇒ same optimizer step). The *fold order* is per-implementation:
+//! the in-process reducers ([`LocalComm`] and the mock) combine in **rank order**
+//! (slot 0 + slot 1 + …), independent of thread arrival order, so their result is
+//! a pure function of the contributions and bit-reproducible against a sequential
+//! reference; [`NcclComm`] returns NCCL's rank-identical output, whose internal
+//! reduction order is its own (ring/tree, not necessarily rank order). Note the
+//! reduced tensors returned to different ranks may share storage — treat them as
 //! read-only (the trainer only ever reads gradients out of them).
 
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -105,9 +110,13 @@ pub enum CommError {
 /// The data-parallel collective seam: rank identity plus sum-reductions.
 ///
 /// Implementations must be [`Send`] (each rank's handle moves into that rank's
-/// thread) and reductions must be **deterministic in rank order** so every
-/// rank computes bit-identical reduced values — the lockstep invariant the
-/// trainer's DP correctness rests on.
+/// thread) and every rank must receive **rank-identical** reduced values — the
+/// lockstep invariant the trainer's DP correctness rests on (same reduced
+/// gradient on every rank ⇒ same optimizer step). The fold *order* is
+/// implementation-defined: [`LocalComm`] / [`SoloComm`] combine in rank order
+/// (bit-reproducible against a sequential reference), whereas [`NcclComm`]
+/// returns NCCL's rank-identical output, which need not equal a rank-order fold
+/// (NCCL may sum in ring/tree order, and float addition is not associative).
 ///
 /// See the [module docs](self) for the collective contract every caller must
 /// uphold (same sequence, same shapes, every rank).
@@ -119,8 +128,8 @@ pub trait Comm: std::fmt::Debug + Send {
     fn world_size(&self) -> usize;
 
     /// Element-wise sum of each tensor across all ranks, in place: on return,
-    /// `tensors[i]` on every rank holds the rank-order sum of all ranks'
-    /// `tensors[i]`. Every rank must pass the same tensor count, shapes, and
+    /// `tensors[i]` holds the sum of every rank's `tensors[i]`, **rank-identical
+    /// on every rank**. Every rank must pass the same tensor count, shapes, and
     /// dtypes; a mismatch fails the collective on every rank.
     ///
     /// # Errors
@@ -131,7 +140,7 @@ pub trait Comm: std::fmt::Debug + Send {
     /// the world is dead at that point and the gradients in flight with it.
     fn all_reduce_sum(&self, tensors: &mut Vec<Tensor>) -> Result<(), CommError>;
 
-    /// Sum of `value` across all ranks (in rank order), returned to every rank.
+    /// Sum of `value` across all ranks, returned **rank-identically** to every rank.
     ///
     /// # Errors
     ///

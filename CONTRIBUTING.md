@@ -37,8 +37,10 @@ just bootstrap   # one-time: toolchain components + pre-commit + cargo-llvm-cov
 just gate        # fmt + clippy + check + test + doc
 ```
 
-The toolchain is pinned in `rust-toolchain.toml`. Lints (`forbid(unsafe_code)`,
-`deny(missing_docs)`, a curated clippy set) live in `Cargo.toml [workspace.lints]`.
+The toolchain is pinned in `rust-toolchain.toml`. Lints (`deny(unsafe_code)` — the
+default build is `unsafe`-free; the optional `--features nccl` FFI module is the one
+gated exception — `deny(missing_docs)`, a curated clippy set) live in
+`Cargo.toml [workspace.lints]`.
 
 ## Security & privacy
 

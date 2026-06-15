@@ -73,7 +73,7 @@ Ruff + mypy + pytest Python setup). All of it runs on cloud CI on GitHub Actions
 |-------------|----------|
 | Formatting  | `rustfmt`, `max_width = 100`, edition 2021. |
 | Linting     | `clippy` with `-D warnings`: `clippy::all` + a **curated** subset of pedantic, plus `clippy::print_stdout` / `clippy::print_stderr` (we log via `tracing`, never `println!`) and a cognitive-complexity bound (~7). Lint levels live in `[workspace.lints]` in `Cargo.toml`. The curated set is chosen so a fresh, correct scaffold compiles **clean** under `-D warnings` — we deliberately do **not** turn on full `pedantic`/`nursery` as warnings. |
-| Safety/docs | Crate-level `#![forbid(unsafe_code)]`; `deny(missing_docs)`; `deny(rustdoc::broken_intra_doc_links)`. |
+| Safety/docs | Crate-level `#![deny(unsafe_code)]` — the default build compiles **zero** `unsafe`; the sole `#[allow(unsafe_code)]` is the optional `--features nccl` NCCL FFI module (not built by default or in CI). `deny(missing_docs)`; `deny(rustdoc::broken_intra_doc_links)`. |
 | Tests       | `cargo test` + doctests; `proptest` for numeric invariants. |
 | Coverage    | `cargo-llvm-cov` with a hard gate `--fail-under-lines 90`. Examples/bin are excluded from coverage so the gate is achievable from commit 1 (which ships the pure GRPO math + tests). |
 | Toolchain   | `rust-toolchain.toml` pins stable + `rustfmt`, `clippy`, `llvm-tools-preview`. |
