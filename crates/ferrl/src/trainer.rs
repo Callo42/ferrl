@@ -680,6 +680,11 @@ impl Trainer {
     /// `config.grad_accum_steps` prompts — cycling through `prompts`, returning one
     /// [`Metrics`] row per optimizer step (also appended to `metrics.jsonl`).
     ///
+    /// Returns the per-step metrics **and a [`RunStop`]**: if a
+    /// [`with_preemption_flag`](Self::with_preemption_flag) fired the loop stops early
+    /// after checkpointing and the stop is [`RunStop::Preempted`] (the history is then
+    /// *partial* — do not treat it as a finished run), else [`RunStop::Completed`].
+    ///
     /// # Errors
     ///
     /// Returns [`TrainerError`] if any forward, optimizer step, telemetry write,
@@ -694,19 +699,15 @@ impl Trainer {
         reward_fn: &R,
         tokenizer: &dyn TokenizerLike,
         prompts: &[String],
-    ) -> Result<Vec<Metrics>, TrainerError> {
-        // `train` is the run-to-completion entry point: a preemption stop is not a
-        // distinct outcome here (the caller installs no flag, or doesn't branch on
-        // it). `resume_latest` is the flag's documented partner and surfaces the stop.
+    ) -> Result<(Vec<Metrics>, RunStop), TrainerError> {
         self.run(0, None, policy, reward_fn, tokenizer, prompts)
-            .map(|(history, _stop)| history)
     }
 
     /// Resume training from `start_step`, running steps `start_step .. config.steps`
     /// (so the total run still ends at `config.steps`). Returns the per-step
     /// [`Metrics`] for the steps actually executed (empty if `start_step >=
-    /// config.steps`); they are also **appended** to `metrics.jsonl`, continuing
-    /// the prior run's stream.
+    /// config.steps`) **and a [`RunStop`]** (as [`train`](Self::train)); they are
+    /// also **appended** to `metrics.jsonl`, continuing the prior run's stream.
     ///
     /// The caller must have loaded the checkpoint's adapter into `policy` first —
     /// [`crate::checkpoint::load_adapter`] returns the [`crate::checkpoint::CheckpointManifest`]
@@ -738,9 +739,8 @@ impl Trainer {
         reward_fn: &R,
         tokenizer: &dyn TokenizerLike,
         prompts: &[String],
-    ) -> Result<Vec<Metrics>, TrainerError> {
+    ) -> Result<(Vec<Metrics>, RunStop), TrainerError> {
         self.run(start_step, None, policy, reward_fn, tokenizer, prompts)
-            .map(|(history, _stop)| history)
     }
 
     /// Resume an interrupted run from a checkpoint directory, **momentum-faithfully**.
@@ -752,6 +752,13 @@ impl Trainer {
     /// (adapter-only) checkpoint there is no optimizer/sampler state to restore, so this
     /// falls back to a fresh [`FerrlAdamW`] and the policy's current sampler (a faithful
     /// continuation, not a bit-exact replay — exactly like [`train_from`](Self::train_from)).
+    ///
+    /// Returns the per-step metrics **and a [`RunStop`]** (as [`train`](Self::train)).
+    /// This is the explicit-path resume a **data-parallel** requeue uses — every rank
+    /// calls it with rank 0's checkpoint dir — so the caller MUST honor
+    /// [`RunStop::Preempted`] (skip held-out eval / gating on the partial history and
+    /// exit so the next requeue continues); auto-discovery via
+    /// [`resume_latest`](Self::resume_latest) is single-rank only.
     ///
     /// `policy` must be the same architecture AND adapter recipe the checkpoint was
     /// written from: the adapter load and the optimizer-moment load each validate
@@ -779,10 +786,9 @@ impl Trainer {
         reward_fn: &R,
         tokenizer: &dyn TokenizerLike,
         prompts: &[String],
-    ) -> Result<Vec<Metrics>, TrainerError> {
+    ) -> Result<(Vec<Metrics>, RunStop), TrainerError> {
         let (start_step, opt_state) = self.load_resume_point(checkpoint_dir.as_ref(), policy)?;
         self.run(start_step, opt_state, policy, reward_fn, tokenizer, prompts)
-            .map(|(history, _stop)| history)
     }
 
     /// Load `checkpoint_dir` into `policy` and return the resumed loop's

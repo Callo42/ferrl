@@ -117,7 +117,7 @@ fn qwen_policy_grpo_smoke_on_gpu() {
 
     // A canary failure, a non-finite gradient, or an OOM would surface as an error
     // here; the run completing is itself most of the gate.
-    let history = trainer
+    let (history, _stop) = trainer
         .train(&mut policy, &SpreadReward, &tok, &prompts)
         .expect("GPU GRPO run failed");
 
@@ -192,7 +192,7 @@ fn qwen_v2_resume_smoke_on_gpu() {
     let tmp2 = TempDir::new();
     let run2 = RunDir::create(&tmp2.0, "qwen-gpu-v2-resume").unwrap();
     let mut trainer2 = Trainer::new(make_cfg(), &run2).unwrap();
-    let resumed = trainer2
+    let (resumed, _stop) = trainer2
         .resume(&ckpt, &mut policy2, &SpreadReward, &tok, &prompts)
         .expect("GPU resume from a v2 checkpoint failed");
     assert_eq!(

@@ -548,7 +548,7 @@ fn gate_reward_trends_up() {
     let tmp = TempDir::new("reward-up");
     let run = RunDir::create(tmp.path(), "echo").unwrap();
     let mut trainer = Trainer::new(cfg, &run).unwrap();
-    let history = trainer
+    let (history, _stop) = trainer
         .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
         .unwrap();
 
@@ -598,7 +598,7 @@ fn eos_padded_rollout_trains_with_length_aware_mask() {
     let tmp = TempDir::new("eos-padded");
     let run = RunDir::create(tmp.path(), "echo").unwrap();
     let mut trainer = Trainer::new(cfg, &run).unwrap();
-    let history = trainer
+    let (history, _stop) = trainer
         .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
         .unwrap();
 
@@ -650,7 +650,7 @@ fn truncation_masking_masks_full_width_rows_end_to_end() {
     let tmp = TempDir::new("truncation-mask");
     let run = RunDir::create(tmp.path(), "echo").unwrap();
     let mut trainer = Trainer::new(cfg, &run).unwrap();
-    let history = trainer
+    let (history, _stop) = trainer
         .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
         .unwrap();
     assert_eq!(history.len(), 4);
@@ -690,7 +690,7 @@ fn truncation_masking_off_keeps_full_width_rows() {
     let tmp = TempDir::new("truncation-mask-off");
     let run_off = RunDir::create(tmp.path(), "echo-off").unwrap();
     let mut trainer_off = Trainer::new(cfg_off, &run_off).unwrap();
-    let history_off = trainer_off
+    let (history_off, _stop) = trainer_off
         .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
         .unwrap();
     for m in &history_off {
@@ -747,7 +747,7 @@ fn capture_free_policy_reports_neutral_rollout_ratios() {
     let tmp = TempDir::new("neutral-ratios");
     let run = RunDir::create(tmp.path(), "echo").unwrap();
     let mut trainer = Trainer::new(cfg, &run).unwrap();
-    let history = trainer
+    let (history, _stop) = trainer
         .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
         .unwrap();
     for m in &history {
@@ -776,7 +776,7 @@ fn warmup_ramps_the_reported_lr_then_holds() {
     let tmp = TempDir::new("warmup");
     let run = RunDir::create(tmp.path(), "echo").unwrap();
     let mut trainer = Trainer::new(cfg, &run).unwrap();
-    let history = trainer
+    let (history, _stop) = trainer
         .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
         .unwrap();
     let want = [0.01f32, 0.02, 0.03, 0.03, 0.03];
@@ -852,7 +852,7 @@ fn degenerate_groups_still_feel_the_kl_pull_when_beta_positive() {
     let tmp = TempDir::new("degenerate-kl");
     let run = RunDir::create(tmp.path(), "echo").unwrap();
     let mut trainer = Trainer::new(cfg, &run).unwrap();
-    let history = trainer
+    let (history, _stop) = trainer
         .train(&mut policy, &ConstReward, &CharTokenizer, &prompts)
         .unwrap();
     for m in &history {
@@ -882,7 +882,7 @@ fn degenerate_groups_still_feel_the_kl_pull_when_beta_positive() {
     };
     let run0 = RunDir::create(tmp.path(), "echo-beta0").unwrap();
     let mut trainer0 = Trainer::new(cfg0, &run0).unwrap();
-    let history0 = trainer0
+    let (history0, _stop) = trainer0
         .train(&mut policy0, &ConstReward, &CharTokenizer, &prompts)
         .unwrap();
     assert!(history0.iter().all(|m| m.grad_norm == 0.0));
@@ -910,7 +910,7 @@ fn grad_clip_binds_and_reports_the_preclip_norm() {
         let tmp = TempDir::new(tag);
         let run = RunDir::create(tmp.path(), "echo").unwrap();
         let mut trainer = Trainer::new(cfg, &run).unwrap();
-        let history = trainer
+        let (history, _stop) = trainer
             .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
             .unwrap();
         (history[0].grad_norm, weights_of(&policy))
@@ -1101,7 +1101,7 @@ fn gate_dr_grpo_paper_config_learns() {
     let tmp = TempDir::new("drgrpo-paper");
     let run = RunDir::create(tmp.path(), "echo").unwrap();
     let mut trainer = Trainer::new(cfg, &run).unwrap();
-    let history = trainer
+    let (history, _stop) = trainer
         .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
         .unwrap();
 
@@ -1156,7 +1156,7 @@ fn gate_grad_accum_effective_batch_learns() {
     let tmp = TempDir::new("grad-accum");
     let run = RunDir::create(tmp.path(), "echo").unwrap();
     let mut trainer = Trainer::new(cfg, &run).unwrap();
-    let history = trainer
+    let (history, _stop) = trainer
         .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
         .unwrap();
     assert_eq!(
@@ -1216,7 +1216,7 @@ fn gate_grad_accum_two_prompt_window() {
     let tmp = TempDir::new("grad-accum-2");
     let run = RunDir::create(tmp.path(), "echo").unwrap();
     let mut trainer = Trainer::new(cfg, &run).unwrap();
-    let history = trainer
+    let (history, _stop) = trainer
         .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
         .unwrap();
 
@@ -1300,7 +1300,7 @@ fn interrupted_run_resumes_bit_identically() {
     let mut policy_full = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 29, TEMP).unwrap();
     let run_full = RunDir::create(tmp.path().join("full"), "echo").unwrap();
     let mut trainer_full = Trainer::new(make_cfg(), &run_full).unwrap();
-    let hist_full = trainer_full
+    let (hist_full, _stop) = trainer_full
         .train(&mut policy_full, &EchoReward, &CharTokenizer, &prompts)
         .unwrap();
     let weights_full = snapshot_vars(&policy_full.trainable_vars());
@@ -1324,7 +1324,7 @@ fn interrupted_run_resumes_bit_identically() {
     let mut policy_f = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 999, TEMP).unwrap();
     let run_f = RunDir::create(tmp.path().join("faithful"), "echo").unwrap();
     let mut trainer_f = Trainer::new(make_cfg(), &run_f).unwrap();
-    let hist_f = trainer_f
+    let (hist_f, _stop) = trainer_f
         .resume(&ckpt, &mut policy_f, &EchoReward, &CharTokenizer, &prompts)
         .unwrap();
     assert_eq!(hist_f.len(), (TOTAL - INTERRUPT_AT) as usize);
@@ -1402,7 +1402,7 @@ fn preemption_stop_then_resume_latest_matches_uninterrupted() {
     let mut policy_full = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 29, TEMP).unwrap();
     let run_full = RunDir::create(tmp.path().join("full"), "echo").unwrap();
     let mut trainer_full = Trainer::new(make_cfg(), &run_full).unwrap();
-    let hist_full = trainer_full
+    let (hist_full, _stop) = trainer_full
         .train(&mut policy_full, &EchoReward, &CharTokenizer, &prompts)
         .unwrap();
     let weights_full = snapshot_vars(&policy_full.trainable_vars());
@@ -1428,9 +1428,15 @@ fn preemption_stop_then_resume_latest_matches_uninterrupted() {
     let mut trainer_a = Trainer::new(make_cfg(), &run_a)
         .unwrap()
         .with_preemption_flag(Arc::clone(&flag));
-    let hist_a = trainer_a
+    let (hist_a, stop_a) = trainer_a
         .train(&mut policy_a, &EchoReward, &CharTokenizer, &prompts)
         .unwrap();
+    assert_eq!(
+        stop_a,
+        RunStop::Preempted,
+        "train() with a pre-set preemption flag must report RunStop::Preempted, \
+         not silently return a partial run as if completed"
+    );
     assert_eq!(
         hist_a.len(),
         1,
@@ -1574,7 +1580,7 @@ fn gate_canary_holds_on_every_real_update() {
     let tmp = TempDir::new("canary");
     let run = RunDir::create(tmp.path(), "echo").unwrap();
     let mut trainer = Trainer::new(cfg, &run).unwrap();
-    let history = trainer
+    let (history, _stop) = trainer
         .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
         .unwrap();
 
@@ -1696,7 +1702,7 @@ fn gate_mu2_beta_positive_run() {
     let tmp = TempDir::new("mu2-beta");
     let run = RunDir::create(tmp.path(), "echo").unwrap();
     let mut trainer = Trainer::new(cfg, &run).unwrap();
-    let history = trainer
+    let (history, _stop) = trainer
         .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
         .unwrap();
 
@@ -1739,7 +1745,7 @@ fn gate_mu_gt1_beta_zero_completes() {
     let tmp = TempDir::new("mu3-beta0");
     let run = RunDir::create(tmp.path(), "echo").unwrap();
     let mut trainer = Trainer::new(cfg, &run).unwrap();
-    let history = trainer
+    let (history, _stop) = trainer
         .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
         .unwrap();
     assert_eq!(history.len(), 40);

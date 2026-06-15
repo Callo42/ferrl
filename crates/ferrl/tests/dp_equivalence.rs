@@ -352,7 +352,7 @@ fn run_scripted_world(
                     let history = trainer
                         .train(&mut policy, &EchoOrFlatReward, &CharTokenizer, prompts)
                         .unwrap();
-                    (var_bits(&policy), history)
+                    (var_bits(&policy), history.0)
                 })
             })
             .collect();
@@ -369,7 +369,7 @@ fn run_scripted_single(base: &Path, cfg: &TrainerConfig, prompts: &[String]) -> 
     let history = trainer
         .train(&mut policy, &EchoOrFlatReward, &CharTokenizer, prompts)
         .unwrap();
-    (var_bits(&policy), history)
+    (var_bits(&policy), history.0)
 }
 
 fn scripted_cfg() -> TrainerConfig {
@@ -467,6 +467,7 @@ fn preemption_flag_stops_the_whole_dp_world_in_lockstep() {
                     trainer
                         .train(&mut policy, &EchoOrFlatReward, &CharTokenizer, &prompts)
                         .unwrap()
+                        .0
                 })
             })
             .collect();
@@ -884,7 +885,7 @@ fn rank_zero_writes_the_only_checkpoint_and_a_dp_resume_continues_bit_exactly() 
                             &live_prompts(),
                         )
                         .unwrap();
-                    (var_bits(&policy), history)
+                    (var_bits(&policy), history.0)
                 })
             })
             .collect();
@@ -1037,7 +1038,7 @@ fn assert_real_model_lockstep(tag: &str, make_policy: fn(u64) -> Qwen3_5Policy) 
                     let history = trainer
                         .train(&mut policy, &SpreadReward, &ByteCodec, &prompts)
                         .unwrap();
-                    (var_bits(&policy), history)
+                    (var_bits(&policy), history.0)
                 })
             })
             .collect();

@@ -376,7 +376,7 @@ fn trainer_checkpoint_captures_final_adapter() {
     let run = RunDir::create(tmp.path(), "qwen-ckpt").unwrap();
     let ckpt_root = run.checkpoints_dir();
     let mut trainer = Trainer::new(ckpt_train_cfg(Some(2)), &run).unwrap();
-    let history = trainer
+    let (history, _stop) = trainer
         .train(&mut policy, &SpreadReward, &CharCodec, &prompts)
         .unwrap();
     assert_eq!(history.len(), 4);
@@ -434,7 +434,7 @@ fn trainer_resumes_from_a_checkpoint() {
 
     let run2 = RunDir::create(tmp.path(), "qwen-resume").unwrap();
     let mut trainer2 = Trainer::new(ckpt_train_cfg(None), &run2).unwrap();
-    let resumed = trainer2
+    let (resumed, _stop) = trainer2
         .train_from(2, &mut resume_policy, &SpreadReward, &CharCodec, &prompts)
         .unwrap();
 
@@ -526,7 +526,7 @@ fn industrial_recipe_round_trips_through_a_trainer_checkpoint() {
     let mut resumed = policy_with_targets(&vb, &cfg, DenseLoraTargets::industrial());
     let run2 = RunDir::create(tmp.path(), "qwen-industrial-resume").unwrap();
     let mut trainer2 = Trainer::new(ckpt_train_cfg(None), &run2).unwrap();
-    let history = trainer2
+    let (history, _stop) = trainer2
         .resume(
             ckpt_root.join("step-2"),
             &mut resumed,

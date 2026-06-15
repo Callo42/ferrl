@@ -100,7 +100,7 @@ fn gspo_training_on_the_moe_model_matches_across_checkpointing() {
         let tmp = TempDir::new(tag);
         let run = RunDir::create(&tmp.0, tag).unwrap();
         let mut trainer = Trainer::new(cfg.clone(), &run).unwrap();
-        let history = trainer
+        let (history, _stop) = trainer
             .train(policy, &SpreadReward, &ByteCodec, &prompts)
             .unwrap();
         assert!(

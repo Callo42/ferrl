@@ -442,7 +442,7 @@ fn qwen35_policy_grpo_smoke_on_gpu() {
     let run = RunDir::create(&tmp.0, "qwen35-gpu-smoke").unwrap();
     let mut trainer = Trainer::new(cfg_t, &run).unwrap();
 
-    let history = trainer
+    let (history, _stop) = trainer
         .train(&mut policy, &SpreadReward, &tok, &prompts)
         .expect("GPU GRPO run failed");
 
