@@ -66,6 +66,18 @@ flash-attn = [
     "cuda",
     "candle-transformers/flash-attn",
 ]
+# NCCL multi-GPU collectives (implies cuda). The `--features nccl` quarantine
+# (decision D2): the crate's ONLY `unsafe` lives behind this flag — the real
+# `NcclComm` all-reduce over cudarc's NCCL bindings. The default CPU build and
+# GitHub CI never compile it, so `#![forbid(unsafe_code)]` holds there; it builds
+# and links only on the GPU cluster (nvhpc SDK ships libnccl), runtime-gated by a
+# manual multi-GPU Slurm run. The portable bridge logic (config, dtype/error
+# mapping, contract validation, orchestration) lives in the default build and is
+# CI-tested against an in-memory mock; only the FFI primitive impl is gated here.
+nccl = [
+    "cuda",
+    "cudarc/nccl",
+]
 
 [lints]
 workspace = true

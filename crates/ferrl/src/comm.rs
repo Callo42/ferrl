@@ -44,9 +44,12 @@
 //!   substrate: it has real collective semantics (barrier, deterministic
 //!   rank-order reduction, mismatch/timeout fail-loud) with no GPU and no
 //!   process orchestration, so the DP equivalence gates run in plain CI.
-//! - NCCL (multi-GPU) is the planned follow-up behind a `--features nccl`
-//!   quarantine (the P8 GPU phase); it implements this same trait, so the
-//!   trainer is already distributed-ready.
+//! - [`NcclComm`] — the real multi-GPU / multi-process implementation, whose
+//!   `unsafe` cudarc-NCCL collective is quarantined behind `--features nccl`
+//!   (decision D2: the crate's only `unsafe`, in one gated module). Its
+//!   GPU-independent logic (config, dtype/contract validation, scalar packing,
+//!   orchestration) is in the default build and CI-tested against an in-memory
+//!   mock (the `nccl` submodule).
 //!
 //! Reductions are **deterministic**: contributions are combined in rank order
 //! (slot 0 + slot 1 + …), independent of thread arrival order, so a reduced
@@ -58,6 +61,12 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use candle_core::Tensor;
+
+mod nccl;
+
+#[cfg(feature = "nccl")]
+pub use nccl::RealNccl;
+pub use nccl::{NcclComm, NcclConfig, NcclPrimitives};
 
 /// How long a [`LocalComm`] collective waits for its peers before declaring
 /// the world dead. Generous: the longest legitimate skew between ranks is one
@@ -86,6 +95,11 @@ pub enum CommError {
     /// A tensor operation inside the reduction failed.
     #[error("candle error inside a collective: {0}")]
     Candle(#[from] candle_core::Error),
+    /// The data-parallel launch environment is malformed — a missing or
+    /// unparseable rank/world variable, or an unusable rendezvous path. Raised
+    /// during [`NcclComm`] bootstrap, before any collective runs.
+    #[error("data-parallel configuration error: {0}")]
+    Config(String),
 }
 
 /// The data-parallel collective seam: rank identity plus sum-reductions.
@@ -158,7 +172,7 @@ impl Comm for SoloComm {
 /// a world, so a dead world is dead for **every** operation type, not just
 /// the one that failed.
 #[derive(Default)]
-struct PoisonCell(Mutex<Option<String>>);
+pub(crate) struct PoisonCell(Mutex<Option<String>>);
 
 impl PoisonCell {
     /// Record the first failure (later failures keep the original message).
@@ -205,8 +219,9 @@ struct Round<T> {
 /// A reusable N-thread rendezvous: every participant deposits a value, the
 /// last arrival combines all of them in rank order, and every participant
 /// collects the combined result. Failures poison the whole world permanently
-/// (via the shared [`PoisonCell`]).
-struct Rendezvous<T> {
+/// (via the shared [`PoisonCell`]). Shared by [`LocalComm`] and the in-memory
+/// `MockNccl` test substrate (see the `nccl` submodule).
+pub(crate) struct Rendezvous<T> {
     world: usize,
     timeout: Duration,
     poison: Arc<PoisonCell>,
@@ -215,7 +230,7 @@ struct Rendezvous<T> {
 }
 
 impl<T: Clone> Rendezvous<T> {
-    fn new(world: usize, timeout: Duration, poison: Arc<PoisonCell>) -> Self {
+    pub(crate) fn new(world: usize, timeout: Duration, poison: Arc<PoisonCell>) -> Self {
         Self {
             world,
             timeout,
@@ -243,7 +258,7 @@ impl<T: Clone> Rendezvous<T> {
 
     /// Deposit `value` for `rank`, rendezvous with the other ranks, and return
     /// the combined outcome (every rank receives a clone of the same result).
-    fn exchange(
+    pub(crate) fn exchange(
         &self,
         rank: usize,
         value: T,
@@ -448,8 +463,10 @@ impl Comm for LocalComm {
 }
 
 /// Combine the ranks' contribution vecs into their element-wise sums, in rank
-/// order, validating the collective contract (same count, shape, dtype).
-fn sum_tensor_slots(vals: &[Vec<Tensor>]) -> Result<Vec<Tensor>, String> {
+/// order, validating the collective contract (same count, shape, dtype). Shared
+/// with the `MockNccl` test substrate (the `nccl` submodule) so the mock reduces
+/// with the identical rank-order semantics [`LocalComm`] uses.
+pub(crate) fn sum_tensor_slots(vals: &[Vec<Tensor>]) -> Result<Vec<Tensor>, String> {
     let n = vals[0].len();
     if let Some((r, v)) = vals.iter().enumerate().find(|(_, v)| v.len() != n) {
         return Err(format!(
