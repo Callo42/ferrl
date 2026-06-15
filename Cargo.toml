@@ -78,9 +78,15 @@ approx = "0.5"
 signal-hook = { version = "0.3", default-features = false }
 
 [workspace.lints.rust]
-# Safety + docs gate. `unsafe_code` is forbidden at the crate root too
-# (#![forbid(unsafe_code)]); duplicating it here keeps future crates honest.
-unsafe_code = "forbid"
+# Safety + docs gate. `unsafe_code` is DENIED workspace-wide (the crate root
+# mirrors it with `#![deny(unsafe_code)]`): the default/CI build compiles zero
+# `unsafe`. It is `deny`, not `forbid`, for exactly one reason — the
+# `--features nccl` NCCL FFI (ferrl's decision-D2 quarantine) needs a single
+# `#[allow(unsafe_code)]` in its one gated module, which `forbid` cannot permit.
+# That module is not compiled without the feature, so the guarantee for ordinary
+# contributors is unchanged; the one allow is greppable and lives only behind the
+# GPU feature.
+unsafe_code = "deny"
 missing_docs = "deny"
 unreachable_pub = "warn"
 

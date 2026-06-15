@@ -77,9 +77,10 @@
 //!   (rank identity + sum-reductions) the trainer all-reduces its accumulated
 //!   gradients through, keeping every rank's weights in bitwise lockstep;
 //!   [`SoloComm`] is the world-1 default (the single-rank path stays
-//!   bit-identical to the pre-DP trainer) and [`LocalComm`] runs an N-thread
-//!   single-process world for the CPU-testable DP equivalence oracle (the
-//!   NCCL multi-GPU implementation is the planned `--features nccl` follow-up);
+//!   bit-identical to the pre-DP trainer), [`LocalComm`] runs an N-thread
+//!   single-process world for the CPU-testable DP equivalence oracle, and
+//!   [`NcclComm`] is the real multi-GPU implementation whose `unsafe` cudarc
+//!   collective is quarantined behind `--features nccl`;
 //! - a CUDA driver-compatibility preflight ([`cuda_compat`]) — translates the cryptic
 //!   `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` (a build-PTX-newer-than-driver mismatch) into
 //!   an actionable rebuild/upgrade message; a no-op without the `cuda` feature;
@@ -111,7 +112,15 @@
 //! ## Stability
 //!
 //! Pre-`1.0`: the public surface may change between minor versions.
-#![forbid(unsafe_code)]
+//
+// `deny`, not `forbid`: the default build compiles **zero** `unsafe` (the lint
+// errors on any), but `forbid` cannot be locally overridden, and the
+// `--features nccl` NCCL FFI ([`comm`]'s decision-D2 quarantine) needs one
+// `#[allow(unsafe_code)]` in its single gated module. That module is not
+// compiled without the feature, so the default/CI build is exactly as
+// unsafe-free as before; only a GPU-cluster `--features nccl` build carries the
+// one allow.
+#![deny(unsafe_code)]
 
 pub mod blocks;
 pub mod checkpoint;
@@ -144,8 +153,10 @@ pub use checkpoint::{
     latest_checkpoint, load_adapter, load_checkpoint, save_adapter, save_checkpoint,
     CheckpointError, CheckpointManifest, LatestCheckpoint, LoadedCheckpoint,
 };
+#[cfg(feature = "nccl")]
+pub use comm::RealNccl;
 #[doc(inline)]
-pub use comm::{Comm, CommError, LocalComm, SoloComm};
+pub use comm::{Comm, CommError, LocalComm, NcclComm, NcclConfig, NcclPrimitives, SoloComm};
 #[doc(inline)]
 pub use countdown::{
     build_prompt, generate_dataset, parse_problem_from_prompt, CountdownConfig, CountdownProblem,
