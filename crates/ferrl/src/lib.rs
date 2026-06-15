@@ -196,7 +196,7 @@ pub use reward::RewardFn;
 #[doc(inline)]
 pub use sampler::GrpoSampler;
 #[doc(inline)]
-pub use telemetry::{init_tracing, Metrics, MetricsWriter, RunDir};
+pub use telemetry::{init_tracing, read_metrics, Metrics, MetricsWriter, RunDir};
 #[doc(inline)]
 pub use tokenizer::HfTokenizer;
 #[doc(inline)]

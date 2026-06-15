@@ -578,18 +578,31 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Defense in depth: a re-launch of an ALREADY-finished run (a stable run id whose
-    // newest checkpoint is already at `steps`) resumes zero new steps and returns an
-    // empty history. The training-reward-trend gate is undefined on no metrics, and the
-    // gate already ran in the original launch — so report and exit instead of feeding
-    // `report_and_gate` an empty slice.
-    if history.is_empty() {
+    // A re-launch that resumed a checkpoint ALREADY at `steps` runs zero new steps and
+    // returns an empty history — but eval/gate may NOT have completed: the job could
+    // have been killed DURING post-training eval and then requeued. So never skip the
+    // gate (reporting success without it would be a false pass). Recover the persisted
+    // training metrics from `metrics.jsonl` and gate on those; the held-out eval below
+    // re-runs from the resumed adapter regardless.
+    let history = if history.is_empty() {
+        let recovered = ferrl::read_metrics(run.metrics_path())
+            .context("recover training metrics for an already-trained resumed run")?;
+        if recovered.is_empty() {
+            bail!(
+                "resume_latest ran zero new steps and {} holds no metrics — cannot evaluate \
+                 the training-reward gate; start a fresh FERRL_CD35_RUN_ID to retrain",
+                run.metrics_path().display()
+            );
+        }
         warn!(
-            "resume_latest found an already-complete run (0 new steps); the training-reward \
-             gate ran in the original launch — nothing to re-train or re-gate"
+            recovered_windows = recovered.len(),
+            "resumed an already-trained run (0 new steps); recovered training metrics to run \
+             the held-out eval + gate (the gate may not have completed before the requeue)"
         );
-        return Ok(());
-    }
+        recovered
+    } else {
+        history
+    };
 
     // Held-out eval AFTER training: `evaluate` scores base (adapter off) vs the
     // trained adapter (adapter on) in one pass, avg@k per prompt on the eval
