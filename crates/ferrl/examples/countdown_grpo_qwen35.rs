@@ -578,31 +578,24 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // A re-launch that resumed a checkpoint ALREADY at `steps` runs zero new steps and
-    // returns an empty history — but eval/gate may NOT have completed: the job could
-    // have been killed DURING post-training eval and then requeued. So never skip the
-    // gate (reporting success without it would be a false pass). Recover the persisted
-    // training metrics from `metrics.jsonl` and gate on those; the held-out eval below
-    // re-runs from the resumed adapter regardless.
-    let history = if history.is_empty() {
-        let recovered = ferrl::read_metrics(run.metrics_path())
-            .context("recover training metrics for an already-trained resumed run")?;
-        if recovered.is_empty() {
-            bail!(
-                "resume_latest ran zero new steps and {} holds no metrics — cannot evaluate \
-                 the training-reward gate; start a fresh FERRL_CD35_RUN_ID to retrain",
-                run.metrics_path().display()
-            );
-        }
-        warn!(
-            recovered_windows = recovered.len(),
-            "resumed an already-trained run (0 new steps); recovered training metrics to run \
-             the held-out eval + gate (the gate may not have completed before the requeue)"
+    // Gate on the FULL run, recovered from `metrics.jsonl` — NOT the `history` this
+    // launch returned. The training-reward-trend gate spans the whole trajectory, but a
+    // requeue's in-memory history covers only the steps THIS launch ran: zero for an
+    // already-trained resume (the job may have been killed during eval, so we must still
+    // gate — skipping would be a false pass), or just the tail for a mid-run resume
+    // (gating on a converged tail would falsely fail). `metrics.jsonl` is the complete
+    // stream in every case (a resume appends to it) and is identical to `history` for a
+    // fresh run, so reading it is correct and uniform. Never report success without
+    // gating; fail loud if no metrics exist at all.
+    let history =
+        ferrl::read_metrics(run.metrics_path()).context("read training metrics for the gate")?;
+    if history.is_empty() {
+        bail!(
+            "no training metrics at {} — cannot evaluate the training-reward gate; \
+             start a fresh FERRL_CD35_RUN_ID to retrain",
+            run.metrics_path().display()
         );
-        recovered
-    } else {
-        history
-    };
+    }
 
     // Held-out eval AFTER training: `evaluate` scores base (adapter off) vs the
     // trained adapter (adapter on) in one pass, avg@k per prompt on the eval
