@@ -33,6 +33,8 @@ cudarc = { workspace = true, optional = true }
 [dev-dependencies]
 proptest = { workspace = true }
 approx = { workspace = true }
+# Signal -> flag wiring for the countdown example's restart-on-preemption demo.
+signal-hook = { workspace = true }
 
 [features]
 # Default is CPU-only: this is what GitHub Actions CI builds and tests, and the

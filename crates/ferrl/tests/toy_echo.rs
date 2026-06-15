@@ -22,6 +22,8 @@
 //!    legitimately-zero gradient is a no-op, not a canary abort.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use candle_core::{DType, Device, IndexOp, Result as CandleResult, Tensor, Var, D};
 use candle_nn::ops::log_softmax;
@@ -32,7 +34,7 @@ use ferrl::policy::{GenConfig, Policy, Rollout};
 use ferrl::reward::RewardFn;
 use ferrl::sampler::GrpoSampler;
 use ferrl::telemetry::RunDir;
-use ferrl::trainer::{TokenizerLike, Trainer, TrainerConfig, TrainerError};
+use ferrl::trainer::{RunStop, TokenizerLike, Trainer, TrainerConfig, TrainerError};
 use ferrl::{LossType, Metrics, ScaleRewards};
 
 /// Toy vocabulary size; the (full-rank) `LoRA` rank equals it, so a rank-`VOCAB`
@@ -546,7 +548,7 @@ fn gate_reward_trends_up() {
     let tmp = TempDir::new("reward-up");
     let run = RunDir::create(tmp.path(), "echo").unwrap();
     let mut trainer = Trainer::new(cfg, &run).unwrap();
-    let history = trainer
+    let (history, _stop) = trainer
         .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
         .unwrap();
 
@@ -596,7 +598,7 @@ fn eos_padded_rollout_trains_with_length_aware_mask() {
     let tmp = TempDir::new("eos-padded");
     let run = RunDir::create(tmp.path(), "echo").unwrap();
     let mut trainer = Trainer::new(cfg, &run).unwrap();
-    let history = trainer
+    let (history, _stop) = trainer
         .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
         .unwrap();
 
@@ -648,7 +650,7 @@ fn truncation_masking_masks_full_width_rows_end_to_end() {
     let tmp = TempDir::new("truncation-mask");
     let run = RunDir::create(tmp.path(), "echo").unwrap();
     let mut trainer = Trainer::new(cfg, &run).unwrap();
-    let history = trainer
+    let (history, _stop) = trainer
         .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
         .unwrap();
     assert_eq!(history.len(), 4);
@@ -688,7 +690,7 @@ fn truncation_masking_off_keeps_full_width_rows() {
     let tmp = TempDir::new("truncation-mask-off");
     let run_off = RunDir::create(tmp.path(), "echo-off").unwrap();
     let mut trainer_off = Trainer::new(cfg_off, &run_off).unwrap();
-    let history_off = trainer_off
+    let (history_off, _stop) = trainer_off
         .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
         .unwrap();
     for m in &history_off {
@@ -745,7 +747,7 @@ fn capture_free_policy_reports_neutral_rollout_ratios() {
     let tmp = TempDir::new("neutral-ratios");
     let run = RunDir::create(tmp.path(), "echo").unwrap();
     let mut trainer = Trainer::new(cfg, &run).unwrap();
-    let history = trainer
+    let (history, _stop) = trainer
         .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
         .unwrap();
     for m in &history {
@@ -774,7 +776,7 @@ fn warmup_ramps_the_reported_lr_then_holds() {
     let tmp = TempDir::new("warmup");
     let run = RunDir::create(tmp.path(), "echo").unwrap();
     let mut trainer = Trainer::new(cfg, &run).unwrap();
-    let history = trainer
+    let (history, _stop) = trainer
         .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
         .unwrap();
     let want = [0.01f32, 0.02, 0.03, 0.03, 0.03];
@@ -850,7 +852,7 @@ fn degenerate_groups_still_feel_the_kl_pull_when_beta_positive() {
     let tmp = TempDir::new("degenerate-kl");
     let run = RunDir::create(tmp.path(), "echo").unwrap();
     let mut trainer = Trainer::new(cfg, &run).unwrap();
-    let history = trainer
+    let (history, _stop) = trainer
         .train(&mut policy, &ConstReward, &CharTokenizer, &prompts)
         .unwrap();
     for m in &history {
@@ -880,7 +882,7 @@ fn degenerate_groups_still_feel_the_kl_pull_when_beta_positive() {
     };
     let run0 = RunDir::create(tmp.path(), "echo-beta0").unwrap();
     let mut trainer0 = Trainer::new(cfg0, &run0).unwrap();
-    let history0 = trainer0
+    let (history0, _stop) = trainer0
         .train(&mut policy0, &ConstReward, &CharTokenizer, &prompts)
         .unwrap();
     assert!(history0.iter().all(|m| m.grad_norm == 0.0));
@@ -908,7 +910,7 @@ fn grad_clip_binds_and_reports_the_preclip_norm() {
         let tmp = TempDir::new(tag);
         let run = RunDir::create(tmp.path(), "echo").unwrap();
         let mut trainer = Trainer::new(cfg, &run).unwrap();
-        let history = trainer
+        let (history, _stop) = trainer
             .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
             .unwrap();
         (history[0].grad_norm, weights_of(&policy))
@@ -1099,7 +1101,7 @@ fn gate_dr_grpo_paper_config_learns() {
     let tmp = TempDir::new("drgrpo-paper");
     let run = RunDir::create(tmp.path(), "echo").unwrap();
     let mut trainer = Trainer::new(cfg, &run).unwrap();
-    let history = trainer
+    let (history, _stop) = trainer
         .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
         .unwrap();
 
@@ -1154,7 +1156,7 @@ fn gate_grad_accum_effective_batch_learns() {
     let tmp = TempDir::new("grad-accum");
     let run = RunDir::create(tmp.path(), "echo").unwrap();
     let mut trainer = Trainer::new(cfg, &run).unwrap();
-    let history = trainer
+    let (history, _stop) = trainer
         .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
         .unwrap();
     assert_eq!(
@@ -1214,7 +1216,7 @@ fn gate_grad_accum_two_prompt_window() {
     let tmp = TempDir::new("grad-accum-2");
     let run = RunDir::create(tmp.path(), "echo").unwrap();
     let mut trainer = Trainer::new(cfg, &run).unwrap();
-    let history = trainer
+    let (history, _stop) = trainer
         .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
         .unwrap();
 
@@ -1298,7 +1300,7 @@ fn interrupted_run_resumes_bit_identically() {
     let mut policy_full = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 29, TEMP).unwrap();
     let run_full = RunDir::create(tmp.path().join("full"), "echo").unwrap();
     let mut trainer_full = Trainer::new(make_cfg(), &run_full).unwrap();
-    let hist_full = trainer_full
+    let (hist_full, _stop) = trainer_full
         .train(&mut policy_full, &EchoReward, &CharTokenizer, &prompts)
         .unwrap();
     let weights_full = snapshot_vars(&policy_full.trainable_vars());
@@ -1322,7 +1324,7 @@ fn interrupted_run_resumes_bit_identically() {
     let mut policy_f = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 999, TEMP).unwrap();
     let run_f = RunDir::create(tmp.path().join("faithful"), "echo").unwrap();
     let mut trainer_f = Trainer::new(make_cfg(), &run_f).unwrap();
-    let hist_f = trainer_f
+    let (hist_f, _stop) = trainer_f
         .resume(&ckpt, &mut policy_f, &EchoReward, &CharTokenizer, &prompts)
         .unwrap();
     assert_eq!(hist_f.len(), (TOTAL - INTERRUPT_AT) as usize);
@@ -1365,6 +1367,236 @@ fn interrupted_run_resumes_bit_identically() {
 }
 
 #[test]
+#[allow(clippy::cognitive_complexity)] // a linear end-to-end scenario: reference run, interrupt, requeue, compare
+fn preemption_stop_then_resume_latest_matches_uninterrupted() {
+    // Restart-on-preemption capstone. A run STOPPED MID-FLIGHT by the preemption
+    // flag writes a final checkpoint, and a requeued launch — `RunDir::open` on the
+    // SAME run id + `resume_latest` — reproduces the uninterrupted run's
+    // post-resume trajectory BIT-FOR-BIT. Same within-one-process relative-equality
+    // argument as `interrupted_run_resumes_bit_identically` (candle's per-process
+    // reduction order makes only *relative* bit-equality meaningful), but here the
+    // stop is driven by the preemption flag and the resume is found by
+    // `latest_checkpoint`, not an explicit `resume(dir)`.
+    //
+    // `checkpoint_every` is None, so the ONLY checkpoint is the one the preemption
+    // stop itself writes — this proves that path emits a resumable momentum-faithful
+    // v3 checkpoint, independent of the periodic cadence.
+    const TOTAL: u64 = 6;
+    let prompts = echo_prompts(VOCAB);
+    let make_cfg = || TrainerConfig {
+        steps: TOTAL,
+        group_size: 32,
+        max_new_tokens: 1,
+        temperature: TEMP,
+        lr: 0.05,
+        // The interrupt (after step 0) lands INSIDE the warmup ramp, so the
+        // resumed arm must re-enter the lr schedule at the same effective lr —
+        // `lr_at` is a pure function of the outer step, so it does.
+        warmup_steps: 3,
+        checkpoint_every: None, // ONLY the preemption stop writes a checkpoint
+        ..TrainerConfig::default()
+    };
+
+    // Uninterrupted reference (seed 29): all TOTAL steps in one go.
+    let tmp = TempDir::new("preempt-resume");
+    let mut policy_full = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 29, TEMP).unwrap();
+    let run_full = RunDir::create(tmp.path().join("full"), "echo").unwrap();
+    let mut trainer_full = Trainer::new(make_cfg(), &run_full).unwrap();
+    let (hist_full, _stop) = trainer_full
+        .train(&mut policy_full, &EchoReward, &CharTokenizer, &prompts)
+        .unwrap();
+    let weights_full = snapshot_vars(&policy_full.trainable_vars());
+    assert_eq!(hist_full.len(), TOTAL as usize);
+
+    // Non-vacuity: the post-resume window MUST contain a real AdamW update, or the
+    // weight / grad-norm equality below is moment-blind (a broken moment restore
+    // would still pass).
+    let post = &hist_full[1..];
+    assert!(
+        post.iter().any(|m| m.grad_norm > 0.0),
+        "post-resume window had no real AdamW update — gate cannot test moment restoration"
+    );
+
+    // Attempt 1 — the interrupted run. SAME seed as the reference (29), so its
+    // step 0 is bit-identical to the reference's; the preemption flag is pre-set,
+    // so after step 0 the stop fires: it writes checkpoints/step-1 (the reference's
+    // post-step-0 state) and returns without finishing.
+    let base = tmp.path().join("preempted");
+    let flag = Arc::new(AtomicBool::new(true));
+    let mut policy_a = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 29, TEMP).unwrap();
+    let run_a = RunDir::create(&base, "echo").unwrap();
+    let mut trainer_a = Trainer::new(make_cfg(), &run_a)
+        .unwrap()
+        .with_preemption_flag(Arc::clone(&flag));
+    let (hist_a, stop_a) = trainer_a
+        .train(&mut policy_a, &EchoReward, &CharTokenizer, &prompts)
+        .unwrap();
+    assert_eq!(
+        stop_a,
+        RunStop::Preempted,
+        "train() with a pre-set preemption flag must report RunStop::Preempted, \
+         not silently return a partial run as if completed"
+    );
+    assert_eq!(
+        hist_a.len(),
+        1,
+        "the pre-set preemption flag must stop the run after the first step"
+    );
+    let ckpt_root = run_a.checkpoints_dir();
+    assert!(
+        ckpt_root.join("step-1").is_dir(),
+        "the preemption stop must write checkpoints/step-1"
+    );
+    assert!(
+        !ckpt_root.join("step-6").exists(),
+        "the run stopped before completing, so no final checkpoint exists"
+    );
+
+    // Attempt 2 — the requeue. Reopen the SAME run id, FRESH policy seeded
+    // DIFFERENTLY (777) so any match is the restore's doing, no flag. resume_latest
+    // discovers step-1 and runs the remaining steps 1..6.
+    let mut policy_b = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 777, TEMP).unwrap();
+    let run_b = RunDir::open(&base, "echo").unwrap();
+    let mut trainer_b = Trainer::new(make_cfg(), &run_b).unwrap();
+    let (hist_b, stop_b) = trainer_b
+        .resume_latest(&mut policy_b, &EchoReward, &CharTokenizer, &prompts)
+        .unwrap();
+    assert_eq!(
+        stop_b,
+        RunStop::Completed,
+        "the requeue runs to completion (no flag set), so it must report Completed"
+    );
+    assert_eq!(
+        hist_b.len(),
+        (TOTAL - 1) as usize,
+        "resume_latest must run the remaining steps 1..6"
+    );
+    // Post-resume metrics bit-equal (reward_mean / frac_reward_zero_std prove the
+    // RNG was restored; grad_norm across a real update proves the moments were).
+    assert_metrics_bit_identical(&hist_b, post);
+    assert_eq!(
+        snapshot_vars(&policy_b.trainable_vars()),
+        weights_full,
+        "preempt + resume_latest must reproduce the uninterrupted final weights bit-for-bit"
+    );
+}
+
+#[test]
+fn resume_latest_starts_fresh_when_no_checkpoint() {
+    // With an empty checkpoints/ directory, resume_latest is exactly train(): it
+    // runs all `steps` from scratch, starting at step 0. (Discovery + ordering are
+    // unit-tested in checkpoint.rs; this pins the trainer-level dispatch.)
+    let prompts = echo_prompts(VOCAB);
+    let cfg = TrainerConfig {
+        steps: 3,
+        group_size: 16,
+        max_new_tokens: 1,
+        temperature: TEMP,
+        lr: 0.05,
+        ..TrainerConfig::default()
+    };
+    let tmp = TempDir::new("resume-latest-fresh");
+    let mut policy = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 7, TEMP).unwrap();
+    let run = RunDir::create(tmp.path(), "echo").unwrap();
+    let mut trainer = Trainer::new(cfg, &run).unwrap();
+    let (hist, stop) = trainer
+        .resume_latest(&mut policy, &EchoReward, &CharTokenizer, &prompts)
+        .unwrap();
+    assert_eq!(
+        stop,
+        RunStop::Completed,
+        "a full fresh run reaches config.steps and must report Completed"
+    );
+    assert_eq!(
+        hist.len(),
+        3,
+        "no checkpoint → resume_latest runs every step fresh"
+    );
+    assert_eq!(
+        (hist[0].step, hist[2].step),
+        (0, 2),
+        "a fresh resume_latest starts at step 0"
+    );
+}
+
+#[test]
+fn resume_latest_surfaces_preemption_stop() {
+    // The launch-path fix for the eval-on-partial-history bug: resume_latest must
+    // SURFACE an early preemption stop as `RunStop::Preempted`, not report it as a
+    // normal completion. The example branches on this to skip held-out eval / the
+    // ladder gate and exit so the requeue resumes. A pre-set flag stops the run after
+    // step 0: the history is partial (one row) and a resumable checkpoint is written.
+    let prompts = echo_prompts(VOCAB);
+    let cfg = TrainerConfig {
+        steps: 5,
+        group_size: 16,
+        max_new_tokens: 1,
+        temperature: TEMP,
+        lr: 0.05,
+        ..TrainerConfig::default()
+    };
+    let tmp = TempDir::new("resume-latest-preempt");
+    let flag = Arc::new(AtomicBool::new(true));
+    let mut policy = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 7, TEMP).unwrap();
+    let run = RunDir::create(tmp.path(), "echo").unwrap();
+    let mut trainer = Trainer::new(cfg, &run)
+        .unwrap()
+        .with_preemption_flag(Arc::clone(&flag));
+    let (hist, stop) = trainer
+        .resume_latest(&mut policy, &EchoReward, &CharTokenizer, &prompts)
+        .unwrap();
+    assert_eq!(
+        stop,
+        RunStop::Preempted,
+        "a pre-set flag must surface as RunStop::Preempted, not Completed"
+    );
+    assert_eq!(
+        hist.len(),
+        1,
+        "the preemption stop halts after the first completed step"
+    );
+    assert!(
+        run.checkpoints_dir().join("step-1").is_dir(),
+        "the preemption stop writes a resumable checkpoint at the completed step"
+    );
+}
+
+#[test]
+fn preemption_after_the_final_step_reports_completed() {
+    // A flag that is still set when the LAST configured step finishes must NOT turn a
+    // finished run into RunStop::Preempted: the loop ran every step, so the run is
+    // Completed. Otherwise the launcher would skip eval/gate, and a requeue would
+    // resume_latest from a step==total checkpoint, run ZERO steps, and gate on an empty
+    // history. `steps == 1` makes the only step the final one, so the post-step poll
+    // sees completed == total with the flag set.
+    let prompts = echo_prompts(VOCAB);
+    let cfg = TrainerConfig {
+        steps: 1,
+        group_size: 16,
+        max_new_tokens: 1,
+        temperature: TEMP,
+        lr: 0.05,
+        ..TrainerConfig::default()
+    };
+    let tmp = TempDir::new("preempt-final-step");
+    let flag = Arc::new(AtomicBool::new(true));
+    let mut policy = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 7, TEMP).unwrap();
+    let run = RunDir::create(tmp.path(), "echo").unwrap();
+    let mut trainer = Trainer::new(cfg, &run)
+        .unwrap()
+        .with_preemption_flag(Arc::clone(&flag));
+    let (hist, stop) = trainer
+        .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
+        .unwrap();
+    assert_eq!(
+        stop,
+        RunStop::Completed,
+        "a flag still set when the final step finishes must report Completed, not Preempted"
+    );
+    assert_eq!(hist.len(), 1, "every configured step ran");
+}
+
+#[test]
 fn gate_canary_holds_on_every_real_update() {
     // The canary is a hard error (missing var / non-finite gradient) on every real
     // update, so a completed run with many real updates proves it held on all of
@@ -1383,7 +1615,7 @@ fn gate_canary_holds_on_every_real_update() {
     let tmp = TempDir::new("canary");
     let run = RunDir::create(tmp.path(), "echo").unwrap();
     let mut trainer = Trainer::new(cfg, &run).unwrap();
-    let history = trainer
+    let (history, _stop) = trainer
         .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
         .unwrap();
 
@@ -1505,7 +1737,7 @@ fn gate_mu2_beta_positive_run() {
     let tmp = TempDir::new("mu2-beta");
     let run = RunDir::create(tmp.path(), "echo").unwrap();
     let mut trainer = Trainer::new(cfg, &run).unwrap();
-    let history = trainer
+    let (history, _stop) = trainer
         .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
         .unwrap();
 
@@ -1548,7 +1780,7 @@ fn gate_mu_gt1_beta_zero_completes() {
     let tmp = TempDir::new("mu3-beta0");
     let run = RunDir::create(tmp.path(), "echo").unwrap();
     let mut trainer = Trainer::new(cfg, &run).unwrap();
-    let history = trainer
+    let (history, _stop) = trainer
         .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
         .unwrap();
     assert_eq!(history.len(), 40);

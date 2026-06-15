@@ -1630,7 +1630,7 @@ mod tests {
         let tmp = TempDir::new();
         let run = RunDir::create(&tmp.0, "qwen-cpu").unwrap();
         let mut trainer = Trainer::new(cfg, &run).unwrap();
-        let history = trainer
+        let (history, _stop) = trainer
             .train(&mut policy, &SpreadReward, &CharCodec, &prompts)
             .unwrap();
 
@@ -1674,7 +1674,7 @@ mod tests {
         let tmp = TempDir::new();
         let run = RunDir::create(&tmp.0, "qwen-ratio").unwrap();
         let mut trainer = Trainer::new(cfg, &run).unwrap();
-        let history = trainer
+        let (history, _stop) = trainer
             .train(&mut policy, &SpreadReward, &CharCodec, &prompts)
             .unwrap();
         assert_eq!(history.len(), 3);
@@ -1737,7 +1737,7 @@ mod tests {
         let tmp = TempDir::new();
         let run = RunDir::create(&tmp.0, "qwen-tis").unwrap();
         let mut trainer = Trainer::new(cfg, &run).unwrap();
-        let history = trainer
+        let (history, _stop) = trainer
             .train(&mut policy, &SpreadReward, &CharCodec, &prompts)
             .unwrap();
         assert_eq!(history.len(), 3);
@@ -1872,12 +1872,14 @@ mod tests {
             .unwrap()
             .train(&mut off, &SpreadReward, &CharCodec, &prompts)
             .unwrap()
+            .0
             .remove(0);
         let run_on = RunDir::create(&tmp.0, "tis-on").unwrap();
         let m_on = Trainer::new(cfg(true), &run_on)
             .unwrap()
             .train(&mut on, &SpreadReward, &CharCodec, &prompts)
             .unwrap()
+            .0
             .remove(0);
 
         for m in [&m_off, &m_on] {
@@ -2081,7 +2083,7 @@ mod tests {
         let tmp = TempDir::new();
         let run = RunDir::create(&tmp.0, "llama-cpu").unwrap();
         let mut trainer = Trainer::new(cfg, &run).unwrap();
-        let history = trainer
+        let (history, _stop) = trainer
             .train(&mut policy, &SpreadReward, &CharCodec, &prompts)
             .unwrap();
 
@@ -2319,7 +2321,7 @@ mod tests {
             let tmp = TempDir::new();
             let run = RunDir::create(&tmp.0, tag).unwrap();
             let mut trainer = Trainer::new(cfg.clone(), &run).unwrap();
-            let history = trainer
+            let (history, _stop) = trainer
                 .train(policy, &SpreadReward, &CharCodec, &prompts)
                 .unwrap();
             assert!(

@@ -36,7 +36,7 @@
 use candle_core::{DType, Device, Result as CandleResult, Tensor, Var, D};
 use candle_nn::ops::log_softmax;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use ferrl::lora::LoraLinear;
@@ -352,7 +352,7 @@ fn run_scripted_world(
                     let history = trainer
                         .train(&mut policy, &EchoOrFlatReward, &CharTokenizer, prompts)
                         .unwrap();
-                    (var_bits(&policy), history)
+                    (var_bits(&policy), history.0)
                 })
             })
             .collect();
@@ -369,7 +369,7 @@ fn run_scripted_single(base: &Path, cfg: &TrainerConfig, prompts: &[String]) -> 
     let history = trainer
         .train(&mut policy, &EchoOrFlatReward, &CharTokenizer, prompts)
         .unwrap();
-    (var_bits(&policy), history)
+    (var_bits(&policy), history.0)
 }
 
 fn scripted_cfg() -> TrainerConfig {
@@ -421,6 +421,68 @@ fn assert_grad_norms_match(world: &[Metrics], single: &[Metrics], what: &str) {
             s.grad_norm
         );
     }
+}
+
+// ---- preemption stop is globalized across the DP world ----------------------
+
+/// The cooperative preemption stop must halt **every** rank at the same step even
+/// when the flag is installed on only ONE rank — the un-footgunned, install-invariant
+/// case. Rank 1 here has **no** flag at all; under a rank-local poll it would skip
+/// the per-step reduce, run ahead into the next window's collective while rank 0
+/// (flag set) broke out, and hang until the timeout. The install-invariant poll makes
+/// rank 1 join the reduce anyway, so both stop after the same step. The 20 s timeout
+/// converts any regression into a loud failure instead of a suite hang.
+#[test]
+fn preemption_flag_stops_the_whole_dp_world_in_lockstep() {
+    let tmp = TempDir::new("preempt-dp");
+    // More steps than we expect to run, so stopping after step 0 is visibly early.
+    let cfg = TrainerConfig {
+        steps: 5,
+        ..scripted_cfg()
+    };
+    let prompts = live_prompts();
+    // Flag installed on rank 0 ONLY; rank 1 gets none — the uneven-install case.
+    let flag0 = Arc::new(AtomicBool::new(true));
+    // A short collective timeout so a regression (a rank that fails to stop in
+    // lockstep) fails fast as a loud timeout instead of hanging the suite.
+    let comms = LocalComm::world_with_timeout(2, std::time::Duration::from_secs(20));
+    let histories: Vec<Vec<Metrics>> = std::thread::scope(|s| {
+        let handles: Vec<_> = comms
+            .into_iter()
+            .map(|comm| {
+                let flag0 = Arc::clone(&flag0);
+                let cfg = cfg.clone();
+                let prompts = prompts.clone();
+                let base = tmp.path().to_path_buf();
+                s.spawn(move || {
+                    let rank = comm.rank();
+                    let mut policy = ScriptedPolicy::new(SEED).unwrap();
+                    let run = RunDir::create(&base, format!("rank{rank}")).unwrap();
+                    let mut trainer = Trainer::with_comm(cfg, &run, comm).unwrap();
+                    if rank == 0 {
+                        trainer = trainer.with_preemption_flag(flag0);
+                    }
+                    // Returns Ok only if the world never deadlocked — a rank stuck in a
+                    // collective its peer skipped would surface as a CommError here.
+                    trainer
+                        .train(&mut policy, &EchoOrFlatReward, &CharTokenizer, &prompts)
+                        .unwrap()
+                        .0
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    assert_eq!(
+        histories[0].len(),
+        1,
+        "rank 0 (flag set) should stop after step 0"
+    );
+    assert_eq!(
+        histories[1].len(),
+        histories[0].len(),
+        "rank 1 (NO flag) must stop at the same step — the poll is install-invariant"
+    );
 }
 
 // ---- gate 1: sharded vs single, measured envelope ---------------------------
@@ -823,7 +885,7 @@ fn rank_zero_writes_the_only_checkpoint_and_a_dp_resume_continues_bit_exactly() 
                             &live_prompts(),
                         )
                         .unwrap();
-                    (var_bits(&policy), history)
+                    (var_bits(&policy), history.0)
                 })
             })
             .collect();
@@ -834,6 +896,41 @@ fn rank_zero_writes_the_only_checkpoint_and_a_dp_resume_continues_bit_exactly() 
     assert_eq!(
         full[0].0, resumed[0].0,
         "interrupted + resumed must be bitwise the uninterrupted run"
+    );
+}
+
+// ---- resume_latest is single-rank only (rank-0-only checkpoint contract) ------
+
+/// `resume_latest` auto-discovers a checkpoint in THIS rank's own `checkpoints/`,
+/// but the DP contract writes checkpoints on rank 0 only and resumes every rank from
+/// rank 0's directory. Per-rank discovery would let non-zero ranks find nothing,
+/// silently start fresh, and diverge from rank 0 — then hang the next collective once
+/// rank 0 finishes its shorter remaining steps first. So under `world_size > 1` it
+/// must REFUSE (a contract error pointing at the explicit `resume(&rank0_ckpt)` path),
+/// not foot-gun. The guard fires before any collective, so a single rank handle of a
+/// 2-world proves it — no threads, no rendezvous.
+#[test]
+fn resume_latest_refuses_under_data_parallel() {
+    let tmp = TempDir::new("resume-latest-dp-guard");
+    let comm = LocalComm::world(2)
+        .into_iter()
+        .next()
+        .expect("a 2-rank world has a rank 0");
+    let run = RunDir::create(tmp.path(), "rank0").unwrap();
+    let mut policy = ScriptedPolicy::new(SEED).unwrap();
+    let mut trainer = Trainer::with_comm(scripted_cfg(), &run, comm).unwrap();
+    let err = trainer
+        .resume_latest(
+            &mut policy,
+            &EchoOrFlatReward,
+            &CharTokenizer,
+            &live_prompts(),
+        )
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("single-rank") && msg.contains("resume("),
+        "DP resume_latest must fail with a contract error pointing at resume(): got {msg:?}"
     );
 }
 
@@ -941,7 +1038,7 @@ fn assert_real_model_lockstep(tag: &str, make_policy: fn(u64) -> Qwen3_5Policy) 
                     let history = trainer
                         .train(&mut policy, &SpreadReward, &ByteCodec, &prompts)
                         .unwrap();
-                    (var_bits(&policy), history)
+                    (var_bits(&policy), history.0)
                 })
             })
             .collect();

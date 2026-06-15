@@ -72,6 +72,10 @@ cudarc = { version = "0.19", default-features = false }
 proptest = "1"
 # Dev: deterministic float comparison in tests.
 approx = "0.5"
+# Dev: safe SIGTERM/SIGUSR1 -> AtomicBool wiring for the example's restart-on-
+# preemption demo. The library never installs signal handlers (stays signal-free
+# and forbid-unsafe-clean); the run binary does, via signal_hook::flag::register.
+signal-hook = { version = "0.3", default-features = false }
 
 [workspace.lints.rust]
 # Safety + docs gate. `unsafe_code` is forbidden at the crate root too

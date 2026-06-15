@@ -141,8 +141,8 @@ pub mod trainer;
 
 #[doc(inline)]
 pub use checkpoint::{
-    load_adapter, load_checkpoint, save_adapter, save_checkpoint, CheckpointError,
-    CheckpointManifest, LoadedCheckpoint,
+    latest_checkpoint, load_adapter, load_checkpoint, save_adapter, save_checkpoint,
+    CheckpointError, CheckpointManifest, LatestCheckpoint, LoadedCheckpoint,
 };
 #[doc(inline)]
 pub use comm::{Comm, CommError, LocalComm, SoloComm};
@@ -196,8 +196,8 @@ pub use reward::RewardFn;
 #[doc(inline)]
 pub use sampler::GrpoSampler;
 #[doc(inline)]
-pub use telemetry::{init_tracing, Metrics, MetricsWriter, RunDir};
+pub use telemetry::{init_tracing, read_metrics, Metrics, MetricsWriter, RunDir};
 #[doc(inline)]
 pub use tokenizer::HfTokenizer;
 #[doc(inline)]
-pub use trainer::{TokenizerLike, Trainer, TrainerConfig, TrainerError};
+pub use trainer::{RunStop, TokenizerLike, Trainer, TrainerConfig, TrainerError};

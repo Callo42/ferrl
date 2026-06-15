@@ -74,6 +74,8 @@ use std::collections::HashSet;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
 use candle_core::{DType, Device};
@@ -83,7 +85,7 @@ use ferrl::countdown::{
 use ferrl::policy::GenConfig;
 use ferrl::{
     evaluate, EvalReport, EvalSampling, HfTokenizer, LoraTargets, Metrics, Qwen3_5Config,
-    Qwen3_5GradModel, Qwen3_5Policy, RunDir, Trainer, TrainerConfig,
+    Qwen3_5GradModel, Qwen3_5Policy, RunDir, RunStop, Trainer, TrainerConfig,
 };
 use tracing::{info, warn};
 
@@ -482,6 +484,40 @@ fn report_and_gate(history: &[Metrics], post: &EvalReport, gen: &GenConfig) -> R
     }
 }
 
+/// Install the cooperative preemption handler and open the run directory.
+///
+/// Registers `SIGTERM`/`SIGUSR1` (Slurm's preempt / timeout grace signals) to flip a
+/// shared flag — the trainer polls it and checkpoints + stops at the next step
+/// boundary (the library itself never touches signals). A stable
+/// `FERRL_CD35_RUN_ID` makes a requeued job **continue** the same run directory
+/// (resuming from its latest checkpoint via [`Trainer::resume_latest`]); unset gives
+/// a fresh, unique run per invocation. Returns the run dir plus the flag to hand the
+/// trainer.
+fn open_run_with_preemption(out: &str) -> Result<(RunDir, Arc<AtomicBool>)> {
+    let preempt = Arc::new(AtomicBool::new(false));
+    for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGUSR1] {
+        signal_hook::flag::register(sig, Arc::clone(&preempt))
+            .context("install preemption signal handler")?;
+    }
+    let run_id = env::var("FERRL_CD35_RUN_ID").unwrap_or_else(|_| {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        format!("countdown-grpo35-{stamp}-{}", std::process::id())
+    });
+    // Reopen an existing run dir (a requeue), else create it fresh. Gate on the
+    // directory existing rather than catching RunDir::open's error, so a genuine I/O
+    // fault on an existing run surfaces loudly instead of masquerading as a
+    // duplicate-run failure from the create fallback.
+    let run = if Path::new(out).join(&run_id).is_dir() {
+        info!(run_id, "resuming existing run directory");
+        RunDir::open(Path::new(out), &run_id).context("open existing run dir")?
+    } else {
+        RunDir::create(Path::new(out), &run_id).context("create run dir")?
+    };
+    Ok((run, preempt))
+}
+
 fn main() -> Result<()> {
     let _ = ferrl::init_tracing();
 
@@ -521,16 +557,45 @@ fn main() -> Result<()> {
     );
 
     let out = env_parse("FERRL_CD35_OUT", "/tmp/ferrl-runs".to_string())?;
-    // Unique run id per invocation (timestamp + pid, so concurrent sweep
-    // launches sharing an out dir cannot collide): `RunDir::create` fails loud
-    // on a duplicate run_id.
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    let run_id = format!("countdown-grpo35-{stamp}-{}", std::process::id());
-    let run = RunDir::create(Path::new(&out), &run_id).context("create run dir")?;
-    let mut trainer = Trainer::new(tcfg, &run)?;
-    let history = trainer.train(&mut policy, &reward, &tok, &train_prompts)?;
+    let (run, preempt) = open_run_with_preemption(&out)?;
+    let mut trainer = Trainer::new(tcfg, &run)?.with_preemption_flag(preempt);
+    // resume_latest continues from the newest checkpoint if one exists (a requeue),
+    // else trains from scratch — paired with the preemption flag above, the run
+    // survives a Slurm preempt/timeout: it checkpoints on the signal and resumes here.
+    let (history, stop) = trainer.resume_latest(&mut policy, &reward, &tok, &train_prompts)?;
+
+    // A preemption stop returns a PARTIAL history with a fresh checkpoint written. Exit
+    // before held-out eval / the ladder gate: running them now would burn the Slurm
+    // grace window and fail the run on incomplete data. The requeue (same
+    // FERRL_CD35_RUN_ID) resumes from the checkpoint and reaches the gate when training
+    // actually finishes.
+    if stop == RunStop::Preempted {
+        warn!(
+            completed_windows = history.len(),
+            "preempted mid-run: final checkpoint written; exiting before eval/gate so the \
+             requeue (same FERRL_CD35_RUN_ID) resumes training"
+        );
+        return Ok(());
+    }
+
+    // Gate on the FULL run, recovered from `metrics.jsonl` — NOT the `history` this
+    // launch returned. The training-reward-trend gate spans the whole trajectory, but a
+    // requeue's in-memory history covers only the steps THIS launch ran: zero for an
+    // already-trained resume (the job may have been killed during eval, so we must still
+    // gate — skipping would be a false pass), or just the tail for a mid-run resume
+    // (gating on a converged tail would falsely fail). `metrics.jsonl` is the complete
+    // stream in every case (a resume appends to it) and is identical to `history` for a
+    // fresh run, so reading it is correct and uniform. Never report success without
+    // gating; fail loud if no metrics exist at all.
+    let history =
+        ferrl::read_metrics(run.metrics_path()).context("read training metrics for the gate")?;
+    if history.is_empty() {
+        bail!(
+            "no training metrics at {} — cannot evaluate the training-reward gate; \
+             start a fresh FERRL_CD35_RUN_ID to retrain",
+            run.metrics_path().display()
+        );
+    }
 
     // Held-out eval AFTER training: `evaluate` scores base (adapter off) vs the
     // trained adapter (adapter on) in one pass, avg@k per prompt on the eval

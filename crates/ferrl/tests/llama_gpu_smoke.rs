@@ -473,7 +473,7 @@ fn llama_policy_grpo_smoke_on_gpu() {
 
     // A canary failure, a non-finite gradient, or an OOM would surface as an
     // error here; the run completing is itself most of the gate.
-    let history = trainer
+    let (history, _stop) = trainer
         .train(&mut policy, &SpreadReward, &tok, &prompts)
         .expect("GPU GRPO run failed");
 

@@ -145,7 +145,7 @@ fn full_ft_training_moves_the_base_weights_and_resume_guards_the_recipe() {
     let run = RunDir::create(&tmp.0, "full-ft").unwrap();
     let mut trainer = Trainer::new(train_cfg(), &run).unwrap();
     let prompts = vec!["abc".to_string(), "bcd".to_string()];
-    let history = trainer
+    let (history, _stop) = trainer
         .train(&mut policy, &SpreadReward, &ByteCodec, &prompts)
         .unwrap();
     assert!(
@@ -175,7 +175,7 @@ fn resume_continues(tmp: &TempDir, step1: &std::path::Path, prompts: &[String]) 
     let mut policy = full_ft_policy(7);
     let run = RunDir::create(&tmp.0, "full-ft-resume").unwrap();
     let mut trainer = Trainer::new(train_cfg(), &run).unwrap();
-    let resumed = trainer
+    let (resumed, _stop) = trainer
         .resume(step1, &mut policy, &SpreadReward, &ByteCodec, prompts)
         .unwrap();
     assert_eq!(
@@ -248,7 +248,7 @@ fn full_ft_gspo_moe_training_runs_and_resumes() {
     let tmp = TempDir::new("gspo-moe");
     let run = RunDir::create(&tmp.0, "full-ft-gspo-moe").unwrap();
     let mut trainer = Trainer::new(cfg.clone(), &run).unwrap();
-    let history = trainer
+    let (history, _stop) = trainer
         .train(&mut policy, &SpreadReward, &ByteCodec, &prompts)
         .unwrap();
     assert!(
@@ -263,7 +263,7 @@ fn full_ft_gspo_moe_training_runs_and_resumes() {
     let mut resumed_policy = full_ft_policy_from(&dir, 7);
     let run2 = RunDir::create(&tmp.0, "full-ft-gspo-moe-resume").unwrap();
     let mut trainer2 = Trainer::new(cfg, &run2).unwrap();
-    let resumed = trainer2
+    let (resumed, _stop) = trainer2
         .resume(
             &step1,
             &mut resumed_policy,

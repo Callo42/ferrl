@@ -30,6 +30,15 @@ pub enum TelemetryError {
     /// A [`Metrics`] record could not be serialized to JSON.
     #[error("failed to serialize metrics: {0}")]
     Serialize(#[from] serde_json::Error),
+    /// A line of `metrics.jsonl` could not be parsed back into a [`Metrics`]
+    /// record (see [`read_metrics`]).
+    #[error("failed to parse a metrics record at {path}: {source}")]
+    Deserialize {
+        /// The `metrics.jsonl` being read.
+        path: PathBuf,
+        /// Underlying JSON parse error.
+        source: serde_json::Error,
+    },
     /// [`RunDir::create`] was given a `run_id` whose directory already holds a
     /// metrics stream — appending a fresh run to a prior run's `metrics.jsonl`
     /// would silently interleave two runs. Use a new `run_id`, or
@@ -448,6 +457,34 @@ impl MetricsWriter {
     }
 }
 
+/// Read a `metrics.jsonl` file back into its [`Metrics`] records — the read
+/// counterpart of [`MetricsWriter`]. One record per non-blank line, in file
+/// order; blank lines are skipped and a malformed line fails loud.
+///
+/// Used to recover a finished run's training metrics when a requeued launch
+/// resumes a checkpoint already at `steps` (so it runs no new steps itself) and
+/// must still evaluate the training-reward gate — never reporting success without
+/// gating just because the relaunch produced no new metrics.
+///
+/// # Errors
+///
+/// Returns [`TelemetryError::Io`] if `path` cannot be read, or
+/// [`TelemetryError::Deserialize`] if a line is not a valid [`Metrics`] record.
+pub fn read_metrics(path: impl AsRef<Path>) -> Result<Vec<Metrics>, TelemetryError> {
+    let path = path.as_ref();
+    let content = std::fs::read_to_string(path).map_err(|e| TelemetryError::io(path, e))?;
+    content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str::<Metrics>(line).map_err(|source| TelemetryError::Deserialize {
+                path: path.to_path_buf(),
+                source,
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -514,6 +551,49 @@ mod tests {
         // to re-create — only an existing stream is guarded.
         RunDir::create(tmp.path(), "run-002").unwrap();
         RunDir::create(tmp.path(), "run-002").unwrap();
+    }
+
+    #[test]
+    fn read_metrics_round_trips_a_written_stream() {
+        // read_metrics is the inverse of MetricsWriter::append: writing N records and
+        // reading them back yields the same records, in order. append() sanitizes via
+        // nan_to_num, so compare against the sanitized originals. This recovery path
+        // is what lets a requeued, already-trained run still evaluate its gate.
+        let tmp = TempDir::new("read-metrics");
+        let rd = RunDir::create(tmp.path(), "run-rt").unwrap();
+        let mut w = rd.metrics_writer().unwrap();
+        let written: Vec<Metrics> = (0..3).map(Metrics::at_step).collect();
+        for m in &written {
+            w.append(m).unwrap();
+        }
+        drop(w);
+        let read = read_metrics(rd.metrics_path()).unwrap();
+        let expected: Vec<Metrics> = written.iter().map(Metrics::nan_to_num).collect();
+        assert_eq!(
+            read, expected,
+            "read_metrics must reproduce the written records in order"
+        );
+    }
+
+    #[test]
+    fn read_metrics_skips_blank_lines_and_fails_loud_on_garbage() {
+        let tmp = TempDir::new("read-metrics-bad");
+        let good = serde_json::to_string(&Metrics::at_step(0)).unwrap();
+        let path = tmp.path().join("m.jsonl");
+        // Blank lines (e.g. a trailing newline) are skipped, not parsed.
+        std::fs::write(&path, format!("{good}\n\n")).unwrap();
+        assert_eq!(
+            read_metrics(&path).unwrap().len(),
+            1,
+            "blank lines must be skipped"
+        );
+        // A malformed line fails loud (the Deserialize variant), never a silent skip.
+        std::fs::write(&path, format!("{good}\nnot json\n")).unwrap();
+        let err = read_metrics(&path).unwrap_err();
+        assert!(
+            matches!(err, TelemetryError::Deserialize { .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]

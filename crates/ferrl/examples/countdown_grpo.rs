@@ -289,7 +289,8 @@ fn main() -> Result<()> {
     let run_id = format!("countdown-grpo-{stamp}");
     let run = RunDir::create(Path::new(&out), &run_id).context("create run dir")?;
     let mut trainer = Trainer::new(tcfg, &run)?;
-    let history = trainer.train(&mut policy, &reward, &tok, &train_prompts)?;
+    // No preemption flag installed → this run always completes; ignore the stop.
+    let (history, _stop) = trainer.train(&mut policy, &reward, &tok, &train_prompts)?;
 
     // Held-out eval AFTER training: `evaluate` scores base (adapter off) vs the
     // trained adapter (adapter on) in one pass — the P4 comparison. There is no
