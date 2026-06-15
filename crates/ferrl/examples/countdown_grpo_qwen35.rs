@@ -85,7 +85,7 @@ use ferrl::countdown::{
 use ferrl::policy::GenConfig;
 use ferrl::{
     evaluate, EvalReport, EvalSampling, HfTokenizer, LoraTargets, Metrics, Qwen3_5Config,
-    Qwen3_5GradModel, Qwen3_5Policy, RunDir, Trainer, TrainerConfig,
+    Qwen3_5GradModel, Qwen3_5Policy, RunDir, RunStop, Trainer, TrainerConfig,
 };
 use tracing::{info, warn};
 
@@ -562,7 +562,21 @@ fn main() -> Result<()> {
     // resume_latest continues from the newest checkpoint if one exists (a requeue),
     // else trains from scratch — paired with the preemption flag above, the run
     // survives a Slurm preempt/timeout: it checkpoints on the signal and resumes here.
-    let history = trainer.resume_latest(&mut policy, &reward, &tok, &train_prompts)?;
+    let (history, stop) = trainer.resume_latest(&mut policy, &reward, &tok, &train_prompts)?;
+
+    // A preemption stop returns a PARTIAL history with a fresh checkpoint written. Exit
+    // before held-out eval / the ladder gate: running them now would burn the Slurm
+    // grace window and fail the run on incomplete data. The requeue (same
+    // FERRL_CD35_RUN_ID) resumes from the checkpoint and reaches the gate when training
+    // actually finishes.
+    if stop == RunStop::Preempted {
+        warn!(
+            completed_windows = history.len(),
+            "preempted mid-run: final checkpoint written; exiting before eval/gate so the \
+             requeue (same FERRL_CD35_RUN_ID) resumes training"
+        );
+        return Ok(());
+    }
 
     // Held-out eval AFTER training: `evaluate` scores base (adapter off) vs the
     // trained adapter (adapter on) in one pass, avg@k per prompt on the eval

@@ -200,4 +200,4 @@ pub use telemetry::{init_tracing, Metrics, MetricsWriter, RunDir};
 #[doc(inline)]
 pub use tokenizer::HfTokenizer;
 #[doc(inline)]
-pub use trainer::{TokenizerLike, Trainer, TrainerConfig, TrainerError};
+pub use trainer::{RunStop, TokenizerLike, Trainer, TrainerConfig, TrainerError};

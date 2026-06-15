@@ -564,6 +564,27 @@ struct PromptStat {
     ratio_stats: Option<RatioStats>,
 }
 
+/// Why a preemption-aware run returned — distinguishes a run that reached
+/// `config.steps` from one the cooperative preemption flag stopped early.
+///
+/// Returned by [`Trainer::resume_latest`] (the launch entry point paired with
+/// [`with_preemption_flag`](Trainer::with_preemption_flag)) so a launcher can tell
+/// "checkpointed for requeue" from "finished all steps": the loop `break`s and
+/// returns identically on both, so without this signal the launcher cannot avoid
+/// running held-out eval / a final gate on a *partial* history during a Slurm
+/// grace window — burning that window and failing the run on incomplete data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunStop {
+    /// The loop ran every step up to `config.steps`: the run is finished and
+    /// downstream eval / gating may proceed on the full history.
+    Completed,
+    /// The preemption flag fired: a final momentum-faithful checkpoint was written
+    /// at the last completed step and the loop stopped early. The returned history
+    /// is partial — the launcher should exit promptly (skipping eval / the gate) so
+    /// a requeued launch continues it via [`Trainer::resume_latest`].
+    Preempted,
+}
+
 impl Trainer {
     /// Open a trainer for `config`, persisting it to `run`'s `config.json` and
     /// opening the `metrics.jsonl` writer.
@@ -674,7 +695,11 @@ impl Trainer {
         tokenizer: &dyn TokenizerLike,
         prompts: &[String],
     ) -> Result<Vec<Metrics>, TrainerError> {
+        // `train` is the run-to-completion entry point: a preemption stop is not a
+        // distinct outcome here (the caller installs no flag, or doesn't branch on
+        // it). `resume_latest` is the flag's documented partner and surfaces the stop.
         self.run(0, None, policy, reward_fn, tokenizer, prompts)
+            .map(|(history, _stop)| history)
     }
 
     /// Resume training from `start_step`, running steps `start_step .. config.steps`
@@ -715,6 +740,7 @@ impl Trainer {
         prompts: &[String],
     ) -> Result<Vec<Metrics>, TrainerError> {
         self.run(start_step, None, policy, reward_fn, tokenizer, prompts)
+            .map(|(history, _stop)| history)
     }
 
     /// Resume an interrupted run from a checkpoint directory, **momentum-faithfully**.
@@ -754,11 +780,27 @@ impl Trainer {
         tokenizer: &dyn TokenizerLike,
         prompts: &[String],
     ) -> Result<Vec<Metrics>, TrainerError> {
-        let checkpoint_dir = checkpoint_dir.as_ref();
-        // Recipe pre-flight BEFORE the positional load mutates the live vars:
-        // count/shape/dtype validation cannot distinguish shape-aliased recipes
-        // (k/v and gate/up projections are shape-identical), so a mismatch here
-        // would land trained adapters on the wrong projections silently.
+        let (start_step, opt_state) = self.load_resume_point(checkpoint_dir.as_ref(), policy)?;
+        self.run(start_step, opt_state, policy, reward_fn, tokenizer, prompts)
+            .map(|(history, _stop)| history)
+    }
+
+    /// Load `checkpoint_dir` into `policy` and return the resumed loop's
+    /// `(start_step, optimizer_state)` — the momentum-faithful prelude shared by
+    /// [`resume`](Self::resume) and [`resume_latest`](Self::resume_latest).
+    ///
+    /// Recipe pre-flight BEFORE the positional load mutates the live vars:
+    /// count/shape/dtype validation cannot distinguish shape-aliased recipes
+    /// (k/v and gate/up projections are shape-identical), so a mismatch here
+    /// would land trained adapters on the wrong projections silently. Then the
+    /// positional adapter + optimizer-moment load, then the rollout-sampler RNG
+    /// restore (a v1 checkpoint carries none → keep the policy's current sampler,
+    /// the documented fresh-momentum fallback).
+    fn load_resume_point<P: Policy>(
+        &self,
+        checkpoint_dir: &Path,
+        policy: &mut P,
+    ) -> Result<(u64, Option<OptimizerState>), TrainerError> {
         let manifest = crate::checkpoint::read_manifest(checkpoint_dir)?;
         if let (Some(saved), Some(current)) = (&manifest.lora_recipe, policy.lora_recipe()) {
             if *saved != current {
@@ -773,19 +815,10 @@ impl Trainer {
         }
         let vars = policy.trainable_vars();
         let loaded = crate::checkpoint::load_checkpoint(checkpoint_dir, &vars)?;
-        // Restore the sampler RNG (v2). A v1 checkpoint carries none → keep the policy's
-        // current sampler (the documented fresh-momentum fallback).
         if let Some(blob) = &loaded.sampler_state {
             policy.restore_sampler_state(blob)?;
         }
-        self.run(
-            loaded.step,
-            loaded.optimizer_state,
-            policy,
-            reward_fn,
-            tokenizer,
-            prompts,
-        )
+        Ok((loaded.step, loaded.optimizer_state))
     }
 
     /// Resume the **newest complete checkpoint** under this run's `checkpoints/`
@@ -804,11 +837,25 @@ impl Trainer {
     /// [`with_preemption_flag`](Self::with_preemption_flag) so each attempt also
     /// flushes a final checkpoint when preempted, minimizing re-done work.
     ///
+    /// Returns the run's metrics **and a [`RunStop`]**: on [`RunStop::Preempted`]
+    /// the history is *partial* (the flag stopped the loop early after
+    /// checkpointing) and the launcher must exit before any held-out eval / final
+    /// gate so the requeue resumes; on [`RunStop::Completed`] the run finished and
+    /// eval / gating may proceed.
+    ///
+    /// **Single-rank only.** Under data parallelism (`world_size > 1`) this returns
+    /// [`TrainerError::Contract`] rather than silently per-rank-discovering: only
+    /// rank 0 writes checkpoints, so auto-discovery would let non-zero ranks start
+    /// fresh and diverge. DP requeue coordinates rank 0's checkpoint dir in the
+    /// launcher and calls [`resume`](Self::resume) on every rank (see
+    /// `tests/dp_equivalence.rs`); DP-coordinated auto-resume lands with P9.
+    ///
     /// # Errors
     ///
     /// As [`resume`](Self::resume) (when a checkpoint is found) or
     /// [`train`](Self::train) (when none is), plus [`TrainerError::Checkpoint`] if
-    /// `checkpoints/` exists but cannot be listed.
+    /// `checkpoints/` exists but cannot be listed, or [`TrainerError::Contract`] if
+    /// called on a multi-rank (`world_size > 1`) trainer.
     ///
     /// # Panics
     ///
@@ -819,7 +866,28 @@ impl Trainer {
         reward_fn: &R,
         tokenizer: &dyn TokenizerLike,
         prompts: &[String],
-    ) -> Result<Vec<Metrics>, TrainerError> {
+    ) -> Result<(Vec<Metrics>, RunStop), TrainerError> {
+        // Single-rank only. Under data parallelism only rank 0 writes checkpoints
+        // (the rank-0-only contract on `maybe_checkpoint`/`write_checkpoint`), and
+        // every rank must resume from rank 0's directory — but this scans THIS rank's
+        // own `checkpoints/`, so a non-zero rank would discover none, silently start
+        // fresh, and diverge from rank 0; the next collective then hangs once rank 0
+        // finishes its (shorter) remaining steps first. The guard keys on `world_size`,
+        // which is uniform across ranks, so it fails fast and IN LOCKSTEP — never a
+        // deadlock. DP-coordinated auto-resume needs rank 0's path broadcast to every
+        // rank (the launcher already does this for the tested explicit
+        // `resume(&rank0_ckpt)` path) or P9 multi-node sharded checkpoints.
+        if self.comm.world_size() > 1 {
+            return Err(TrainerError::Contract(
+                "resume_latest auto-discovery is single-rank only: under data parallelism \
+                 only rank 0 writes checkpoints, so non-zero ranks would discover none and \
+                 silently start fresh, diverging from rank 0 and hanging the next collective. \
+                 Coordinate rank 0's checkpoint directory in the launcher and call \
+                 resume(&rank0_ckpt, ..) on every rank (see tests/dp_equivalence.rs); \
+                 DP-coordinated auto-resume lands with P9 multi-node sharded checkpoints."
+                    .into(),
+            ));
+        }
         match crate::checkpoint::latest_checkpoint(&self.checkpoints_dir)? {
             Some(latest) => {
                 tracing::info!(
@@ -827,11 +895,12 @@ impl Trainer {
                     dir = %latest.dir.display(),
                     "resume_latest: continuing from the newest checkpoint"
                 );
-                self.resume(latest.dir, policy, reward_fn, tokenizer, prompts)
+                let (start_step, opt_state) = self.load_resume_point(&latest.dir, policy)?;
+                self.run(start_step, opt_state, policy, reward_fn, tokenizer, prompts)
             }
             None => {
                 tracing::info!("resume_latest: no checkpoint found — starting a fresh run");
-                self.train(policy, reward_fn, tokenizer, prompts)
+                self.run(0, None, policy, reward_fn, tokenizer, prompts)
             }
         }
     }
@@ -847,7 +916,7 @@ impl Trainer {
         reward_fn: &R,
         tokenizer: &dyn TokenizerLike,
         prompts: &[String],
-    ) -> Result<Vec<Metrics>, TrainerError> {
+    ) -> Result<(Vec<Metrics>, RunStop), TrainerError> {
         assert!(!prompts.is_empty(), "train: no prompts");
         // The KL reference (`beta > 0`) IS the adapter-disabled policy
         // (`reference_logprobs` toggles the adapter off to score it). A policy
@@ -911,10 +980,10 @@ impl Trainer {
                     completed_steps = completed,
                     "preemption requested: checkpointed and stopping early"
                 );
-                break;
+                return Ok((history, RunStop::Preempted));
             }
         }
-        Ok(history)
+        Ok((history, RunStop::Completed))
     }
 
     /// One optimizer step over a window of `grad_accum_steps` prompts: collect each

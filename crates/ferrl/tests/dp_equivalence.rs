@@ -898,6 +898,41 @@ fn rank_zero_writes_the_only_checkpoint_and_a_dp_resume_continues_bit_exactly() 
     );
 }
 
+// ---- resume_latest is single-rank only (rank-0-only checkpoint contract) ------
+
+/// `resume_latest` auto-discovers a checkpoint in THIS rank's own `checkpoints/`,
+/// but the DP contract writes checkpoints on rank 0 only and resumes every rank from
+/// rank 0's directory. Per-rank discovery would let non-zero ranks find nothing,
+/// silently start fresh, and diverge from rank 0 — then hang the next collective once
+/// rank 0 finishes its shorter remaining steps first. So under `world_size > 1` it
+/// must REFUSE (a contract error pointing at the explicit `resume(&rank0_ckpt)` path),
+/// not foot-gun. The guard fires before any collective, so a single rank handle of a
+/// 2-world proves it — no threads, no rendezvous.
+#[test]
+fn resume_latest_refuses_under_data_parallel() {
+    let tmp = TempDir::new("resume-latest-dp-guard");
+    let comm = LocalComm::world(2)
+        .into_iter()
+        .next()
+        .expect("a 2-rank world has a rank 0");
+    let run = RunDir::create(tmp.path(), "rank0").unwrap();
+    let mut policy = ScriptedPolicy::new(SEED).unwrap();
+    let mut trainer = Trainer::with_comm(scripted_cfg(), &run, comm).unwrap();
+    let err = trainer
+        .resume_latest(
+            &mut policy,
+            &EchoOrFlatReward,
+            &CharTokenizer,
+            &live_prompts(),
+        )
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("single-rank") && msg.contains("resume("),
+        "DP resume_latest must fail with a contract error pointing at resume(): got {msg:?}"
+    );
+}
+
 // ---- gate 2: real tiny qwen3.5, bitwise rank lockstep, both modes -------------
 
 fn fixture_dir() -> PathBuf {

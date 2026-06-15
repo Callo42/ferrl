@@ -34,7 +34,7 @@ use ferrl::policy::{GenConfig, Policy, Rollout};
 use ferrl::reward::RewardFn;
 use ferrl::sampler::GrpoSampler;
 use ferrl::telemetry::RunDir;
-use ferrl::trainer::{TokenizerLike, Trainer, TrainerConfig, TrainerError};
+use ferrl::trainer::{RunStop, TokenizerLike, Trainer, TrainerConfig, TrainerError};
 use ferrl::{LossType, Metrics, ScaleRewards};
 
 /// Toy vocabulary size; the (full-rank) `LoRA` rank equals it, so a rank-`VOCAB`
@@ -1452,9 +1452,14 @@ fn preemption_stop_then_resume_latest_matches_uninterrupted() {
     let mut policy_b = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 777, TEMP).unwrap();
     let run_b = RunDir::open(&base, "echo").unwrap();
     let mut trainer_b = Trainer::new(make_cfg(), &run_b).unwrap();
-    let hist_b = trainer_b
+    let (hist_b, stop_b) = trainer_b
         .resume_latest(&mut policy_b, &EchoReward, &CharTokenizer, &prompts)
         .unwrap();
+    assert_eq!(
+        stop_b,
+        RunStop::Completed,
+        "the requeue runs to completion (no flag set), so it must report Completed"
+    );
     assert_eq!(
         hist_b.len(),
         (TOTAL - 1) as usize,
@@ -1488,9 +1493,14 @@ fn resume_latest_starts_fresh_when_no_checkpoint() {
     let mut policy = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 7, TEMP).unwrap();
     let run = RunDir::create(tmp.path(), "echo").unwrap();
     let mut trainer = Trainer::new(cfg, &run).unwrap();
-    let hist = trainer
+    let (hist, stop) = trainer
         .resume_latest(&mut policy, &EchoReward, &CharTokenizer, &prompts)
         .unwrap();
+    assert_eq!(
+        stop,
+        RunStop::Completed,
+        "a full fresh run reaches config.steps and must report Completed"
+    );
     assert_eq!(
         hist.len(),
         3,
@@ -1500,6 +1510,48 @@ fn resume_latest_starts_fresh_when_no_checkpoint() {
         (hist[0].step, hist[2].step),
         (0, 2),
         "a fresh resume_latest starts at step 0"
+    );
+}
+
+#[test]
+fn resume_latest_surfaces_preemption_stop() {
+    // The launch-path fix for the eval-on-partial-history bug: resume_latest must
+    // SURFACE an early preemption stop as `RunStop::Preempted`, not report it as a
+    // normal completion. The example branches on this to skip held-out eval / the
+    // ladder gate and exit so the requeue resumes. A pre-set flag stops the run after
+    // step 0: the history is partial (one row) and a resumable checkpoint is written.
+    let prompts = echo_prompts(VOCAB);
+    let cfg = TrainerConfig {
+        steps: 5,
+        group_size: 16,
+        max_new_tokens: 1,
+        temperature: TEMP,
+        lr: 0.05,
+        ..TrainerConfig::default()
+    };
+    let tmp = TempDir::new("resume-latest-preempt");
+    let flag = Arc::new(AtomicBool::new(true));
+    let mut policy = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 7, TEMP).unwrap();
+    let run = RunDir::create(tmp.path(), "echo").unwrap();
+    let mut trainer = Trainer::new(cfg, &run)
+        .unwrap()
+        .with_preemption_flag(Arc::clone(&flag));
+    let (hist, stop) = trainer
+        .resume_latest(&mut policy, &EchoReward, &CharTokenizer, &prompts)
+        .unwrap();
+    assert_eq!(
+        stop,
+        RunStop::Preempted,
+        "a pre-set flag must surface as RunStop::Preempted, not Completed"
+    );
+    assert_eq!(
+        hist.len(),
+        1,
+        "the preemption stop halts after the first completed step"
+    );
+    assert!(
+        run.checkpoints_dir().join("step-1").is_dir(),
+        "the preemption stop writes a resumable checkpoint at the completed step"
     );
 }
 
