@@ -22,6 +22,8 @@
 //!    legitimately-zero gradient is a no-op, not a canary abort.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use candle_core::{DType, Device, IndexOp, Result as CandleResult, Tensor, Var, D};
 use candle_nn::ops::log_softmax;
@@ -1361,6 +1363,143 @@ fn interrupted_run_resumes_bit_identically() {
         snapshot_vars(&policy_m.trainable_vars()),
         weights_full,
         "fresh moments (RNG restored) must diverge — momentum restoration is what makes resume faithful"
+    );
+}
+
+#[test]
+#[allow(clippy::cognitive_complexity)] // a linear end-to-end scenario: reference run, interrupt, requeue, compare
+fn preemption_stop_then_resume_latest_matches_uninterrupted() {
+    // Restart-on-preemption capstone. A run STOPPED MID-FLIGHT by the preemption
+    // flag writes a final checkpoint, and a requeued launch — `RunDir::open` on the
+    // SAME run id + `resume_latest` — reproduces the uninterrupted run's
+    // post-resume trajectory BIT-FOR-BIT. Same within-one-process relative-equality
+    // argument as `interrupted_run_resumes_bit_identically` (candle's per-process
+    // reduction order makes only *relative* bit-equality meaningful), but here the
+    // stop is driven by the preemption flag and the resume is found by
+    // `latest_checkpoint`, not an explicit `resume(dir)`.
+    //
+    // `checkpoint_every` is None, so the ONLY checkpoint is the one the preemption
+    // stop itself writes — this proves that path emits a resumable momentum-faithful
+    // v3 checkpoint, independent of the periodic cadence.
+    const TOTAL: u64 = 6;
+    let prompts = echo_prompts(VOCAB);
+    let make_cfg = || TrainerConfig {
+        steps: TOTAL,
+        group_size: 32,
+        max_new_tokens: 1,
+        temperature: TEMP,
+        lr: 0.05,
+        // The interrupt (after step 0) lands INSIDE the warmup ramp, so the
+        // resumed arm must re-enter the lr schedule at the same effective lr —
+        // `lr_at` is a pure function of the outer step, so it does.
+        warmup_steps: 3,
+        checkpoint_every: None, // ONLY the preemption stop writes a checkpoint
+        ..TrainerConfig::default()
+    };
+
+    // Uninterrupted reference (seed 29): all TOTAL steps in one go.
+    let tmp = TempDir::new("preempt-resume");
+    let mut policy_full = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 29, TEMP).unwrap();
+    let run_full = RunDir::create(tmp.path().join("full"), "echo").unwrap();
+    let mut trainer_full = Trainer::new(make_cfg(), &run_full).unwrap();
+    let hist_full = trainer_full
+        .train(&mut policy_full, &EchoReward, &CharTokenizer, &prompts)
+        .unwrap();
+    let weights_full = snapshot_vars(&policy_full.trainable_vars());
+    assert_eq!(hist_full.len(), TOTAL as usize);
+
+    // Non-vacuity: the post-resume window MUST contain a real AdamW update, or the
+    // weight / grad-norm equality below is moment-blind (a broken moment restore
+    // would still pass).
+    let post = &hist_full[1..];
+    assert!(
+        post.iter().any(|m| m.grad_norm > 0.0),
+        "post-resume window had no real AdamW update — gate cannot test moment restoration"
+    );
+
+    // Attempt 1 — the interrupted run. SAME seed as the reference (29), so its
+    // step 0 is bit-identical to the reference's; the preemption flag is pre-set,
+    // so after step 0 the stop fires: it writes checkpoints/step-1 (the reference's
+    // post-step-0 state) and returns without finishing.
+    let base = tmp.path().join("preempted");
+    let flag = Arc::new(AtomicBool::new(true));
+    let mut policy_a = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 29, TEMP).unwrap();
+    let run_a = RunDir::create(&base, "echo").unwrap();
+    let mut trainer_a = Trainer::new(make_cfg(), &run_a)
+        .unwrap()
+        .with_preemption_flag(Arc::clone(&flag));
+    let hist_a = trainer_a
+        .train(&mut policy_a, &EchoReward, &CharTokenizer, &prompts)
+        .unwrap();
+    assert_eq!(
+        hist_a.len(),
+        1,
+        "the pre-set preemption flag must stop the run after the first step"
+    );
+    let ckpt_root = run_a.checkpoints_dir();
+    assert!(
+        ckpt_root.join("step-1").is_dir(),
+        "the preemption stop must write checkpoints/step-1"
+    );
+    assert!(
+        !ckpt_root.join("step-6").exists(),
+        "the run stopped before completing, so no final checkpoint exists"
+    );
+
+    // Attempt 2 — the requeue. Reopen the SAME run id, FRESH policy seeded
+    // DIFFERENTLY (777) so any match is the restore's doing, no flag. resume_latest
+    // discovers step-1 and runs the remaining steps 1..6.
+    let mut policy_b = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 777, TEMP).unwrap();
+    let run_b = RunDir::open(&base, "echo").unwrap();
+    let mut trainer_b = Trainer::new(make_cfg(), &run_b).unwrap();
+    let hist_b = trainer_b
+        .resume_latest(&mut policy_b, &EchoReward, &CharTokenizer, &prompts)
+        .unwrap();
+    assert_eq!(
+        hist_b.len(),
+        (TOTAL - 1) as usize,
+        "resume_latest must run the remaining steps 1..6"
+    );
+    // Post-resume metrics bit-equal (reward_mean / frac_reward_zero_std prove the
+    // RNG was restored; grad_norm across a real update proves the moments were).
+    assert_metrics_bit_identical(&hist_b, post);
+    assert_eq!(
+        snapshot_vars(&policy_b.trainable_vars()),
+        weights_full,
+        "preempt + resume_latest must reproduce the uninterrupted final weights bit-for-bit"
+    );
+}
+
+#[test]
+fn resume_latest_starts_fresh_when_no_checkpoint() {
+    // With an empty checkpoints/ directory, resume_latest is exactly train(): it
+    // runs all `steps` from scratch, starting at step 0. (Discovery + ordering are
+    // unit-tested in checkpoint.rs; this pins the trainer-level dispatch.)
+    let prompts = echo_prompts(VOCAB);
+    let cfg = TrainerConfig {
+        steps: 3,
+        group_size: 16,
+        max_new_tokens: 1,
+        temperature: TEMP,
+        lr: 0.05,
+        ..TrainerConfig::default()
+    };
+    let tmp = TempDir::new("resume-latest-fresh");
+    let mut policy = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 7, TEMP).unwrap();
+    let run = RunDir::create(tmp.path(), "echo").unwrap();
+    let mut trainer = Trainer::new(cfg, &run).unwrap();
+    let hist = trainer
+        .resume_latest(&mut policy, &EchoReward, &CharTokenizer, &prompts)
+        .unwrap();
+    assert_eq!(
+        hist.len(),
+        3,
+        "no checkpoint → resume_latest runs every step fresh"
+    );
+    assert_eq!(
+        (hist[0].step, hist[2].step),
+        (0, 2),
+        "a fresh resume_latest starts at step 0"
     );
 }
 

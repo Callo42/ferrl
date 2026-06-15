@@ -36,7 +36,7 @@
 use candle_core::{DType, Device, Result as CandleResult, Tensor, Var, D};
 use candle_nn::ops::log_softmax;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use ferrl::lora::LoraLinear;
@@ -421,6 +421,67 @@ fn assert_grad_norms_match(world: &[Metrics], single: &[Metrics], what: &str) {
             s.grad_norm
         );
     }
+}
+
+// ---- preemption stop is globalized across the DP world ----------------------
+
+/// The cooperative preemption stop must halt **every** rank at the same step even
+/// when the flag is installed on only ONE rank — the un-footgunned, install-invariant
+/// case. Rank 1 here has **no** flag at all; under a rank-local poll it would skip
+/// the per-step reduce, run ahead into the next window's collective while rank 0
+/// (flag set) broke out, and hang until the timeout. The install-invariant poll makes
+/// rank 1 join the reduce anyway, so both stop after the same step. The 20 s timeout
+/// converts any regression into a loud failure instead of a suite hang.
+#[test]
+fn preemption_flag_stops_the_whole_dp_world_in_lockstep() {
+    let tmp = TempDir::new("preempt-dp");
+    // More steps than we expect to run, so stopping after step 0 is visibly early.
+    let cfg = TrainerConfig {
+        steps: 5,
+        ..scripted_cfg()
+    };
+    let prompts = live_prompts();
+    // Flag installed on rank 0 ONLY; rank 1 gets none — the uneven-install case.
+    let flag0 = Arc::new(AtomicBool::new(true));
+    // A short collective timeout so a regression (a rank that fails to stop in
+    // lockstep) fails fast as a loud timeout instead of hanging the suite.
+    let comms = LocalComm::world_with_timeout(2, std::time::Duration::from_secs(20));
+    let histories: Vec<Vec<Metrics>> = std::thread::scope(|s| {
+        let handles: Vec<_> = comms
+            .into_iter()
+            .map(|comm| {
+                let flag0 = Arc::clone(&flag0);
+                let cfg = cfg.clone();
+                let prompts = prompts.clone();
+                let base = tmp.path().to_path_buf();
+                s.spawn(move || {
+                    let rank = comm.rank();
+                    let mut policy = ScriptedPolicy::new(SEED).unwrap();
+                    let run = RunDir::create(&base, format!("rank{rank}")).unwrap();
+                    let mut trainer = Trainer::with_comm(cfg, &run, comm).unwrap();
+                    if rank == 0 {
+                        trainer = trainer.with_preemption_flag(flag0);
+                    }
+                    // Returns Ok only if the world never deadlocked — a rank stuck in a
+                    // collective its peer skipped would surface as a CommError here.
+                    trainer
+                        .train(&mut policy, &EchoOrFlatReward, &CharTokenizer, &prompts)
+                        .unwrap()
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    assert_eq!(
+        histories[0].len(),
+        1,
+        "rank 0 (flag set) should stop after step 0"
+    );
+    assert_eq!(
+        histories[1].len(),
+        histories[0].len(),
+        "rank 1 (NO flag) must stop at the same step — the poll is install-invariant"
+    );
 }
 
 // ---- gate 1: sharded vs single, measured envelope ---------------------------

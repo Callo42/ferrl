@@ -569,6 +569,89 @@ pub fn load_checkpoint(
     })
 }
 
+/// The newest complete checkpoint discovered under a `checkpoints/` directory:
+/// its directory and the completed-step count its manifest records (the
+/// `start_step` a resume continues from — see [`crate::Trainer::resume`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LatestCheckpoint {
+    /// The checkpoint directory (`<checkpoints_dir>/step-<n>`).
+    pub dir: PathBuf,
+    /// The manifest `step`: completed optimizer steps, the resume `start_step`.
+    pub step: u64,
+}
+
+/// Find the newest **complete** checkpoint under `checkpoints_dir`, or `None` if
+/// there is none — the discovery half of restart-on-preemption (a requeued job
+/// calls this to learn where to resume; see [`crate::Trainer::resume_latest`]).
+///
+/// Scans only the immediate `step-<n>` subdirectories (the layout
+/// [`crate::Trainer`] writes), reads each one's manifest, and returns the one
+/// with the greatest completed-step count. Ordering is on the manifest's numeric
+/// `step`, **not** the directory name, so `step-10` correctly outranks `step-2`
+/// (a lexical sort would invert them).
+///
+/// A subdirectory whose manifest is missing, unreadable, or an unsupported
+/// format version is **skipped, not an error**: the writer publishes a checkpoint
+/// only once its manifest is committed by the final atomic rename (see the module
+/// docs), so a `step-<n>` directory without a readable manifest is an interrupted
+/// or foreign write, never a usable checkpoint — and a present, readable manifest
+/// is therefore a sufficient completeness marker (every sibling file landed in the
+/// same rename). Crash-leftover `.tmp-*` / `.old-*` siblings do not match the
+/// `step-<n>` shape and are ignored, as is any unrelated entry.
+///
+/// # Errors
+///
+/// Returns [`CheckpointError::Io`] only if `checkpoints_dir` exists but its
+/// listing cannot be read (a permissions / IO fault on the directory itself). A
+/// **missing** `checkpoints_dir` is not an error — it returns `None` (a run that
+/// has not checkpointed yet).
+pub fn latest_checkpoint(
+    checkpoints_dir: impl AsRef<Path>,
+) -> Result<Option<LatestCheckpoint>, CheckpointError> {
+    let dir = checkpoints_dir.as_ref();
+    if !dir.exists() {
+        return Ok(None);
+    }
+    let mut best: Option<LatestCheckpoint> = None;
+    for entry in std::fs::read_dir(dir).map_err(|e| io(dir, e))? {
+        let entry = entry.map_err(|e| io(dir, e))?;
+        // A per-entry file-type fault (e.g. a sibling being swept right now) is
+        // not a candidate, not a reason to fail the whole discovery.
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        // Match exactly `step-<digits>`: this excludes `.tmp-*` / `.old-*`
+        // crash siblings (their names carry a dot-suffix after the digits) and
+        // any foreign directory.
+        let is_step_dir = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_prefix("step-"))
+            .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()));
+        if !is_step_dir {
+            continue;
+        }
+        // The manifest is both the completeness marker and the source of truth
+        // for `step`. A partial / foreign / future-version directory simply is
+        // not a candidate (skip, do not fail).
+        let Ok(manifest) = read_manifest(&path) else {
+            continue;
+        };
+        let candidate = LatestCheckpoint {
+            dir: path,
+            step: manifest.step,
+        };
+        if best.as_ref().is_none_or(|b| candidate.step > b.step) {
+            best = Some(candidate);
+        }
+    }
+    Ok(best)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1007,5 +1090,73 @@ mod tests {
             "v1 has no optimizer state"
         );
         assert!(loaded.sampler_state.is_none(), "v1 has no sampler state");
+    }
+
+    /// Write a real (loadable) checkpoint at `root/step-<n>` with manifest `step = n`.
+    fn write_step(root: &Path, n: u64) {
+        save_checkpoint(
+            root.join(format!("step-{n}")),
+            &make_vars(),
+            &make_opt_state(),
+            &[1u8],
+            n,
+            None,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn latest_checkpoint_is_none_when_missing_or_empty() {
+        let tmp = TempDir::new("latest-none");
+        // A path that does not exist at all → None (not an error).
+        assert_eq!(latest_checkpoint(tmp.path().join("nope")).unwrap(), None);
+        // An existing but empty checkpoints dir → None.
+        assert_eq!(latest_checkpoint(tmp.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn latest_checkpoint_picks_highest_step_numerically_not_lexically() {
+        // step-10 must beat step-2 even though "step-10" < "step-2" lexically —
+        // a string sort would pick the wrong one.
+        let tmp = TempDir::new("latest-order");
+        write_step(tmp.path(), 2);
+        write_step(tmp.path(), 10);
+        let got = latest_checkpoint(tmp.path()).unwrap().unwrap();
+        assert_eq!(got.step, 10);
+        assert_eq!(got.dir, tmp.path().join("step-10"));
+        // And the discovered checkpoint actually loads from there.
+        let vars = make_vars();
+        assert_eq!(load_checkpoint(&got.dir, &vars).unwrap().step, 10);
+    }
+
+    #[test]
+    fn latest_checkpoint_skips_dirs_without_a_committed_manifest() {
+        // A higher-numbered directory with no manifest (an interrupted write)
+        // is not a candidate — discovery falls back to the newest complete one.
+        let tmp = TempDir::new("latest-partial");
+        write_step(tmp.path(), 5);
+        std::fs::create_dir_all(tmp.path().join("step-99")).unwrap(); // no manifest
+        let got = latest_checkpoint(tmp.path()).unwrap().unwrap();
+        assert_eq!(got.step, 5, "the manifest-less step-99 must be skipped");
+    }
+
+    #[test]
+    fn latest_checkpoint_ignores_tmp_old_and_foreign_siblings() {
+        let tmp = TempDir::new("latest-foreign");
+        write_step(tmp.path(), 3);
+        // Crash-leftover stage / aside dirs (name has a dot-suffix after digits).
+        std::fs::create_dir_all(tmp.path().join("step-7.tmp-12345")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("step-7.old-12345")).unwrap();
+        // Foreign entries: non-numeric suffix, empty suffix, unrelated name, a file.
+        std::fs::create_dir_all(tmp.path().join("step-abc")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("step-")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("latest")).unwrap();
+        std::fs::write(tmp.path().join("step-100"), b"a file, not a dir").unwrap();
+        let got = latest_checkpoint(tmp.path()).unwrap().unwrap();
+        assert_eq!(
+            got.step, 3,
+            "only the real step-3 checkpoint is a candidate"
+        );
+        assert_eq!(got.dir, tmp.path().join("step-3"));
     }
 }

@@ -141,8 +141,8 @@ pub mod trainer;
 
 #[doc(inline)]
 pub use checkpoint::{
-    load_adapter, load_checkpoint, save_adapter, save_checkpoint, CheckpointError,
-    CheckpointManifest, LoadedCheckpoint,
+    latest_checkpoint, load_adapter, load_checkpoint, save_adapter, save_checkpoint,
+    CheckpointError, CheckpointManifest, LatestCheckpoint, LoadedCheckpoint,
 };
 #[doc(inline)]
 pub use comm::{Comm, CommError, LocalComm, SoloComm};
