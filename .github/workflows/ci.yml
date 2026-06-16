@@ -36,7 +36,7 @@ jobs:
     name: rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - name: Install Rust (pinned via rust-toolchain.toml) + rustfmt
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -48,7 +48,7 @@ jobs:
     name: clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - name: Install Rust + clippy
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -70,7 +70,7 @@ jobs:
     name: test + coverage
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - name: Install Rust + llvm-tools-preview
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -114,7 +114,7 @@ jobs:
       # Treat all rustdoc warnings (incl. broken intra-doc links) as errors.
       RUSTDOCFLAGS: "-D warnings"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
@@ -128,7 +128,7 @@ jobs:
     name: supply-chain (deny + audit)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       # cargo-deny shells out to `cargo metadata`, so a toolchain is required even
       # though nothing is compiled here.
       - name: Install Rust
@@ -150,7 +150,7 @@ jobs:
     name: msrv (1.87)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       # The declared floor (workspace `rust-version = "1.87"`). 1.87 is the real
       # floor: the resolved hf-hub/ureq/url/idna path needs `edition2024` (1.85),
       # and candle-core 0.10.2 uses `is_multiple_of` (1.87) — the binding one. The
@@ -176,7 +176,7 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           # cog check walks the commit graph; it needs full history, not a
           # shallow clone, or it will fail to resolve the commit range.
