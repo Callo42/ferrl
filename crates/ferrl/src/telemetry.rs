@@ -101,20 +101,29 @@ pub fn init_tracing() -> Result<(), TelemetryError> {
 /// nested per-step `step` span inside it, so a trainer's own events are
 /// `rank`/`world`/`step`-stamped automatically; a launcher wraps its setup/eval/gate
 /// events by entering this span itself.
+///
+/// The span is created at **ERROR** level — the max severity — deliberately. A span is
+/// only entered while its level passes the active filter, so an `info`-level context
+/// span would silently drop out under `RUST_LOG=warn`/`error` (the very filters used to
+/// quiet a long run) and the warnings/errors that matter most — e.g. the preemption
+/// warn — would emit *without* rank/world/step. ERROR level keeps the context enabled
+/// for any filter that emits anything at all, so emitted warnings/errors always carry it.
 #[must_use]
 pub fn run_span(rank: usize, world: usize) -> tracing::Span {
-    tracing::info_span!("run", rank, world)
+    tracing::error_span!("run", rank, world)
 }
 
 /// The per-step span nested under [`run_span`]: stamps `step` onto every event emitted
 /// during one optimizer step.
 ///
-/// Kept a function rather than an inline `info_span!` at the call site so the macro's
+/// ERROR level for the same reason as [`run_span`] — the context must survive a
+/// `RUST_LOG=warn`/`error` filter so emitted warnings/errors keep their `step`. Kept a
+/// function rather than an inline `error_span!` at the call site so the macro's
 /// level-check branch counts against this trivial helper, not the trainer's already
 /// complexity-bounded run loop.
 #[must_use]
 pub(crate) fn step_span(step: u64) -> tracing::Span {
-    tracing::info_span!("step", step)
+    tracing::error_span!("step", step)
 }
 
 /// Owns the on-disk `runs/<run_id>/` directory for a single training run.
@@ -916,15 +925,26 @@ mod tests {
         }
     }
 
-    /// Run `f` under a thread-local fmt subscriber that captures rendered output into a
-    /// buffer (returned). Installs the global subscriber first (idempotent) so the
-    /// span/event callsites register as dynamic and the thread-local capture reliably
-    /// receives them regardless of test order — without a real global default, a sibling
-    /// test can register a callsite against the no-op subscriber and cache it disabled.
+    /// Run `f` under a thread-local fmt subscriber (default `info` filter) that captures
+    /// rendered output into a buffer (returned).
     fn capture_with_default(f: impl FnOnce()) -> std::sync::Arc<std::sync::Mutex<Vec<u8>>> {
+        capture_with_filter("info", f)
+    }
+
+    /// Run `f` under a thread-local fmt subscriber whose `EnvFilter` is `directive`,
+    /// capturing rendered output into a buffer (returned). Installs the global subscriber
+    /// first (idempotent) so the span/event callsites register as dynamic and the
+    /// thread-local capture reliably receives them regardless of test order — without a
+    /// real global default, a sibling test can register a callsite against the no-op
+    /// subscriber and cache it disabled.
+    fn capture_with_filter(
+        directive: &str,
+        f: impl FnOnce(),
+    ) -> std::sync::Arc<std::sync::Mutex<Vec<u8>>> {
         let _ = init_tracing();
         let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
         let sub = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(directive))
             .with_writer(CaptureWriter(std::sync::Arc::clone(&buf)))
             .with_ansi(false)
             .finish();
@@ -959,6 +979,26 @@ mod tests {
         assert!(out.contains("rank=0"), "rank not stamped: {out}");
         assert!(out.contains("world=1"), "world not stamped: {out}");
         assert!(out.contains("step=2"), "step not stamped: {out}");
+    }
+
+    #[test]
+    fn warn_events_stay_stamped_under_a_warn_level_filter() {
+        // The regression guard for the ERROR-level span choice: an operator quieting a
+        // run with RUST_LOG=warn filters out info-level spans, but the spans are ERROR
+        // level so they stay enabled — a WARN event (e.g. the preemption warn) must
+        // still carry rank/world/step. An info-level span would drop the fields here.
+        let buf = capture_with_filter("warn", || {
+            let _run = run_span(5, 9).entered();
+            let _step = step_span(3).entered();
+            tracing::warn!("a warning under a warn-level filter");
+        });
+        let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(out.contains("rank=5"), "rank lost under warn filter: {out}");
+        assert!(
+            out.contains("world=9"),
+            "world lost under warn filter: {out}"
+        );
+        assert!(out.contains("step=3"), "step lost under warn filter: {out}");
     }
 
     #[test]
