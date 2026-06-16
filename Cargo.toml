@@ -82,7 +82,7 @@ approx = "0.5"
 # Dev: safe SIGTERM/SIGUSR1 -> AtomicBool wiring for the example's restart-on-
 # preemption demo. The library never installs signal handlers (stays signal-free
 # and forbid-unsafe-clean); the run binary does, via signal_hook::flag::register.
-signal-hook = { version = "0.3", default-features = false }
+signal-hook = { version = "0.4", default-features = false }
 
 [workspace.lints.rust]
 # Safety + docs gate. `unsafe_code` is DENIED workspace-wide (the crate root
