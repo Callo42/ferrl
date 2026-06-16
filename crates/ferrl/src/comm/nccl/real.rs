@@ -60,6 +60,20 @@ impl RealNccl {
         let id = exchange_unique_id(config)?;
         let comm = Comm::from_rank(stream, config.rank(), config.world_size(), id)
             .map_err(|e| CommError::Config(format!("ncclCommInitRank failed: {e:?}")))?;
+        // The communicator is built. `ncclCommInitRank` is a collective that returns
+        // only once every rank has joined — and a peer reads the unique id *before* it
+        // can join — so by here every peer has already consumed the rendezvous file.
+        // rank 0 (its sole writer) deletes it now: the file is pure scratch from this
+        // point, and removing it means a later launch that REUSES the same path finds
+        // it empty and waits for a fresh publish, rather than reading a STALE id and
+        // building a communicator from a dead `ncclUniqueId`. This makes a reused
+        // rendezvous path safe across clean re-launches (e.g. preempt -> checkpoint ->
+        // requeue) with **no** scheduler knowledge in the library. (A hard kill inside
+        // the bootstrap window can still strand a file; `write_id_file`'s
+        // delete-before-write and a unique-per-launch path remain the backstop.)
+        if config.rank() == 0 {
+            let _ = std::fs::remove_file(config.rendezvous_file());
+        }
         Ok((
             Self {
                 comm,

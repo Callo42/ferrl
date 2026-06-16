@@ -1,8 +1,11 @@
 //! Multi-process NCCL all-reduce equivalence check — the GPU gate for the
 //! [`NcclComm`](ferrl::NcclComm) data-parallel bridge (P8).
 //!
-//! Launch one process per GPU (single node, e.g. `srun --ntasks=2
-//! --gpus-per-task=1 --gres=gpu:2`). Each process builds its communicator from
+//! Launch one process per GPU on one node, with **every rank able to see all the
+//! allocated GPUs** so each binds its own by `SLURM_LOCALID` — e.g. `srun --ntasks=2
+//! --gres=gpu:2` with `CUDA_VISIBLE_DEVICES=0,1` exported to every task (not
+//! `--gpus-per-task=1`, which masks each task to a single device a non-zero rank then
+//! cannot open). Each process builds its communicator from
 //! the Slurm environment ([`NcclComm::from_slurm_env`](ferrl::NcclComm)), then
 //! runs a multi-tensor and a scalar sum-all-reduce with **known** per-rank
 //! inputs: rank `r` contributes `r + 1`. The cross-rank sum is therefore the
@@ -76,7 +79,9 @@ fn main() -> anyhow::Result<()> {
 fn main() {
     eprintln!(
         "nccl_dp_allreduce: build with --features nccl (a multi-GPU build) and launch one \
-         process per GPU under srun (e.g. srun --ntasks=2 --gpus-per-task=1)."
+         process per GPU under srun, with every rank seeing all the allocated GPUs so each \
+         binds its own by SLURM_LOCALID (e.g. srun --ntasks=2 --gres=gpu:2 with \
+         CUDA_VISIBLE_DEVICES=0,1; NOT --gpus-per-task=1)."
     );
     std::process::exit(2);
 }

@@ -163,8 +163,11 @@ fn parse_usize_env(get: &impl Fn(&str) -> Option<String>, key: &str) -> Result<u
 /// Clears any pre-existing id at `path` first, so that during the brief publish
 /// window a peer polling [`read_id_file`] finds *no* file (and waits) rather than
 /// a **stale** id from a prior run on a reused path — which would build a
-/// communicator from a dead `ncclUniqueId` and hang. A fresh per-launch path (see
-/// [`NcclConfig::from_env`]) is the real guarantee; this only narrows the window.
+/// communicator from a dead `ncclUniqueId` and hang. The *primary* defense, though,
+/// is that `RealNccl::bootstrap` deletes this file on rank 0 the moment the
+/// communicator is built (every peer has read the id by then), so a cleanly-finished
+/// run leaves nothing stale for a reused path to trip on; this clear-before-write and
+/// a unique-per-launch path are the backstops for a hard kill mid-bootstrap.
 ///
 /// # Errors
 ///
@@ -613,6 +616,39 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let err = read_id_file(&path, Duration::from_millis(80)).unwrap_err();
         assert!(matches!(err, CommError::Config(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn rank0_cleanup_after_bootstrap_removes_the_stale_id_hazard() {
+        // `RealNccl::bootstrap` deletes the rendezvous file on rank 0 once the
+        // communicator is built (every peer has read the id by then). This test pins
+        // the hazard that removal eliminates — a reused path still holding a prior
+        // launch's id — by contrasting the two states of the rendezvous primitives.
+        let path = unique_path("stale");
+        let _ = std::fs::remove_file(&path);
+        let mut id = [7u8; NCCL_UNIQUE_ID_LEN];
+        id[0] = 42;
+        write_id_file(&path, &id).unwrap();
+
+        // WITHOUT the cleanup the file lingers, so a second launch reusing the path
+        // reads the STALE id (and would build a comm from a dead `ncclUniqueId`) — the
+        // exact hazard:
+        assert_eq!(
+            read_id_file(&path, Duration::from_millis(80)).unwrap(),
+            id,
+            "a lingering rendezvous file hands a reused path the stale id"
+        );
+
+        // WITH the post-bootstrap cleanup (rank 0 removes the file), the path is empty,
+        // so a reused launch finds nothing and waits for a fresh publish rather than
+        // racing on a dead id:
+        let _ = std::fs::remove_file(&path);
+        assert!(!path.exists(), "rank 0 leaves no rendezvous file behind");
+        let err = read_id_file(&path, Duration::from_millis(80)).unwrap_err();
+        assert!(
+            matches!(err, CommError::Config(_)),
+            "a cleaned, reused path must time out (no stale id), got {err:?}"
+        );
     }
 
     // ---- NcclComm orchestration over the mock ----
