@@ -532,6 +532,16 @@ impl LlamaGradModel {
                  would silently produce non-parity logits)"
             );
         }
+        // num_attention_heads is the divisor for the derived head_dim. Zero must
+        // be rejected explicitly: `is_multiple_of(0)` is true when hidden_size is
+        // also 0, so the divisibility check below would let a degenerate `(0, 0)`
+        // config slip past and fail deep in weight-load instead of loud here.
+        if cfg.num_attention_heads == 0 {
+            candle_core::bail!(
+                "LlamaGradModel: num_attention_heads must be >= 1 (got 0); head_dim is \
+                 derived as hidden_size / num_attention_heads"
+            );
+        }
         // head_dim is DERIVED as hidden_size / num_attention_heads (the llama
         // Config has no head_dim field). The shipped loader trips a reshape
         // error deep in the forward when the division truncates; we would
@@ -1632,6 +1642,26 @@ mod tests {
         assert!(
             err.to_string().contains("num_attention_heads"),
             "expected a divisibility rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_rejects_zero_attention_heads() {
+        // The num_attention_heads >= 1 guard closes the one gap the is_multiple_of
+        // rewrite left: at num_attention_heads == 0 AND hidden_size == 0,
+        // `hidden_size.is_multiple_of(0)` is true, so the divisibility check alone
+        // would let a degenerate (0, 0) config slip past and fail later at
+        // weight-load. The explicit guard rejects it loud, up front. (vb is built
+        // from a valid cfg; the guard fires before any tensor is touched.)
+        let good = tiny_cfg();
+        let vb = tiny_vb(&good);
+        let mut bad = tiny_cfg();
+        bad.hidden_size = 0;
+        bad.num_attention_heads = 0;
+        let err = LlamaGradModel::load(&bad, &vb, 2, 4.0).unwrap_err();
+        assert!(
+            err.to_string().contains("num_attention_heads must be"),
+            "expected a num_attention_heads>=1 rejection, got: {err}"
         );
     }
 
