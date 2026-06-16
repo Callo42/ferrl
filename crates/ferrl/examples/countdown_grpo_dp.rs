@@ -2,9 +2,13 @@
 //! bridge unlocks: a **real multi-GPU GRPO training run**, not just a synthetic
 //! all-reduce.
 //!
-//! Launch one process per GPU (single node, e.g. `srun --ntasks=2
-//! --gpus-per-task=1 --gres=gpu:2`). Each process builds its communicator from
-//! the Slurm environment ([`NcclComm::from_slurm_env`](ferrl::NcclComm)) and
+//! Launch one process per GPU on one node, with **every rank able to see all the
+//! allocated GPUs** so each binds its own by `SLURM_LOCALID` — e.g. `srun --ntasks=2
+//! --gres=gpu:2` with `CUDA_VISIBLE_DEVICES=0,1` exported to every task. Do **not** pass
+//! `--gpus-per-task=1`: it masks each task to a single visible device, so a non-zero
+//! rank tries to open a GPU index it cannot see and fails before training. Each process
+//! builds its communicator from the Slurm environment
+//! ([`NcclComm::from_slurm_env`](ferrl::NcclComm)) and
 //! drives [`ferrl::QwenPolicy`] (real `Qwen3-0.6B-Base`, bf16 base / F32 `LoRA`
 //! adapter) through GRPO over the verifiable [`ferrl::countdown`] reward. The
 //! trainer all-reduces the `LoRA` gradients each accumulation window, so — starting
@@ -360,8 +364,10 @@ mod dp {
 fn main() {
     eprintln!(
         "countdown_grpo_dp: build with --features nccl (a multi-GPU build) and launch one \
-         process per GPU under srun (e.g. srun --ntasks=2 --gpus-per-task=1 --gres=gpu:2). \
-         See .git/ for the gate launcher."
+         process per GPU under srun, with every rank seeing all the allocated GPUs so each \
+         binds its own by SLURM_LOCALID (e.g. srun --ntasks=2 --gres=gpu:2 with \
+         CUDA_VISIBLE_DEVICES=0,1 — NOT --gpus-per-task=1, which masks each task to one \
+         device). See .git/ for the gate launcher."
     );
     std::process::exit(2);
 }
