@@ -1,0 +1,37 @@
+# Dependabot — automated dependency-update PRs.
+#
+# Two ecosystems: Cargo (the crate's dependencies) and the GitHub Actions pinned
+# in CI. Each update opens a PR into `main`, which then runs the full CI gate
+# (fmt / clippy / test+cov / docs / supply-chain / msrv) before any merge — so the
+# branch-protection contract holds for bot PRs exactly as for human ones.
+#
+# Commit prefixes are Conventional-Commits types (cocogitto's `cog check` runs on
+# every PR): `build(deps…)` for crate bumps (shown in the changelog under "Build
+# System" — dependency changes are consumer-relevant) and `ci(deps)` for Action
+# bumps (omitted from the changelog as CI-internal).
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "build"
+      prefix-development: "build"
+      include: scope
+    groups:
+      # candle-core/-nn/-transformers are pinned in lockstep (`=0.10.2`) on
+      # purpose; group them so a bump moves the trio together rather than
+      # splitting the pin across three PRs.
+      candle:
+        patterns:
+          - "candle-*"
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci"
+      include: scope

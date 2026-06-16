@@ -124,6 +124,51 @@ jobs:
       - name: cargo doc --no-deps
         run: cargo doc --no-deps
 
+  supply-chain:
+    name: supply-chain (deny + audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # cargo-deny shells out to `cargo metadata`, so a toolchain is required even
+      # though nothing is compiled here.
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-deny + cargo-audit (prebuilt)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny,cargo-audit
+      # License / bans / sources / advisories policy lives in deny.toml. Resolves
+      # the GPU stack too (deny.toml sets all-features) without compiling it.
+      - name: cargo deny check
+        run: cargo deny check
+      # Canonical RUSTSEC vulnerability scan over the committed Cargo.lock — kept
+      # alongside cargo-deny's advisory pass as defense in depth.
+      - name: cargo audit
+        run: cargo audit
+
+  msrv:
+    name: msrv (1.87)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # The declared floor (workspace `rust-version = "1.87"`). 1.87 is the real
+      # floor: the resolved hf-hub/ureq/url/idna path needs `edition2024` (1.85),
+      # and candle-core 0.10.2 uses `is_multiple_of` (1.87) — the binding one. The
+      # explicit `cargo +1.87` below overrides rust-toolchain.toml (pins `stable`).
+      - name: Install the declared MSRV toolchain (1.87)
+        uses: dtolnay/rust-toolchain@1.87
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      # Compile-check the library on the MSRV, pinned to the committed lockfile so
+      # the check is deterministic. Plain `cargo check` (no --all-targets) is the
+      # consumer-faithful gate: it builds the lib + its normal deps, not the
+      # dev-only examples/tests. DEFAULT (CPU) features only — GPU features pull
+      # cudarc/nvcc and never build in CI.
+      - name: cargo +1.87 check --locked --workspace
+        run: cargo +1.87 check --locked --workspace
+
   commit-lint:
     name: commit-lint (Conventional Commits)
     # Only meaningful on PRs: validates the PR's commit range against the
