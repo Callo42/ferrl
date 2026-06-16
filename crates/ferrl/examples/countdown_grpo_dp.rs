@@ -274,10 +274,15 @@ mod dp {
         let rank = comm.rank();
         let world = comm.world_size();
         let device = comm.device().clone();
+        // Stamp every event this rank logs with rank/world — all ranks share one stdout
+        // under srun, so the span is what makes the interleaved lines attributable. The
+        // trainer enters its own (identical) run span + a nested per-step span; this one
+        // covers the launcher's setup / eval / gate events.
+        let _run = ferrl::run_span(rank, world).entered();
         // Driver/PTX preflight on this rank's device (proactive warn, then a forced
         // JIT so a real mismatch fails here with an actionable message).
         if let Some(w) = ferrl::check_driver_compat(&device).warning() {
-            warn!("[rank {rank}] {w}");
+            warn!("{w}");
         }
         ferrl::guard_first_kernel(&device).context("CUDA preflight")?;
 
@@ -291,8 +296,6 @@ mod dp {
         let eos = resolve_eos(&dir)?;
         let tcfg = build_trainer_config(eos);
         info!(
-            rank,
-            world,
             steps = tcfg.steps,
             group_size = tcfg.group_size,
             grad_accum_steps = tcfg.grad_accum_steps,
@@ -315,10 +318,7 @@ mod dp {
         // Exit before the gate so the requeue (same FERRL_CDDP_RUN_ID) resumes — the
         // grace window is short; gating now would burn it and fail on incomplete data.
         if stop == RunStop::Preempted {
-            warn!(
-                rank,
-                "preempted mid-run: checkpoint written; exiting for the requeue"
-            );
+            warn!("preempted mid-run: checkpoint written; exiting for the requeue");
             println!("[rank {rank}] DP_PREEMPTED");
             return Ok(());
         }
@@ -347,7 +347,7 @@ mod dp {
         let (first, last) = reward_trend(&history);
         let margin = env_parse("FERRL_CDDP_MARGIN", 0.05f32);
         let rises = (last - first) > margin;
-        info!(rank, first, last, margin, rises, "DP train reward trend");
+        info!(first, last, margin, rises, "DP train reward trend");
         if rises {
             println!("[rank {rank}] DP_TRAIN_PASS");
             Ok(())
