@@ -18,13 +18,14 @@ candle-nn = { workspace = true }
 candle-transformers = { workspace = true }
 hf-hub = { workspace = true }
 tokenizers = { workspace = true }
-# Telemetry, serialization, errors, RNG.
+# Telemetry, serialization, errors, RNG. The library's typed errors use
+# `thiserror`; `anyhow` is NOT a library dependency (it lives in dev-dependencies,
+# used only by the examples / glue), so the crate's public API is `anyhow`-free.
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-anyhow = { workspace = true }
 rand = { workspace = true }
 # Optional, activated only by the `cuda` feature (see below): the proactive
 # driver-version query in `cuda_compat`. Off by default, so the CPU build is unchanged.
@@ -33,6 +34,10 @@ cudarc = { workspace = true, optional = true }
 [dev-dependencies]
 proptest = { workspace = true }
 approx = { workspace = true }
+# `anyhow` is an example/glue convenience (boxed errors in the runnable demos);
+# keeping it out of [dependencies] guarantees the published library API never
+# surfaces an `anyhow` type. Examples can still use it (they see dev-dependencies).
+anyhow = { workspace = true }
 # Signal -> flag wiring for the countdown example's restart-on-preemption demo.
 signal-hook = { workspace = true }
 
