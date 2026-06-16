@@ -969,6 +969,7 @@ impl Trainer {
                 // directory from the broadcast step — rank 0's checkpoint.
                 let dir = self.checkpoints_dir.join(format!("step-{step}"));
                 tracing::info!(
+                    rank = self.comm.rank(),
                     resume_step = step,
                     dir = %dir.display(),
                     world_size = self.comm.world_size(),
@@ -979,6 +980,7 @@ impl Trainer {
             }
             None => {
                 tracing::info!(
+                    rank = self.comm.rank(),
                     world_size = self.comm.world_size(),
                     "resume_latest: no checkpoint found — starting a fresh run"
                 );
@@ -1057,6 +1059,12 @@ impl Trainer {
         prompts: &[String],
     ) -> Result<(Vec<Metrics>, RunStop), TrainerError> {
         assert!(!prompts.is_empty(), "train: no prompts");
+        // Stamp every event this run emits — the per-step events below, plus anything
+        // the policy/reward logs — with this rank's rank/world. Under DP all ranks share
+        // one stdout, so an unstamped line is unattributable; a nested per-step `step`
+        // span is entered inside the loop. All four entry points funnel through `run`,
+        // so the stamp covers train / train_from / resume / resume_latest alike.
+        let _run = crate::telemetry::run_span(self.comm.rank(), self.comm.world_size()).entered();
         // The KL reference (`beta > 0`) IS the adapter-disabled policy
         // (`reference_logprobs` toggles the adapter off to score it). A policy
         // that cannot disable its adapter — full fine-tuning: the base weights
@@ -1099,6 +1107,11 @@ impl Trainer {
         let remaining = total.saturating_sub(start_step) as usize;
         let mut history = Vec::with_capacity(remaining);
         for step in start_step..total {
+            // Nest a per-step span under the run span so every event in this iteration
+            // (the trainer's, the policy's) also carries `step` — rank/world/step on
+            // every line. A helper, not an inline `info_span!`, to keep the macro's
+            // level-check branch out of this loop's cognitive-complexity budget.
+            let _step = crate::telemetry::step_span(step).entered();
             // Linear warmup, constant after: a pure function of the step index,
             // so a resume mid-warmup re-enters the schedule exactly.
             opt.set_learning_rate(self.config.lr_at(step));

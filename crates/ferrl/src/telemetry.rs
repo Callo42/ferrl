@@ -84,6 +84,39 @@ pub fn init_tracing() -> Result<(), TelemetryError> {
     Ok(())
 }
 
+/// Build the per-run `rank`/`world` span that stamps **every** event emitted while it
+/// is entered with this rank's identity.
+///
+/// Under data parallelism every rank logs to the same stdout/stderr, so without a rank
+/// stamp the interleaved lines are unattributable. Enter this span once for the lifetime
+/// of a run (hold the returned guard) and every `tracing` event below it — the policy's,
+/// the reward's, the trainer's — carries `rank` and `world`:
+///
+/// ```
+/// let _run = ferrl::run_span(0, 1).entered();
+/// // Every `tracing` event emitted while `_run` is held carries rank=0 world=1.
+/// ```
+///
+/// [`Trainer`](crate::trainer::Trainer) enters this span around its run loop and a
+/// nested per-step `step` span inside it, so a trainer's own events are
+/// `rank`/`world`/`step`-stamped automatically; a launcher wraps its setup/eval/gate
+/// events by entering this span itself.
+#[must_use]
+pub fn run_span(rank: usize, world: usize) -> tracing::Span {
+    tracing::info_span!("run", rank, world)
+}
+
+/// The per-step span nested under [`run_span`]: stamps `step` onto every event emitted
+/// during one optimizer step.
+///
+/// Kept a function rather than an inline `info_span!` at the call site so the macro's
+/// level-check branch counts against this trivial helper, not the trainer's already
+/// complexity-bounded run loop.
+#[must_use]
+pub(crate) fn step_span(step: u64) -> tracing::Span {
+    tracing::info_span!("step", step)
+}
+
 /// Owns the on-disk `runs/<run_id>/` directory for a single training run.
 ///
 /// Construction creates the directory tree eagerly. Paths to the standard
@@ -859,6 +892,73 @@ mod tests {
         // Should not panic even when called twice (try_init swallows the second).
         init_tracing().unwrap();
         init_tracing().unwrap();
+    }
+
+    /// A `MakeWriter` that captures formatted log output into a shared buffer, so a test
+    /// can assert on what the subscriber actually rendered.
+    #[derive(Clone)]
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Run `f` under a thread-local fmt subscriber that captures rendered output into a
+    /// buffer (returned). Installs the global subscriber first (idempotent) so the
+    /// span/event callsites register as dynamic and the thread-local capture reliably
+    /// receives them regardless of test order — without a real global default, a sibling
+    /// test can register a callsite against the no-op subscriber and cache it disabled.
+    fn capture_with_default(f: impl FnOnce()) -> std::sync::Arc<std::sync::Mutex<Vec<u8>>> {
+        let _ = init_tracing();
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let sub = tracing_subscriber::fmt()
+            .with_writer(CaptureWriter(std::sync::Arc::clone(&buf)))
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(sub, f);
+        buf
+    }
+
+    #[test]
+    fn run_span_stamps_rank_and_world_on_events() {
+        // The contract: every event emitted while the span is entered inherits this
+        // rank's rank/world. Capture the rendered output and assert both appear.
+        let buf = capture_with_default(|| {
+            let _run = run_span(3, 8).entered();
+            tracing::info!("captured event");
+        });
+        let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(out.contains("rank=3"), "rank not stamped: {out}");
+        assert!(out.contains("world=8"), "world not stamped: {out}");
+        assert!(out.contains("captured event"), "event missing: {out}");
+    }
+
+    #[test]
+    fn run_and_step_spans_stamp_rank_world_and_step() {
+        // The trainer's exact construction: a run span (rank/world) wrapping a nested
+        // per-step span (step). An event emitted within carries all three fields.
+        let buf = capture_with_default(|| {
+            let _run = run_span(0, 1).entered();
+            let _step = step_span(2).entered();
+            tracing::info!("step-scoped event");
+        });
+        let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(out.contains("rank=0"), "rank not stamped: {out}");
+        assert!(out.contains("world=1"), "world not stamped: {out}");
+        assert!(out.contains("step=2"), "step not stamped: {out}");
     }
 
     #[test]

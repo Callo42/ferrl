@@ -208,7 +208,8 @@ pub use reward::RewardFn;
 pub use sampler::GrpoSampler;
 #[doc(inline)]
 pub use telemetry::{
-    init_tracing, read_metrics, summarize, Anomaly, Metrics, MetricsWriter, RunDir, RunSummary,
+    init_tracing, read_metrics, run_span, summarize, Anomaly, Metrics, MetricsWriter, RunDir,
+    RunSummary,
 };
 #[doc(inline)]
 pub use tokenizer::HfTokenizer;

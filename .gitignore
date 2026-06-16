@@ -11,6 +11,12 @@
 # log. These are produced by training and are not source; never commit them.
 /runs
 
+# --- Slurm job output ---
+# sbatch/srun write slurm-<jobid>.out into the submit directory when GPU/DP runs are
+# launched on the cluster. They are run logs, not source, and never appear for
+# ordinary contributors or GitHub runners (CPU CI never touches Slurm).
+slurm-*.out
+
 # --- Python oracle scratch ---
 # scripts/gen_golden.py is committed; its environment and bytecode are not.
 __pycache__/
