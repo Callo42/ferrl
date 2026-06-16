@@ -43,7 +43,7 @@ use ferrl::lora::LoraLinear;
 use ferrl::nn::RmsNorm;
 use ferrl::policy::{GenConfig, Policy, Rollout};
 use ferrl::telemetry::RunDir;
-use ferrl::trainer::{TokenizerLike, Trainer, TrainerConfig};
+use ferrl::trainer::{TokenizerLike, Trainer, TrainerConfig, TrainerError};
 use ferrl::{
     tensors_from_pretrained, varbuilder_from_pretrained, Comm, CommError, LocalComm, LossType,
     Metrics, Qwen3_5Config, Qwen3_5GradModel, Qwen3_5Policy, RewardFn, SoloComm,
@@ -899,38 +899,289 @@ fn rank_zero_writes_the_only_checkpoint_and_a_dp_resume_continues_bit_exactly() 
     );
 }
 
-// ---- resume_latest is single-rank only (rank-0-only checkpoint contract) ------
+// ---- resume_latest auto-discovers rank 0's checkpoint under data parallelism --
 
-/// `resume_latest` auto-discovers a checkpoint in THIS rank's own `checkpoints/`,
-/// but the DP contract writes checkpoints on rank 0 only and resumes every rank from
-/// rank 0's directory. Per-rank discovery would let non-zero ranks find nothing,
-/// silently start fresh, and diverge from rank 0 — then hang the next collective once
-/// rank 0 finishes its shorter remaining steps first. So under `world_size > 1` it
-/// must REFUSE (a contract error pointing at the explicit `resume(&rank0_ckpt)` path),
-/// not foot-gun. The guard fires before any collective, so a single rank handle of a
-/// 2-world proves it — no threads, no rendezvous.
+/// Run a fresh 2-rank DP world that resumes-or-starts via `resume_latest`, with
+/// every rank pointing at ONE shared checkpoint dir (`with_checkpoints_dir`) — the
+/// auto-discovery substrate — while keeping per-rank run dirs for telemetry. `tag`
+/// distinguishes each call's per-rank run dirs (a duplicate `run_id` is rejected).
+fn run_dp_world_resume_latest(
+    base: &Path,
+    shared_ckpts: &Path,
+    tag: u64,
+    cfg: &TrainerConfig,
+) -> Vec<RankRun> {
+    let comms = LocalComm::world(2);
+    std::thread::scope(|s| {
+        let handles: Vec<_> = comms
+            .into_iter()
+            .map(|comm| {
+                let cfg = cfg.clone();
+                let shared = shared_ckpts.to_path_buf();
+                s.spawn(move || {
+                    let rank = comm.rank();
+                    let mut policy = ScriptedPolicy::new(SEED).unwrap();
+                    let run = RunDir::create(base, format!("rl{tag}-rank{rank}")).unwrap();
+                    let mut trainer = Trainer::with_comm(cfg, &run, comm)
+                        .unwrap()
+                        .with_checkpoints_dir(shared);
+                    let history = trainer
+                        .resume_latest(
+                            &mut policy,
+                            &EchoOrFlatReward,
+                            &CharTokenizer,
+                            &live_prompts(),
+                        )
+                        .unwrap();
+                    (var_bits(&policy), history.0)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    })
+}
+
+/// The auto-discovery counterpart of
+/// `rank_zero_writes_the_only_checkpoint_and_a_dp_resume_continues_bit_exactly`:
+/// instead of the launcher handing every rank rank 0's checkpoint dir for an
+/// explicit `resume`, every rank points at ONE shared checkpoint dir
+/// (`with_checkpoints_dir`) and calls `resume_latest`. rank 0's scan is broadcast
+/// to the world (broadcast-from-rank-0 via the sum all-reduce), so all ranks resume
+/// from the SAME step in lockstep — bitwise the uninterrupted run, exactly as the
+/// explicit path. This is the behavior that replaced the old hard DP refusal.
 #[test]
-fn resume_latest_refuses_under_data_parallel() {
-    let tmp = TempDir::new("resume-latest-dp-guard");
-    let comm = LocalComm::world(2)
-        .into_iter()
-        .next()
-        .expect("a 2-rank world has a rank 0");
-    let run = RunDir::create(tmp.path(), "rank0").unwrap();
-    let mut policy = ScriptedPolicy::new(SEED).unwrap();
-    let mut trainer = Trainer::with_comm(scripted_cfg(), &run, comm).unwrap();
-    let err = trainer
-        .resume_latest(
-            &mut policy,
-            &EchoOrFlatReward,
-            &CharTokenizer,
-            &live_prompts(),
-        )
-        .unwrap_err();
-    let msg = err.to_string();
+fn resume_latest_under_dp_auto_discovers_rank0_checkpoint_in_lockstep() {
+    let base = TrainerConfig {
+        checkpoint_every: Some(1),
+        grad_accum_steps: 2,
+        ..scripted_cfg()
+    };
+    // Oracle: an uninterrupted 4-step DP world (per-rank dirs, default checkpoints).
+    let tmp_full = TempDir::new("rl-dp-full");
+    let full = run_scripted_world(
+        tmp_full.path(),
+        2,
+        &TrainerConfig {
+            steps: 4,
+            ..base.clone()
+        },
+        &live_prompts(),
+    );
+    assert_lockstep(&full, "uninterrupted");
+
+    // ONE shared checkpoint dir every rank reads, rank 0 writes (not pre-created —
+    // the save path makes it; `latest_checkpoint` reads a missing dir as "none").
+    let tmp = TempDir::new("rl-dp-shared");
+    let shared_ckpts = tmp.path().join("shared-checkpoints");
+
+    // Phase 1: an empty shared dir → all ranks start fresh, run 2 steps, rank 0
+    // checkpoints step-2 into the shared dir.
+    let phase1 = run_dp_world_resume_latest(
+        tmp.path(),
+        &shared_ckpts,
+        1,
+        &TrainerConfig {
+            steps: 2,
+            ..base.clone()
+        },
+    );
+    assert_lockstep(&phase1, "phase 1");
+    assert_eq!(phase1[0].1.len(), 2, "phase 1 runs steps 0..2 fresh");
     assert!(
-        msg.contains("single-rank") && msg.contains("resume("),
-        "DP resume_latest must fail with a contract error pointing at resume(): got {msg:?}"
+        shared_ckpts.join("step-2").is_dir(),
+        "rank 0 must write the checkpoint into the shared dir"
+    );
+
+    // Phase 2: resume_latest to step 4 — auto-discovers step-2 from the shared dir
+    // and broadcasts it, so every rank resumes there and runs 2..4 in lockstep.
+    let resumed = run_dp_world_resume_latest(
+        tmp.path(),
+        &shared_ckpts,
+        2,
+        &TrainerConfig { steps: 4, ..base },
+    );
+    assert_lockstep(&resumed, "resumed");
+    assert_eq!(resumed[0].1.len(), 2, "resume_latest runs steps 2..4");
+    assert_eq!(
+        full[0].0, resumed[0].0,
+        "DP resume_latest must reproduce the uninterrupted run bit-for-bit"
+    );
+}
+
+/// With no checkpoint in the shared dir, `resume_latest` under DP must start every
+/// rank fresh in lockstep — the broadcast carries the "start fresh" sentinel, so
+/// the whole world takes the same branch (never a rank-0-resumes / peers-restart
+/// split). Equivalent to an uninterrupted `train()` DP world.
+#[test]
+fn resume_latest_under_dp_with_no_checkpoint_starts_fresh_in_lockstep() {
+    let cfg = TrainerConfig {
+        steps: 3,
+        grad_accum_steps: 2,
+        ..scripted_cfg()
+    };
+    let tmp_full = TempDir::new("rl-dp-fresh-oracle");
+    let full = run_scripted_world(tmp_full.path(), 2, &cfg, &live_prompts());
+    assert_lockstep(&full, "uninterrupted fresh");
+
+    let tmp = TempDir::new("rl-dp-fresh");
+    let shared_ckpts = tmp.path().join("shared-checkpoints"); // never created
+    let fresh = run_dp_world_resume_latest(tmp.path(), &shared_ckpts, 1, &cfg);
+    assert_lockstep(&fresh, "no-checkpoint fresh");
+    assert_eq!(fresh[0].1.len(), 3, "no checkpoint → every step runs fresh");
+    assert_eq!(
+        full[0].0, fresh[0].0,
+        "DP resume_latest with no checkpoint must equal an uninterrupted DP train()"
+    );
+}
+
+/// The divergence-prevention claim, pinned directly: with **per-rank** checkpoint dirs
+/// (the misuse the shared-dir contract warns against), the broadcast still carries rank
+/// 0's decision to the peers, so a peer ATTEMPTS rank 0's resume and fails **loudly**
+/// (its own dir lacks the checkpoint) rather than silently starting fresh and diverging.
+///
+/// This is the test the shared-dir equivalence cases above cannot be: with a shared dir,
+/// a buggy no-broadcast implementation (each rank scans its own dir) would *also* pass,
+/// because every rank sees rank 0's checkpoint. Here, only rank 0's dir has the
+/// checkpoint — so a no-broadcast implementation would have rank 1 scan its empty dir,
+/// start fresh, run every step while rank 0 (resuming the final step) runs none, and
+/// **deadlock** on the first mismatched collective (surfacing as a `Comm` timeout). The
+/// coordinated implementation instead makes rank 1 fail at the checkpoint load
+/// (`TrainerError::Checkpoint`), which this test asserts — and a `Comm` error would fail
+/// it. `steps == the checkpoint step` so rank 0 runs zero further steps and neither rank
+/// hangs on the happy path.
+#[test]
+fn resume_latest_under_dp_without_a_shared_dir_resumes_rank0s_step_loudly_not_fresh() {
+    let base = TrainerConfig {
+        checkpoint_every: Some(1),
+        grad_accum_steps: 2,
+        steps: 2,
+        ..scripted_cfg()
+    };
+    let tmp = TempDir::new("rl-dp-perrank");
+    // Phase 1: a 2-rank world with PER-RANK dirs writes rank 0's checkpoint at step 2;
+    // rank 1's own checkpoint dir stays empty (rank-0-only writes).
+    let phase1 = run_scripted_world(tmp.path(), 2, &base, &live_prompts());
+    assert_lockstep(&phase1, "phase 1");
+    assert!(
+        tmp.path()
+            .join("rank0")
+            .join("checkpoints")
+            .join("step-2")
+            .is_dir(),
+        "rank 0 must write the only checkpoint"
+    );
+    assert_eq!(
+        std::fs::read_dir(tmp.path().join("rank1").join("checkpoints"))
+            .unwrap()
+            .count(),
+        0,
+        "rank 1's own checkpoint dir must be empty"
+    );
+
+    // Phase 2: resume_latest with PER-RANK dirs (each rank REOPENS its own phase-1 dir),
+    // steps == the checkpoint step. A short timeout so the buggy-impl divergence surfaces
+    // as a fast Comm timeout rather than hanging the test.
+    let comms = LocalComm::world_with_timeout(2, std::time::Duration::from_secs(20));
+    let outcomes: Vec<Result<(), TrainerError>> = std::thread::scope(|s| {
+        let handles: Vec<_> = comms
+            .into_iter()
+            .map(|comm| {
+                let cfg = base.clone();
+                let basep = tmp.path();
+                s.spawn(move || {
+                    let rank = comm.rank();
+                    let mut policy = ScriptedPolicy::new(SEED).unwrap();
+                    let run = RunDir::open(basep, format!("rank{rank}")).unwrap();
+                    let mut trainer = Trainer::with_comm(cfg, &run, comm).unwrap();
+                    trainer
+                        .resume_latest(
+                            &mut policy,
+                            &EchoOrFlatReward,
+                            &CharTokenizer,
+                            &live_prompts(),
+                        )
+                        .map(|_| ())
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    // rank 0 resumed its own step-2 checkpoint; steps == 2 so zero further steps → Ok.
+    assert!(
+        outcomes[0].is_ok(),
+        "rank 0 resumes its own checkpoint cleanly: {:?}",
+        outcomes[0]
+    );
+    // rank 1 received rank 0's broadcast step and tried to resume from its OWN (empty)
+    // dir → a loud checkpoint-load error. NOT a silent fresh start, NOT a Comm timeout
+    // from a diverged collective (which is exactly what a no-broadcast impl produces).
+    let err1 = outcomes[1].as_ref().unwrap_err();
+    assert!(
+        matches!(err1, TrainerError::Checkpoint(_)),
+        "rank 1 must fail loudly at the checkpoint load (broadcast carried rank 0's step \
+         to a dir that lacks it), not diverge into a Comm timeout: got {err1:?}"
+    );
+}
+
+/// A rank-0 checkpoint-scan FAILURE must ride the broadcast every rank enters, so the
+/// world aborts **in lockstep and promptly** — not a rank-0-only early return that
+/// strands the peers in the collective until the timeout (the fresh-eyes-review
+/// deadlock vector). Induced by pointing the shared checkpoint dir at a FILE, so rank
+/// 0's `read_dir` of it errors (`ENOTDIR`). With a short collective timeout, a
+/// regression (rank-0 `?`-return before the broadcast) would surface as a peer `Comm`
+/// timeout — which this test forbids; the fix makes rank 0 return the real
+/// `Checkpoint` error and the peer the synthesized `Contract` error, both at once.
+#[test]
+fn resume_latest_under_dp_broadcasts_a_rank0_scan_failure_instead_of_hanging() {
+    let tmp = TempDir::new("rl-dp-scanfail");
+    let not_a_dir = tmp.path().join("checkpoints-is-a-file");
+    std::fs::write(&not_a_dir, b"not a directory").unwrap();
+    let comms = LocalComm::world_with_timeout(2, std::time::Duration::from_secs(15));
+    let errs: Vec<TrainerError> = std::thread::scope(|s| {
+        let handles: Vec<_> = comms
+            .into_iter()
+            .map(|comm| {
+                let basep = tmp.path();
+                let ckpt = not_a_dir.clone();
+                s.spawn(move || {
+                    let rank = comm.rank();
+                    let mut policy = ScriptedPolicy::new(SEED).unwrap();
+                    let run = RunDir::create(basep, format!("sf-rank{rank}")).unwrap();
+                    let mut trainer = Trainer::with_comm(scripted_cfg(), &run, comm)
+                        .unwrap()
+                        .with_checkpoints_dir(ckpt);
+                    trainer
+                        .resume_latest(
+                            &mut policy,
+                            &EchoOrFlatReward,
+                            &CharTokenizer,
+                            &live_prompts(),
+                        )
+                        .map(|_| ())
+                        .unwrap_err()
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    // No rank may surface a Comm timeout — that would mean a peer was stranded in the
+    // broadcast by a rank-0-only early return (the bug the broadcast-the-failure fix
+    // closes). rank 0 surfaces the real checkpoint IO error; the peer the Contract one.
+    for e in &errs {
+        assert!(
+            !matches!(e, TrainerError::Comm(_)),
+            "a rank-0 scan failure must abort in lockstep, not strand a peer in the \
+             collective (Comm timeout): got {e:?}"
+        );
+    }
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, TrainerError::Checkpoint(_))),
+        "rank 0 must surface the real checkpoint scan error: {errs:?}"
+    );
+    assert!(
+        errs.iter().any(|e| matches!(e, TrainerError::Contract(_))),
+        "the peer must surface the synthesized lockstep-abort error: {errs:?}"
     );
 }
 

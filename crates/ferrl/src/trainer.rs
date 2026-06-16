@@ -585,6 +585,54 @@ pub enum RunStop {
     Preempted,
 }
 
+/// rank 0's [`Trainer::resume_latest`] discovery outcome, encoded as one `f64` for
+/// the cross-rank broadcast sum (see `resume_latest`).
+///
+/// The three outcomes are kept disjoint and exact so a single
+/// [`Comm::all_reduce_scalar_sum`] — with
+/// rank 0 contributing its decision and every peer contributing [`Fresh`](Self::Fresh)
+/// (the additive identity `0.0`) — returns rank 0's decision, rank-identical, on every
+/// rank. Crucially this lets a rank-0 scan *failure* ride the same broadcast every rank
+/// enters, so a transient IO fault aborts the world in lockstep instead of stranding
+/// the peers in a collective rank 0 bailed before reaching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumeDecision {
+    /// No checkpoint found — start a fresh run.
+    Fresh,
+    /// Resume from this completed step.
+    Resume(u64),
+    /// rank 0's checkpoint scan itself failed (the directory exists but its listing
+    /// errored) — the world must abort, not resume or start fresh.
+    ScanFailed,
+}
+
+impl ResumeDecision {
+    /// Encode for the broadcast sum: `Fresh → 0.0` (also the additive identity the
+    /// peers contribute), `Resume(s) → s + 1.0` (always `≥ 1.0`, distinct from the
+    /// `Fresh` sentinel even for `s = 0`), `ScanFailed → -1.0`. Every value is an exact
+    /// integer far below 2^53, so summing rank 0's value against zero-contributing peers
+    /// returns it bit-exactly.
+    fn encode(self) -> f64 {
+        match self {
+            ResumeDecision::Fresh => 0.0,
+            ResumeDecision::Resume(step) => step as f64 + 1.0,
+            ResumeDecision::ScanFailed => -1.0,
+        }
+    }
+
+    /// Inverse of [`encode`](Self::encode). The wire values are exact by construction;
+    /// the `±0.5` thresholds are purely defensive rounding.
+    fn decode(signal: f64) -> Self {
+        if signal < -0.5 {
+            ResumeDecision::ScanFailed
+        } else if signal < 0.5 {
+            ResumeDecision::Fresh
+        } else {
+            ResumeDecision::Resume(signal.round() as u64 - 1)
+        }
+    }
+}
+
 impl Trainer {
     /// Open a trainer for `config`, persisting it to `run`'s `config.json` and
     /// opening the `metrics.jsonl` writer.
@@ -676,6 +724,29 @@ impl Trainer {
         self
     }
 
+    /// Redirect checkpoint reads **and** writes to `dir` instead of this run's
+    /// own `checkpoints/` subdirectory.
+    ///
+    /// The default ([`with_comm`](Self::with_comm)) checkpoints under the run
+    /// dir, so each rank's checkpoints land in its **own** per-rank run dir —
+    /// correct for per-rank telemetry (`metrics.jsonl` never interleaves), but
+    /// it leaves non-zero ranks with no checkpoints of their own (the
+    /// `maybe_checkpoint` write is rank-0-only). For a
+    /// data-parallel run that wants **auto-resume**
+    /// ([`resume_latest`](Self::resume_latest)), point **every rank** at one
+    /// **shared** directory on a filesystem all ranks can read (a single node's
+    /// `/tmp`, or NFS across nodes): rank 0 writes the world's checkpoints there
+    /// and every rank discovers and resumes from them. Per-rank run dirs still
+    /// own each rank's `metrics.jsonl`; only the checkpoint location is shared.
+    ///
+    /// Has no effect on the world-1 / single-rank path beyond relocating the
+    /// checkpoint directory.
+    #[must_use]
+    pub fn with_checkpoints_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.checkpoints_dir = dir.into();
+        self
+    }
+
     /// Run `config.steps` optimizer steps — each over a window of
     /// `config.grad_accum_steps` prompts — cycling through `prompts`, returning one
     /// [`Metrics`] row per optimizer step (also appended to `metrics.jsonl`).
@@ -754,11 +825,13 @@ impl Trainer {
     /// continuation, not a bit-exact replay — exactly like [`train_from`](Self::train_from)).
     ///
     /// Returns the per-step metrics **and a [`RunStop`]** (as [`train`](Self::train)).
-    /// This is the explicit-path resume a **data-parallel** requeue uses — every rank
-    /// calls it with rank 0's checkpoint dir — so the caller MUST honor
-    /// [`RunStop::Preempted`] (skip held-out eval / gating on the partial history and
-    /// exit so the next requeue continues); auto-discovery via
-    /// [`resume_latest`](Self::resume_latest) is single-rank only.
+    /// This is the **explicit-path** data-parallel resume — every rank calls it with
+    /// rank 0's checkpoint dir (the launcher supplies the path) — so the caller MUST
+    /// honor [`RunStop::Preempted`] (skip held-out eval / gating on the partial history
+    /// and exit so the next requeue continues). The **auto-discovery** counterpart,
+    /// [`resume_latest`](Self::resume_latest), also works under data parallelism: it
+    /// coordinates rank 0's discovery across the world for you, given a shared
+    /// checkpoint directory ([`with_checkpoints_dir`](Self::with_checkpoints_dir)).
     ///
     /// `policy` must be the same architecture AND adapter recipe the checkpoint was
     /// written from: the adapter load and the optimizer-moment load each validate
@@ -849,19 +922,33 @@ impl Trainer {
     /// gate so the requeue resumes; on [`RunStop::Completed`] the run finished and
     /// eval / gating may proceed.
     ///
-    /// **Single-rank only.** Under data parallelism (`world_size > 1`) this returns
-    /// [`TrainerError::Contract`] rather than silently per-rank-discovering: only
-    /// rank 0 writes checkpoints, so auto-discovery would let non-zero ranks start
-    /// fresh and diverge. DP requeue coordinates rank 0's checkpoint dir in the
-    /// launcher and calls [`resume`](Self::resume) on every rank (see
-    /// `tests/dp_equivalence.rs`); DP-coordinated auto-resume lands with P9.
+    /// **Data-parallel auto-resume is coordinated through rank 0**, not scanned
+    /// per rank. Only rank 0 writes checkpoints, so a naive per-rank scan would
+    /// have non-zero ranks find none, start fresh, and diverge from rank 0 (then
+    /// deadlock the next collective once rank 0 finishes its shorter remaining
+    /// steps). Instead, under `world_size > 1`, rank 0 scans the checkpoint
+    /// directory and **broadcasts the resume step** to every rank, so the whole
+    /// world resumes from rank 0's checkpoint — or all start fresh — **in
+    /// lockstep**, then each rank loads it via the same momentum-faithful path the
+    /// explicit `resume(&rank0_ckpt)` requeue uses. This requires every rank to
+    /// point at **one shared checkpoint directory** (a filesystem all ranks read:
+    /// a single node's `/tmp`, or NFS across nodes) via
+    /// [`with_checkpoints_dir`](Self::with_checkpoints_dir) — rank 0 writes it,
+    /// all read it; per-rank run dirs still own each rank's `metrics.jsonl`. The
+    /// broadcast is a single scalar collective (rank 0's value summed against
+    /// zero-contributing peers), so [`Comm`] needs no dedicated
+    /// broadcast primitive.
     ///
     /// # Errors
     ///
     /// As [`resume`](Self::resume) (when a checkpoint is found) or
-    /// [`train`](Self::train) (when none is), plus [`TrainerError::Checkpoint`] if
-    /// `checkpoints/` exists but cannot be listed, or [`TrainerError::Contract`] if
-    /// called on a multi-rank (`world_size > 1`) trainer.
+    /// [`train`](Self::train) (when none is), plus [`TrainerError::Comm`] if the
+    /// rank-0 broadcast coordinating the decision fails (a peer aborted or the world
+    /// is poisoned). If rank 0's checkpoint scan itself fails (the directory exists
+    /// but cannot be listed), the failure is broadcast so every rank aborts **in
+    /// lockstep** — rank 0 returns [`TrainerError::Checkpoint`] (the underlying IO
+    /// error), the other ranks [`TrainerError::Contract`] — rather than stranding the
+    /// peers in the collective until the timeout.
     ///
     /// # Panics
     ///
@@ -873,41 +960,87 @@ impl Trainer {
         tokenizer: &dyn TokenizerLike,
         prompts: &[String],
     ) -> Result<(Vec<Metrics>, RunStop), TrainerError> {
-        // Single-rank only. Under data parallelism only rank 0 writes checkpoints
-        // (the rank-0-only contract on `maybe_checkpoint`/`write_checkpoint`), and
-        // every rank must resume from rank 0's directory — but this scans THIS rank's
-        // own `checkpoints/`, so a non-zero rank would discover none, silently start
-        // fresh, and diverge from rank 0; the next collective then hangs once rank 0
-        // finishes its (shorter) remaining steps first. The guard keys on `world_size`,
-        // which is uniform across ranks, so it fails fast and IN LOCKSTEP — never a
-        // deadlock. DP-coordinated auto-resume needs rank 0's path broadcast to every
-        // rank (the launcher already does this for the tested explicit
-        // `resume(&rank0_ckpt)` path) or P9 multi-node sharded checkpoints.
-        if self.comm.world_size() > 1 {
-            return Err(TrainerError::Contract(
-                "resume_latest auto-discovery is single-rank only: under data parallelism \
-                 only rank 0 writes checkpoints, so non-zero ranks would discover none and \
-                 silently start fresh, diverging from rank 0 and hanging the next collective. \
-                 Coordinate rank 0's checkpoint directory in the launcher and call \
-                 resume(&rank0_ckpt, ..) on every rank (see tests/dp_equivalence.rs); \
-                 DP-coordinated auto-resume lands with P9 multi-node sharded checkpoints."
-                    .into(),
-            ));
-        }
-        match crate::checkpoint::latest_checkpoint(&self.checkpoints_dir)? {
-            Some(latest) => {
+        // Discover the resume point through rank 0 and broadcast it so the whole world
+        // branches identically in lockstep (see `coordinate_resume_step`).
+        match self.coordinate_resume_step()? {
+            Some(step) => {
+                // The canonical on-disk layout is `checkpoints_dir/step-<n>` (see
+                // `write_checkpoint`), so every rank reconstructs the identical
+                // directory from the broadcast step — rank 0's checkpoint.
+                let dir = self.checkpoints_dir.join(format!("step-{step}"));
                 tracing::info!(
-                    resume_step = latest.step,
-                    dir = %latest.dir.display(),
+                    resume_step = step,
+                    dir = %dir.display(),
+                    world_size = self.comm.world_size(),
                     "resume_latest: continuing from the newest checkpoint"
                 );
-                let (start_step, opt_state) = self.load_resume_point(&latest.dir, policy)?;
+                let (start_step, opt_state) = self.load_resume_point(&dir, policy)?;
                 self.run(start_step, opt_state, policy, reward_fn, tokenizer, prompts)
             }
             None => {
-                tracing::info!("resume_latest: no checkpoint found — starting a fresh run");
+                tracing::info!(
+                    world_size = self.comm.world_size(),
+                    "resume_latest: no checkpoint found — starting a fresh run"
+                );
                 self.run(0, None, policy, reward_fn, tokenizer, prompts)
             }
+        }
+    }
+
+    /// Coordinate the data-parallel resume decision across the world: rank 0 scans for
+    /// the newest checkpoint and **broadcasts** the outcome so every rank agrees in
+    /// lockstep — see [`resume_latest`](Self::resume_latest). Returns the resume step
+    /// (`Some`) or a fresh start (`None`).
+    ///
+    /// The outcome is three-way — found / none / scan-FAILED — and all three ride the
+    /// one broadcast every rank enters. In particular a rank-0 scan failure must NOT
+    /// `?`-return *before* that broadcast: a rank-0-only early return would strand every
+    /// peer in the collective until the timeout. So the failure is broadcast and
+    /// surfaced as an error on **every** rank in lockstep — rank 0 the real IO error,
+    /// peers a synthesized [`TrainerError::Contract`].
+    fn coordinate_resume_step(&self) -> Result<Option<u64>, TrainerError> {
+        let (local, rank0_scan_err) = self.scan_local_resume();
+        // rank 0 contributes its decision; peers contribute `Fresh` (the additive
+        // identity), so the rank-identical sum decodes to rank 0's decision on every
+        // rank. (`Comm` has no broadcast; this is broadcast-from-rank-0 via the sum
+        // all-reduce — see `ResumeDecision`.) Every rank enters this collective.
+        let decision = if self.comm.world_size() > 1 {
+            ResumeDecision::decode(self.comm.all_reduce_scalar_sum(local.encode())?)
+        } else {
+            local
+        };
+        match decision {
+            ResumeDecision::Fresh => Ok(None),
+            ResumeDecision::Resume(step) => Ok(Some(step)),
+            ResumeDecision::ScanFailed => Err(rank0_scan_err.map_or_else(
+                || {
+                    TrainerError::Contract(
+                        "resume_latest: rank 0's checkpoint discovery failed; the \
+                         data-parallel resume aborted in lockstep on every rank"
+                            .into(),
+                    )
+                },
+                TrainerError::Checkpoint,
+            )),
+        }
+    }
+
+    /// rank 0's local resume scan (single-rank, or rank 0 of a DP world): the
+    /// [`ResumeDecision`] to broadcast plus rank 0's real scan error, if any. Non-zero
+    /// DP ranks skip the scan and contribute the additive identity
+    /// ([`ResumeDecision::Fresh`]) — only rank 0's scan is authoritative.
+    fn scan_local_resume(&self) -> (ResumeDecision, Option<crate::checkpoint::CheckpointError>) {
+        if self.comm.world_size() > 1 && self.comm.rank() != 0 {
+            return (ResumeDecision::Fresh, None);
+        }
+        match crate::checkpoint::latest_checkpoint(&self.checkpoints_dir) {
+            Ok(found) => (
+                found.map_or(ResumeDecision::Fresh, |latest| {
+                    ResumeDecision::Resume(latest.step)
+                }),
+                None,
+            ),
+            Err(e) => (ResumeDecision::ScanFailed, Some(e)),
         }
     }
 
@@ -2644,6 +2777,36 @@ mod tests {
             ..TrainerConfig::default()
         };
         assert_relative_eq!(off.lr_at(0), 1.0, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn resume_decision_round_trips_and_keeps_outcomes_disjoint() {
+        use ResumeDecision::{Fresh, Resume, ScanFailed};
+        // The DP `resume_latest` broadcast encodes rank 0's three-way decision in one
+        // f64. Every outcome must round-trip exactly (it is summed against the peers'
+        // zero contributions) — including Resume(0), the corner the `+1` sentinel keeps
+        // distinct from a fresh start.
+        for d in [
+            Fresh,
+            ScanFailed,
+            Resume(0),
+            Resume(1),
+            Resume(49),
+            Resume(1_000_000),
+        ] {
+            assert_eq!(ResumeDecision::decode(d.encode()), d, "round-trip {d:?}");
+        }
+        // Fresh is the additive identity peers contribute, and the three outcome kinds
+        // must occupy three DISTINCT wire values (so the broadcast sum is unambiguous).
+        assert_eq!(Fresh.encode(), 0.0);
+        let mut wires = vec![Fresh.encode(), ScanFailed.encode(), Resume(0).encode()];
+        wires.sort_by(f64::total_cmp);
+        wires.dedup();
+        assert_eq!(
+            wires.len(),
+            3,
+            "Fresh / ScanFailed / Resume(0) must be distinct wires"
+        );
     }
 
     #[test]
