@@ -10,18 +10,29 @@ math, autograd, GPU, and model code** to candle (`candle-core`, `candle-nn`,
 `candle-transformers`). We do not reimplement autodiff or kernels; we orchestrate
 candle's.
 
-> Status: the single-GPU training stack works end-to-end and is validated on real
-> hardware — GRPO trainer (gradient accumulation, EOS/length masking,
-> momentum-faithful checkpoint/resume), manual LoRA with a bf16-base / F32-adapter
-> dtype split, a KV-cached merged-weight rollout, opt-in activation checkpointing
-> (layer-boundary rematerialization — candle ships no checkpoint primitive), and a
-> held-out eval harness. Grad-bearing model forwards exist for **three
-> architectures** — Qwen3 (dense), dense Llama-3.x, and the hybrid `qwen3_5`
-> family (GatedDeltaNet + gated GQA, i.e. Qwen3.5/3.6) — behind the
-> `GradModel`/`CachedDecoder` trait seam, so the same generic policy and trainer
-> drive all three unchanged; each forward is pinned against a reference
-> implementation by per-position logit-equivalence gates. Multi-GPU data
-> parallelism is the next track.
+> Status: the training stack runs end-to-end on real hardware, single-GPU **and**
+> single-node multi-GPU. The single-GPU core — GRPO trainer (gradient accumulation,
+> EOS/length masking, momentum-faithful checkpoint/resume), manual LoRA with a
+> bf16-base / F32-adapter dtype split, a KV-cached merged-weight rollout, opt-in
+> activation checkpointing (layer-boundary rematerialization — candle ships no
+> checkpoint primitive), and a held-out eval harness — scales to a **Qwen3.6-27B
+> LoRA-GRPO run end-to-end on a single H200** (forward-equivalent to the reference,
+> rematerialization fits the activation footprint, training reward rises). Grad-bearing
+> forwards exist for **three architectures** — Qwen3 (dense), dense Llama-3.x, and the
+> hybrid `qwen3_5` family (GatedDeltaNet + gated GQA, i.e. Qwen3.5/3.6) — behind the
+> `GradModel`/`CachedDecoder` trait seam, so one generic policy and trainer drive all
+> three unchanged, each pinned by per-position logit-equivalence gates.
+>
+> **Single-node data parallelism is in and verified on multi-GPU hardware**: an
+> all-reduce of LoRA gradients over an NCCL `Comm` bridge (`--features nccl` — the
+> crate's only `unsafe`, developed CPU-mock-first), DP-coordinated checkpoint resume +
+> restart-on-preemption, and run observability (per-step timing, a `summarize` health
+> view, the `runreport` tool, and rank/world/step-stamped `tracing` logs); verified
+> bit-identical across ranks on multi-A100. **Multi-node rendezvous and tensor
+> parallelism are parked by choice** — the capability goal (correct GRPO+LoRA at the
+> ~27B single-card scale) is met, and both remaining pieces buy throughput, not
+> capability, so the supported scope is single-node DP over models that fit one card
+> with rematerialization (~27–32B). They stay documented and revivable.
 
 ---
 
@@ -57,6 +68,8 @@ ferrl/
     │   ├── blocks.rs  gdn.rs  remat.rs      # shared blocks, GatedDeltaNet math, activation ckpt
     │   ├── moe.rs                           # qwen3.5/3.6 sparse-MoE kernels (router/experts, M3′)
     │   ├── lm_policy.rs                     # Policy over any GradModel (Qwen/Llama/Qwen3_5 Policy)
+    │   ├── comm.rs  comm/                   # data-parallel Comm seam (Solo/Local + NCCL bridge)
+    │   ├── full_ft.rs                       # opt-in full fine-tune (vs LoRA)
     │   └── {lib,policy,reward,nn,tokenizer,countdown,telemetry,cuda_compat}.rs
     └── tests/fixtures/grpo_golden.json      # committed oracle output
 ```
@@ -192,14 +205,19 @@ runs/<run_id>/
 │                     #   kl, clip_ratio, frac_truncated, completion_len,
 │                     #   rollout_ratio_mean, rollout_logratio_mean,
 │                     #   rollout_ratio_max, frac_rollout_ratio_capped,
-│                     #   rollout_capture_tokens, dropped_rows, grad_norm, lr
+│                     #   rollout_capture_tokens, dropped_rows, grad_norm, lr,
+│                     #   step_secs, tokens_per_sec
 ├── checkpoints/      # LoRA checkpoints
 └── run.log           # human-readable log
 ```
 
-Logging is structured via `tracing` + `tracing-subscriber`, with spans around rollout
-and update. `runs/` is git-ignored. The on-disk layout is created by
-[`ferrl::telemetry::RunDir`] and metrics are appended by `ferrl::telemetry::MetricsWriter`.
+Logging is structured via `tracing` + `tracing-subscriber`: the trainer enters a
+`run{rank=N world=N}` span and a per-step `step{step=N}` span, so every event carries
+rank / world / step (at ERROR level, the fields survive even `RUST_LOG=warn`). `runs/`
+is git-ignored. The on-disk layout is created by [`ferrl::telemetry::RunDir`] and metrics
+are appended by `ferrl::telemetry::MetricsWriter`; the `runreport` example reads a run's
+`metrics.jsonl` and prints a health summary — reward trend, throughput, and grad-norm
+anomalies (human, `--json`, or `--strict`).
 
 ---
 

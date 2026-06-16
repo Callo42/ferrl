@@ -25,8 +25,13 @@ autograd, GPU, and the base model forward to [candle](https://github.com/hugging
 - Core seams: `RewardFn` (user rewards, plain `f32`), `Policy` (generate +
   token-logprobs + adapter toggle), `LoraLinear` (frozen base + low-rank A/B),
   the GRPO math, and the `Trainer`.
-- Telemetry: `tracing`; each run writes `runs/<run_id>/` (config + metrics.jsonl +
-  checkpoints). `runs/` and `target/` are git-ignored.
+- Data parallelism: a `Comm` seam (`SoloComm`/`LocalComm`, plus an NCCL bridge behind
+  `--features nccl`) all-reduces LoRA gradients for single-node multi-GPU DP, with
+  DP-coordinated resume. Multi-node and tensor parallelism are parked — documented,
+  not built.
+- Telemetry: `tracing` (every event stamped with `rank`/`world`/`step`); each run writes
+  `runs/<run_id>/` (config + metrics.jsonl + checkpoints), summarized by the `runreport`
+  example. `runs/` and `target/` are git-ignored.
 
 ## Gotchas to respect
 
