@@ -24,11 +24,33 @@
 //! concatenates the prompt ids with the sampled completion ids. Decoding **skips**
 //! special tokens so the [`RewardFn`](crate::reward::RewardFn) scores clean text.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tokenizers::Tokenizer;
 
 use crate::trainer::TokenizerLike;
+
+/// Errors raised while constructing a [`HfTokenizer`].
+///
+/// Construction is the one fallible point in this adapter — the
+/// [`TokenizerLike`] call path is total by contract (see the module docs) — so a
+/// single load variant covers the whole surface. This is a typed library error
+/// rather than a boxed `anyhow` value: a downstream caller can match on it, and
+/// the crate's public API stays `anyhow`-free (`anyhow` is reserved for examples
+/// and glue code).
+#[derive(Debug, thiserror::Error)]
+pub enum TokenizerError {
+    /// The file at `path` could not be read, or did not contain a valid
+    /// `tokenizers` fast-tokenizer definition.
+    #[error("failed to load tokenizer from {path:?}: {source}")]
+    Load {
+        /// The `tokenizer.json` path that failed to load.
+        path: PathBuf,
+        /// The underlying error reported by the `tokenizers` crate (a boxed
+        /// trait object; `tokenizers::Error` is not a concrete type we can name).
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
 
 /// A [`TokenizerLike`] backed by a Hugging Face fast tokenizer.
 ///
@@ -45,13 +67,15 @@ impl HfTokenizer {
     ///
     /// # Errors
     ///
-    /// Returns an error if `path` cannot be read or does not contain a valid
-    /// `tokenizers` definition.
-    pub fn from_file<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
-        // `tokenizers` returns a boxed error that is not `'static`-bounded in a
-        // way `anyhow` accepts via `?`; surface its message explicitly.
-        let inner = Tokenizer::from_file(path.as_ref()).map_err(|e| {
-            anyhow::anyhow!("failed to load tokenizer from {:?}: {e}", path.as_ref())
+    /// Returns [`TokenizerError::Load`] if `path` cannot be read or does not
+    /// contain a valid `tokenizers` definition.
+    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, TokenizerError> {
+        let path = path.as_ref();
+        // `tokenizers::from_file` returns a boxed error (`tokenizers::Error`);
+        // capture it as the typed variant's `source` so the chain is preserved.
+        let inner = Tokenizer::from_file(path).map_err(|source| TokenizerError::Load {
+            path: path.to_path_buf(),
+            source,
         })?;
         Ok(Self { inner })
     }

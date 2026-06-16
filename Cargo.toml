@@ -16,9 +16,16 @@ members = ["crates/ferrl"]
 
 [workspace.package]
 edition = "2021"
-# candle 0.10.x declares no MSRV; 1.82 is a comfortable floor for the whole
-# dependency tree (cudarc 0.19, tokenizers 0.22, edition 2021). Bump on purpose.
-rust-version = "1.82"
+# MSRV = the toolchain floor that builds the WHOLE dependency tree, which is 1.87
+# — not ferrl's own edition (2021). Two stacked constraints from the resolved lock:
+# (1) the `hf-hub -> ureq -> cookie_store -> url -> idna -> idna_adapter` path pulls
+# crates requiring Cargo's `edition2024` feature (stabilized 1.85); (2) candle-core
+# 0.10.2 calls the `is_multiple_of` integer method (the `unsigned_is_multiple_of`
+# library feature, stabilized 1.87) — the binding constraint. Enforced by the
+# `msrv` CI job (`cargo +1.87 check --locked`); verified building the full tree
+# before PR-①. 1.82 was the original aspirational floor (never CI-enforced); the
+# real floor surfaced when PR-① added the gate. Bump on purpose.
+rust-version = "1.87"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Callo42/ferrl"
 authors = ["Callo42"]

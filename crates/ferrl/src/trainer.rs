@@ -1275,7 +1275,7 @@ impl Trainer {
         };
         let completed = step + 1;
         let is_final = completed == self.config.steps;
-        if completed % every != 0 && !is_final {
+        if !completed.is_multiple_of(every) && !is_final {
             return Ok(());
         }
         self.write_checkpoint(completed, vars, opt, policy)

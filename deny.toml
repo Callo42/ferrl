@@ -1,0 +1,74 @@
+# cargo-deny configuration — ferrl's supply-chain gate.
+#
+# Run in CI by the `supply-chain` job (`cargo deny check`) alongside `cargo audit`
+# (PR-①, v0.2.0 BYOT infra warm-up). cargo-deny owns licenses / bans / sources and
+# also scans advisories; cargo-audit is the canonical RUSTSEC vulnerability scan
+# kept as belt-and-suspenders. Schema: https://embarkstudios.github.io/cargo-deny/
+#
+# Tuned against the actual resolved dependency tree — every list below was
+# self-gated with `cargo deny check` on the cluster before this PR opened, so CI
+# is green on open.
+
+[graph]
+# Evaluate the tree for the platform ferrl actually builds on (x86_64 Linux —
+# GitHub runners + the Slurm cluster). all-features pulls the optional GPU stack
+# (cudarc behind `cuda`/`nccl`) into the graph so its licenses/advisories are
+# covered too; feature resolution needs no nvcc, so this is CI-safe.
+targets = [{ triple = "x86_64-unknown-linux-gnu" }]
+all-features = true
+
+[advisories]
+# v2 schema: vulnerabilities and unsound/unmaintained advisories fail by default;
+# allowlist specific advisory IDs via `ignore` (empty = none tolerated). `yanked`
+# is a warning, not a failure, so an upstream yank of a locked version cannot turn
+# CI red without a code change.
+version = 2
+yanked = "warn"
+ignore = [
+    # `paste` 1.0.15 — RUSTSEC-2024-0436, *unmaintained* (the author archived the
+    # repo), NOT a vulnerability. It is purely transitive and unactionable by
+    # ferrl: `paste` ← gemm/pulp ← candle-core, and macro_rules_attribute ←
+    # tokenizers, with "no safe upgrade available". Tolerated until candle/gemm
+    # drop it upstream. (Plain `cargo audit` already treats this as informational,
+    # so only cargo-deny's stricter advisory pass needs the allowance.)
+    "RUSTSEC-2024-0436",
+]
+
+[licenses]
+# v2 schema: anything whose SPDX expression is not satisfied by `allow` fails.
+# Every entry is a permissive / weak-copyleft license compatible with ferrl's own
+# `MIT OR Apache-2.0`.
+version = 2
+confidence-threshold = 0.8
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+]
+# Per-crate license clarifications (a crate with no machine-readable license but a
+# known-good one) go here. None needed against the current tree.
+exceptions = []
+
+[bans]
+# A large transitive tree (candle + tokenizers + cudarc) routinely carries
+# duplicate versions of small utility crates; warn rather than fail so an
+# upstream's lockfile churn never blocks a ferrl PR.
+multiple-versions = "warn"
+# ferrl pins exact (`=0.10.2`) or caret versions; a bare `*` requirement is a
+# supply-chain footgun and is rejected.
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+# Only crates.io is trusted. An unknown registry or git source is a red flag; add
+# explicit entries to `allow-git` if a vetted git dependency is ever introduced.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = []

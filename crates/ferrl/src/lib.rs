@@ -212,6 +212,6 @@ pub use telemetry::{
     RunSummary,
 };
 #[doc(inline)]
-pub use tokenizer::HfTokenizer;
+pub use tokenizer::{HfTokenizer, TokenizerError};
 #[doc(inline)]
 pub use trainer::{RunStop, TokenizerLike, Trainer, TrainerConfig, TrainerError};

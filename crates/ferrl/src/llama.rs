@@ -536,7 +536,7 @@ impl LlamaGradModel {
         // Config has no head_dim field). The shipped loader trips a reshape
         // error deep in the forward when the division truncates; we would
         // silently run a degenerate (non-parity) model — so reject it at load.
-        if cfg.hidden_size % cfg.num_attention_heads != 0 {
+        if !cfg.hidden_size.is_multiple_of(cfg.num_attention_heads) {
             candle_core::bail!(
                 "LlamaGradModel: hidden_size {} is not divisible by num_attention_heads {} \
                  (head_dim is derived as their quotient; such a config cannot be a real \
