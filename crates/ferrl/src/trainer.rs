@@ -1102,8 +1102,17 @@ impl Trainer {
             // Linear warmup, constant after: a pure function of the step index,
             // so a resume mid-warmup re-enters the schedule exactly.
             opt.set_learning_rate(self.config.lr_at(step));
-            let m =
+            // Wall-clock the whole step (rollout + reward + the mu inner update
+            // epochs) so a long run is observable: step_secs drives steps/sec and
+            // an ETA, tokens_per_sec the rollout throughput. Per-rank — the world
+            // figure is world_size × tokens_per_sec (each rank rolls out its own
+            // prompt shard); see `telemetry::Metrics`.
+            let started = std::time::Instant::now();
+            let (mut m, local_tokens) =
                 self.run_window(step, policy, reward_fn, tokenizer, prompts, &mut opt, &vars)?;
+            let secs = started.elapsed().as_secs_f64();
+            m.step_secs = secs as f32;
+            m.tokens_per_sec = step_throughput(local_tokens, secs);
             self.writer.append(&m)?;
             history.push(m);
             self.maybe_checkpoint(step, &vars, &opt, policy)?;
@@ -1140,7 +1149,9 @@ impl Trainer {
     /// One optimizer step over a window of `grad_accum_steps` prompts: collect each
     /// prompt's group (rollout → reward → advantages, snapshotting the non-degenerate
     /// ones), then run the `mu` inner epochs that accumulate the window's gradients
-    /// into a single `AdamW` update. Returns the window's aggregated [`Metrics`].
+    /// into a single `AdamW` update. Returns the window's aggregated [`Metrics`] and
+    /// this rank's real completion-token count for the window (the throughput
+    /// numerator the caller divides by the step wall-time — local, not world-summed).
     #[allow(clippy::too_many_arguments)]
     fn run_window<P: Policy, R: RewardFn>(
         &self,
@@ -1151,7 +1162,7 @@ impl Trainer {
         prompts: &[String],
         opt: &mut FerrlAdamW,
         vars: &[Var],
-    ) -> Result<Metrics, TrainerError> {
+    ) -> Result<(Metrics, usize), TrainerError> {
         let accum = self.config.grad_accum_steps;
         let world = self.comm.world_size();
         let mut stats = Vec::with_capacity(accum);
@@ -1216,7 +1227,10 @@ impl Trainer {
         } else {
             self.update_window(policy, &live, vars, opt, window_tokens, n_live_global)?
         };
-        Ok(self.build_window_metrics(step, &stats, &agg, opt))
+        Ok((
+            self.build_window_metrics(step, &stats, &agg, opt),
+            local_tokens,
+        ))
     }
 
     /// After completing step `step` (0-based), write a momentum-faithful (v2)
@@ -1788,6 +1802,17 @@ impl Trainer {
         m.grad_norm = agg.grad_norm;
         m.lr = opt.learning_rate() as f32;
         m
+    }
+}
+
+/// Per-rank rollout throughput for a step: this rank's real completion tokens over
+/// the step wall-time, guarding the degenerate `secs == 0` (a sub-tick step) so the
+/// metric is `0.0` rather than infinite.
+fn step_throughput(tokens: usize, secs: f64) -> f32 {
+    if secs > 0.0 {
+        (tokens as f64 / secs) as f32
+    } else {
+        0.0
     }
 }
 

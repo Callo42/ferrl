@@ -328,6 +328,26 @@ pub struct Metrics {
     pub grad_norm: f32,
     /// Effective learning rate for this step.
     pub lr: f32,
+    /// Wall-clock seconds this optimizer step took — the whole window (rollout +
+    /// reward + the `mu` inner update epochs), measured around
+    /// [`Trainer::run`](crate::trainer::Trainer)'s per-step body. Lets an operator
+    /// read steps/sec and an ETA off a long run that is otherwise blind to its own
+    /// pace. Under DP this is the rank's own wall time; ranks run the same
+    /// collectives in lockstep so the figure is ~equal across the world.
+    ///
+    /// `#[serde(default)]` (`0.0`) for records written before this field existed
+    /// and for a step whose duration was not measured.
+    #[serde(default)]
+    pub step_secs: f32,
+    /// Completion tokens **this rank** generated this step divided by `step_secs`
+    /// — the rollout-throughput number a long run is otherwise blind to. It counts
+    /// the window's real (EOS-inclusive) completion tokens, the same total that
+    /// drives the DAPO loss normalizer. **Per-rank:** the world figure is
+    /// `world_size ×` this (each rank rolls out its own prompt shard); a report
+    /// tool multiplies up. `0.0` when the step was not timed (`#[serde(default)]`,
+    /// also the value for older records).
+    #[serde(default)]
+    pub tokens_per_sec: f32,
 }
 
 /// `serde` default for the rollout-ratio metrics: `1.0` (exactly on-policy —
@@ -360,6 +380,8 @@ impl Metrics {
             dropped_rows: 0,
             grad_norm: 0.0,
             lr: 0.0,
+            step_secs: 0.0,
+            tokens_per_sec: 0.0,
         }
     }
 
@@ -400,6 +422,8 @@ impl Metrics {
             &mut m.frac_rollout_ratio_capped,
             &mut m.grad_norm,
             &mut m.lr,
+            &mut m.step_secs,
+            &mut m.tokens_per_sec,
         ] {
             *f = finite(*f);
         }
@@ -483,6 +507,322 @@ pub fn read_metrics(path: impl AsRef<Path>) -> Result<Vec<Metrics>, TelemetryErr
             })
         })
         .collect()
+}
+
+/// `grad_norm` above this multiple of the run's median positive `grad_norm` is
+/// flagged as a spike.
+const GRAD_SPIKE_FACTOR: f32 = 8.0;
+/// Runs shorter than this many steps are not checked for a reward stall (too
+/// little signal to call one).
+const STALL_MIN_STEPS: usize = 5;
+/// Mean degenerate-group fraction at or above this, together with a flat reward
+/// trend, marks a stall.
+const STALL_ZERO_STD_FRAC: f32 = 0.9;
+/// `|reward_trend|` at or below this counts as "the reward did not move".
+const STALL_TREND_EPS: f32 = 1e-4;
+
+/// A health flag raised by [`summarize`] over a run's metrics stream — something
+/// worth an operator's eyes, not necessarily fatal.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[non_exhaustive]
+pub enum Anomaly {
+    /// A metric saturated to the [`Metrics::nan_to_num`] sentinel (`f32::MAX` /
+    /// `f32::MIN`) at this step — the underlying value overflowed or was
+    /// non-finite (an exploded `grad_norm`, an overflowed `kl`, …).
+    NonFinite {
+        /// Step the saturated value was recorded at.
+        step: u64,
+        /// Which metric field saturated.
+        field: &'static str,
+    },
+    /// `grad_norm` at this step exceeded `8×` (`GRAD_SPIKE_FACTOR`) the run's
+    /// median positive `grad_norm` — an update spike worth investigating.
+    GradSpike {
+        /// Step the spike occurred at.
+        step: u64,
+        /// The spiking gradient norm.
+        grad_norm: f32,
+        /// The run's median positive `grad_norm`, for scale.
+        median: f32,
+    },
+    /// Across the run the batch taught the policy almost nothing: the mean
+    /// fraction of zero-std (degenerate) groups was near `1` and the reward trend
+    /// was flat — rewards saturated, or the task is mis-scaled for the model.
+    RewardStall {
+        /// Mean [`Metrics::frac_reward_zero_std`] over the run.
+        mean_frac_zero_std: f32,
+        /// The reward trend (see [`RunSummary::reward_trend`]).
+        reward_trend: f32,
+    },
+    /// Completions were silently dropped (all-pad rows) over the run.
+    DroppedRows {
+        /// Total [`Metrics::dropped_rows`] summed over the run.
+        total: u32,
+    },
+    /// Off-policy drift telemetry was dark for the whole run (every step captured
+    /// zero rollout log-probs), so the ratio fields are neutral placeholders
+    /// rather than measurements and drift went unmonitored.
+    TelemetryDark,
+}
+
+impl std::fmt::Display for Anomaly {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonFinite { step, field } => {
+                write!(f, "non-finite `{field}` saturated at step {step}")
+            }
+            Self::GradSpike {
+                step,
+                grad_norm,
+                median,
+            } => write!(
+                f,
+                "grad_norm spike {grad_norm:.3} at step {step} ({:.1}× median {median:.3})",
+                grad_norm / median
+            ),
+            Self::RewardStall {
+                mean_frac_zero_std,
+                reward_trend,
+            } => write!(
+                f,
+                "reward stalled: {:.0}% groups zero-std, trend {reward_trend:+.4}",
+                mean_frac_zero_std * 100.0
+            ),
+            Self::DroppedRows { total } => write!(f, "{total} completion rows dropped"),
+            Self::TelemetryDark => write!(f, "off-policy drift telemetry dark all run"),
+        }
+    }
+}
+
+/// A reduced, operator-facing health view over a run's `metrics.jsonl`, produced
+/// by [`summarize`]. A **pure function of the stream** — no I/O and no clock, so
+/// it is deterministic and unit-testable; the timing inputs were measured when
+/// the metrics were written.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[non_exhaustive]
+pub struct RunSummary {
+    /// Number of metrics records (optimizer steps) summarized.
+    pub steps: usize,
+    /// `step` of the first record.
+    pub first_step: u64,
+    /// `step` of the last record.
+    pub last_step: u64,
+    /// `reward_mean` of the first record.
+    pub reward_first: f32,
+    /// `reward_mean` of the last record.
+    pub reward_last: f32,
+    /// `reward_last − reward_first` — the net move over the run.
+    pub reward_delta: f32,
+    /// Mean reward over the last third minus the mean over the first third — a
+    /// noise-robust trend (falls back to `reward_delta` for runs under 3 steps).
+    pub reward_trend: f32,
+    /// `kl` of the last record.
+    pub final_kl: f32,
+    /// `lr` of the last record.
+    pub final_lr: f32,
+    /// `grad_norm` of the last record.
+    pub final_grad_norm: f32,
+    /// Largest `grad_norm` seen over the run.
+    pub max_grad_norm: f32,
+    /// Mean per-step wall-clock seconds (mean of [`Metrics::step_secs`]).
+    pub mean_step_secs: f32,
+    /// Mean per-rank rollout throughput (mean of [`Metrics::tokens_per_sec`]); the
+    /// world figure is `world_size ×` this.
+    pub mean_tokens_per_sec: f32,
+    /// Total measured wall-clock seconds (Σ [`Metrics::step_secs`]).
+    pub total_wall_secs: f32,
+    /// Total dropped (all-pad) completion rows over the run.
+    pub total_dropped_rows: u32,
+    /// Health flags raised over the stream; empty means nothing notable.
+    pub anomalies: Vec<Anomaly>,
+}
+
+impl std::fmt::Display for RunSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let verdict = if self.anomalies.is_empty() {
+            "HEALTHY"
+        } else {
+            "WARN"
+        };
+        writeln!(
+            f,
+            "run summary — {verdict}  ({} steps, {}..{})",
+            self.steps, self.first_step, self.last_step
+        )?;
+        writeln!(
+            f,
+            "  reward      {:.4} → {:.4}   (Δ {:+.4}, trend {:+.4})",
+            self.reward_first, self.reward_last, self.reward_delta, self.reward_trend
+        )?;
+        writeln!(
+            f,
+            "  throughput  {:.1} tok/s/rank   step {:.2}s   wall {:.1}s",
+            self.mean_tokens_per_sec, self.mean_step_secs, self.total_wall_secs
+        )?;
+        writeln!(
+            f,
+            "  grad_norm   final {:.3}   max {:.3}      kl {:.4}   lr {:.2e}",
+            self.final_grad_norm, self.max_grad_norm, self.final_kl, self.final_lr
+        )?;
+        if self.total_dropped_rows > 0 {
+            writeln!(f, "  dropped_rows {}", self.total_dropped_rows)?;
+        }
+        for a in &self.anomalies {
+            writeln!(f, "  ! {a}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Reduce a run's [`Metrics`] stream into a [`RunSummary`] — reward trend,
+/// throughput, gradient health, and any [`Anomaly`] flags. **Pure**: no I/O, no
+/// clock (the timing was measured when the metrics were written), so it is fully
+/// deterministic and unit-testable.
+///
+/// Returns `None` for an empty stream (nothing to summarize). Pair with
+/// [`read_metrics`] to summarize a finished run's `metrics.jsonl`.
+#[must_use]
+pub fn summarize(history: &[Metrics]) -> Option<RunSummary> {
+    let first = history.first()?;
+    let last = history.last()?;
+    let trend = reward_trend(history);
+    let max_grad_norm = history.iter().map(|m| m.grad_norm).fold(0.0_f32, f32::max);
+    Some(RunSummary {
+        steps: history.len(),
+        first_step: first.step,
+        last_step: last.step,
+        reward_first: first.reward_mean,
+        reward_last: last.reward_mean,
+        reward_delta: last.reward_mean - first.reward_mean,
+        reward_trend: trend,
+        final_kl: last.kl,
+        final_lr: last.lr,
+        final_grad_norm: last.grad_norm,
+        max_grad_norm,
+        mean_step_secs: mean_of(history, |m| m.step_secs),
+        mean_tokens_per_sec: mean_of(history, |m| m.tokens_per_sec),
+        total_wall_secs: history.iter().map(|m| m.step_secs).sum(),
+        total_dropped_rows: history.iter().map(|m| m.dropped_rows).sum(),
+        anomalies: detect_anomalies(history, trend),
+    })
+}
+
+/// Mean of `f` over the records, or `0.0` for an empty slice.
+fn mean_of(history: &[Metrics], f: impl Fn(&Metrics) -> f32) -> f32 {
+    if history.is_empty() {
+        return 0.0;
+    }
+    history.iter().map(f).sum::<f32>() / history.len() as f32
+}
+
+/// Reward trend: mean of the last third minus the first third (noise-robust),
+/// falling back to `last − first` for short runs (< 3 steps).
+fn reward_trend(history: &[Metrics]) -> f32 {
+    let n = history.len();
+    let (Some(first), Some(last)) = (history.first(), history.last()) else {
+        return 0.0;
+    };
+    if n < 3 {
+        return last.reward_mean - first.reward_mean;
+    }
+    let third = n / 3;
+    mean_of(&history[n - third..], |m| m.reward_mean)
+        - mean_of(&history[..third], |m| m.reward_mean)
+}
+
+/// Run every anomaly check over the stream, collecting the flags raised.
+fn detect_anomalies(history: &[Metrics], trend: f32) -> Vec<Anomaly> {
+    let mut out = Vec::new();
+    push_nonfinite(history, &mut out);
+    push_grad_spike(history, &mut out);
+    push_reward_stall(history, trend, &mut out);
+    push_dropped_rows(history, &mut out);
+    push_telemetry_dark(history, &mut out);
+    out
+}
+
+/// Flag any metric that saturated to the `nan_to_num` sentinel (`f32::MAX`/`MIN`).
+fn push_nonfinite(history: &[Metrics], out: &mut Vec<Anomaly>) {
+    for m in history {
+        for (field, v) in [
+            ("grad_norm", m.grad_norm),
+            ("kl", m.kl),
+            ("reward_mean", m.reward_mean),
+        ] {
+            if v == f32::MAX || v == f32::MIN {
+                out.push(Anomaly::NonFinite {
+                    step: m.step,
+                    field,
+                });
+            }
+        }
+    }
+}
+
+/// Flag the worst step whose `grad_norm` exceeds `GRAD_SPIKE_FACTOR ×` the run's
+/// median positive `grad_norm`.
+fn push_grad_spike(history: &[Metrics], out: &mut Vec<Anomaly>) {
+    let median = median_positive_grad_norm(history);
+    if median <= 0.0 {
+        return;
+    }
+    let Some(worst) = history
+        .iter()
+        .max_by(|a, b| a.grad_norm.total_cmp(&b.grad_norm))
+    else {
+        return;
+    };
+    if worst.grad_norm > GRAD_SPIKE_FACTOR * median {
+        out.push(Anomaly::GradSpike {
+            step: worst.step,
+            grad_norm: worst.grad_norm,
+            median,
+        });
+    }
+}
+
+/// Median of the strictly-positive `grad_norm`s (warmup zero-grad steps excluded),
+/// or `0.0` if none — the scale a spike is measured against.
+fn median_positive_grad_norm(history: &[Metrics]) -> f32 {
+    let mut v: Vec<f32> = history
+        .iter()
+        .map(|m| m.grad_norm)
+        .filter(|x| *x > 0.0)
+        .collect();
+    if v.is_empty() {
+        return 0.0;
+    }
+    v.sort_by(f32::total_cmp);
+    v[v.len() / 2]
+}
+
+/// Flag a run that taught ~nothing: near-all-degenerate groups and a flat reward.
+fn push_reward_stall(history: &[Metrics], trend: f32, out: &mut Vec<Anomaly>) {
+    if history.len() < STALL_MIN_STEPS {
+        return;
+    }
+    let mean_zero = mean_of(history, |m| m.frac_reward_zero_std);
+    if mean_zero >= STALL_ZERO_STD_FRAC && trend.abs() <= STALL_TREND_EPS {
+        out.push(Anomaly::RewardStall {
+            mean_frac_zero_std: mean_zero,
+            reward_trend: trend,
+        });
+    }
+}
+
+/// Flag any silently-dropped (all-pad) completion rows over the run.
+fn push_dropped_rows(history: &[Metrics], out: &mut Vec<Anomaly>) {
+    let total: u32 = history.iter().map(|m| m.dropped_rows).sum();
+    if total > 0 {
+        out.push(Anomaly::DroppedRows { total });
+    }
+}
+
+/// Flag a run with no off-policy drift telemetry at all (every step captured zero).
+fn push_telemetry_dark(history: &[Metrics], out: &mut Vec<Anomaly>) {
+    if !history.is_empty() && history.iter().all(|m| m.rollout_capture_tokens == 0) {
+        out.push(Anomaly::TelemetryDark);
+    }
 }
 
 #[cfg(test)]
@@ -699,6 +1039,8 @@ mod tests {
             dropped_rows: 3,
             grad_norm: 1.23,
             lr: 5e-6,
+            step_secs: 1.5,
+            tokens_per_sec: 128.0,
         };
         let j = serde_json::to_string(&m).unwrap();
         let back: Metrics = serde_json::from_str(&j).unwrap();
@@ -718,6 +1060,8 @@ mod tests {
             (m.step, m.frac_reward_zero_std, m.dropped_rows),
             (3, 0.0, 0)
         );
+        // The PR-4 timing fields are absent from an old record → default to 0.0.
+        assert_eq!((m.step_secs, m.tokens_per_sec), (0.0, 0.0));
         assert_eq!(
             (
                 m.rollout_ratio_mean,
@@ -753,6 +1097,171 @@ mod tests {
         assert_eq!(back.kl, 0.0);
         assert_eq!(back.frac_truncated, 0.0);
         assert_eq!(back.rollout_ratio_max, f32::MAX);
+    }
+
+    /// A metrics record carrying the fields [`summarize`] reads, with off-policy
+    /// telemetry marked live (`rollout_capture_tokens = 1`) so a stream of these is
+    /// not flagged [`Anomaly::TelemetryDark`] unless a test opts in.
+    fn metric(step: u64, reward: f32, grad_norm: f32, step_secs: f32, toks: f32) -> Metrics {
+        let mut m = Metrics::at_step(step);
+        m.reward_mean = reward;
+        m.grad_norm = grad_norm;
+        m.step_secs = step_secs;
+        m.tokens_per_sec = toks;
+        m.rollout_capture_tokens = 1;
+        m
+    }
+
+    #[test]
+    fn summarize_empty_stream_is_none() {
+        assert!(summarize(&[]).is_none());
+    }
+
+    #[test]
+    fn summarize_reports_reward_trend() {
+        // Reward rises 0.0 → 0.5 over 6 steps.
+        let hist: Vec<Metrics> = (0..6)
+            .map(|i| metric(i, 0.1 * i as f32, 1.0, 2.0, 100.0))
+            .collect();
+        let s = summarize(&hist).unwrap();
+        assert_eq!((s.steps, s.first_step, s.last_step), (6, 0, 5));
+        assert!((s.reward_last - 0.5).abs() < 1e-6, "last {}", s.reward_last);
+        assert!(s.reward_trend > 0.0, "trend {}", s.reward_trend);
+    }
+
+    #[test]
+    fn summarize_reports_throughput_and_grad_health() {
+        // Steady throughput (2 s/step, 100 tok/s) and flat grad ≈ 1.0 → no flags.
+        // Values are identical per step, so the means are exact.
+        let hist: Vec<Metrics> = (0..6)
+            .map(|i| metric(i, 0.1 * i as f32, 1.0, 2.0, 100.0))
+            .collect();
+        let s = summarize(&hist).unwrap();
+        assert_eq!(s.mean_step_secs, 2.0);
+        assert_eq!(s.mean_tokens_per_sec, 100.0);
+        assert_eq!(s.max_grad_norm, 1.0);
+        assert!(s.anomalies.is_empty(), "healthy run: {:?}", s.anomalies);
+    }
+
+    #[test]
+    fn summarize_flags_nonfinite_saturation() {
+        let mut hist: Vec<Metrics> = (0..3).map(|i| metric(i, 0.5, 1.0, 1.0, 50.0)).collect();
+        hist[1].grad_norm = f32::MAX; // a nan_to_num'd blow-up
+        let s = summarize(&hist).unwrap();
+        assert!(
+            s.anomalies
+                .iter()
+                .any(|a| matches!(a, Anomaly::NonFinite { field, .. } if *field == "grad_norm")),
+            "expected a NonFinite(grad_norm) flag, got {:?}",
+            s.anomalies
+        );
+    }
+
+    #[test]
+    fn summarize_flags_grad_spike() {
+        // Steady grad_norm ≈ 1.0 with one 20× spike (no saturation).
+        let mut hist: Vec<Metrics> = (0..6).map(|i| metric(i, 0.5, 1.0, 1.0, 50.0)).collect();
+        hist[4].grad_norm = 20.0;
+        let s = summarize(&hist).unwrap();
+        assert!(
+            s.anomalies
+                .iter()
+                .any(|a| matches!(a, Anomaly::GradSpike { step: 4, .. })),
+            "expected a GradSpike at step 4, got {:?}",
+            s.anomalies
+        );
+    }
+
+    #[test]
+    fn summarize_flags_reward_stall() {
+        // Flat reward + every group degenerate over ≥ STALL_MIN_STEPS steps.
+        let hist: Vec<Metrics> = (0..6)
+            .map(|i| {
+                let mut m = metric(i, 0.5, 1.0, 1.0, 50.0);
+                m.frac_reward_zero_std = 1.0;
+                m
+            })
+            .collect();
+        let s = summarize(&hist).unwrap();
+        assert!(
+            s.anomalies
+                .iter()
+                .any(|a| matches!(a, Anomaly::RewardStall { .. })),
+            "expected a RewardStall flag, got {:?}",
+            s.anomalies
+        );
+    }
+
+    #[test]
+    fn summarize_flags_dropped_rows_and_dark_telemetry() {
+        // at_step leaves rollout_capture_tokens = 0 → the whole run is telemetry-dark.
+        let hist: Vec<Metrics> = (0..3)
+            .map(|i| {
+                let mut m = Metrics::at_step(i);
+                m.dropped_rows = 2;
+                m
+            })
+            .collect();
+        let s = summarize(&hist).unwrap();
+        assert_eq!(s.total_dropped_rows, 6);
+        let flags = format!("{:?}", s.anomalies);
+        assert!(flags.contains("DroppedRows"), "flags: {flags}");
+        assert!(flags.contains("TelemetryDark"), "flags: {flags}");
+    }
+
+    #[test]
+    fn run_summary_healthy_renders_text_and_json() {
+        let hist: Vec<Metrics> = (0..4)
+            .map(|i| metric(i, 0.1 * i as f32, 1.0, 1.0, 50.0))
+            .collect();
+        let s = summarize(&hist).unwrap();
+        let text = s.to_string();
+        assert!(text.contains("HEALTHY"), "text:\n{text}");
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("reward_trend"), "json: {json}");
+        assert!(json.contains("mean_tokens_per_sec"), "json: {json}");
+    }
+
+    #[test]
+    fn run_summary_warn_renders_flags_and_dropped_rows() {
+        // Dark + dropped rows → WARN verdict, a dropped_rows line, and a flag bullet.
+        let hist: Vec<Metrics> = (0..2)
+            .map(|i| {
+                let mut m = Metrics::at_step(i);
+                m.dropped_rows = 1;
+                m
+            })
+            .collect();
+        let s = summarize(&hist).unwrap();
+        let text = s.to_string();
+        assert!(text.contains("WARN"), "text:\n{text}");
+        assert!(text.contains("dropped_rows"), "text:\n{text}");
+        assert!(text.contains("! "), "text:\n{text}");
+    }
+
+    #[test]
+    fn anomaly_variants_all_render_non_empty() {
+        // Exercises every Anomaly Display arm (one per variant).
+        let flags = [
+            Anomaly::NonFinite {
+                step: 1,
+                field: "grad_norm",
+            },
+            Anomaly::GradSpike {
+                step: 2,
+                grad_norm: 20.0,
+                median: 1.0,
+            },
+            Anomaly::RewardStall {
+                mean_frac_zero_std: 1.0,
+                reward_trend: 0.0,
+            },
+            Anomaly::DroppedRows { total: 3 },
+            Anomaly::TelemetryDark,
+        ];
+        for a in &flags {
+            assert!(!a.to_string().is_empty(), "empty render: {a:?}");
+        }
     }
 
     #[test]

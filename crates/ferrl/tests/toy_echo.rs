@@ -568,6 +568,48 @@ fn gate_reward_trends_up() {
 }
 
 #[test]
+fn summarize_reduces_a_real_toy_run_with_populated_timing() {
+    // End-to-end of the observability path: a real Trainer loop stamps
+    // step_secs/tokens_per_sec (the unit tests build those by hand) and writes the
+    // history that `summarize` reduces. Asserts the reducer runs over genuine data
+    // and the timing came through as sensible, finite, positive values.
+    let mut policy = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 7, TEMP).unwrap();
+    let prompts = echo_prompts(VOCAB);
+    let cfg = TrainerConfig {
+        steps: 30,
+        group_size: 16,
+        max_new_tokens: 1,
+        temperature: TEMP,
+        lr: 0.05,
+        max_grad_norm: None,
+        ..TrainerConfig::default()
+    };
+    let tmp = TempDir::new("summarize-real");
+    let run = RunDir::create(tmp.path(), "echo").unwrap();
+    let mut trainer = Trainer::new(cfg, &run).unwrap();
+    let (history, _stop) = trainer
+        .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
+        .unwrap();
+
+    let s = ferrl::summarize(&history).expect("a non-empty run summarizes");
+    assert_eq!(s.steps, history.len());
+    assert_eq!((s.first_step, s.last_step), (0, history.len() as u64 - 1));
+    // Timing came off the real loop — 30 steps of real compute take measurable
+    // wall-clock, and every window generates tokens, so both are strictly positive.
+    assert!(
+        s.total_wall_secs > 0.0 && s.mean_step_secs > 0.0,
+        "step timing not populated: wall={}, mean_step={}",
+        s.total_wall_secs,
+        s.mean_step_secs
+    );
+    assert!(
+        s.mean_tokens_per_sec.is_finite() && s.mean_tokens_per_sec > 0.0,
+        "throughput not populated: {}",
+        s.mean_tokens_per_sec
+    );
+}
+
+#[test]
 fn eos_padded_rollout_trains_with_length_aware_mask() {
     // The trainer consumes completion_lens end-to-end with a VARIABLE per-row length:
     // a `Some` eos_token_id no longer errors (the PR3 guard-lift), each sequence keeps a
