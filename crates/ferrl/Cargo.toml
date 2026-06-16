@@ -1,6 +1,6 @@
 [package]
 name = "ferrl"
-version = "0.0.1"
+version = "0.1.0"
 description = "A candle-native GRPO reinforcement-learning library for RL-fine-tuning LLMs in Rust."
 keywords = ["rl", "grpo", "llm", "candle", "fine-tuning"]
 categories = ["science", "algorithms"]
