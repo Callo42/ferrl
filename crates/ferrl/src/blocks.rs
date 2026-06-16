@@ -213,7 +213,7 @@ pub fn rope_partial(
     rot_dim: usize,
 ) -> CandleResult<Tensor> {
     let (_b, _h, _l, head_dim) = x.dims4()?;
-    if rot_dim == 0 || rot_dim % 2 != 0 || rot_dim > head_dim {
+    if rot_dim == 0 || !rot_dim.is_multiple_of(2) || rot_dim > head_dim {
         candle_core::bail!(
             "rope_partial: rot_dim {rot_dim} must be a nonzero even number <= head_dim {head_dim}"
         );

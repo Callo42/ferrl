@@ -531,14 +531,20 @@ impl Qwen3_5TextConfig {
                 self.attention_dropout
             );
         }
-        if self.num_attention_heads % self.num_key_value_heads != 0 {
+        if !self
+            .num_attention_heads
+            .is_multiple_of(self.num_key_value_heads)
+        {
             bail!(
                 "qwen3_5 config: num_attention_heads {} not divisible by num_key_value_heads {}",
                 self.num_attention_heads,
                 self.num_key_value_heads
             );
         }
-        if self.linear_num_value_heads % self.linear_num_key_heads != 0 {
+        if !self
+            .linear_num_value_heads
+            .is_multiple_of(self.linear_num_key_heads)
+        {
             bail!(
                 "qwen3_5 config: linear_num_value_heads {} not divisible by \
                  linear_num_key_heads {}",
@@ -601,7 +607,7 @@ impl Qwen3_5TextConfig {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let rot = rot_exact as usize;
         #[allow(clippy::cast_precision_loss)]
-        if (rot as f64 - rot_exact).abs() > 1e-9 || rot == 0 || rot % 2 != 0 {
+        if (rot as f64 - rot_exact).abs() > 1e-9 || rot == 0 || !rot.is_multiple_of(2) {
             bail!(
                 "qwen3_5 config: head_dim {} * partial_rotary_factor {prf} = {rot_exact} must \
                  be a nonzero even integer",
