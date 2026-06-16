@@ -156,7 +156,7 @@ jobs:
       # and candle-core 0.10.2 uses `is_multiple_of` (1.87) — the binding one. The
       # explicit `cargo +1.87` below overrides rust-toolchain.toml (pins `stable`).
       - name: Install the declared MSRV toolchain (1.87)
-        uses: dtolnay/rust-toolchain@1.87
+        uses: dtolnay/rust-toolchain@1.100
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
         with:
