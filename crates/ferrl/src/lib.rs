@@ -128,6 +128,7 @@ pub mod comm;
 pub mod countdown;
 pub mod cuda_compat;
 pub mod data;
+pub mod dense;
 pub mod eval;
 mod full_ft;
 pub mod gdn;

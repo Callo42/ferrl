@@ -1931,7 +1931,7 @@ impl Qwen3_5GradModel {
     /// The narrowed scoring forward: the full layer walk with the final
     /// norm + head applied to the `(start, len)` window alone — same scheme
     /// and contract as
-    /// [`QwenGradModel::forward_narrowed`](crate::qwen::QwenGradModel::forward_narrowed).
+    /// [`DenseGradModel::forward_narrowed`](crate::dense::DenseGradModel::forward_narrowed).
     ///
     /// # Errors
     ///
@@ -2077,7 +2077,7 @@ impl Qwen3_5GradModel {
     /// Back-propagate a loss built from this model's logits — plain
     /// `loss.backward()` normally, tape-stitched under
     /// [activation checkpointing](Self::set_activation_checkpointing); same
-    /// contract as [`QwenGradModel::backward`](crate::qwen::QwenGradModel::backward).
+    /// contract as [`DenseGradModel::backward`](crate::dense::DenseGradModel::backward).
     ///
     /// # Errors
     ///
@@ -2112,7 +2112,7 @@ impl Qwen3_5GradModel {
 
     /// Turn **activation checkpointing** on or off (default: off) — same
     /// trade and contract as
-    /// [`QwenGradModel::set_activation_checkpointing`](crate::qwen::QwenGradModel::set_activation_checkpointing).
+    /// [`DenseGradModel::set_activation_checkpointing`](crate::dense::DenseGradModel::set_activation_checkpointing).
     ///
     /// **Full-FT caveat:** checkpointing is not yet supported in full
     /// fine-tuning mode — the next grad-bearing forward fails loud (see
