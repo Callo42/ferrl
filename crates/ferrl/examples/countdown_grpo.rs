@@ -37,8 +37,8 @@
 //! ```text
 //! cargo build --release --features cuda --example countdown_grpo
 //! FERRL_QWEN_WEIGHTS=/path/to/qwen3-0.6b-base \
-//!     srun --partition=home --gres=gpu:A100_40G:1 \
-//!     /tmp/ferrl-target/release/examples/countdown_grpo
+//!     srun --gres=gpu:1 \
+//!     target/release/examples/countdown_grpo
 //! ```
 //!
 //! Every knob has an `FERRL_CD_*` env override (steps, group size, max new tokens,

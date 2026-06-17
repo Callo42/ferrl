@@ -1,5 +1,5 @@
 # --- Rust build artifacts ---
-# The cargo build dir. On the platformax cluster this is redirected to node-local
+# The cargo build dir. On an NFS-home cluster this can be redirected to node-local
 # /tmp via CARGO_TARGET_DIR (see justfile), so /target here is for ordinary
 # contributors and GitHub runners.
 /target

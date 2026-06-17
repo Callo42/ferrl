@@ -61,8 +61,8 @@
 //! ```text
 //! cargo build --release --features cuda --example countdown_grpo_qwen35
 //! FERRL_QWEN35_WEIGHTS=/path/to/qwen3.5-0.8b-base \
-//!     srun --partition=home --gres=gpu:A100_40G:1 \
-//!     /tmp/ferrl-target/release/examples/countdown_grpo_qwen35
+//!     srun --gres=gpu:1 \
+//!     target/release/examples/countdown_grpo_qwen35
 //! ```
 //!
 //! `FERRL_QWEN35_WEIGHTS` points at the checkpoint directory (`config.json`,

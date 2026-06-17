@@ -59,7 +59,7 @@ default = []
 # `cuda` forwards the CUDA backend to every candle crate ferrl links. Because
 # ferrl depends on candle-core / candle-nn / candle-transformers directly (not
 # via candle's internal `candle` alias), the feature paths use those exact
-# dependency names. Built only on the Slurm GPU cluster, never in CI.
+# dependency names. Built only on a GPU machine with a CUDA toolkit, never in CI.
 #   cargo build --features cuda
 cuda = [
     "candle-core/cuda",
@@ -87,9 +87,8 @@ flash-attn = [
 # `NcclComm` all-reduce over cudarc's NCCL bindings. The default CPU build and
 # GitHub CI never compile it, so the default build stays `unsafe`-free under
 # `#![deny(unsafe_code)]` (`deny`, not `forbid`, so this one gated module may
-# `#[allow]`); it builds and links only on the GPU cluster (nvhpc SDK ships
-# libnccl), runtime-gated by a
-# manual multi-GPU Slurm run. The portable bridge logic (config, dtype/error
+# `#[allow]`); it builds and links only with a CUDA toolkit that provides NCCL
+# (libnccl), runtime-gated by a manual multi-GPU run. The portable bridge logic (config, dtype/error
 # mapping, contract validation, orchestration) lives in the default build and is
 # CI-tested against an in-memory mock; only the FFI primitive impl is gated here.
 nccl = [
