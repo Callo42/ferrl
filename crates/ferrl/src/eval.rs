@@ -48,7 +48,8 @@
 //! full width and decoding is the entire post-prompt slice, unchanged.
 
 use crate::policy::{GenConfig, Policy, Rollout};
-use crate::reward::RewardFn;
+use crate::reward::{RewardError, RewardFn};
+use crate::sample::Sample;
 use crate::trainer::TokenizerLike;
 
 /// Per-prompt mean reward under the base model and under the adapter.
@@ -99,9 +100,13 @@ pub enum EvalError {
     /// reading the last prompt position would underflow).
     #[error("eval contract violation: {0}")]
     Contract(String),
+    /// A [`RewardFn`] could not compute a reward — its (possibly external)
+    /// verifier failed.
+    #[error(transparent)]
+    Reward(#[from] RewardError),
 }
 
-/// Score `policy` on `prompts` with the adapter off (base) and on, returning the
+/// Score `policy` on `samples` with the adapter off (base) and on, returning the
 /// mean reward of each.
 ///
 /// For each prompt, `group_size` completions are sampled with the adapter
@@ -123,7 +128,7 @@ pub enum EvalError {
 ///
 /// # Errors
 ///
-/// Returns [`EvalError::Contract`] if `prompts` is empty; if a prompt encodes to zero
+/// Returns [`EvalError::Contract`] if `samples` is empty; if a prompt encodes to zero
 /// tokens; if the policy cannot disable its adapter (a full-fine-tuning policy has no
 /// frozen base to compare against — the comparison would be the policy vs. itself);
 /// if a policy returns a malformed rollout (wrong completion count, no prompt
@@ -135,11 +140,11 @@ pub fn evaluate<P: Policy, R: RewardFn>(
     policy: &mut P,
     reward_fn: &R,
     tokenizer: &dyn TokenizerLike,
-    prompts: &[String],
+    samples: &[Sample<R::Target>],
     gen: &GenConfig,
 ) -> Result<EvalReport, EvalError> {
-    if prompts.is_empty() {
-        return Err(EvalError::Contract("no eval prompts".into()));
+    if samples.is_empty() {
+        return Err(EvalError::Contract("no eval samples".into()));
     }
     // Restore the adapter flag on the way out — on success, on a `?` early return,
     // and on a panic — via the guard's Drop.
@@ -158,7 +163,7 @@ pub fn evaluate<P: Policy, R: RewardFn>(
                 .into(),
         ));
     }
-    let per_prompt = score_all(guard.policy, reward_fn, tokenizer, prompts, gen)?;
+    let per_prompt = score_all(guard.policy, reward_fn, tokenizer, samples, gen)?;
 
     let n = per_prompt.len();
     let base_reward_mean = per_prompt.iter().map(|p| p.base_mean).sum::<f32>() / n as f32;
@@ -190,15 +195,16 @@ fn score_all<P: Policy, R: RewardFn>(
     policy: &mut P,
     reward_fn: &R,
     tokenizer: &dyn TokenizerLike,
-    prompts: &[String],
+    samples: &[Sample<R::Target>],
     gen: &GenConfig,
 ) -> Result<Vec<PromptEval>, EvalError> {
-    let mut per_prompt = Vec::with_capacity(prompts.len());
-    for (idx, prompt) in prompts.iter().enumerate() {
-        let ids = tokenizer.encode(prompt);
+    let mut per_prompt = Vec::with_capacity(samples.len());
+    for (idx, sample) in samples.iter().enumerate() {
+        let ids = tokenizer.encode(&sample.prompt);
         if ids.is_empty() {
             return Err(EvalError::Contract(format!(
-                "prompt encoded to zero tokens: {prompt:?}"
+                "prompt encoded to zero tokens: {:?}",
+                sample.prompt
             )));
         }
         // Seed each prompt's eval rollouts from a distinct global row base (its
@@ -207,9 +213,9 @@ fn score_all<P: Policy, R: RewardFn>(
         // and adapter share the per-prompt base — a controlled, same-RNG comparison.
         let base = (idx as u64).wrapping_mul(gen.group_size as u64);
         policy.set_adapter_enabled(false);
-        let base_mean = mean_reward(policy, reward_fn, tokenizer, prompt, &ids, gen, base)?;
+        let base_mean = mean_reward(policy, reward_fn, tokenizer, sample, &ids, gen, base)?;
         policy.set_adapter_enabled(true);
-        let adapter_mean = mean_reward(policy, reward_fn, tokenizer, prompt, &ids, gen, base)?;
+        let adapter_mean = mean_reward(policy, reward_fn, tokenizer, sample, &ids, gen, base)?;
         per_prompt.push(PromptEval {
             base_mean,
             adapter_mean,
@@ -218,12 +224,12 @@ fn score_all<P: Policy, R: RewardFn>(
     Ok(per_prompt)
 }
 
-/// Sample one group for `prompt` and return the mean of its finite rewards.
+/// Sample one group for `sample` and return the mean of its finite rewards.
 fn mean_reward<P: Policy, R: RewardFn>(
     policy: &mut P,
     reward_fn: &R,
     tokenizer: &dyn TokenizerLike,
-    prompt: &str,
+    sample: &Sample<R::Target>,
     prompt_ids: &[u32],
     gen: &GenConfig,
     global_row_base: u64,
@@ -244,7 +250,7 @@ fn mean_reward<P: Policy, R: RewardFn>(
             tokenizer.decode(ids.get(start..end).unwrap_or(&[]))
         })
         .collect();
-    let rewards = reward_fn.reward_group(prompt, &completions);
+    let rewards = reward_fn.reward_group(sample, &completions)?;
     // Enforce the RewardFn contract (one reward per completion), exactly as the
     // trainer does — otherwise eval would average over a different sample count
     // than it generated and skew the base-vs-adapter comparison.
@@ -448,11 +454,12 @@ mod tests {
     /// Reward = sum of the completion's decimal digits.
     struct DigitSumReward;
     impl RewardFn for DigitSumReward {
-        fn reward(&self, _prompt: &str, completion: &str) -> f32 {
-            completion
+        type Target = ();
+        fn reward(&self, _sample: &Sample<()>, completion: &str) -> Result<f32, RewardError> {
+            Ok(completion
                 .chars()
                 .filter_map(|c| c.to_digit(10))
-                .sum::<u32>() as f32
+                .sum::<u32>() as f32)
         }
     }
 
@@ -471,12 +478,12 @@ mod tests {
         // base token = 0 -> completion "000" -> reward 0.
         // adapter token = 2 -> completion "222" -> reward 6 (3 digits * 2).
         let mut policy = ScriptedPolicy::new(0, 2);
-        let prompts = vec!["1".to_string(), "9".to_string()];
+        let samples = vec![Sample::new("1", ()), Sample::new("9", ())];
         let report = evaluate(
             &mut policy,
             &DigitSumReward,
             &DigitCodec,
-            &prompts,
+            &samples,
             &gen(4, 3),
         )
         .unwrap();
@@ -564,12 +571,12 @@ mod tests {
             pad: 9,
             enabled: true,
         };
-        let prompts = vec!["5".to_string()];
+        let samples = vec![Sample::new("5", ())];
         let cfg = GenConfig {
             eos_token_id: Some(9),
             ..gen(4, 3)
         };
-        let report = evaluate(&mut policy, &DigitSumReward, &DigitCodec, &prompts, &cfg).unwrap();
+        let report = evaluate(&mut policy, &DigitSumReward, &DigitCodec, &samples, &cfg).unwrap();
         assert_eq!(report.base_reward_mean, 1.0);
         assert_eq!(report.adapter_reward_mean, 1.0);
     }
@@ -578,12 +585,12 @@ mod tests {
     fn toggles_base_then_adapter_per_prompt_and_restores_prior_state() {
         let mut policy = ScriptedPolicy::new(0, 1);
         assert!(policy.adapter_enabled()); // prior == true
-        let prompts = vec!["5".to_string()];
+        let samples = vec![Sample::new("5", ())];
         evaluate(
             &mut policy,
             &DigitSumReward,
             &DigitCodec,
-            &prompts,
+            &samples,
             &gen(2, 2),
         )
         .unwrap();
@@ -599,12 +606,12 @@ mod tests {
         let mut policy = ScriptedPolicy::new(0, 1);
         policy.set_adapter_enabled(false); // prior == false
         policy.toggles.borrow_mut().clear();
-        let prompts = vec!["5".to_string()];
+        let samples = vec![Sample::new("5", ())];
         evaluate(
             &mut policy,
             &DigitSumReward,
             &DigitCodec,
-            &prompts,
+            &samples,
             &gen(2, 2),
         )
         .unwrap();
@@ -657,12 +664,12 @@ mod tests {
     #[test]
     fn an_untoggleable_adapter_is_a_loud_contract_error() {
         let mut policy = UntoggleablePolicy;
-        let prompts = vec!["5".to_string()];
+        let samples = vec![Sample::new("5", ())];
         let err = evaluate(
             &mut policy,
             &DigitSumReward,
             &DigitCodec,
-            &prompts,
+            &samples,
             &gen(2, 2),
         )
         .unwrap_err();
@@ -678,12 +685,12 @@ mod tests {
         // "abc" has no decimal digits, so DigitCodec encodes it to []; the harness
         // must reject it (and still restore the adapter flag).
         let mut policy = ScriptedPolicy::new(0, 1);
-        let prompts = vec!["abc".to_string()];
+        let samples = vec![Sample::new("abc", ())];
         let err = evaluate(
             &mut policy,
             &DigitSumReward,
             &DigitCodec,
-            &prompts,
+            &samples,
             &gen(2, 2),
         )
         .unwrap_err();
@@ -791,7 +798,7 @@ mod tests {
 
     #[test]
     fn rejects_malformed_rollouts() {
-        let prompts = vec!["5".to_string()];
+        let samples = vec![Sample::new("5", ())];
         for mode in [
             Malformed::Overfill,
             Malformed::ShortSeq,
@@ -803,7 +810,7 @@ mod tests {
                 &mut policy,
                 &DigitSumReward,
                 &DigitCodec,
-                &prompts,
+                &samples,
                 &gen(2, 2),
             )
             .unwrap_err();
@@ -817,11 +824,16 @@ mod tests {
     /// A reward that violates the one-reward-per-completion contract.
     struct WrongCountReward;
     impl RewardFn for WrongCountReward {
-        fn reward(&self, _prompt: &str, _completion: &str) -> f32 {
-            0.0
+        type Target = ();
+        fn reward(&self, _sample: &Sample<()>, _completion: &str) -> Result<f32, RewardError> {
+            Ok(0.0)
         }
-        fn reward_group(&self, _prompt: &str, _completions: &[String]) -> Vec<f32> {
-            vec![1.0] // always one reward, regardless of the group size
+        fn reward_group(
+            &self,
+            _sample: &Sample<()>,
+            _completions: &[String],
+        ) -> Result<Vec<f32>, RewardError> {
+            Ok(vec![1.0]) // always one reward, regardless of the group size
         }
     }
 
@@ -829,15 +841,40 @@ mod tests {
     fn rejects_reward_count_mismatch() {
         // group_size 3 -> 3 completions, but reward_group returns 1 reward.
         let mut policy = ScriptedPolicy::new(0, 1);
-        let prompts = vec!["5".to_string()];
+        let samples = vec![Sample::new("5", ())];
         let err = evaluate(
             &mut policy,
             &WrongCountReward,
             &DigitCodec,
-            &prompts,
+            &samples,
             &gen(3, 2),
         )
         .unwrap_err();
         assert!(matches!(err, EvalError::Contract(_)), "got {err:?}");
+    }
+
+    /// A reward whose verifier always fails — to check the error propagates out of
+    /// `evaluate` as a typed [`EvalError::Reward`], not swallowed or scored as zero.
+    struct FailingReward;
+    impl RewardFn for FailingReward {
+        type Target = ();
+        fn reward(&self, _sample: &Sample<()>, _completion: &str) -> Result<f32, RewardError> {
+            Err(RewardError::msg("verifier exploded"))
+        }
+    }
+
+    #[test]
+    fn propagates_reward_error() {
+        let mut policy = ScriptedPolicy::new(0, 1);
+        let samples = vec![Sample::new("5", ())];
+        let err = evaluate(
+            &mut policy,
+            &FailingReward,
+            &DigitCodec,
+            &samples,
+            &gen(2, 2),
+        )
+        .unwrap_err();
+        assert!(matches!(err, EvalError::Reward(_)), "got {err:?}");
     }
 }

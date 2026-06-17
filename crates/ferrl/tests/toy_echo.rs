@@ -35,7 +35,7 @@ use ferrl::reward::RewardFn;
 use ferrl::sampler::GrpoSampler;
 use ferrl::telemetry::RunDir;
 use ferrl::trainer::{RunStop, TokenizerLike, Trainer, TrainerConfig, TrainerError};
-use ferrl::{LossType, Metrics, ScaleRewards};
+use ferrl::{LossType, Metrics, RewardError, Sample, ScaleRewards};
 
 /// Toy vocabulary size; the (full-rank) `LoRA` rank equals it, so a rank-`VOCAB`
 /// adapter can represent the whole echo map.
@@ -232,11 +232,13 @@ impl TokenizerLike for CharTokenizer {
 struct EchoReward;
 
 impl RewardFn for EchoReward {
-    fn reward(&self, prompt: &str, completion: &str) -> f32 {
-        match (prompt.chars().next(), completion.chars().next()) {
+    type Target = ();
+    fn reward(&self, sample: &Sample<()>, completion: &str) -> Result<f32, RewardError> {
+        let prompt = sample.prompt.as_str();
+        Ok(match (prompt.chars().next(), completion.chars().next()) {
             (Some(p), Some(c)) if p == c => 1.0,
             _ => 0.0,
-        }
+        })
     }
 }
 
@@ -402,11 +404,27 @@ impl Policy for EosPaddedEchoPolicy {
 struct BadCountReward;
 
 impl RewardFn for BadCountReward {
-    fn reward(&self, _prompt: &str, _completion: &str) -> f32 {
-        0.0
+    type Target = ();
+    fn reward(&self, _sample: &Sample<()>, _completion: &str) -> Result<f32, RewardError> {
+        Ok(0.0)
     }
-    fn reward_group(&self, _prompt: &str, completions: &[String]) -> Vec<f32> {
-        vec![0.0; completions.len().saturating_sub(1)]
+    fn reward_group(
+        &self,
+        _sample: &Sample<()>,
+        completions: &[String],
+    ) -> Result<Vec<f32>, RewardError> {
+        Ok(vec![0.0; completions.len().saturating_sub(1)])
+    }
+}
+
+/// A reward whose verifier always fails — to check the error propagates out of the
+/// trainer as a typed [`TrainerError::Reward`], not swallowed or scored as zero.
+struct FailingReward;
+
+impl RewardFn for FailingReward {
+    type Target = ();
+    fn reward(&self, _sample: &Sample<()>, _completion: &str) -> Result<f32, RewardError> {
+        Err(RewardError::msg("verifier exploded"))
     }
 }
 
@@ -450,10 +468,11 @@ impl Policy for UnderfilledPolicy {
 
 // ---- helpers ---------------------------------------------------------------
 
-/// `'a'..` prompts, one per vocab symbol, each a single token.
-fn echo_prompts(n: usize) -> Vec<String> {
+/// `'a'..` prompts, one per vocab symbol, each a single token. These toy rewards
+/// carry no typed ground truth, so each sample's target is `()`.
+fn echo_prompts(n: usize) -> Vec<Sample<()>> {
     (0..n)
-        .map(|i| char::from(b'a' + i as u8).to_string())
+        .map(|i| Sample::new(char::from(b'a' + i as u8).to_string(), ()))
         .collect()
 }
 
@@ -838,8 +857,9 @@ fn warmup_ramps_the_reported_lr_then_holds() {
 struct ConstReward;
 
 impl RewardFn for ConstReward {
-    fn reward(&self, _prompt: &str, _completion: &str) -> f32 {
-        1.0
+    type Target = ();
+    fn reward(&self, _sample: &Sample<()>, _completion: &str) -> Result<f32, RewardError> {
+        Ok(1.0)
     }
 }
 
@@ -1897,6 +1917,31 @@ fn reward_count_mismatch_is_a_typed_error() {
 }
 
 #[test]
+fn reward_error_propagates_through_the_trainer() {
+    // A RewardFn whose verifier fails must surface as TrainerError::Reward — the
+    // error propagates out of the GRPO loop rather than being swallowed (scoring a
+    // failed verifier as zero would corrupt the advantage signal).
+    let mut policy = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 1, TEMP).unwrap();
+    let prompts = echo_prompts(VOCAB);
+    let cfg = TrainerConfig {
+        steps: 1,
+        group_size: 8,
+        max_new_tokens: 1,
+        ..TrainerConfig::default()
+    };
+    let tmp = TempDir::new("failreward");
+    let run = RunDir::create(tmp.path(), "x").unwrap();
+    let mut trainer = Trainer::new(cfg, &run).unwrap();
+    let err = trainer
+        .train(&mut policy, &FailingReward, &CharTokenizer, &prompts)
+        .unwrap_err();
+    assert!(
+        matches!(err, TrainerError::Reward(_)),
+        "expected a Reward error, got {err:?}"
+    );
+}
+
+#[test]
 fn wrong_rollout_size_is_a_typed_error() {
     // A Policy returning fewer completions than group_size must surface a typed
     // error, not silently become a degenerate single-item group that skips the step.
@@ -1928,7 +1973,7 @@ fn empty_prompt_is_a_typed_error() {
     // surface a typed Contract error BEFORE generate — never an underflow panic at
     // a policy's `len - 1` last-position index, and never a malformed rollout.
     let mut policy = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 1, TEMP).unwrap();
-    let prompts = vec![String::new()];
+    let prompts = vec![Sample::new(String::new(), ())];
     let cfg = TrainerConfig {
         steps: 1,
         group_size: 8,

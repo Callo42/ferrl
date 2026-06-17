@@ -19,8 +19,8 @@ use ferrl::grpo::ImportanceSamplingLevel;
 use ferrl::policy::GenConfig;
 use ferrl::{
     evaluate, tensors_from_pretrained, varbuilder_from_pretrained, EvalError, Policy,
-    Qwen3_5Config, Qwen3_5GradModel, Qwen3_5Policy, RewardFn, RunDir, TokenizerLike, Trainer,
-    TrainerConfig, TrainerError,
+    Qwen3_5Config, Qwen3_5GradModel, Qwen3_5Policy, RewardError, RewardFn, RunDir, Sample,
+    TokenizerLike, Trainer, TrainerConfig, TrainerError,
 };
 use std::path::PathBuf;
 
@@ -49,13 +49,14 @@ impl TokenizerLike for ByteCodec {
 /// are non-degenerate.
 struct SpreadReward;
 impl RewardFn for SpreadReward {
-    fn reward(&self, _prompt: &str, completion: &str) -> f32 {
-        completion
+    type Target = ();
+    fn reward(&self, _sample: &Sample<()>, completion: &str) -> Result<f32, RewardError> {
+        Ok(completion
             .bytes()
             .enumerate()
             .map(|(i, b)| f32::from(b) * (0.3 + i as f32 * 0.17))
             .sum::<f32>()
-            % 5.0
+            % 5.0)
     }
 }
 
@@ -144,9 +145,9 @@ fn full_ft_training_moves_the_base_weights_and_resume_guards_the_recipe() {
     let tmp = TempDir::new("train");
     let run = RunDir::create(&tmp.0, "full-ft").unwrap();
     let mut trainer = Trainer::new(train_cfg(), &run).unwrap();
-    let prompts = vec!["abc".to_string(), "bcd".to_string()];
+    let samples = vec![Sample::new("abc", ()), Sample::new("bcd", ())];
     let (history, _stop) = trainer
-        .train(&mut policy, &SpreadReward, &ByteCodec, &prompts)
+        .train(&mut policy, &SpreadReward, &ByteCodec, &samples)
         .unwrap();
     assert!(
         history
@@ -165,18 +166,18 @@ fn full_ft_training_moves_the_base_weights_and_resume_guards_the_recipe() {
 
     let step1 = run.checkpoints_dir().join("step-1");
     assert!(step1.is_dir(), "expected the step-1 checkpoint");
-    resume_continues(&tmp, &step1, &prompts);
-    lora_resume_is_rejected(&tmp, &step1, &prompts);
+    resume_continues(&tmp, &step1, &samples);
+    lora_resume_is_rejected(&tmp, &step1, &samples);
 }
 
 /// Resume leg: a FRESH full-FT policy continues from the step-1 checkpoint
 /// (the recipe matches, vars/optimizer/sampler restore positionally).
-fn resume_continues(tmp: &TempDir, step1: &std::path::Path, prompts: &[String]) {
+fn resume_continues(tmp: &TempDir, step1: &std::path::Path, samples: &[Sample<()>]) {
     let mut policy = full_ft_policy(7);
     let run = RunDir::create(&tmp.0, "full-ft-resume").unwrap();
     let mut trainer = Trainer::new(train_cfg(), &run).unwrap();
     let (resumed, _stop) = trainer
-        .resume(step1, &mut policy, &SpreadReward, &ByteCodec, prompts)
+        .resume(step1, &mut policy, &SpreadReward, &ByteCodec, samples)
         .unwrap();
     assert_eq!(
         resumed.len(),
@@ -187,12 +188,12 @@ fn resume_continues(tmp: &TempDir, step1: &std::path::Path, prompts: &[String]) 
 
 /// The guard: a `LoRA` policy against the full-FT checkpoint is a loud recipe
 /// mismatch, BEFORE any var is mutated.
-fn lora_resume_is_rejected(tmp: &TempDir, step1: &std::path::Path, prompts: &[String]) {
+fn lora_resume_is_rejected(tmp: &TempDir, step1: &std::path::Path, samples: &[Sample<()>]) {
     let mut wrong = lora_policy(7);
     let run = RunDir::create(&tmp.0, "full-ft-mismatch").unwrap();
     let mut trainer = Trainer::new(train_cfg(), &run).unwrap();
     let err = trainer
-        .resume(step1, &mut wrong, &SpreadReward, &ByteCodec, prompts)
+        .resume(step1, &mut wrong, &SpreadReward, &ByteCodec, samples)
         .unwrap_err();
     assert!(
         matches!(err, TrainerError::Checkpoint(_)),
@@ -220,7 +221,12 @@ fn full_ft_with_kl_beta_is_a_loud_contract_error() {
     };
     let mut trainer = Trainer::new(cfg, &run).unwrap();
     let err = trainer
-        .train(&mut policy, &SpreadReward, &ByteCodec, &["abc".to_string()])
+        .train(
+            &mut policy,
+            &SpreadReward,
+            &ByteCodec,
+            &[Sample::new("abc", ())],
+        )
         .unwrap_err();
     assert!(matches!(err, TrainerError::Contract(_)), "got {err:?}");
     assert!(
@@ -243,13 +249,13 @@ fn full_ft_gspo_moe_training_runs_and_resumes() {
         importance_sampling_level: ImportanceSamplingLevel::Sequence,
         ..train_cfg()
     };
-    let prompts = vec!["abc".to_string(), "bcd".to_string()];
+    let samples = vec![Sample::new("abc", ()), Sample::new("bcd", ())];
 
     let tmp = TempDir::new("gspo-moe");
     let run = RunDir::create(&tmp.0, "full-ft-gspo-moe").unwrap();
     let mut trainer = Trainer::new(cfg.clone(), &run).unwrap();
     let (history, _stop) = trainer
-        .train(&mut policy, &SpreadReward, &ByteCodec, &prompts)
+        .train(&mut policy, &SpreadReward, &ByteCodec, &samples)
         .unwrap();
     assert!(
         history
@@ -269,7 +275,7 @@ fn full_ft_gspo_moe_training_runs_and_resumes() {
             &mut resumed_policy,
             &SpreadReward,
             &ByteCodec,
-            &prompts,
+            &samples,
         )
         .unwrap();
     assert_eq!(
@@ -293,7 +299,7 @@ fn full_ft_eval_comparison_fails_loud() {
         &mut policy,
         &SpreadReward,
         &ByteCodec,
-        &["abc".to_string()],
+        &[Sample::new("abc", ())],
         &gen,
     )
     .unwrap_err();

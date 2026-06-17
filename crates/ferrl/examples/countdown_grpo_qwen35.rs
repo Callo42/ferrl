@@ -85,7 +85,7 @@ use ferrl::countdown::{
 use ferrl::policy::GenConfig;
 use ferrl::{
     evaluate, EvalReport, EvalSampling, HfTokenizer, LoraTargets, Metrics, Qwen3_5Config,
-    Qwen3_5GradModel, Qwen3_5Policy, RunDir, RunStop, Trainer, TrainerConfig,
+    Qwen3_5GradModel, Qwen3_5Policy, RunDir, RunStop, Sample, Trainer, TrainerConfig,
 };
 use tracing::{info, warn};
 
@@ -284,11 +284,15 @@ fn held_out(
     eval
 }
 
-/// The Countdown train / held-out splits, as ready-to-use prompts. The held-out
-/// set is generated from a different stream **and** filtered so no problem also
-/// appears in train — a genuine generalization gap, not memorization. Fails
-/// loud (before any GPU work) if the held-out set comes up empty.
-fn build_splits(data_seed: u64) -> Result<(Vec<String>, Vec<String>)> {
+/// Train / held-out splits: each a vec of typed `(prompt, CountdownProblem)` samples.
+type Splits = (Vec<Sample<CountdownProblem>>, Vec<Sample<CountdownProblem>>);
+
+/// The Countdown train / held-out splits, as ready-to-use samples (each prompt
+/// paired with its typed `CountdownProblem` target). The held-out set is generated
+/// from a different stream **and** filtered so no problem also appears in train —
+/// a genuine generalization gap, not memorization. Fails loud (before any GPU
+/// work) if the held-out set comes up empty.
+fn build_splits(data_seed: u64) -> Result<Splits> {
     let cd_cfg = CountdownConfig {
         num_count: env_parse("FERRL_CD35_NUMCOUNT", 3usize)?,
         min_number: env_parse("FERRL_CD35_MINNUM", 1u32)?,
@@ -308,9 +312,15 @@ fn build_splits(data_seed: u64) -> Result<(Vec<String>, Vec<String>)> {
         );
     }
 
-    let train_prompts = train.iter().map(build_prompt).collect();
-    let eval_prompts = eval.iter().map(build_prompt).collect();
-    Ok((train_prompts, eval_prompts))
+    let train_samples = train
+        .into_iter()
+        .map(|p| Sample::new(build_prompt(&p), p))
+        .collect();
+    let eval_samples = eval
+        .into_iter()
+        .map(|p| Sample::new(build_prompt(&p), p))
+        .collect();
+    Ok((train_samples, eval_samples))
 }
 
 /// The trainer config — the **modern (R-track) recipe**, every field
@@ -528,7 +538,7 @@ fn main() -> Result<()> {
     let knobs = read_knobs()?;
     let device = open_cuda_device()?;
     let (mut policy, tok) = build_policy(&dir, &device, &knobs)?;
-    let (train_prompts, eval_prompts) = build_splits(knobs.data_seed)?;
+    let (train_samples, eval_samples) = build_splits(knobs.data_seed)?;
     let reward = CountdownReward::default();
     // The EOS id flows into both the trainer and the eval `gen` below so
     // generation is EOS-aware on both paths.
@@ -551,8 +561,8 @@ fn main() -> Result<()> {
         remat = knobs.remat,
         eval_k = gen.group_size,
         eval_sampling = ?gen.eval_sampling,
-        train = train_prompts.len(),
-        eval = eval_prompts.len(),
+        train = train_samples.len(),
+        eval = eval_samples.len(),
         "countdown GRPO ladder run (qwen3_5, modern recipe) starting"
     );
 
@@ -562,7 +572,7 @@ fn main() -> Result<()> {
     // resume_latest continues from the newest checkpoint if one exists (a requeue),
     // else trains from scratch — paired with the preemption flag above, the run
     // survives a Slurm preempt/timeout: it checkpoints on the signal and resumes here.
-    let (history, stop) = trainer.resume_latest(&mut policy, &reward, &tok, &train_prompts)?;
+    let (history, stop) = trainer.resume_latest(&mut policy, &reward, &tok, &train_samples)?;
 
     // A preemption stop returns a PARTIAL history with a fresh checkpoint written. Exit
     // before held-out eval / the ladder gate: running them now would burn the Slurm
@@ -601,6 +611,6 @@ fn main() -> Result<()> {
     // trained adapter (adapter on) in one pass, avg@k per prompt on the eval
     // distribution. No pre-train eval: the adapter starts as a no-op (`B = 0`),
     // so base == adapter there.
-    let post = evaluate(&mut policy, &reward, &tok, &eval_prompts, &gen)?;
+    let post = evaluate(&mut policy, &reward, &tok, &eval_samples, &gen)?;
     report_and_gate(&history, &post, &gen)
 }

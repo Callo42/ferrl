@@ -36,8 +36,8 @@ use candle_nn::VarBuilder;
 use candle_transformers::models::llama::{Cache, Config, Llama, LlamaConfig};
 use ferrl::policy::GenConfig;
 use ferrl::{
-    grad_coverage, HfTokenizer, LlamaGradModel, LlamaPolicy, Policy, RewardFn, RunDir,
-    TokenizerLike, Trainer, TrainerConfig,
+    grad_coverage, HfTokenizer, LlamaGradModel, LlamaPolicy, Policy, RewardError, RewardFn, RunDir,
+    Sample, TokenizerLike, Trainer, TrainerConfig,
 };
 
 /// `LoRA` rank / alpha for the smoke — a typical small adapter.
@@ -131,13 +131,14 @@ fn force_b_nonzero(vars: &[Var], device: &Device) {
 /// sharing a byte multiset don't collide to the same reward.
 struct SpreadReward;
 impl RewardFn for SpreadReward {
-    fn reward(&self, _prompt: &str, completion: &str) -> f32 {
-        completion
+    type Target = ();
+    fn reward(&self, _sample: &Sample<()>, completion: &str) -> Result<f32, RewardError> {
+        Ok(completion
             .bytes()
             .enumerate()
             .map(|(i, b)| (i as f32 + 1.0) * f32::from(b))
             .sum::<f32>()
-            / 1000.0
+            / 1000.0)
     }
 }
 
@@ -458,7 +459,7 @@ fn llama_policy_grpo_smoke_on_gpu() {
     let mut policy = LlamaPolicy::new(model, 1234, 1.0);
     let tok = HfTokenizer::from_file(dir.join("tokenizer.json")).expect("load tokenizer");
 
-    let prompts = vec!["The capital of France is".to_string()];
+    let samples = vec![Sample::new("The capital of France is", ())];
     let cfg_t = TrainerConfig {
         steps: 2,
         group_size: 4,
@@ -474,7 +475,7 @@ fn llama_policy_grpo_smoke_on_gpu() {
     // A canary failure, a non-finite gradient, or an OOM would surface as an
     // error here; the run completing is itself most of the gate.
     let (history, _stop) = trainer
-        .train(&mut policy, &SpreadReward, &tok, &prompts)
+        .train(&mut policy, &SpreadReward, &tok, &samples)
         .expect("GPU GRPO run failed");
 
     assert_eq!(history.len(), 2);

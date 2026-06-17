@@ -15,9 +15,8 @@
 //!   exists), using a self-contained `SplitMix64` PRNG so a `(seed, config)` pair
 //!   is byte-stable across `rand` releases;
 //! - **the prompt** ([`build_prompt`]) — a few-shot, base-model-friendly prompt
-//!   that ends right before the model's turn and carries the problem in a
-//!   machine-parseable `Numbers:` / `Target:` block, so the reward can recover the
-//!   problem from the prompt text alone (no side channel through the trainer);
+//!   that ends right before the model's turn and presents the problem in a
+//!   `Numbers:` / `Target:` block for the model to read;
 //! - **the reward** ([`CountdownReward`]) — a shaped [`RewardFn`]: it reads the
 //!   model's `` `<answer>…</answer>` `` expression and scores it in tiers, so a
 //!   GRPO group has reward *spread* even before any completion is fully correct.
@@ -45,7 +44,8 @@
 //! Countdown eval, via [`crate::evaluate`]) — lives in
 //! `examples/countdown_grpo.rs`, outside the coverage-gated library.
 
-use crate::reward::RewardFn;
+use crate::reward::{RewardError, RewardFn};
+use crate::sample::Sample;
 
 /// The `<answer>` open tag the reward parses.
 const ANSWER_OPEN: &str = "<answer>";
@@ -131,8 +131,9 @@ pub fn generate_dataset(seed: u64, count: usize, cfg: &CountdownConfig) -> Vec<C
 ///
 /// The prompt ends right after the problem's `Target:` line (no open tag), so the
 /// model emits its own `` `<answer>…</answer>` ``. The two worked examples teach a
-/// base model the format; the trailing `Numbers:` / `Target:` block is what
-/// [`CountdownReward`] parses back via [`parse_problem_from_prompt`].
+/// base model the format; the trailing `Numbers:` / `Target:` block presents the
+/// problem to the model. (The reward scores against the typed
+/// [`Sample::target`](crate::Sample::target), not by re-parsing this text.)
 #[must_use]
 pub fn build_prompt(problem: &CountdownProblem) -> String {
     let nums = problem
@@ -154,42 +155,11 @@ only the final expression between <answer> and </answer> tags.";
 const FEWSHOT: &str = "Numbers: 2, 3, 4\nTarget: 14\n<answer>2 * (3 + 4)</answer>\n\n\
 Numbers: 5, 5, 2\nTarget: 12\n<answer>5 + 5 + 2</answer>\n";
 
-/// Recover the problem from a prompt built by [`build_prompt`].
-///
-/// Reads the **last** `Numbers:` and `Target:` lines (the few-shot examples carry
-/// the same keys, so "last" selects the real problem, which the prompt places
-/// last). Returns `None` if either line is missing or malformed.
-#[must_use]
-pub fn parse_problem_from_prompt(prompt: &str) -> Option<CountdownProblem> {
-    // Anchor on the LAST `Numbers:` (the real problem; the few-shot examples come
-    // earlier), then read the `Target:` that follows it — so the two keys are
-    // always paired within the same trailing block, never across blocks.
-    let block = &prompt[prompt.rfind(NUMBERS_KEY)?..];
-    let nums_str = line_value(block, NUMBERS_KEY)?;
-    let target_str = line_value(block, TARGET_KEY)?;
-    let numbers = nums_str
-        .split(',')
-        .map(|t| t.trim().parse::<u32>().ok())
-        .collect::<Option<Vec<u32>>>()?;
-    if numbers.is_empty() {
-        return None;
-    }
-    let target = target_str.parse::<i64>().ok()?;
-    Some(CountdownProblem { numbers, target })
-}
-
-/// The trimmed remainder of the first line in `text` that contains `key`.
-fn line_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
-    let idx = text.find(key)?;
-    text[idx + key.len()..].lines().next().map(str::trim)
-}
-
 /// A shaped, verifiable reward for the Countdown task.
 ///
-/// The problem is recovered from the prompt each call (see
-/// [`parse_problem_from_prompt`]), so a single `CountdownReward` scores any
-/// Countdown prompt — no per-problem state. See the [module docs](self) for the
-/// reward tiers.
+/// `CountdownReward` is stateless — it scores any completion against the typed
+/// [`Sample::target`](crate::Sample::target) (`CountdownProblem`) it is given,
+/// not by re-parsing the prompt. See the [module docs](self) for the reward tiers.
 #[derive(Debug, Clone, Copy)]
 pub struct CountdownReward {
     /// Reward for emitting a closed `` `<answer>…</answer>` `` tag at all.
@@ -233,23 +203,17 @@ impl CountdownReward {
 }
 
 impl RewardFn for CountdownReward {
-    fn reward(&self, prompt: &str, completion: &str) -> f32 {
-        match parse_problem_from_prompt(prompt) {
-            Some(problem) => self.score(&problem, completion),
-            None => 0.0,
-        }
-    }
+    type Target = CountdownProblem;
 
-    fn reward_group(&self, prompt: &str, completions: &[String]) -> Vec<f32> {
-        // Parse the problem once for the whole group rather than per completion.
-        let Some(problem) = parse_problem_from_prompt(prompt) else {
-            return vec![0.0; completions.len()];
-        };
-        completions
-            .iter()
-            .map(|c| self.score(&problem, c))
-            .collect()
+    fn reward(
+        &self,
+        sample: &Sample<CountdownProblem>,
+        completion: &str,
+    ) -> Result<f32, RewardError> {
+        Ok(self.score(&sample.target, completion))
     }
+    // No `reward_group` override: the default (map `reward` over the group) is
+    // ideal now that the typed target needs no per-group parsing to amortize.
 }
 
 /// Extract the inner text of the **first** closed `` `<answer>…</answer>` `` tag in
@@ -750,12 +714,12 @@ mod tests {
     fn scores_the_models_answer_not_its_parroted_repeat() {
         // Realistic no-EOS completion: the model answers, then parrots a fresh
         // problem + answer. The reward must score the FIRST answer against the
-        // real problem (from the prompt), ignoring the parroted block.
+        // sample's typed target, ignoring the parroted block.
         let r = CountdownReward::default();
-        let prompt = prompt_for(&[2, 3, 4], 14);
+        let s = sample_for(&[2, 3, 4], 14);
         let completion =
             "<answer>2 * (3 + 4)</answer>\n\nNumbers: 1, 1, 1\nTarget: 3\n<answer>1 + 1 + 1</answer>";
-        assert!((r.reward(&prompt, completion) - 1.0).abs() < 1e-6);
+        assert!((r.reward(&s, completion).unwrap() - 1.0).abs() < 1e-6);
     }
 
     // --- legality ---
@@ -783,10 +747,10 @@ mod tests {
         assert!(!p.check("2 * 3 * 4 * 1")); // extra number
     }
 
-    // --- prompt round-trip ---
+    // --- prompt ---
 
     #[test]
-    fn prompt_round_trips_through_parse() {
+    fn prompt_embeds_the_problem() {
         let p = CountdownProblem {
             numbers: vec![6, 3, 7],
             target: 16,
@@ -794,69 +758,56 @@ mod tests {
         let prompt = build_prompt(&p);
         assert!(prompt.contains("Numbers: 6, 3, 7"));
         assert!(prompt.contains("Target: 16"));
-        // The few-shot examples also carry Numbers:/Target: lines; parsing must
-        // recover the *real* problem (the last one), not an example.
-        let recovered = parse_problem_from_prompt(&prompt).unwrap();
-        assert_eq!(recovered, p);
-    }
-
-    #[test]
-    fn parse_problem_rejects_malformed() {
-        assert!(parse_problem_from_prompt("no keys at all").is_none());
-        assert!(parse_problem_from_prompt("Numbers: 1, 2\n").is_none()); // no Target
-        assert!(parse_problem_from_prompt("Numbers: \nTarget: 5").is_none()); // empty numbers
-        assert!(parse_problem_from_prompt("Numbers: 1, x\nTarget: 5").is_none()); // bad number
-        assert!(parse_problem_from_prompt("Numbers: 1, 2\nTarget: nope").is_none());
-        // bad target
     }
 
     // --- reward tiers ---
 
-    fn prompt_for(numbers: &[u32], target: i64) -> String {
-        build_prompt(&CountdownProblem {
+    /// A sample whose prompt is built from the problem and whose typed target is
+    /// that same problem — the reward scores against the target, not the prompt.
+    fn sample_for(numbers: &[u32], target: i64) -> Sample<CountdownProblem> {
+        let problem = CountdownProblem {
             numbers: numbers.to_vec(),
             target,
-        })
+        };
+        Sample::new(build_prompt(&problem), problem)
     }
 
     #[test]
     fn reward_tiers_span_the_range() {
         let r = CountdownReward::default();
-        let prompt = prompt_for(&[2, 3, 4], 14);
+        let s = sample_for(&[2, 3, 4], 14);
         // No tag -> 0.0.
-        assert_eq!(r.reward(&prompt, "I think it is 2 * 7"), 0.0);
+        assert_eq!(r.reward(&s, "I think it is 2 * 7").unwrap(), 0.0);
         // Tag, unparseable expression -> format only.
-        assert_eq!(r.reward(&prompt, "<answer>2 * </answer>"), 0.1);
+        assert_eq!(r.reward(&s, "<answer>2 * </answer>").unwrap(), 0.1);
         // Tag, parses, illegal numbers -> format only.
-        assert_eq!(r.reward(&prompt, "<answer>2 * 7</answer>"), 0.1);
+        assert_eq!(r.reward(&s, "<answer>2 * 7</answer>").unwrap(), 0.1);
         // Tag, legal numbers, wrong value -> format + legal.
-        assert!((r.reward(&prompt, "<answer>2 + 3 + 4</answer>") - 0.2).abs() < 1e-6);
+        assert!((r.reward(&s, "<answer>2 + 3 + 4</answer>").unwrap() - 0.2).abs() < 1e-6);
         // Tag, legal numbers, equals target -> full.
-        assert!((r.reward(&prompt, "reason... <answer>2 * (3 + 4)</answer>") - 1.0).abs() < 1e-6);
+        assert!(
+            (r.reward(&s, "reason... <answer>2 * (3 + 4)</answer>")
+                .unwrap()
+                - 1.0)
+                .abs()
+                < 1e-6
+        );
     }
 
     #[test]
-    fn reward_group_parses_once_and_scores_each() {
+    fn reward_group_scores_each() {
         let r = CountdownReward::default();
-        let prompt = prompt_for(&[5, 5, 2], 12);
+        let s = sample_for(&[5, 5, 2], 12);
         let completions = vec![
             "<answer>5 + 5 + 2</answer>".to_string(), // correct -> 1.0
             "<answer>5 + 5</answer>".to_string(),     // illegal (too few) -> 0.1
             "no answer".to_string(),                  // -> 0.0
         ];
-        let got = r.reward_group(&prompt, &completions);
+        let got = r.reward_group(&s, &completions).unwrap();
         assert_eq!(got.len(), 3);
         assert!((got[0] - 1.0).abs() < 1e-6);
         assert!((got[1] - 0.1).abs() < 1e-6);
         assert_eq!(got[2], 0.0);
-    }
-
-    #[test]
-    fn reward_zero_on_unparseable_prompt() {
-        let r = CountdownReward::default();
-        let got = r.reward_group("garbage prompt", &["<answer>1 + 2</answer>".to_string()]);
-        assert_eq!(got, vec![0.0]);
-        assert_eq!(r.reward("garbage prompt", "<answer>1 + 2</answer>"), 0.0);
     }
 
     #[test]
@@ -866,9 +817,9 @@ mod tests {
             legal_reward: 0.25,
             correct_reward: 0.7,
         };
-        let prompt = prompt_for(&[2, 3, 4], 14);
-        assert!((r.reward(&prompt, "<answer>2 + 3 + 4</answer>") - 0.30).abs() < 1e-6);
-        assert!((r.reward(&prompt, "<answer>2 * (3 + 4)</answer>") - 1.0).abs() < 1e-6);
+        let s = sample_for(&[2, 3, 4], 14);
+        assert!((r.reward(&s, "<answer>2 + 3 + 4</answer>").unwrap() - 0.30).abs() < 1e-6);
+        assert!((r.reward(&s, "<answer>2 * (3 + 4)</answer>").unwrap() - 1.0).abs() < 1e-6);
     }
 
     // --- generator ---

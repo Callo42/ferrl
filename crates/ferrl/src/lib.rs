@@ -143,6 +143,7 @@ pub mod qwen;
 pub mod qwen35;
 pub mod remat;
 pub mod reward;
+pub mod sample;
 pub mod sampler;
 pub mod telemetry;
 pub mod tokenizer;
@@ -159,8 +160,7 @@ pub use comm::RealNccl;
 pub use comm::{Comm, CommError, LocalComm, NcclComm, NcclConfig, NcclPrimitives, SoloComm};
 #[doc(inline)]
 pub use countdown::{
-    build_prompt, generate_dataset, parse_problem_from_prompt, CountdownConfig, CountdownProblem,
-    CountdownReward,
+    build_prompt, generate_dataset, CountdownConfig, CountdownProblem, CountdownReward,
 };
 #[doc(inline)]
 pub use cuda_compat::{check_driver_compat, guard_first_kernel, translate_ptx_error, CompatReport};
@@ -203,7 +203,9 @@ pub use qwen35::{
 #[doc(inline)]
 pub use remat::{stitched_backward, RematTape};
 #[doc(inline)]
-pub use reward::RewardFn;
+pub use reward::{RewardError, RewardFn};
+#[doc(inline)]
+pub use sample::Sample;
 #[doc(inline)]
 pub use sampler::GrpoSampler;
 #[doc(inline)]
