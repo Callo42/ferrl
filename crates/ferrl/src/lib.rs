@@ -127,10 +127,12 @@ pub mod checkpoint;
 pub mod comm;
 pub mod countdown;
 pub mod cuda_compat;
+pub mod data;
 pub mod eval;
 mod full_ft;
 pub mod gdn;
 pub mod grpo;
+pub mod hf;
 pub mod llama;
 pub mod lm_policy;
 pub mod lora;
@@ -165,6 +167,8 @@ pub use countdown::{
 #[doc(inline)]
 pub use cuda_compat::{check_driver_compat, guard_first_kernel, translate_ptx_error, CompatReport};
 #[doc(inline)]
+pub use data::{parse_jsonl, read_jsonl, train_eval_split, DataError};
+#[doc(inline)]
 pub use eval::{evaluate, EvalError, EvalReport, PromptEval};
 
 pub use gdn::{
@@ -176,6 +180,8 @@ pub use grpo::{
     clipped_surrogate, group_advantages, k3_kl, masked_mean, tis_weight, zero_mask_rows, LossType,
     ScaleRewards, GROUP_STD_EPS,
 };
+#[doc(inline)]
+pub use hf::{chatml, eos_from_config, HfError};
 #[doc(inline)]
 pub use llama::{LlamaGradModel, LlamaMergedDecoder};
 #[doc(inline)]
@@ -216,4 +222,6 @@ pub use telemetry::{
 #[doc(inline)]
 pub use tokenizer::{HfTokenizer, TokenizerError};
 #[doc(inline)]
-pub use trainer::{RunStop, TokenizerLike, Trainer, TrainerConfig, TrainerError};
+pub use trainer::{
+    RunStop, TokenizerLike, Trainer, TrainerConfig, TrainerConfigBuilder, TrainerError,
+};

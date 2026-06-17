@@ -358,7 +358,235 @@ impl Default for TrainerConfig {
     }
 }
 
+impl From<&TrainerConfig> for GenConfig {
+    /// Derive the rollout [`GenConfig`] from a [`TrainerConfig`], so the two cannot
+    /// drift: group size, completion width, sampling temperature, and the EOS id
+    /// all flow from the single trainer config. `eval_sampling` is always `None` —
+    /// training rolls out at the configured temperature; the held-out eval harness
+    /// sets its own [`EvalSampling`](crate::policy::EvalSampling) override.
+    fn from(config: &TrainerConfig) -> Self {
+        Self {
+            group_size: config.group_size,
+            max_new_tokens: config.max_new_tokens,
+            temperature: config.temperature,
+            eos_token_id: config.eos_token_id,
+            eval_sampling: None,
+        }
+    }
+}
+
+/// A fluent builder for [`TrainerConfig`].
+///
+/// Seeded with [`TrainerConfig::default`]; each setter overrides one field and
+/// returns `self`, so only the fields you name change. [`build`](Self::build)
+/// returns a [`TrainerConfig`] **identical to the equivalent struct literal**
+/// (`TrainerConfig { ..overrides, ..Default::default() }`). It does not validate:
+/// an out-of-range value surfaces at [`Trainer::new`], which calls
+/// [`TrainerConfig::validate`].
+///
+/// ```
+/// use ferrl::TrainerConfig;
+///
+/// let cfg = TrainerConfig::builder()
+///     .steps(200)
+///     .group_size(16)
+///     .lr(1e-6)
+///     .beta(0.04)
+///     .build();
+/// assert_eq!(cfg.steps, 200);
+/// assert_eq!(cfg.group_size, 16);
+/// // Unset fields keep their defaults.
+/// assert_eq!(cfg.mu, TrainerConfig::default().mu);
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct TrainerConfigBuilder {
+    cfg: TrainerConfig,
+}
+
+impl TrainerConfigBuilder {
+    /// A builder seeded with [`TrainerConfig::default`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set [`TrainerConfig::steps`].
+    #[must_use]
+    pub fn steps(mut self, steps: u64) -> Self {
+        self.cfg.steps = steps;
+        self
+    }
+
+    /// Set [`TrainerConfig::group_size`].
+    #[must_use]
+    pub fn group_size(mut self, group_size: usize) -> Self {
+        self.cfg.group_size = group_size;
+        self
+    }
+
+    /// Set [`TrainerConfig::max_new_tokens`].
+    #[must_use]
+    pub fn max_new_tokens(mut self, max_new_tokens: usize) -> Self {
+        self.cfg.max_new_tokens = max_new_tokens;
+        self
+    }
+
+    /// Set [`TrainerConfig::temperature`].
+    #[must_use]
+    pub fn temperature(mut self, temperature: f64) -> Self {
+        self.cfg.temperature = temperature;
+        self
+    }
+
+    /// Set [`TrainerConfig::mu`].
+    #[must_use]
+    pub fn mu(mut self, mu: usize) -> Self {
+        self.cfg.mu = mu;
+        self
+    }
+
+    /// Set [`TrainerConfig::beta`].
+    #[must_use]
+    pub fn beta(mut self, beta: f64) -> Self {
+        self.cfg.beta = beta;
+        self
+    }
+
+    /// Set [`TrainerConfig::clip_eps`].
+    #[must_use]
+    pub fn clip_eps(mut self, clip_eps: f64) -> Self {
+        self.cfg.clip_eps = clip_eps;
+        self
+    }
+
+    /// Set [`TrainerConfig::clip_eps_high`].
+    #[must_use]
+    pub fn clip_eps_high(mut self, clip_eps_high: Option<f64>) -> Self {
+        self.cfg.clip_eps_high = clip_eps_high;
+        self
+    }
+
+    /// Set [`TrainerConfig::importance_sampling_level`].
+    #[must_use]
+    pub fn importance_sampling_level(mut self, level: ImportanceSamplingLevel) -> Self {
+        self.cfg.importance_sampling_level = level;
+        self
+    }
+
+    /// Set [`TrainerConfig::lr`].
+    #[must_use]
+    pub fn lr(mut self, lr: f64) -> Self {
+        self.cfg.lr = lr;
+        self
+    }
+
+    /// Set [`TrainerConfig::weight_decay`].
+    #[must_use]
+    pub fn weight_decay(mut self, weight_decay: f64) -> Self {
+        self.cfg.weight_decay = weight_decay;
+        self
+    }
+
+    /// Set [`TrainerConfig::adam_beta1`].
+    #[must_use]
+    pub fn adam_beta1(mut self, adam_beta1: f64) -> Self {
+        self.cfg.adam_beta1 = adam_beta1;
+        self
+    }
+
+    /// Set [`TrainerConfig::adam_beta2`].
+    #[must_use]
+    pub fn adam_beta2(mut self, adam_beta2: f64) -> Self {
+        self.cfg.adam_beta2 = adam_beta2;
+        self
+    }
+
+    /// Set [`TrainerConfig::warmup_steps`].
+    #[must_use]
+    pub fn warmup_steps(mut self, warmup_steps: u64) -> Self {
+        self.cfg.warmup_steps = warmup_steps;
+        self
+    }
+
+    /// Set [`TrainerConfig::max_grad_norm`].
+    #[must_use]
+    pub fn max_grad_norm(mut self, max_grad_norm: Option<f64>) -> Self {
+        self.cfg.max_grad_norm = max_grad_norm;
+        self
+    }
+
+    /// Set [`TrainerConfig::truncation_masking`].
+    #[must_use]
+    pub fn truncation_masking(mut self, truncation_masking: bool) -> Self {
+        self.cfg.truncation_masking = truncation_masking;
+        self
+    }
+
+    /// Set [`TrainerConfig::tis`].
+    #[must_use]
+    pub fn tis(mut self, tis: bool) -> Self {
+        self.cfg.tis = tis;
+        self
+    }
+
+    /// Set [`TrainerConfig::tis_imp_ratio_cap`].
+    #[must_use]
+    pub fn tis_imp_ratio_cap(mut self, tis_imp_ratio_cap: f64) -> Self {
+        self.cfg.tis_imp_ratio_cap = tis_imp_ratio_cap;
+        self
+    }
+
+    /// Set [`TrainerConfig::loss_type`].
+    #[must_use]
+    pub fn loss_type(mut self, loss_type: LossType) -> Self {
+        self.cfg.loss_type = loss_type;
+        self
+    }
+
+    /// Set [`TrainerConfig::scale_rewards`].
+    #[must_use]
+    pub fn scale_rewards(mut self, scale_rewards: ScaleRewards) -> Self {
+        self.cfg.scale_rewards = scale_rewards;
+        self
+    }
+
+    /// Set [`TrainerConfig::grad_accum_steps`].
+    #[must_use]
+    pub fn grad_accum_steps(mut self, grad_accum_steps: usize) -> Self {
+        self.cfg.grad_accum_steps = grad_accum_steps;
+        self
+    }
+
+    /// Set [`TrainerConfig::checkpoint_every`].
+    #[must_use]
+    pub fn checkpoint_every(mut self, checkpoint_every: Option<u64>) -> Self {
+        self.cfg.checkpoint_every = checkpoint_every;
+        self
+    }
+
+    /// Set [`TrainerConfig::eos_token_id`].
+    #[must_use]
+    pub fn eos_token_id(mut self, eos_token_id: Option<u32>) -> Self {
+        self.cfg.eos_token_id = eos_token_id;
+        self
+    }
+
+    /// Finish building, returning the configured [`TrainerConfig`].
+    ///
+    /// Does not validate (see the type docs); [`Trainer::new`] validates.
+    #[must_use]
+    pub fn build(self) -> TrainerConfig {
+        self.cfg
+    }
+}
+
 impl TrainerConfig {
+    /// Start a fluent [`TrainerConfigBuilder`] seeded with the defaults.
+    #[must_use]
+    pub fn builder() -> TrainerConfigBuilder {
+        TrainerConfigBuilder::new()
+    }
+
     /// Reject settings that would silently do nothing or crash mid-run.
     ///
     /// In particular `mu = 0` would run **no** inner update — no backward, no
@@ -1379,13 +1607,9 @@ impl Trainer {
                 sample.prompt
             )));
         }
-        let gen = GenConfig {
-            group_size: self.config.group_size,
-            max_new_tokens: self.config.max_new_tokens,
-            temperature: self.config.temperature,
-            eos_token_id: self.config.eos_token_id,
-            eval_sampling: None,
-        };
+        // Derive the rollout config from the trainer config (single source of truth;
+        // see `impl From<&TrainerConfig> for GenConfig`) so the two cannot drift.
+        let gen = GenConfig::from(&self.config);
         // Seed the rollout's per-row substreams from this prompt's GLOBAL row base
         // (its ordinal in the flattened world-global stream × group_size), so the
         // sampled tokens are invariant to the data-parallel shard layout and a resume
@@ -2551,6 +2775,92 @@ mod tests {
 
     fn cpu() -> Device {
         Device::Cpu
+    }
+
+    #[test]
+    fn gen_config_from_trainer_config_mirrors_the_rollout_fields() {
+        let config = TrainerConfig {
+            group_size: 12,
+            max_new_tokens: 48,
+            temperature: 0.7,
+            eos_token_id: Some(151_645),
+            ..TrainerConfig::default()
+        };
+        let gen = GenConfig::from(&config);
+        // The exact config the rollout site used to hand-build, now in one place.
+        // (`GenConfig` is not `PartialEq`, so check field-by-field.)
+        assert_eq!(gen.group_size, 12);
+        assert_eq!(gen.max_new_tokens, 48);
+        assert_eq!(gen.temperature, 0.7);
+        assert_eq!(gen.eos_token_id, Some(151_645));
+        assert!(gen.eval_sampling.is_none());
+    }
+
+    #[test]
+    fn builder_default_equals_trainer_config_default() {
+        let built = TrainerConfig::builder().build();
+        assert_eq!(
+            serde_json::to_value(&built).unwrap(),
+            serde_json::to_value(TrainerConfig::default()).unwrap()
+        );
+    }
+
+    #[test]
+    fn builder_equals_the_equivalent_struct_literal() {
+        let built = TrainerConfig::builder()
+            .steps(200)
+            .group_size(16)
+            .max_new_tokens(64)
+            .temperature(0.8)
+            .mu(2)
+            .beta(0.04)
+            .clip_eps(0.2)
+            .clip_eps_high(Some(0.28))
+            .importance_sampling_level(ImportanceSamplingLevel::Sequence)
+            .lr(1e-6)
+            .weight_decay(0.01)
+            .adam_beta1(0.9)
+            .adam_beta2(0.95)
+            .warmup_steps(20)
+            .max_grad_norm(Some(1.0))
+            .truncation_masking(false)
+            .tis(true)
+            .tis_imp_ratio_cap(2.0)
+            .loss_type(LossType::Grpo)
+            .scale_rewards(ScaleRewards::None)
+            .grad_accum_steps(4)
+            .checkpoint_every(Some(50))
+            .eos_token_id(Some(151_645))
+            .build();
+        let literal = TrainerConfig {
+            steps: 200,
+            group_size: 16,
+            max_new_tokens: 64,
+            temperature: 0.8,
+            mu: 2,
+            beta: 0.04,
+            clip_eps: 0.2,
+            clip_eps_high: Some(0.28),
+            importance_sampling_level: ImportanceSamplingLevel::Sequence,
+            lr: 1e-6,
+            weight_decay: 0.01,
+            adam_beta1: 0.9,
+            adam_beta2: 0.95,
+            warmup_steps: 20,
+            max_grad_norm: Some(1.0),
+            truncation_masking: false,
+            tis: true,
+            tis_imp_ratio_cap: 2.0,
+            loss_type: LossType::Grpo,
+            scale_rewards: ScaleRewards::None,
+            grad_accum_steps: 4,
+            checkpoint_every: Some(50),
+            eos_token_id: Some(151_645),
+        };
+        assert_eq!(
+            serde_json::to_value(&built).unwrap(),
+            serde_json::to_value(&literal).unwrap()
+        );
     }
 
     fn mat(rows: &[&[f32]]) -> Tensor {

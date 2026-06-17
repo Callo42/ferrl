@@ -79,30 +79,17 @@ fn load_config(dir: &Path) -> Result<Config> {
     serde_json::from_slice(&bytes).context("parse config.json into qwen3::Config")
 }
 
-/// The model's end-of-sequence token id, read from the checkpoint's `config.json`.
-///
-/// candle's [`Config`] does not deserialize `eos_token_id`, so read the raw JSON.
-/// Returns `Ok(None)` when the field is absent (a model with no EOS) or is not a
-/// plain integer — a list-valued `eos_token_id` (multi-EOS) is not handled, since
-/// [`GenConfig::eos_token_id`] carries a single id.
-fn config_eos(dir: &Path) -> Result<Option<u32>> {
-    let bytes = std::fs::read(dir.join("config.json")).context("read config.json")?;
-    let json: serde_json::Value = serde_json::from_slice(&bytes).context("parse config.json")?;
-    Ok(json
-        .get("eos_token_id")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|v| u32::try_from(v).ok()))
-}
-
 /// Resolve the EOS token id for the run.
 ///
 /// `FERRL_CD_EOS` overrides the checkpoint default: unset reads the model's
-/// `eos_token_id` from `config.json` (the actual EOS run); `none`/`off` (any case)
-/// yields `None`, recovering the legacy full-width rollout for an A/B comparison;
-/// any other value is parsed as an explicit id.
+/// `eos_token_id` from `config.json` via [`ferrl::eos_from_config`] (the actual EOS
+/// run; the helper accepts either a top-level `eos_token_id` — the Qwen3 base shape
+/// here — or a `text_config`-nested one); `none`/`off` (any case) yields `None`,
+/// recovering the legacy full-width rollout for an A/B comparison; any other value
+/// is parsed as an explicit id.
 fn resolve_eos(dir: &Path) -> Result<Option<u32>> {
     match env::var("FERRL_CD_EOS") {
-        Err(_) => config_eos(dir),
+        Err(_) => Ok(ferrl::eos_from_config(dir)?),
         Ok(raw) => {
             let v = raw.trim();
             if v.eq_ignore_ascii_case("none") || v.eq_ignore_ascii_case("off") {
@@ -271,13 +258,9 @@ fn main() -> Result<()> {
     // trainer and the eval `gen` below so generation is EOS-aware on both paths.
     let eos = resolve_eos(&dir)?;
     let tcfg = build_trainer_config(eos);
-    let gen = GenConfig {
-        group_size: tcfg.group_size,
-        max_new_tokens: tcfg.max_new_tokens,
-        temperature: tcfg.temperature,
-        eos_token_id: tcfg.eos_token_id,
-        eval_sampling: None,
-    };
+    // The eval generation config is the trainer's rollout config (single source of
+    // truth via `GenConfig::from(&TrainerConfig)`), so the two cannot drift.
+    let gen = GenConfig::from(&tcfg);
     info!(
         steps = tcfg.steps,
         group_size = tcfg.group_size,

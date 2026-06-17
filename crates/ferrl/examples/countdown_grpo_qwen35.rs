@@ -147,33 +147,17 @@ fn read_knobs() -> Result<RunKnobs> {
     })
 }
 
-/// The model's end-of-sequence token id, read from the checkpoint's
-/// `config.json`. `qwen3_5` checkpoints nest it under the multimodal wrapper's
-/// `text_config` (the real 0.8B file's shape); the top level is the fallback.
-///
-/// [`Qwen3_5Config`] does not carry it, so read the raw JSON. Returns `Ok(None)`
-/// when the field is absent or is not a plain integer — a list-valued
-/// `eos_token_id` (multi-EOS) is not handled, since [`GenConfig::eos_token_id`]
-/// carries a single id.
-fn config_eos(dir: &Path) -> Result<Option<u32>> {
-    let bytes = std::fs::read(dir.join("config.json")).context("read config.json")?;
-    let json: serde_json::Value = serde_json::from_slice(&bytes).context("parse config.json")?;
-    Ok(json
-        .pointer("/text_config/eos_token_id")
-        .or_else(|| json.get("eos_token_id"))
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|v| u32::try_from(v).ok()))
-}
-
 /// Resolve the EOS token id for the run.
 ///
 /// `FERRL_CD35_EOS` overrides the checkpoint default: unset reads the model's
-/// `eos_token_id` from `config.json`; `none`/`off` (any case) yields `None`,
-/// recovering the legacy full-width rollout for an A/B comparison; any other
-/// value is parsed as an explicit id.
+/// `eos_token_id` from `config.json` via [`ferrl::eos_from_config`] (which checks
+/// the multimodal wrapper's `text_config` first — the real 0.8B file's shape —
+/// then the top level); `none`/`off` (any case) yields `None`, recovering the
+/// legacy full-width rollout for an A/B comparison; any other value is parsed as an
+/// explicit id.
 fn resolve_eos(dir: &Path) -> Result<Option<u32>> {
     match env::var("FERRL_CD35_EOS") {
-        Err(_) => config_eos(dir),
+        Err(_) => Ok(ferrl::eos_from_config(dir)?),
         Ok(raw) => {
             let v = raw.trim();
             if v.eq_ignore_ascii_case("none") || v.eq_ignore_ascii_case("off") {

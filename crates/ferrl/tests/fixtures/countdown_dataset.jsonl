@@ -1,0 +1,3 @@
+{"prompt":"Solve the countdown puzzle. Use each number exactly once with + - * / and parentheses to reach the target. Give the expression between <answer> and </answer>.\nNumbers: 3, 7, 11\nTarget: 100\n","target":{"numbers":[3,7,11],"target":100}}
+{"prompt":"Solve the countdown puzzle. Use each number exactly once with + - * / and parentheses to reach the target. Give the expression between <answer> and </answer>.\nNumbers: 5, 6, 8\nTarget: 24\n","target":{"numbers":[5,6,8],"target":24}}
+{"prompt":"Solve the countdown puzzle. Use each number exactly once with + - * / and parentheses to reach the target. Give the expression between <answer> and </answer>.\nNumbers: 2, 9, 9\nTarget: 81\n","target":{"numbers":[2,9,9],"target":81}}

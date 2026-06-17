@@ -61,7 +61,10 @@ const MAX_GEN_ATTEMPTS: usize = 64;
 
 /// A Countdown problem: reach `target` from `numbers`, using each number exactly
 /// once with `+ - * /` and parentheses.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+///
+/// It derives `serde` (de)serialization so a `Sample<CountdownProblem>` dataset
+/// round-trips through JSONL via [`read_jsonl`](crate::data::read_jsonl).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct CountdownProblem {
     /// The numbers available to the expression (each must be used exactly once).
     pub numbers: Vec<u32>,
