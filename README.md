@@ -55,7 +55,7 @@ ferrl/
 ├── rust-toolchain.toml        # pinned stable + rustfmt/clippy/llvm-tools-preview
 ├── rustfmt.toml  clippy.toml  # max_width=100; cognitive-complexity threshold 7
 ├── cog.toml                   # cocogitto (Conventional Commits + SemVer)
-├── justfile                   # task runner (platformax-aware cargo wrapper)
+├── justfile                   # task runner (NFS-home-aware cargo wrapper)
 ├── scripts/gen_golden.py      # the Python GRPO oracle (regenerates the fixture)
 ├── .github/workflows/ci.yml   # CPU-only CI gate
 └── crates/ferrl/
@@ -218,34 +218,6 @@ is git-ignored. The on-disk layout is created by [`ferrl::telemetry::RunDir`] an
 are appended by `ferrl::telemetry::MetricsWriter`; the `runreport` example reads a run's
 `metrics.jsonl` and prints a health summary — reward trend, throughput, and grad-norm
 anomalies (human, `--json`, or `--strict`).
-
----
-
-## Building on the platformax cluster
-
-On the platformax dev cluster, `$HOME` lives on NFS. Bare `cargo` **deadlocks on its
-SQLite global-cache lock** (`"database is locked"`) *before* it compiles anything,
-because the cache lock does not behave over NFS. The fix: point `CARGO_HOME` and
-`CARGO_TARGET_DIR` at node-local `/tmp`.
-
-The `justfile` handles this transparently and is **env-overridable**. By default it
-changes nothing about cargo's environment, so ordinary contributors and GitHub runners
-get standard behavior. On platformax, opt in with a single switch:
-
-```sh
-export FERRL_LOCAL_CARGO=1     # reroute CARGO_HOME + CARGO_TARGET_DIR to /tmp
-just test
-```
-
-Or override the paths explicitly (wins over everything):
-
-```sh
-export CARGO_HOME=/tmp/$USER/cargo-home
-export CARGO_TARGET_DIR=/tmp/$USER/ferrl-target
-just test
-```
-
-See the `justfile` header for the exact override variables and defaults.
 
 ---
 

@@ -328,12 +328,10 @@ pub(crate) mod logic {
                 // Slurm token if a future edit ever interpolated one into a user message.
                 for forbidden in [
                     "/home/",
-                    "user_rsww",
                     "/tmp/ferrl-",
-                    "platformax",
                     "n00",
-                    "nvhpc",
                     "srun",
+                    "sbatch",
                     "--partition",
                     "--gres",
                 ] {

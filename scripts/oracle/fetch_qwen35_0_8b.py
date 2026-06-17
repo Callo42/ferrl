@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Fetch Qwen/Qwen3.5-0.8B-Base from ModelScope into Research_Realm/assets/.
+"""Fetch Qwen/Qwen3.5-0.8B-Base from ModelScope into a sibling assets/ dir.
 
-Run on the cluster in the `ferrl-oracle` env (ModelScope is the reachable
-mirror there; HF is blocked). The asset lands OUTSIDE the repo
+ModelScope is the download source (HF Hub also works where reachable). The
+asset lands OUTSIDE the repo
 (`../assets/qwen3_5-0.8b-base`), like the other model assets. Verify shas
 against the ModelScope manifest afterwards (see the M1 llama playbook).
 """

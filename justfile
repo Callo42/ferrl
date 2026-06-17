@@ -5,9 +5,9 @@
 # these recipes too, which keeps the contract in exactly one place.
 #
 # ---------------------------------------------------------------------------
-# platformax / NFS-HOME note (the cargo SQLite deadlock)
+# NFS-home note (the cargo SQLite deadlock)
 # ---------------------------------------------------------------------------
-# On the platformax dev cluster, $HOME lives on NFS. Cargo's global cache uses a
+# On a cluster where $HOME lives on NFS, Cargo's global cache uses a
 # SQLite-backed lock under $CARGO_HOME (`.global-cache`), and SQLite file locking
 # is unreliable on NFS — so a bare `cargo` call can DEADLOCK on "Blocking waiting
 # for file lock on package cache" / "database is locked" *before it compiles a
@@ -20,7 +20,7 @@
 #     the plain `cargo` on your PATH with your normal CARGO_HOME — exactly what a
 #     laptop or a GitHub runner wants.
 #
-#   * On platformax you opt in with ONE switch:  FERRL_LOCAL_CARGO=1
+#   * On such a cluster you opt in with ONE switch:  FERRL_LOCAL_CARGO=1
 #     That reroutes CARGO_HOME and CARGO_TARGET_DIR to a per-user dir under /tmp
 #     (node-local), sidestepping the NFS lock. Export it in your shell rc on the
 #     cluster and forget about it:
@@ -52,7 +52,7 @@ set positional-arguments
 # The cargo binary. Override to e.g. `cross`, `cargo +nightly`, sccache wrappers.
 CARGO := env_var_or_default("CARGO", "cargo")
 
-# Opt-in flag for the platformax /tmp reroute. "0" / empty = off (default).
+# Opt-in flag for the node-local /tmp reroute. "0" / empty = off (default).
 FERRL_LOCAL_CARGO := env_var_or_default("FERRL_LOCAL_CARGO", "0")
 
 # Base dir for the node-local reroute. Defaults to /tmp/ferrl-cargo-$USER.
@@ -81,7 +81,7 @@ COV_MIN := env_var_or_default("FERRL_COV_MIN", "90")
 # CARGO_HOME / CARGO_TARGET_DIR ONLY when they resolve to a non-empty value, so
 # the default contributor/runner path is byte-for-byte a plain `cargo ...`.
 # `mkdir -p` is harmless when the dirs already exist and creates the /tmp tree
-# on first use on platformax.
+# on first use.
 [private]
 _cargo +args:
     #!/usr/bin/env bash

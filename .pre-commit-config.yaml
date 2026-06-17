@@ -11,7 +11,7 @@
 # commit.
 #
 # NOTE on the local cargo hooks: they shell out through the justfile's `_cargo`
-# wrapper so that on platformax (NFS HOME) the CARGO_HOME/-TARGET_DIR reroute
+# wrapper so that on an NFS-home cluster the CARGO_HOME/-TARGET_DIR reroute
 # applies inside the hook too — see the justfile header. On a laptop / CI this is
 # a no-op and behaves like a plain `cargo`.
 

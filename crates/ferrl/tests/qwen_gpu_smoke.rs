@@ -12,7 +12,7 @@
 //! GPU. Run it on a GPU node:
 //!
 //! ```text
-//! module load nvhpc && export CC=gcc CXX=g++ CUDA_COMPUTE_CAP=80
+//! export CC=gcc CXX=g++ CUDA_COMPUTE_CAP=80   # nvcc + a CUDA toolkit on PATH
 //! FERRL_QWEN_WEIGHTS=/path/to/qwen3-0.6b-base \
 //!     cargo test -p ferrl --features cuda --test qwen_gpu_smoke -- --ignored
 //! ```
