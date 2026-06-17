@@ -1,0 +1,6 @@
+{
+  "architectures": ["Qwen3ForCausalLM"],
+  "hidden_size": 16,
+  "num_attention_heads": 2,
+  "eos_token_id": 151645
+}
