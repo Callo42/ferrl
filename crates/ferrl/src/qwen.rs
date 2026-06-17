@@ -430,9 +430,11 @@ impl QwenGradModel {
     /// # Errors
     ///
     /// Returns a candle error if `cfg` requests an unsupported option
-    /// (`attention_bias`, `use_sliding_window`), if `targets` selects nothing
-    /// (an untrainable model), if a weight tensor is missing or mis-shaped, or
-    /// if the `LoRA` factors cannot be allocated.
+    /// (`attention_bias`, `use_sliding_window`), if `cfg` carries a degenerate
+    /// head configuration (`num_attention_heads == 0`, `num_key_value_heads == 0`,
+    /// or `num_attention_heads` not divisible by `num_key_value_heads`), if
+    /// `targets` selects nothing (an untrainable model), if a weight tensor is
+    /// missing or mis-shaped, or if the `LoRA` factors cannot be allocated.
     pub fn load_with_targets(
         cfg: &Config,
         vb: &VarBuilder,
@@ -463,6 +465,47 @@ impl QwenGradModel {
             candle_core::bail!(
                 "QwenGradModel: cfg.use_sliding_window=true is unsupported (only a full \
                  causal mask is implemented)"
+            );
+        }
+        // The head-count invariants the GQA arithmetic relies on. Unlike the llama
+        // grad model (which DERIVES head_dim = hidden_size / num_attention_heads),
+        // Qwen3 carries an explicit head_dim, so the projection widths are not at
+        // risk here; what is, is num_kv_groups = num_attention_heads /
+        // num_key_value_heads (the GQA repeat factor). Reject the degenerate configs
+        // that would divide-by-zero or silently truncate that quotient — matching the
+        // qwen3.5 loader's Config::validate() (which enforces both head counts > 0
+        // and GQA divisibility).
+        if cfg.num_attention_heads == 0 {
+            candle_core::bail!(
+                "QwenGradModel: num_attention_heads must be >= 1 (got 0); it is the query \
+                 head count and the numerator of num_kv_groups = num_attention_heads / \
+                 num_key_value_heads"
+            );
+        }
+        // num_key_value_heads is the divisor that derives num_kv_groups. Zero would
+        // integer-divide-by-zero and panic deep in attention load; reject it loud
+        // here. Checked before the divisibility guard below so that guard never
+        // evaluates is_multiple_of(0) (which is true only when the dividend is 0).
+        if cfg.num_key_value_heads == 0 {
+            candle_core::bail!(
+                "QwenGradModel: num_key_value_heads must be >= 1 (got 0); num_kv_groups is \
+                 derived as num_attention_heads / num_key_value_heads"
+            );
+        }
+        // A non-divisible pair truncates num_kv_groups, so repeat_kv would expand the
+        // KV heads to a count that no longer matches the Q heads — a degenerate
+        // (non-parity) model. Reject it at load, matching the qwen3.5 loader's
+        // existing GQA-divisibility guard.
+        if !cfg
+            .num_attention_heads
+            .is_multiple_of(cfg.num_key_value_heads)
+        {
+            candle_core::bail!(
+                "QwenGradModel: num_attention_heads {} is not divisible by \
+                 num_key_value_heads {} (num_kv_groups is derived as their quotient; such a \
+                 config cannot be a real Qwen3 and would silently load as a degenerate model)",
+                cfg.num_attention_heads,
+                cfg.num_key_value_heads
             );
         }
         let h = cfg.hidden_size;
@@ -1537,6 +1580,59 @@ mod tests {
         assert!(
             err.to_string().contains("sliding_window"),
             "expected a sliding-window rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_rejects_zero_attention_heads() {
+        // num_attention_heads == 0 is the query head count and the numerator of
+        // num_kv_groups; it loads a degenerate (zero-width q_proj, num_kv_groups 0)
+        // model. The guard rejects it loud, up front. (vb is built from a valid
+        // cfg; the guard fires before any tensor is touched.)
+        let good = tiny_cfg();
+        let vb = tiny_vb(&good);
+        let mut bad = tiny_cfg();
+        bad.num_attention_heads = 0;
+        let err = QwenGradModel::load(&bad, &vb, 2, 4.0).unwrap_err();
+        assert!(
+            err.to_string().contains("num_attention_heads must be"),
+            "expected a num_attention_heads>=1 rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_rejects_zero_kv_heads() {
+        // num_key_value_heads == 0 would integer-divide-by-zero deriving
+        // num_kv_groups (num_attention_heads / num_key_value_heads) and panic in
+        // attention load. The guard rejects it loud, up front. (vb is built from a
+        // valid cfg; the guard fires before any tensor is touched.)
+        let good = tiny_cfg();
+        let vb = tiny_vb(&good);
+        let mut bad = tiny_cfg();
+        bad.num_key_value_heads = 0;
+        let err = QwenGradModel::load(&bad, &vb, 2, 4.0).unwrap_err();
+        assert!(
+            err.to_string().contains("num_key_value_heads must be"),
+            "expected a num_key_value_heads>=1 rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_rejects_indivisible_gqa() {
+        // num_attention_heads not divisible by num_key_value_heads truncates
+        // num_kv_groups, so repeat_kv expands the KV heads to a count that no
+        // longer matches the Q heads — a degenerate non-parity model. The load
+        // must fail loud. (Qwen3 head_dim is an explicit Config field, independent
+        // of num_attention_heads, so only the GQA-divisibility guard is at play.)
+        let mut cfg = tiny_cfg();
+        cfg.num_attention_heads = 4;
+        cfg.num_key_value_heads = 3; // 4 % 3 != 0
+        let vb = tiny_vb(&cfg);
+        let err = QwenGradModel::load(&cfg, &vb, 2, 4.0).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("not divisible by num_key_value_heads"),
+            "expected a GQA divisibility rejection, got: {err}"
         );
     }
 
