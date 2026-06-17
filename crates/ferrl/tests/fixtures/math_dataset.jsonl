@@ -1,0 +1,4 @@
+{"prompt": "What is 2 + 3?\nPut your final answer inside <answer></answer> tags.\n", "target": {"answer": "5"}}
+{"prompt": "What is 10 - 4?\nPut your final answer inside <answer></answer> tags.\n", "target": {"answer": "6"}}
+{"prompt": "What is 6 * 7?\nPut your final answer inside <answer></answer> tags.\n", "target": {"answer": "42"}}
+{"prompt": "What is 100 / 4?\nPut your final answer inside <answer></answer> tags.\n", "target": {"answer": "25"}}

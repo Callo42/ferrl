@@ -27,6 +27,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 rand = { workspace = true }
+# CLI parsing for the `ferrl` binary (the single-binary front door). Used only by
+# `src/bin/ferrl.rs`; the library API stays clap-free.
+clap = { workspace = true }
 # Optional, activated only by the `cuda` feature (see below): the proactive
 # driver-version query in `cuda_compat`. Off by default, so the CPU build is unchanged.
 cudarc = { workspace = true, optional = true }
@@ -40,6 +43,14 @@ approx = { workspace = true }
 anyhow = { workspace = true }
 # Signal -> flag wiring for the countdown example's restart-on-preemption demo.
 signal-hook = { workspace = true }
+
+# The single-binary front door: `ferrl train --config` / `ferrl runreport`. Lives
+# in `src/bin/` so it is excluded from the coverage denominator (it is thin CLI
+# glue; its end-to-end behavior is gated by the manual CPU smoke, and all
+# extractable logic lives in covered library modules).
+[[bin]]
+name = "ferrl"
+path = "src/bin/ferrl.rs"
 
 [features]
 # Default is CPU-only: this is what GitHub Actions CI builds and tests, and the

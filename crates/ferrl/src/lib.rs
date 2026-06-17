@@ -135,7 +135,9 @@ pub mod grpo;
 pub mod hf;
 pub mod llama;
 pub mod lm_policy;
+pub mod loader;
 pub mod lora;
+pub mod math;
 pub mod model;
 pub mod moe;
 pub mod nn;
@@ -187,7 +189,11 @@ pub use llama::{LlamaGradModel, LlamaMergedDecoder};
 #[doc(inline)]
 pub use lm_policy::{LlamaPolicy, LmPolicy, Qwen3_5Policy, QwenPolicy};
 #[doc(inline)]
+pub use loader::{load_qwen_policy, LoaderError, LoaderOpts};
+#[doc(inline)]
 pub use lora::DenseLoraTargets;
+#[doc(inline)]
+pub use math::{math_prompt, MathProblem, MathReward};
 #[doc(inline)]
 pub use model::{CachedDecoder, GradModel};
 #[doc(inline)]

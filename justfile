@@ -172,16 +172,17 @@ test:
 
 # Line coverage with the HARD gate (--fail-under-lines, default 90). Note:
 # llvm-cov does not instrument doctests, so this measures unit + integration
-# tests only — matching the CI `test` job. examples/ and bins are excluded from
-# the coverage denominator so thin, hard-to-test glue code (CLI entry points,
-# demo scripts) never dilutes the library's measured coverage.
+# tests only — matching the CI `test` job. examples/, bins, and `loader.rs` are
+# excluded from the coverage denominator so thin, hard-to-test glue code (CLI
+# entry points, demo scripts, the multi-GB checkpoint loader whose happy path
+# needs a real asset) never dilutes the library's measured coverage.
 [doc("Line coverage with HARD --fail-under-lines gate (default 90)")]
 cov:
-    @just _cargo llvm-cov --workspace --ignore-filename-regex '(examples|bin)/' --fail-under-lines {{COV_MIN}}
+    @just _cargo llvm-cov --workspace --ignore-filename-regex '(examples|bin)/|loader\.rs' --fail-under-lines {{COV_MIN}}
 
 # Emit an HTML coverage report under target/llvm-cov/html for local inspection.
 cov-html:
-    @just _cargo llvm-cov --workspace --ignore-filename-regex '(examples|bin)/' --html
+    @just _cargo llvm-cov --workspace --ignore-filename-regex '(examples|bin)/|loader\.rs' --html
     @echo ">> open target/llvm-cov/html/index.html"
 
 # --- Docs -------------------------------------------------------------------
