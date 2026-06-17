@@ -87,13 +87,14 @@ jobs:
       # NOT instrumented by llvm-cov, so they run separately below to guarantee
       # the examples in docs stay correct.
       # DEFAULT (CPU) features only — see the clippy job for why --all-features
-      # cannot run on CPU-only runners. examples/ and bins are excluded from the
-      # coverage denominator so glue code never dilutes the library gate.
+      # cannot run on CPU-only runners. examples/, bins, and loader.rs are excluded
+      # from the coverage denominator so glue code (CLI entry points, the multi-GB
+      # checkpoint loader) never dilutes the library gate.
       - name: "cargo llvm-cov (HARD gate: --fail-under-lines 90)"
         run: >-
           cargo llvm-cov
           --workspace
-          --ignore-filename-regex '(examples|bin)/'
+          --ignore-filename-regex '(examples|bin)/|loader\.rs'
           --lcov
           --output-path lcov.info
           --fail-under-lines 90

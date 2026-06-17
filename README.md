@@ -151,6 +151,68 @@ The script emits stable, indented JSON, so a no-op regeneration produces no diff
 
 ---
 
+## Wire your own task
+
+ferrl is **bring your own task**: you supply a *reward* and a *dataset of typed
+samples*, and the trainer does the rest. There are two paths in.
+
+### From the CLI — a built-in task
+
+The `ferrl` binary trains a built-in task end-to-end from a JSON config, and reports
+on a finished run:
+
+```sh
+cargo build --release            # builds the `ferrl` binary (target/release/ferrl)
+ferrl train --config run.json    # GRPO-train a built-in task; writes a run under runs/
+ferrl runreport runs/<run-id>    # one-glance health summary (--json, --strict available)
+```
+
+A `run.json` selects a task, points at a Qwen checkpoint, and carries the trainer
+config (only `task`, `model_dir`, and `trainer` are required; everything else has a
+default):
+
+```jsonc
+{
+  "task": "countdown",                 // built-in: "countdown" or "math"
+  "model_dir": "/path/to/qwen3-0.6b-base",
+  "device": "cpu",                     // or "cuda" (needs a --features cuda build)
+  "data": { "train_n": 64, "eval_n": 16 },
+  "trainer": { "steps": 50, "group_size": 8, "max_new_tokens": 48,
+               "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
+               "lr": 1e-5, "weight_decay": 0.0,
+               "loss_type": "grpo", "scale_rewards": "group" }
+}
+```
+
+`countdown` generates its data procedurally; `math` is file-backed — set `data.path`
+to a JSONL dataset of `{"prompt": ..., "target": {"answer": ...}}` lines (see
+`crates/ferrl/tests/fixtures/math_dataset.jsonl`).
+
+### From Rust — a task that isn't built in
+
+Implement `RewardFn` over your own typed target and hand the trainer a
+`Vec<Sample<T>>`. The full runnable template is
+[`examples/minimal_task.rs`](crates/ferrl/examples/minimal_task.rs); the core is:
+
+```rust
+use ferrl::{RewardError, RewardFn, Sample};
+
+struct ContainsKeyword;
+impl RewardFn for ContainsKeyword {
+    type Target = String;                       // your typed ground truth
+    fn reward(&self, sample: &Sample<String>, completion: &str) -> Result<f32, RewardError> {
+        Ok(if completion.contains(sample.target.as_str()) { 1.0 } else { 0.0 })
+    }
+}
+```
+
+Then load a policy (`ferrl::load_qwen_policy`), build a config
+(`TrainerConfig::builder()`), and call `Trainer::train`. Datasets load from JSONL via
+`ferrl::read_jsonl`; the library's worked rewards (`ferrl::CountdownReward`,
+`ferrl::MathReward`) are fuller references.
+
+---
+
 ## Oracle + golden fixture
 
 `scripts/gen_golden.py` computes, for tiny fixed examples, the GRPO advantages, the
@@ -215,8 +277,8 @@ Logging is structured via `tracing` + `tracing-subscriber`: the trainer enters a
 `run{rank=N world=N}` span and a per-step `step{step=N}` span, so every event carries
 rank / world / step (at ERROR level, the fields survive even `RUST_LOG=warn`). `runs/`
 is git-ignored. The on-disk layout is created by [`ferrl::telemetry::RunDir`] and metrics
-are appended by `ferrl::telemetry::MetricsWriter`; the `runreport` example reads a run's
-`metrics.jsonl` and prints a health summary — reward trend, throughput, and grad-norm
+are appended by `ferrl::telemetry::MetricsWriter`; the `ferrl runreport` subcommand reads a
+run's `metrics.jsonl` and prints a health summary — reward trend, throughput, and grad-norm
 anomalies (human, `--json`, or `--strict`).
 
 ---
