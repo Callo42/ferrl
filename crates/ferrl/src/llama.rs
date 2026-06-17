@@ -1,90 +1,44 @@
-//! A grad-bearing, uncached dense Llama-3.x forward — the second [`GradModel`].
+//! The dense Llama-3.x binding of the shared dense backbone ([`crate::dense`]).
 //!
 //! candle-transformers ships a Llama forward, but it is inference-shaped
 //! (`&mut Cache`, last-position-only logits, all layer types private) and built
-//! from ops that have **no backward**, so it cannot be used to train. This module
-//! is the *update* path for the dense Llama family (Llama 3.x: plain GQA,
+//! from ops that have **no backward**, so it cannot be used to train. The
+//! grad-bearing *update* path for the dense Llama family (Llama 3.x: plain GQA,
 //! rotate-half `RoPE` with optional llama3 scaling, `SwiGLU`, `RMSNorm`, no
-//! QK-norm, no biases): a full-sequence, uncached forward over the **same loaded
-//! weights** as candle's shipped `llama::Llama`, expressed entirely in
-//! grad-bearing ops, with a manual `LoRA` adapter attached per a
-//! [`DenseLoraTargets`] recipe (the historical `load()` default is q/v-only;
-//! see [`LlamaGradModel::load_with_targets`] for the industrial
-//! every-projection recipe).
+//! QK-norm, no biases) lives in [`crate::dense`] now, shared with Qwen3. This
+//! module is the thin Llama-specific seam over it: the [`LlamaArch`] marker,
+//! which validates candle's `llama::Config` and distills it into a [`DenseSpec`].
 //!
-//! It is the second implementor of the [`GradModel`] / [`CachedDecoder`] seam
-//! (after [`crate::qwen`]) — the validator that the model abstraction is real:
-//! the generic [`crate::lm_policy::LmPolicy`] and the `Trainer` drive it with
-//! **zero** policy/trainer changes. The architecture-specific code is only this
-//! module; everything neutral (frozen linear, GQA `repeat_kv`, `RoPE` tables,
-//! causal masks) comes from [`crate::blocks`].
-//!
-//! ## The three grad landmines (all replaced here)
-//!
-//! The same three autograd-cutting fused ops the Qwen forward replaces
-//! (see [`crate::qwen`] for the full table): `candle_nn::ops::rms_norm` →
-//! [`crate::nn::RmsNorm`] (`rms_norm_slow`), `candle_nn::rotary_emb::rope` →
-//! `rope_slow`, `candle_nn::ops::softmax_last_dim` → `softmax(_, D::Minus1)`.
-//! `silu` has a backward and is reused verbatim.
-//!
-//! ## Parity notes vs the shipped forward
+//! ## Parity notes vs the shipped forward (the Llama knobs)
 //!
 //! - The shipped non-flash attention **force-casts q/k/v to F32** for the
 //!   score/softmax computation and casts the context back to the model dtype;
-//!   this forward mirrors that (a no-op at F32, the same numerics at BF16).
-//!   The causal mask is therefore built in F32 here, matching the F32 scores.
+//!   the shared backbone mirrors that via `sdpa_f32 = true` (a no-op at F32, the
+//!   same numerics at BF16). The causal mask is therefore F32 here.
 //! - `head_dim` is derived as `hidden_size / num_attention_heads` (the llama
 //!   `Config` has no `head_dim` field), exactly as the shipped loader does.
-//! - `tie_word_embeddings == true` reuses the embedding matrix as the LM head
-//!   (the shared weight map then has **no** `lm_head.weight`), mirroring shipped.
+//! - No per-head QK-norm; the `SwiGLU` activation is fixed `Silu`.
 //! - `rope_scaling`: `None` (or `Some` with `rope_type: Default`) is the plain
 //!   `1/theta^(2i/d)` family; `Some` with `rope_type: Llama3` applies the llama3
-//!   wavelength-smoothing rescale to the inv-freqs at table-build time — both
-//!   mirrored from the shipped `Cache::new`, pinned by exact-value inv-freq
-//!   pins (every smoothing branch) plus the equivalence gates.
+//!   wavelength-smoothing rescale to the inv-freqs at table-build time (the
+//!   private `inv_freq_for` helper) — both mirrored from the shipped `Cache::new`,
+//!   pinned by exact-value inv-freq pins plus the equivalence gates below.
 //!
 //! ## Validation beyond CPU CI: real weights and the bf16 path
 //!
-//! Every CI test here runs on CPU at F32, where the attention force-cast pair
-//! is a same-dtype `to_dtype` — an op-free clone, structurally absent from the
+//! Every CI test here runs on CPU at F32, where the attention force-cast pair is
+//! a same-dtype `to_dtype` — an op-free clone, structurally absent from the
 //! autograd graph. The gaps that leaves are closed by two `#[ignore]`d manual
-//! gates (run by hand with a staged Llama-3.2-1B checkpoint; see their module
-//! docs), both green as of 2026-06:
-//!
-//! - `tests/llama_real_weights.rs` (CPU, F32): per-position equivalence vs
-//!   shipped at real scale — including the real llama3 `RoPE`-scaling regime
-//!   (factor 32 over 131k positions) and the tied 128k-row head — measured
-//!   worst per-position max-abs divergence 1.7e-5; plus two-phase per-branch
-//!   `LoRA`-grad coverage and a tokenizer round-trip.
-//! - `tests/llama_gpu_smoke.rs` (CUDA, bf16): the three behaviors previously
-//!   deferred here, now validated on an `sm_80` GPU — **bf16 logit equivalence
-//!   vs shipped** (argmax agreement 12/12, max rel diff 0.95% of logit scale),
-//!   **a real `ToDType` backward through the attention cast** (bf16-base /
-//!   F32-adapter two-phase grad coverage, every gradient landing in the F32
-//!   master dtype), and **bf16 merged-weight fidelity** (cached vs uncached:
-//!   argmax 21/21, max rel diff 1.9%) — plus a GRPO smoke driving
-//!   `LmPolicy<LlamaGradModel>` through the unchanged generic `Trainer`.
-//!
-//! Honest residual: these gates are manual (CI stays offline and CPU-only), so
-//! a bf16 regression surfaces at the next manual gate run, not in CI.
+//! gates (`tests/llama_real_weights.rs`, `tests/llama_gpu_smoke.rs`); see their
+//! module docs. Honest residual: those gates are manual, so a bf16 regression
+//! surfaces at the next manual gate run, not in CI.
 
-use std::cell::RefCell;
-
-use candle_core::backprop::GradStore;
-use candle_core::{DType, Device, Result as CandleResult, Tensor, Var, D};
-use candle_nn::kv_cache::ConcatKvCache;
-use candle_nn::ops::softmax;
-use candle_nn::rotary_emb::rope_slow;
-use candle_nn::{Activation, VarBuilder};
+use candle_core::{DType, Device, Result as CandleResult};
+use candle_nn::Activation;
 use candle_transformers::models::llama::{Config, Llama3RopeConfig, Llama3RopeType};
 
-use crate::blocks::{
-    causal_mask, causal_mask_at, frozen_linear, repeat_kv, windowed, RotaryTables,
-};
-use crate::lora::{DenseLoraTargets, Proj};
-use crate::model::{CachedDecoder, GradModel};
-use crate::nn::RmsNorm;
-use crate::remat::{stitched_backward, RematTape};
+use crate::blocks::RotaryTables;
+use crate::dense::{DenseArch, DenseCachedDecoder, DenseGradModel, DenseSpec};
 
 /// The plain rotate-half inverse frequencies `1/theta^(2i/d)`, one per rotated
 /// dimension pair — computed in f32 exactly as the shipped
@@ -133,393 +87,17 @@ fn inv_freq_for(cfg: &Config) -> Vec<f32> {
     }
 }
 
-/// One dense-Llama attention block; each projection carries the `LoRA` adapter
-/// or stays frozen per the [`DenseLoraTargets`] recipe. Replicates the shipped
-/// `CausalSelfAttention` (no QK-norm, no biases, F32 score path) with the
-/// grad-safe substitutions and no KV cache.
-#[derive(Debug)]
-struct LlamaAttention {
-    q_proj: Proj,
-    k_proj: Proj,
-    v_proj: Proj,
-    o_proj: Proj,
-    num_heads: usize,
-    num_kv_heads: usize,
-    num_kv_groups: usize,
-    head_dim: usize,
-    attn_hidden: usize,
-}
+/// The dense Llama-3.x architecture marker for the shared dense backbone (see
+/// [`crate::dense::DenseArch`]). Zero-sized; only its [`DenseArch`] impl matters.
+#[derive(Debug, Clone, Copy)]
+pub struct LlamaArch;
 
-impl LlamaAttention {
-    fn load(
-        cfg: &Config,
-        vb: &VarBuilder,
-        targets: DenseLoraTargets,
-        rank: usize,
-        alpha: f64,
-        adapter_dtype: DType,
-    ) -> CandleResult<Self> {
-        let h = cfg.hidden_size;
-        // The llama Config has no head_dim field; derive it as shipped does.
-        let head_dim = cfg.hidden_size / cfg.num_attention_heads;
-        let q_out = cfg.num_attention_heads * head_dim;
-        let kv_out = cfg.num_key_value_heads * head_dim;
-        Ok(Self {
-            q_proj: Proj::load(
-                vb,
-                "q_proj",
-                (q_out, h),
-                targets.attn_q,
-                rank,
-                alpha,
-                adapter_dtype,
-            )?,
-            k_proj: Proj::load(
-                vb,
-                "k_proj",
-                (kv_out, h),
-                targets.attn_k,
-                rank,
-                alpha,
-                adapter_dtype,
-            )?,
-            v_proj: Proj::load(
-                vb,
-                "v_proj",
-                (kv_out, h),
-                targets.attn_v,
-                rank,
-                alpha,
-                adapter_dtype,
-            )?,
-            o_proj: Proj::load(
-                vb,
-                "o_proj",
-                (h, q_out),
-                targets.attn_o,
-                rank,
-                alpha,
-                adapter_dtype,
-            )?,
-            num_heads: cfg.num_attention_heads,
-            num_kv_heads: cfg.num_key_value_heads,
-            num_kv_groups: cfg.num_attention_heads / cfg.num_key_value_heads,
-            head_dim,
-            attn_hidden: q_out,
-        })
-    }
+impl DenseArch for LlamaArch {
+    type Config = Config;
 
-    fn forward(
-        &self,
-        x: &Tensor,
-        mask: Option<&Tensor>,
-        rot: &RotaryTables,
-    ) -> CandleResult<Tensor> {
-        let (b, l, _) = x.dims3()?;
-        let in_dtype = x.dtype();
+    const LABEL: &'static str = "LlamaGradModel";
 
-        // 1. Projections, each adapted or frozen per the recipe. No biases
-        //    anywhere.
-        let q = self.q_proj.forward(x)?;
-        let k = self.k_proj.forward(x)?;
-        let v = self.v_proj.forward(x)?;
-
-        // 2. (B, L, H, D) -> (B, H, L, D).
-        let q = q
-            .reshape((b, l, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let k = k
-            .reshape((b, l, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let v = v
-            .reshape((b, l, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-
-        // 3. RoPE (grad-safe rope_slow; half-width cos/sin). No QK-norm.
-        let (cos, sin) = rot.slice(l)?;
-        let q = rope_slow(&q.contiguous()?, &cos, &sin)?;
-        let k = rope_slow(&k.contiguous()?, &cos, &sin)?;
-
-        // 4. (no KV cache) GQA repeat.
-        let k = repeat_kv(&k, self.num_kv_groups)?.contiguous()?;
-        let v = repeat_kv(&v.contiguous()?, self.num_kv_groups)?.contiguous()?;
-
-        // 5. Scaled dot-product attention in F32 (the shipped non-flash path
-        //    force-casts q/k/v to F32 — a grad-safe identity at F32, the same
-        //    numerics at BF16), with the grad-safe softmax.
-        let q = q.to_dtype(DType::F32)?;
-        let k = k.to_dtype(DType::F32)?;
-        let v = v.to_dtype(DType::F32)?;
-        let mut scores = (q.contiguous()?.matmul(&k.transpose(2, 3)?.contiguous()?)?
-            / (self.head_dim as f64).sqrt())?;
-        if let Some(m) = mask {
-            scores = scores.broadcast_add(m)?;
-        }
-        let probs = softmax(&scores, D::Minus1)?;
-        let ctx = probs.matmul(&v)?.to_dtype(in_dtype)?;
-
-        // 6. Output projection.
-        let ctx = ctx
-            .transpose(1, 2)?
-            .contiguous()?
-            .reshape((b, l, self.attn_hidden))?;
-        self.o_proj.forward(&ctx)
-    }
-
-    fn set_adapter_enabled(&mut self, enabled: bool) {
-        self.q_proj.set_enabled(enabled);
-        self.k_proj.set_enabled(enabled);
-        self.v_proj.set_enabled(enabled);
-        self.o_proj.set_enabled(enabled);
-    }
-
-    /// Var order within the layer: `q_proj, k_proj, v_proj, o_proj` (adapted
-    /// ones only).
-    fn push_vars(&self, out: &mut Vec<Var>) {
-        self.q_proj.push_vars(out);
-        self.k_proj.push_vars(out);
-        self.v_proj.push_vars(out);
-        self.o_proj.push_vars(out);
-    }
-}
-
-/// `SwiGLU` MLP, activation fixed to `silu` (the llama Config has no
-/// `hidden_act` knob); each projection may carry the adapter per the
-/// [`DenseLoraTargets`] recipe.
-#[derive(Debug)]
-struct LlamaMlp {
-    gate_proj: Proj,
-    up_proj: Proj,
-    down_proj: Proj,
-}
-
-impl LlamaMlp {
-    fn load(
-        cfg: &Config,
-        vb: &VarBuilder,
-        targets: DenseLoraTargets,
-        rank: usize,
-        alpha: f64,
-        adapter_dtype: DType,
-    ) -> CandleResult<Self> {
-        let h = cfg.hidden_size;
-        let i = cfg.intermediate_size;
-        Ok(Self {
-            gate_proj: Proj::load(
-                vb,
-                "gate_proj",
-                (i, h),
-                targets.mlp_gate,
-                rank,
-                alpha,
-                adapter_dtype,
-            )?,
-            up_proj: Proj::load(
-                vb,
-                "up_proj",
-                (i, h),
-                targets.mlp_up,
-                rank,
-                alpha,
-                adapter_dtype,
-            )?,
-            down_proj: Proj::load(
-                vb,
-                "down_proj",
-                (h, i),
-                targets.mlp_down,
-                rank,
-                alpha,
-                adapter_dtype,
-            )?,
-        })
-    }
-
-    fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
-        let lhs = self.gate_proj.forward(x)?.apply(&Activation::Silu)?;
-        let rhs = self.up_proj.forward(x)?;
-        self.down_proj.forward(&lhs.broadcast_mul(&rhs)?)
-    }
-
-    fn set_adapter_enabled(&mut self, enabled: bool) {
-        self.gate_proj.set_enabled(enabled);
-        self.up_proj.set_enabled(enabled);
-        self.down_proj.set_enabled(enabled);
-    }
-
-    /// Var order: `gate_proj, up_proj, down_proj` (adapted ones only).
-    fn push_vars(&self, out: &mut Vec<Var>) {
-        self.gate_proj.push_vars(out);
-        self.up_proj.push_vars(out);
-        self.down_proj.push_vars(out);
-    }
-}
-
-/// One decoder layer: pre-norm attention + pre-norm `SwiGLU`, both residual.
-#[derive(Debug)]
-struct LlamaLayer {
-    ln1: RmsNorm,
-    attn: LlamaAttention,
-    ln2: RmsNorm,
-    mlp: LlamaMlp,
-}
-
-impl LlamaLayer {
-    fn load(
-        cfg: &Config,
-        vb: &VarBuilder,
-        targets: DenseLoraTargets,
-        rank: usize,
-        alpha: f64,
-        adapter_dtype: DType,
-    ) -> CandleResult<Self> {
-        let eps = cfg.rms_norm_eps as f32;
-        let h = cfg.hidden_size;
-        Ok(Self {
-            ln1: RmsNorm::new(vb.pp("input_layernorm").get(h, "weight")?, eps),
-            attn: LlamaAttention::load(
-                cfg,
-                &vb.pp("self_attn"),
-                targets,
-                rank,
-                alpha,
-                adapter_dtype,
-            )?,
-            ln2: RmsNorm::new(vb.pp("post_attention_layernorm").get(h, "weight")?, eps),
-            mlp: LlamaMlp::load(cfg, &vb.pp("mlp"), targets, rank, alpha, adapter_dtype)?,
-        })
-    }
-
-    fn forward(
-        &self,
-        x: &Tensor,
-        mask: Option<&Tensor>,
-        rot: &RotaryTables,
-    ) -> CandleResult<Tensor> {
-        let h = self.ln1.forward(x)?;
-        let h = self.attn.forward(&h, mask, rot)?;
-        let x = x.broadcast_add(&h)?;
-        let h2 = self.ln2.forward(&x)?;
-        let h2 = self.mlp.forward(&h2)?;
-        x.broadcast_add(&h2)
-    }
-
-    fn set_adapter_enabled(&mut self, enabled: bool) {
-        self.attn.set_adapter_enabled(enabled);
-        self.mlp.set_adapter_enabled(enabled);
-    }
-
-    /// Var order within the layer: the attention projections first, then the
-    /// MLP's.
-    fn push_vars(&self, out: &mut Vec<Var>) {
-        self.attn.push_vars(out);
-        self.mlp.push_vars(out);
-    }
-}
-
-/// A grad-bearing, uncached dense Llama-3.x forward with `LoRA` attached per a
-/// [`DenseLoraTargets`] recipe — the second [`GradModel`] implementor.
-///
-/// Built from the same [`VarBuilder`] (over the same safetensors) as candle's
-/// shipped `llama::Llama`, so the two are weight-identical and their logits
-/// match (the M1 equivalence gate). The base weights are frozen [`Tensor`]s;
-/// only the `LoRA` `A`/`B` factors are trainable [`Var`]s, in a deterministic
-/// layer-major order (the positional checkpoint contract).
-#[derive(Debug)]
-pub struct LlamaGradModel {
-    embed: Tensor,
-    lm_head: Option<Tensor>,
-    layers: Vec<LlamaLayer>,
-    norm: RmsNorm,
-    rot: RotaryTables,
-    hidden: usize,
-    device: Device,
-    targets: DenseLoraTargets,
-    adapter_enabled: bool,
-    remat: bool,
-    /// The pending checkpointed-forward tape — see
-    /// [`QwenGradModel`](crate::qwen::QwenGradModel)'s field of the same name
-    /// (same contract: one tape per forward, one backward per tape, `!Sync`).
-    tape: RefCell<Option<RematTape>>,
-}
-
-impl LlamaGradModel {
-    /// Load the model from `vb`, attaching a `LoRA` adapter of the given `rank`
-    /// and `alpha` with the **historical q/v-only recipe**
-    /// ([`DenseLoraTargets::legacy`]) — kept (rather than the industrial
-    /// default) so pre-recipe adapter checkpoints stay positionally loadable
-    /// through this constructor. Use
-    /// [`load_with_targets`](Self::load_with_targets) for the industrial
-    /// recipe.
-    ///
-    /// `vb` must be over the Llama safetensors (any dtype; F32 for the CPU
-    /// equivalence gate). `cfg` is candle's own `llama::Config` so derived dims
-    /// (notably `head_dim = hidden_size / num_attention_heads`) match the
-    /// shipped model exactly. Only the non-flash-attention configuration is
-    /// supported; `use_flash_attn == true` is rejected (see Errors) rather than
-    /// loaded as a silently non-parity model.
-    ///
-    /// # Errors
-    ///
-    /// As [`load_with_targets`](Self::load_with_targets).
-    pub fn load(cfg: &Config, vb: &VarBuilder, rank: usize, alpha: f64) -> CandleResult<Self> {
-        // The adapter shares the base weights' dtype (the toy / all-F32 case).
-        Self::load_with_targets(cfg, vb, rank, alpha, vb.dtype(), DenseLoraTargets::legacy())
-    }
-
-    /// Like [`load`](Self::load) (the historical q/v-only recipe), but holds
-    /// the trainable `LoRA` adapter in `adapter_dtype`, independent of the
-    /// (frozen) base weights' dtype.
-    ///
-    /// This is the same **bf16-base / F32-adapter** split as
-    /// [`crate::qwen::QwenGradModel::load_with_adapter_dtype`]: load `vb` in
-    /// BF16 while keeping the adapter — and so its gradients and the `AdamW`
-    /// moments — in F32, where a small update cannot collapse. See
-    /// [`crate::lora::LoraLinear::with_adapter_dtype`].
-    ///
-    /// # Errors
-    ///
-    /// As [`load_with_targets`](Self::load_with_targets).
-    pub fn load_with_adapter_dtype(
-        cfg: &Config,
-        vb: &VarBuilder,
-        rank: usize,
-        alpha: f64,
-        adapter_dtype: DType,
-    ) -> CandleResult<Self> {
-        Self::load_with_targets(
-            cfg,
-            vb,
-            rank,
-            alpha,
-            adapter_dtype,
-            DenseLoraTargets::legacy(),
-        )
-    }
-
-    /// Load the model from `vb`, attaching the `LoRA` adapter per `targets`
-    /// (see [`DenseLoraTargets`]; `DenseLoraTargets::default()` is the
-    /// industrial every-projection recipe).
-    ///
-    /// # Errors
-    ///
-    /// Returns a candle error if `cfg.use_flash_attn` is set, if `targets`
-    /// selects nothing (an untrainable model), if a weight tensor is missing
-    /// or mis-shaped, or if the `LoRA` factors cannot be allocated.
-    pub fn load_with_targets(
-        cfg: &Config,
-        vb: &VarBuilder,
-        rank: usize,
-        alpha: f64,
-        adapter_dtype: DType,
-        targets: DenseLoraTargets,
-    ) -> CandleResult<Self> {
-        if !targets.any() {
-            candle_core::bail!(
-                "LlamaGradModel: DenseLoraTargets selects no projection — the model would \
-                 have no trainable parameters"
-            );
-        }
+    fn spec(cfg: &Config, dtype: DType, device: &Device) -> CandleResult<DenseSpec> {
         // Fail loud on Config options this forward does not implement, rather
         // than silently loading a non-parity model (the P3 pattern). Flash
         // attention is a fused GPU kernel with no backward and different
@@ -583,636 +161,55 @@ impl LlamaGradModel {
                 cfg.num_key_value_heads
             );
         }
-        let h = cfg.hidden_size;
-        let embed = vb
-            .pp("model.embed_tokens")
-            .get((cfg.vocab_size, h), "weight")?;
-        let lm_head = if cfg.tie_word_embeddings {
-            None
-        } else {
-            Some(vb.pp("lm_head").get((cfg.vocab_size, h), "weight")?)
-        };
-        let layers_vb = vb.pp("model.layers");
-        let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
-        for i in 0..cfg.num_hidden_layers {
-            layers.push(LlamaLayer::load(
-                cfg,
-                &layers_vb.pp(i),
-                targets,
-                rank,
-                alpha,
-                adapter_dtype,
-            )?);
-        }
-        Ok(Self {
-            embed,
-            lm_head,
-            layers,
-            norm: RmsNorm::new(
-                vb.pp("model.norm").get(h, "weight")?,
-                cfg.rms_norm_eps as f32,
-            ),
-            // The inv-freqs carry the whole rope_scaling story (llama3
-            // smoothing happens at table-build time); the table layout itself
-            // is the architecture-neutral one in crate::blocks.
+        Ok(DenseSpec {
+            vocab_size: cfg.vocab_size,
+            hidden_size: cfg.hidden_size,
+            num_hidden_layers: cfg.num_hidden_layers,
+            num_attention_heads: cfg.num_attention_heads,
+            num_key_value_heads: cfg.num_key_value_heads,
+            // The llama Config has no head_dim field; derive it as shipped does.
+            head_dim: cfg.hidden_size / cfg.num_attention_heads,
+            intermediate_size: cfg.intermediate_size,
+            rms_norm_eps: cfg.rms_norm_eps as f32,
+            tie_word_embeddings: cfg.tie_word_embeddings,
+            // Llama has no per-head QK-norm; it force-casts the SDPA to F32 (the
+            // shipped non-flash path) and fixes the SwiGLU activation to Silu.
+            qk_norm: false,
+            sdpa_f32: true,
+            activation: Activation::Silu,
+            // The inv-freqs carry the whole rope_scaling story (llama3 smoothing
+            // happens at table-build time); the table layout is the neutral one.
             rot: RotaryTables::with_inv_freq(
                 inv_freq_for(cfg),
                 cfg.max_position_embeddings,
-                vb.dtype(),
-                vb.device(),
+                dtype,
+                device,
             )?,
-            hidden: h,
-            device: vb.device().clone(),
-            targets,
-            adapter_enabled: true,
-            remat: false,
-            tape: RefCell::new(None),
         })
     }
-
-    /// The [`DenseLoraTargets`] recipe this model was loaded with (for logging
-    /// and checkpoint metadata — see [`DenseLoraTargets::canonical`]).
-    #[must_use]
-    pub fn lora_targets(&self) -> DenseLoraTargets {
-        self.targets
-    }
-
-    /// Full-sequence logits `[batch, seq, vocab]` for `input_ids` (`[batch,
-    /// seq]`, `u32`). Unlike candle's shipped `Llama::forward` (which narrows
-    /// to the last position and force-casts to F32), this returns every
-    /// position in the model dtype so the trainer can score whole completions.
-    ///
-    /// # Errors
-    ///
-    /// Returns a candle error if any tensor op fails (e.g. a shape mismatch).
-    pub fn forward(&self, input_ids: &Tensor) -> CandleResult<Tensor> {
-        self.forward_window(input_ids, None)
-    }
-
-    /// The narrowed scoring forward: the full layer walk with the final
-    /// norm + head applied to the `(start, len)` window alone — same scheme
-    /// and contract as
-    /// [`QwenGradModel::forward_narrowed`](crate::qwen::QwenGradModel::forward_narrowed).
-    ///
-    /// # Errors
-    ///
-    /// Returns a candle error if the window exceeds the sequence or any
-    /// tensor op fails.
-    pub fn forward_narrowed(
-        &self,
-        input_ids: &Tensor,
-        start: usize,
-        len: usize,
-    ) -> CandleResult<Tensor> {
-        self.forward_window(input_ids, Some((start, len)))
-    }
-
-    /// The shared tape-bearing walk behind [`forward`](Self::forward) and
-    /// [`forward_narrowed`](Self::forward_narrowed).
-    fn forward_window(
-        &self,
-        input_ids: &Tensor,
-        window: Option<(usize, usize)>,
-    ) -> CandleResult<Tensor> {
-        if self.remat {
-            return self.forward_remat(input_ids, window);
-        }
-        let (mut h, mask) = self.embed_and_mask(input_ids)?;
-        for layer in &self.layers {
-            h = layer.forward(&h, mask.as_ref(), &self.rot)?;
-        }
-        self.norm_and_head(&h, window)
-    }
-
-    /// Shared prologue of every full-sequence walk: the token embedding plus
-    /// the full causal mask (`None` at seq-len 1). The mask is built in F32
-    /// because the attention scores it is added to are always F32 (the
-    /// shipped force-cast, mirrored in `LlamaAttention`).
-    fn embed_and_mask(&self, input_ids: &Tensor) -> CandleResult<(Tensor, Option<Tensor>)> {
-        let (b, l) = input_ids.dims2()?;
-        let ids = input_ids.flatten_all()?;
-        let h = self
-            .embed
-            .index_select(&ids, 0)?
-            .reshape((b, l, self.hidden))?;
-        let mask = if l == 1 {
-            None
-        } else {
-            Some(causal_mask(l, DType::F32, &self.device)?)
-        };
-        Ok((h, mask))
-    }
-
-    /// Shared tail of every walk: narrow to the `window` FIRST (this is the
-    /// memory lever — the head must only ever see the window), then the final
-    /// norm plus the (possibly tied) `lm_head` projection. The narrow lives
-    /// inside this seam deliberately, so no caller can reorder it after the
-    /// head and silently rematerialize full-width logits.
-    fn norm_and_head(&self, h: &Tensor, window: Option<(usize, usize)>) -> CandleResult<Tensor> {
-        let h = self.norm.forward(&windowed(h, window)?)?;
-        match &self.lm_head {
-            Some(w) => frozen_linear(&h, w),
-            None => frozen_linear(&h, &self.embed),
-        }
-    }
-
-    /// The checkpointed forward — boundary [`Var`] per layer plus the tail;
-    /// same scheme and contract as
-    /// [`QwenGradModel`](crate::qwen::QwenGradModel)'s, including the
-    /// loss-tape window narrow (the tail boundary stays full-width).
-    fn forward_remat(
-        &self,
-        input_ids: &Tensor,
-        window: Option<(usize, usize)>,
-    ) -> CandleResult<Tensor> {
-        let (mut h, mask) = self.embed_and_mask(input_ids)?;
-        let mut tape = RematTape::new(self.adapter_enabled);
-        for layer in &self.layers {
-            let x = tape.capture(&h)?;
-            h = layer.forward(&x, mask.as_ref(), &self.rot)?;
-        }
-        let x = tape.capture(&h)?;
-        *self.tape.borrow_mut() = Some(tape);
-        self.norm_and_head(&x, window)
-    }
-
-    /// Detached full-sequence logits with a rolling boundary detach — same
-    /// values as [`forward`](Self::forward) at a one-layer peak footprint,
-    /// never capturing a tape. For the value-only scorings.
-    ///
-    /// # Errors
-    ///
-    /// Returns a candle error if any tensor op fails.
-    pub fn forward_detached(&self, input_ids: &Tensor) -> CandleResult<Tensor> {
-        self.forward_detached_window(input_ids, None)
-    }
-
-    /// The narrowed detached scoring forward: rolling boundary detach plus
-    /// the windowed tail (see [`GradModel::forward_detached_narrowed`]).
-    ///
-    /// # Errors
-    ///
-    /// Returns a candle error if the window exceeds the sequence or any
-    /// tensor op fails.
-    pub fn forward_detached_narrowed(
-        &self,
-        input_ids: &Tensor,
-        start: usize,
-        len: usize,
-    ) -> CandleResult<Tensor> {
-        self.forward_detached_window(input_ids, Some((start, len)))
-    }
-
-    /// The shared detached walk behind
-    /// [`forward_detached`](Self::forward_detached) and
-    /// [`forward_detached_narrowed`](Self::forward_detached_narrowed).
-    fn forward_detached_window(
-        &self,
-        input_ids: &Tensor,
-        window: Option<(usize, usize)>,
-    ) -> CandleResult<Tensor> {
-        let (mut h, mask) = self.embed_and_mask(input_ids)?;
-        for layer in &self.layers {
-            h = layer.forward(&h, mask.as_ref(), &self.rot)?.detach();
-        }
-        Ok(self.norm_and_head(&h, window)?.detach())
-    }
-
-    /// Back-propagate a loss built from this model's logits — plain
-    /// `loss.backward()` normally, tape-stitched under
-    /// [activation checkpointing](Self::set_activation_checkpointing); same
-    /// contract as [`QwenGradModel::backward`](crate::qwen::QwenGradModel::backward).
-    ///
-    /// # Errors
-    ///
-    /// Returns a candle error on any backward failure or tape-contract
-    /// violation (no pending forward, foreign loss, adapter flipped).
-    pub fn backward(&self, loss: &Tensor) -> CandleResult<GradStore> {
-        if !self.remat {
-            return loss.backward();
-        }
-        let Some(tape) = self.tape.borrow_mut().take() else {
-            candle_core::bail!(
-                "LlamaGradModel::backward: activation checkpointing is on but no checkpointed \
-                 forward is pending (each forward's tape is consumed by exactly one backward)"
-            )
-        };
-        if tape.adapter_enabled() != self.adapter_enabled {
-            candle_core::bail!(
-                "LlamaGradModel::backward: the adapter toggle flipped between the checkpointed \
-                 forward and its backward — the recompute would rebuild different values"
-            )
-        }
-        let l = tape.first_boundary_dims().map(|d| d[1]).unwrap_or_default();
-        let mask = if l <= 1 {
-            None
-        } else {
-            Some(causal_mask(l, DType::F32, &self.device)?)
-        };
-        stitched_backward(loss, &tape, &self.trainable_vars(), |i, x| {
-            self.layers[i].forward(x, mask.as_ref(), &self.rot)
-        })
-    }
-
-    /// Turn **activation checkpointing** on or off (default: off) — same
-    /// trade and contract as
-    /// [`QwenGradModel::set_activation_checkpointing`](crate::qwen::QwenGradModel::set_activation_checkpointing).
-    pub fn set_activation_checkpointing(&mut self, on: bool) {
-        self.remat = on;
-        if !on {
-            *self.tape.borrow_mut() = None;
-        }
-    }
-
-    /// Whether activation checkpointing is currently on.
-    #[must_use]
-    pub fn activation_checkpointing(&self) -> bool {
-        self.remat
-    }
-
-    /// Enable/disable the `LoRA` adapter on every layer (disabled == the frozen
-    /// base model == the GRPO reference policy).
-    pub fn set_adapter_enabled(&mut self, enabled: bool) {
-        for layer in &mut self.layers {
-            layer.set_adapter_enabled(enabled);
-        }
-        self.adapter_enabled = enabled;
-    }
-
-    /// All trainable `LoRA` [`Var`]s in a **deterministic** order — layer-major;
-    /// within a layer the attention projections first (`q,k,v,o`), then the
-    /// MLP's (`gate,up,down`); each adapted projection contributes `[A, B]`.
-    /// The order is a pure function of (config, [`DenseLoraTargets`]) — the
-    /// positional checkpoint contract.
-    #[must_use]
-    pub fn trainable_vars(&self) -> Vec<Var> {
-        let mut vars = Vec::new();
-        for layer in &self.layers {
-            layer.push_vars(&mut vars);
-        }
-        vars
-    }
-
-    /// The device the weights live on, so a caller (e.g.
-    /// [`crate::LlamaPolicy`]) can build `input_ids` tensors on the same device.
-    #[must_use]
-    pub fn device(&self) -> &Device {
-        &self.device
-    }
-
-    /// Snapshot the **current** effective weights into a KV-cached, grad-free
-    /// [`LlamaMergedDecoder`] for fast incremental rollout.
-    ///
-    /// Same design as [`crate::qwen::QwenGradModel::merged_decoder`]: folds the
-    /// live `LoRA` adapter into every adapted projection via
-    /// [`crate::lora::LoraLinear::merged_weight`] (respecting the adapter
-    /// toggle), clones the frozen rest, and hands back a decoder over candle's
-    /// `ConcatKvCache` — O(L) per token instead of the uncached forward's
-    /// O(L²). **Rebuild after every optimizer step** (and after any
-    /// `set_adapter_enabled` flip): the returned decoder is a tape-detached
-    /// value snapshot.
-    ///
-    /// # Errors
-    ///
-    /// Returns a candle error if any `merged_weight` build fails.
-    pub fn merged_decoder(&self) -> CandleResult<LlamaMergedDecoder> {
-        LlamaMergedDecoder::from_model(self)
-    }
 }
 
-/// The [`GradModel`] seam over [`LlamaGradModel`]: pure delegation to the
-/// inherent methods above (which stay public — the trait adds a generic
-/// surface, it does not replace the concrete one).
-impl GradModel for LlamaGradModel {
-    type Decoder = LlamaMergedDecoder;
+/// A grad-bearing, uncached dense Llama-3.x forward with `LoRA` — the
+/// [`DenseGradModel`] over the Llama [`LlamaArch`]. Built from the same
+/// `VarBuilder` (over the same safetensors) as candle's shipped `llama::Llama`,
+/// so the two are weight-identical and their logits match (the equivalence gate
+/// below).
+pub type LlamaGradModel = DenseGradModel<LlamaArch>;
 
-    fn device(&self) -> &Device {
-        LlamaGradModel::device(self)
-    }
-
-    fn forward(&self, input_ids: &Tensor) -> CandleResult<Tensor> {
-        LlamaGradModel::forward(self, input_ids)
-    }
-
-    fn forward_detached(&self, input_ids: &Tensor) -> CandleResult<Tensor> {
-        LlamaGradModel::forward_detached(self, input_ids)
-    }
-
-    fn forward_narrowed(
-        &self,
-        input_ids: &Tensor,
-        start: usize,
-        len: usize,
-    ) -> CandleResult<Tensor> {
-        LlamaGradModel::forward_narrowed(self, input_ids, start, len)
-    }
-
-    fn forward_detached_narrowed(
-        &self,
-        input_ids: &Tensor,
-        start: usize,
-        len: usize,
-    ) -> CandleResult<Tensor> {
-        LlamaGradModel::forward_detached_narrowed(self, input_ids, start, len)
-    }
-
-    fn backward(&self, loss: &Tensor) -> CandleResult<GradStore> {
-        LlamaGradModel::backward(self, loss)
-    }
-
-    fn trainable_vars(&self) -> Vec<Var> {
-        LlamaGradModel::trainable_vars(self)
-    }
-
-    fn set_adapter_enabled(&mut self, enabled: bool) {
-        LlamaGradModel::set_adapter_enabled(self, enabled);
-    }
-
-    fn merged_decoder(&self) -> CandleResult<LlamaMergedDecoder> {
-        LlamaGradModel::merged_decoder(self)
-    }
-
-    fn lora_recipe(&self) -> Option<String> {
-        Some(self.targets.canonical())
-    }
-}
-
-/// One dense-Llama attention block over **merged** weights with an incremental
-/// KV cache — the grad-free mirror of [`LlamaAttention`]. Every projection uses
-/// its single effective weight (the folded
-/// [`crate::lora::LoraLinear::merged_weight`] when adapted, the frozen base
-/// otherwise; all bias-free — the llama family has no projection biases); the
-/// un-repeated K/V are appended to a [`ConcatKvCache`] before `repeat_kv`, the
-/// shipped op order (project → reshape/transpose → `RoPE(offset)` → cache
-/// append → `repeat_kv` → F32 SDPA → `o_proj`).
-#[derive(Debug)]
-struct LlamaMergedAttention {
-    q_weight: Tensor,
-    k_weight: Tensor,
-    v_weight: Tensor,
-    o_weight: Tensor,
-    num_heads: usize,
-    num_kv_heads: usize,
-    num_kv_groups: usize,
-    head_dim: usize,
-    attn_hidden: usize,
-    /// Un-repeated K/V cache (`[b, kv_heads, seq, head_dim]`), concatenated on
-    /// the sequence axis (dim 2); `repeat_kv` is applied to the cache's output,
-    /// never to what is stored.
-    cache: ConcatKvCache,
-}
-
-impl LlamaMergedAttention {
-    fn forward(
-        &mut self,
-        x: &Tensor,
-        offset: usize,
-        mask: Option<&Tensor>,
-        rot: &RotaryTables,
-    ) -> CandleResult<Tensor> {
-        let (b, l, _) = x.dims3()?;
-        let in_dtype = x.dtype();
-
-        // 1. Projections over merged weights (adapted ones carry the folded
-        //    adapter; the rest are the frozen base). Bias-free by construction.
-        let q = frozen_linear(x, &self.q_weight)?;
-        let k = frozen_linear(x, &self.k_weight)?;
-        let v = frozen_linear(x, &self.v_weight)?;
-
-        // 2. (B, L, H, D) -> (B, H, L, D).
-        let q = q
-            .reshape((b, l, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let k = k
-            .reshape((b, l, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let v = v
-            .reshape((b, l, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-
-        // 3. RoPE at the absolute position `offset` (grad-safe rope_slow).
-        let (cos, sin) = rot.slice_at(offset, l)?;
-        let q = rope_slow(&q.contiguous()?, &cos, &sin)?;
-        let k = rope_slow(&k.contiguous()?, &cos, &sin)?;
-
-        // 4. Append the UN-repeated K/V, then GQA-repeat the full cached K/V —
-        //    repeat AFTER append (the shipped order) so the cache stays compact.
-        let (k, v) = self.cache.append(&k.contiguous()?, &v.contiguous()?)?;
-        let k = repeat_kv(&k, self.num_kv_groups)?.contiguous()?;
-        let v = repeat_kv(&v, self.num_kv_groups)?.contiguous()?;
-
-        // 5. Scaled dot-product attention in F32 (mirroring the shipped
-        //    force-cast and the uncached LlamaAttention) with grad-safe softmax.
-        let q = q.to_dtype(DType::F32)?;
-        let k = k.to_dtype(DType::F32)?;
-        let v = v.to_dtype(DType::F32)?;
-        let mut scores = (q.contiguous()?.matmul(&k.transpose(2, 3)?.contiguous()?)?
-            / (self.head_dim as f64).sqrt())?;
-        if let Some(m) = mask {
-            scores = scores.broadcast_add(m)?;
-        }
-        let probs = softmax(&scores, D::Minus1)?;
-        let ctx = probs.matmul(&v)?.to_dtype(in_dtype)?;
-
-        // 6. Output projection.
-        let ctx = ctx
-            .transpose(1, 2)?
-            .contiguous()?
-            .reshape((b, l, self.attn_hidden))?;
-        frozen_linear(&ctx, &self.o_weight)
-    }
-}
-
-/// `SwiGLU` MLP over merged weights — the grad-free mirror of [`LlamaMlp`].
-#[derive(Debug)]
-struct LlamaMergedMlp {
-    gate_weight: Tensor,
-    up_weight: Tensor,
-    down_weight: Tensor,
-}
-
-impl LlamaMergedMlp {
-    fn from_layer(mlp: &LlamaMlp) -> CandleResult<Self> {
-        Ok(Self {
-            gate_weight: mlp.gate_proj.merged_weight()?,
-            up_weight: mlp.up_proj.merged_weight()?,
-            down_weight: mlp.down_proj.merged_weight()?,
-        })
-    }
-
-    fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
-        let lhs = frozen_linear(x, &self.gate_weight)?.apply(&Activation::Silu)?;
-        let rhs = frozen_linear(x, &self.up_weight)?;
-        frozen_linear(&lhs.broadcast_mul(&rhs)?, &self.down_weight)
-    }
-}
-
-/// One decoder layer over merged weights: pre-norm cached attention + pre-norm
-/// merged `SwiGLU`, both residual. The grad-free mirror of [`LlamaLayer`].
-#[derive(Debug)]
-struct LlamaMergedLayer {
-    ln1: RmsNorm,
-    attn: LlamaMergedAttention,
-    ln2: RmsNorm,
-    mlp: LlamaMergedMlp,
-}
-
-impl LlamaMergedLayer {
-    fn forward(
-        &mut self,
-        x: &Tensor,
-        offset: usize,
-        mask: Option<&Tensor>,
-        rot: &RotaryTables,
-    ) -> CandleResult<Tensor> {
-        let h = self.ln1.forward(x)?;
-        let h = self.attn.forward(&h, offset, mask, rot)?;
-        let x = x.broadcast_add(&h)?;
-        let h2 = self.ln2.forward(&x)?;
-        let h2 = self.mlp.forward(&h2)?;
-        x.broadcast_add(&h2)
-    }
-}
-
-/// A KV-cached, **grad-free** dense-Llama decoder over weights with the `LoRA`
-/// adapter already folded in — the fast rollout twin of [`LlamaGradModel`],
-/// and its [`CachedDecoder`].
-///
-/// Built by [`LlamaGradModel::merged_decoder`]; same design, contracts, and
-/// cache lifecycle as [`crate::qwen::MergedDecoder`] (value snapshot —
-/// rebuild after any optimizer step or adapter toggle; `offset` must equal the
-/// cached length, enforced fail-loud; `reset_cache` starts a fresh sequence).
-/// It holds **no** [`Var`] and records no autograd tape.
-#[derive(Debug)]
-pub struct LlamaMergedDecoder {
-    embed: Tensor,
-    lm_head: Option<Tensor>,
-    layers: Vec<LlamaMergedLayer>,
-    norm: RmsNorm,
-    rot: RotaryTables,
-    hidden: usize,
-    device: Device,
-}
-
-impl LlamaMergedDecoder {
-    /// Snapshot a [`LlamaGradModel`]'s current effective weights. Private —
-    /// callers go through [`LlamaGradModel::merged_decoder`].
-    fn from_model(model: &LlamaGradModel) -> CandleResult<Self> {
-        let mut layers = Vec::with_capacity(model.layers.len());
-        for layer in &model.layers {
-            let a = &layer.attn;
-            // This snapshot applies NO bias, which is sound by construction:
-            // every projection is a `Proj`, and `Proj::load` always builds
-            // bias-free (the llama family has no projection biases).
-            layers.push(LlamaMergedLayer {
-                ln1: layer.ln1.clone(),
-                attn: LlamaMergedAttention {
-                    q_weight: a.q_proj.merged_weight()?,
-                    k_weight: a.k_proj.merged_weight()?,
-                    v_weight: a.v_proj.merged_weight()?,
-                    o_weight: a.o_proj.merged_weight()?,
-                    num_heads: a.num_heads,
-                    num_kv_heads: a.num_kv_heads,
-                    num_kv_groups: a.num_kv_groups,
-                    head_dim: a.head_dim,
-                    attn_hidden: a.attn_hidden,
-                    cache: ConcatKvCache::new(2),
-                },
-                ln2: layer.ln2.clone(),
-                mlp: LlamaMergedMlp::from_layer(&layer.mlp)?,
-            });
-        }
-        Ok(Self {
-            embed: model.embed.clone(),
-            lm_head: model.lm_head.clone(),
-            layers,
-            norm: model.norm.clone(),
-            rot: model.rot.clone(),
-            hidden: model.hidden,
-            device: model.device.clone(),
-        })
-    }
-
-    /// Logits `[batch, chunk_len, vocab]` for `input_ids` (`[batch,
-    /// chunk_len]`, `u32`) placed at absolute positions `[offset, offset +
-    /// chunk_len)`, appending to the KV cache.
-    ///
-    /// Pass the whole prompt at `offset == 0` to prefill, then one token at a
-    /// time at the running offset to decode. `offset` **must** equal the number
-    /// of tokens already in the cache (it indexes the `RoPE` tables and sizes
-    /// the causal mask); a mismatch is rejected (see Errors) rather than
-    /// silently producing wrong logits. Like [`LlamaGradModel::forward`],
-    /// every position is returned (the caller narrows to the last for sampling).
-    ///
-    /// # Errors
-    ///
-    /// Returns a candle error if `offset` does not equal the cached sequence
-    /// length, if any tensor op fails, or if `offset + chunk_len` exceeds the
-    /// `RoPE` table's `max_position_embeddings`.
-    pub fn forward(&mut self, input_ids: &Tensor, offset: usize) -> CandleResult<Tensor> {
-        let (b, l) = input_ids.dims2()?;
-        // Same fail-loud guard as the Qwen MergedDecoder: the l == 1 decode
-        // path builds no mask, so an offset desync would silently corrupt the
-        // logits rather than trip a shape error. All layer caches advance in
-        // lockstep, so layer 0 is the truth.
-        let cached = self
-            .layers
-            .first()
-            .map_or(0, |layer| layer.attn.cache.current_seq_len());
-        if offset != cached {
-            candle_core::bail!(
-                "LlamaMergedDecoder::forward: offset {offset} != cached sequence length \
-                 {cached} (pass offset == tokens already decoded; 0 to prefill)"
-            );
-        }
-        let ids = input_ids.flatten_all()?;
-        let mut h = self
-            .embed
-            .index_select(&ids, 0)?
-            .reshape((b, l, self.hidden))?;
-        // A single new token attends to the whole cache (all past keys are
-        // causally valid). The mask is F32 to match the F32 attention scores.
-        let mask = if l == 1 {
-            None
-        } else {
-            Some(causal_mask_at(offset, l, DType::F32, &self.device)?)
-        };
-        for layer in &mut self.layers {
-            h = layer.forward(&h, offset, mask.as_ref(), &self.rot)?;
-        }
-        let h = self.norm.forward(&h)?;
-        match &self.lm_head {
-            Some(w) => frozen_linear(&h, w),
-            None => frozen_linear(&h, &self.embed),
-        }
-    }
-
-    /// Clear every layer's KV cache so the decoder can start a fresh sequence
-    /// (next [`forward`](Self::forward) must use `offset == 0`).
-    pub fn reset_cache(&mut self) {
-        for layer in &mut self.layers {
-            layer.attn.cache.reset();
-        }
-    }
-}
-
-/// The [`CachedDecoder`] seam over [`LlamaMergedDecoder`]: pure delegation to
-/// the inherent methods above (which carry the offset fail-loud guard and the
-/// cache-lifecycle contract the trait requires).
-impl CachedDecoder for LlamaMergedDecoder {
-    fn forward(&mut self, input_ids: &Tensor, offset: usize) -> CandleResult<Tensor> {
-        LlamaMergedDecoder::forward(self, input_ids, offset)
-    }
-
-    fn reset_cache(&mut self) {
-        LlamaMergedDecoder::reset_cache(self);
-    }
-}
+/// A KV-cached, grad-free dense-Llama decoder over merged weights — the fast
+/// rollout twin of [`LlamaGradModel`]. The shared [`DenseCachedDecoder`].
+pub type LlamaMergedDecoder = DenseCachedDecoder;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dense::DenseLayer;
+    use crate::lora::{DenseLoraTargets, Proj};
+    use crate::model::GradModel;
     use crate::nn::grad_coverage;
+    use candle_core::backprop::GradStore;
+    use candle_core::{Tensor, Var};
+    use candle_nn::VarBuilder;
     use candle_transformers::models::llama::{Cache, Llama};
     use rand::rngs::Xoshiro256PlusPlus;
     use rand::{RngExt, SeedableRng};
@@ -2221,7 +1218,7 @@ mod tests {
     }
 
     /// Every projection the legacy q/v-only recipe must NOT adapt stays frozen.
-    fn assert_legacy_frozen(layer: &LlamaLayer) {
+    fn assert_legacy_frozen(layer: &DenseLayer) {
         for (p, name) in [
             (&layer.attn.k_proj, "k_proj"),
             (&layer.attn.o_proj, "o_proj"),
@@ -2239,7 +1236,7 @@ mod tests {
     /// One layer's vars in the DOCUMENTED industrial order
     /// `[q,k,v,o,gate,up,down]`, built directly from the layer fields — so a
     /// swap inside any `push_vars` reddens the pin that compares against this.
-    fn industrial_layer_vars(layer: &LlamaLayer) -> Vec<Var> {
+    fn industrial_layer_vars(layer: &DenseLayer) -> Vec<Var> {
         let mut out = Vec::new();
         for p in [
             &layer.attn.q_proj,
