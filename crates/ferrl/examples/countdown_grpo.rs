@@ -60,7 +60,8 @@ use ferrl::countdown::{
 };
 use ferrl::policy::GenConfig;
 use ferrl::{
-    evaluate, HfTokenizer, Metrics, QwenGradModel, QwenPolicy, RunDir, Trainer, TrainerConfig,
+    evaluate, HfTokenizer, Metrics, QwenGradModel, QwenPolicy, RunDir, Sample, Trainer,
+    TrainerConfig,
 };
 use tracing::{info, warn};
 
@@ -165,10 +166,11 @@ fn build_policy(dir: &Path, device: &Device) -> Result<(QwenPolicy, HfTokenizer)
     Ok((policy, tok))
 }
 
-/// The Countdown train / held-out splits, as ready-to-use prompts. The held-out
-/// set is generated from a different stream **and** filtered so no problem also
-/// appears in train — a genuine generalization gap, not memorization.
-fn build_splits() -> (Vec<String>, Vec<String>) {
+/// The Countdown train / held-out splits, as ready-to-use samples (each prompt
+/// paired with its typed `CountdownProblem` target). The held-out set is generated
+/// from a different stream **and** filtered so no problem also appears in train —
+/// a genuine generalization gap, not memorization.
+fn build_splits() -> (Vec<Sample<CountdownProblem>>, Vec<Sample<CountdownProblem>>) {
     let cd_cfg = CountdownConfig {
         num_count: env_parse("FERRL_CD_NUMCOUNT", 3usize),
         min_number: env_parse("FERRL_CD_MINNUM", 1u32),
@@ -198,9 +200,17 @@ fn build_splits() -> (Vec<String>, Vec<String>) {
         }
     }
 
-    let train_prompts = train.iter().map(build_prompt).collect();
-    let eval_prompts = eval.iter().map(build_prompt).collect();
-    (train_prompts, eval_prompts)
+    // Each sample carries the prompt the model sees AND the typed problem the reward
+    // scores against — no smuggling the answer through the prompt string.
+    let train_samples = train
+        .into_iter()
+        .map(|p| Sample::new(build_prompt(&p), p))
+        .collect();
+    let eval_samples = eval
+        .into_iter()
+        .map(|p| Sample::new(build_prompt(&p), p))
+        .collect();
+    (train_samples, eval_samples)
 }
 
 /// The trainer config, every field env-overridable. `eos_token_id` is resolved by
@@ -255,7 +265,7 @@ fn main() -> Result<()> {
     let dir = PathBuf::from(weights);
     let device = open_cuda_device()?;
     let (mut policy, tok) = build_policy(&dir, &device)?;
-    let (train_prompts, eval_prompts) = build_splits();
+    let (train_samples, eval_samples) = build_splits();
     let reward = CountdownReward::default();
     // Read the model's EOS from config.json (env-overridable); flows into both the
     // trainer and the eval `gen` below so generation is EOS-aware on both paths.
@@ -274,8 +284,8 @@ fn main() -> Result<()> {
         max_new_tokens = tcfg.max_new_tokens,
         lr = tcfg.lr,
         eos_token_id = ?tcfg.eos_token_id,
-        train = train_prompts.len(),
-        eval = eval_prompts.len(),
+        train = train_samples.len(),
+        eval = eval_samples.len(),
         "countdown GRPO run starting"
     );
 
@@ -290,13 +300,13 @@ fn main() -> Result<()> {
     let run = RunDir::create(Path::new(&out), &run_id).context("create run dir")?;
     let mut trainer = Trainer::new(tcfg, &run)?;
     // No preemption flag installed → this run always completes; ignore the stop.
-    let (history, _stop) = trainer.train(&mut policy, &reward, &tok, &train_prompts)?;
+    let (history, _stop) = trainer.train(&mut policy, &reward, &tok, &train_samples)?;
 
     // Held-out eval AFTER training: `evaluate` scores base (adapter off) vs the
     // trained adapter (adapter on) in one pass — the P4 comparison. There is no
     // pre-train eval: the adapter starts as a no-op (`B = 0`), so base == adapter,
     // and that extra sampling only fragments GPU memory ahead of the first grad step.
-    let post = evaluate(&mut policy, &reward, &tok, &eval_prompts, &gen)?;
+    let post = evaluate(&mut policy, &reward, &tok, &eval_samples, &gen)?;
     let (first, last) = reward_trend(&history);
     let improvement = post.improvement();
     // EOS witness: the length-aware mean completion length over the run. Below

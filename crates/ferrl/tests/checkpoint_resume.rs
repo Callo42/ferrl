@@ -21,8 +21,8 @@ use candle_transformers::models::qwen3::Config;
 use ferrl::policy::{GenConfig, Rollout};
 use ferrl::{
     evaluate, load_adapter, save_adapter, DenseLoraTargets, EvalReport, LlamaGradModel,
-    LlamaPolicy, Policy, QwenGradModel, QwenPolicy, RewardFn, RunDir, TokenizerLike, Trainer,
-    TrainerConfig,
+    LlamaPolicy, Policy, QwenGradModel, QwenPolicy, RewardError, RewardFn, RunDir, Sample,
+    TokenizerLike, Trainer, TrainerConfig,
 };
 
 const RANK: usize = 2;
@@ -133,13 +133,14 @@ impl TokenizerLike for CharCodec {
 /// group carries no gradient); same one the in-crate Qwen CPU test uses.
 struct SpreadReward;
 impl RewardFn for SpreadReward {
-    fn reward(&self, _prompt: &str, completion: &str) -> f32 {
-        completion
+    type Target = ();
+    fn reward(&self, _sample: &Sample<()>, completion: &str) -> Result<f32, RewardError> {
+        Ok(completion
             .bytes()
             .enumerate()
             .map(|(i, b)| (i as f32 + 1.0) * f32::from(b))
             .sum::<f32>()
-            / 1000.0
+            / 1000.0)
     }
 }
 
@@ -370,14 +371,14 @@ fn trainer_checkpoint_captures_final_adapter() {
     let cfg = tiny_cfg();
     let vb = tiny_vb(&cfg);
     let mut policy = policy_from(&vb, &cfg);
-    let prompts = vec!["abc".to_string(), "bcd".to_string()];
+    let samples = vec![Sample::new("abc", ()), Sample::new("bcd", ())];
 
     let tmp = TempDir::new("run");
     let run = RunDir::create(tmp.path(), "qwen-ckpt").unwrap();
     let ckpt_root = run.checkpoints_dir();
     let mut trainer = Trainer::new(ckpt_train_cfg(Some(2)), &run).unwrap();
     let (history, _stop) = trainer
-        .train(&mut policy, &SpreadReward, &CharCodec, &prompts)
+        .train(&mut policy, &SpreadReward, &CharCodec, &samples)
         .unwrap();
     assert_eq!(history.len(), 4);
     // A real AdamW step must have run (grad_norm > 0 only when the optimizer
@@ -413,7 +414,7 @@ fn trainer_resumes_from_a_checkpoint() {
     let cfg = tiny_cfg();
     let vb = tiny_vb(&cfg);
     let mut policy = policy_from(&vb, &cfg);
-    let prompts = vec!["abc".to_string(), "bcd".to_string()];
+    let samples = vec![Sample::new("abc", ()), Sample::new("bcd", ())];
 
     // First run: produce the step-2 checkpoint.
     let tmp = TempDir::new("resume");
@@ -421,7 +422,7 @@ fn trainer_resumes_from_a_checkpoint() {
     let ckpt_root = run.checkpoints_dir();
     let mut trainer = Trainer::new(ckpt_train_cfg(Some(2)), &run).unwrap();
     trainer
-        .train(&mut policy, &SpreadReward, &CharCodec, &prompts)
+        .train(&mut policy, &SpreadReward, &CharCodec, &samples)
         .unwrap();
 
     // Resume: load step-2 into a fresh policy and run the remaining 2 steps. We
@@ -435,7 +436,7 @@ fn trainer_resumes_from_a_checkpoint() {
     let run2 = RunDir::create(tmp.path(), "qwen-resume").unwrap();
     let mut trainer2 = Trainer::new(ckpt_train_cfg(None), &run2).unwrap();
     let (resumed, _stop) = trainer2
-        .train_from(2, &mut resume_policy, &SpreadReward, &CharCodec, &prompts)
+        .train_from(2, &mut resume_policy, &SpreadReward, &CharCodec, &samples)
         .unwrap();
 
     assert_eq!(resumed.len(), 2, "resume should run steps 2 and 3");
@@ -458,7 +459,7 @@ fn evaluate_scores_base_and_adapter_through_qwen_policy() {
         v.set(&Tensor::randn(0f32, 0.1f32, dims, &Device::Cpu).unwrap())
             .unwrap();
     }
-    let prompts = vec!["abc".to_string(), "bca".to_string()];
+    let samples = vec![Sample::new("abc", ()), Sample::new("bca", ())];
     let gen = GenConfig {
         group_size: 4,
         max_new_tokens: 3,
@@ -466,7 +467,7 @@ fn evaluate_scores_base_and_adapter_through_qwen_policy() {
         eos_token_id: None,
         eval_sampling: None,
     };
-    let report = evaluate(&mut policy, &SpreadReward, &CharCodec, &prompts, &gen).unwrap();
+    let report = evaluate(&mut policy, &SpreadReward, &CharCodec, &samples, &gen).unwrap();
 
     assert_eq!(report.n_prompts, 2);
     assert_eq!(report.group_size, 4);
@@ -507,14 +508,14 @@ fn industrial_recipe_round_trips_through_a_trainer_checkpoint() {
     let vb = tiny_vb(&cfg);
     let mut policy = policy_with_targets(&vb, &cfg, DenseLoraTargets::industrial());
     assert_eq!(policy.trainable_vars().len(), cfg.num_hidden_layers * 14);
-    let prompts = vec!["abc".to_string(), "bcd".to_string()];
+    let samples = vec![Sample::new("abc", ()), Sample::new("bcd", ())];
 
     let tmp = TempDir::new("industrial");
     let run = RunDir::create(tmp.path(), "qwen-industrial").unwrap();
     let ckpt_root = run.checkpoints_dir();
     let mut trainer = Trainer::new(ckpt_train_cfg(Some(2)), &run).unwrap();
     trainer
-        .train(&mut policy, &SpreadReward, &CharCodec, &prompts)
+        .train(&mut policy, &SpreadReward, &CharCodec, &samples)
         .unwrap();
 
     // The manifest is recipe-self-describing.
@@ -532,7 +533,7 @@ fn industrial_recipe_round_trips_through_a_trainer_checkpoint() {
             &mut resumed,
             &SpreadReward,
             &CharCodec,
-            &prompts,
+            &samples,
         )
         .unwrap();
     assert_eq!(history.len(), 2, "resume runs the remaining 2 of 4 steps");
@@ -563,14 +564,14 @@ fn resume_rejects_a_shape_aliased_recipe_swap() {
         ..qk
     };
     let mut policy = policy_with_targets(&vb, &cfg, qk);
-    let prompts = vec!["abc".to_string(), "bcd".to_string()];
+    let samples = vec![Sample::new("abc", ()), Sample::new("bcd", ())];
 
     let tmp = TempDir::new("alias");
     let run = RunDir::create(tmp.path(), "qwen-alias").unwrap();
     let ckpt_root = run.checkpoints_dir();
     let mut trainer = Trainer::new(ckpt_train_cfg(Some(2)), &run).unwrap();
     trainer
-        .train(&mut policy, &SpreadReward, &CharCodec, &prompts)
+        .train(&mut policy, &SpreadReward, &CharCodec, &samples)
         .unwrap();
 
     let mut wrong = policy_with_targets(&vb, &cfg, qv);
@@ -583,7 +584,7 @@ fn resume_rejects_a_shape_aliased_recipe_swap() {
             &mut wrong,
             &SpreadReward,
             &CharCodec,
-            &prompts,
+            &samples,
         )
         .unwrap_err();
     assert!(

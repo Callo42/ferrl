@@ -1537,7 +1537,8 @@ mod tests {
 
     // ---- end-to-end: QwenPolicy through the real Trainer (CPU) --------------
 
-    use crate::reward::RewardFn;
+    use crate::reward::{RewardError, RewardFn};
+    use crate::sample::Sample;
     use crate::telemetry::RunDir;
     use crate::trainer::{TokenizerLike, Trainer, TrainerConfig};
 
@@ -1563,13 +1564,14 @@ mod tests {
     /// same reward and silently degenerate the group.
     struct SpreadReward;
     impl RewardFn for SpreadReward {
-        fn reward(&self, _prompt: &str, completion: &str) -> f32 {
-            completion
+        type Target = ();
+        fn reward(&self, _sample: &Sample<()>, completion: &str) -> Result<f32, RewardError> {
+            Ok(completion
                 .bytes()
                 .enumerate()
                 .map(|(i, b)| (i as f32 + 1.0) * f32::from(b))
                 .sum::<f32>()
-                / 1000.0
+                / 1000.0)
         }
     }
 
@@ -1615,7 +1617,7 @@ mod tests {
         // grad-coverage canary -> AdamW. A clean multi-step run proves the canary
         // held on every real update (it aborts on a missing/non-finite grad).
         let mut policy = tiny_policy();
-        let prompts = vec!["abc".to_string(), "bcd".to_string()];
+        let samples = vec![Sample::new("abc", ()), Sample::new("bcd", ())];
         // beta > 0 so the adapter-disabled KL reference forward (and its restore)
         // actually runs through the Qwen path, not just the policy forward.
         let cfg = TrainerConfig {
@@ -1631,7 +1633,7 @@ mod tests {
         let run = RunDir::create(&tmp.0, "qwen-cpu").unwrap();
         let mut trainer = Trainer::new(cfg, &run).unwrap();
         let (history, _stop) = trainer
-            .train(&mut policy, &SpreadReward, &CharCodec, &prompts)
+            .train(&mut policy, &SpreadReward, &CharCodec, &samples)
             .unwrap();
 
         assert_eq!(history.len(), 4);
@@ -1662,7 +1664,7 @@ mod tests {
         // a ratio visibly away from 1.
         let mut policy = tiny_policy();
         force_b_nonzero(&policy.trainable_vars()); // non-trivial merge
-        let prompts = vec!["abc".to_string(), "bcd".to_string()];
+        let samples = vec![Sample::new("abc", ()), Sample::new("bcd", ())];
         let cfg = TrainerConfig {
             steps: 3,
             group_size: 6,
@@ -1675,7 +1677,7 @@ mod tests {
         let run = RunDir::create(&tmp.0, "qwen-ratio").unwrap();
         let mut trainer = Trainer::new(cfg, &run).unwrap();
         let (history, _stop) = trainer
-            .train(&mut policy, &SpreadReward, &CharCodec, &prompts)
+            .train(&mut policy, &SpreadReward, &CharCodec, &samples)
             .unwrap();
         assert_eq!(history.len(), 3);
         for m in &history {
@@ -1724,7 +1726,7 @@ mod tests {
         // (The fail-loud path for a policy WITHOUT capture is pinned in
         // tests/toy_echo.rs; the weight math itself in trainer.rs unit tests.)
         let mut policy = tiny_policy();
-        let prompts = vec!["abc".to_string(), "bcd".to_string()];
+        let samples = vec![Sample::new("abc", ()), Sample::new("bcd", ())];
         let cfg = TrainerConfig {
             steps: 3,
             group_size: 6,
@@ -1738,7 +1740,7 @@ mod tests {
         let run = RunDir::create(&tmp.0, "qwen-tis").unwrap();
         let mut trainer = Trainer::new(cfg, &run).unwrap();
         let (history, _stop) = trainer
-            .train(&mut policy, &SpreadReward, &CharCodec, &prompts)
+            .train(&mut policy, &SpreadReward, &CharCodec, &samples)
             .unwrap();
         assert_eq!(history.len(), 3);
         for m in &history {
@@ -1855,7 +1857,7 @@ mod tests {
             inner: p_b,
             delta: delta as f32,
         };
-        let prompts = vec!["abc".to_string(), "bcd".to_string()];
+        let samples = vec![Sample::new("abc", ()), Sample::new("bcd", ())];
         let cfg = |tis: bool| TrainerConfig {
             steps: 1,
             group_size: 6,
@@ -1870,14 +1872,14 @@ mod tests {
         let run_off = RunDir::create(&tmp.0, "tis-off").unwrap();
         let m_off = Trainer::new(cfg(false), &run_off)
             .unwrap()
-            .train(&mut off, &SpreadReward, &CharCodec, &prompts)
+            .train(&mut off, &SpreadReward, &CharCodec, &samples)
             .unwrap()
             .0
             .remove(0);
         let run_on = RunDir::create(&tmp.0, "tis-on").unwrap();
         let m_on = Trainer::new(cfg(true), &run_on)
             .unwrap()
-            .train(&mut on, &SpreadReward, &CharCodec, &prompts)
+            .train(&mut on, &SpreadReward, &CharCodec, &samples)
             .unwrap()
             .0
             .remove(0);
@@ -1901,7 +1903,7 @@ mod tests {
         // nucleus top-p must generate (no temperature bail) and produce a finite
         // report, with the adapter flag restored.
         let mut policy = tiny_policy();
-        let prompts = vec!["abc".to_string()];
+        let samples = vec![Sample::new("abc", ())];
         let gen = GenConfig {
             group_size: 4,
             max_new_tokens: 3,
@@ -1910,7 +1912,7 @@ mod tests {
             eval_sampling: Some(crate::policy::EvalSampling::default()), // T 0.6 / top-p 0.95
         };
         let report =
-            crate::eval::evaluate(&mut policy, &SpreadReward, &CharCodec, &prompts, &gen).unwrap();
+            crate::eval::evaluate(&mut policy, &SpreadReward, &CharCodec, &samples, &gen).unwrap();
         assert_eq!(report.n_prompts, 1);
         assert_eq!(report.group_size, 4);
         assert!(report.base_reward_mean.is_finite());
@@ -2070,7 +2072,7 @@ mod tests {
         // dependence lesson); beta > 0 routes the adapter-disabled KL reference
         // forward through the Llama path too.
         let mut policy = llama_tiny_policy();
-        let prompts = vec!["abc".to_string(), "bcd".to_string()];
+        let samples = vec![Sample::new("abc", ()), Sample::new("bcd", ())];
         let cfg = TrainerConfig {
             steps: 4,
             group_size: 6,
@@ -2084,7 +2086,7 @@ mod tests {
         let run = RunDir::create(&tmp.0, "llama-cpu").unwrap();
         let mut trainer = Trainer::new(cfg, &run).unwrap();
         let (history, _stop) = trainer
-            .train(&mut policy, &SpreadReward, &CharCodec, &prompts)
+            .train(&mut policy, &SpreadReward, &CharCodec, &samples)
             .unwrap();
 
         assert_eq!(history.len(), 4);
@@ -2316,13 +2318,13 @@ mod tests {
             lr: 1e-3,
             ..TrainerConfig::default()
         };
-        let prompts = vec!["abc".to_string(), "bcd".to_string()];
+        let samples = vec![Sample::new("abc", ()), Sample::new("bcd", ())];
         let run_one = |policy: &mut QwenPolicy, tag: &str| {
             let tmp = TempDir::new();
             let run = RunDir::create(&tmp.0, tag).unwrap();
             let mut trainer = Trainer::new(cfg.clone(), &run).unwrap();
             let (history, _stop) = trainer
-                .train(policy, &SpreadReward, &CharCodec, &prompts)
+                .train(policy, &SpreadReward, &CharCodec, &samples)
                 .unwrap();
             assert!(
                 history.iter().any(|m| m.grad_norm > 0.0),

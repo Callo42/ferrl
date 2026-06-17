@@ -39,7 +39,8 @@ use candle_core::{DType, Device, IndexOp, Tensor, Var, D};
 use ferrl::policy::GenConfig;
 use ferrl::{
     grad_coverage, varbuilder_from_pretrained, HfTokenizer, LayerType, Policy, Qwen3_5Config,
-    Qwen3_5GradModel, Qwen3_5Policy, RewardFn, RunDir, TokenizerLike, Trainer, TrainerConfig,
+    Qwen3_5GradModel, Qwen3_5Policy, RewardError, RewardFn, RunDir, Sample, TokenizerLike, Trainer,
+    TrainerConfig,
 };
 
 /// `LoRA` rank / alpha for the smoke — a typical small adapter.
@@ -188,13 +189,14 @@ fn expected_default_var_count(cfg: &Qwen3_5Config) -> usize {
 /// byte-multiset collisions don't collapse the group).
 struct SpreadReward;
 impl RewardFn for SpreadReward {
-    fn reward(&self, _prompt: &str, completion: &str) -> f32 {
-        completion
+    type Target = ();
+    fn reward(&self, _sample: &Sample<()>, completion: &str) -> Result<f32, RewardError> {
+        Ok(completion
             .bytes()
             .enumerate()
             .map(|(i, b)| (i as f32 + 1.0) * f32::from(b))
             .sum::<f32>()
-            / 1000.0
+            / 1000.0)
     }
 }
 
@@ -429,7 +431,7 @@ fn qwen35_policy_grpo_smoke_on_gpu() {
     let mut policy = Qwen3_5Policy::new(model, 1234, 1.0);
     let tok = HfTokenizer::from_file(weights_dir().join("tokenizer.json")).expect("tokenizer");
 
-    let prompts = vec!["The capital of France is".to_string()];
+    let samples = vec![Sample::new("The capital of France is", ())];
     let cfg_t = TrainerConfig {
         steps: 2,
         group_size: 4,
@@ -443,7 +445,7 @@ fn qwen35_policy_grpo_smoke_on_gpu() {
     let mut trainer = Trainer::new(cfg_t, &run).unwrap();
 
     let (history, _stop) = trainer
-        .train(&mut policy, &SpreadReward, &tok, &prompts)
+        .train(&mut policy, &SpreadReward, &tok, &samples)
         .expect("GPU GRPO run failed");
 
     assert_eq!(history.len(), 2);

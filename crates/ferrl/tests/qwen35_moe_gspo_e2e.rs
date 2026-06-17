@@ -13,8 +13,8 @@
 use candle_core::{DType, Device};
 use ferrl::grpo::ImportanceSamplingLevel;
 use ferrl::{
-    varbuilder_from_pretrained, Policy, Qwen3_5Config, Qwen3_5GradModel, Qwen3_5Policy, RewardFn,
-    RunDir, TokenizerLike, Trainer, TrainerConfig,
+    varbuilder_from_pretrained, Policy, Qwen3_5Config, Qwen3_5GradModel, Qwen3_5Policy,
+    RewardError, RewardFn, RunDir, Sample, TokenizerLike, Trainer, TrainerConfig,
 };
 use std::path::PathBuf;
 
@@ -39,13 +39,14 @@ impl TokenizerLike for ByteCodec {
 /// distinct scores), so group advantages are non-degenerate.
 struct SpreadReward;
 impl RewardFn for SpreadReward {
-    fn reward(&self, _prompt: &str, completion: &str) -> f32 {
-        completion
+    type Target = ();
+    fn reward(&self, _sample: &Sample<()>, completion: &str) -> Result<f32, RewardError> {
+        Ok(completion
             .bytes()
             .enumerate()
             .map(|(i, b)| f32::from(b) * (0.3 + i as f32 * 0.17))
             .sum::<f32>()
-            % 5.0
+            % 5.0)
     }
 }
 
@@ -94,14 +95,14 @@ fn gspo_training_on_the_moe_model_matches_across_checkpointing() {
         importance_sampling_level: ImportanceSamplingLevel::Sequence,
         ..TrainerConfig::default()
     };
-    let prompts = vec!["abc".to_string(), "bcd".to_string()];
+    let samples = vec![Sample::new("abc", ()), Sample::new("bcd", ())];
 
     let run_one = |policy: &mut Qwen3_5Policy, tag: &str| {
         let tmp = TempDir::new(tag);
         let run = RunDir::create(&tmp.0, tag).unwrap();
         let mut trainer = Trainer::new(cfg.clone(), &run).unwrap();
         let (history, _stop) = trainer
-            .train(policy, &SpreadReward, &ByteCodec, &prompts)
+            .train(policy, &SpreadReward, &ByteCodec, &samples)
             .unwrap();
         assert!(
             history.iter().any(|m| m.grad_norm > 0.0),

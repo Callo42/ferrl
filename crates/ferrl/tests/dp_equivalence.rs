@@ -46,7 +46,8 @@ use ferrl::telemetry::RunDir;
 use ferrl::trainer::{TokenizerLike, Trainer, TrainerConfig, TrainerError};
 use ferrl::{
     tensors_from_pretrained, varbuilder_from_pretrained, Comm, CommError, LocalComm, LossType,
-    Metrics, Qwen3_5Config, Qwen3_5GradModel, Qwen3_5Policy, RewardFn, SoloComm,
+    Metrics, Qwen3_5Config, Qwen3_5GradModel, Qwen3_5Policy, RewardError, RewardFn, Sample,
+    SoloComm,
 };
 
 const VOCAB: usize = 5;
@@ -178,14 +179,16 @@ impl TokenizerLike for CharTokenizer {
 /// rewards, zero advantages), the lever the degenerate-shard gates pull.
 struct EchoOrFlatReward;
 impl RewardFn for EchoOrFlatReward {
-    fn reward(&self, prompt: &str, completion: &str) -> f32 {
+    type Target = ();
+    fn reward(&self, sample: &Sample<()>, completion: &str) -> Result<f32, RewardError> {
+        let prompt = sample.prompt.as_str();
         if prompt.starts_with('e') {
-            return 0.5;
+            return Ok(0.5);
         }
-        match (prompt.chars().next(), completion.chars().next()) {
+        Ok(match (prompt.chars().next(), completion.chars().next()) {
             (Some(p), Some(c)) if p == c => 1.0,
             _ => 0.0,
-        }
+        })
     }
 }
 
@@ -337,7 +340,7 @@ fn run_scripted_world(
     base: &Path,
     world_size: usize,
     cfg: &TrainerConfig,
-    prompts: &[String],
+    samples: &[Sample<()>],
 ) -> Vec<RankRun> {
     let comms = LocalComm::world(world_size);
     std::thread::scope(|s| {
@@ -350,7 +353,7 @@ fn run_scripted_world(
                     let run = RunDir::create(base, format!("rank{rank}")).unwrap();
                     let mut trainer = Trainer::with_comm(cfg.clone(), &run, comm).unwrap();
                     let history = trainer
-                        .train(&mut policy, &EchoOrFlatReward, &CharTokenizer, prompts)
+                        .train(&mut policy, &EchoOrFlatReward, &CharTokenizer, samples)
                         .unwrap();
                     (var_bits(&policy), history.0)
                 })
@@ -362,12 +365,12 @@ fn run_scripted_world(
 
 /// Train a fresh single-rank [`ScriptedPolicy`] run via the legacy
 /// constructor, returning its outcome.
-fn run_scripted_single(base: &Path, cfg: &TrainerConfig, prompts: &[String]) -> RankRun {
+fn run_scripted_single(base: &Path, cfg: &TrainerConfig, samples: &[Sample<()>]) -> RankRun {
     let mut policy = ScriptedPolicy::new(SEED).unwrap();
     let run = RunDir::create(base, "single").unwrap();
     let mut trainer = Trainer::new(cfg.clone(), &run).unwrap();
     let history = trainer
-        .train(&mut policy, &EchoOrFlatReward, &CharTokenizer, prompts)
+        .train(&mut policy, &EchoOrFlatReward, &CharTokenizer, samples)
         .unwrap();
     (var_bits(&policy), history.0)
 }
@@ -386,8 +389,11 @@ fn scripted_cfg() -> TrainerConfig {
     }
 }
 
-fn live_prompts() -> Vec<String> {
-    ["a", "b", "c", "d"].map(String::from).to_vec()
+fn live_samples() -> Vec<Sample<()>> {
+    ["a", "b", "c", "d"]
+        .map(|s| Sample::new(s, ()))
+        .into_iter()
+        .collect()
 }
 
 fn assert_lockstep(ranks: &[RankRun], what: &str) {
@@ -440,7 +446,7 @@ fn preemption_flag_stops_the_whole_dp_world_in_lockstep() {
         steps: 5,
         ..scripted_cfg()
     };
-    let prompts = live_prompts();
+    let samples = live_samples();
     // Flag installed on rank 0 ONLY; rank 1 gets none — the uneven-install case.
     let flag0 = Arc::new(AtomicBool::new(true));
     // A short collective timeout so a regression (a rank that fails to stop in
@@ -452,7 +458,7 @@ fn preemption_flag_stops_the_whole_dp_world_in_lockstep() {
             .map(|comm| {
                 let flag0 = Arc::clone(&flag0);
                 let cfg = cfg.clone();
-                let prompts = prompts.clone();
+                let samples = samples.clone();
                 let base = tmp.path().to_path_buf();
                 s.spawn(move || {
                     let rank = comm.rank();
@@ -465,7 +471,7 @@ fn preemption_flag_stops_the_whole_dp_world_in_lockstep() {
                     // Returns Ok only if the world never deadlocked — a rank stuck in a
                     // collective its peer skipped would surface as a CommError here.
                     trainer
-                        .train(&mut policy, &EchoOrFlatReward, &CharTokenizer, &prompts)
+                        .train(&mut policy, &EchoOrFlatReward, &CharTokenizer, &samples)
                         .unwrap()
                         .0
                 })
@@ -505,8 +511,8 @@ fn world2_matches_single_run_within_the_reassociation_envelope_grpo() {
         grad_accum_steps: 4,
         ..scripted_cfg()
     };
-    let ranks = run_scripted_world(tmp.path(), 2, &cfg2, &live_prompts());
-    let single = run_scripted_single(tmp.path(), &cfg1, &live_prompts());
+    let ranks = run_scripted_world(tmp.path(), 2, &cfg2, &live_samples());
+    let single = run_scripted_single(tmp.path(), &cfg1, &live_samples());
     assert_lockstep(&ranks, "grpo envelope");
     let envelope = max_abs_diff(&ranks[0].0, &single.0);
     eprintln!("measured grpo sharded-vs-single envelope: {envelope:.3e}");
@@ -541,8 +547,8 @@ fn world2_matches_single_run_within_the_reassociation_envelope_dapo() {
         grad_accum_steps: 4,
         ..base
     };
-    let ranks = run_scripted_world(tmp.path(), 2, &cfg2, &live_prompts());
-    let single = run_scripted_single(tmp.path(), &cfg1, &live_prompts());
+    let ranks = run_scripted_world(tmp.path(), 2, &cfg2, &live_samples());
+    let single = run_scripted_single(tmp.path(), &cfg1, &live_samples());
     assert_lockstep(&ranks, "dapo envelope");
     let envelope = max_abs_diff(&ranks[0].0, &single.0);
     eprintln!("measured dapo sharded-vs-single envelope: {envelope:.3e}");
@@ -574,9 +580,12 @@ fn world2_matches_single_run_when_the_prompt_cycle_wraps() {
         grad_accum_steps: 4,
         ..scripted_cfg()
     };
-    let prompts: Vec<String> = ["a", "b", "c", "d", "b"].map(String::from).to_vec();
-    let ranks = run_scripted_world(tmp.path(), 2, &cfg2, &prompts);
-    let single = run_scripted_single(tmp.path(), &cfg1, &prompts);
+    let samples: Vec<Sample<()>> = ["a", "b", "c", "d", "b"]
+        .map(|s| Sample::new(s, ()))
+        .into_iter()
+        .collect();
+    let ranks = run_scripted_world(tmp.path(), 2, &cfg2, &samples);
+    let single = run_scripted_single(tmp.path(), &cfg1, &samples);
     assert_lockstep(&ranks, "wraparound envelope");
     let envelope = max_abs_diff(&ranks[0].0, &single.0);
     eprintln!("measured wraparound sharded-vs-single envelope: {envelope:.3e}");
@@ -602,7 +611,7 @@ fn world_one_localcomm_solocomm_and_legacy_are_bit_identical() {
             grad_accum_steps: accum,
             ..scripted_cfg()
         };
-        let legacy = run_scripted_single(tmp.path(), &cfg, &live_prompts());
+        let legacy = run_scripted_single(tmp.path(), &cfg, &live_samples());
 
         let mut solo_policy = ScriptedPolicy::new(SEED).unwrap();
         let run = RunDir::create(tmp.path(), "solo").unwrap();
@@ -612,7 +621,7 @@ fn world_one_localcomm_solocomm_and_legacy_are_bit_identical() {
                 &mut solo_policy,
                 &EchoOrFlatReward,
                 &CharTokenizer,
-                &live_prompts(),
+                &live_samples(),
             )
             .unwrap();
         assert_eq!(
@@ -621,7 +630,7 @@ fn world_one_localcomm_solocomm_and_legacy_are_bit_identical() {
             "SoloComm diverged from the legacy constructor at accum {accum}"
         );
 
-        let world1 = run_scripted_world(tmp.path(), 1, &cfg, &live_prompts());
+        let world1 = run_scripted_world(tmp.path(), 1, &cfg, &live_samples());
         assert_eq!(
             legacy.0, world1[0].0,
             "world-1 LocalComm diverged from the legacy constructor at accum {accum}"
@@ -651,8 +660,11 @@ fn an_all_degenerate_local_shard_neither_deadlocks_nor_diverges() {
         grad_accum_steps: 1,
         ..cfg
     };
-    let prompts = ["e", "a"].map(String::from).to_vec();
-    let ranks = run_scripted_world(tmp.path(), 2, &cfg, &prompts);
+    let samples = ["e", "a"]
+        .map(|s| Sample::new(s, ()))
+        .into_iter()
+        .collect::<Vec<Sample<()>>>();
+    let ranks = run_scripted_world(tmp.path(), 2, &cfg, &samples);
     assert_lockstep(&ranks, "degenerate local shard");
     let init = var_bits(&ScriptedPolicy::new(SEED).unwrap());
     assert!(
@@ -679,7 +691,7 @@ fn an_all_degenerate_local_shard_neither_deadlocks_nor_diverges() {
             grad_accum_steps: 2,
             ..cfg
         },
-        &prompts,
+        &samples,
     );
     let envelope = max_abs_diff(&ranks[0].0, &single.0);
     assert!(
@@ -705,14 +717,17 @@ fn an_uncovered_var_on_one_rank_aborts_every_rank_in_lockstep() {
         grad_accum_steps: 1,
         ..scripted_cfg()
     };
-    let prompts = ["a", "b"].map(String::from).to_vec();
+    let samples = ["a", "b"]
+        .map(|s| Sample::new(s, ()))
+        .into_iter()
+        .collect::<Vec<Sample<()>>>();
     let comms = LocalComm::world(2);
     let errs: Vec<(usize, String)> = std::thread::scope(|s| {
         let handles: Vec<_> = comms
             .into_iter()
             .map(|comm| {
                 let cfg = cfg.clone();
-                let prompts = prompts.clone();
+                let samples = samples.clone();
                 let base = tmp.path();
                 s.spawn(move || {
                     let rank = comm.rank();
@@ -723,7 +738,7 @@ fn an_uncovered_var_on_one_rank_aborts_every_rank_in_lockstep() {
                     let run = RunDir::create(base, format!("rank{rank}")).unwrap();
                     let mut trainer = Trainer::with_comm(cfg, &run, comm).unwrap();
                     let err = trainer
-                        .train(&mut policy, &EchoOrFlatReward, &CharTokenizer, &prompts)
+                        .train(&mut policy, &EchoOrFlatReward, &CharTokenizer, &samples)
                         .unwrap_err();
                     (rank, err.to_string())
                 })
@@ -774,7 +789,7 @@ fn world_one_training_issues_no_collective_calls() {
             &mut policy,
             &EchoOrFlatReward,
             &CharTokenizer,
-            &live_prompts(),
+            &live_samples(),
         )
         .unwrap();
     assert_eq!(
@@ -796,8 +811,11 @@ fn an_all_degenerate_global_window_is_skipped_by_every_rank() {
         grad_accum_steps: 1,
         ..scripted_cfg()
     };
-    let prompts = ["e", "e"].map(String::from).to_vec();
-    let ranks = run_scripted_world(tmp.path(), 2, &cfg, &prompts);
+    let samples = ["e", "e"]
+        .map(|s| Sample::new(s, ()))
+        .into_iter()
+        .collect::<Vec<Sample<()>>>();
+    let ranks = run_scripted_world(tmp.path(), 2, &cfg, &samples);
     assert_lockstep(&ranks, "degenerate global window");
     let init = var_bits(&ScriptedPolicy::new(SEED).unwrap());
     assert_eq!(
@@ -835,7 +853,7 @@ fn rank_zero_writes_the_only_checkpoint_and_a_dp_resume_continues_bit_exactly() 
             steps: 4,
             ..base.clone()
         },
-        &live_prompts(),
+        &live_samples(),
     );
     assert_lockstep(&full, "uninterrupted");
 
@@ -848,7 +866,7 @@ fn rank_zero_writes_the_only_checkpoint_and_a_dp_resume_continues_bit_exactly() 
             steps: 2,
             ..base.clone()
         },
-        &live_prompts(),
+        &live_samples(),
     );
     assert_lockstep(&phase1, "phase 1");
     let rank0_ckpt = tmp.path().join("rank0").join("checkpoints").join("step-2");
@@ -882,7 +900,7 @@ fn rank_zero_writes_the_only_checkpoint_and_a_dp_resume_continues_bit_exactly() 
                             &mut policy,
                             &EchoOrFlatReward,
                             &CharTokenizer,
-                            &live_prompts(),
+                            &live_samples(),
                         )
                         .unwrap();
                     (var_bits(&policy), history.0)
@@ -930,7 +948,7 @@ fn run_dp_world_resume_latest(
                             &mut policy,
                             &EchoOrFlatReward,
                             &CharTokenizer,
-                            &live_prompts(),
+                            &live_samples(),
                         )
                         .unwrap();
                     (var_bits(&policy), history.0)
@@ -965,7 +983,7 @@ fn resume_latest_under_dp_auto_discovers_rank0_checkpoint_in_lockstep() {
             steps: 4,
             ..base.clone()
         },
-        &live_prompts(),
+        &live_samples(),
     );
     assert_lockstep(&full, "uninterrupted");
 
@@ -1020,7 +1038,7 @@ fn resume_latest_under_dp_with_no_checkpoint_starts_fresh_in_lockstep() {
         ..scripted_cfg()
     };
     let tmp_full = TempDir::new("rl-dp-fresh-oracle");
-    let full = run_scripted_world(tmp_full.path(), 2, &cfg, &live_prompts());
+    let full = run_scripted_world(tmp_full.path(), 2, &cfg, &live_samples());
     assert_lockstep(&full, "uninterrupted fresh");
 
     let tmp = TempDir::new("rl-dp-fresh");
@@ -1060,7 +1078,7 @@ fn resume_latest_under_dp_without_a_shared_dir_resumes_rank0s_step_loudly_not_fr
     let tmp = TempDir::new("rl-dp-perrank");
     // Phase 1: a 2-rank world with PER-RANK dirs writes rank 0's checkpoint at step 2;
     // rank 1's own checkpoint dir stays empty (rank-0-only writes).
-    let phase1 = run_scripted_world(tmp.path(), 2, &base, &live_prompts());
+    let phase1 = run_scripted_world(tmp.path(), 2, &base, &live_samples());
     assert_lockstep(&phase1, "phase 1");
     assert!(
         tmp.path()
@@ -1098,7 +1116,7 @@ fn resume_latest_under_dp_without_a_shared_dir_resumes_rank0s_step_loudly_not_fr
                             &mut policy,
                             &EchoOrFlatReward,
                             &CharTokenizer,
-                            &live_prompts(),
+                            &live_samples(),
                         )
                         .map(|_| ())
                 })
@@ -1155,7 +1173,7 @@ fn resume_latest_under_dp_broadcasts_a_rank0_scan_failure_instead_of_hanging() {
                             &mut policy,
                             &EchoOrFlatReward,
                             &CharTokenizer,
-                            &live_prompts(),
+                            &live_samples(),
                         )
                         .map(|_| ())
                         .unwrap_err()
@@ -1208,13 +1226,14 @@ impl TokenizerLike for ByteCodec {
 /// are non-degenerate.
 struct SpreadReward;
 impl RewardFn for SpreadReward {
-    fn reward(&self, _prompt: &str, completion: &str) -> f32 {
-        completion
+    type Target = ();
+    fn reward(&self, _sample: &Sample<()>, completion: &str) -> Result<f32, RewardError> {
+        Ok(completion
             .bytes()
             .enumerate()
             .map(|(i, b)| f32::from(b) * (0.3 + i as f32 * 0.17))
             .sum::<f32>()
-            % 5.0
+            % 5.0)
     }
 }
 
@@ -1272,14 +1291,17 @@ fn assert_real_model_lockstep(tag: &str, make_policy: fn(u64) -> Qwen3_5Policy) 
         loss_type: LossType::Grpo,
         ..TrainerConfig::default()
     };
-    let prompts = ["abc", "bcd"].map(String::from).to_vec();
+    let samples = ["abc", "bcd"]
+        .map(|s| Sample::new(s, ()))
+        .into_iter()
+        .collect::<Vec<Sample<()>>>();
     let comms = LocalComm::world(2);
     let ranks: Vec<RankRun> = std::thread::scope(|s| {
         let handles: Vec<_> = comms
             .into_iter()
             .map(|comm| {
                 let cfg = cfg.clone();
-                let prompts = prompts.clone();
+                let samples = samples.clone();
                 let base = tmp.path();
                 s.spawn(move || {
                     let rank = comm.rank();
@@ -1287,7 +1309,7 @@ fn assert_real_model_lockstep(tag: &str, make_policy: fn(u64) -> Qwen3_5Policy) 
                     let run = RunDir::create(base, format!("rank{rank}")).unwrap();
                     let mut trainer = Trainer::with_comm(cfg, &run, comm).unwrap();
                     let history = trainer
-                        .train(&mut policy, &SpreadReward, &ByteCodec, &prompts)
+                        .train(&mut policy, &SpreadReward, &ByteCodec, &samples)
                         .unwrap();
                     (var_bits(&policy), history.0)
                 })

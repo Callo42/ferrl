@@ -71,7 +71,8 @@ use crate::grpo::{
 use crate::nn::grad_coverage;
 use crate::optim::{FerrlAdamW, OptimizerState};
 use crate::policy::{GenConfig, Policy, Rollout};
-use crate::reward::RewardFn;
+use crate::reward::{RewardError, RewardFn};
+use crate::sample::Sample;
 use crate::telemetry::{Metrics, MetricsWriter, RunDir, TelemetryError};
 
 /// An error raised while running a GRPO training step.
@@ -93,6 +94,10 @@ pub enum TrainerError {
     /// number of completions).
     #[error("contract violation: {0}")]
     Contract(String),
+    /// A [`RewardFn`] could not compute a reward — its (possibly external)
+    /// verifier failed (a sandbox, IO, network, or judge error).
+    #[error(transparent)]
+    Reward(#[from] RewardError),
     /// Writing a periodic adapter checkpoint failed.
     #[error(transparent)]
     Checkpoint(#[from] crate::checkpoint::CheckpointError),
@@ -748,7 +753,7 @@ impl Trainer {
     }
 
     /// Run `config.steps` optimizer steps — each over a window of
-    /// `config.grad_accum_steps` prompts — cycling through `prompts`, returning one
+    /// `config.grad_accum_steps` samples — cycling through `samples`, returning one
     /// [`Metrics`] row per optimizer step (also appended to `metrics.jsonl`).
     ///
     /// Returns the per-step metrics **and a [`RunStop`]**: if a
@@ -763,15 +768,15 @@ impl Trainer {
     ///
     /// # Panics
     ///
-    /// Panics if `prompts` is empty: a run with no data is a caller bug.
+    /// Panics if `samples` is empty: a run with no data is a caller bug.
     pub fn train<P: Policy, R: RewardFn>(
         &mut self,
         policy: &mut P,
         reward_fn: &R,
         tokenizer: &dyn TokenizerLike,
-        prompts: &[String],
+        samples: &[Sample<R::Target>],
     ) -> Result<(Vec<Metrics>, RunStop), TrainerError> {
-        self.run(0, None, policy, reward_fn, tokenizer, prompts)
+        self.run(0, None, policy, reward_fn, tokenizer, samples)
     }
 
     /// Resume training from `start_step`, running steps `start_step .. config.steps`
@@ -802,16 +807,16 @@ impl Trainer {
     ///
     /// # Panics
     ///
-    /// Panics if `prompts` is empty.
+    /// Panics if `samples` is empty.
     pub fn train_from<P: Policy, R: RewardFn>(
         &mut self,
         start_step: u64,
         policy: &mut P,
         reward_fn: &R,
         tokenizer: &dyn TokenizerLike,
-        prompts: &[String],
+        samples: &[Sample<R::Target>],
     ) -> Result<(Vec<Metrics>, RunStop), TrainerError> {
-        self.run(start_step, None, policy, reward_fn, tokenizer, prompts)
+        self.run(start_step, None, policy, reward_fn, tokenizer, samples)
     }
 
     /// Resume an interrupted run from a checkpoint directory, **momentum-faithfully**.
@@ -851,17 +856,17 @@ impl Trainer {
     ///
     /// # Panics
     ///
-    /// Panics if `prompts` is empty.
+    /// Panics if `samples` is empty.
     pub fn resume<P: Policy, R: RewardFn>(
         &mut self,
         checkpoint_dir: impl AsRef<Path>,
         policy: &mut P,
         reward_fn: &R,
         tokenizer: &dyn TokenizerLike,
-        prompts: &[String],
+        samples: &[Sample<R::Target>],
     ) -> Result<(Vec<Metrics>, RunStop), TrainerError> {
         let (start_step, opt_state) = self.load_resume_point(checkpoint_dir.as_ref(), policy)?;
-        self.run(start_step, opt_state, policy, reward_fn, tokenizer, prompts)
+        self.run(start_step, opt_state, policy, reward_fn, tokenizer, samples)
     }
 
     /// Load `checkpoint_dir` into `policy` and return the resumed loop's
@@ -952,13 +957,13 @@ impl Trainer {
     ///
     /// # Panics
     ///
-    /// Panics if `prompts` is empty.
+    /// Panics if `samples` is empty.
     pub fn resume_latest<P: Policy, R: RewardFn>(
         &mut self,
         policy: &mut P,
         reward_fn: &R,
         tokenizer: &dyn TokenizerLike,
-        prompts: &[String],
+        samples: &[Sample<R::Target>],
     ) -> Result<(Vec<Metrics>, RunStop), TrainerError> {
         // Discover the resume point through rank 0 and broadcast it so the whole world
         // branches identically in lockstep (see `coordinate_resume_step`).
@@ -976,7 +981,7 @@ impl Trainer {
                     "resume_latest: continuing from the newest checkpoint"
                 );
                 let (start_step, opt_state) = self.load_resume_point(&dir, policy)?;
-                self.run(start_step, opt_state, policy, reward_fn, tokenizer, prompts)
+                self.run(start_step, opt_state, policy, reward_fn, tokenizer, samples)
             }
             None => {
                 tracing::info!(
@@ -984,7 +989,7 @@ impl Trainer {
                     world_size = self.comm.world_size(),
                     "resume_latest: no checkpoint found — starting a fresh run"
                 );
-                self.run(0, None, policy, reward_fn, tokenizer, prompts)
+                self.run(0, None, policy, reward_fn, tokenizer, samples)
             }
         }
     }
@@ -1048,7 +1053,7 @@ impl Trainer {
 
     /// Shared loop for [`train`](Self::train) / [`train_from`](Self::train_from):
     /// run optimizer steps `start_step .. config.steps`, each consuming a window of
-    /// `grad_accum_steps` prompts, checkpointing on the configured cadence.
+    /// `grad_accum_steps` samples, checkpointing on the configured cadence.
     fn run<P: Policy, R: RewardFn>(
         &mut self,
         start_step: u64,
@@ -1056,9 +1061,9 @@ impl Trainer {
         policy: &mut P,
         reward_fn: &R,
         tokenizer: &dyn TokenizerLike,
-        prompts: &[String],
+        samples: &[Sample<R::Target>],
     ) -> Result<(Vec<Metrics>, RunStop), TrainerError> {
-        assert!(!prompts.is_empty(), "train: no prompts");
+        assert!(!samples.is_empty(), "train: no samples");
         // Stamp every event this run emits — the per-step events below, plus anything
         // the policy/reward logs — with this rank's rank/world. Under DP all ranks share
         // one stdout, so an unstamped line is unattributable; a nested per-step `step`
@@ -1122,7 +1127,7 @@ impl Trainer {
             // prompt shard); see `telemetry::Metrics`.
             let started = std::time::Instant::now();
             let (mut m, local_tokens) =
-                self.run_window(step, policy, reward_fn, tokenizer, prompts, &mut opt, &vars)?;
+                self.run_window(step, policy, reward_fn, tokenizer, samples, &mut opt, &vars)?;
             let secs = started.elapsed().as_secs_f64();
             m.step_secs = secs as f32;
             m.tokens_per_sec = step_throughput(local_tokens, secs);
@@ -1172,7 +1177,7 @@ impl Trainer {
         policy: &mut P,
         reward_fn: &R,
         tokenizer: &dyn TokenizerLike,
-        prompts: &[String],
+        samples: &[Sample<R::Target>],
         opt: &mut FerrlAdamW,
         vars: &[Var],
     ) -> Result<(Metrics, usize), TrainerError> {
@@ -1191,8 +1196,8 @@ impl Trainer {
             // At world 1 this is the legacy `step*accum + j`.
             // The prompt's GLOBAL ordinal in the flattened rollout stream — the same
             // for a given (step, window position) regardless of world size / rank, so
-            // seeding the rollout by it (in `collect_prompt`) makes a world-W run
-            // reproduce the single-process draws. `idx` (mod len) selects which prompt;
+            // seeding the rollout by it (in `collect_sample`) makes a world-W run
+            // reproduce the single-process draws. `idx` (mod len) selects which sample;
             // `g` (unbounded) seeds it, so re-cycling the dataset across windows still
             // gives fresh per-window rollout RNG.
             let local = self.comm.rank() * accum + j;
@@ -1200,9 +1205,9 @@ impl Trainer {
             // arithmetic; for any real run neither overflows, so they stay
             // consistent by construction.
             let g = step * (accum * world) as u64 + local as u64;
-            let idx = (step as usize * (accum * world) + local) % prompts.len();
+            let idx = (step as usize * (accum * world) + local) % samples.len();
             let (stat, item) =
-                self.collect_prompt(policy, reward_fn, tokenizer, &prompts[idx], g)?;
+                self.collect_sample(policy, reward_fn, tokenizer, &samples[idx], g)?;
             stats.push(stat);
             if let Some(item) = item {
                 live.push(item);
@@ -1346,23 +1351,23 @@ impl Trainer {
         }
     }
 
-    /// Collect one prompt's group for the current window: rollout (adapter on) →
+    /// Collect one sample's group for the current window: rollout (adapter on) →
     /// reward → group advantages, validating the `Policy` / `RewardFn` contract. A
     /// degenerate (all-zero-advantage) group returns `(stat, None)` — a GRPO no-op
     /// with no snapshot and no update; a live group also snapshots the old / reference
     /// log-probs (taken now, at the window's start) into a [`LiveItem`] for the inner
     /// epochs.
-    fn collect_prompt<P: Policy, R: RewardFn>(
+    fn collect_sample<P: Policy, R: RewardFn>(
         &self,
         policy: &mut P,
         reward_fn: &R,
         tokenizer: &dyn TokenizerLike,
-        prompt: &str,
+        sample: &Sample<R::Target>,
         global_prompt_index: u64,
     ) -> Result<(PromptStat, Option<LiveItem>), TrainerError> {
         // Rollout with the adapter on, then score it.
         policy.set_adapter_enabled(true);
-        let prompt_ids = tokenizer.encode(prompt);
+        let prompt_ids = tokenizer.encode(&sample.prompt);
         // A prompt that encodes to zero tokens (a real tokenizer can yield `[]` for
         // empty/whitespace input) must fail HERE, before generate: teacher-forced
         // scoring needs >= 1 prompt token, and a policy that builds an empty input
@@ -1370,7 +1375,8 @@ impl Trainer {
         // contract (`prompt_len >= 1`) is otherwise only checked after generation.
         if prompt_ids.is_empty() {
             return Err(TrainerError::Contract(format!(
-                "prompt encoded to zero tokens: {prompt:?}"
+                "prompt encoded to zero tokens: {:?}",
+                sample.prompt
             )));
         }
         let gen = GenConfig {
@@ -1413,7 +1419,7 @@ impl Trainer {
             )));
         }
         let completions = decode_completions(&rollout, tokenizer);
-        let rewards = reward_fn.reward_group(prompt, &completions);
+        let rewards = reward_fn.reward_group(sample, &completions)?;
         if rewards.len() != rollout.len() {
             return Err(TrainerError::Contract(format!(
                 "reward_group returned {} rewards for {} completions",
@@ -4428,7 +4434,7 @@ mod tests {
 
     /// Shared driver for a ragged-mask gradcheck. Builds the `[G, T]` loss mask from
     /// `completion_lens` via the production [`length_mask_rows`] (so the gradcheck pins
-    /// the same `j < completion_lens[i]` predicate `collect_prompt` uses, at `f64` for
+    /// the same `j < completion_lens[i]` predicate `collect_sample` uses, at `f64` for
     /// accurate central differences), hard-asserts the mask is ragged exactly as
     /// specified (premise guard — else the check could silently degrade to a
     /// uniform/all-ones mask and stop exercising variable lengths), then runs the

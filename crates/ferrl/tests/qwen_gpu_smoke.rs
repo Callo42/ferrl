@@ -28,8 +28,8 @@ use candle_nn::VarBuilder;
 use candle_transformers::models::qwen3::Config;
 use ferrl::policy::{GenConfig, Rollout};
 use ferrl::{
-    evaluate, load_adapter, save_adapter, HfTokenizer, Policy, QwenGradModel, QwenPolicy, RewardFn,
-    RunDir, TokenizerLike, Trainer, TrainerConfig,
+    evaluate, load_adapter, save_adapter, HfTokenizer, Policy, QwenGradModel, QwenPolicy,
+    RewardError, RewardFn, RunDir, Sample, TokenizerLike, Trainer, TrainerConfig,
 };
 
 /// `LoRA` rank / alpha for the smoke — a typical small adapter.
@@ -55,13 +55,14 @@ fn load_config(dir: &Path) -> Config {
 /// sharing a byte multiset don't collide to the same reward.
 struct SpreadReward;
 impl RewardFn for SpreadReward {
-    fn reward(&self, _prompt: &str, completion: &str) -> f32 {
-        completion
+    type Target = ();
+    fn reward(&self, _sample: &Sample<()>, completion: &str) -> Result<f32, RewardError> {
+        Ok(completion
             .bytes()
             .enumerate()
             .map(|(i, b)| (i as f32 + 1.0) * f32::from(b))
             .sum::<f32>()
-            / 1000.0
+            / 1000.0)
     }
 }
 
@@ -102,7 +103,7 @@ fn qwen_policy_grpo_smoke_on_gpu() {
     let mut policy = QwenPolicy::new(model, 1234, 1.0);
     let tok = HfTokenizer::from_file(dir.join("tokenizer.json")).expect("load tokenizer");
 
-    let prompts = vec!["The capital of France is".to_string()];
+    let samples = vec![Sample::new("The capital of France is", ())];
     let cfg_t = TrainerConfig {
         steps: 2,
         group_size: 4,
@@ -118,7 +119,7 @@ fn qwen_policy_grpo_smoke_on_gpu() {
     // A canary failure, a non-finite gradient, or an OOM would surface as an error
     // here; the run completing is itself most of the gate.
     let (history, _stop) = trainer
-        .train(&mut policy, &SpreadReward, &tok, &prompts)
+        .train(&mut policy, &SpreadReward, &tok, &samples)
         .expect("GPU GRPO run failed");
 
     assert_eq!(history.len(), 2);
@@ -157,7 +158,7 @@ fn qwen_v2_resume_smoke_on_gpu() {
     let vb = VarBuilder::from_buffered_safetensors(buf, DType::F32, &device)
         .expect("load model.safetensors onto the GPU");
     let tok = HfTokenizer::from_file(dir.join("tokenizer.json")).expect("load tokenizer");
-    let prompts = vec!["The capital of France is".to_string()];
+    let samples = vec![Sample::new("The capital of France is", ())];
     let make_cfg = || TrainerConfig {
         steps: 2,
         group_size: 4,
@@ -175,7 +176,7 @@ fn qwen_v2_resume_smoke_on_gpu() {
     let run = RunDir::create(&tmp.0, "qwen-gpu-v2").unwrap();
     let mut trainer = Trainer::new(make_cfg(), &run).unwrap();
     trainer
-        .train(&mut policy, &SpreadReward, &tok, &prompts)
+        .train(&mut policy, &SpreadReward, &tok, &samples)
         .expect("GPU train with v2 checkpointing failed");
 
     // The step-1 v2 checkpoint must carry the optimizer moments (the new CUDA save path).
@@ -193,7 +194,7 @@ fn qwen_v2_resume_smoke_on_gpu() {
     let run2 = RunDir::create(&tmp2.0, "qwen-gpu-v2-resume").unwrap();
     let mut trainer2 = Trainer::new(make_cfg(), &run2).unwrap();
     let (resumed, _stop) = trainer2
-        .resume(&ckpt, &mut policy2, &SpreadReward, &tok, &prompts)
+        .resume(&ckpt, &mut policy2, &SpreadReward, &tok, &samples)
         .expect("GPU resume from a v2 checkpoint failed");
     assert_eq!(
         resumed.len(),
@@ -474,7 +475,7 @@ fn qwen_checkpoint_roundtrip_and_eval_on_gpu() {
 
     // The eval harness on GPU: base vs adapter, finite means, flag restored.
     let tok = HfTokenizer::from_file(dir.join("tokenizer.json")).expect("load tokenizer");
-    let prompts = vec!["The capital of France is".to_string()];
+    let samples = vec![Sample::new("The capital of France is", ())];
     let gen = GenConfig {
         group_size: 4,
         max_new_tokens: 6,
@@ -482,7 +483,7 @@ fn qwen_checkpoint_roundtrip_and_eval_on_gpu() {
         eos_token_id: None,
         eval_sampling: None,
     };
-    let report = evaluate(&mut src, &SpreadReward, &tok, &prompts, &gen).expect("eval on GPU");
+    let report = evaluate(&mut src, &SpreadReward, &tok, &samples, &gen).expect("eval on GPU");
     assert_eq!(report.n_prompts, 1);
     assert!(report.base_reward_mean.is_finite() && report.adapter_reward_mean.is_finite());
     assert!(src.adapter_enabled());

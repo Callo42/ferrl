@@ -64,10 +64,12 @@ mod dp {
     use candle_core::{DType, Device};
     use candle_nn::VarBuilder;
     use candle_transformers::models::qwen3::Config;
-    use ferrl::countdown::{build_prompt, generate_dataset, CountdownConfig, CountdownReward};
+    use ferrl::countdown::{
+        build_prompt, generate_dataset, CountdownConfig, CountdownProblem, CountdownReward,
+    };
     use ferrl::{
         read_metrics, Comm, HfTokenizer, Metrics, NcclComm, Policy, QwenGradModel, QwenPolicy,
-        RunDir, RunStop, Trainer, TrainerConfig,
+        RunDir, RunStop, Sample, Trainer, TrainerConfig,
     };
     use tracing::{info, warn};
 
@@ -153,7 +155,7 @@ mod dp {
     /// the same `FERRL_CDDP_DATA_SEED`; the trainer shards it per rank). No held-out
     /// split — this gate proves DP correctness + learning, not the P4 beats-base
     /// claim (that is `countdown_grpo`'s job, and a held-out *win* is downstream).
-    fn build_train_prompts() -> Vec<String> {
+    fn build_train_samples() -> Vec<Sample<CountdownProblem>> {
         let cd_cfg = CountdownConfig {
             num_count: env_parse("FERRL_CDDP_NUMCOUNT", 3usize),
             min_number: env_parse("FERRL_CDDP_MINNUM", 1u32),
@@ -163,8 +165,8 @@ mod dp {
         let train_n = env_parse("FERRL_CDDP_TRAIN_N", 64usize);
         let data_seed = env_parse("FERRL_CDDP_DATA_SEED", 7u64);
         generate_dataset(data_seed, train_n, &cd_cfg)
-            .iter()
-            .map(build_prompt)
+            .into_iter()
+            .map(|p| Sample::new(build_prompt(&p), p))
             .collect()
     }
 
@@ -291,7 +293,7 @@ mod dp {
         })?;
         let dir = PathBuf::from(weights);
         let (mut policy, tok) = build_policy(&dir, &device)?;
-        let train_prompts = build_train_prompts();
+        let train_samples = build_train_samples();
         let reward = CountdownReward::default();
         let eos = resolve_eos(&dir)?;
         let tcfg = build_trainer_config(eos);
@@ -300,7 +302,7 @@ mod dp {
             group_size = tcfg.group_size,
             grad_accum_steps = tcfg.grad_accum_steps,
             lr = tcfg.lr,
-            train = train_prompts.len(),
+            train = train_samples.len(),
             "data-parallel countdown GRPO run starting"
         );
 
@@ -312,7 +314,7 @@ mod dp {
         // resume_latest auto-discovers rank 0's newest checkpoint and broadcasts it
         // so every rank resumes in lockstep (or all start fresh) — see the module
         // docs. Paired with the preemption flag, a Slurm preempt is survivable.
-        let (_history, stop) = trainer.resume_latest(&mut policy, &reward, &tok, &train_prompts)?;
+        let (_history, stop) = trainer.resume_latest(&mut policy, &reward, &tok, &train_samples)?;
 
         // A preemption stop wrote a fresh checkpoint and returned a PARTIAL history.
         // Exit before the gate so the requeue (same FERRL_CDDP_RUN_ID) resumes — the
