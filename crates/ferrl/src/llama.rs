@@ -542,6 +542,17 @@ impl LlamaGradModel {
                  derived as hidden_size / num_attention_heads"
             );
         }
+        // num_key_value_heads is the divisor that derives num_kv_groups (the GQA
+        // repeat factor, num_attention_heads / num_key_value_heads). Zero would
+        // integer-divide-by-zero and panic deep in attention load; reject it loud
+        // here. num_attention_heads is guarded above, so a zero divisor can only
+        // come from num_key_value_heads itself.
+        if cfg.num_key_value_heads == 0 {
+            candle_core::bail!(
+                "LlamaGradModel: num_key_value_heads must be >= 1 (got 0); num_kv_groups is \
+                 derived as num_attention_heads / num_key_value_heads"
+            );
+        }
         // head_dim is DERIVED as hidden_size / num_attention_heads (the llama
         // Config has no head_dim field). The shipped loader trips a reshape
         // error deep in the forward when the division truncates; we would
@@ -553,6 +564,23 @@ impl LlamaGradModel {
                  Llama and would silently load as a degenerate model)",
                 cfg.hidden_size,
                 cfg.num_attention_heads
+            );
+        }
+        // num_kv_groups is DERIVED as num_attention_heads / num_key_value_heads
+        // (the GQA repeat factor). A non-divisible pair truncates the quotient,
+        // so repeat_kv would expand the KV heads to a count that no longer matches
+        // the Q heads — a degenerate (non-parity) model. Reject it at load,
+        // matching the qwen3.5 loader's existing GQA-divisibility guard.
+        if !cfg
+            .num_attention_heads
+            .is_multiple_of(cfg.num_key_value_heads)
+        {
+            candle_core::bail!(
+                "LlamaGradModel: num_attention_heads {} is not divisible by \
+                 num_key_value_heads {} (num_kv_groups is derived as their quotient; such a \
+                 config cannot be a real Llama and would silently load as a degenerate model)",
+                cfg.num_attention_heads,
+                cfg.num_key_value_heads
             );
         }
         let h = cfg.hidden_size;
@@ -1662,6 +1690,44 @@ mod tests {
         assert!(
             err.to_string().contains("num_attention_heads must be"),
             "expected a num_attention_heads>=1 rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_rejects_zero_kv_heads() {
+        // num_key_value_heads == 0 would integer-divide-by-zero deriving
+        // num_kv_groups (num_attention_heads / num_key_value_heads) and panic in
+        // attention load. The guard rejects it loud, up front. (vb is built from a
+        // valid cfg; the guard fires before any tensor is touched — and a kv==0
+        // weight_map would itself build zero-row kv projections.)
+        let good = tiny_cfg();
+        let vb = tiny_vb(&good);
+        let mut bad = tiny_cfg();
+        bad.num_key_value_heads = 0;
+        let err = LlamaGradModel::load(&bad, &vb, 2, 4.0).unwrap_err();
+        assert!(
+            err.to_string().contains("num_key_value_heads must be"),
+            "expected a num_key_value_heads>=1 rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_rejects_indivisible_gqa() {
+        // num_attention_heads not divisible by num_key_value_heads truncates
+        // num_kv_groups, so repeat_kv expands the KV heads to a count that no
+        // longer matches the Q heads — a degenerate non-parity model. The load
+        // must fail loud (mirrors the head_dim divisibility guard). hidden_size 8
+        // stays divisible by 4 heads (head_dim 2) so the head_dim guard passes
+        // and the GQA-divisibility guard is what fires.
+        let mut cfg = tiny_cfg();
+        cfg.num_attention_heads = 4;
+        cfg.num_key_value_heads = 3; // 4 % 3 != 0
+        let vb = tiny_vb(&cfg);
+        let err = LlamaGradModel::load(&cfg, &vb, 2, 4.0).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("not divisible by num_key_value_heads"),
+            "expected a GQA divisibility rejection, got: {err}"
         );
     }
 
