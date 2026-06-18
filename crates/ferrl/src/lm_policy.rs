@@ -1179,6 +1179,80 @@ mod tests {
         assert_eq!(r.completion_lens[0], 1, "seq 0 stops at the probed EOS");
     }
 
+    /// THE EOS-path companion to
+    /// [`captured_behavior_logprobs_align_with_the_scoring_path`]: under EOS
+    /// early-stop, the per-token *value* alignment of capture vs scoring must still
+    /// hold across each row's live prefix — INCLUDING the EOS draw itself (the last
+    /// real token of a retired row). The no-EOS gate above proves value alignment
+    /// only when every row is full width; the row-count gate
+    /// ([`captured_logprob_rows_match_the_true_completion_lens_under_eos`]) checks
+    /// only the *count* under EOS, never the values. But discovery runs *with* an EOS
+    /// token, so a capture/scoring misalignment that bites only on the early-stop path
+    /// — a shifted retired-row capture, or an EOS-draw log-prob gathered from the
+    /// wrong position — would slip every existing gate. Here `scored` is the full
+    /// rectangular completion width; the EOS-padded tail (`j >= completion_lens[i]`)
+    /// is scored but never sampled, so only the real draws are compared. Run at
+    /// T = 1.0 (bit-identical default) and a non-trivial T = 0.7.
+    #[test]
+    fn captured_behavior_logprobs_align_with_the_scoring_path_under_eos() {
+        let prompt = [1u32, 2, 3];
+        let max_new = 5usize;
+        for temperature in [1.0, 0.7] {
+            let mut policy = tiny_policy_at(temperature);
+            force_b_nonzero(&policy.trainable_vars()); // non-trivial merge
+            let base = GenConfig {
+                group_size: 4,
+                max_new_tokens: max_new,
+                temperature,
+                eos_token_id: None,
+                eval_sampling: None,
+            };
+            // Probe row 0's first token, then make THAT the EOS id. `generate` forks
+            // each row's substream purely from the run seed (no sampler mutation), and
+            // EOS only retires a row *after* its draw — it never changes the draw — so
+            // row 0 redraws the same token at step 0 and deterministically retires at
+            // length 1. At least one row therefore exercises the early-stop path.
+            let eos = policy.generate(&prompt, &base).unwrap().token_ids[0][prompt.len()];
+            let rollout = policy
+                .generate(
+                    &prompt,
+                    &GenConfig {
+                        eos_token_id: Some(eos),
+                        ..base
+                    },
+                )
+                .unwrap();
+            assert!(
+                rollout.completion_lens.iter().any(|&l| l < max_new),
+                "T={temperature}: no row retired under EOS — the early-stop path went untested"
+            );
+            let captured = rollout.rollout_logprobs.clone().expect("capture present");
+            let scored = policy
+                .token_logprobs(&rollout)
+                .unwrap()
+                .to_vec2::<f32>()
+                .unwrap();
+            for (i, (cap_row, &len)) in captured.iter().zip(&rollout.completion_lens).enumerate() {
+                // Ragged capture: exactly `completion_lens[i]` real draws, EOS-inclusive.
+                assert_eq!(
+                    cap_row.len(),
+                    len,
+                    "T={temperature} seq {i}: one capture per real draw"
+                );
+                // Value alignment over the live prefix only (incl. the EOS draw at
+                // j == len - 1); the padded tail j >= len was never sampled.
+                for (j, &lp) in cap_row.iter().enumerate() {
+                    assert!(
+                        (lp - scored[i][j]).abs() <= 1e-4,
+                        "T={temperature} seq {i} draw {j} (len {len}): behavior logprob {lp} \
+                         != scored {} — capture/scoring misaligned on the EOS path",
+                        scored[i][j]
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn eval_sampling_override_bypasses_the_temperature_check() {
         // The override is the deliberate eval channel: it samples its own
