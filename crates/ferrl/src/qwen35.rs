@@ -4236,8 +4236,19 @@ mod tests {
         let logits = model.forward(&ids(9)).unwrap();
         assert_eq!(logits.dims(), &[1, 9, 24]);
         let grads = model.backward(&probe_loss(&logits)).unwrap();
+        // Per-var teeth: `armed_moe_model` already forces every `B` nonzero, so this
+        // backward is fully wired — EVERY adapter var must carry a nonzero finite grad,
+        // exactly as the dense/GDN/Qwen3/Llama gates assert. Aggregate `is_ok()`
+        // (>= 1 live) would let a present-but-zero adapter subset — a shared-expert or
+        // attention projection silently cut from the graph — train as a no-op without
+        // tripping the gate. (Negative control: zeroing one `B` factor structurally
+        // kills its paired `A`, dropping `nonzero` to total-1 and turning this red.)
         let cov = grad_coverage(&vars, &grads).unwrap();
-        assert!(cov.is_ok(), "grad coverage: {cov:?}");
+        assert!(
+            cov.nonzero == cov.total && cov.nonfinite == 0,
+            "MoE recipe: not every LoRA var carries a nonzero finite grad on the armed \
+             (fully-wired) backward — a present-but-zero adapter would train as a no-op: {cov:?}"
+        );
 
         // Layer 0 is linear-attention: under the industrial recipe its ONLY
         // adapters are the shared expert's (gate, up, down — vars 0..6).
