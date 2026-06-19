@@ -59,6 +59,7 @@
 //! is a `gate`-feature integration test (`tests/trimul_gate.rs`), run on an `sm_80`
 //! node against the eval image; like the GPU tests it is never compiled in CI.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -200,6 +201,217 @@ pub fn geomean(xs: &[f64]) -> Option<f64> {
     Some((log_sum / xs.len() as f64).exp())
 }
 
+/// An error loading or parsing the GPU Mode `task.yml` that carries the concrete
+/// TriMul case list.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum TrimulError {
+    /// The `task.yml` file could not be read.
+    #[error("failed to read task.yml from {path}")]
+    Io {
+        /// The path that could not be read.
+        path: PathBuf,
+        /// The underlying IO error.
+        #[source]
+        source: std::io::Error,
+    },
+    /// The `task.yml` body could not be parsed into case lists.
+    #[error("task.yml parse error: {0}")]
+    Parse(String),
+}
+
+/// Which case section of `task.yml` we are reading.
+#[derive(Debug, Clone, Copy)]
+enum Section {
+    /// The `tests:` (correctness) cases.
+    Tests,
+    /// The `benchmarks:` (timing) cases.
+    Benchmarks,
+}
+
+/// Load the TriMul case lists from a GPU Mode `task.yml` at `path`, returning the
+/// `(tests, benchmarks)` cases — the correctness set and the timing set.
+///
+/// The `task.yml` carries GPU Mode's Researcher Reciprocity License and is **not**
+/// vendored into this repo; it is read at run time from the pinned eval bundle on the
+/// cluster (the same place [`TrimulReward`]'s `eval_dir` points at). See the module docs.
+///
+/// # Errors
+///
+/// [`TrimulError::Io`] if `path` cannot be read, or [`TrimulError::Parse`] if the body
+/// has no `tests`/`benchmarks` cases or a case line is malformed.
+pub fn load_task_yml(
+    path: impl AsRef<Path>,
+) -> Result<(Vec<TrimulCase>, Vec<TrimulCase>), TrimulError> {
+    let path = path.as_ref();
+    let text = std::fs::read_to_string(path).map_err(|source| TrimulError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    parse_task_yml(&text)
+}
+
+/// Parse the `tests:` and `benchmarks:` case lists out of a GPU Mode `task.yml` body.
+///
+/// The format each section uses is a list of one-line flow mappings, e.g.
+/// `- {"seqlen": 32, "bs": 1, "dim": 128, "hiddendim": 128, "seed": 9371, "nomask":
+/// True, "distribution": "normal"}`. Python-style `True`/`False` booleans are accepted
+/// (the GPU Mode file uses them). Only the `tests`/`benchmarks` top-level sections are
+/// read; every other section (`files`, `description`, …) is ignored.
+///
+/// # Errors
+///
+/// [`TrimulError::Parse`] if either section is empty or a case line is malformed.
+pub fn parse_task_yml(text: &str) -> Result<(Vec<TrimulCase>, Vec<TrimulCase>), TrimulError> {
+    let mut tests = Vec::new();
+    let mut benches = Vec::new();
+    let mut section: Option<Section> = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // A non-indented line is a top-level key: it switches into (or ends) a section.
+        if !line.starts_with(char::is_whitespace) {
+            section = match trimmed {
+                "tests:" => Some(Section::Tests),
+                "benchmarks:" => Some(Section::Benchmarks),
+                _ => None,
+            };
+            continue;
+        }
+        // Inside a case section, an indented `- { … }` line is one case; anything else
+        // (or any line while not in a case section) is skipped.
+        let Some(sec) = section else { continue };
+        let item = trimmed.strip_prefix('-').map_or(trimmed, str::trim);
+        if !item.starts_with('{') {
+            continue;
+        }
+        let case = parse_case(item)?;
+        match sec {
+            Section::Tests => tests.push(case),
+            Section::Benchmarks => benches.push(case),
+        }
+    }
+    if tests.is_empty() {
+        return Err(TrimulError::Parse("no `tests:` cases found".into()));
+    }
+    if benches.is_empty() {
+        return Err(TrimulError::Parse("no `benchmarks:` cases found".into()));
+    }
+    Ok((tests, benches))
+}
+
+/// Parse one flow-mapping case line (the body between `{` and `}`) into a [`TrimulCase`].
+/// Values may be quoted; the mapping has no nested commas, so a flat split on `,` is safe.
+fn parse_case(mapping: &str) -> Result<TrimulCase, TrimulError> {
+    let inner = mapping.trim().trim_start_matches('{').trim_end_matches('}');
+    let mut fields: HashMap<String, String> = HashMap::new();
+    for pair in inner.split(',') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        let (k, v) = pair
+            .split_once(':')
+            .ok_or_else(|| TrimulError::Parse(format!("malformed field {pair:?}")))?;
+        let key = k.trim().trim_matches(['"', '\'']).to_string();
+        let val = v.trim().trim_matches(['"', '\'']).to_string();
+        fields.insert(key, val);
+    }
+    let int_field = |name: &str| -> Result<u32, TrimulError> {
+        let raw = fields
+            .get(name)
+            .ok_or_else(|| TrimulError::Parse(format!("missing field {name:?}")))?;
+        raw.parse()
+            .map_err(|_| TrimulError::Parse(format!("field {name:?} is not an integer: {raw:?}")))
+    };
+    let seed = {
+        let raw = fields
+            .get("seed")
+            .ok_or_else(|| TrimulError::Parse("missing field \"seed\"".to_string()))?;
+        raw.parse::<u64>()
+            .map_err(|_| TrimulError::Parse(format!("field \"seed\" is not an integer: {raw:?}")))?
+    };
+    Ok(TrimulCase {
+        seqlen: int_field("seqlen")?,
+        bs: int_field("bs")?,
+        dim: int_field("dim")?,
+        hiddendim: int_field("hiddendim")?,
+        seed,
+        nomask: parse_bool(fields.get("nomask"))?,
+        distribution: parse_distribution(fields.get("distribution"))?,
+    })
+}
+
+/// Parse a case's `nomask` value, accepting Python (`True`/`False`), YAML
+/// (`true`/`false`/`yes`/`no`), and integer (`1`/`0`) spellings.
+fn parse_bool(raw: Option<&String>) -> Result<bool, TrimulError> {
+    let raw = raw.ok_or_else(|| TrimulError::Parse("missing field \"nomask\"".to_string()))?;
+    match raw.to_ascii_lowercase().as_str() {
+        "true" | "yes" | "1" => Ok(true),
+        "false" | "no" | "0" => Ok(false),
+        other => Err(TrimulError::Parse(format!(
+            "field \"nomask\" is not a boolean: {other:?}"
+        ))),
+    }
+}
+
+/// Parse a case's `distribution` value into a [`Distribution`].
+fn parse_distribution(raw: Option<&String>) -> Result<Distribution, TrimulError> {
+    let raw =
+        raw.ok_or_else(|| TrimulError::Parse("missing field \"distribution\"".to_string()))?;
+    match raw.to_ascii_lowercase().as_str() {
+        "normal" => Ok(Distribution::Normal),
+        "cauchy" => Ok(Distribution::Cauchy),
+        other => Err(TrimulError::Parse(format!(
+            "field \"distribution\" is not normal|cauchy: {other:?}"
+        ))),
+    }
+}
+
+/// The discovery prompt: ask the policy to write a faster `custom_kernel` for the
+/// outgoing Triangle Multiplicative Update.
+///
+/// This is ferrl's own wording — the GPU Mode task description is **not** vendored. It
+/// states the exact call contract the eval harness expects (the `(input, mask, weights,
+/// config)` tuple) and requires the kernel in a single fenced Python block, which is
+/// what [`extract_submission`] reads back out of the completion.
+#[must_use]
+pub fn build_prompt() -> String {
+    // A self-contained instruction; kept deliberately small and stable. Prompt
+    // refinement for the discovery run is a later, separate concern.
+    "You are optimizing a GPU kernel written in Python (PyTorch + Triton are available).\n\
+     \n\
+     Task: implement the *outgoing* Triangle Multiplicative Update (TriMul), a core\n\
+     operation in AlphaFold-style protein structure models. Implement the forward pass\n\
+     only — you do not need gradients.\n\
+     \n\
+     Define exactly one function with this signature:\n\
+     \n\
+     \x20   def custom_kernel(data):\n\
+     \x20       ...\n\
+     \x20       return output\n\
+     \n\
+     `data` is a tuple `(input, mask, weights, config)`:\n\
+     \x20 - input:   a float tensor of shape [batch, seq_len, seq_len, dim]\n\
+     \x20 - mask:    a tensor of shape [batch, seq_len, seq_len]\n\
+     \x20 - weights: a dict of the module's parameter tensors\n\
+     \x20 - config:  a dict of configuration values\n\
+     Return the processed tensor of shape [batch, seq_len, seq_len, dim].\n\
+     \n\
+     Your kernel must produce numerically the same result as the reference\n\
+     implementation on every test case, and should run as fast as possible.\n\
+     \n\
+     Respond with the implementation in a single fenced Python code block:\n\
+     \n\
+     ```python\n\
+     def custom_kernel(data):\n\
+     \x20   ...\n\
+     ```\n"
+        .to_string()
+}
+
 /// The TriMul discovery reward: runs a candidate kernel in the sandboxed eval image
 /// and scores it on correctness + speed. Construct with [`TrimulReward::new`].
 #[derive(Debug, Clone)]
@@ -231,6 +443,26 @@ pub struct TrimulReward {
     /// The sandbox backend.
     sandbox: ApptainerSandbox,
 }
+
+/// The parsed result of one sandboxed eval: whether the candidate passed every
+/// correctness case, and the plausibility-checked geometric-mean benchmark runtime
+/// (ns) — `None` when the candidate is incorrect or its timing is implausibly fast.
+#[derive(Debug, Clone, Copy)]
+struct EvalOutcome {
+    /// Whether the eval reported `check: pass`.
+    correct: bool,
+    /// The plausibility-checked geometric-mean benchmark time (ns), if any.
+    geomean_ns: Option<f64>,
+}
+
+/// A `custom_kernel` that delegates to the bundled reference implementation. Used to
+/// **measure the speedup baseline**: the reference is correct by definition, so it
+/// passes correctness and its benchmark time *is* the reference runtime. The
+/// `reference` module is copied next to the submission inside the image (see
+/// [`TrimulReward::in_container_command`]). This is the extracted code, not a fenced
+/// block — it is fed straight to the eval path, bypassing [`extract_submission`].
+const REFERENCE_SUBMISSION: &str =
+    "def custom_kernel(data):\n    from reference import ref_kernel\n    return ref_kernel(data)\n";
 
 impl TrimulReward {
     /// Construct with the eval `image`, the pinned `eval_dir` bundle, and a
@@ -392,7 +624,7 @@ impl TrimulReward {
     /// Returns [`RewardError`] only if the eval could not be *carried out* (scratch
     /// I/O or the sandbox failing to launch) — a crashing or wrong candidate is a
     /// `0.0` reward, not an error.
-    fn run_eval(&self, submission: &str) -> Result<f32, RewardError> {
+    fn run_eval(&self, submission: &str) -> Result<EvalOutcome, RewardError> {
         let scratch = self.make_scratch()?;
         let result = self.eval_in(&scratch, submission);
         // Best-effort cleanup; the scratch is node-local and disposable.
@@ -400,9 +632,27 @@ impl TrimulReward {
         result
     }
 
+    /// Measure the reference kernel's geometric-mean runtime (ns) on this node's GPU,
+    /// by running the bundled reference as the candidate over the configured
+    /// `benchmark_cases`. This is the value to pin as the speedup baseline
+    /// ([`with_baseline_ns`](Self::with_baseline_ns)) — a *guarded pin*: measure it once
+    /// on the target GPU, record it, and re-use it for runs on that same GPU.
+    ///
+    /// Returns `None` if the reference somehow did not pass correctness or produced no
+    /// plausible timing (it should always pass — it *is* the reference).
+    ///
+    /// # Errors
+    ///
+    /// As [`reward`](RewardFn::reward): [`RewardError`] only if the eval could not be
+    /// *carried out* (scratch I/O or the sandbox failing to launch).
+    pub fn measure_reference_geomean_ns(&self) -> Result<Option<f64>, RewardError> {
+        let outcome = self.run_eval(REFERENCE_SUBMISSION)?;
+        Ok(outcome.correct.then_some(outcome.geomean_ns).flatten())
+    }
+
     /// The body of [`run_eval`](Self::run_eval), split out so the scratch is always
     /// cleaned up.
-    fn eval_in(&self, scratch: &Path, submission: &str) -> Result<f32, RewardError> {
+    fn eval_in(&self, scratch: &Path, submission: &str) -> Result<EvalOutcome, RewardError> {
         std::fs::create_dir_all(scratch.join("cache")).map_err(RewardError::verifier)?;
         write(scratch, "submission.py", submission)?;
         write(scratch, "test_spec.txt", &render_spec(&self.test_cases))?;
@@ -423,12 +673,15 @@ impl TrimulReward {
 
         let (test_log, bench_log) = split_result(&outcome.stdout);
         let correct = test_passed(test_log);
-        let geo = if correct {
+        let geomean_ns = if correct {
             self.plausible_geomean(&benchmark_means_ns(bench_log))
         } else {
             None
         };
-        Ok(self.reward_value(correct, geo))
+        Ok(EvalOutcome {
+            correct,
+            geomean_ns,
+        })
     }
 
     /// Create a fresh, uniquely-named scratch dir under `scratch_root`. The
@@ -469,7 +722,10 @@ impl RewardFn for TrimulReward {
 
     fn reward(&self, _sample: &Sample<()>, completion: &str) -> Result<f32, RewardError> {
         match extract_submission(completion) {
-            Some(code) => self.run_eval(&code),
+            Some(code) => {
+                let outcome = self.run_eval(&code)?;
+                Ok(self.reward_value(outcome.correct, outcome.geomean_ns))
+            }
             // No code block at all: nothing to run, a zero reward.
             None => Ok(0.0),
         }
@@ -669,5 +925,105 @@ mod tests {
                 .unwrap(),
             0.0
         );
+    }
+
+    // --- task.yml case-list parsing. The fixture uses made-up sizes (the real GPU Mode
+    //     case list is not vendored); it mirrors the file's *shape*: surrounding sections
+    //     to skip, Python `True`/`False`, and quoted keys/values.
+
+    const SAMPLE_TASK_YML: &str = r#"
+# name: trimul
+files:
+  - {"name": "submission.py", "source": "@SUBMISSION@"}
+description: |
+  A made-up description for the fixture.
+  - this dash line is inside a skipped section and must be ignored
+config:
+  main: "eval.py"
+tests:
+  - {"seqlen": 8, "bs": 1, "dim": 16, "hiddendim": 16, "seed": 100, "nomask": True, "distribution": "normal"}
+  - {"seqlen": 12, "bs": 2, "dim": 16, "hiddendim": 16, "seed": 101, "nomask": False, "distribution": "cauchy"}
+benchmarks:
+  - {"seqlen": 16, "bs": 1, "dim": 32, "hiddendim": 16, "seed": 200, "nomask": True, "distribution": "normal"}
+"#;
+
+    #[test]
+    fn parse_task_yml_reads_both_sections_and_skips_the_rest() {
+        let (tests, benches) = parse_task_yml(SAMPLE_TASK_YML).unwrap();
+        assert_eq!((tests.len(), benches.len()), (2, 1));
+        // Whole-case equality exercises every field at once — including Python
+        // `True`/`False` and the distribution token — and confirms the surrounding
+        // `files`/`description` sections were skipped (else the counts would be off).
+        let want = TrimulCase {
+            seqlen: 8,
+            bs: 1,
+            dim: 16,
+            hiddendim: 16,
+            seed: 100,
+            nomask: true,
+            distribution: Distribution::Normal,
+        };
+        assert_eq!(tests[0], want);
+        assert_eq!(tests[1].distribution, Distribution::Cauchy);
+        assert!(!tests[1].nomask); // "False"
+        assert_eq!(benches[0].seqlen, 16);
+    }
+
+    #[test]
+    fn parse_task_yml_round_trips_through_render_spec() {
+        // A parsed case renders back to the spec line the eval harness reads.
+        let (tests, _) = parse_task_yml(SAMPLE_TASK_YML).unwrap();
+        let line = tests[0].render();
+        assert!(line.contains("seqlen: 8"));
+        assert!(line.contains("nomask: 1")); // rendered as an integer
+        assert!(line.contains("distribution: normal"));
+    }
+
+    #[test]
+    fn parse_task_yml_errors_on_missing_sections() {
+        // No `tests:` / `benchmarks:` at all.
+        assert!(matches!(
+            parse_task_yml("files:\n  - {}\n"),
+            Err(TrimulError::Parse(_))
+        ));
+        // A `tests:` section but no `benchmarks:`.
+        let only_tests = "tests:\n  - {\"seqlen\": 8, \"bs\": 1, \"dim\": 16, \"hiddendim\": 16, \"seed\": 1, \"nomask\": True, \"distribution\": \"normal\"}\n";
+        assert!(matches!(
+            parse_task_yml(only_tests),
+            Err(TrimulError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn parse_task_yml_errors_on_a_malformed_case() {
+        // Missing the `distribution` field.
+        let bad = "tests:\n  - {\"seqlen\": 8, \"bs\": 1, \"dim\": 16, \"hiddendim\": 16, \"seed\": 1, \"nomask\": True}\nbenchmarks:\n  - {}\n";
+        assert!(matches!(parse_task_yml(bad), Err(TrimulError::Parse(_))));
+        // A non-integer seqlen.
+        let bad2 = "tests:\n  - {\"seqlen\": big, \"bs\": 1, \"dim\": 16, \"hiddendim\": 16, \"seed\": 1, \"nomask\": True, \"distribution\": \"normal\"}\nbenchmarks:\n  - {}\n";
+        assert!(matches!(parse_task_yml(bad2), Err(TrimulError::Parse(_))));
+    }
+
+    #[test]
+    fn parse_bool_accepts_python_yaml_and_int_spellings() {
+        for t in ["True", "true", "yes", "1"] {
+            assert!(parse_bool(Some(&t.to_string())).unwrap());
+        }
+        for f in ["False", "false", "no", "0"] {
+            assert!(!parse_bool(Some(&f.to_string())).unwrap());
+        }
+        assert!(parse_bool(Some(&"maybe".to_string())).is_err());
+        assert!(parse_bool(None).is_err());
+    }
+
+    #[test]
+    fn build_prompt_states_the_contract_and_a_python_fence() {
+        let p = build_prompt();
+        assert!(p.contains("custom_kernel(data)"));
+        assert!(p.contains("(input, mask, weights, config)"));
+        assert!(p.contains("[batch, seq_len, seq_len, dim]"));
+        // The single fenced Python block the policy is asked to emit — the marker
+        // `extract_submission` keys on in the completion.
+        assert!(p.contains("```python"));
     }
 }

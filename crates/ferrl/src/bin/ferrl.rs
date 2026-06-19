@@ -2,16 +2,23 @@
 //! JSON run config, and report on a finished run.
 //!
 //! ```text
-//! ferrl train --config run.json     # GRPO-train a built-in task (countdown | math)
+//! ferrl train --config run.json     # GRPO-train a built-in task (countdown | math | trimul)
+//! ferrl trimul-baseline --config run.json   # measure the TriMul reference baseline (ns) on this GPU
 //! ferrl runreport <run-dir> [--json] [--strict]   # one-glance run health summary
 //! ```
 //!
 //! `train` reads a `RunConfig` (a serialized [`TrainerConfig`](ferrl::TrainerConfig)
 //! plus a model directory, a device, and a task selector), loads a Qwen policy via
 //! [`ferrl::load_qwen_policy`], builds the named task's train/eval splits, and runs
-//! the GRPO [`Trainer`](ferrl::Trainer). The task registry is closed (the two worked
-//! examples, `countdown` and `math`); a *custom* task is wired in Rust against the
-//! library — see `examples/minimal_task.rs` and the README's "Wire your own task".
+//! the GRPO [`Trainer`](ferrl::Trainer). The task registry is closed (the worked
+//! examples `countdown` and `math`, plus the `trimul` kernel-discovery task — which
+//! runs a sandboxed GPU eval as its reward); a *custom* task is wired in Rust against
+//! the library — see `examples/minimal_task.rs` and the README's "Wire your own task".
+//!
+//! `trimul-baseline` runs the bundled reference kernel through the same sandboxed eval
+//! to measure its geometric-mean runtime on *this* node's GPU, and prints `{ns, gpu}`
+//! to paste into the run config's `trimul.baseline` (the guarded-pin baseline — a
+//! `train` run refuses a baseline measured on a different GPU than it is running on).
 //!
 //! `runreport` folds in the standalone run-summary tool: it reads a run's
 //! `metrics.jsonl` and prints (or emits as JSON) a [`RunSummary`](ferrl::RunSummary),
@@ -22,6 +29,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use candle_core::{DType, Device};
 use clap::{Args, Parser, Subcommand};
@@ -33,6 +41,7 @@ use ferrl::policy::GenConfig;
 use ferrl::{
     evaluate, load_qwen_policy, read_jsonl, summarize, train_eval_split, CountdownReward,
     LoaderOpts, MathProblem, MathReward, RewardFn, RunDir, Sample, Trainer, TrainerConfig,
+    TrimulReward,
 };
 
 /// A task's train/eval split: `(train, eval)` samples of the task's target type.
@@ -56,6 +65,8 @@ struct Cli {
 enum Command {
     /// GRPO-train a built-in task end-to-end from a JSON run config.
     Train(TrainArgs),
+    /// Measure the TriMul reference baseline (ns) on this node's GPU for the guarded pin.
+    TrimulBaseline(TrimulBaselineArgs),
     /// Print a one-glance health summary for a finished run.
     Runreport(RunreportArgs),
 }
@@ -64,6 +75,14 @@ enum Command {
 #[derive(Debug, Args)]
 struct TrainArgs {
     /// Path to the JSON run config (see `RunConfig`).
+    #[arg(long)]
+    config: PathBuf,
+}
+
+/// Arguments for `ferrl trimul-baseline`.
+#[derive(Debug, Args)]
+struct TrimulBaselineArgs {
+    /// Path to the JSON run config (the same `trimul` block `ferrl train` reads).
     #[arg(long)]
     config: PathBuf,
 }
@@ -109,6 +128,9 @@ enum CliError {
     /// A dataset could not be read.
     #[error(transparent)]
     Data(#[from] ferrl::DataError),
+    /// The TriMul `task.yml` case list could not be loaded.
+    #[error(transparent)]
+    Trimul(#[from] ferrl::TrimulError),
     /// The trainer failed.
     #[error(transparent)]
     Trainer(#[from] ferrl::TrainerError),
@@ -245,6 +267,46 @@ impl Default for DataCfg {
     }
 }
 
+/// The reference baseline pin for the TriMul speedup reward: the reference
+/// geometric-mean runtime (`ns`) and the GPU it was measured on (`gpu`). A *guarded
+/// pin* — `gpu` must appear in this node's `nvidia-smi` product name, so a speedup is
+/// never scored against a baseline taken on different hardware. Produce it with
+/// `ferrl trimul-baseline`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BaselineCfg {
+    /// Reference geometric-mean runtime in nanoseconds (the speedup denominator).
+    ns: f64,
+    /// A label identifying the GPU the baseline was measured on. The intended value is
+    /// the full product name `ferrl trimul-baseline` prints (e.g. `"NVIDIA H100 80GB
+    /// HBM3"`); a shorter token like `"H100"` also works as long as it isn't a substring
+    /// of a different card's name. Unknown keys are rejected so a typo can't silently
+    /// disable the guard.
+    gpu: String,
+}
+
+/// TriMul task knobs (read only when `task == "trimul"`): the sandboxed eval image and
+/// the pinned GPU Mode bundle, the held-out secret seed, the per-candidate wall budget,
+/// and the optional baseline pin. The concrete case list is loaded at run time from
+/// `<eval_dir>/task.yml` (GPU Mode's, not vendored into this repo).
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct TrimulCfg {
+    /// The eval image — the pinned PyTorch+Triton `.sif`.
+    image: PathBuf,
+    /// The pinned GPU Mode eval bundle (`eval.py`/`reference.py`/`task.py`/`utils.py` +
+    /// `task.yml`), bound read-only into the sandbox.
+    eval_dir: PathBuf,
+    /// Node-local scratch root for per-candidate dirs (e.g. `/tmp`).
+    scratch_root: PathBuf,
+    /// The held-out secret seed (`POPCORN_SEED`), combined with each case's public seed.
+    secret_seed: u64,
+    /// Per-candidate wall-clock budget in seconds (`0` → the reward default, 600 s).
+    wall_secs: u64,
+    /// The reference baseline pin (omit to fall back to an inverse-time reward).
+    baseline: Option<BaselineCfg>,
+}
+
 /// A `ferrl train` run, deserialized from JSON.
 ///
 /// The wire shape is a flat object: a `task` selector, the `model_dir` checkpoint,
@@ -269,6 +331,9 @@ struct RunConfig {
     /// Dataset knobs.
     #[serde(default)]
     data: DataCfg,
+    /// TriMul task knobs (only read when `task == "trimul"`).
+    #[serde(default)]
+    trimul: TrimulCfg,
     /// The GRPO trainer config.
     trainer: TrainerConfig,
 }
@@ -331,6 +396,53 @@ impl RunConfig {
         let samples = read_jsonl::<MathProblem, _>(path)?;
         Ok(train_eval_split(samples, self.data.eval_n, self.data.seed))
     }
+
+    /// Build the TriMul train/eval splits: the single discovery prompt, repeated.
+    ///
+    /// Unlike countdown/math this does **not** use [`train_eval_split`]: that helper
+    /// deduplicates whole samples, so a unit-target dataset of one repeated prompt would
+    /// collapse to a single row. TriMul is one task — the generalization held out is over
+    /// the *cases* (the secret seed inside the reward), not the prompt — and the trainer
+    /// cycles prompts mod the train length, so a one-prompt train set *is* the
+    /// single-task regime. `eval` (held-out) runs the same prompt through the reward, so a
+    /// non-zero `data.eval_n` gives an adapter-vs-base reward comparison.
+    fn trimul_splits(&self) -> Splits<()> {
+        let prompt = ferrl::trimul::build_prompt();
+        let train = std::iter::repeat_with(|| Sample::new(prompt.clone(), ()))
+            .take(self.data.train_n.max(1))
+            .collect();
+        let eval = std::iter::repeat_with(|| Sample::new(prompt.clone(), ()))
+            .take(self.data.eval_n)
+            .collect();
+        (train, eval)
+    }
+
+    /// Build the TriMul reward *without* a baseline: load the case list from
+    /// `<eval_dir>/task.yml`, and set the image, bundle, scratch, secret seed, and wall
+    /// budget. This is the form `trimul-baseline` measures against; `train` layers the
+    /// guarded baseline on top via [`build_trimul_reward`](Self::build_trimul_reward).
+    fn build_trimul_reward_base(&self) -> Result<TrimulReward, CliError> {
+        let t = &self.trimul;
+        let (tests, benches) = ferrl::trimul::load_task_yml(t.eval_dir.join("task.yml"))?;
+        let wall = Duration::from_secs(if t.wall_secs == 0 { 600 } else { t.wall_secs });
+        Ok(TrimulReward::new(&t.image, &t.eval_dir, &t.scratch_root)
+            .with_cases(tests, benches)
+            .with_secret_seed(t.secret_seed)
+            .with_wall(wall))
+    }
+
+    /// Build the TriMul reward for a `train` run: the base reward plus, when a baseline
+    /// is pinned, the speedup denominator — guarded so the run is refused unless this
+    /// node's GPU matches the GPU the baseline was measured on. With no baseline the
+    /// reward falls back to an inverse-time signal (faster still scores higher).
+    fn build_trimul_reward(&self) -> Result<TrimulReward, CliError> {
+        let mut reward = self.build_trimul_reward_base()?;
+        if let Some(b) = &self.trimul.baseline {
+            guard_baseline_gpu(&b.gpu)?;
+            reward = reward.with_baseline_ns(b.ns);
+        }
+        Ok(reward)
+    }
 }
 
 /// Dispatch `ferrl train`: parse the config, open the device, build the named task's
@@ -348,8 +460,13 @@ fn train(args: &TrainArgs) -> Result<(), CliError> {
             let (train, eval) = cfg.math_splits()?;
             run_training(&cfg, &device, &MathReward::default(), &train, &eval)
         }
+        "trimul" => {
+            let (train, eval) = cfg.trimul_splits();
+            let reward = cfg.build_trimul_reward()?;
+            run_training(&cfg, &device, &reward, &train, &eval)
+        }
         other => Err(CliError::msg(format!(
-            "unknown task {other:?}; built-in tasks are \"countdown\" and \"math\""
+            "unknown task {other:?}; built-in tasks are \"countdown\", \"math\", and \"trimul\""
         ))),
     }
 }
@@ -402,6 +519,104 @@ fn run_training<R: RewardFn>(
     Ok(())
 }
 
+/// This node's first GPU product name, read from `nvidia-smi`, or `None` if it cannot
+/// be read (no `nvidia-smi`, a non-GPU node, or a query failure).
+fn detect_gpu_name() -> Option<String> {
+    let out = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=name", "--format=csv,noheader"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(ToString::to_string)
+}
+
+/// Whether `needle` appears in `haystack` as a whole token — bounded by a string edge
+/// or a non-alphanumeric character on both sides — rather than a raw substring. Both
+/// inputs must already be lowercased. This is stricter than `str::contains` on purpose:
+/// `"a100"` matches `"nvidia a100 80gb"` and `"nvidia a100-sxm4"` but NOT `"a1000"`, and
+/// `"l40"` does NOT match `"l40s"` — so a short GPU label can't false-match a different,
+/// longer part number. An empty needle never matches.
+fn contains_word(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let bytes = haystack.as_bytes();
+    haystack.match_indices(needle).any(|(i, m)| {
+        let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+        let after = i + m.len();
+        let after_ok = after >= bytes.len() || !bytes[after].is_ascii_alphanumeric();
+        before_ok && after_ok
+    })
+}
+
+/// The guarded-pin check: the configured baseline GPU label must appear as a whole token
+/// in this node's detected GPU name (case-insensitive — so the full `ferrl trimul-baseline`
+/// product name matches exactly, and a short label like `"A100"` matches `"NVIDIA A100…"`
+/// but not a different card like `"A1000"`). **Fails closed**: an empty label or an
+/// unreadable GPU is an error, never a pass — so a speedup is never scored against a
+/// baseline taken on different hardware.
+fn baseline_gpu_matches(configured: &str, detected: Option<&str>) -> Result<(), String> {
+    let want = configured.trim();
+    if want.is_empty() {
+        return Err(
+            "trimul.baseline.gpu is empty; set it to the GPU label the baseline was \
+             measured on (the full product name `ferrl trimul-baseline` prints)"
+                .to_string(),
+        );
+    }
+    let want_lc = want.to_lowercase();
+    match detected {
+        Some(name) if contains_word(&name.to_lowercase(), &want_lc) => Ok(()),
+        Some(name) => Err(format!(
+            "baseline was measured on GPU {want:?} but this node's GPU is {name:?}; \
+             re-measure on this GPU (`ferrl trimul-baseline`) or fix trimul.baseline.gpu"
+        )),
+        None => Err(format!(
+            "cannot read this node's GPU (nvidia-smi unavailable) to verify the baseline \
+             was measured on GPU {want:?}; run on the target GPU node"
+        )),
+    }
+}
+
+/// Apply [`baseline_gpu_matches`] against the live `nvidia-smi` reading.
+fn guard_baseline_gpu(configured: &str) -> Result<(), CliError> {
+    baseline_gpu_matches(configured, detect_gpu_name().as_deref()).map_err(CliError::Msg)
+}
+
+/// Dispatch `ferrl trimul-baseline`: run the bundled reference kernel through the
+/// sandboxed eval on this node's GPU, and print `{ "ns", "gpu" }` to paste into the run
+/// config's `trimul.baseline` (the guarded pin).
+fn trimul_baseline(args: &TrimulBaselineArgs) -> Result<(), CliError> {
+    let _ = ferrl::init_tracing();
+    let cfg = RunConfig::load(&args.config)?;
+    // Measure against the un-pinned reward (we are producing the baseline, not using one).
+    let reward = cfg.build_trimul_reward_base()?;
+    let gpu = detect_gpu_name().ok_or_else(|| {
+        CliError::msg(
+            "cannot read this node's GPU (nvidia-smi unavailable); run on the target GPU node",
+        )
+    })?;
+    let ns = reward
+        .measure_reference_geomean_ns()
+        .map_err(|e| CliError::msg(format!("baseline eval failed: {e}")))?
+        .ok_or_else(|| {
+            CliError::msg("the reference kernel produced no plausible benchmark time")
+        })?;
+    let pin = serde_json::json!({ "ns": ns, "gpu": gpu });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&pin).unwrap_or_else(|_| pin.to_string())
+    );
+    eprintln!("ferrl: paste the above into your run config's trimul.baseline");
+    Ok(())
+}
+
 /// Dispatch `ferrl runreport`: read the run's metrics, summarize, and emit.
 fn runreport(args: &RunreportArgs) -> Result<ExitCode, CliError> {
     let metrics_path = resolve_metrics_path(&args.path);
@@ -440,6 +655,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match &cli.cmd {
         Command::Train(args) => train(args).map(|()| ExitCode::SUCCESS),
+        Command::TrimulBaseline(args) => trimul_baseline(args).map(|()| ExitCode::SUCCESS),
         Command::Runreport(args) => runreport(args),
     };
     match result {
@@ -530,18 +746,87 @@ mod tests {
         );
     }
 
-    /// The clap surface parses both subcommands.
+    /// The clap surface parses every subcommand.
     #[test]
     fn clap_parses_subcommands() {
         let c = Cli::try_parse_from(["ferrl", "train", "--config", "run.json"]).unwrap();
         assert!(matches!(c.cmd, Command::Train(_)));
+        // The `TrimulBaseline` variant renders as the `trimul-baseline` subcommand.
+        let b = Cli::try_parse_from(["ferrl", "trimul-baseline", "--config", "run.json"]).unwrap();
+        assert!(matches!(b.cmd, Command::TrimulBaseline(_)));
         let r =
             Cli::try_parse_from(["ferrl", "runreport", "runs/x", "--json", "--strict"]).unwrap();
         match r.cmd {
             Command::Runreport(a) => {
                 assert!(a.json && a.strict);
             }
-            Command::Train(_) => panic!("expected runreport"),
+            _ => panic!("expected runreport"),
         }
+    }
+
+    /// A `trimul` run config parses, with its task block and a baseline pin.
+    #[test]
+    fn parses_a_trimul_config() {
+        let json = r#"{ "task": "trimul", "model_dir": "/m",
+                        "device": "cuda",
+                        "data": { "train_n": 8, "eval_n": 2 },
+                        "trimul": { "image": "/img.sif", "eval_dir": "/eval",
+                          "scratch_root": "/tmp", "secret_seed": 123, "wall_secs": 300,
+                          "baseline": { "ns": 5200000.0, "gpu": "H100" } },
+                        "trainer": { "steps": 1, "group_size": 2, "max_new_tokens": 8,
+                          "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
+                          "lr": 1e-5, "weight_decay": 0.0,
+                          "loss_type": "grpo", "scale_rewards": "group" } }"#;
+        let cfg: RunConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.task, "trimul");
+        assert_eq!((cfg.trimul.secret_seed, cfg.trimul.wall_secs), (123, 300));
+        let b = cfg.trimul.baseline.as_ref().expect("baseline present");
+        assert_eq!((b.ns, b.gpu.as_str()), (5_200_000.0, "H100"));
+        // The single-prompt splits honour train_n / eval_n without deduping to one row.
+        let (train, eval) = cfg.trimul_splits();
+        assert_eq!((train.len(), eval.len()), (8, 2));
+        assert!(train[0].prompt.contains("custom_kernel"));
+    }
+
+    /// A `trimul` config with no `trimul` block still parses (the defaults), and the
+    /// other tasks parse without a `trimul` block at all.
+    #[test]
+    fn trimul_block_defaults_when_omitted() {
+        let json = r#"{ "task": "countdown", "model_dir": "/m",
+                        "trainer": { "steps": 1, "group_size": 2, "max_new_tokens": 8,
+                          "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
+                          "lr": 1e-5, "weight_decay": 0.0,
+                          "loss_type": "grpo", "scale_rewards": "group" } }"#;
+        let cfg: RunConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.trimul.baseline.is_none());
+        assert_eq!(cfg.trimul.wall_secs, 0);
+    }
+
+    /// The guarded-pin GPU check: a label that is a substring of the detected name
+    /// passes; a different GPU or an unreadable GPU fails closed.
+    #[test]
+    fn baseline_gpu_guard_matches_and_fails_closed() {
+        // A label matches as a whole token of the full product name.
+        assert!(baseline_gpu_matches("H100", Some("NVIDIA H100 80GB HBM3")).is_ok());
+        assert!(baseline_gpu_matches("l40s", Some("NVIDIA L40S")).is_ok());
+        // A different GPU is refused.
+        assert!(baseline_gpu_matches("H100", Some("NVIDIA L40S")).is_err());
+        // An unreadable GPU fails closed (never silently passes).
+        assert!(baseline_gpu_matches("H100", None).is_err());
+    }
+
+    /// The guard is token-bounded (not a raw substring) and rejects an empty label, so a
+    /// short or blank `baseline.gpu` cannot silently match the wrong card or disable the
+    /// check.
+    #[test]
+    fn baseline_gpu_guard_rejects_lookalikes_and_empty() {
+        // A short label must not match a longer, different part number.
+        assert!(baseline_gpu_matches("A100", Some("NVIDIA A1000")).is_err());
+        assert!(baseline_gpu_matches("L40", Some("NVIDIA L40S")).is_err());
+        // …but still matches its real card (token bounded by space/hyphen).
+        assert!(baseline_gpu_matches("A100", Some("NVIDIA A100-SXM4-80GB")).is_ok());
+        // An empty / whitespace label fails closed.
+        assert!(baseline_gpu_matches("", Some("NVIDIA L40S")).is_err());
+        assert!(baseline_gpu_matches("   ", Some("NVIDIA L40S")).is_err());
     }
 }
