@@ -240,4 +240,4 @@ pub use trainer::{
     RunStop, TokenizerLike, Trainer, TrainerConfig, TrainerConfigBuilder, TrainerError,
 };
 #[doc(inline)]
-pub use trimul::{Distribution, TrimulCase, TrimulReward};
+pub use trimul::{Distribution, TrimulCase, TrimulError, TrimulReward};

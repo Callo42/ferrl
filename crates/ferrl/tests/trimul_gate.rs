@@ -109,6 +109,21 @@ fn gate_wrong_submission_scores_zero() {
 
 #[test]
 #[ignore = "needs an sm_80 GPU + the eval image/bundle; run with --ignored"]
+fn gate_reference_baseline_is_measurable_and_positive() {
+    // The guarded-pin baseline: run the bundled reference through the eval and read its
+    // geometric-mean runtime. It must pass correctness (it *is* the reference) and yield
+    // a positive, plausible time — the value pinned as the speedup denominator.
+    let ns = reward()
+        .measure_reference_geomean_ns()
+        .expect("the baseline eval should be carried out");
+    assert!(
+        ns.is_some_and(|v| v > 0.0),
+        "the reference baseline must measure a positive ns, got {ns:?}"
+    );
+}
+
+#[test]
+#[ignore = "needs an sm_80 GPU + the eval image/bundle; run with --ignored"]
 fn gate_malicious_submission_is_contained_and_scores_zero() {
     // The sandbox runs with no network, so the connection attempt fails and the eval
     // reports no pass — the candidate scores zero and the host is untouched. This
