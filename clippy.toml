@@ -3,3 +3,8 @@
 # exceeds this trips `clippy::cognitive_complexity` (warn -> error under CI's
 # -D warnings). Keep functions small and factored.
 cognitive-complexity-threshold = 7
+
+# Domain terms that read as prose but look like code identifiers to
+# `clippy::doc_markdown` (CamelCase / mixed case). `..` extends clippy's built-in
+# allow-list rather than replacing it.
+doc-valid-idents = ["TriMul", "AlphaFold", "PyTorch", "PoC", ".."]

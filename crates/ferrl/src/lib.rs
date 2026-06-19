@@ -154,6 +154,7 @@ pub mod sandbox;
 pub mod telemetry;
 pub mod tokenizer;
 pub mod trainer;
+pub mod trimul;
 
 #[doc(inline)]
 pub use checkpoint::{
@@ -238,3 +239,5 @@ pub use tokenizer::{HfTokenizer, TokenizerError};
 pub use trainer::{
     RunStop, TokenizerLike, Trainer, TrainerConfig, TrainerConfigBuilder, TrainerError,
 };
+#[doc(inline)]
+pub use trimul::{Distribution, TrimulCase, TrimulReward};
