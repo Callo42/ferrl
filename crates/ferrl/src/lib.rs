@@ -150,6 +150,7 @@ pub mod remat;
 pub mod reward;
 pub mod sample;
 pub mod sampler;
+pub mod sandbox;
 pub mod telemetry;
 pub mod tokenizer;
 pub mod trainer;
@@ -221,6 +222,11 @@ pub use reward::{RewardError, RewardFn};
 pub use sample::Sample;
 #[doc(inline)]
 pub use sampler::GrpoSampler;
+#[doc(inline)]
+pub use sandbox::{
+    ApptainerSandbox, Bind, BindMode, NetworkPolicy, ResourceLimits, RunOutcome, RunSpec,
+    RunStatus, Sandbox, SandboxError,
+};
 #[doc(inline)]
 pub use telemetry::{
     init_tracing, read_metrics, run_span, summarize, Anomaly, Metrics, MetricsWriter, RunDir,
