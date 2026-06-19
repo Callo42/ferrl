@@ -27,7 +27,10 @@
 //! - in-image `ulimit`s (CPU, address space, processes, file size), beneath a
 //!   **host-side wall-clock supervisor** that is the final authority on the time
 //!   budget — it kills the run if it overruns, and cannot be evaded from inside
-//!   the container.
+//!   the container;
+//! - **bounded output capture** — at most `CAPTURE_CAP` bytes per stream are read
+//!   into host memory, so a payload spewing to stdout cannot exhaust the host;
+//!   past the cap the writer blocks on a full pipe and the supervisor reaps it.
 //!
 //! ## Testing split (the same shape as [`crate::cuda_compat`])
 //!
@@ -429,6 +432,13 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// pipe open, so the supervisor returns promptly instead of blocking on it.
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
+/// Largest captured stream kept per pipe (8 MiB). Untrusted output is otherwise
+/// unbounded — a payload spewing to stdout could exhaust host memory well within the
+/// wall budget — so each drain stops reading here and drops the pipe, leaving the
+/// writer to block on a full pipe (then be reaped by the wall-clock supervisor). The
+/// eval's machine-read *result* travels via a bound output file, not this log stream.
+const CAPTURE_CAP: usize = 8 << 20;
+
 /// Spawn `command`, drain its stdout/stderr concurrently, and enforce `deadline`
 /// (wall-clock) by killing the process if it overruns. The concurrent drain avoids
 /// the classic pipe-buffer deadlock; the kill is the final authority over a runaway.
@@ -463,19 +473,31 @@ fn supervise(mut command: Command, deadline: Duration) -> Result<RunOutcome, San
     })
 }
 
-/// Read a child pipe to end-of-file on a detached thread, sending the raw bytes back
-/// over a channel (a missing pipe yields an immediately-ready empty result). The
-/// thread is **not** joined: on a clean exit it finishes at EOF, but if a killed
-/// process left a descendant holding the write end it would block — so
-/// [`collect_output`] takes the bytes with a timeout and the supervisor never waits
-/// on that descendant.
+/// Read a child pipe on a detached thread, capturing at most [`CAPTURE_CAP`] bytes
+/// and sending them back over a channel (a missing pipe yields an immediately-ready
+/// empty result). Stopping at the cap drops the read end, so a payload spewing past
+/// it blocks on a full pipe and is reaped by the wall-clock supervisor rather than
+/// ballooning host memory. The thread is **not** joined: on a clean exit it finishes
+/// at EOF; [`collect_output`] takes the bytes with a timeout, so a descendant holding
+/// the write end can never block the supervisor.
 fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> Receiver<Vec<u8>> {
     let (tx, rx) = mpsc::channel();
     match pipe {
         Some(mut reader) => {
             thread::spawn(move || {
                 let mut buf = Vec::new();
-                let _ = reader.read_to_end(&mut buf);
+                let mut chunk = [0u8; 8192];
+                while buf.len() < CAPTURE_CAP {
+                    match reader.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            let room = CAPTURE_CAP - buf.len();
+                            buf.extend_from_slice(&chunk[..n.min(room)]);
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(_) => break,
+                    }
+                }
                 let _ = tx.send(buf);
             });
         }
@@ -731,6 +753,20 @@ mod tests {
             .run(&spec())
             .unwrap();
         assert_eq!(outcome.status, RunStatus::Exited(0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supervise_bounds_captured_output() {
+        // A process spewing far more than the cap is captured only up to CAPTURE_CAP,
+        // so untrusted output cannot exhaust host memory; past the cap the read end is
+        // dropped and the writer EPIPEs, so the run ends without ballooning the buffer.
+        let outcome = supervise(sh("head -c 50000000 /dev/zero"), Duration::from_secs(5)).unwrap();
+        assert!(
+            outcome.stdout.len() <= CAPTURE_CAP,
+            "captured {} bytes, cap is {CAPTURE_CAP}",
+            outcome.stdout.len()
+        );
     }
 
     #[test]

@@ -219,3 +219,41 @@ fn gate_process_cap_is_applied() {
         out.stderr
     );
 }
+
+#[test]
+#[ignore = "needs apptainer + $FERRL_SANDBOX_IMAGE on an isolated node"]
+fn gate_multiprocess_orphan_is_reaped() {
+    // A *multi-process* runaway: double-fork (setsid, a new session) a child that
+    // waits past the wall budget then touches a sentinel, while the main process
+    // busy-loops to trip the wall-clock kill. If the kill reaped only the launcher
+    // PID, the orphan survives (it would hold a GPU / scratch) and creates SURVIVED;
+    // a correct whole-tree teardown (the PID namespace dying with its init) prevents
+    // it. This is the case the single-process timeout probe does NOT cover.
+    let dir = scratch("orphan");
+    let spec = RunSpec::new(
+        image(),
+        vec![
+            "bash".into(),
+            "-c".into(),
+            "setsid bash -c 'sleep 8; touch /work/SURVIVED' & echo STARTED; while true; do :; done"
+                .into(),
+        ],
+    )
+    .with_binds(vec![Bind::rw(&dir, "/work")])
+    .with_workdir("/work")
+    .with_limits(ResourceLimits {
+        wall: Duration::from_secs(3),
+        ..ResourceLimits::default()
+    });
+    let out = run(&spec);
+    assert_eq!(out.status, RunStatus::TimedOut, "stderr: {}", out.stderr);
+    // Wait past the orphan's delayed touch (8 s after its start; the run was killed
+    // at ~3 s), so a survivor would have created the sentinel by now.
+    std::thread::sleep(Duration::from_secs(10));
+    let survived = dir.join("SURVIVED").exists();
+    let _ = fs::remove_dir_all(&dir);
+    assert!(
+        !survived,
+        "a forked orphan survived the wall-clock kill — the whole-tree teardown is incomplete"
+    );
+}
