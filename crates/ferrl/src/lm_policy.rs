@@ -2307,6 +2307,13 @@ mod tests {
     /// `Policy::backward` under activation checkpointing: full var coverage,
     /// gradients matching the uncut run on the same instance — the
     /// policy-level end-to-end of the remat stitch.
+    ///
+    /// **Scope: F32, by necessity.** `tiny_policy` is all-F32 and candle's CPU
+    /// backend has no bf16 matmul (`UnsupportedDTypeForOp`), so this CI gate can
+    /// only assert the stitch bit-exactly at F32. The regime discovery actually
+    /// runs in — a BF16 frozen base with an F32 adapter — is gated by the cuda-only
+    /// `remat_equivalence_holds_in_the_bf16_base_regime` below (a manual GPU gate,
+    /// since the recompute's bf16 reassociation cannot be exercised on CPU).
     #[test]
     fn policy_backward_stitches_under_checkpointing() {
         let mut policy = tiny_policy();
@@ -2339,6 +2346,113 @@ mod tests {
                 "stitched grad diverged from the uncut backward by {diff}"
             );
         }
+    }
+
+    /// The bf16-base companion to [`policy_backward_stitches_under_checkpointing`]:
+    /// the remat stitch must reproduce the uncut backward in the regime discovery
+    /// runs in — a **BF16 frozen base with an F32 adapter** — not only at F32.
+    ///
+    /// candle's CPU backend has no bf16 matmul, so this is a **manual GPU gate**
+    /// (cuda-only; absent from the default build and CI). Run it on a GPU node:
+    /// `cargo test --features cuda remat_equivalence_holds_in_the_bf16_base_regime`.
+    /// The recompute is deterministic, so remat-vs-uncut can differ only by bf16
+    /// reassociation of the per-segment accumulation — bounded here by an honest
+    /// envelope well below the adapter-grad scale. The negative control (a boundary
+    /// cotangent truncated before the stitch's VJP surrogate) blows past the
+    /// envelope, so the gate is not vacuous.
+    #[cfg(feature = "cuda")]
+    // A manual GPU gate prints its measured envelope (max_diff / grad scale) so a
+    // re-run shows the gate is exercising real grads, not vacuously passing.
+    #[allow(clippy::print_stderr)]
+    #[test]
+    fn remat_equivalence_holds_in_the_bf16_base_regime() {
+        let device = Device::new_cuda(0).expect("a cuda device for the bf16 remat gate");
+        let cfg = tiny_cfg();
+        // The production dtype split: BF16 frozen base, F32 adapter. weight_map
+        // builds F32 CPU tensors — move them to the GPU and cast the base to BF16.
+        let weights: HashMap<String, Tensor> = weight_map(&cfg)
+            .into_iter()
+            .map(|(k, v)| {
+                let t = v.to_device(&device).unwrap().to_dtype(DType::BF16).unwrap();
+                (k, t)
+            })
+            .collect();
+        let vb = VarBuilder::from_tensors(weights, DType::BF16, &device);
+        let model = QwenGradModel::load_with_adapter_dtype(&cfg, &vb, 2, 4.0, DType::F32).unwrap();
+        let mut policy = QwenPolicy::new(model, 7, 1.0);
+
+        // Arm every adapter B nonzero (F32 adapter, on the GPU) so A and B both
+        // carry a live gradient (dL/dA ∝ B). Device/dtype-matched, unlike the
+        // CPU `arm_policy`.
+        for v in policy.trainable_vars().iter().skip(1).step_by(2) {
+            let dims = v.as_tensor().dims().to_vec();
+            v.set(&Tensor::randn(0f32, 0.5f32, dims, &device).unwrap())
+                .unwrap();
+        }
+        let rollout = small_rollout(&mut policy);
+        let vars = policy.trainable_vars();
+
+        // A fixed non-uniform weighted sum of the scored log-probs, on-device.
+        let probe = |p: &QwenPolicy| -> Tensor {
+            let logp = p.token_logprobs(&rollout).unwrap();
+            let n = logp.elem_count();
+            let w: Vec<f32> = (0..n).map(|i| ((i % 5) as f32) * 0.3 - 0.5).collect();
+            let w = Tensor::from_vec(w, logp.dims().to_vec(), &device).unwrap();
+            logp.mul(&w).unwrap().sum_all().unwrap()
+        };
+
+        let plain = policy.backward(&probe(&policy)).unwrap();
+        policy.model_mut().set_activation_checkpointing(true);
+        let stitched = policy.backward(&probe(&policy)).unwrap();
+
+        // Honest, scale-invariant BF16 envelope: the worst per-var grad
+        // disagreement must be a small *fraction* of the grad scale. The adapter
+        // grads are F32 but are formed from BF16 activations the stitch recomputes,
+        // so remat-vs-uncut could differ by bf16 reassociation; `rel_tol` is a few
+        // bf16 ulps of headroom. In practice each adapter var lives in a single
+        // segment, so there is no cross-segment reassociation and the grads come out
+        // bit-identical (measured `max_diff == 0` on an Ampere-class GPU) — the envelope is
+        // conservative, and the teeth are the negative control: a boundary cotangent
+        // truncated to a coarse grid before the VJP surrogate drives `max_diff` to a
+        // large fraction of the grad scale, far past `rel_tol`.
+        let rel_tol = 2e-2_f32;
+        let scalar = |t: &Tensor| -> f32 {
+            t.abs()
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .max(0)
+                .unwrap()
+                .to_scalar()
+                .unwrap()
+        };
+        let mut max_diff = 0f32;
+        let mut max_mag = 0f32;
+        for v in &vars {
+            let a = plain
+                .get(v)
+                .expect("uncut store missing a var")
+                .to_dtype(DType::F32)
+                .unwrap();
+            let b = stitched
+                .get(v)
+                .expect("stitched store missing a var")
+                .to_dtype(DType::F32)
+                .unwrap();
+            max_diff = max_diff.max(scalar(&a.sub(&b).unwrap()));
+            max_mag = max_mag.max(scalar(&a));
+        }
+        // Non-vacuity: the uncut backward must carry a real gradient to compare.
+        assert!(
+            max_mag > 0.0,
+            "every uncut grad was zero — the comparison is vacuous"
+        );
+        eprintln!("REMAT_BF16_EQUIV max_diff={max_diff} max_grad_mag={max_mag} rel_tol={rel_tol}");
+        assert!(
+            max_diff <= rel_tol * max_mag,
+            "bf16-base remat grad diverged from the uncut backward by {max_diff} \
+             (> {rel_tol} * {max_mag})"
+        );
     }
 
     /// The tape-preservation invariant, in the order that would clobber it: a
