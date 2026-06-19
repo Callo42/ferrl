@@ -56,6 +56,15 @@ path = "src/bin/ferrl.rs"
 # Default is CPU-only: this is what GitHub Actions CI builds and tests, and the
 # default for ordinary contributors without a GPU.
 default = []
+# Enables the sandbox malicious-probe integration battery (`tests/sandbox_gate.rs`):
+# real `apptainer exec` runs that prove the isolation *contains a hostile payload*
+# (no $HOME/credential read, no network, fork/OOM/file caps, wall-clock timeout).
+# Off by default — like the `cuda` GPU tests, CI never compiles it (so it neither
+# runs nor affects coverage). Run on a cluster node with an ISOLATED allocation:
+#   cargo test --features gate --test sandbox_gate -- --ignored
+# clippy/fmt for it are self-gated manually (CI does not see them):
+#   cargo clippy --features gate --all-targets
+gate = []
 # `cuda` forwards the CUDA backend to every candle crate ferrl links. Because
 # ferrl depends on candle-core / candle-nn / candle-transformers directly (not
 # via candle's internal `candle` alias), the feature paths use those exact
