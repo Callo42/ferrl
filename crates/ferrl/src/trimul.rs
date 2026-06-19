@@ -15,12 +15,15 @@
 //! 3. Run the eval in the sandbox ([`crate::sandbox::ApptainerSandbox`]): the pinned
 //!    GPUMODE eval files are bound **read-only**, the scratch **read-write**, the GPU
 //!    exposed (`--nv`), and the **network denied**. Inside, the GPUMODE `eval.py`
-//!    runs `test` (correctness) then `benchmark` (variance-aware CUDA-event timing),
-//!    writing results to a file via its `POPCORN_FD` channel — never the (capped)
-//!    stdout, so a noisy or hostile payload cannot drown the result.
-//! 4. Read the result files and map to a reward: **`0` if the candidate is missing,
-//!    crashes, or fails any correctness case; otherwise the geometric-mean speedup
-//!    over a reference baseline.** GRPO normalizes rewards within a group, so a
+//!    runs `test` (correctness) then `benchmark` (variance-aware CUDA-event timing).
+//!    Its grade is written to `POPCORN_FD`, which we route to the **captured stdout
+//!    pipe** while the candidate's own stdout goes to `/dev/null` — so the grade rides
+//!    a channel the untrusted candidate cannot reach (its worker neither inherits the
+//!    fd nor can target it by path), foreclosing a forged pass.
+//! 4. Map the captured grade to a reward: **`0` if the candidate is missing, crashes,
+//!    fails any correctness case, or reports an implausibly fast time (below the
+//!    kernel-launch floor — a glitch or forged grade); otherwise the geometric-mean
+//!    speedup over a reference baseline.** GRPO normalizes rewards within a group, so a
 //!    monotone-in-speed signal is what the search needs.
 //!
 //! ## What lives where
@@ -32,6 +35,22 @@
 //! live only in the pinned eval bundle on the cluster (bound in at run time). The
 //! case list is therefore *configuration* ([`TrimulReward::with_cases`]); the tests
 //! here use generic, made-up sizes.
+//!
+//! ## Reward integrity
+//!
+//! The grade rides a channel the candidate cannot reach by file or by print, and an
+//! implausibly fast time is rejected — so the trivial gaming routes (forge a `/work`
+//! result file, print a fake pass, report a 0 ns kernel) all score zero, gated by the
+//! negative-control suite. **Known residual (PoC):** a candidate that scans `/proc` for
+//! the grader's grade fd *and* reports a physically plausible fake time could still
+//! forge a pass — its worker shares the grader's PID namespace and uid, so only
+//! per-candidate PID-namespace isolation closes it (earned when untrusted external
+//! submissions arrive, not this PoC, whose kernel-writing policy is extremely unlikely
+//! to emit such an exploit). The held-out `POPCORN_SEED` is likewise candidate-readable;
+//! both are moot against an attacker who can already forge the grade and close together
+//! with that isolation. The dynamic guard — watching the discovery run for implausible
+//! wins and re-verifying top candidates — is the spec's Phase-1 instrumentation, done
+//! in the run, not the reward.
 //!
 //! ## Testing split (as in [`crate::sandbox`])
 //!
@@ -204,6 +223,11 @@ pub struct TrimulReward {
     baseline_ns: Option<f64>,
     /// Wall-clock budget for one candidate's full eval.
     wall: Duration,
+    /// Floor (ns) on each benchmark mean: a real GPU kernel cannot run faster than the
+    /// kernel-launch overhead, so a sub-floor time is a measurement glitch or a forged
+    /// grade — the candidate scores zero. Defence-in-depth against absurd reward
+    /// gaming, on top of the off-filesystem grade channel.
+    min_plausible_ns: f64,
     /// The sandbox backend.
     sandbox: ApptainerSandbox,
 }
@@ -227,6 +251,7 @@ impl TrimulReward {
             secret_seed: 0,
             baseline_ns: None,
             wall: Duration::from_secs(600),
+            min_plausible_ns: 1_000.0,
             sandbox: ApptainerSandbox::default(),
         }
     }
@@ -264,6 +289,25 @@ impl TrimulReward {
         self
     }
 
+    /// Set the per-case timing floor (ns); a benchmark mean below it is implausible (a
+    /// glitch or a forged grade) and scores the candidate zero.
+    #[must_use]
+    pub fn with_min_plausible_ns(mut self, min_plausible_ns: f64) -> Self {
+        self.min_plausible_ns = min_plausible_ns;
+        self
+    }
+
+    /// The geometric mean of the benchmark `means`, or `None` if any is implausibly
+    /// fast (below the configured floor) — a measurement glitch or a forged grade, which
+    /// must not earn a reward.
+    #[must_use]
+    pub fn plausible_geomean(&self, means: &[f64]) -> Option<f64> {
+        if means.iter().any(|&m| m < self.min_plausible_ns) {
+            return None;
+        }
+        geomean(means)
+    }
+
     /// Map a parsed `(correct, geom-mean ns)` outcome to a scalar reward: `0` unless
     /// the candidate is correct and produced a positive runtime; otherwise the
     /// speedup over the baseline (or an inverse-time proxy when no baseline is set).
@@ -288,6 +332,11 @@ impl TrimulReward {
     fn limits(&self) -> ResourceLimits {
         ResourceLimits {
             wall: self.wall,
+            // CUDA reserves a huge virtual range and Triton JIT compilation is
+            // CPU-heavy; an address-space or CPU-seconds cap would false-fail a
+            // legitimate compile/eval and inject noise into the reward. The wall budget
+            // (and the still-capped process / file-size limits) is the bound here.
+            cpu: None,
             address_space: None,
             ..ResourceLimits::default()
         }
@@ -298,9 +347,17 @@ impl TrimulReward {
     /// each writing its result via fd 3 (`POPCORN_FD`). A trailing `true` keeps the
     /// shell's exit status clean; ferrl reads the result files, not the exit code.
     fn in_container_command() -> String {
+        // Route the grade (POPCORN fd 3) to the *captured stdout pipe* (`3>&1`) and
+        // send the eval's — and the candidate's — own stdout to `/dev/null`
+        // (`1>/dev/null`). The grade therefore arrives on a channel the untrusted
+        // candidate cannot reach: its spawn-worker does not inherit fd 3 (eval.py marks
+        // it non-inheritable) and its stdout is discarded, so it cannot forge a pass by
+        // writing files or printing. A separator splits the two sections; benchmark runs
+        // only if `test` passed.
         "cp /eval/eval.py /eval/reference.py /eval/task.py /eval/utils.py . && \
-         { POPCORN_FD=3 python eval.py test test_spec.txt 3>test_result.txt && \
-           POPCORN_FD=3 python eval.py benchmark bench_spec.txt 3>bench_result.txt; }; \
+         { POPCORN_FD=3 python eval.py test test_spec.txt 3>&1 1>/dev/null && \
+           echo '===FERRL-BENCH===' && \
+           POPCORN_FD=3 python eval.py benchmark bench_spec.txt 3>&1 1>/dev/null; }; \
          true"
             .to_string()
     }
@@ -355,16 +412,19 @@ impl TrimulReward {
             &render_spec(&self.benchmark_cases),
         )?;
 
-        // The verdict lives in the POPCORN result files (read below), not the exit
-        // status — the in-container command ends with `true`, so a crashing candidate
-        // returns cleanly and is scored a failure from its empty result file.
-        self.sandbox
+        // The grade arrives on the captured stdout (fd 3 → the pipe; see
+        // `in_container_command`), NOT on a candidate-writable file — so a forged
+        // `/work` file or a printed `check: pass` cannot influence the score. A
+        // crashing candidate yields no grade lines, scored a failure.
+        let outcome = self
+            .sandbox
             .run(&self.build_run_spec(scratch))
             .map_err(RewardError::verifier)?;
 
-        let correct = test_passed(&read(scratch, "test_result.txt"));
+        let (test_log, bench_log) = split_result(&outcome.stdout);
+        let correct = test_passed(test_log);
         let geo = if correct {
-            geomean(&benchmark_means_ns(&read(scratch, "bench_result.txt")))
+            self.plausible_geomean(&benchmark_means_ns(bench_log))
         } else {
             None
         };
@@ -393,12 +453,15 @@ fn write(dir: &Path, name: &str, contents: &str) -> Result<(), RewardError> {
     std::fs::write(dir.join(name), contents).map_err(RewardError::verifier)
 }
 
-/// Read `dir/name` UTF-8-lossily, or `""` if absent (a missing result file means the
-/// eval never got that far — scored as a failure, not an error).
-fn read(dir: &Path, name: &str) -> String {
-    std::fs::read(dir.join(name))
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-        .unwrap_or_default()
+/// The marker the in-container command echoes between the `test` and `benchmark`
+/// result sections on the grade channel.
+const RESULT_SPLIT: &str = "===FERRL-BENCH===";
+
+/// Split the captured grade stream into its `(test, benchmark)` sections. If the
+/// separator is absent (the `test` run failed, so `benchmark` never ran), the whole
+/// stream is the test section and the benchmark section is empty.
+fn split_result(stdout: &str) -> (&str, &str) {
+    stdout.split_once(RESULT_SPLIT).unwrap_or((stdout, ""))
 }
 
 impl RewardFn for TrimulReward {
@@ -505,6 +568,16 @@ mod tests {
     }
 
     #[test]
+    fn plausible_geomean_rejects_sub_floor_timings() {
+        let r = reward().with_min_plausible_ns(1000.0);
+        // A real-looking set passes; an implausibly fast mean (a forged 0.001 ns or a
+        // measurement glitch) makes the whole thing `None`, so it cannot score.
+        assert!(r.plausible_geomean(&[2000.0, 8000.0]).is_some());
+        assert_eq!(r.plausible_geomean(&[2000.0, 0.001]), None);
+        assert_eq!(r.plausible_geomean(&[]), None);
+    }
+
+    #[test]
     fn reward_is_zero_when_incorrect() {
         assert_eq!(reward().reward_value(false, Some(100.0)), 0.0);
     }
@@ -564,12 +637,25 @@ mod tests {
     }
 
     #[test]
-    fn in_container_command_runs_test_then_benchmark_via_fd3() {
+    fn in_container_command_routes_the_grade_to_stdout_and_gates_benchmark() {
         let cmd = TrimulReward::in_container_command();
-        assert!(cmd.contains("eval.py test test_spec.txt 3>test_result.txt"));
-        assert!(cmd.contains("eval.py benchmark bench_spec.txt 3>bench_result.txt"));
-        // benchmark is gated on test passing.
-        assert!(cmd.contains("test_result.txt && "));
+        // Grade -> fd 3 -> the captured stdout pipe; the eval's/candidate's own stdout
+        // is discarded, so a forged file or print cannot influence the score.
+        assert!(cmd.contains("eval.py test test_spec.txt 3>&1 1>/dev/null"));
+        assert!(cmd.contains("eval.py benchmark bench_spec.txt 3>&1 1>/dev/null"));
+        // The separator runs, and benchmark after it, only if `test` passed.
+        assert!(cmd.contains("1>/dev/null && echo '===FERRL-BENCH===' &&"));
+    }
+
+    #[test]
+    fn split_result_separates_test_and_benchmark_sections() {
+        let (test, bench) = split_result("check: pass\n===FERRL-BENCH===\nbenchmark.0.mean: 5.0\n");
+        assert!(test.contains("check: pass"));
+        assert!(bench.contains("benchmark.0.mean: 5.0"));
+        // No separator (test failed, benchmark never ran) -> all test, empty bench.
+        let (test2, bench2) = split_result("check: fail\n");
+        assert_eq!(test2, "check: fail\n");
+        assert_eq!(bench2, "");
     }
 
     #[test]
