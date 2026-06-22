@@ -5,7 +5,7 @@ intentionally narrow: it locks what must be recorded, re-run, and reported befor
 candidate kernel can count as a discovery artifact. It is not a general task SDK.
 
 The contract applies to runs of `ferrl train --config <run.json>` where `task` is
-`trimul` and to the artifact extraction step that follows such a run. The extraction command is `ferrl trimul-artifact --config <run.json> --completion <raw.txt> --out <artifact-dir> --training-reward <reward> --run-health <summary>` with run provenance, audit seed, and repeated `--baseline-ns` values.
+`trimul` and to the artifact extraction step that follows such a run. The extraction command is `ferrl trimul-artifact --config <run.json> --completion <raw.txt> --out <artifact-dir> --training-reward <reward> --run-health <summary> --source-inspection clean --source-inspection-notes <notes>` with run provenance, audit seed, source-inspection evidence, and repeated `--baseline-ns` values.
 
 ## Pre-Run Lock
 
@@ -52,7 +52,11 @@ The manifest schema is versioned from the first run:
     "group_index": 0,
     "training_reward": 0.0,
     "completion_sha256": "<sha256 of raw completion>",
-    "source_sha256": "<sha256 of submission.py>"
+    "source_sha256": "<sha256 of submission.py>",
+    "source_inspection": {
+      "result": "clean",
+      "notes": "<process/file-descriptor/environment/network/out-of-input path inspection notes>"
+    }
   },
   "model": {
     "family": "qwen3.x",
@@ -162,8 +166,8 @@ The final report must fit this outline:
 1. Verdict: `accepted_artifact`, `no_win`, or `invalid_run`.
 2. Baseline: GPU, raw measurements, median runtime, and command used.
 3. Training: ferrl commit, config hash, model identity, seeds, budget, and run health.
-4. Candidate table: source hash, training reward, clean correctness, median runtime,
-   speedup, and accept/reject reason.
+4. Candidate table: source hash, training reward, source-inspection result, clean
+   correctness, median runtime, speedup, and accept/reject reason.
 5. Artifact bundle path and manifest hash, when accepted.
 6. Reviewer checklist: each acceptance and reward-hacking check marked pass/fail.
 

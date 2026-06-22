@@ -34,7 +34,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use candle_core::{DType, Device};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::info;
@@ -134,6 +134,13 @@ struct TrimulArtifactArgs {
     /// Training run health summary copied from `runreport` or run notes.
     #[arg(long)]
     run_health: String,
+    /// Source inspection result for process/file/environment/network/path probes.
+    #[arg(long, value_enum)]
+    source_inspection: SourceInspectionResult,
+    /// Human source-inspection notes covering process state, file descriptors,
+    /// environment variables, network sockets, and paths outside kernel inputs.
+    #[arg(long)]
+    source_inspection_notes: String,
     /// Model family label for the artifact manifest.
     #[arg(long, default_value = "qwen3.x")]
     model_family: String,
@@ -710,6 +717,27 @@ struct ArtifactVerificationRun {
     speedup: Option<f64>,
 }
 
+/// Result of the reviewer-facing source inspection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+enum SourceInspectionResult {
+    /// No process-state, file-descriptor, environment, network, or out-of-input
+    /// path inspection was found.
+    Clean,
+    /// Source inspection found suspicious process-state, file-descriptor,
+    /// environment, network, or out-of-input path access.
+    Suspicious,
+}
+
+/// Reviewer-facing source-inspection record.
+#[derive(Debug, Clone, Serialize)]
+struct SourceInspectionManifest {
+    /// Machine-readable source-inspection result.
+    result: SourceInspectionResult,
+    /// Human notes covering the inspected surfaces.
+    notes: String,
+}
+
 /// Contract manifest written to `manifest.json`.
 #[derive(Debug, Serialize)]
 struct ArtifactManifest {
@@ -748,6 +776,8 @@ struct CandidateManifest {
     completion_sha256: String,
     /// SHA-256 of `submission.py`.
     source_sha256: String,
+    /// Reviewer-facing source-inspection evidence.
+    source_inspection: SourceInspectionManifest,
 }
 
 /// Model provenance fields.
@@ -878,7 +908,8 @@ fn trimul_artifact(args: &TrimulArtifactArgs) -> Result<(), CliError> {
     let (test_cases, benchmark_cases) =
         ferrl::trimul::load_task_yml(cfg.trimul.eval_dir.join("task.yml"))?;
     let runs = verify_submission_repeated(&reward, &submission, args.repeats)?;
-    let accepted = accepted_artifact(&runs, baseline_median);
+    let accepted = accepted_artifact(&runs, baseline_median)
+        && args.source_inspection == SourceInspectionResult::Clean;
     write_artifact_bundle(
         args,
         &cfg,
@@ -1023,6 +1054,10 @@ fn build_manifest(
             training_reward: args.training_reward,
             completion_sha256: sha256_hex(inputs.completion_bytes),
             source_sha256: sha256_hex(inputs.submission.as_bytes()),
+            source_inspection: SourceInspectionManifest {
+                result: args.source_inspection,
+                notes: args.source_inspection_notes.clone(),
+            },
         },
         model: ModelManifest {
             family: args.model_family.clone(),
@@ -1146,6 +1181,7 @@ fn artifact_report(
     let candidate_median =
         median_candidate.map_or_else(|| "none".to_string(), |v| format!("{v:.6}"));
     let speedup = speedup.map_or_else(|| "none".to_string(), |v| format!("{v:.6}"));
+    let source_inspection = source_inspection_label(manifest.candidate.source_inspection.result);
 
     let mut out = String::new();
     writeln!(&mut out, "# TriMul Artifact Report\n").expect("writing to String cannot fail");
@@ -1212,20 +1248,27 @@ fn artifact_report(
     writeln!(&mut out, "## 4. Candidate Table\n").expect("writing to String cannot fail");
     writeln!(
         &mut out,
-        "| source hash | training reward | clean correctness | median runtime ns | speedup | accept/reject reason |"
+        "| source hash | training reward | source inspection | clean correctness | median runtime ns | speedup | accept/reject reason |"
     )
     .expect("writing to String cannot fail");
-    writeln!(&mut out, "|---|---:|---:|---:|---:|---|").expect("writing to String cannot fail");
+    writeln!(&mut out, "|---|---:|---|---:|---:|---:|---|").expect("writing to String cannot fail");
     writeln!(
         &mut out,
-        "| {} | {:.6} | {}/{} | {} | {} | {} |\n",
+        "| {} | {:.6} | {} | {}/{} | {} | {} | {} |\n",
         manifest.candidate.source_sha256,
         manifest.candidate.training_reward,
+        source_inspection,
         clean_correct,
         clean_total,
         candidate_median,
         speedup,
         decision
+    )
+    .expect("writing to String cannot fail");
+    writeln!(
+        &mut out,
+        "Source inspection notes: {}\n",
+        manifest.candidate.source_inspection.notes
     )
     .expect("writing to String cannot fail");
 
@@ -1294,6 +1337,16 @@ fn artifact_report(
     );
     push_check(
         &mut out,
+        manifest.candidate.source_inspection.result == SourceInspectionResult::Clean,
+        "source inspection found no process/file/env/network/path probing",
+    );
+    push_check(
+        &mut out,
+        !manifest.candidate.source_inspection.notes.trim().is_empty(),
+        "source inspection notes recorded",
+    );
+    push_check(
+        &mut out,
         !manifest.eval.bundle.trim().is_empty(),
         "eval bundle identity recorded",
     );
@@ -1322,6 +1375,8 @@ fn artifact_accept_reason(
 ) -> &'static str {
     if manifest.verification.accepted {
         "accepted: all clean runs correct and median runtime beats baseline"
+    } else if manifest.candidate.source_inspection.result == SourceInspectionResult::Suspicious {
+        "rejected: source inspection found process/file/env/network/path probing"
     } else if manifest.verification.runs.iter().any(|r| !r.correct) {
         "rejected: at least one clean verification run failed correctness"
     } else if manifest
@@ -1335,6 +1390,14 @@ fn artifact_accept_reason(
         "rejected: candidate median runtime does not beat baseline"
     } else {
         "rejected: insufficient clean verification evidence"
+    }
+}
+
+/// Stable report label for source inspection results.
+fn source_inspection_label(result: SourceInspectionResult) -> &'static str {
+    match result {
+        SourceInspectionResult::Clean => "clean",
+        SourceInspectionResult::Suspicious => "suspicious",
     }
 }
 
@@ -1550,6 +1613,10 @@ mod tests {
             "1.25",
             "--run-health",
             "healthy",
+            "--source-inspection",
+            "clean",
+            "--source-inspection-notes",
+            "no process, file descriptor, environment, network, or out-of-input path probes",
             "--audit-secret-seed",
             "99",
             "--baseline-ns",
@@ -1668,6 +1735,11 @@ mod tests {
                 training_reward: 1.5,
                 completion_sha256: "completion-hash".to_string(),
                 source_sha256: "source-hash".to_string(),
+                source_inspection: SourceInspectionManifest {
+                    result: SourceInspectionResult::Clean,
+                    notes: "no process, file descriptor, environment, network, or out-of-input path probes"
+                        .to_string(),
+                },
             },
             model: ModelManifest {
                 family: "qwen3.x".to_string(),
@@ -1733,12 +1805,14 @@ mod tests {
             "ferrl commit: abc123",
             "Config hash: config-hash",
             "Run health: healthy",
-            "| source hash | training reward | clean correctness | median runtime ns | speedup | accept/reject reason |",
-            "| source-hash | 1.500000 | 3/3 | 9.000000 | 1.222222 | accepted: all clean runs correct and median runtime beats baseline |",
+            "| source hash | training reward | source inspection | clean correctness | median runtime ns | speedup | accept/reject reason |",
+            "| source-hash | 1.500000 | clean | 3/3 | 9.000000 | 1.222222 | accepted: all clean runs correct and median runtime beats baseline |",
+            "Source inspection notes: no process, file descriptor, environment, network, or out-of-input path probes",
             "Path: artifact",
             "Manifest SHA-256: manifest-hash",
             "## 6. Reviewer Checklist",
             "[pass] audit seed differs from training seed",
+            "[pass] source inspection found no process/file/env/network/path probing",
         ] {
             assert!(report.contains(required), "missing report field: {required}");
         }
