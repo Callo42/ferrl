@@ -52,6 +52,7 @@ that surface so it can be tested to a high bar.
 ```
 ferrl/
 ├── Cargo.toml                 # workspace: [workspace.lints] = the locked lint bar
+├── docs/                      # run contracts and operator-facing project docs
 ├── rust-toolchain.toml        # pinned stable + rustfmt/clippy/llvm-tools-preview
 ├── rustfmt.toml  clippy.toml  # max_width=100; cognitive-complexity threshold 7
 ├── cog.toml                   # cocogitto (Conventional Commits + SemVer)
@@ -187,6 +188,15 @@ default):
 `countdown` generates its data procedurally; `math` is file-backed — set `data.path`
 to a JSONL dataset of `{"prompt": ..., "target": {"answer": ...}}` lines (see
 `crates/ferrl/tests/fixtures/math_dataset.jsonl`).
+
+### TriMul discovery runs
+
+The built-in `trimul` task is ferrl's first discovery task: training samples are
+candidate GPU kernels, and success is an emitted artifact rather than just a rising
+reward curve. Before spending GPU time on a TriMul run, use the
+[TriMul Discovery Run Contract](docs/trimul-discovery-run-contract.md). It defines the
+artifact bundle, provenance fields, same-GPU baseline pin, held-out verification,
+dynamic reward-hacking checks, and the no-win stopping report that the reviewer audits.
 
 ### From Rust — a task that isn't built in
 
