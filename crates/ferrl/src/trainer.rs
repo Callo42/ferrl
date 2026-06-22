@@ -73,7 +73,9 @@ use crate::optim::{FerrlAdamW, OptimizerState};
 use crate::policy::{GenConfig, Policy, Rollout};
 use crate::reward::{RewardError, RewardFn};
 use crate::sample::Sample;
-use crate::telemetry::{Metrics, MetricsWriter, RunDir, TelemetryError};
+use crate::telemetry::{
+    CandidateRecord, CandidateWriter, Metrics, MetricsWriter, RunDir, TelemetryError,
+};
 
 /// An error raised while running a GRPO training step.
 #[derive(Debug, thiserror::Error)]
@@ -282,6 +284,13 @@ pub struct TrainerConfig {
     /// this field existed still deserializes (to `None`).
     #[serde(default)]
     pub checkpoint_every: Option<u64>,
+    /// Persist the top-K sampled completions per prompt group to
+    /// `candidates.jsonl`, ordered by scalar reward. `0` disables the candidate
+    /// ledger. This is intentionally opt-in because completions can be large; it
+    /// is required for discovery runs that need to feed raw candidates to an
+    /// artifact extractor after training.
+    #[serde(default)]
+    pub candidate_log_top_k: usize,
     /// End-of-sequence token id threaded into [`GenConfig::eos_token_id`] for
     /// rollout: when `Some`, a sampled EOS ends a completion early (EOS-inclusive)
     /// and the row is right-padded to `max_new_tokens`, the true length recorded in
@@ -353,6 +362,7 @@ impl Default for TrainerConfig {
             scale_rewards: ScaleRewards::Group,
             grad_accum_steps: 1,
             checkpoint_every: None,
+            candidate_log_top_k: 0,
             eos_token_id: None,
         }
     }
@@ -564,6 +574,13 @@ impl TrainerConfigBuilder {
         self
     }
 
+    /// Set [`TrainerConfig::candidate_log_top_k`].
+    #[must_use]
+    pub fn candidate_log_top_k(mut self, candidate_log_top_k: usize) -> Self {
+        self.cfg.candidate_log_top_k = candidate_log_top_k;
+        self
+    }
+
     /// Set [`TrainerConfig::eos_token_id`].
     #[must_use]
     pub fn eos_token_id(mut self, eos_token_id: Option<u32>) -> Self {
@@ -726,6 +743,8 @@ pub struct Trainer {
     /// the loop writes a final checkpoint and stops at the next step boundary. Safe
     /// to install unevenly across DP ranks — the per-step poll is install-invariant.
     preempt: Option<Arc<AtomicBool>>,
+    /// Optional top-candidate ledger for discovery runs.
+    candidate_writer: Option<CandidateWriter>,
 }
 
 /// Per-inner-step quantities folded into the step's [`Metrics`].
@@ -930,12 +949,18 @@ impl Trainer {
         }
         run.write_config(&config)?;
         let writer = run.metrics_writer()?;
+        let candidate_writer = if config.candidate_log_top_k > 0 {
+            Some(run.candidate_writer()?)
+        } else {
+            None
+        };
         Ok(Self {
             config,
             writer,
             checkpoints_dir: run.checkpoints_dir(),
             comm: Box::new(comm),
             preempt: None,
+            candidate_writer,
         })
     }
 
@@ -1400,7 +1425,7 @@ impl Trainer {
     /// numerator the caller divides by the step wall-time — local, not world-summed).
     #[allow(clippy::too_many_arguments)]
     fn run_window<P: Policy, R: RewardFn>(
-        &self,
+        &mut self,
         step: u64,
         policy: &mut P,
         reward_fn: &R,
@@ -1435,7 +1460,7 @@ impl Trainer {
             let g = step * (accum * world) as u64 + local as u64;
             let idx = (step as usize * (accum * world) + local) % samples.len();
             let (stat, item) =
-                self.collect_sample(policy, reward_fn, tokenizer, &samples[idx], g)?;
+                self.collect_sample(step, policy, reward_fn, tokenizer, &samples[idx], g)?;
             stats.push(stat);
             if let Some(item) = item {
                 live.push(item);
@@ -1477,6 +1502,46 @@ impl Trainer {
             self.build_window_metrics(step, &stats, &agg, opt),
             local_tokens,
         ))
+    }
+
+    /// Persist this prompt group's top-K decoded completions when the candidate
+    /// ledger is enabled. The ledger is written immediately after rewards are known,
+    /// before any later degenerate-group skip, so a no-update run still preserves the
+    /// evidence needed for artifact extraction or debugging.
+    fn write_candidate_records(
+        &mut self,
+        step: u64,
+        prompt_index: u64,
+        completions: &[String],
+        rewards: &[f32],
+        rollout: &Rollout,
+    ) -> Result<(), TrainerError> {
+        let k = self.config.candidate_log_top_k.min(completions.len());
+        if k == 0 {
+            return Ok(());
+        }
+        let rank = self.comm.rank();
+        let world_size = self.comm.world_size();
+        let Some(writer) = self.candidate_writer.as_mut() else {
+            return Ok(());
+        };
+        let mut order: Vec<usize> = (0..completions.len()).collect();
+        order.sort_by(|&a, &b| {
+            candidate_reward_order(rewards[a], rewards[b]).then_with(|| a.cmp(&b))
+        });
+        for &group_index in order.iter().take(k) {
+            writer.append(&CandidateRecord {
+                step,
+                rank,
+                world_size,
+                prompt_index,
+                group_index,
+                reward: rewards[group_index],
+                completion_len_tokens: rollout.completion_lens[group_index],
+                completion: completions[group_index].clone(),
+            })?;
+        }
+        Ok(())
     }
 
     /// After completing step `step` (0-based), write a momentum-faithful (v2)
@@ -1586,7 +1651,8 @@ impl Trainer {
     /// log-probs (taken now, at the window's start) into a [`LiveItem`] for the inner
     /// epochs.
     fn collect_sample<P: Policy, R: RewardFn>(
-        &self,
+        &mut self,
+        step: u64,
         policy: &mut P,
         reward_fn: &R,
         tokenizer: &dyn TokenizerLike,
@@ -1651,6 +1717,7 @@ impl Trainer {
                 rollout.len()
             )));
         }
+        self.write_candidate_records(step, global_prompt_index, &completions, &rewards, &rollout)?;
 
         // Length-aware loss mask: column j of sequence i is a real completion token
         // (kept, 1.0) iff j < completion_lens[i]; the EOS padding at and beyond that
@@ -2056,6 +2123,18 @@ fn step_throughput(tokens: usize, secs: f64) -> f32 {
         (tokens as f64 / secs) as f32
     } else {
         0.0
+    }
+}
+
+/// Candidate ledger ordering: higher finite reward first; non-finite rewards sort
+/// after every finite candidate so a verifier glitch cannot hide the best usable
+/// completion.
+fn candidate_reward_order(a: f32, b: f32) -> std::cmp::Ordering {
+    match (a.is_finite(), b.is_finite()) {
+        (true, true) => b.total_cmp(&a),
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        (false, false) => a.total_cmp(&b),
     }
 }
 
@@ -2830,6 +2909,7 @@ mod tests {
             .scale_rewards(ScaleRewards::None)
             .grad_accum_steps(4)
             .checkpoint_every(Some(50))
+            .candidate_log_top_k(2)
             .eos_token_id(Some(151_645))
             .build();
         let literal = TrainerConfig {
@@ -2855,6 +2935,7 @@ mod tests {
             scale_rewards: ScaleRewards::None,
             grad_accum_steps: 4,
             checkpoint_every: Some(50),
+            candidate_log_top_k: 2,
             eos_token_id: Some(151_645),
         };
         assert_eq!(
@@ -3810,6 +3891,7 @@ mod tests {
         assert_eq!(back.loss_type, cfg.loss_type);
         assert_eq!(back.scale_rewards, cfg.scale_rewards);
         assert_eq!(back.grad_accum_steps, cfg.grad_accum_steps);
+        assert_eq!(back.candidate_log_top_k, cfg.candidate_log_top_k);
     }
 
     #[test]
@@ -3863,6 +3945,7 @@ mod tests {
         // (no accumulation), not fail — the serde default keeps old runs loadable.
         let cfg: TrainerConfig = serde_json::from_str(OLD_CONFIG_JSON).unwrap();
         assert_eq!(cfg.grad_accum_steps, 1);
+        assert_eq!(cfg.candidate_log_top_k, 0);
         // The EOS field also predates the JSON above; serde fills it from the default.
         assert_eq!(cfg.eos_token_id, None);
         assert!(cfg.validate().is_ok());
@@ -3915,6 +3998,108 @@ mod tests {
         let (mean, std) = reward_stats(&[f32::NAN, f32::NAN]);
         assert_eq!(mean, 0.0);
         assert_eq!(std, 0.0);
+    }
+
+    struct CandidateCodec;
+    impl TokenizerLike for CandidateCodec {
+        fn encode(&self, _text: &str) -> Vec<u32> {
+            vec![1]
+        }
+        fn decode(&self, ids: &[u32]) -> String {
+            ids.iter().map(u32::to_string).collect::<Vec<_>>().join(",")
+        }
+    }
+
+    struct CandidatePolicy {
+        logp: Var,
+    }
+    impl Policy for CandidatePolicy {
+        fn generate(&mut self, _prompt: &[u32], _cfg: &GenConfig) -> CandleResult<Rollout> {
+            Ok(Rollout {
+                token_ids: vec![vec![1, 7, 7], vec![1, 9, 9], vec![1, 2, 2]],
+                prompt_len: 1,
+                completion_lens: vec![2, 2, 2],
+                rollout_logprobs: None,
+            })
+        }
+
+        fn token_logprobs(&self, _rollout: &Rollout) -> CandleResult<Tensor> {
+            Ok(self.logp.as_tensor().clone())
+        }
+
+        fn set_adapter_enabled(&mut self, _enabled: bool) {}
+        fn adapter_enabled(&self) -> bool {
+            true
+        }
+        fn trainable_vars(&self) -> Vec<Var> {
+            vec![self.logp.clone()]
+        }
+        fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+            Ok(Vec::new())
+        }
+        fn restore_sampler_state(&mut self, _state: &[u8]) -> CandleResult<()> {
+            Ok(())
+        }
+    }
+
+    struct CandidateReward;
+    impl RewardFn for CandidateReward {
+        type Target = ();
+
+        fn reward(&self, _sample: &Sample<()>, completion: &str) -> Result<f32, RewardError> {
+            Ok(match completion {
+                "7,7" => f32::NAN,
+                "9,9" => 2.0,
+                _ => 1.0,
+            })
+        }
+    }
+
+    #[test]
+    fn trainer_writes_top_candidate_records_when_enabled() {
+        let tmp = WireTmp::new("candidates");
+        let run = RunDir::create(&tmp.0, "candidate-run").unwrap();
+        let cfg = TrainerConfig {
+            steps: 1,
+            group_size: 3,
+            max_new_tokens: 2,
+            lr: 0.0,
+            candidate_log_top_k: 2,
+            loss_type: LossType::Grpo,
+            ..TrainerConfig::default()
+        };
+        let logp = Var::from_tensor(&mat(&[&[-1.0, -1.0], &[-1.0, -1.0], &[-1.0, -1.0]])).unwrap();
+        let mut policy = CandidatePolicy { logp };
+        let mut trainer = Trainer::new(cfg, &run).unwrap();
+        trainer
+            .train(
+                &mut policy,
+                &CandidateReward,
+                &CandidateCodec,
+                &[Sample::new("prompt", ())],
+            )
+            .unwrap();
+
+        let raw = std::fs::read_to_string(run.candidates_path()).unwrap();
+        let lines: Vec<&str> = raw.lines().collect();
+        assert_eq!(lines.len(), 2);
+        let rec0: CandidateRecord = serde_json::from_str(lines[0]).unwrap();
+        let rec1: CandidateRecord = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(
+            (
+                rec0.step,
+                rec0.prompt_index,
+                rec0.group_index,
+                rec0.reward,
+                rec0.completion_len_tokens,
+                rec0.completion.as_str()
+            ),
+            (0, 0, 1, 2.0, 2, "9,9")
+        );
+        assert_eq!(
+            (rec1.group_index, rec1.reward, rec1.completion.as_str()),
+            (2, 1.0, "2,2")
+        );
     }
 
     // ---- completion_lens consumption (length-aware mask / decode / metric) --

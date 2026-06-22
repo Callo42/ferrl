@@ -2,10 +2,12 @@
 //!
 //! Every training run materializes a `runs/<run_id>/` directory containing
 //! `config.json` (the run configuration), `metrics.jsonl` (one [`Metrics`] JSON
-//! object per optimizer step), a `checkpoints/` subdirectory, and `run.log` (a
+//! object per optimizer step), an optional `candidates.jsonl` stream (top sampled
+//! completions when enabled), a `checkpoints/` subdirectory, and `run.log` (a
 //! human-readable log). [`init_tracing`] wires up `tracing` once for the
 //! process; [`RunDir`] owns the directory; [`MetricsWriter`] appends step
-//! metrics as JSON Lines.
+//! metrics as JSON Lines; [`CandidateWriter`] appends sampled-completion
+//! provenance as JSON Lines.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -39,16 +41,16 @@ pub enum TelemetryError {
         /// Underlying JSON parse error.
         source: serde_json::Error,
     },
-    /// [`RunDir::create`] was given a `run_id` whose directory already holds a
-    /// metrics stream — appending a fresh run to a prior run's `metrics.jsonl`
-    /// would silently interleave two runs. Use a new `run_id`, or
+    /// [`RunDir::create`] was given a `run_id` whose directory already holds an
+    /// append-only telemetry stream — appending a fresh run to a prior run's
+    /// stream would silently interleave two runs. Use a new `run_id`, or
     /// [`RunDir::open`] to deliberately continue the existing run (resume).
     #[error(
-        "run directory already contains a metrics stream at {path} \
+        "run directory already contains an append-only telemetry stream at {path} \
          (duplicate run_id? use RunDir::open to resume)"
     )]
     DuplicateRun {
-        /// The pre-existing `metrics.jsonl`.
+        /// The pre-existing append-only telemetry stream.
         path: PathBuf,
     },
 }
@@ -139,6 +141,8 @@ pub struct RunDir {
 impl RunDir {
     /// Standard filename for the per-step metrics stream.
     pub const METRICS_FILE: &'static str = "metrics.jsonl";
+    /// Standard filename for the optional per-candidate ledger stream.
+    pub const CANDIDATES_FILE: &'static str = "candidates.jsonl";
     /// Standard filename for the serialized run configuration.
     pub const CONFIG_FILE: &'static str = "config.json";
     /// Standard filename for the human-readable run log.
@@ -149,25 +153,29 @@ impl RunDir {
     /// Create `runs_root/<run_id>/` (and its `checkpoints/` subdir) for a
     /// **fresh** run.
     ///
-    /// Fails loud if the directory already holds a `metrics.jsonl`: the metrics
-    /// writer appends, so a duplicate `run_id` would silently interleave a new
-    /// run's stream into a prior run's file (the `RUNDIR-APPEND` hazard). To
+    /// Fails loud if the directory already holds an append-only telemetry
+    /// stream (`metrics.jsonl` or `candidates.jsonl`): those writers append, so
+    /// a duplicate `run_id` would silently interleave a new run's stream into a
+    /// prior run's file (the `RUNDIR-APPEND` hazard). To
     /// deliberately continue an existing run — the checkpoint-resume path — use
     /// [`open`](Self::open) instead.
     ///
     /// # Errors
     ///
-    /// Returns [`TelemetryError::DuplicateRun`] if `runs_root/<run_id>/metrics.jsonl`
-    /// already exists, or [`TelemetryError::Io`] if any directory cannot be created.
+    /// Returns [`TelemetryError::DuplicateRun`] if an append-only telemetry
+    /// stream already exists under `runs_root/<run_id>/`, or [`TelemetryError::Io`]
+    /// if any directory cannot be created.
     pub fn create(
         runs_root: impl AsRef<Path>,
         run_id: impl Into<String>,
     ) -> Result<Self, TelemetryError> {
         let run_id = run_id.into();
         let root = runs_root.as_ref().join(&run_id);
-        let metrics = root.join(Self::METRICS_FILE);
-        if metrics.exists() {
-            return Err(TelemetryError::DuplicateRun { path: metrics });
+        for file in [Self::METRICS_FILE, Self::CANDIDATES_FILE] {
+            let path = root.join(file);
+            if path.exists() {
+                return Err(TelemetryError::DuplicateRun { path });
+            }
         }
         fs::create_dir_all(&root).map_err(|e| TelemetryError::io(&root, e))?;
         let ckpt = root.join(Self::CHECKPOINTS_DIR);
@@ -221,6 +229,12 @@ impl RunDir {
         self.root.join(Self::METRICS_FILE)
     }
 
+    /// Path to `candidates.jsonl`.
+    #[must_use]
+    pub fn candidates_path(&self) -> PathBuf {
+        self.root.join(Self::CANDIDATES_FILE)
+    }
+
     /// Path to `config.json`.
     #[must_use]
     pub fn config_path(&self) -> PathBuf {
@@ -257,6 +271,15 @@ impl RunDir {
     /// Returns [`TelemetryError::Io`] if the file cannot be opened for append.
     pub fn metrics_writer(&self) -> Result<MetricsWriter, TelemetryError> {
         MetricsWriter::open(self.metrics_path())
+    }
+
+    /// Open a [`CandidateWriter`] appending to this run's `candidates.jsonl`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TelemetryError::Io`] if the candidate ledger file cannot be opened.
+    pub fn candidate_writer(&self) -> Result<CandidateWriter, TelemetryError> {
+        CandidateWriter::open(self.candidates_path())
     }
 }
 
@@ -481,6 +504,96 @@ impl Metrics {
 pub struct MetricsWriter {
     path: PathBuf,
     file: File,
+}
+
+/// One sampled completion persisted to `candidates.jsonl`.
+///
+/// The ledger is intentionally raw: it records the decoded completion text exactly
+/// as the reward saw it, plus enough position/provenance to feed a later
+/// artifact-extraction command without reconstructing candidates from aggregate
+/// metrics.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CandidateRecord {
+    /// Global optimizer step (0-based).
+    pub step: u64,
+    /// Data-parallel rank that sampled and scored this completion.
+    pub rank: usize,
+    /// Data-parallel world size for the run.
+    pub world_size: usize,
+    /// Global prompt ordinal used to seed this group.
+    pub prompt_index: u64,
+    /// Completion index within the prompt's sampled group.
+    pub group_index: usize,
+    /// Scalar reward assigned to this completion.
+    pub reward: f32,
+    /// Real completion length in tokens, EOS-inclusive.
+    pub completion_len_tokens: usize,
+    /// Decoded completion text, exactly as passed to the reward.
+    pub completion: String,
+}
+
+impl CandidateRecord {
+    /// A copy with a finite reward so `candidates.jsonl` stays re-readable JSON.
+    #[must_use]
+    pub fn nan_to_num(&self) -> Self {
+        let mut out = self.clone();
+        out.reward = if out.reward.is_finite() {
+            out.reward
+        } else if out.reward.is_nan() {
+            0.0
+        } else if out.reward.is_sign_positive() {
+            f32::MAX
+        } else {
+            f32::MIN
+        };
+        out
+    }
+}
+
+/// Appends [`CandidateRecord`]s to a JSON Lines file, one object per line.
+#[derive(Debug)]
+pub struct CandidateWriter {
+    path: PathBuf,
+    file: File,
+}
+
+impl CandidateWriter {
+    /// Open (creating if absent) `path` for appending candidate records.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TelemetryError::Io`] if the file cannot be opened.
+    pub fn open(path: impl Into<PathBuf>) -> Result<Self, TelemetryError> {
+        let path = path.into();
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| TelemetryError::io(&path, e))?;
+        Ok(Self { path, file })
+    }
+
+    /// Append one candidate record as a JSON line and flush it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TelemetryError`] if serialization or the write/flush fails.
+    pub fn append(&mut self, record: &CandidateRecord) -> Result<(), TelemetryError> {
+        let mut line = serde_json::to_string(&record.nan_to_num())?;
+        line.push('\n');
+        self.file
+            .write_all(line.as_bytes())
+            .map_err(|e| TelemetryError::io(&self.path, e))?;
+        self.file
+            .flush()
+            .map_err(|e| TelemetryError::io(&self.path, e))
+    }
+
+    /// The path this writer appends to.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
 }
 
 impl MetricsWriter {
@@ -1034,6 +1147,40 @@ mod tests {
     }
 
     #[test]
+    fn rundir_create_rejects_stale_candidate_ledger_without_metrics() {
+        // Candidates are written during sample collection before step metrics.
+        // If the process dies in that window, a fresh run with the same run_id
+        // must not append indistinguishable coordinates into the stale ledger.
+        let tmp = TempDir::new("dup-candidates");
+        let rd = RunDir::create(tmp.path(), "run-001").unwrap();
+        let mut w = rd.candidate_writer().unwrap();
+        w.append(&CandidateRecord {
+            step: 0,
+            rank: 0,
+            world_size: 1,
+            prompt_index: 0,
+            group_index: 0,
+            reward: 1.0,
+            completion_len_tokens: 2,
+            completion: "candidate".to_string(),
+        })
+        .unwrap();
+        drop(w);
+        assert!(
+            !rd.metrics_path().exists(),
+            "regression must cover crash-before-metrics"
+        );
+
+        let err = RunDir::create(tmp.path(), "run-001").unwrap_err();
+        match err {
+            TelemetryError::DuplicateRun { path } => {
+                assert_eq!(path, rd.candidates_path());
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
     fn read_metrics_round_trips_a_written_stream() {
         // read_metrics is the inverse of MetricsWriter::append: writing N records and
         // reading them back yields the same records, in order. append() sanitizes via
@@ -1053,6 +1200,34 @@ mod tests {
             read, expected,
             "read_metrics must reproduce the written records in order"
         );
+    }
+
+    #[test]
+    fn candidate_writer_appends_jsonl_records() {
+        let tmp = TempDir::new("candidates");
+        let rd = RunDir::create(tmp.path(), "run-candidates").unwrap();
+        let mut w = rd.candidate_writer().unwrap();
+        let rec = CandidateRecord {
+            step: 3,
+            rank: 0,
+            world_size: 1,
+            prompt_index: 12,
+            group_index: 1,
+            reward: f32::NAN,
+            completion_len_tokens: 42,
+            completion: "```python\ndef custom_kernel(data):\n    return data\n```".to_string(),
+        };
+        w.append(&rec).unwrap();
+        drop(w);
+
+        let raw = std::fs::read_to_string(rd.candidates_path()).unwrap();
+        let lines: Vec<&str> = raw.lines().collect();
+        assert_eq!(lines.len(), 1);
+        let parsed: CandidateRecord = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(parsed.step, 3);
+        assert_eq!(parsed.group_index, 1);
+        assert_eq!(parsed.reward, 0.0);
+        assert!(parsed.completion.contains("custom_kernel"));
     }
 
     #[test]
