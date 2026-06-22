@@ -192,7 +192,7 @@ pub use llama::{LlamaGradModel, LlamaMergedDecoder};
 #[doc(inline)]
 pub use lm_policy::{LlamaPolicy, LmPolicy, Qwen3_5Policy, QwenPolicy};
 #[doc(inline)]
-pub use loader::{load_qwen_policy, LoaderError, LoaderOpts};
+pub use loader::{load_auto_policy, load_qwen_policy, AutoPolicy, LoaderError, LoaderOpts};
 #[doc(inline)]
 pub use lora::DenseLoraTargets;
 #[doc(inline)]
