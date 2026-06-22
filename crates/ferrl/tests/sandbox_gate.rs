@@ -3,9 +3,9 @@
 //! [`ferrl::sandbox`]'s unit tests prove the `apptainer exec` argv **encodes** the
 //! isolation policy. These tests prove Apptainer **enforces** it: a deliberately
 //! hostile payload cannot read host credentials, reach the network, fork-storm,
-//! exhaust memory, or write an unbounded file, and a runaway is killed on its
-//! wall-clock budget. This is the spec's "isolation from day one" invariant, shown
-//! against a real adversary rather than asserted.
+//! exhaust memory, write an unbounded file or unbounded scratch tree, and a
+//! runaway is killed on its wall-clock budget. This is the spec's "isolation from
+//! day one" invariant, shown against a real adversary rather than asserted.
 //!
 //! Gated behind the off-by-default `gate` feature, so — exactly like the GPU tests
 //! — CI never compiles it (no run, no coverage impact). The probes are *bounded*
@@ -38,6 +38,23 @@ fn scratch(tag: &str) -> PathBuf {
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).expect("create scratch dir");
     dir
+}
+
+/// Best-effort size of a scratch tree after a hostile probe.
+fn dir_size(path: &std::path::Path) -> u64 {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if !meta.is_dir() {
+        return meta.len();
+    }
+    let mut total = meta.len();
+    if let Ok(entries) = fs::read_dir(path) {
+        for entry in entries.flatten() {
+            total = total.saturating_add(dir_size(&entry.path()));
+        }
+    }
+    total
 }
 
 /// Run a spec to completion; the run itself must be *carried out* (a non-zero exit
@@ -187,6 +204,74 @@ fn gate_file_size_cap_bounds_a_write() {
     assert!(
         written <= 2 << 20,
         "file-size cap did not bound the write: {written} bytes"
+    );
+}
+
+#[test]
+#[ignore = "needs apptainer + $FERRL_SANDBOX_IMAGE on an isolated node"]
+fn gate_scratch_total_cap_bounds_many_files() {
+    // The per-file `ulimit -f` is not enough: a payload can write many small files.
+    // Prove the host supervisor watches the total `/work` tree and kills the run.
+    let dir = scratch("scratch-total");
+    let spec = RunSpec::new(
+        image(),
+        vec![
+            "bash".into(),
+            "-c".into(),
+            "i=0; while true; do dd if=/dev/zero of=/work/$i bs=1024 count=64 2>/dev/null; i=$((i+1)); sleep 0.05; done".into(),
+        ],
+    )
+    .with_binds(vec![Bind::rw(&dir, "/work").with_total_limit(1 << 20)])
+    .with_workdir("/work")
+    .with_limits(ResourceLimits {
+        wall: Duration::from_secs(10),
+        max_file: Some(1 << 20),
+        ..ResourceLimits::default()
+    });
+    let out = run(&spec);
+    let written = dir_size(&dir);
+    let _ = fs::remove_dir_all(&dir);
+    assert_eq!(
+        out.status,
+        RunStatus::ScratchExceeded,
+        "scratch total cap did not terminate the run; stdout={:?} stderr={:?}",
+        out.stdout,
+        out.stderr
+    );
+    assert!(
+        written <= 4 << 20,
+        "scratch overflow guard reacted too late: {written} bytes"
+    );
+}
+
+#[test]
+#[ignore = "needs apptainer + $FERRL_SANDBOX_IMAGE on an isolated node"]
+fn gate_scratch_total_cap_catches_fast_clean_exit() {
+    // A finite payload may fill `/work` and exit before the next poll. The final
+    // scratch check must still reject it as an overflow, not a clean success.
+    let dir = scratch("scratch-exit");
+    let spec = RunSpec::new(
+        image(),
+        vec![
+            "bash".into(),
+            "-c".into(),
+            "dd if=/dev/zero of=/work/big bs=1024 count=2048 2>/dev/null; exit 0".into(),
+        ],
+    )
+    .with_binds(vec![Bind::rw(&dir, "/work").with_total_limit(1 << 20)])
+    .with_workdir("/work")
+    .with_limits(ResourceLimits {
+        wall: Duration::from_secs(10),
+        ..ResourceLimits::default()
+    });
+    let out = run(&spec);
+    let _ = fs::remove_dir_all(&dir);
+    assert_eq!(
+        out.status,
+        RunStatus::ScratchExceeded,
+        "scratch overflow on a fast clean exit was accepted; stdout={:?} stderr={:?}",
+        out.stdout,
+        out.stderr
     );
 }
 

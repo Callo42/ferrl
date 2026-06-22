@@ -28,6 +28,8 @@
 //!   **host-side wall-clock supervisor** that is the final authority on the time
 //!   budget — it kills the run if it overruns, and cannot be evaded from inside
 //!   the container;
+//! - optional host-supervised total byte caps for writable binds such as `/work`,
+//!   so many-small-file fills are bounded as well as single large writes;
 //! - **bounded output capture** — at most `CAPTURE_CAP` bytes per stream are read
 //!   into host memory, so a payload spewing to stdout cannot exhaust the host;
 //!   past the cap the writer blocks on a full pipe and the supervisor reaps it.
@@ -45,7 +47,7 @@
 //! allocation; it is never compiled in CI, just as the GPU tests are not.
 
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
@@ -79,6 +81,9 @@ pub struct Bind {
     pub dst: PathBuf,
     /// Read-only or read-write.
     pub mode: BindMode,
+    /// Optional total byte cap for a writable host path, enforced by the host
+    /// supervisor over the whole tree.
+    pub total_limit: Option<u64>,
 }
 
 impl Bind {
@@ -90,6 +95,7 @@ impl Bind {
             src: src.into(),
             dst: dst.into(),
             mode: BindMode::ReadOnly,
+            total_limit: None,
         }
     }
 
@@ -101,7 +107,15 @@ impl Bind {
             src: src.into(),
             dst: dst.into(),
             mode: BindMode::ReadWrite,
+            total_limit: None,
         }
+    }
+
+    /// Add a host-supervised total byte cap to this bind.
+    #[must_use]
+    pub fn with_total_limit(mut self, bytes: u64) -> Self {
+        self.total_limit = Some(bytes);
+        self
     }
 
     /// Render as the `src:dst:mode` string `apptainer --bind` expects.
@@ -253,6 +267,8 @@ pub enum RunStatus {
     TimedOut,
     /// The command was killed by a signal (e.g. an OOM or a file-size cap).
     Signaled(i32),
+    /// The run exceeded a host-supervised writable-bind total byte cap and was killed.
+    ScratchExceeded,
 }
 
 impl RunStatus {
@@ -261,6 +277,15 @@ impl RunStatus {
     pub fn is_success(self) -> bool {
         matches!(self, RunStatus::Exited(0))
     }
+}
+
+/// A host path whose total disk usage is capped during a sandboxed run.
+#[derive(Debug, Clone)]
+struct ScratchLimit {
+    /// Host path to monitor.
+    path: PathBuf,
+    /// Maximum total bytes allowed beneath `path`.
+    bytes: u64,
 }
 
 /// The result of a sandboxed run: how it ended, plus its captured output.
@@ -386,8 +411,25 @@ impl Sandbox for ApptainerSandbox {
     fn run(&self, spec: &RunSpec) -> Result<RunOutcome, SandboxError> {
         let mut command = Command::new(&self.bin);
         command.args(self.build_argv(spec));
-        supervise(command, spec.limits.wall)
+        let scratch_limits = scratch_limits(spec);
+        supervise(command, spec.limits.wall, &scratch_limits)
     }
+}
+
+/// Extract writable bind limits from the run spec.
+fn scratch_limits(spec: &RunSpec) -> Vec<ScratchLimit> {
+    spec.binds
+        .iter()
+        .filter_map(|bind| {
+            (bind.mode == BindMode::ReadWrite)
+                .then_some(bind.total_limit)
+                .flatten()
+                .map(|bytes| ScratchLimit {
+                    path: bind.src.clone(),
+                    bytes,
+                })
+        })
+        .collect()
 }
 
 /// The `bash -c` script run *inside* the image: apply the requested `ulimit`s, then
@@ -442,7 +484,11 @@ const CAPTURE_CAP: usize = 8 << 20;
 /// Spawn `command`, drain its stdout/stderr concurrently, and enforce `deadline`
 /// (wall-clock) by killing the process if it overruns. The concurrent drain avoids
 /// the classic pipe-buffer deadlock; the kill is the final authority over a runaway.
-fn supervise(mut command: Command, deadline: Duration) -> Result<RunOutcome, SandboxError> {
+fn supervise(
+    mut command: Command,
+    deadline: Duration,
+    scratch_limits: &[ScratchLimit],
+) -> Result<RunOutcome, SandboxError> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -453,8 +499,10 @@ fn supervise(mut command: Command, deadline: Duration) -> Result<RunOutcome, San
     let err = drain(child.stderr.take());
 
     let mut timed_out = false;
+    let mut scratch_exceeded = false;
     let status = loop {
         if let Some(status) = child.try_wait().map_err(SandboxError::Supervise)? {
+            scratch_exceeded = scratch_over_limit(scratch_limits);
             break status;
         }
         if start.elapsed() >= deadline {
@@ -462,15 +510,47 @@ fn supervise(mut command: Command, deadline: Duration) -> Result<RunOutcome, San
             timed_out = true;
             break child.wait().map_err(SandboxError::Supervise)?;
         }
+        if scratch_over_limit(scratch_limits) {
+            let _ = child.kill();
+            scratch_exceeded = true;
+            break child.wait().map_err(SandboxError::Supervise)?;
+        }
         thread::sleep(POLL_INTERVAL);
     };
 
     Ok(RunOutcome {
-        status: classify_exit(status, timed_out),
+        status: classify_exit(status, timed_out, scratch_exceeded),
         stdout: collect_output(&out),
         stderr: collect_output(&err),
         wall: start.elapsed(),
     })
+}
+
+/// `true` if any monitored path's current tree size is over its cap. Missing
+/// paths count as empty, but other I/O errors fail closed: a payload should not
+/// be able to hide scratch usage by changing permissions or racing traversal.
+fn scratch_over_limit(limits: &[ScratchLimit]) -> bool {
+    limits
+        .iter()
+        .any(|limit| dir_size(&limit.path).map_or(true, |bytes| bytes > limit.bytes))
+}
+
+/// Total bytes used by `path`, summing regular files and directory entries without
+/// following symlinks.
+fn dir_size(path: &Path) -> std::io::Result<u64> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => return Err(err),
+    };
+    if !meta.is_dir() {
+        return Ok(meta.len());
+    }
+    let mut total = meta.len();
+    for entry in std::fs::read_dir(path)? {
+        total = total.saturating_add(dir_size(&entry?.path())?);
+    }
+    Ok(total)
 }
 
 /// Read a child pipe on a detached thread, capturing at most [`CAPTURE_CAP`] bytes
@@ -517,7 +597,10 @@ fn collect_output(rx: &Receiver<Vec<u8>>) -> String {
 }
 
 /// Classify a finished child into a [`RunStatus`].
-fn classify_exit(status: ExitStatus, timed_out: bool) -> RunStatus {
+fn classify_exit(status: ExitStatus, timed_out: bool, scratch_exceeded: bool) -> RunStatus {
+    if scratch_exceeded {
+        return RunStatus::ScratchExceeded;
+    }
     if timed_out {
         return RunStatus::TimedOut;
     }
@@ -677,6 +760,7 @@ mod tests {
         assert!(!RunStatus::Exited(1).is_success());
         assert!(!RunStatus::TimedOut.is_success());
         assert!(!RunStatus::Signaled(9).is_success());
+        assert!(!RunStatus::ScratchExceeded.is_success());
     }
 
     // --- Host-side supervisor: real subprocess, no container runtime needed. ---
@@ -691,7 +775,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn supervise_captures_stdout_on_clean_exit() {
-        let outcome = supervise(sh("printf hello"), Duration::from_secs(5)).unwrap();
+        let outcome = supervise(sh("printf hello"), Duration::from_secs(5), &[]).unwrap();
         assert_eq!(outcome.status, RunStatus::Exited(0));
         assert_eq!(outcome.stdout, "hello");
     }
@@ -699,7 +783,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn supervise_captures_stderr_and_nonzero_exit() {
-        let outcome = supervise(sh("printf oops 1>&2; exit 3"), Duration::from_secs(5)).unwrap();
+        let outcome =
+            supervise(sh("printf oops 1>&2; exit 3"), Duration::from_secs(5), &[]).unwrap();
         assert_eq!(outcome.status, RunStatus::Exited(3));
         assert_eq!(outcome.stderr, "oops");
     }
@@ -709,7 +794,7 @@ mod tests {
     fn supervise_kills_on_wallclock_overrun() {
         // `sh -c 'sleep 30'` exec-replaces sh with sleep, so the kill closes the
         // pipe and the drain returns promptly.
-        let outcome = supervise(sh("sleep 30"), Duration::from_millis(300)).unwrap();
+        let outcome = supervise(sh("sleep 30"), Duration::from_millis(300), &[]).unwrap();
         assert_eq!(outcome.status, RunStatus::TimedOut);
         assert!(
             outcome.wall < Duration::from_secs(5),
@@ -724,6 +809,7 @@ mod tests {
         let err = supervise(
             Command::new("/no/such/ferrl-binary-xyz"),
             Duration::from_secs(1),
+            &[],
         )
         .unwrap_err();
         assert!(matches!(err, SandboxError::Spawn(_)));
@@ -734,7 +820,7 @@ mod tests {
     fn supervise_reports_a_signal_death() {
         // The child kills itself with SIGKILL — it dies by signal (no exit code),
         // so the outcome is `Signaled`, exercising the signal-classification path.
-        let outcome = supervise(sh("kill -KILL $$"), Duration::from_secs(5)).unwrap();
+        let outcome = supervise(sh("kill -KILL $$"), Duration::from_secs(5), &[]).unwrap();
         assert!(
             matches!(outcome.status, RunStatus::Signaled(_)),
             "expected a signal death, got {:?}",
@@ -757,11 +843,71 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn supervise_kills_when_scratch_total_exceeds_limit() {
+        let dir =
+            std::env::temp_dir().join(format!("ferrl-scratch-limit-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = format!(
+            "dd if=/dev/zero of={}/big bs=1024 count=2048 2>/dev/null; sleep 30",
+            shell_quote(&dir.display().to_string())
+        );
+        let outcome = supervise(
+            sh(&script),
+            Duration::from_secs(10),
+            &[ScratchLimit {
+                path: dir.clone(),
+                bytes: 1 << 20,
+            }],
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(outcome.status, RunStatus::ScratchExceeded);
+        assert!(
+            outcome.wall < Duration::from_secs(5),
+            "scratch overflow should kill promptly, took {:?}",
+            outcome.wall
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supervise_reports_scratch_overflow_even_after_clean_exit() {
+        let dir = std::env::temp_dir().join(format!(
+            "ferrl-scratch-exit-limit-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = format!(
+            "dd if=/dev/zero of={}/big bs=1024 count=2048 2>/dev/null; exit 0",
+            shell_quote(&dir.display().to_string())
+        );
+        let outcome = supervise(
+            sh(&script),
+            Duration::from_secs(10),
+            &[ScratchLimit {
+                path: dir.clone(),
+                bytes: 1 << 20,
+            }],
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(outcome.status, RunStatus::ScratchExceeded);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn supervise_bounds_captured_output() {
         // A process spewing far more than the cap is captured only up to CAPTURE_CAP,
         // so untrusted output cannot exhaust host memory; past the cap the read end is
         // dropped and the writer EPIPEs, so the run ends without ballooning the buffer.
-        let outcome = supervise(sh("head -c 50000000 /dev/zero"), Duration::from_secs(5)).unwrap();
+        let outcome = supervise(
+            sh("head -c 50000000 /dev/zero"),
+            Duration::from_secs(5),
+            &[],
+        )
+        .unwrap();
         assert!(
             outcome.stdout.len() <= CAPTURE_CAP,
             "captured {} bytes, cap is {CAPTURE_CAP}",
