@@ -4,6 +4,7 @@
 //! ```text
 //! ferrl train --config run.json     # GRPO-train a built-in task (countdown | math | trimul)
 //! ferrl trimul-baseline --config run.json   # measure the TriMul reference baseline (ns) on this GPU
+//! ferrl trimul-artifact --config run.json --completion raw.txt --out artifact/ ...
 //! ferrl runreport <run-dir> [--json] [--strict]   # one-glance run health summary
 //! ```
 //!
@@ -27,13 +28,15 @@
 // A CLI whose interface *is* its stdout/stderr; the library logs via `tracing`.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
 use candle_core::{DType, Device};
 use clap::{Args, Parser, Subcommand};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tracing::info;
 
 use ferrl::countdown::{build_prompt, generate_dataset, CountdownConfig, CountdownProblem};
@@ -67,6 +70,8 @@ enum Command {
     Train(TrainArgs),
     /// Measure the TriMul reference baseline (ns) on this node's GPU for the guarded pin.
     TrimulBaseline(TrimulBaselineArgs),
+    /// Extract and verify a TriMul artifact bundle from a raw model completion.
+    TrimulArtifact(Box<TrimulArtifactArgs>),
     /// Print a one-glance health summary for a finished run.
     Runreport(RunreportArgs),
 }
@@ -85,6 +90,56 @@ struct TrimulBaselineArgs {
     /// Path to the JSON run config (the same `trimul` block `ferrl train` reads).
     #[arg(long)]
     config: PathBuf,
+}
+
+/// Arguments for `ferrl trimul-artifact`.
+#[derive(Debug, Args)]
+struct TrimulArtifactArgs {
+    /// Path to the JSON run config used for the discovery run.
+    #[arg(long)]
+    config: PathBuf,
+    /// Raw model completion to extract `custom_kernel` from.
+    #[arg(long)]
+    completion: PathBuf,
+    /// Output artifact directory. Fails if `manifest.json` already exists.
+    #[arg(long)]
+    out: PathBuf,
+    /// Training run id or run directory name.
+    #[arg(long)]
+    run_id: String,
+    /// Candidate optimizer step, when known from the run notes.
+    #[arg(long, default_value_t = 0)]
+    step: u64,
+    /// Candidate index within the sampled group, when known from the run notes.
+    #[arg(long, default_value_t = 0)]
+    group_index: u64,
+    /// Audit seed for clean held-out re-verification. Must differ from training seed.
+    #[arg(long)]
+    audit_secret_seed: u64,
+    /// Raw guarded-baseline measurements in ns; pass at least three values.
+    #[arg(long = "baseline-ns", required = true)]
+    baseline_measurements_ns: Vec<f64>,
+    /// Number of clean candidate verification re-runs.
+    #[arg(long, default_value_t = 3)]
+    repeats: usize,
+    /// Full ferrl git commit SHA for the training run.
+    #[arg(long)]
+    ferrl_commit: String,
+    /// Model family label for the artifact manifest.
+    #[arg(long, default_value = "qwen3.x")]
+    model_family: String,
+    /// Operator-supplied checkpoint identity. Defaults to `model_dir`.
+    #[arg(long)]
+    checkpoint: Option<String>,
+    /// Operator-supplied tokenizer identity. Defaults to `model_dir/tokenizer.json`.
+    #[arg(long)]
+    tokenizer: Option<String>,
+    /// Immutable identity of the GPUMODE eval bundle. Defaults to `trimul.eval_dir`.
+    #[arg(long)]
+    eval_bundle: Option<String>,
+    /// Immutable identity of the Apptainer image. Defaults to `trimul.image`.
+    #[arg(long)]
+    sandbox_image: Option<String>,
 }
 
 /// Arguments for `ferrl runreport`.
@@ -210,6 +265,14 @@ impl DtypeSel {
         match self {
             DtypeSel::F32 => DType::F32,
             DtypeSel::Bf16 => DType::BF16,
+        }
+    }
+
+    /// Stable manifest spelling for this dtype.
+    fn as_str(self) -> &'static str {
+        match self {
+            DtypeSel::F32 => "f32",
+            DtypeSel::Bf16 => "bf16",
         }
     }
 }
@@ -625,6 +688,468 @@ fn trimul_baseline(args: &TrimulBaselineArgs) -> Result<(), CliError> {
     Ok(())
 }
 
+/// One clean artifact-verification run written under `verification/`.
+#[derive(Debug, Clone, Serialize)]
+struct ArtifactVerificationRun {
+    /// Whether the candidate passed every correctness case.
+    correct: bool,
+    /// Per-benchmark means, in ns.
+    benchmark_means_ns: Vec<f64>,
+    /// Geometric mean runtime, in ns.
+    geomean_ns: Option<f64>,
+    /// Speedup over the baseline median.
+    speedup: Option<f64>,
+}
+
+/// Contract manifest written to `manifest.json`.
+#[derive(Debug, Serialize)]
+struct ArtifactManifest {
+    /// Manifest schema version.
+    contract_version: u32,
+    /// The task this artifact targets.
+    task: &'static str,
+    /// Full ferrl commit SHA.
+    ferrl_commit: String,
+    /// Training run id.
+    run_id: String,
+    /// Candidate provenance.
+    candidate: CandidateManifest,
+    /// Model provenance.
+    model: ModelManifest,
+    /// Run-config provenance.
+    config: ArtifactConfigManifest,
+    /// Eval harness provenance.
+    eval: EvalManifest,
+    /// Same-GPU baseline record.
+    baseline: BaselineManifest,
+    /// Clean re-verification record.
+    verification: VerificationManifest,
+}
+
+/// Candidate provenance fields.
+#[derive(Debug, Serialize)]
+struct CandidateManifest {
+    /// Optimizer step where this candidate was sampled.
+    step: u64,
+    /// Candidate group index where this candidate was sampled.
+    group_index: u64,
+    /// SHA-256 of the raw completion text.
+    completion_sha256: String,
+    /// SHA-256 of `submission.py`.
+    source_sha256: String,
+}
+
+/// Model provenance fields.
+#[derive(Debug, Serialize)]
+struct ModelManifest {
+    /// Model family label.
+    family: String,
+    /// Operator-supplied checkpoint identity.
+    checkpoint: String,
+    /// Operator-supplied tokenizer identity.
+    tokenizer: String,
+    /// `LoRA` rank.
+    lora_rank: usize,
+    /// `LoRA` alpha.
+    lora_alpha: f64,
+    /// Frozen base dtype.
+    base_dtype: &'static str,
+}
+
+/// Run-config provenance fields.
+#[derive(Debug, Serialize)]
+struct ArtifactConfigManifest {
+    /// SHA-256 of the run config bytes passed to this command.
+    run_config_sha256: String,
+    /// Trainer step budget.
+    trainer_steps: u64,
+    /// GRPO group size.
+    group_size: usize,
+    /// Policy rollout seed.
+    policy_seed: u64,
+    /// Data seed.
+    data_seed: u64,
+    /// Secret seed used during training.
+    training_secret_seed: u64,
+    /// Secret seed used for artifact audit verification.
+    audit_secret_seed: u64,
+    /// Candidate scratch cap in bytes.
+    scratch_max_bytes: u64,
+}
+
+/// Eval harness provenance fields.
+#[derive(Debug, Serialize)]
+struct EvalManifest {
+    /// Immutable eval bundle identity.
+    bundle: String,
+    /// Immutable sandbox image identity.
+    sandbox_image: String,
+    /// Number of correctness cases loaded from `task.yml`.
+    test_cases: usize,
+    /// Number of benchmark cases loaded from `task.yml`.
+    benchmark_cases: usize,
+}
+
+/// Same-GPU baseline fields.
+#[derive(Debug, Serialize)]
+struct BaselineManifest {
+    /// GPU product name seen during extraction.
+    gpu: String,
+    /// Raw baseline measurements, in ns.
+    measurements_ns: Vec<f64>,
+    /// Median baseline runtime, in ns.
+    median_ns: f64,
+}
+
+/// Verification summary fields.
+#[derive(Debug, Serialize)]
+struct VerificationManifest {
+    /// GPU product name seen during extraction.
+    gpu: String,
+    /// Clean re-verification runs.
+    runs: Vec<ArtifactVerificationRun>,
+    /// Whether this bundle satisfies the mechanical artifact acceptance checks.
+    accepted: bool,
+}
+
+/// Dispatch `ferrl trimul-artifact`: extract `custom_kernel` from a model completion,
+/// re-verify it with an audit seed, and write the contract artifact bundle.
+fn trimul_artifact(args: &TrimulArtifactArgs) -> Result<(), CliError> {
+    let _ = ferrl::init_tracing();
+    if args.repeats < 3 {
+        return Err(CliError::msg(
+            "trimul-artifact requires --repeats >= 3 for the first-run contract",
+        ));
+    }
+    let config_bytes = read_bytes(&args.config)?;
+    let cfg = parse_run_config(&args.config, &config_bytes)?;
+    if cfg.task != "trimul" {
+        return Err(CliError::msg(
+            "trimul-artifact requires a config with task \"trimul\"",
+        ));
+    }
+    if args.audit_secret_seed == cfg.trimul.secret_seed {
+        return Err(CliError::msg(
+            "audit secret seed must differ from trimul.secret_seed used during training",
+        ));
+    }
+    let baseline = cfg.trimul.baseline.as_ref().ok_or_else(|| {
+        CliError::msg("trimul-artifact requires trimul.baseline in the run config")
+    })?;
+    let baseline_median = median_checked(&args.baseline_measurements_ns, "baseline-ns")?;
+    require_baseline_matches_config(baseline_median, baseline.ns)?;
+    let gpu = detect_gpu_name().ok_or_else(|| {
+        CliError::msg(
+            "cannot read this node's GPU (nvidia-smi unavailable); run on the target GPU node",
+        )
+    })?;
+    baseline_gpu_matches(&baseline.gpu, Some(&gpu)).map_err(CliError::Msg)?;
+
+    let completion_bytes = read_bytes(&args.completion)?;
+    let completion = String::from_utf8(completion_bytes.clone()).map_err(|e| {
+        CliError::msg(format!(
+            "completion file {} is not valid UTF-8: {e}",
+            args.completion.display()
+        ))
+    })?;
+    let submission = ferrl::trimul::extract_submission(&completion).ok_or_else(|| {
+        CliError::msg("completion does not contain a closed non-empty fenced code block")
+    })?;
+
+    let mut reward = cfg.build_trimul_reward_base()?;
+    reward = reward
+        .with_secret_seed(args.audit_secret_seed)
+        .with_baseline_ns(baseline_median);
+    let (test_cases, benchmark_cases) =
+        ferrl::trimul::load_task_yml(cfg.trimul.eval_dir.join("task.yml"))?;
+    let runs = verify_submission_repeated(&reward, &submission, args.repeats)?;
+    let accepted = accepted_artifact(&runs, baseline_median);
+    write_artifact_bundle(
+        args,
+        &cfg,
+        &ArtifactInputs {
+            gpu,
+            completion: &completion,
+            completion_bytes: &completion_bytes,
+            config_bytes: &config_bytes,
+            submission: &submission,
+            baseline_median,
+            test_cases: test_cases.len(),
+            benchmark_cases: benchmark_cases.len(),
+            runs,
+            accepted,
+        },
+    )?;
+    println!(
+        "ferrl: wrote TriMul artifact bundle -> {}",
+        args.out.display()
+    );
+    Ok(())
+}
+
+/// Values needed to write the artifact bundle.
+struct ArtifactInputs<'a> {
+    /// GPU product name.
+    gpu: String,
+    /// Raw completion string.
+    completion: &'a str,
+    /// Raw completion bytes.
+    completion_bytes: &'a [u8],
+    /// Raw config bytes.
+    config_bytes: &'a [u8],
+    /// Extracted source.
+    submission: &'a str,
+    /// Median baseline runtime, in ns.
+    baseline_median: f64,
+    /// Loaded correctness case count.
+    test_cases: usize,
+    /// Loaded benchmark case count.
+    benchmark_cases: usize,
+    /// Verification runs.
+    runs: Vec<ArtifactVerificationRun>,
+    /// Mechanical acceptance decision.
+    accepted: bool,
+}
+
+/// Read `path` into bytes with CLI-shaped IO errors.
+fn read_bytes(path: &Path) -> Result<Vec<u8>, CliError> {
+    std::fs::read(path).map_err(|source| CliError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// Parse a [`RunConfig`] from already-read bytes.
+fn parse_run_config(path: &Path, bytes: &[u8]) -> Result<RunConfig, CliError> {
+    serde_json::from_slice(bytes).map_err(|source| CliError::Config {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// Run clean verification `repeats` times.
+fn verify_submission_repeated(
+    reward: &TrimulReward,
+    submission: &str,
+    repeats: usize,
+) -> Result<Vec<ArtifactVerificationRun>, CliError> {
+    (0..repeats)
+        .map(|_| {
+            let v = reward
+                .verify_submission(submission)
+                .map_err(|e| CliError::msg(format!("artifact verification failed: {e}")))?;
+            Ok(ArtifactVerificationRun {
+                correct: v.correct,
+                benchmark_means_ns: v.benchmark_means_ns,
+                geomean_ns: v.geomean_ns,
+                speedup: v.speedup,
+            })
+        })
+        .collect()
+}
+
+/// Mechanical artifact acceptance: every re-run correct and timed, and the median
+/// candidate runtime beats the median baseline.
+fn accepted_artifact(runs: &[ArtifactVerificationRun], baseline_median: f64) -> bool {
+    let geos: Vec<f64> = runs.iter().filter_map(|r| r.geomean_ns).collect();
+    geos.len() == runs.len()
+        && runs.iter().all(|r| r.correct)
+        && median_checked(&geos, "candidate geomean")
+            .is_ok_and(|candidate| candidate < baseline_median)
+}
+
+/// Write the full contract artifact bundle.
+fn write_artifact_bundle(
+    args: &TrimulArtifactArgs,
+    cfg: &RunConfig,
+    inputs: &ArtifactInputs<'_>,
+) -> Result<(), CliError> {
+    let manifest_path = args.out.join("manifest.json");
+    if manifest_path.exists() {
+        return Err(CliError::msg(format!(
+            "{} already exists; refusing to overwrite an artifact",
+            manifest_path.display()
+        )));
+    }
+    std::fs::create_dir_all(args.out.join("verification")).map_err(|source| CliError::Io {
+        path: args.out.clone(),
+        source,
+    })?;
+    write_text(&args.out.join("submission.py"), inputs.submission)?;
+    write_text(&args.out.join("completion.txt"), inputs.completion)?;
+    for (i, run) in inputs.runs.iter().enumerate() {
+        write_json(&args.out.join(format!("verification/run-{i:03}.json")), run)?;
+    }
+    let manifest = build_manifest(args, cfg, inputs);
+    write_json(&manifest_path, &manifest)?;
+    write_text(&args.out.join("report.md"), &artifact_report(&manifest))?;
+    Ok(())
+}
+
+/// Build the artifact manifest.
+fn build_manifest(
+    args: &TrimulArtifactArgs,
+    cfg: &RunConfig,
+    inputs: &ArtifactInputs<'_>,
+) -> ArtifactManifest {
+    ArtifactManifest {
+        contract_version: 1,
+        task: "trimul",
+        ferrl_commit: args.ferrl_commit.clone(),
+        run_id: args.run_id.clone(),
+        candidate: CandidateManifest {
+            step: args.step,
+            group_index: args.group_index,
+            completion_sha256: sha256_hex(inputs.completion_bytes),
+            source_sha256: sha256_hex(inputs.submission.as_bytes()),
+        },
+        model: ModelManifest {
+            family: args.model_family.clone(),
+            checkpoint: args
+                .checkpoint
+                .clone()
+                .unwrap_or_else(|| cfg.model_dir.display().to_string()),
+            tokenizer: args
+                .tokenizer
+                .clone()
+                .unwrap_or_else(|| cfg.model_dir.join("tokenizer.json").display().to_string()),
+            lora_rank: cfg.policy.lora_rank,
+            lora_alpha: cfg.policy.lora_alpha,
+            base_dtype: cfg.policy.base_dtype.as_str(),
+        },
+        config: ArtifactConfigManifest {
+            run_config_sha256: sha256_hex(inputs.config_bytes),
+            trainer_steps: cfg.trainer.steps,
+            group_size: cfg.trainer.group_size,
+            policy_seed: cfg.policy.seed,
+            data_seed: cfg.data.seed,
+            training_secret_seed: cfg.trimul.secret_seed,
+            audit_secret_seed: args.audit_secret_seed,
+            scratch_max_bytes: trimul_scratch_cap(cfg),
+        },
+        eval: EvalManifest {
+            bundle: args
+                .eval_bundle
+                .clone()
+                .unwrap_or_else(|| cfg.trimul.eval_dir.display().to_string()),
+            sandbox_image: args
+                .sandbox_image
+                .clone()
+                .unwrap_or_else(|| cfg.trimul.image.display().to_string()),
+            test_cases: inputs.test_cases,
+            benchmark_cases: inputs.benchmark_cases,
+        },
+        baseline: BaselineManifest {
+            gpu: inputs.gpu.clone(),
+            measurements_ns: args.baseline_measurements_ns.clone(),
+            median_ns: inputs.baseline_median,
+        },
+        verification: VerificationManifest {
+            gpu: inputs.gpu.clone(),
+            runs: inputs.runs.clone(),
+            accepted: inputs.accepted,
+        },
+    }
+}
+
+/// The effective TriMul scratch cap in bytes.
+fn trimul_scratch_cap(cfg: &RunConfig) -> u64 {
+    if cfg.trimul.scratch_max_bytes == 0 {
+        1 << 30
+    } else {
+        cfg.trimul.scratch_max_bytes
+    }
+}
+
+/// Write UTF-8 text to `path`.
+fn write_text(path: &Path, text: &str) -> Result<(), CliError> {
+    std::fs::write(path, text).map_err(|source| CliError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// Pretty-write JSON to `path`.
+fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), CliError> {
+    let json = serde_json::to_string_pretty(value)
+        .map_err(|e| CliError::msg(format!("serialize {}: {e}", path.display())))?;
+    write_text(path, &json)
+}
+
+/// A compact human report next to the machine manifest.
+fn artifact_report(manifest: &ArtifactManifest) -> String {
+    let median_candidate = median_checked(
+        &manifest
+            .verification
+            .runs
+            .iter()
+            .filter_map(|r| r.geomean_ns)
+            .collect::<Vec<_>>(),
+        "candidate geomean",
+    )
+    .ok();
+    let speedup = median_candidate.map(|c| manifest.baseline.median_ns / c);
+    format!(
+        "# TriMul Artifact Report\n\n\
+         Verdict: {}\n\n\
+         Baseline GPU: {}\n\
+         Baseline median ns: {:.6}\n\
+         Candidate median ns: {}\n\
+         Speedup: {}\n\n\
+         Manifest source SHA-256: {}\n",
+        if manifest.verification.accepted {
+            "accepted_artifact"
+        } else {
+            "invalid_run"
+        },
+        manifest.baseline.gpu,
+        manifest.baseline.median_ns,
+        median_candidate.map_or_else(|| "none".to_string(), |v| format!("{v:.6}")),
+        speedup.map_or_else(|| "none".to_string(), |v| format!("{v:.6}")),
+        manifest.candidate.source_sha256
+    )
+}
+
+/// SHA-256 hex digest of `bytes`.
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        write!(&mut out, "{b:02x}").expect("writing to String cannot fail");
+    }
+    out
+}
+
+/// Median of positive finite values. Requires at least three values for first-run
+/// timing discipline.
+fn median_checked(values: &[f64], label: &str) -> Result<f64, CliError> {
+    if values.len() < 3 {
+        return Err(CliError::msg(format!(
+            "{label} requires at least three measurements"
+        )));
+    }
+    if values.iter().any(|v| !v.is_finite() || *v <= 0.0) {
+        return Err(CliError::msg(format!(
+            "{label} measurements must be positive finite values"
+        )));
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    Ok(sorted[sorted.len() / 2])
+}
+
+/// Require the raw baseline median to match the config's guarded baseline pin.
+fn require_baseline_matches_config(median: f64, pinned: f64) -> Result<(), CliError> {
+    let tol = (pinned.abs().max(median.abs()) * 1e-9).max(1e-6);
+    if (median - pinned).abs() <= tol {
+        Ok(())
+    } else {
+        Err(CliError::msg(format!(
+            "median --baseline-ns ({median}) does not match trimul.baseline.ns ({pinned})"
+        )))
+    }
+}
+
 /// Dispatch `ferrl runreport`: read the run's metrics, summarize, and emit.
 fn runreport(args: &RunreportArgs) -> Result<ExitCode, CliError> {
     let metrics_path = resolve_metrics_path(&args.path);
@@ -664,6 +1189,7 @@ fn main() -> ExitCode {
     let result = match &cli.cmd {
         Command::Train(args) => train(args).map(|()| ExitCode::SUCCESS),
         Command::TrimulBaseline(args) => trimul_baseline(args).map(|()| ExitCode::SUCCESS),
+        Command::TrimulArtifact(args) => trimul_artifact(args).map(|()| ExitCode::SUCCESS),
         Command::Runreport(args) => runreport(args),
     };
     match result {
@@ -772,6 +1298,35 @@ mod tests {
         }
     }
 
+    /// The clap surface parses the artifact subcommand.
+    #[test]
+    fn clap_parses_trimul_artifact() {
+        let a = Cli::try_parse_from([
+            "ferrl",
+            "trimul-artifact",
+            "--config",
+            "run.json",
+            "--completion",
+            "completion.txt",
+            "--out",
+            "artifact",
+            "--run-id",
+            "trimul-1",
+            "--audit-secret-seed",
+            "99",
+            "--baseline-ns",
+            "10",
+            "--baseline-ns",
+            "11",
+            "--baseline-ns",
+            "12",
+            "--ferrl-commit",
+            "abc123",
+        ])
+        .unwrap();
+        assert!(matches!(a.cmd, Command::TrimulArtifact(_)));
+    }
+
     /// A `trimul` run config parses, with its task block and a baseline pin.
     #[test]
     fn parses_a_trimul_config() {
@@ -838,5 +1393,27 @@ mod tests {
         // An empty / whitespace label fails closed.
         assert!(baseline_gpu_matches("", Some("NVIDIA L40S")).is_err());
         assert!(baseline_gpu_matches("   ", Some("NVIDIA L40S")).is_err());
+    }
+
+    #[test]
+    fn sha256_hex_is_stable() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn median_checked_requires_three_positive_values() {
+        assert_eq!(median_checked(&[3.0, 1.0, 2.0], "x").unwrap(), 2.0);
+        assert!(median_checked(&[1.0, 2.0], "x").is_err());
+        assert!(median_checked(&[1.0, f64::NAN, 3.0], "x").is_err());
+        assert!(median_checked(&[1.0, 0.0, 3.0], "x").is_err());
+    }
+
+    #[test]
+    fn baseline_median_must_match_config_pin() {
+        assert!(require_baseline_matches_config(10.0, 10.0).is_ok());
+        assert!(require_baseline_matches_config(10.0, 11.0).is_err());
     }
 }

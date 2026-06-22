@@ -5,7 +5,7 @@ intentionally narrow: it locks what must be recorded, re-run, and reported befor
 candidate kernel can count as a discovery artifact. It is not a general task SDK.
 
 The contract applies to runs of `ferrl train --config <run.json>` where `task` is
-`trimul` and to the artifact extraction step that follows such a run.
+`trimul` and to the artifact extraction step that follows such a run. The extraction command is `ferrl trimul-artifact --config <run.json> --completion <raw.txt> --out <artifact-dir>` with run provenance, audit seed, and repeated `--baseline-ns` values.
 
 ## Pre-Run Lock
 
@@ -164,5 +164,4 @@ The final report must fit this outline:
 5. Artifact bundle path and manifest hash, when accepted.
 6. Reviewer checklist: each acceptance and reward-hacking check marked pass/fail.
 
-The next implementation step after this contract is artifact extraction: persist the
-best correct-and-fast candidates with enough provenance to fill this manifest.
+Use `ferrl trimul-artifact` after training to persist the best correct-and-fast candidates with enough provenance to fill this manifest and produce the reviewer-facing report.
