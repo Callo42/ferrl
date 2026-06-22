@@ -4,6 +4,7 @@
 //! ```text
 //! ferrl train --config run.json     # GRPO-train a built-in task (countdown | math | trimul)
 //! ferrl trimul-baseline --config run.json   # measure the TriMul reference baseline (ns) on this GPU
+//! ferrl trimul-artifact --config run.json --completion raw.txt --out artifact/ ...
 //! ferrl runreport <run-dir> [--json] [--strict]   # one-glance run health summary
 //! ```
 //!
@@ -27,13 +28,15 @@
 // A CLI whose interface *is* its stdout/stderr; the library logs via `tracing`.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
 use candle_core::{DType, Device};
-use clap::{Args, Parser, Subcommand};
-use serde::Deserialize;
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tracing::info;
 
 use ferrl::countdown::{build_prompt, generate_dataset, CountdownConfig, CountdownProblem};
@@ -67,6 +70,8 @@ enum Command {
     Train(TrainArgs),
     /// Measure the TriMul reference baseline (ns) on this node's GPU for the guarded pin.
     TrimulBaseline(TrimulBaselineArgs),
+    /// Extract and verify a TriMul artifact bundle from a raw model completion.
+    TrimulArtifact(Box<TrimulArtifactArgs>),
     /// Print a one-glance health summary for a finished run.
     Runreport(RunreportArgs),
 }
@@ -85,6 +90,72 @@ struct TrimulBaselineArgs {
     /// Path to the JSON run config (the same `trimul` block `ferrl train` reads).
     #[arg(long)]
     config: PathBuf,
+}
+
+/// Arguments for `ferrl trimul-artifact`.
+#[derive(Debug, Args)]
+struct TrimulArtifactArgs {
+    /// Path to the JSON run config used for the discovery run.
+    #[arg(long)]
+    config: PathBuf,
+    /// Raw model completion to extract `custom_kernel` from.
+    #[arg(long)]
+    completion: PathBuf,
+    /// Output artifact directory. Fails if `manifest.json` already exists.
+    #[arg(long)]
+    out: PathBuf,
+    /// Training run id or run directory name.
+    #[arg(long)]
+    run_id: String,
+    /// Candidate optimizer step, when known from the run notes.
+    #[arg(long, default_value_t = 0)]
+    step: u64,
+    /// Candidate index within the sampled group, when known from the run notes.
+    #[arg(long, default_value_t = 0)]
+    group_index: u64,
+    /// Candidate training reward recorded when this candidate was selected.
+    #[arg(long)]
+    training_reward: f64,
+    /// Audit seed for clean held-out re-verification. Must differ from training seed.
+    #[arg(long)]
+    audit_secret_seed: u64,
+    /// Raw guarded-baseline measurements in ns; pass at least three values.
+    #[arg(long = "baseline-ns", required = true)]
+    baseline_measurements_ns: Vec<f64>,
+    /// Exact baseline command used. Defaults to `ferrl trimul-baseline --config <config>`.
+    #[arg(long)]
+    baseline_command: Option<String>,
+    /// Number of clean candidate verification re-runs.
+    #[arg(long, default_value_t = 3)]
+    repeats: usize,
+    /// Full ferrl git commit SHA for the training run.
+    #[arg(long)]
+    ferrl_commit: String,
+    /// Training run health summary copied from `runreport` or run notes.
+    #[arg(long)]
+    run_health: String,
+    /// Source inspection result for process/file/environment/network/path probes.
+    #[arg(long, value_enum)]
+    source_inspection: SourceInspectionResult,
+    /// Human source-inspection notes covering process state, file descriptors,
+    /// environment variables, network sockets, and paths outside kernel inputs.
+    #[arg(long)]
+    source_inspection_notes: String,
+    /// Model family label for the artifact manifest.
+    #[arg(long, default_value = "qwen3.x")]
+    model_family: String,
+    /// Operator-supplied checkpoint identity. Defaults to `model_dir`.
+    #[arg(long)]
+    checkpoint: Option<String>,
+    /// Operator-supplied tokenizer identity. Defaults to `model_dir/tokenizer.json`.
+    #[arg(long)]
+    tokenizer: Option<String>,
+    /// Immutable identity of the GPUMODE eval bundle. Defaults to `trimul.eval_dir`.
+    #[arg(long)]
+    eval_bundle: Option<String>,
+    /// Immutable identity of the Apptainer image. Defaults to `trimul.image`.
+    #[arg(long)]
+    sandbox_image: Option<String>,
 }
 
 /// Arguments for `ferrl runreport`.
@@ -210,6 +281,14 @@ impl DtypeSel {
         match self {
             DtypeSel::F32 => DType::F32,
             DtypeSel::Bf16 => DType::BF16,
+        }
+    }
+
+    /// Stable manifest spelling for this dtype.
+    fn as_str(self) -> &'static str {
+        match self {
+            DtypeSel::F32 => "f32",
+            DtypeSel::Bf16 => "bf16",
         }
     }
 }
@@ -625,6 +704,749 @@ fn trimul_baseline(args: &TrimulBaselineArgs) -> Result<(), CliError> {
     Ok(())
 }
 
+/// One clean artifact-verification run written under `verification/`.
+#[derive(Debug, Clone, Serialize)]
+struct ArtifactVerificationRun {
+    /// Whether the candidate passed every correctness case.
+    correct: bool,
+    /// Per-benchmark means, in ns.
+    benchmark_means_ns: Vec<f64>,
+    /// Geometric mean runtime, in ns.
+    geomean_ns: Option<f64>,
+    /// Speedup over the baseline median.
+    speedup: Option<f64>,
+}
+
+/// Result of the reviewer-facing source inspection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+enum SourceInspectionResult {
+    /// No process-state, file-descriptor, environment, network, or out-of-input
+    /// path inspection was found.
+    Clean,
+    /// Source inspection found suspicious process-state, file-descriptor,
+    /// environment, network, or out-of-input path access.
+    Suspicious,
+}
+
+/// Reviewer-facing source-inspection record.
+#[derive(Debug, Clone, Serialize)]
+struct SourceInspectionManifest {
+    /// Machine-readable source-inspection result.
+    result: SourceInspectionResult,
+    /// Human notes covering the inspected surfaces.
+    notes: String,
+}
+
+/// Contract manifest written to `manifest.json`.
+#[derive(Debug, Serialize)]
+struct ArtifactManifest {
+    /// Manifest schema version.
+    contract_version: u32,
+    /// The task this artifact targets.
+    task: &'static str,
+    /// Full ferrl commit SHA.
+    ferrl_commit: String,
+    /// Training run id.
+    run_id: String,
+    /// Candidate provenance.
+    candidate: CandidateManifest,
+    /// Model provenance.
+    model: ModelManifest,
+    /// Run-config provenance.
+    config: ArtifactConfigManifest,
+    /// Eval harness provenance.
+    eval: EvalManifest,
+    /// Same-GPU baseline record.
+    baseline: BaselineManifest,
+    /// Clean re-verification record.
+    verification: VerificationManifest,
+}
+
+/// Candidate provenance fields.
+#[derive(Debug, Serialize)]
+struct CandidateManifest {
+    /// Optimizer step where this candidate was sampled.
+    step: u64,
+    /// Candidate group index where this candidate was sampled.
+    group_index: u64,
+    /// Training reward recorded when this candidate was selected.
+    training_reward: f64,
+    /// SHA-256 of the raw completion text.
+    completion_sha256: String,
+    /// SHA-256 of `submission.py`.
+    source_sha256: String,
+    /// Reviewer-facing source-inspection evidence.
+    source_inspection: SourceInspectionManifest,
+}
+
+/// Model provenance fields.
+#[derive(Debug, Serialize)]
+struct ModelManifest {
+    /// Model family label.
+    family: String,
+    /// Operator-supplied checkpoint identity.
+    checkpoint: String,
+    /// Operator-supplied tokenizer identity.
+    tokenizer: String,
+    /// `LoRA` rank.
+    lora_rank: usize,
+    /// `LoRA` alpha.
+    lora_alpha: f64,
+    /// Frozen base dtype.
+    base_dtype: &'static str,
+}
+
+/// Run-config provenance fields.
+#[derive(Debug, Serialize)]
+struct ArtifactConfigManifest {
+    /// SHA-256 of the run config bytes passed to this command.
+    run_config_sha256: String,
+    /// Trainer step budget.
+    trainer_steps: u64,
+    /// GRPO group size.
+    group_size: usize,
+    /// Training run health summary copied from `runreport` or run notes.
+    run_health: String,
+    /// Policy rollout seed.
+    policy_seed: u64,
+    /// Data seed.
+    data_seed: u64,
+    /// Secret seed used during training.
+    training_secret_seed: u64,
+    /// Secret seed used for artifact audit verification.
+    audit_secret_seed: u64,
+    /// Candidate scratch cap in bytes.
+    scratch_max_bytes: u64,
+}
+
+/// Eval harness provenance fields.
+#[derive(Debug, Serialize)]
+struct EvalManifest {
+    /// Immutable eval bundle identity.
+    bundle: String,
+    /// Immutable sandbox image identity.
+    sandbox_image: String,
+    /// Number of correctness cases loaded from `task.yml`.
+    test_cases: usize,
+    /// Number of benchmark cases loaded from `task.yml`.
+    benchmark_cases: usize,
+}
+
+/// Same-GPU baseline fields.
+#[derive(Debug, Serialize)]
+struct BaselineManifest {
+    /// GPU product name seen during extraction.
+    gpu: String,
+    /// Raw baseline measurements, in ns.
+    measurements_ns: Vec<f64>,
+    /// Median baseline runtime, in ns.
+    median_ns: f64,
+    /// Exact baseline command used for these measurements.
+    command: String,
+}
+
+/// Verification summary fields.
+#[derive(Debug, Serialize)]
+struct VerificationManifest {
+    /// GPU product name seen during extraction.
+    gpu: String,
+    /// Clean re-verification runs.
+    runs: Vec<ArtifactVerificationRun>,
+    /// Whether this bundle satisfies the mechanical artifact acceptance checks.
+    accepted: bool,
+}
+
+/// Dispatch `ferrl trimul-artifact`: extract `custom_kernel` from a model completion,
+/// re-verify it with an audit seed, and write the contract artifact bundle.
+fn trimul_artifact(args: &TrimulArtifactArgs) -> Result<(), CliError> {
+    let _ = ferrl::init_tracing();
+    if args.repeats < 3 {
+        return Err(CliError::msg(
+            "trimul-artifact requires --repeats >= 3 for the first-run contract",
+        ));
+    }
+    let config_bytes = read_bytes(&args.config)?;
+    let cfg = parse_run_config(&args.config, &config_bytes)?;
+    if cfg.task != "trimul" {
+        return Err(CliError::msg(
+            "trimul-artifact requires a config with task \"trimul\"",
+        ));
+    }
+    if args.audit_secret_seed == cfg.trimul.secret_seed {
+        return Err(CliError::msg(
+            "audit secret seed must differ from trimul.secret_seed used during training",
+        ));
+    }
+    let baseline = cfg.trimul.baseline.as_ref().ok_or_else(|| {
+        CliError::msg("trimul-artifact requires trimul.baseline in the run config")
+    })?;
+    let baseline_median = median_checked(&args.baseline_measurements_ns, "baseline-ns")?;
+    require_baseline_matches_config(baseline_median, baseline.ns)?;
+    let gpu = detect_gpu_name().ok_or_else(|| {
+        CliError::msg(
+            "cannot read this node's GPU (nvidia-smi unavailable); run on the target GPU node",
+        )
+    })?;
+    baseline_gpu_matches(&baseline.gpu, Some(&gpu)).map_err(CliError::Msg)?;
+
+    let completion_bytes = read_bytes(&args.completion)?;
+    let completion = String::from_utf8(completion_bytes.clone()).map_err(|e| {
+        CliError::msg(format!(
+            "completion file {} is not valid UTF-8: {e}",
+            args.completion.display()
+        ))
+    })?;
+    let submission = ferrl::trimul::extract_submission(&completion).ok_or_else(|| {
+        CliError::msg("completion does not contain a closed non-empty fenced code block")
+    })?;
+
+    let mut reward = cfg.build_trimul_reward_base()?;
+    reward = reward
+        .with_secret_seed(args.audit_secret_seed)
+        .with_baseline_ns(baseline_median);
+    let (test_cases, benchmark_cases) =
+        ferrl::trimul::load_task_yml(cfg.trimul.eval_dir.join("task.yml"))?;
+    let runs = verify_submission_repeated(&reward, &submission, args.repeats)?;
+    let accepted = accepted_artifact(&runs, baseline_median)
+        && args.source_inspection == SourceInspectionResult::Clean;
+    write_artifact_bundle(
+        args,
+        &cfg,
+        &ArtifactInputs {
+            gpu,
+            completion: &completion,
+            completion_bytes: &completion_bytes,
+            config_bytes: &config_bytes,
+            submission: &submission,
+            baseline_median,
+            test_cases: test_cases.len(),
+            benchmark_cases: benchmark_cases.len(),
+            runs,
+            accepted,
+        },
+    )?;
+    println!(
+        "ferrl: wrote TriMul artifact bundle -> {}",
+        args.out.display()
+    );
+    Ok(())
+}
+
+/// Values needed to write the artifact bundle.
+struct ArtifactInputs<'a> {
+    /// GPU product name.
+    gpu: String,
+    /// Raw completion string.
+    completion: &'a str,
+    /// Raw completion bytes.
+    completion_bytes: &'a [u8],
+    /// Raw config bytes.
+    config_bytes: &'a [u8],
+    /// Extracted source.
+    submission: &'a str,
+    /// Median baseline runtime, in ns.
+    baseline_median: f64,
+    /// Loaded correctness case count.
+    test_cases: usize,
+    /// Loaded benchmark case count.
+    benchmark_cases: usize,
+    /// Verification runs.
+    runs: Vec<ArtifactVerificationRun>,
+    /// Mechanical acceptance decision.
+    accepted: bool,
+}
+
+/// Read `path` into bytes with CLI-shaped IO errors.
+fn read_bytes(path: &Path) -> Result<Vec<u8>, CliError> {
+    std::fs::read(path).map_err(|source| CliError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// Parse a [`RunConfig`] from already-read bytes.
+fn parse_run_config(path: &Path, bytes: &[u8]) -> Result<RunConfig, CliError> {
+    serde_json::from_slice(bytes).map_err(|source| CliError::Config {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// Run clean verification `repeats` times.
+fn verify_submission_repeated(
+    reward: &TrimulReward,
+    submission: &str,
+    repeats: usize,
+) -> Result<Vec<ArtifactVerificationRun>, CliError> {
+    (0..repeats)
+        .map(|_| {
+            let v = reward
+                .verify_submission(submission)
+                .map_err(|e| CliError::msg(format!("artifact verification failed: {e}")))?;
+            Ok(ArtifactVerificationRun {
+                correct: v.correct,
+                benchmark_means_ns: v.benchmark_means_ns,
+                geomean_ns: v.geomean_ns,
+                speedup: v.speedup,
+            })
+        })
+        .collect()
+}
+
+/// Mechanical artifact acceptance: every re-run correct and timed, and the median
+/// candidate runtime beats the median baseline.
+fn accepted_artifact(runs: &[ArtifactVerificationRun], baseline_median: f64) -> bool {
+    let geos: Vec<f64> = runs.iter().filter_map(|r| r.geomean_ns).collect();
+    geos.len() == runs.len()
+        && runs.iter().all(|r| r.correct)
+        && median_checked(&geos, "candidate geomean")
+            .is_ok_and(|candidate| candidate < baseline_median)
+}
+
+/// Write the full contract artifact bundle.
+fn write_artifact_bundle(
+    args: &TrimulArtifactArgs,
+    cfg: &RunConfig,
+    inputs: &ArtifactInputs<'_>,
+) -> Result<(), CliError> {
+    let manifest_path = args.out.join("manifest.json");
+    if manifest_path.exists() {
+        return Err(CliError::msg(format!(
+            "{} already exists; refusing to overwrite an artifact",
+            manifest_path.display()
+        )));
+    }
+    std::fs::create_dir_all(args.out.join("verification")).map_err(|source| CliError::Io {
+        path: args.out.clone(),
+        source,
+    })?;
+    write_text(&args.out.join("submission.py"), inputs.submission)?;
+    write_text(&args.out.join("completion.txt"), inputs.completion)?;
+    for (i, run) in inputs.runs.iter().enumerate() {
+        write_json(&args.out.join(format!("verification/run-{i:03}.json")), run)?;
+    }
+    let manifest = build_manifest(args, cfg, inputs);
+    let manifest_json = json_pretty(&manifest_path, &manifest)?;
+    write_text(&manifest_path, &manifest_json)?;
+    let manifest_sha256 = sha256_hex(manifest_json.as_bytes());
+    write_text(
+        &args.out.join("report.md"),
+        &artifact_report(&manifest, &args.out, &manifest_sha256),
+    )?;
+    Ok(())
+}
+
+/// Build the artifact manifest.
+fn build_manifest(
+    args: &TrimulArtifactArgs,
+    cfg: &RunConfig,
+    inputs: &ArtifactInputs<'_>,
+) -> ArtifactManifest {
+    ArtifactManifest {
+        contract_version: 1,
+        task: "trimul",
+        ferrl_commit: args.ferrl_commit.clone(),
+        run_id: args.run_id.clone(),
+        candidate: CandidateManifest {
+            step: args.step,
+            group_index: args.group_index,
+            training_reward: args.training_reward,
+            completion_sha256: sha256_hex(inputs.completion_bytes),
+            source_sha256: sha256_hex(inputs.submission.as_bytes()),
+            source_inspection: SourceInspectionManifest {
+                result: args.source_inspection,
+                notes: args.source_inspection_notes.clone(),
+            },
+        },
+        model: ModelManifest {
+            family: args.model_family.clone(),
+            checkpoint: args
+                .checkpoint
+                .clone()
+                .unwrap_or_else(|| cfg.model_dir.display().to_string()),
+            tokenizer: args
+                .tokenizer
+                .clone()
+                .unwrap_or_else(|| cfg.model_dir.join("tokenizer.json").display().to_string()),
+            lora_rank: cfg.policy.lora_rank,
+            lora_alpha: cfg.policy.lora_alpha,
+            base_dtype: cfg.policy.base_dtype.as_str(),
+        },
+        config: ArtifactConfigManifest {
+            run_config_sha256: sha256_hex(inputs.config_bytes),
+            trainer_steps: cfg.trainer.steps,
+            group_size: cfg.trainer.group_size,
+            run_health: args.run_health.clone(),
+            policy_seed: cfg.policy.seed,
+            data_seed: cfg.data.seed,
+            training_secret_seed: cfg.trimul.secret_seed,
+            audit_secret_seed: args.audit_secret_seed,
+            scratch_max_bytes: trimul_scratch_cap(cfg),
+        },
+        eval: EvalManifest {
+            bundle: args
+                .eval_bundle
+                .clone()
+                .unwrap_or_else(|| cfg.trimul.eval_dir.display().to_string()),
+            sandbox_image: args
+                .sandbox_image
+                .clone()
+                .unwrap_or_else(|| cfg.trimul.image.display().to_string()),
+            test_cases: inputs.test_cases,
+            benchmark_cases: inputs.benchmark_cases,
+        },
+        baseline: BaselineManifest {
+            gpu: inputs.gpu.clone(),
+            measurements_ns: args.baseline_measurements_ns.clone(),
+            median_ns: inputs.baseline_median,
+            command: args.baseline_command.clone().unwrap_or_else(|| {
+                format!("ferrl trimul-baseline --config {}", args.config.display())
+            }),
+        },
+        verification: VerificationManifest {
+            gpu: inputs.gpu.clone(),
+            runs: inputs.runs.clone(),
+            accepted: inputs.accepted,
+        },
+    }
+}
+
+/// The effective TriMul scratch cap in bytes.
+fn trimul_scratch_cap(cfg: &RunConfig) -> u64 {
+    if cfg.trimul.scratch_max_bytes == 0 {
+        1 << 30
+    } else {
+        cfg.trimul.scratch_max_bytes
+    }
+}
+
+/// Write UTF-8 text to `path`.
+fn write_text(path: &Path, text: &str) -> Result<(), CliError> {
+    std::fs::write(path, text).map_err(|source| CliError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// Pretty-write JSON to `path`.
+fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), CliError> {
+    let json = json_pretty(path, value)?;
+    write_text(path, &json)
+}
+
+/// Render pretty JSON for `path` so callers can hash the exact bytes they write.
+fn json_pretty<T: Serialize>(path: &Path, value: &T) -> Result<String, CliError> {
+    serde_json::to_string_pretty(value)
+        .map_err(|e| CliError::msg(format!("serialize {}: {e}", path.display())))
+}
+
+/// A contract-shaped human report next to the machine manifest.
+fn artifact_report(
+    manifest: &ArtifactManifest,
+    artifact_dir: &Path,
+    manifest_sha256: &str,
+) -> String {
+    let median_candidate = median_checked(
+        &manifest
+            .verification
+            .runs
+            .iter()
+            .filter_map(|r| r.geomean_ns)
+            .collect::<Vec<_>>(),
+        "candidate geomean",
+    )
+    .ok();
+    let speedup = median_candidate.map(|c| manifest.baseline.median_ns / c);
+    let verdict = if manifest.verification.accepted {
+        "accepted_artifact"
+    } else {
+        "invalid_run"
+    };
+    let clean_correct = manifest
+        .verification
+        .runs
+        .iter()
+        .filter(|r| r.correct)
+        .count();
+    let clean_total = manifest.verification.runs.len();
+    let decision = artifact_accept_reason(manifest, median_candidate);
+    let baseline_measurements = manifest
+        .baseline
+        .measurements_ns
+        .iter()
+        .map(|v| format!("{v:.6}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let candidate_median =
+        median_candidate.map_or_else(|| "none".to_string(), |v| format!("{v:.6}"));
+    let speedup = speedup.map_or_else(|| "none".to_string(), |v| format!("{v:.6}"));
+    let source_inspection = source_inspection_label(manifest.candidate.source_inspection.result);
+
+    let mut out = String::new();
+    writeln!(&mut out, "# TriMul Artifact Report\n").expect("writing to String cannot fail");
+    writeln!(&mut out, "## 1. Verdict\n").expect("writing to String cannot fail");
+    writeln!(&mut out, "{verdict}\n").expect("writing to String cannot fail");
+
+    writeln!(&mut out, "## 2. Baseline\n").expect("writing to String cannot fail");
+    writeln!(&mut out, "- GPU: {}", manifest.baseline.gpu).expect("writing to String cannot fail");
+    writeln!(&mut out, "- Raw measurements ns: {baseline_measurements}")
+        .expect("writing to String cannot fail");
+    writeln!(
+        &mut out,
+        "- Median runtime ns: {:.6}",
+        manifest.baseline.median_ns
+    )
+    .expect("writing to String cannot fail");
+    writeln!(
+        &mut out,
+        "- Command used: `{}`\n",
+        manifest.baseline.command
+    )
+    .expect("writing to String cannot fail");
+
+    writeln!(&mut out, "## 3. Training\n").expect("writing to String cannot fail");
+    writeln!(&mut out, "- ferrl commit: {}", manifest.ferrl_commit)
+        .expect("writing to String cannot fail");
+    writeln!(
+        &mut out,
+        "- Config hash: {}",
+        manifest.config.run_config_sha256
+    )
+    .expect("writing to String cannot fail");
+    writeln!(
+        &mut out,
+        "- Model: family={}, checkpoint={}, tokenizer={}, lora_rank={}, lora_alpha={}, base_dtype={}",
+        manifest.model.family,
+        manifest.model.checkpoint,
+        manifest.model.tokenizer,
+        manifest.model.lora_rank,
+        manifest.model.lora_alpha,
+        manifest.model.base_dtype
+    )
+    .expect("writing to String cannot fail");
+    writeln!(
+        &mut out,
+        "- Seeds: data={}, policy={}, training_secret={}, audit_secret={}",
+        manifest.config.data_seed,
+        manifest.config.policy_seed,
+        manifest.config.training_secret_seed,
+        manifest.config.audit_secret_seed
+    )
+    .expect("writing to String cannot fail");
+    writeln!(
+        &mut out,
+        "- Budget: trainer_steps={}, group_size={}, scratch_max_bytes={}",
+        manifest.config.trainer_steps,
+        manifest.config.group_size,
+        manifest.config.scratch_max_bytes
+    )
+    .expect("writing to String cannot fail");
+    writeln!(&mut out, "- Run health: {}\n", manifest.config.run_health)
+        .expect("writing to String cannot fail");
+
+    writeln!(&mut out, "## 4. Candidate Table\n").expect("writing to String cannot fail");
+    writeln!(
+        &mut out,
+        "| source hash | training reward | source inspection | clean correctness | median runtime ns | speedup | accept/reject reason |"
+    )
+    .expect("writing to String cannot fail");
+    writeln!(&mut out, "|---|---:|---|---:|---:|---:|---|").expect("writing to String cannot fail");
+    writeln!(
+        &mut out,
+        "| {} | {:.6} | {} | {}/{} | {} | {} | {} |\n",
+        manifest.candidate.source_sha256,
+        manifest.candidate.training_reward,
+        source_inspection,
+        clean_correct,
+        clean_total,
+        candidate_median,
+        speedup,
+        decision
+    )
+    .expect("writing to String cannot fail");
+    writeln!(
+        &mut out,
+        "Source inspection notes: {}\n",
+        manifest.candidate.source_inspection.notes
+    )
+    .expect("writing to String cannot fail");
+
+    writeln!(&mut out, "## 5. Artifact Bundle\n").expect("writing to String cannot fail");
+    writeln!(&mut out, "- Path: {}", artifact_dir.display())
+        .expect("writing to String cannot fail");
+    writeln!(
+        &mut out,
+        "- Manifest path: {}/manifest.json",
+        artifact_dir.display()
+    )
+    .expect("writing to String cannot fail");
+    writeln!(&mut out, "- Manifest SHA-256: {manifest_sha256}\n")
+        .expect("writing to String cannot fail");
+
+    writeln!(&mut out, "## 6. Reviewer Checklist\n").expect("writing to String cannot fail");
+    push_check(&mut out, manifest.task == "trimul", "task is trimul");
+    push_check(
+        &mut out,
+        !manifest.ferrl_commit.trim().is_empty(),
+        "ferrl commit recorded",
+    );
+    push_check(
+        &mut out,
+        !manifest.config.run_config_sha256.is_empty(),
+        "config hash recorded",
+    );
+    push_check(
+        &mut out,
+        manifest.baseline.measurements_ns.len() >= 3,
+        "raw baseline has at least three measurements",
+    );
+    push_check(
+        &mut out,
+        manifest.baseline.gpu == manifest.verification.gpu,
+        "baseline and verification GPU match",
+    );
+    push_check(
+        &mut out,
+        manifest.config.audit_secret_seed != manifest.config.training_secret_seed,
+        "audit seed differs from training seed",
+    );
+    push_check(
+        &mut out,
+        clean_total >= 3,
+        "at least three clean verification runs",
+    );
+    push_check(
+        &mut out,
+        clean_correct == clean_total,
+        "every verification run is correct",
+    );
+    push_check(
+        &mut out,
+        manifest
+            .verification
+            .runs
+            .iter()
+            .all(|r| r.geomean_ns.is_some()),
+        "every verification run is timed",
+    );
+    push_check(
+        &mut out,
+        median_candidate.is_some_and(|v| v < manifest.baseline.median_ns),
+        "candidate median beats baseline median",
+    );
+    push_check(
+        &mut out,
+        manifest.candidate.source_inspection.result == SourceInspectionResult::Clean,
+        "source inspection found no process/file/env/network/path probing",
+    );
+    push_check(
+        &mut out,
+        !manifest.candidate.source_inspection.notes.trim().is_empty(),
+        "source inspection notes recorded",
+    );
+    push_check(
+        &mut out,
+        !manifest.eval.bundle.trim().is_empty(),
+        "eval bundle identity recorded",
+    );
+    push_check(
+        &mut out,
+        !manifest.eval.sandbox_image.trim().is_empty(),
+        "sandbox image identity recorded",
+    );
+    push_check(
+        &mut out,
+        manifest.config.scratch_max_bytes > 0,
+        "scratch cap recorded",
+    );
+    push_check(
+        &mut out,
+        !manifest_sha256.trim().is_empty(),
+        "manifest hash recorded",
+    );
+    out
+}
+
+/// Human-readable accept/reject reason for the candidate table.
+fn artifact_accept_reason(
+    manifest: &ArtifactManifest,
+    median_candidate: Option<f64>,
+) -> &'static str {
+    if manifest.verification.accepted {
+        "accepted: all clean runs correct and median runtime beats baseline"
+    } else if manifest.candidate.source_inspection.result == SourceInspectionResult::Suspicious {
+        "rejected: source inspection found process/file/env/network/path probing"
+    } else if manifest.verification.runs.iter().any(|r| !r.correct) {
+        "rejected: at least one clean verification run failed correctness"
+    } else if manifest
+        .verification
+        .runs
+        .iter()
+        .any(|r| r.geomean_ns.is_none())
+    {
+        "rejected: at least one clean verification run did not produce timing"
+    } else if median_candidate.is_some_and(|v| v >= manifest.baseline.median_ns) {
+        "rejected: candidate median runtime does not beat baseline"
+    } else {
+        "rejected: insufficient clean verification evidence"
+    }
+}
+
+/// Stable report label for source inspection results.
+fn source_inspection_label(result: SourceInspectionResult) -> &'static str {
+    match result {
+        SourceInspectionResult::Clean => "clean",
+        SourceInspectionResult::Suspicious => "suspicious",
+    }
+}
+
+/// Append a reviewer checklist row.
+fn push_check(out: &mut String, pass: bool, label: &str) {
+    writeln!(out, "- [{}] {label}", if pass { "pass" } else { "fail" })
+        .expect("writing to String cannot fail");
+}
+
+/// SHA-256 hex digest of `bytes`.
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        write!(&mut out, "{b:02x}").expect("writing to String cannot fail");
+    }
+    out
+}
+
+/// Median of positive finite values. Requires at least three values for first-run
+/// timing discipline.
+fn median_checked(values: &[f64], label: &str) -> Result<f64, CliError> {
+    if values.len() < 3 {
+        return Err(CliError::msg(format!(
+            "{label} requires at least three measurements"
+        )));
+    }
+    if values.iter().any(|v| !v.is_finite() || *v <= 0.0) {
+        return Err(CliError::msg(format!(
+            "{label} measurements must be positive finite values"
+        )));
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    Ok(sorted[sorted.len() / 2])
+}
+
+/// Require the raw baseline median to match the config's guarded baseline pin.
+fn require_baseline_matches_config(median: f64, pinned: f64) -> Result<(), CliError> {
+    let tol = (pinned.abs().max(median.abs()) * 1e-9).max(1e-6);
+    if (median - pinned).abs() <= tol {
+        Ok(())
+    } else {
+        Err(CliError::msg(format!(
+            "median --baseline-ns ({median}) does not match trimul.baseline.ns ({pinned})"
+        )))
+    }
+}
+
 /// Dispatch `ferrl runreport`: read the run's metrics, summarize, and emit.
 fn runreport(args: &RunreportArgs) -> Result<ExitCode, CliError> {
     let metrics_path = resolve_metrics_path(&args.path);
@@ -664,6 +1486,7 @@ fn main() -> ExitCode {
     let result = match &cli.cmd {
         Command::Train(args) => train(args).map(|()| ExitCode::SUCCESS),
         Command::TrimulBaseline(args) => trimul_baseline(args).map(|()| ExitCode::SUCCESS),
+        Command::TrimulArtifact(args) => trimul_artifact(args).map(|()| ExitCode::SUCCESS),
         Command::Runreport(args) => runreport(args),
     };
     match result {
@@ -772,6 +1595,43 @@ mod tests {
         }
     }
 
+    /// The clap surface parses the artifact subcommand.
+    #[test]
+    fn clap_parses_trimul_artifact() {
+        let a = Cli::try_parse_from([
+            "ferrl",
+            "trimul-artifact",
+            "--config",
+            "run.json",
+            "--completion",
+            "completion.txt",
+            "--out",
+            "artifact",
+            "--run-id",
+            "trimul-1",
+            "--training-reward",
+            "1.25",
+            "--run-health",
+            "healthy",
+            "--source-inspection",
+            "clean",
+            "--source-inspection-notes",
+            "no process, file descriptor, environment, network, or out-of-input path probes",
+            "--audit-secret-seed",
+            "99",
+            "--baseline-ns",
+            "10",
+            "--baseline-ns",
+            "11",
+            "--baseline-ns",
+            "12",
+            "--ferrl-commit",
+            "abc123",
+        ])
+        .unwrap();
+        assert!(matches!(a.cmd, Command::TrimulArtifact(_)));
+    }
+
     /// A `trimul` run config parses, with its task block and a baseline pin.
     #[test]
     fn parses_a_trimul_config() {
@@ -838,5 +1698,123 @@ mod tests {
         // An empty / whitespace label fails closed.
         assert!(baseline_gpu_matches("", Some("NVIDIA L40S")).is_err());
         assert!(baseline_gpu_matches("   ", Some("NVIDIA L40S")).is_err());
+    }
+
+    #[test]
+    fn sha256_hex_is_stable() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn median_checked_requires_three_positive_values() {
+        assert_eq!(median_checked(&[3.0, 1.0, 2.0], "x").unwrap(), 2.0);
+        assert!(median_checked(&[1.0, 2.0], "x").is_err());
+        assert!(median_checked(&[1.0, f64::NAN, 3.0], "x").is_err());
+        assert!(median_checked(&[1.0, 0.0, 3.0], "x").is_err());
+    }
+
+    #[test]
+    fn baseline_median_must_match_config_pin() {
+        assert!(require_baseline_matches_config(10.0, 10.0).is_ok());
+        assert!(require_baseline_matches_config(10.0, 11.0).is_err());
+    }
+
+    #[test]
+    fn artifact_report_matches_the_contract_outline() {
+        let manifest = ArtifactManifest {
+            contract_version: 1,
+            task: "trimul",
+            ferrl_commit: "abc123".to_string(),
+            run_id: "trimul-1".to_string(),
+            candidate: CandidateManifest {
+                step: 7,
+                group_index: 2,
+                training_reward: 1.5,
+                completion_sha256: "completion-hash".to_string(),
+                source_sha256: "source-hash".to_string(),
+                source_inspection: SourceInspectionManifest {
+                    result: SourceInspectionResult::Clean,
+                    notes: "no process, file descriptor, environment, network, or out-of-input path probes"
+                        .to_string(),
+                },
+            },
+            model: ModelManifest {
+                family: "qwen3.x".to_string(),
+                checkpoint: "checkpoint".to_string(),
+                tokenizer: "tokenizer".to_string(),
+                lora_rank: 8,
+                lora_alpha: 16.0,
+                base_dtype: "bf16",
+            },
+            config: ArtifactConfigManifest {
+                run_config_sha256: "config-hash".to_string(),
+                trainer_steps: 100,
+                group_size: 4,
+                run_health: "healthy".to_string(),
+                policy_seed: 11,
+                data_seed: 22,
+                training_secret_seed: 33,
+                audit_secret_seed: 44,
+                scratch_max_bytes: 1024,
+            },
+            eval: EvalManifest {
+                bundle: "eval-bundle".to_string(),
+                sandbox_image: "sandbox-image".to_string(),
+                test_cases: 3,
+                benchmark_cases: 2,
+            },
+            baseline: BaselineManifest {
+                gpu: "H100".to_string(),
+                measurements_ns: vec![10.0, 11.0, 12.0],
+                median_ns: 11.0,
+                command: "ferrl trimul-baseline --config run.json".to_string(),
+            },
+            verification: VerificationManifest {
+                gpu: "H100".to_string(),
+                runs: vec![
+                    ArtifactVerificationRun {
+                        correct: true,
+                        benchmark_means_ns: vec![8.0],
+                        geomean_ns: Some(8.0),
+                        speedup: Some(1.375),
+                    },
+                    ArtifactVerificationRun {
+                        correct: true,
+                        benchmark_means_ns: vec![9.0],
+                        geomean_ns: Some(9.0),
+                        speedup: Some(1.222),
+                    },
+                    ArtifactVerificationRun {
+                        correct: true,
+                        benchmark_means_ns: vec![10.0],
+                        geomean_ns: Some(10.0),
+                        speedup: Some(1.1),
+                    },
+                ],
+                accepted: true,
+            },
+        };
+        let report = artifact_report(&manifest, Path::new("artifact"), "manifest-hash");
+        for required in [
+            "## 1. Verdict",
+            "Raw measurements ns: 10.000000, 11.000000, 12.000000",
+            "Command used: `ferrl trimul-baseline --config run.json`",
+            "ferrl commit: abc123",
+            "Config hash: config-hash",
+            "Run health: healthy",
+            "| source hash | training reward | source inspection | clean correctness | median runtime ns | speedup | accept/reject reason |",
+            "| source-hash | 1.500000 | clean | 3/3 | 9.000000 | 1.222222 | accepted: all clean runs correct and median runtime beats baseline |",
+            "Source inspection notes: no process, file descriptor, environment, network, or out-of-input path probes",
+            "Path: artifact",
+            "Manifest SHA-256: manifest-hash",
+            "## 6. Reviewer Checklist",
+            "[pass] audit seed differs from training seed",
+            "[pass] source inspection found no process/file/env/network/path probing",
+        ] {
+            assert!(report.contains(required), "missing report field: {required}");
+        }
     }
 }

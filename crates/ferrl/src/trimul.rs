@@ -64,6 +64,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 use crate::reward::{RewardError, RewardFn};
 use crate::sample::Sample;
 use crate::sandbox::{ApptainerSandbox, Bind, ResourceLimits, RunSpec, Sandbox};
@@ -447,15 +449,17 @@ pub struct TrimulReward {
     sandbox: ApptainerSandbox,
 }
 
-/// The parsed result of one sandboxed eval: whether the candidate passed every
-/// correctness case, and the plausibility-checked geometric-mean benchmark runtime
-/// (ns) — `None` when the candidate is incorrect or its timing is implausibly fast.
-#[derive(Debug, Clone, Copy)]
-struct EvalOutcome {
+/// The parsed result of one sandboxed TriMul eval.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrimulVerification {
     /// Whether the eval reported `check: pass`.
-    correct: bool,
-    /// The plausibility-checked geometric-mean benchmark time (ns), if any.
-    geomean_ns: Option<f64>,
+    pub correct: bool,
+    /// Per-benchmark mean runtimes in nanoseconds, after parsing the grade stream.
+    pub benchmark_means_ns: Vec<f64>,
+    /// Plausibility-checked geometric-mean benchmark time (ns), if any.
+    pub geomean_ns: Option<f64>,
+    /// Speedup over the configured baseline, when both baseline and timing are present.
+    pub speedup: Option<f64>,
 }
 
 /// A `custom_kernel` that delegates to the bundled reference implementation. Used to
@@ -570,6 +574,17 @@ impl TrimulReward {
         value as f32
     }
 
+    /// Verify an extracted `submission` exactly as the reward does, returning the parsed
+    /// correctness/timing record instead of a scalar reward.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RewardError`] if the eval could not be carried out (scratch I/O or
+    /// sandbox launch/supervision failure).
+    pub fn verify_submission(&self, submission: &str) -> Result<TrimulVerification, RewardError> {
+        self.run_eval(submission)
+    }
+
     /// Resource ceilings for one eval. `address_space` is left unset — a CUDA process
     /// reserves a huge virtual range an address-space cap would wrongly kill.
     fn limits(&self) -> ResourceLimits {
@@ -635,7 +650,7 @@ impl TrimulReward {
     /// Returns [`RewardError`] only if the eval could not be *carried out* (scratch
     /// I/O or the sandbox failing to launch) — a crashing or wrong candidate is a
     /// `0.0` reward, not an error.
-    fn run_eval(&self, submission: &str) -> Result<EvalOutcome, RewardError> {
+    fn run_eval(&self, submission: &str) -> Result<TrimulVerification, RewardError> {
         let scratch = self.make_scratch()?;
         let result = self.eval_in(&scratch, submission);
         // Best-effort cleanup; the scratch is node-local and disposable.
@@ -663,7 +678,7 @@ impl TrimulReward {
 
     /// The body of [`run_eval`](Self::run_eval), split out so the scratch is always
     /// cleaned up.
-    fn eval_in(&self, scratch: &Path, submission: &str) -> Result<EvalOutcome, RewardError> {
+    fn eval_in(&self, scratch: &Path, submission: &str) -> Result<TrimulVerification, RewardError> {
         std::fs::create_dir_all(scratch.join("cache")).map_err(RewardError::verifier)?;
         write(scratch, "submission.py", submission)?;
         write(scratch, "test_spec.txt", &render_spec(&self.test_cases))?;
@@ -684,14 +699,25 @@ impl TrimulReward {
 
         let (test_log, bench_log) = split_result(&outcome.stdout);
         let correct = test_passed(test_log);
+        let benchmark_means_ns = if correct {
+            benchmark_means_ns(bench_log)
+        } else {
+            Vec::new()
+        };
         let geomean_ns = if correct {
-            self.plausible_geomean(&benchmark_means_ns(bench_log))
+            self.plausible_geomean(&benchmark_means_ns)
         } else {
             None
         };
-        Ok(EvalOutcome {
+        let speedup = self
+            .baseline_ns
+            .zip(geomean_ns)
+            .map(|(baseline, geo)| baseline / geo);
+        Ok(TrimulVerification {
             correct,
+            benchmark_means_ns,
             geomean_ns,
+            speedup,
         })
     }
 
@@ -868,6 +894,20 @@ mod tests {
         // 1e9 / geo: a faster (smaller) geo yields a larger reward.
         let r = reward();
         assert!(r.reward_value(true, Some(1e6)) < r.reward_value(true, Some(1e5)));
+    }
+
+    #[test]
+    fn trimul_verification_serializes_for_artifact_manifests() {
+        let v = TrimulVerification {
+            correct: true,
+            benchmark_means_ns: vec![100.0, 400.0],
+            geomean_ns: Some(200.0),
+            speedup: Some(2.0),
+        };
+        let raw = serde_json::to_string(&v).unwrap();
+        assert!(raw.contains("\"correct\":true"));
+        let back: TrimulVerification = serde_json::from_str(&raw).unwrap();
+        assert_eq!(back, v);
     }
 
     #[test]
