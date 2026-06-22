@@ -9,8 +9,8 @@
 //! ```
 //!
 //! `train` reads a `RunConfig` (a serialized [`TrainerConfig`](ferrl::TrainerConfig)
-//! plus a model directory, a device, and a task selector), loads a Qwen policy via
-//! [`ferrl::load_qwen_policy`], builds the named task's train/eval splits, and runs
+//! plus a model directory, a device, and a task selector), loads a Qwen-family policy via
+//! [`ferrl::load_auto_policy`], builds the named task's train/eval splits, and runs
 //! the GRPO [`Trainer`](ferrl::Trainer). The task registry is closed (the worked
 //! examples `countdown` and `math`, plus the `trimul` kernel-discovery task — which
 //! runs a sandboxed GPU eval as its reward); a *custom* task is wired in Rust against
@@ -42,7 +42,7 @@ use tracing::info;
 use ferrl::countdown::{build_prompt, generate_dataset, CountdownConfig, CountdownProblem};
 use ferrl::policy::GenConfig;
 use ferrl::{
-    evaluate, load_qwen_policy, read_jsonl, summarize, train_eval_split, CountdownReward,
+    evaluate, load_auto_policy, read_jsonl, summarize, train_eval_split, CountdownReward,
     LoaderOpts, MathProblem, MathReward, RewardFn, RunDir, Sample, Trainer, TrainerConfig,
     TrimulReward,
 };
@@ -578,7 +578,7 @@ fn run_training<R: RewardFn>(
     train: &[Sample<R::Target>],
     eval: &[Sample<R::Target>],
 ) -> Result<(), CliError> {
-    let (mut policy, tok) = load_qwen_policy(&cfg.model_dir, device, &cfg.loader_opts())?;
+    let (mut policy, tok) = load_auto_policy(&cfg.model_dir, device, &cfg.loader_opts())?;
     let tcfg = cfg.trainer.clone();
     let gen = GenConfig::from(&tcfg);
     info!(
