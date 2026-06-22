@@ -110,9 +110,18 @@ struct TrimulArtifactArgs {
     /// Candidate optimizer step, when known from the run notes.
     #[arg(long, default_value_t = 0)]
     step: u64,
+    /// Global prompt ordinal from `candidates.jsonl`.
+    #[arg(long, default_value_t = 0)]
+    prompt_index: u64,
     /// Candidate index within the sampled group, when known from the run notes.
     #[arg(long, default_value_t = 0)]
     group_index: u64,
+    /// Data-parallel rank from `candidates.jsonl`.
+    #[arg(long, default_value_t = 0)]
+    rank: usize,
+    /// Data-parallel world size from `candidates.jsonl`.
+    #[arg(long, default_value_t = 1)]
+    world_size: usize,
     /// Candidate training reward recorded when this candidate was selected.
     #[arg(long)]
     training_reward: f64,
@@ -768,8 +777,14 @@ struct ArtifactManifest {
 struct CandidateManifest {
     /// Optimizer step where this candidate was sampled.
     step: u64,
+    /// Global prompt ordinal where this candidate was sampled.
+    prompt_index: u64,
     /// Candidate group index where this candidate was sampled.
     group_index: u64,
+    /// Data-parallel rank that sampled this candidate.
+    rank: usize,
+    /// Data-parallel world size for the training run.
+    world_size: usize,
     /// Training reward recorded when this candidate was selected.
     training_reward: f64,
     /// SHA-256 of the raw completion text.
@@ -1050,7 +1065,10 @@ fn build_manifest(
         run_id: args.run_id.clone(),
         candidate: CandidateManifest {
             step: args.step,
+            prompt_index: args.prompt_index,
             group_index: args.group_index,
+            rank: args.rank,
+            world_size: args.world_size,
             training_reward: args.training_reward,
             completion_sha256: sha256_hex(inputs.completion_bytes),
             source_sha256: sha256_hex(inputs.submission.as_bytes()),
@@ -1609,6 +1627,14 @@ mod tests {
             "artifact",
             "--run-id",
             "trimul-1",
+            "--prompt-index",
+            "5",
+            "--group-index",
+            "1",
+            "--rank",
+            "0",
+            "--world-size",
+            "1",
             "--training-reward",
             "1.25",
             "--run-health",
@@ -1629,7 +1655,15 @@ mod tests {
             "abc123",
         ])
         .unwrap();
-        assert!(matches!(a.cmd, Command::TrimulArtifact(_)));
+        match a.cmd {
+            Command::TrimulArtifact(a) => {
+                assert_eq!(
+                    (a.prompt_index, a.group_index, a.rank, a.world_size),
+                    (5, 1, 0, 1)
+                );
+            }
+            _ => panic!("expected trimul-artifact"),
+        }
     }
 
     /// A `trimul` run config parses, with its task block and a baseline pin.
@@ -1731,7 +1765,10 @@ mod tests {
             run_id: "trimul-1".to_string(),
             candidate: CandidateManifest {
                 step: 7,
+                prompt_index: 12,
                 group_index: 2,
+                rank: 0,
+                world_size: 1,
                 training_reward: 1.5,
                 completion_sha256: "completion-hash".to_string(),
                 source_sha256: "source-hash".to_string(),

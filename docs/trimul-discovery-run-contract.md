@@ -5,7 +5,18 @@ intentionally narrow: it locks what must be recorded, re-run, and reported befor
 candidate kernel can count as a discovery artifact. It is not a general task SDK.
 
 The contract applies to runs of `ferrl train --config <run.json>` where `task` is
-`trimul` and to the artifact extraction step that follows such a run. The extraction command is `ferrl trimul-artifact --config <run.json> --completion <raw.txt> --out <artifact-dir> --training-reward <reward> --run-health <summary> --source-inspection clean --source-inspection-notes <notes>` with run provenance, audit seed, source-inspection evidence, and repeated `--baseline-ns` values.
+`trimul` and to the artifact extraction step that follows such a run. Set
+`trainer.candidate_log_top_k` high enough to persist the best sampled completions
+in `candidates.jsonl`; that ledger is the source for the raw completion and the
+`--step` / `--prompt-index` / `--group-index` / `--rank` / `--world-size`
+coordinates passed to artifact extraction. The extraction command is `ferrl
+trimul-artifact --config <run.json> --completion <raw.txt> --out <artifact-dir>
+--run-id <run-id> --step <step> --prompt-index <prompt-index> --group-index
+<group-index> --rank <rank> --world-size <world-size> --training-reward <reward>
+--audit-secret-seed <seed> --baseline-ns <ns> --baseline-ns <ns> --baseline-ns
+<ns> --ferrl-commit <sha> --run-health <summary> --source-inspection clean
+--source-inspection-notes <notes>` with run provenance, audit seed,
+source-inspection evidence, and repeated `--baseline-ns` values.
 
 ## Pre-Run Lock
 
@@ -22,6 +33,7 @@ with the final report:
 | cases | `task.yml` identity and the loaded counts for `tests` and `benchmarks`. |
 | seeds | `data.seed`, `policy.seed`, trainer seed-bearing knobs, and the training `trimul.secret_seed`. |
 | scratch cap | `trimul.scratch_max_bytes`; `0` means the ferrl default, currently 1 GiB. |
+| candidate ledger | `trainer.candidate_log_top_k`; use a positive value for discovery runs so top completions are persisted in `candidates.jsonl`. |
 | hardware | GPU product name reported by the baseline command and visible CUDA device count. |
 | budget | Trainer `steps`, `group_size`, wall-clock allocation, and the stop condition chosen below. |
 
@@ -49,7 +61,10 @@ The manifest schema is versioned from the first run:
   "run_id": "<run directory name>",
   "candidate": {
     "step": 0,
+    "prompt_index": 0,
     "group_index": 0,
+    "rank": 0,
+    "world_size": 1,
     "training_reward": 0.0,
     "completion_sha256": "<sha256 of raw completion>",
     "source_sha256": "<sha256 of submission.py>",
