@@ -286,9 +286,9 @@ struct BaselineCfg {
 }
 
 /// TriMul task knobs (read only when `task == "trimul"`): the sandboxed eval image and
-/// the pinned GPU Mode bundle, the held-out secret seed, the per-candidate wall budget,
-/// and the optional baseline pin. The concrete case list is loaded at run time from
-/// `<eval_dir>/task.yml` (GPU Mode's, not vendored into this repo).
+/// the pinned GPU Mode bundle, bounded scratch, the held-out secret seed, the
+/// per-candidate wall budget, and the optional baseline pin. The concrete case list is
+/// loaded at run time from `<eval_dir>/task.yml` (GPU Mode's, not vendored into this repo).
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct TrimulCfg {
@@ -297,8 +297,12 @@ struct TrimulCfg {
     /// The pinned GPU Mode eval bundle (`eval.py`/`reference.py`/`task.py`/`utils.py` +
     /// `task.yml`), bound read-only into the sandbox.
     eval_dir: PathBuf,
-    /// Node-local scratch root for per-candidate dirs (e.g. `/tmp`).
+    /// Node-local scratch root for per-candidate dirs; prefer a tmpfs root such as
+    /// `/dev/shm/ferrl`.
     scratch_root: PathBuf,
+    /// Host-supervised total byte cap for one candidate's writable scratch tree
+    /// (`0` -> the reward default, 1 GiB).
+    scratch_max_bytes: u64,
     /// The held-out secret seed (`POPCORN_SEED`), combined with each case's public seed.
     secret_seed: u64,
     /// Per-candidate wall-clock budget in seconds (`0` → the reward default, 600 s).
@@ -425,10 +429,14 @@ impl RunConfig {
         let t = &self.trimul;
         let (tests, benches) = ferrl::trimul::load_task_yml(t.eval_dir.join("task.yml"))?;
         let wall = Duration::from_secs(if t.wall_secs == 0 { 600 } else { t.wall_secs });
-        Ok(TrimulReward::new(&t.image, &t.eval_dir, &t.scratch_root)
+        let mut reward = TrimulReward::new(&t.image, &t.eval_dir, &t.scratch_root)
             .with_cases(tests, benches)
             .with_secret_seed(t.secret_seed)
-            .with_wall(wall))
+            .with_wall(wall);
+        if t.scratch_max_bytes != 0 {
+            reward = reward.with_scratch_max_bytes(t.scratch_max_bytes);
+        }
+        Ok(reward)
     }
 
     /// Build the TriMul reward for a `train` run: the base reward plus, when a baseline
@@ -771,7 +779,8 @@ mod tests {
                         "device": "cuda",
                         "data": { "train_n": 8, "eval_n": 2 },
                         "trimul": { "image": "/img.sif", "eval_dir": "/eval",
-                          "scratch_root": "/tmp", "secret_seed": 123, "wall_secs": 300,
+                          "scratch_root": "/tmp", "scratch_max_bytes": 1048576,
+                          "secret_seed": 123, "wall_secs": 300,
                           "baseline": { "ns": 5200000.0, "gpu": "H100" } },
                         "trainer": { "steps": 1, "group_size": 2, "max_new_tokens": 8,
                           "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
@@ -780,6 +789,7 @@ mod tests {
         let cfg: RunConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.task, "trimul");
         assert_eq!((cfg.trimul.secret_seed, cfg.trimul.wall_secs), (123, 300));
+        assert_eq!(cfg.trimul.scratch_max_bytes, 1_048_576);
         let b = cfg.trimul.baseline.as_ref().expect("baseline present");
         assert_eq!((b.ns, b.gpu.as_str()), (5_200_000.0, "H100"));
         // The single-prompt splits honour train_n / eval_n without deduping to one row.

@@ -421,8 +421,11 @@ pub struct TrimulReward {
     /// The pinned GPUMODE eval bundle (`eval.py`/`reference.py`/`task.py`/`utils.py`),
     /// bound **read-only**.
     eval_dir: PathBuf,
-    /// Where per-candidate scratch dirs are created — node-local (e.g. `/tmp`).
+    /// Where per-candidate scratch dirs are created — node-local tmpfs is preferred
+    /// (e.g. `/dev/shm/ferrl`) so overflow cannot fill persistent host storage.
     scratch_root: PathBuf,
+    /// Host-supervised total byte cap for the candidate-writable `/work` tree.
+    scratch_max_bytes: u64,
     /// Correctness cases (GPU Mode's, loaded from the pinned `task.yml`).
     test_cases: Vec<TrimulCase>,
     /// Timing cases.
@@ -478,6 +481,7 @@ impl TrimulReward {
             image: image.into(),
             eval_dir: eval_dir.into(),
             scratch_root: scratch_root.into(),
+            scratch_max_bytes: 1 << 30,
             test_cases: Vec::new(),
             benchmark_cases: Vec::new(),
             secret_seed: 0,
@@ -518,6 +522,13 @@ impl TrimulReward {
     #[must_use]
     pub fn with_wall(mut self, wall: Duration) -> Self {
         self.wall = wall;
+        self
+    }
+
+    /// Set the total byte cap for the candidate-writable `/work` tree.
+    #[must_use]
+    pub fn with_scratch_max_bytes(mut self, bytes: u64) -> Self {
+        self.scratch_max_bytes = bytes;
         self
     }
 
@@ -606,7 +617,7 @@ impl TrimulReward {
         .with_gpu(true)
         .with_binds(vec![
             Bind::ro(&self.eval_dir, "/eval"),
-            Bind::rw(scratch, "/work"),
+            Bind::rw(scratch, "/work").with_total_limit(self.scratch_max_bytes),
         ])
         .with_workdir("/work")
         .with_env(vec![
@@ -890,6 +901,7 @@ mod tests {
             .find(|b| b.dst == Path::new("/work"))
             .expect("scratch is bound");
         assert_eq!(work.mode, crate::sandbox::BindMode::ReadWrite);
+        assert_eq!(work.total_limit, Some(1 << 30));
     }
 
     #[test]
