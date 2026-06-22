@@ -246,6 +246,37 @@ fn gate_scratch_total_cap_bounds_many_files() {
 
 #[test]
 #[ignore = "needs apptainer + $FERRL_SANDBOX_IMAGE on an isolated node"]
+fn gate_scratch_total_cap_catches_fast_clean_exit() {
+    // A finite payload may fill `/work` and exit before the next poll. The final
+    // scratch check must still reject it as an overflow, not a clean success.
+    let dir = scratch("scratch-exit");
+    let spec = RunSpec::new(
+        image(),
+        vec![
+            "bash".into(),
+            "-c".into(),
+            "dd if=/dev/zero of=/work/big bs=1024 count=2048 2>/dev/null; exit 0".into(),
+        ],
+    )
+    .with_binds(vec![Bind::rw(&dir, "/work").with_total_limit(1 << 20)])
+    .with_workdir("/work")
+    .with_limits(ResourceLimits {
+        wall: Duration::from_secs(10),
+        ..ResourceLimits::default()
+    });
+    let out = run(&spec);
+    let _ = fs::remove_dir_all(&dir);
+    assert_eq!(
+        out.status,
+        RunStatus::ScratchExceeded,
+        "scratch overflow on a fast clean exit was accepted; stdout={:?} stderr={:?}",
+        out.stdout,
+        out.stderr
+    );
+}
+
+#[test]
+#[ignore = "needs apptainer + $FERRL_SANDBOX_IMAGE on an isolated node"]
 fn gate_process_cap_is_applied() {
     // `ulimit -u` is the fork-bomb mitigation, but on a shared uid it is kernel-wide
     // (no user-namespace remap), so a cap below the uid's live task count would

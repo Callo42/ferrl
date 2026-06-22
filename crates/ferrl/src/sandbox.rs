@@ -502,6 +502,7 @@ fn supervise(
     let mut scratch_exceeded = false;
     let status = loop {
         if let Some(status) = child.try_wait().map_err(SandboxError::Supervise)? {
+            scratch_exceeded = scratch_over_limit(scratch_limits);
             break status;
         }
         if start.elapsed() >= deadline {
@@ -867,6 +868,32 @@ mod tests {
             "scratch overflow should kill promptly, took {:?}",
             outcome.wall
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supervise_reports_scratch_overflow_even_after_clean_exit() {
+        let dir = std::env::temp_dir().join(format!(
+            "ferrl-scratch-exit-limit-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = format!(
+            "dd if=/dev/zero of={}/big bs=1024 count=2048 2>/dev/null; exit 0",
+            shell_quote(&dir.display().to_string())
+        );
+        let outcome = supervise(
+            sh(&script),
+            Duration::from_secs(10),
+            &[ScratchLimit {
+                path: dir.clone(),
+                bytes: 1 << 20,
+            }],
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(outcome.status, RunStatus::ScratchExceeded);
     }
 
     #[cfg(unix)]
