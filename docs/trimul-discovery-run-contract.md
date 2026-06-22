@@ -5,7 +5,7 @@ intentionally narrow: it locks what must be recorded, re-run, and reported befor
 candidate kernel can count as a discovery artifact. It is not a general task SDK.
 
 The contract applies to runs of `ferrl train --config <run.json>` where `task` is
-`trimul` and to the artifact extraction step that follows such a run. The extraction command is `ferrl trimul-artifact --config <run.json> --completion <raw.txt> --out <artifact-dir>` with run provenance, audit seed, and repeated `--baseline-ns` values.
+`trimul` and to the artifact extraction step that follows such a run. The extraction command is `ferrl trimul-artifact --config <run.json> --completion <raw.txt> --out <artifact-dir> --training-reward <reward> --run-health <summary>` with run provenance, audit seed, and repeated `--baseline-ns` values.
 
 ## Pre-Run Lock
 
@@ -50,6 +50,7 @@ The manifest schema is versioned from the first run:
   "candidate": {
     "step": 0,
     "group_index": 0,
+    "training_reward": 0.0,
     "completion_sha256": "<sha256 of raw completion>",
     "source_sha256": "<sha256 of submission.py>"
   },
@@ -65,6 +66,7 @@ The manifest schema is versioned from the first run:
     "run_config_sha256": "<sha256 of resolved run config>",
     "trainer_steps": 0,
     "group_size": 0,
+    "run_health": "<runreport summary or run notes>",
     "policy_seed": 0,
     "data_seed": 0,
     "training_secret_seed": 0,
@@ -80,7 +82,8 @@ The manifest schema is versioned from the first run:
   "baseline": {
     "gpu": "<nvidia-smi product name>",
     "measurements_ns": [0.0, 0.0, 0.0],
-    "median_ns": 0.0
+    "median_ns": 0.0,
+    "command": "ferrl trimul-baseline --config <run.json>"
   },
   "verification": {
     "gpu": "<nvidia-smi product name>",

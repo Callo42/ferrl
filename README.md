@@ -197,7 +197,7 @@ reward curve. Before spending GPU time on a TriMul run, use the
 [TriMul Discovery Run Contract](docs/trimul-discovery-run-contract.md). It defines the
 artifact bundle, provenance fields, same-GPU baseline pin, held-out verification,
 dynamic reward-hacking checks, and the no-win stopping report that the reviewer audits.
-After a run, use `ferrl trimul-artifact --config <run.json> --completion <raw.txt> --out <artifact-dir>` to extract `submission.py`, re-verify with an audit seed, and write the contract manifest/report.
+After a run, use `ferrl trimul-artifact --config <run.json> --completion <raw.txt> --out <artifact-dir> --training-reward <reward> --run-health <summary>` to extract `submission.py`, re-verify with an audit seed, and write the contract manifest/report.
 
 ### From Rust — a task that isn't built in
 

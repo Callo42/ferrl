@@ -113,18 +113,27 @@ struct TrimulArtifactArgs {
     /// Candidate index within the sampled group, when known from the run notes.
     #[arg(long, default_value_t = 0)]
     group_index: u64,
+    /// Candidate training reward recorded when this candidate was selected.
+    #[arg(long)]
+    training_reward: f64,
     /// Audit seed for clean held-out re-verification. Must differ from training seed.
     #[arg(long)]
     audit_secret_seed: u64,
     /// Raw guarded-baseline measurements in ns; pass at least three values.
     #[arg(long = "baseline-ns", required = true)]
     baseline_measurements_ns: Vec<f64>,
+    /// Exact baseline command used. Defaults to `ferrl trimul-baseline --config <config>`.
+    #[arg(long)]
+    baseline_command: Option<String>,
     /// Number of clean candidate verification re-runs.
     #[arg(long, default_value_t = 3)]
     repeats: usize,
     /// Full ferrl git commit SHA for the training run.
     #[arg(long)]
     ferrl_commit: String,
+    /// Training run health summary copied from `runreport` or run notes.
+    #[arg(long)]
+    run_health: String,
     /// Model family label for the artifact manifest.
     #[arg(long, default_value = "qwen3.x")]
     model_family: String,
@@ -733,6 +742,8 @@ struct CandidateManifest {
     step: u64,
     /// Candidate group index where this candidate was sampled.
     group_index: u64,
+    /// Training reward recorded when this candidate was selected.
+    training_reward: f64,
     /// SHA-256 of the raw completion text.
     completion_sha256: String,
     /// SHA-256 of `submission.py`.
@@ -765,6 +776,8 @@ struct ArtifactConfigManifest {
     trainer_steps: u64,
     /// GRPO group size.
     group_size: usize,
+    /// Training run health summary copied from `runreport` or run notes.
+    run_health: String,
     /// Policy rollout seed.
     policy_seed: u64,
     /// Data seed.
@@ -799,6 +812,8 @@ struct BaselineManifest {
     measurements_ns: Vec<f64>,
     /// Median baseline runtime, in ns.
     median_ns: f64,
+    /// Exact baseline command used for these measurements.
+    command: String,
 }
 
 /// Verification summary fields.
@@ -981,8 +996,13 @@ fn write_artifact_bundle(
         write_json(&args.out.join(format!("verification/run-{i:03}.json")), run)?;
     }
     let manifest = build_manifest(args, cfg, inputs);
-    write_json(&manifest_path, &manifest)?;
-    write_text(&args.out.join("report.md"), &artifact_report(&manifest))?;
+    let manifest_json = json_pretty(&manifest_path, &manifest)?;
+    write_text(&manifest_path, &manifest_json)?;
+    let manifest_sha256 = sha256_hex(manifest_json.as_bytes());
+    write_text(
+        &args.out.join("report.md"),
+        &artifact_report(&manifest, &args.out, &manifest_sha256),
+    )?;
     Ok(())
 }
 
@@ -1000,6 +1020,7 @@ fn build_manifest(
         candidate: CandidateManifest {
             step: args.step,
             group_index: args.group_index,
+            training_reward: args.training_reward,
             completion_sha256: sha256_hex(inputs.completion_bytes),
             source_sha256: sha256_hex(inputs.submission.as_bytes()),
         },
@@ -1021,6 +1042,7 @@ fn build_manifest(
             run_config_sha256: sha256_hex(inputs.config_bytes),
             trainer_steps: cfg.trainer.steps,
             group_size: cfg.trainer.group_size,
+            run_health: args.run_health.clone(),
             policy_seed: cfg.policy.seed,
             data_seed: cfg.data.seed,
             training_secret_seed: cfg.trimul.secret_seed,
@@ -1043,6 +1065,9 @@ fn build_manifest(
             gpu: inputs.gpu.clone(),
             measurements_ns: args.baseline_measurements_ns.clone(),
             median_ns: inputs.baseline_median,
+            command: args.baseline_command.clone().unwrap_or_else(|| {
+                format!("ferrl trimul-baseline --config {}", args.config.display())
+            }),
         },
         verification: VerificationManifest {
             gpu: inputs.gpu.clone(),
@@ -1071,13 +1096,22 @@ fn write_text(path: &Path, text: &str) -> Result<(), CliError> {
 
 /// Pretty-write JSON to `path`.
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), CliError> {
-    let json = serde_json::to_string_pretty(value)
-        .map_err(|e| CliError::msg(format!("serialize {}: {e}", path.display())))?;
+    let json = json_pretty(path, value)?;
     write_text(path, &json)
 }
 
-/// A compact human report next to the machine manifest.
-fn artifact_report(manifest: &ArtifactManifest) -> String {
+/// Render pretty JSON for `path` so callers can hash the exact bytes they write.
+fn json_pretty<T: Serialize>(path: &Path, value: &T) -> Result<String, CliError> {
+    serde_json::to_string_pretty(value)
+        .map_err(|e| CliError::msg(format!("serialize {}: {e}", path.display())))
+}
+
+/// A contract-shaped human report next to the machine manifest.
+fn artifact_report(
+    manifest: &ArtifactManifest,
+    artifact_dir: &Path,
+    manifest_sha256: &str,
+) -> String {
     let median_candidate = median_checked(
         &manifest
             .verification
@@ -1089,25 +1123,225 @@ fn artifact_report(manifest: &ArtifactManifest) -> String {
     )
     .ok();
     let speedup = median_candidate.map(|c| manifest.baseline.median_ns / c);
-    format!(
-        "# TriMul Artifact Report\n\n\
-         Verdict: {}\n\n\
-         Baseline GPU: {}\n\
-         Baseline median ns: {:.6}\n\
-         Candidate median ns: {}\n\
-         Speedup: {}\n\n\
-         Manifest source SHA-256: {}\n",
-        if manifest.verification.accepted {
-            "accepted_artifact"
-        } else {
-            "invalid_run"
-        },
-        manifest.baseline.gpu,
-        manifest.baseline.median_ns,
-        median_candidate.map_or_else(|| "none".to_string(), |v| format!("{v:.6}")),
-        speedup.map_or_else(|| "none".to_string(), |v| format!("{v:.6}")),
-        manifest.candidate.source_sha256
+    let verdict = if manifest.verification.accepted {
+        "accepted_artifact"
+    } else {
+        "invalid_run"
+    };
+    let clean_correct = manifest
+        .verification
+        .runs
+        .iter()
+        .filter(|r| r.correct)
+        .count();
+    let clean_total = manifest.verification.runs.len();
+    let decision = artifact_accept_reason(manifest, median_candidate);
+    let baseline_measurements = manifest
+        .baseline
+        .measurements_ns
+        .iter()
+        .map(|v| format!("{v:.6}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let candidate_median =
+        median_candidate.map_or_else(|| "none".to_string(), |v| format!("{v:.6}"));
+    let speedup = speedup.map_or_else(|| "none".to_string(), |v| format!("{v:.6}"));
+
+    let mut out = String::new();
+    writeln!(&mut out, "# TriMul Artifact Report\n").expect("writing to String cannot fail");
+    writeln!(&mut out, "## 1. Verdict\n").expect("writing to String cannot fail");
+    writeln!(&mut out, "{verdict}\n").expect("writing to String cannot fail");
+
+    writeln!(&mut out, "## 2. Baseline\n").expect("writing to String cannot fail");
+    writeln!(&mut out, "- GPU: {}", manifest.baseline.gpu).expect("writing to String cannot fail");
+    writeln!(&mut out, "- Raw measurements ns: {baseline_measurements}")
+        .expect("writing to String cannot fail");
+    writeln!(
+        &mut out,
+        "- Median runtime ns: {:.6}",
+        manifest.baseline.median_ns
     )
+    .expect("writing to String cannot fail");
+    writeln!(
+        &mut out,
+        "- Command used: `{}`\n",
+        manifest.baseline.command
+    )
+    .expect("writing to String cannot fail");
+
+    writeln!(&mut out, "## 3. Training\n").expect("writing to String cannot fail");
+    writeln!(&mut out, "- ferrl commit: {}", manifest.ferrl_commit)
+        .expect("writing to String cannot fail");
+    writeln!(
+        &mut out,
+        "- Config hash: {}",
+        manifest.config.run_config_sha256
+    )
+    .expect("writing to String cannot fail");
+    writeln!(
+        &mut out,
+        "- Model: family={}, checkpoint={}, tokenizer={}, lora_rank={}, lora_alpha={}, base_dtype={}",
+        manifest.model.family,
+        manifest.model.checkpoint,
+        manifest.model.tokenizer,
+        manifest.model.lora_rank,
+        manifest.model.lora_alpha,
+        manifest.model.base_dtype
+    )
+    .expect("writing to String cannot fail");
+    writeln!(
+        &mut out,
+        "- Seeds: data={}, policy={}, training_secret={}, audit_secret={}",
+        manifest.config.data_seed,
+        manifest.config.policy_seed,
+        manifest.config.training_secret_seed,
+        manifest.config.audit_secret_seed
+    )
+    .expect("writing to String cannot fail");
+    writeln!(
+        &mut out,
+        "- Budget: trainer_steps={}, group_size={}, scratch_max_bytes={}",
+        manifest.config.trainer_steps,
+        manifest.config.group_size,
+        manifest.config.scratch_max_bytes
+    )
+    .expect("writing to String cannot fail");
+    writeln!(&mut out, "- Run health: {}\n", manifest.config.run_health)
+        .expect("writing to String cannot fail");
+
+    writeln!(&mut out, "## 4. Candidate Table\n").expect("writing to String cannot fail");
+    writeln!(
+        &mut out,
+        "| source hash | training reward | clean correctness | median runtime ns | speedup | accept/reject reason |"
+    )
+    .expect("writing to String cannot fail");
+    writeln!(&mut out, "|---|---:|---:|---:|---:|---|").expect("writing to String cannot fail");
+    writeln!(
+        &mut out,
+        "| {} | {:.6} | {}/{} | {} | {} | {} |\n",
+        manifest.candidate.source_sha256,
+        manifest.candidate.training_reward,
+        clean_correct,
+        clean_total,
+        candidate_median,
+        speedup,
+        decision
+    )
+    .expect("writing to String cannot fail");
+
+    writeln!(&mut out, "## 5. Artifact Bundle\n").expect("writing to String cannot fail");
+    writeln!(&mut out, "- Path: {}", artifact_dir.display())
+        .expect("writing to String cannot fail");
+    writeln!(
+        &mut out,
+        "- Manifest path: {}/manifest.json",
+        artifact_dir.display()
+    )
+    .expect("writing to String cannot fail");
+    writeln!(&mut out, "- Manifest SHA-256: {manifest_sha256}\n")
+        .expect("writing to String cannot fail");
+
+    writeln!(&mut out, "## 6. Reviewer Checklist\n").expect("writing to String cannot fail");
+    push_check(&mut out, manifest.task == "trimul", "task is trimul");
+    push_check(
+        &mut out,
+        !manifest.ferrl_commit.trim().is_empty(),
+        "ferrl commit recorded",
+    );
+    push_check(
+        &mut out,
+        !manifest.config.run_config_sha256.is_empty(),
+        "config hash recorded",
+    );
+    push_check(
+        &mut out,
+        manifest.baseline.measurements_ns.len() >= 3,
+        "raw baseline has at least three measurements",
+    );
+    push_check(
+        &mut out,
+        manifest.baseline.gpu == manifest.verification.gpu,
+        "baseline and verification GPU match",
+    );
+    push_check(
+        &mut out,
+        manifest.config.audit_secret_seed != manifest.config.training_secret_seed,
+        "audit seed differs from training seed",
+    );
+    push_check(
+        &mut out,
+        clean_total >= 3,
+        "at least three clean verification runs",
+    );
+    push_check(
+        &mut out,
+        clean_correct == clean_total,
+        "every verification run is correct",
+    );
+    push_check(
+        &mut out,
+        manifest
+            .verification
+            .runs
+            .iter()
+            .all(|r| r.geomean_ns.is_some()),
+        "every verification run is timed",
+    );
+    push_check(
+        &mut out,
+        median_candidate.is_some_and(|v| v < manifest.baseline.median_ns),
+        "candidate median beats baseline median",
+    );
+    push_check(
+        &mut out,
+        !manifest.eval.bundle.trim().is_empty(),
+        "eval bundle identity recorded",
+    );
+    push_check(
+        &mut out,
+        !manifest.eval.sandbox_image.trim().is_empty(),
+        "sandbox image identity recorded",
+    );
+    push_check(
+        &mut out,
+        manifest.config.scratch_max_bytes > 0,
+        "scratch cap recorded",
+    );
+    push_check(
+        &mut out,
+        !manifest_sha256.trim().is_empty(),
+        "manifest hash recorded",
+    );
+    out
+}
+
+/// Human-readable accept/reject reason for the candidate table.
+fn artifact_accept_reason(
+    manifest: &ArtifactManifest,
+    median_candidate: Option<f64>,
+) -> &'static str {
+    if manifest.verification.accepted {
+        "accepted: all clean runs correct and median runtime beats baseline"
+    } else if manifest.verification.runs.iter().any(|r| !r.correct) {
+        "rejected: at least one clean verification run failed correctness"
+    } else if manifest
+        .verification
+        .runs
+        .iter()
+        .any(|r| r.geomean_ns.is_none())
+    {
+        "rejected: at least one clean verification run did not produce timing"
+    } else if median_candidate.is_some_and(|v| v >= manifest.baseline.median_ns) {
+        "rejected: candidate median runtime does not beat baseline"
+    } else {
+        "rejected: insufficient clean verification evidence"
+    }
+}
+
+/// Append a reviewer checklist row.
+fn push_check(out: &mut String, pass: bool, label: &str) {
+    writeln!(out, "- [{}] {label}", if pass { "pass" } else { "fail" })
+        .expect("writing to String cannot fail");
 }
 
 /// SHA-256 hex digest of `bytes`.
@@ -1312,6 +1546,10 @@ mod tests {
             "artifact",
             "--run-id",
             "trimul-1",
+            "--training-reward",
+            "1.25",
+            "--run-health",
+            "healthy",
             "--audit-secret-seed",
             "99",
             "--baseline-ns",
@@ -1415,5 +1653,94 @@ mod tests {
     fn baseline_median_must_match_config_pin() {
         assert!(require_baseline_matches_config(10.0, 10.0).is_ok());
         assert!(require_baseline_matches_config(10.0, 11.0).is_err());
+    }
+
+    #[test]
+    fn artifact_report_matches_the_contract_outline() {
+        let manifest = ArtifactManifest {
+            contract_version: 1,
+            task: "trimul",
+            ferrl_commit: "abc123".to_string(),
+            run_id: "trimul-1".to_string(),
+            candidate: CandidateManifest {
+                step: 7,
+                group_index: 2,
+                training_reward: 1.5,
+                completion_sha256: "completion-hash".to_string(),
+                source_sha256: "source-hash".to_string(),
+            },
+            model: ModelManifest {
+                family: "qwen3.x".to_string(),
+                checkpoint: "checkpoint".to_string(),
+                tokenizer: "tokenizer".to_string(),
+                lora_rank: 8,
+                lora_alpha: 16.0,
+                base_dtype: "bf16",
+            },
+            config: ArtifactConfigManifest {
+                run_config_sha256: "config-hash".to_string(),
+                trainer_steps: 100,
+                group_size: 4,
+                run_health: "healthy".to_string(),
+                policy_seed: 11,
+                data_seed: 22,
+                training_secret_seed: 33,
+                audit_secret_seed: 44,
+                scratch_max_bytes: 1024,
+            },
+            eval: EvalManifest {
+                bundle: "eval-bundle".to_string(),
+                sandbox_image: "sandbox-image".to_string(),
+                test_cases: 3,
+                benchmark_cases: 2,
+            },
+            baseline: BaselineManifest {
+                gpu: "H100".to_string(),
+                measurements_ns: vec![10.0, 11.0, 12.0],
+                median_ns: 11.0,
+                command: "ferrl trimul-baseline --config run.json".to_string(),
+            },
+            verification: VerificationManifest {
+                gpu: "H100".to_string(),
+                runs: vec![
+                    ArtifactVerificationRun {
+                        correct: true,
+                        benchmark_means_ns: vec![8.0],
+                        geomean_ns: Some(8.0),
+                        speedup: Some(1.375),
+                    },
+                    ArtifactVerificationRun {
+                        correct: true,
+                        benchmark_means_ns: vec![9.0],
+                        geomean_ns: Some(9.0),
+                        speedup: Some(1.222),
+                    },
+                    ArtifactVerificationRun {
+                        correct: true,
+                        benchmark_means_ns: vec![10.0],
+                        geomean_ns: Some(10.0),
+                        speedup: Some(1.1),
+                    },
+                ],
+                accepted: true,
+            },
+        };
+        let report = artifact_report(&manifest, Path::new("artifact"), "manifest-hash");
+        for required in [
+            "## 1. Verdict",
+            "Raw measurements ns: 10.000000, 11.000000, 12.000000",
+            "Command used: `ferrl trimul-baseline --config run.json`",
+            "ferrl commit: abc123",
+            "Config hash: config-hash",
+            "Run health: healthy",
+            "| source hash | training reward | clean correctness | median runtime ns | speedup | accept/reject reason |",
+            "| source-hash | 1.500000 | 3/3 | 9.000000 | 1.222222 | accepted: all clean runs correct and median runtime beats baseline |",
+            "Path: artifact",
+            "Manifest SHA-256: manifest-hash",
+            "## 6. Reviewer Checklist",
+            "[pass] audit seed differs from training seed",
+        ] {
+            assert!(report.contains(required), "missing report field: {required}");
+        }
     }
 }
