@@ -75,7 +75,8 @@ use crate::policy::{GenConfig, Policy, Rollout};
 use crate::reward::{RewardError, RewardFn};
 use crate::sample::Sample;
 use crate::telemetry::{
-    CandidateRecord, CandidateWriter, Metrics, MetricsWriter, RunDir, TelemetryError,
+    cuda_memory_snapshot, CandidateRecord, CandidateWriter, GpuMemorySnapshot, Metrics,
+    MetricsWriter, RunDir, TelemetryError,
 };
 
 /// An error raised while running a GRPO training step.
@@ -320,6 +321,15 @@ pub struct TrainerConfig {
     /// artifact extractor after training.
     #[serde(default)]
     pub candidate_log_top_k: usize,
+    /// Opt-in CUDA memory telemetry for GPU runs.
+    ///
+    /// When `true`, the trainer samples CUDA runtime free/total memory at coarse
+    /// phase boundaries (rollout, reward, detached scoring, backward, gradient
+    /// reduction, optimizer) and persists per-step start/peak/end memory fields
+    /// in `metrics.jsonl`. It is intentionally off by default: the default CPU
+    /// build records zeros, and ordinary training avoids runtime-query overhead.
+    #[serde(default)]
+    pub gpu_memory_probe: bool,
     /// End-of-sequence token id threaded into [`GenConfig::eos_token_id`] for
     /// rollout: when `Some`, a sampled EOS ends a completion early (EOS-inclusive)
     /// and the row is right-padded to `max_new_tokens`, the true length recorded in
@@ -393,6 +403,7 @@ impl Default for TrainerConfig {
             grad_accum_steps: 1,
             checkpoint_every: None,
             candidate_log_top_k: 0,
+            gpu_memory_probe: false,
             eos_token_id: None,
         }
     }
@@ -615,6 +626,13 @@ impl TrainerConfigBuilder {
     #[must_use]
     pub fn candidate_log_top_k(mut self, candidate_log_top_k: usize) -> Self {
         self.cfg.candidate_log_top_k = candidate_log_top_k;
+        self
+    }
+
+    /// Set [`TrainerConfig::gpu_memory_probe`].
+    #[must_use]
+    pub fn gpu_memory_probe(mut self, gpu_memory_probe: bool) -> Self {
+        self.cfg.gpu_memory_probe = gpu_memory_probe;
         self
     }
 
@@ -843,6 +861,77 @@ struct PromptSelection {
     rollout_global_row_base: u64,
 }
 
+#[derive(Clone, Copy)]
+struct SelectedSample<'a, T> {
+    sample: &'a Sample<T>,
+    selection: &'a PromptSelection,
+}
+
+#[derive(Debug, Default)]
+struct StepGpuMemory {
+    enabled: bool,
+    start: Option<GpuMemorySnapshot>,
+    peak: Option<GpuMemorySnapshot>,
+    end: Option<GpuMemorySnapshot>,
+}
+
+impl StepGpuMemory {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            start: None,
+            peak: None,
+            end: None,
+        }
+    }
+
+    fn record(&mut self, phase: &'static str) {
+        if !self.enabled {
+            return;
+        }
+        let Some(snapshot) = cuda_memory_snapshot() else {
+            tracing::warn!(phase, "cuda memory probe unavailable");
+            return;
+        };
+        if self.start.is_none() {
+            self.start = Some(snapshot);
+        }
+        if self
+            .peak
+            .is_none_or(|peak| snapshot.used_bytes > peak.used_bytes)
+        {
+            self.peak = Some(snapshot);
+        }
+        self.end = Some(snapshot);
+        tracing::info!(
+            phase,
+            cuda_mem_used_bytes = snapshot.used_bytes,
+            cuda_mem_free_bytes = snapshot.free_bytes,
+            cuda_mem_total_bytes = snapshot.total_bytes,
+            cuda_mem_peak_delta_bytes = self.peak_delta_bytes(),
+            "cuda memory probe"
+        );
+    }
+
+    fn apply(&self, metrics: &mut Metrics) {
+        let (Some(start), Some(peak), Some(end)) = (self.start, self.peak, self.end) else {
+            return;
+        };
+        metrics.cuda_mem_start_used_bytes = start.used_bytes;
+        metrics.cuda_mem_peak_used_bytes = peak.used_bytes;
+        metrics.cuda_mem_end_used_bytes = end.used_bytes;
+        metrics.cuda_mem_total_bytes = peak.total_bytes;
+        metrics.cuda_mem_peak_delta_bytes = peak.used_bytes.saturating_sub(start.used_bytes);
+    }
+
+    fn peak_delta_bytes(&self) -> u64 {
+        match (self.start, self.peak) {
+            (Some(start), Some(peak)) => peak.used_bytes.saturating_sub(start.used_bytes),
+            _ => 0,
+        }
+    }
+}
+
 /// Per-prompt quantities aggregated into a window's [`Metrics`] (the reward
 /// distribution, completion length, dropped/truncated rows, the group's total
 /// completion tokens — the DAPO normalizer contribution — and whether the
@@ -864,6 +953,12 @@ struct PromptStat {
     /// behavior log-probs, or when the group was skipped before its `logp_old`
     /// scoring snapshot existed (a degenerate group at `beta == 0`).
     ratio_stats: Option<RatioStats>,
+}
+
+struct UpdateCtx<'a> {
+    vars: &'a [Var],
+    opt: &'a mut FerrlAdamW,
+    gpu_mem: &'a mut StepGpuMemory,
 }
 
 /// Why a preemption-aware run returned — distinguishes a run that reached
@@ -1434,11 +1529,23 @@ impl Trainer {
             // figure is world_size × tokens_per_sec (each rank rolls out its own
             // prompt shard); see `telemetry::Metrics`.
             let started = std::time::Instant::now();
-            let (mut m, local_tokens) =
-                self.run_window(step, policy, reward_fn, tokenizer, samples, &mut opt, &vars)?;
+            let mut gpu_mem = StepGpuMemory::new(self.config.gpu_memory_probe);
+            gpu_mem.record("step_start");
+            let (mut m, local_tokens) = self.run_window(
+                step,
+                policy,
+                reward_fn,
+                tokenizer,
+                samples,
+                &mut opt,
+                &vars,
+                &mut gpu_mem,
+            )?;
+            gpu_mem.record("step_end");
             let secs = started.elapsed().as_secs_f64();
             m.step_secs = secs as f32;
             m.tokens_per_sec = step_throughput(local_tokens, secs);
+            gpu_mem.apply(&mut m);
             self.writer.append(&m)?;
             history.push(m);
             self.maybe_checkpoint(step, &vars, &opt, policy)?;
@@ -1488,21 +1595,22 @@ impl Trainer {
         samples: &[Sample<R::Target>],
         opt: &mut FerrlAdamW,
         vars: &[Var],
+        gpu_mem: &mut StepGpuMemory,
     ) -> Result<(Metrics, usize), TrainerError> {
+        gpu_mem.record("window_start");
         let accum = self.config.grad_accum_steps;
         let world = self.comm.world_size();
         let mut stats = Vec::with_capacity(accum);
         let mut live = Vec::with_capacity(accum);
         for j in 0..accum {
             let sel = self.select_prompt(step, j, samples.len());
-            let (stat, item) = self.collect_sample(
-                step,
-                policy,
-                reward_fn,
-                tokenizer,
-                &samples[sel.sample_idx],
-                &sel,
-            )?;
+            self.record_prompt_selection(&sel);
+            let selected = SelectedSample {
+                sample: &samples[sel.sample_idx],
+                selection: &sel,
+            };
+            let (stat, item) =
+                self.collect_sample(step, policy, reward_fn, tokenizer, &selected, gpu_mem)?;
             stats.push(stat);
             if let Some(item) = item {
                 live.push(item);
@@ -1519,27 +1627,33 @@ impl Trainer {
         // (raw local sums reduce first — clamping locally would overcount).
         let local_tokens = stats.iter().map(|s| s.completion_tokens).sum::<usize>();
         let window_tokens = if world > 1 {
+            gpu_mem.record("token_count_all_reduce_start");
             self.comm
                 .all_reduce_scalar_sum(local_tokens as f64)?
                 .max(1.0)
         } else {
             local_tokens.max(1) as f64
         };
+        gpu_mem.record("token_count_all_reduce_end");
         // A window with no live prompts (every group degenerate) is a GRPO no-op: no
         // update, no canary — mirroring the single-prompt degenerate skip. Under DP
         // the decision must be GLOBAL: a rank whose local shard is all-degenerate
         // still has to enter the inner epochs' collectives (contributing zeros)
         // while any peer holds live items — a local skip would deadlock the world.
         let n_live_global = if world > 1 {
+            gpu_mem.record("live_count_all_reduce_start");
             self.comm.all_reduce_scalar_sum(live.len() as f64)?
         } else {
             live.len() as f64
         };
+        gpu_mem.record("live_count_all_reduce_end");
         let agg = if n_live_global == 0.0 {
             InnerAgg::default()
         } else {
-            self.update_window(policy, &live, vars, opt, window_tokens, n_live_global)?
+            let mut ctx = UpdateCtx { vars, opt, gpu_mem };
+            self.update_window(policy, &live, &mut ctx, window_tokens, n_live_global)?
         };
+        gpu_mem.record("window_end");
         Ok((
             self.build_window_metrics(step, &stats, &agg, opt),
             local_tokens,
@@ -1581,6 +1695,19 @@ impl Trainer {
                 }
             }
         }
+    }
+
+    fn record_prompt_selection(&self, sel: &PromptSelection) {
+        if !self.config.gpu_memory_probe {
+            return;
+        }
+        tracing::info!(
+            sample_idx = sel.sample_idx,
+            prompt_index = sel.prompt_index,
+            rollout_global_row_base = sel.rollout_global_row_base,
+            reward_group_scope = ?self.config.reward_group_scope,
+            "trainer: selected prompt"
+        );
     }
 
     /// Persist this prompt group's top-K decoded completions when the candidate
@@ -1735,12 +1862,12 @@ impl Trainer {
         policy: &mut P,
         reward_fn: &R,
         tokenizer: &dyn TokenizerLike,
-        sample: &Sample<R::Target>,
-        selection: &PromptSelection,
+        selected: &SelectedSample<'_, R::Target>,
+        gpu_mem: &mut StepGpuMemory,
     ) -> Result<(PromptStat, Option<LiveItem>), TrainerError> {
         // Rollout with the adapter on, then score it.
         policy.set_adapter_enabled(true);
-        let prompt_ids = tokenizer.encode(&sample.prompt);
+        let prompt_ids = tokenizer.encode(&selected.sample.prompt);
         // A prompt that encodes to zero tokens (a real tokenizer can yield `[]` for
         // empty/whitespace input) must fail HERE, before generate: teacher-forced
         // scoring needs >= 1 prompt token, and a policy that builds an empty input
@@ -1749,7 +1876,7 @@ impl Trainer {
         if prompt_ids.is_empty() {
             return Err(TrainerError::Contract(format!(
                 "prompt encoded to zero tokens: {:?}",
-                sample.prompt
+                selected.sample.prompt
             )));
         }
         // Derive the rollout config from the trainer config (single source of truth;
@@ -1757,7 +1884,13 @@ impl Trainer {
         let gen = GenConfig::from(&self.config);
         // See `select_prompt`: prompt selection and rollout RNG row ranges differ
         // in distributed same-prompt mode.
-        let rollout = policy.generate_at(&prompt_ids, &gen, selection.rollout_global_row_base)?;
+        gpu_mem.record("rollout_start");
+        let rollout = policy.generate_at(
+            &prompt_ids,
+            &gen,
+            selected.selection.rollout_global_row_base,
+        )?;
+        gpu_mem.record("rollout_end");
         // Validate the rollout BEFORE decoding/scoring it: completion_dims rejects
         // an empty, ragged, or shorter-than-prompt rollout (and a misaligned
         // behavior-log-prob capture), so the decode slice `ids[prompt_len..]`
@@ -1785,7 +1918,9 @@ impl Trainer {
             )));
         }
         let completions = decode_completions(&rollout, tokenizer);
-        let rewards = reward_fn.reward_group(sample, &completions)?;
+        gpu_mem.record("reward_start");
+        let rewards = reward_fn.reward_group(selected.sample, &completions)?;
+        gpu_mem.record("reward_end");
         if rewards.len() != rollout.len() {
             return Err(TrainerError::Contract(format!(
                 "reward_group returned {} rewards for {} completions",
@@ -1795,7 +1930,7 @@ impl Trainer {
         }
         self.write_candidate_records(
             step,
-            selection.prompt_index,
+            selected.selection.prompt_index,
             &completions,
             &rewards,
             &rollout,
@@ -1851,7 +1986,9 @@ impl Trainer {
         // reused across the mu inner epochs. Value-only, so the detached
         // scoring path: same values, a fraction of the activation footprint
         // on policies that override it (no tape is built or captured).
+        gpu_mem.record("logp_old_start");
         let logp_old = policy.token_logprobs_detached(&rollout)?;
+        gpu_mem.record("logp_old_end");
         // Train/rollout off-policy diagnostics + the optional TIS weight, both off
         // the captured behavior log-probs vs the logp_old scoring snapshot.
         let (ratio_stats, tis_w) = rollout_ratio_and_tis(
@@ -1864,7 +2001,9 @@ impl Trainer {
         stat.ratio_stats = ratio_stats;
         let device = logp_old.device().clone();
         let mask = mask_rows_to_tensor(&mask_rows, &device)?;
+        gpu_mem.record("logp_ref_start");
         let logp_ref = self.reference_logprobs(policy, &rollout)?;
+        gpu_mem.record("logp_ref_end");
         let advantages = advantages_tensor(&advantages, &device)?;
         let item = LiveItem {
             rollout,
@@ -1911,14 +2050,13 @@ impl Trainer {
         &self,
         policy: &P,
         live: &[LiveItem],
-        vars: &[Var],
-        opt: &mut FerrlAdamW,
+        ctx: &mut UpdateCtx<'_>,
         window_tokens: f64,
         n_live_global: f64,
     ) -> Result<InnerAgg, TrainerError> {
         let mut agg = InnerAgg::default();
         for _ in 0..self.config.mu {
-            agg = self.accumulate_step(policy, live, vars, opt, window_tokens, n_live_global)?;
+            agg = self.accumulate_step(policy, live, ctx, window_tokens, n_live_global)?;
         }
         Ok(agg)
     }
@@ -1939,24 +2077,27 @@ impl Trainer {
         &self,
         policy: &P,
         live: &[LiveItem],
-        vars: &[Var],
-        opt: &mut FerrlAdamW,
+        ctx: &mut UpdateCtx<'_>,
         window_tokens: f64,
         n_live_global: f64,
     ) -> Result<InnerAgg, TrainerError> {
+        let vars = ctx.vars;
         let mut acc: Vec<Option<Tensor>> = vec![None; vars.len()];
         let mut covered = vec![true; vars.len()];
         let mut container: Option<GradStore> = None;
         let mut sum_kl = 0.0_f32;
         let mut sum_clip = 0.0_f32;
         for item in live {
+            ctx.gpu_mem.record("item_backward_start");
             let (grads, kl, clip_frac) = self.item_backward(policy, item, window_tokens)?;
+            ctx.gpu_mem.record("item_backward_end");
             sum_kl += kl;
             sum_clip += clip_frac;
             fold_var_grads(vars, &grads, &mut acc, &mut covered)?;
             container = Some(grads);
         }
         let (kl, clip_frac, uncovered_global) = if self.comm.world_size() > 1 {
+            ctx.gpu_mem.record("grad_all_reduce_start");
             self.reduce_epoch(vars, &mut acc, &covered, sum_kl, sum_clip, n_live_global)?
         } else {
             (
@@ -1965,6 +2106,7 @@ impl Trainer {
                 0.0,
             )
         };
+        ctx.gpu_mem.record("grad_all_reduce_end");
         // Reuse the last backward's store as the optimizer container, overwriting its
         // trainable-var entries with the accumulated sums (and dropping any var absent
         // from some prompt so the canary catches the silent-skip). A rank whose local
@@ -2010,10 +2152,14 @@ impl Trainer {
         let grad_norm = global_grad_norm(vars, &store)?;
         if let Some(max) = self.config.max_grad_norm {
             if grad_norm > max {
+                ctx.gpu_mem.record("grad_clip_start");
                 scale_var_grads(vars, &mut store, max / grad_norm)?;
+                ctx.gpu_mem.record("grad_clip_end");
             }
         }
-        opt.step(&store)?;
+        ctx.gpu_mem.record("optimizer_start");
+        ctx.opt.step(&store)?;
+        ctx.gpu_mem.record("optimizer_end");
         Ok(InnerAgg {
             kl,
             clip_frac,
@@ -3066,6 +3212,7 @@ mod tests {
             .grad_accum_steps(4)
             .checkpoint_every(Some(50))
             .candidate_log_top_k(2)
+            .gpu_memory_probe(true)
             .eos_token_id(Some(151_645))
             .build();
         let literal = TrainerConfig {
@@ -3093,6 +3240,7 @@ mod tests {
             grad_accum_steps: 4,
             checkpoint_every: Some(50),
             candidate_log_top_k: 2,
+            gpu_memory_probe: true,
             eos_token_id: Some(151_645),
         };
         assert_eq!(

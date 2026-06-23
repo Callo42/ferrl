@@ -18,6 +18,53 @@ use tracing_subscriber::filter::EnvFilter;
 use tracing_subscriber::fmt;
 use tracing_subscriber::prelude::*;
 
+/// One instantaneous CUDA memory reading for the process' current device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpuMemorySnapshot {
+    /// Free device memory in bytes.
+    pub free_bytes: u64,
+    /// Total device memory in bytes.
+    pub total_bytes: u64,
+    /// Used device memory in bytes (`total - free`, saturating).
+    pub used_bytes: u64,
+}
+
+impl GpuMemorySnapshot {
+    #[cfg(feature = "cuda")]
+    fn from_free_total(free: usize, total: usize) -> Self {
+        let free_bytes = free as u64;
+        let total_bytes = total as u64;
+        Self {
+            free_bytes,
+            total_bytes,
+            used_bytes: total_bytes.saturating_sub(free_bytes),
+        }
+    }
+}
+
+/// Read CUDA memory for the current device, when this binary was built with
+/// `--features cuda` and the CUDA runtime can answer.
+///
+/// Returns `None` for CPU/default builds and for runtime query failures. This is
+/// telemetry, not a training precondition: a failed memory probe must never turn
+/// a valid run red.
+#[must_use]
+pub fn cuda_memory_snapshot() -> Option<GpuMemorySnapshot> {
+    cuda_memory_snapshot_impl()
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_memory_snapshot_impl() -> Option<GpuMemorySnapshot> {
+    cudarc::runtime::result::mem_get_info()
+        .ok()
+        .map(|(free, total)| GpuMemorySnapshot::from_free_total(free, total))
+}
+
+#[cfg(not(feature = "cuda"))]
+fn cuda_memory_snapshot_impl() -> Option<GpuMemorySnapshot> {
+    None
+}
+
 /// Errors raised while setting up or writing run telemetry.
 #[derive(Debug, thiserror::Error)]
 pub enum TelemetryError {
@@ -413,6 +460,28 @@ pub struct Metrics {
     /// also the value for older records).
     #[serde(default)]
     pub tokens_per_sec: f32,
+    /// CUDA memory used by this rank at the first step probe, in bytes.
+    ///
+    /// Written only when [`TrainerConfig::gpu_memory_probe`](crate::trainer::TrainerConfig::gpu_memory_probe)
+    /// is enabled in a CUDA build; `0` means unmeasured.
+    #[serde(default)]
+    pub cuda_mem_start_used_bytes: u64,
+    /// Peak CUDA memory used by this rank across the step's probes, in bytes.
+    /// `0` means unmeasured.
+    #[serde(default)]
+    pub cuda_mem_peak_used_bytes: u64,
+    /// CUDA memory used by this rank at the final step probe, in bytes. `0`
+    /// means unmeasured.
+    #[serde(default)]
+    pub cuda_mem_end_used_bytes: u64,
+    /// Total CUDA memory reported for this rank's current device, in bytes. `0`
+    /// means unmeasured.
+    #[serde(default)]
+    pub cuda_mem_total_bytes: u64,
+    /// Peak per-step CUDA memory increase from the first probe, in bytes. `0`
+    /// means unmeasured or no increase.
+    #[serde(default)]
+    pub cuda_mem_peak_delta_bytes: u64,
 }
 
 /// `serde` default for the rollout-ratio metrics: `1.0` (exactly on-policy —
@@ -447,6 +516,11 @@ impl Metrics {
             lr: 0.0,
             step_secs: 0.0,
             tokens_per_sec: 0.0,
+            cuda_mem_start_used_bytes: 0,
+            cuda_mem_peak_used_bytes: 0,
+            cuda_mem_end_used_bytes: 0,
+            cuda_mem_total_bytes: 0,
+            cuda_mem_peak_delta_bytes: 0,
         }
     }
 
@@ -786,6 +860,12 @@ pub struct RunSummary {
     pub mean_tokens_per_sec: f32,
     /// Total measured wall-clock seconds (Σ [`Metrics::step_secs`]).
     pub total_wall_secs: f32,
+    /// Highest CUDA memory peak reported by any step, in bytes. `0` when the
+    /// memory probe was disabled or unavailable.
+    pub max_cuda_mem_peak_used_bytes: u64,
+    /// Highest per-step CUDA memory delta from a step's first probe, in bytes.
+    /// `0` when the memory probe was disabled or unavailable.
+    pub max_cuda_mem_peak_delta_bytes: u64,
     /// Total dropped (all-pad) completion rows over the run.
     pub total_dropped_rows: u32,
     /// Health flags raised over the stream; empty means nothing notable.
@@ -819,6 +899,14 @@ impl std::fmt::Display for RunSummary {
             "  grad_norm   final {:.3}   max {:.3}      kl {:.4}   lr {:.2e}",
             self.final_grad_norm, self.max_grad_norm, self.final_kl, self.final_lr
         )?;
+        if self.max_cuda_mem_peak_used_bytes > 0 {
+            writeln!(
+                f,
+                "  cuda_mem    peak {} MiB   step_delta {} MiB",
+                bytes_to_mib(self.max_cuda_mem_peak_used_bytes),
+                bytes_to_mib(self.max_cuda_mem_peak_delta_bytes)
+            )?;
+        }
         if self.total_dropped_rows > 0 {
             writeln!(f, "  dropped_rows {}", self.total_dropped_rows)?;
         }
@@ -857,9 +945,23 @@ pub fn summarize(history: &[Metrics]) -> Option<RunSummary> {
         mean_step_secs: mean_of(history, |m| m.step_secs),
         mean_tokens_per_sec: mean_of(history, |m| m.tokens_per_sec),
         total_wall_secs: history.iter().map(|m| m.step_secs).sum(),
+        max_cuda_mem_peak_used_bytes: history
+            .iter()
+            .map(|m| m.cuda_mem_peak_used_bytes)
+            .max()
+            .unwrap_or(0),
+        max_cuda_mem_peak_delta_bytes: history
+            .iter()
+            .map(|m| m.cuda_mem_peak_delta_bytes)
+            .max()
+            .unwrap_or(0),
         total_dropped_rows: history.iter().map(|m| m.dropped_rows).sum(),
         anomalies: detect_anomalies(history, trend),
     })
+}
+
+fn bytes_to_mib(bytes: u64) -> u64 {
+    bytes / (1024 * 1024)
 }
 
 /// Mean of `f` over the records, or `0.0` for an empty slice.
@@ -1356,6 +1458,11 @@ mod tests {
             lr: 5e-6,
             step_secs: 1.5,
             tokens_per_sec: 128.0,
+            cuda_mem_start_used_bytes: 10,
+            cuda_mem_peak_used_bytes: 30,
+            cuda_mem_end_used_bytes: 20,
+            cuda_mem_total_bytes: 100,
+            cuda_mem_peak_delta_bytes: 20,
         };
         let j = serde_json::to_string(&m).unwrap();
         let back: Metrics = serde_json::from_str(&j).unwrap();
@@ -1377,6 +1484,16 @@ mod tests {
         );
         // The PR-4 timing fields are absent from an old record → default to 0.0.
         assert_eq!((m.step_secs, m.tokens_per_sec), (0.0, 0.0));
+        assert_eq!(
+            (
+                m.cuda_mem_start_used_bytes,
+                m.cuda_mem_peak_used_bytes,
+                m.cuda_mem_end_used_bytes,
+                m.cuda_mem_total_bytes,
+                m.cuda_mem_peak_delta_bytes,
+            ),
+            (0, 0, 0, 0, 0)
+        );
         assert_eq!(
             (
                 m.rollout_ratio_mean,
@@ -1456,6 +1573,20 @@ mod tests {
         assert_eq!(s.mean_tokens_per_sec, 100.0);
         assert_eq!(s.max_grad_norm, 1.0);
         assert!(s.anomalies.is_empty(), "healthy run: {:?}", s.anomalies);
+    }
+
+    #[test]
+    fn summarize_reports_cuda_memory_peak_when_present() {
+        let mut hist: Vec<Metrics> = (0..3)
+            .map(|i| metric(i, 0.1 * i as f32, 1.0, 2.0, 100.0))
+            .collect();
+        hist[1].cuda_mem_peak_used_bytes = 16 * 1024 * 1024;
+        hist[1].cuda_mem_peak_delta_bytes = 4 * 1024 * 1024;
+
+        let s = summarize(&hist).unwrap();
+        assert_eq!(s.max_cuda_mem_peak_used_bytes, 16 * 1024 * 1024);
+        assert_eq!(s.max_cuda_mem_peak_delta_bytes, 4 * 1024 * 1024);
+        assert!(s.to_string().contains("cuda_mem"));
     }
 
     #[test]

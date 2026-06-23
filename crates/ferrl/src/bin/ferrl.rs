@@ -318,6 +318,11 @@ struct PolicyCfg {
     base_dtype: DtypeSel,
     /// Rollout sampler seed.
     seed: u64,
+    /// Enable layer-boundary activation checkpointing for the update forward.
+    ///
+    /// This trades extra recompute for a lower activation peak and is the main
+    /// CLI-accessible memory lever for long Qwen-family GPU training runs.
+    activation_checkpointing: bool,
 }
 
 impl Default for PolicyCfg {
@@ -327,6 +332,7 @@ impl Default for PolicyCfg {
             lora_alpha: 32.0,
             base_dtype: DtypeSel::F32,
             seed: 1234,
+            activation_checkpointing: false,
         }
     }
 }
@@ -665,12 +671,14 @@ fn run_training<R: RewardFn>(
     eval: &[Sample<R::Target>],
 ) -> Result<(), CliError> {
     let (mut policy, tok) = load_auto_policy(&cfg.model_dir, device, &cfg.loader_opts())?;
+    policy.set_activation_checkpointing(cfg.policy.activation_checkpointing);
     let tcfg = cfg.trainer.clone();
     let gen = GenConfig::from(&tcfg);
     info!(
         task = %cfg.task,
         steps = tcfg.steps,
         group_size = tcfg.group_size,
+        activation_checkpointing = policy.activation_checkpointing(),
         train = train.len(),
         eval = eval.len(),
         "ferrl train: starting"
@@ -1669,6 +1677,7 @@ mod tests {
         assert!(matches!(cfg.device, DeviceSel::Cpu));
         assert_eq!(cfg.out_dir, PathBuf::from("runs"));
         assert_eq!(cfg.policy.lora_rank, 16);
+        assert!(!cfg.policy.activation_checkpointing);
         assert_eq!(cfg.data.train_n, 64);
         // The loader temperature mirrors the trainer's (cannot drift).
         assert!((cfg.loader_opts().temperature - cfg.trainer.temperature).abs() < f64::EPSILON);
@@ -1681,7 +1690,7 @@ mod tests {
             "task": "math",
             "model_dir": "/m",
             "device": "cuda",
-            "policy": { "base_dtype": "bf16" },
+            "policy": { "base_dtype": "bf16", "activation_checkpointing": true },
             "data": { "path": "data.jsonl", "eval_n": 4 },
             "trainer": { "steps": 1, "group_size": 2, "max_new_tokens": 8,
                          "temperature": 0.7, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
@@ -1691,6 +1700,7 @@ mod tests {
         let cfg: RunConfig = serde_json::from_str(json).unwrap();
         assert!(matches!(cfg.device, DeviceSel::Cuda));
         assert_eq!(cfg.loader_opts().base_dtype, DType::BF16);
+        assert!(cfg.policy.activation_checkpointing);
         assert_eq!(cfg.data.path.as_deref(), Some(Path::new("data.jsonl")));
     }
 
