@@ -116,6 +116,30 @@ pub enum AutoPolicy {
     Qwen3_5(Box<Qwen3_5Policy>),
 }
 
+impl AutoPolicy {
+    /// Enable or disable layer-boundary activation checkpointing when the loaded
+    /// model supports it.
+    ///
+    /// This is the CLI-facing memory lever for long CUDA training runs: rollout
+    /// remains cached and grad-free, while update forwards rematerialize layer
+    /// segments during backward to reduce activation peak memory.
+    pub fn set_activation_checkpointing(&mut self, on: bool) {
+        match self {
+            Self::Qwen(policy) => policy.model_mut().set_activation_checkpointing(on),
+            Self::Qwen3_5(policy) => policy.model_mut().set_activation_checkpointing(on),
+        }
+    }
+
+    /// Whether activation checkpointing is enabled on this model.
+    #[must_use]
+    pub fn activation_checkpointing(&self) -> bool {
+        match self {
+            Self::Qwen(policy) => policy.model().activation_checkpointing(),
+            Self::Qwen3_5(policy) => policy.model().activation_checkpointing(),
+        }
+    }
+}
+
 impl Policy for AutoPolicy {
     fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
         match self {
