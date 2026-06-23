@@ -67,6 +67,7 @@ use serde::{Deserialize, Serialize};
 use crate::comm::{Comm, SoloComm};
 use crate::grpo::{
     group_advantages, zero_mask_rows, ImportanceSamplingLevel, LossType, ScaleRewards,
+    GROUP_STD_EPS,
 };
 use crate::nn::grad_coverage;
 use crate::optim::{FerrlAdamW, OptimizerState};
@@ -122,6 +123,25 @@ pub trait TokenizerLike {
     fn encode(&self, text: &str) -> Vec<u32>;
     /// Decode token `ids` back into text scored by [`RewardFn`].
     fn decode(&self, ids: &[u32]) -> String;
+}
+
+/// Where a prompt's reward-normalization group is formed.
+///
+/// `Local` is the classic GRPO behavior: each rank samples and normalizes a full
+/// group independently. `DistributedSamePrompt` is the memory-saving distributed
+/// mode: every rank's local completions are assumed to be shards of the same
+/// prompt's reward group, so the trainer all-reduces the group's finite reward
+/// statistics before computing advantages. It is intentionally narrow; future
+/// multi-prompt distributed batches need explicit group-key-aware aggregation,
+/// not silent mixing across unrelated prompts or tasks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RewardGroupScope {
+    /// Normalize rewards within each local rank's sampled group.
+    #[default]
+    Local,
+    /// Treat every rank's local completions as the same prompt's reward group.
+    DistributedSamePrompt,
 }
 
 /// Configuration for a GRPO training run.
@@ -263,6 +283,13 @@ pub struct TrainerConfig {
     pub loss_type: LossType,
     /// How to scale group-centered rewards into advantages.
     pub scale_rewards: ScaleRewards,
+    /// Where reward-normalization groups are formed. Defaults to local GRPO
+    /// behavior for old configs and single-rank runs. The distributed option is
+    /// valid only when every rank is sampling the same prompt/reward group; it is
+    /// rejected for multi-prompt accumulation until group-key-aware aggregation is
+    /// implemented.
+    #[serde(default)]
+    pub reward_group_scope: RewardGroupScope,
     /// Number of prompts whose gradients are accumulated into a single optimizer
     /// step (gradient accumulation **across prompts**). Each [`steps`](Self::steps)
     /// outer step consumes this many prompts — a *window* — summing their per-prompt
@@ -360,6 +387,7 @@ impl Default for TrainerConfig {
             tis_imp_ratio_cap: default_tis_imp_ratio_cap(),
             loss_type: LossType::Dapo,
             scale_rewards: ScaleRewards::Group,
+            reward_group_scope: RewardGroupScope::Local,
             grad_accum_steps: 1,
             checkpoint_every: None,
             candidate_log_top_k: 0,
@@ -560,6 +588,13 @@ impl TrainerConfigBuilder {
         self
     }
 
+    /// Set [`TrainerConfig::reward_group_scope`].
+    #[must_use]
+    pub fn reward_group_scope(mut self, reward_group_scope: RewardGroupScope) -> Self {
+        self.cfg.reward_group_scope = reward_group_scope;
+        self
+    }
+
     /// Set [`TrainerConfig::grad_accum_steps`].
     #[must_use]
     pub fn grad_accum_steps(mut self, grad_accum_steps: usize) -> Self {
@@ -693,6 +728,11 @@ impl TrainerConfig {
             "tis is a token-level correction and cannot combine with sequence-level \
              importance sampling (GSPO) — pick one",
         )?;
+        require(
+            self.reward_group_scope == RewardGroupScope::Local || self.grad_accum_steps == 1,
+            "reward_group_scope = distributed_same_prompt requires grad_accum_steps = 1 until \
+             group-key-aware distributed aggregation exists",
+        )?;
         Ok(())
     }
 
@@ -791,6 +831,13 @@ struct RatioStats {
     max: f64,
     capped: usize,
     tokens: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RewardStatsAcc {
+    count: f64,
+    sum: f64,
+    sumsq: f64,
 }
 
 /// Per-prompt quantities aggregated into a window's [`Metrics`] (the reward
@@ -1750,7 +1797,7 @@ impl Trainer {
         // k3 term carries gradient). Skipping it would silently drop that
         // regularization, diverging from TRL whenever rewards saturate mid-run.
         let rewards_f64: Vec<f64> = rewards.iter().map(|&r| f64::from(r)).collect();
-        let advantages = group_advantages(&rewards_f64, self.config.scale_rewards);
+        let advantages = self.reward_group_advantages(&rewards_f64)?;
         let degenerate = advantages.iter().all(|a| *a == 0.0);
         let mut stat = PromptStat {
             completion_len: mean_completion_len(&rollout),
@@ -1793,6 +1840,28 @@ impl Trainer {
             tis_w,
         };
         Ok((stat, Some(item)))
+    }
+
+    fn reward_group_advantages(&self, rewards: &[f64]) -> Result<Vec<f64>, TrainerError> {
+        match self.config.reward_group_scope {
+            RewardGroupScope::Local => Ok(group_advantages(rewards, self.config.scale_rewards)),
+            RewardGroupScope::DistributedSamePrompt if self.comm.world_size() == 1 => {
+                Ok(group_advantages(rewards, self.config.scale_rewards))
+            }
+            RewardGroupScope::DistributedSamePrompt => {
+                let local = RewardStatsAcc::from_rewards(rewards);
+                let global = RewardStatsAcc {
+                    count: self.comm.all_reduce_scalar_sum(local.count)?,
+                    sum: self.comm.all_reduce_scalar_sum(local.sum)?,
+                    sumsq: self.comm.all_reduce_scalar_sum(local.sumsq)?,
+                };
+                Ok(advantages_from_stats(
+                    rewards,
+                    global,
+                    self.config.scale_rewards,
+                ))
+            }
+        }
     }
 
     /// Run the `mu` inner epochs over a window's live items, each epoch accumulating
@@ -2542,6 +2611,57 @@ fn reward_stats(rewards: &[f32]) -> (f32, f32) {
     (mean, var.sqrt())
 }
 
+impl RewardStatsAcc {
+    fn from_rewards(rewards: &[f64]) -> Self {
+        rewards.iter().copied().filter(|r| r.is_finite()).fold(
+            Self {
+                count: 0.0,
+                sum: 0.0,
+                sumsq: 0.0,
+            },
+            |acc, r| Self {
+                count: acc.count + 1.0,
+                sum: acc.sum + r,
+                sumsq: acc.sumsq + r * r,
+            },
+        )
+    }
+
+    fn mean_std(self) -> (f64, f64) {
+        if self.count <= 0.0 {
+            return (0.0, 0.0);
+        }
+        let mean = self.sum / self.count;
+        let std = if self.count < 2.0 {
+            0.0
+        } else {
+            ((self.sumsq - (self.sum * self.sum / self.count)) / (self.count - 1.0))
+                .max(0.0)
+                .sqrt()
+        };
+        (mean, std)
+    }
+}
+
+fn advantages_from_stats(rewards: &[f64], stats: RewardStatsAcc, scale: ScaleRewards) -> Vec<f64> {
+    let (mean, std) = stats.mean_std();
+    let denom = match scale {
+        ScaleRewards::None => 1.0,
+        ScaleRewards::Group => std + GROUP_STD_EPS,
+    };
+    rewards
+        .iter()
+        .map(|&r| {
+            let a = (r - mean) / denom;
+            if a.is_finite() {
+                a
+            } else {
+                0.0
+            }
+        })
+        .collect()
+}
+
 /// The raw importance ratio `exp(logp - logp_old)`. At `mu = 1` the snapshot
 /// equals the current log-probs, so this is exactly `1`. Test-only reference:
 /// the production path goes through [`level_ratio`], whose Token arm is this
@@ -2907,6 +3027,7 @@ mod tests {
             .tis_imp_ratio_cap(2.0)
             .loss_type(LossType::Grpo)
             .scale_rewards(ScaleRewards::None)
+            .reward_group_scope(RewardGroupScope::Local)
             .grad_accum_steps(4)
             .checkpoint_every(Some(50))
             .candidate_log_top_k(2)
@@ -2933,6 +3054,7 @@ mod tests {
             tis_imp_ratio_cap: 2.0,
             loss_type: LossType::Grpo,
             scale_rewards: ScaleRewards::None,
+            reward_group_scope: RewardGroupScope::Local,
             grad_accum_steps: 4,
             checkpoint_every: Some(50),
             candidate_log_top_k: 2,
@@ -3946,6 +4068,7 @@ mod tests {
         let cfg: TrainerConfig = serde_json::from_str(OLD_CONFIG_JSON).unwrap();
         assert_eq!(cfg.grad_accum_steps, 1);
         assert_eq!(cfg.candidate_log_top_k, 0);
+        assert_eq!(cfg.reward_group_scope, RewardGroupScope::Local);
         // The EOS field also predates the JSON above; serde fills it from the default.
         assert_eq!(cfg.eos_token_id, None);
         assert!(cfg.validate().is_ok());
@@ -3972,6 +4095,105 @@ mod tests {
             (None, Some(1.0), true)
         );
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn distributed_reward_group_scope_rejects_multi_prompt_accumulation() {
+        let cfg = TrainerConfig {
+            reward_group_scope: RewardGroupScope::DistributedSamePrompt,
+            grad_accum_steps: 2,
+            ..TrainerConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("distributed_same_prompt"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn distributed_reward_group_stats_match_local_for_one_rank() {
+        let rewards = [1.0, f64::NAN, 3.0];
+        let local = group_advantages(&rewards, ScaleRewards::Group);
+        let via_stats = advantages_from_stats(
+            &rewards,
+            RewardStatsAcc::from_rewards(&rewards),
+            ScaleRewards::Group,
+        );
+        assert_eq!(via_stats.len(), local.len());
+        for (a, b) in via_stats.iter().zip(local.iter()) {
+            assert_relative_eq!(*a, *b, epsilon = 1e-12);
+        }
+    }
+
+    #[test]
+    fn distributed_reward_group_same_prompt_produces_cross_rank_advantages() {
+        std::thread::scope(|scope| {
+            let comms = crate::comm::LocalComm::world(2);
+            let handles: Vec<_> = comms
+                .into_iter()
+                .enumerate()
+                .map(|(rank, comm)| {
+                    scope.spawn(move || {
+                        let tmp = WireTmp::new(&format!("dist-adv-{rank}"));
+                        let run = RunDir::create(&tmp.0, format!("rank-{rank}")).unwrap();
+                        let cfg = TrainerConfig {
+                            reward_group_scope: RewardGroupScope::DistributedSamePrompt,
+                            scale_rewards: ScaleRewards::None,
+                            ..TrainerConfig::default()
+                        };
+                        let trainer = Trainer::with_comm(cfg, &run, comm).unwrap();
+                        let reward = if rank == 0 { 1.0 } else { 3.0 };
+                        trainer.reward_group_advantages(&[reward]).unwrap()
+                    })
+                })
+                .collect();
+            let mut got = Vec::new();
+            for h in handles {
+                got.push(h.join().unwrap());
+            }
+            assert_eq!(got[0], vec![-1.0]);
+            assert_eq!(got[1], vec![1.0]);
+        });
+    }
+
+    #[test]
+    fn distributed_reward_group_same_prompt_identical_rewards_stays_degenerate() {
+        std::thread::scope(|scope| {
+            let comms = crate::comm::LocalComm::world(2);
+            let handles: Vec<_> = comms
+                .into_iter()
+                .enumerate()
+                .map(|(rank, comm)| {
+                    scope.spawn(move || {
+                        let tmp = WireTmp::new(&format!("dist-degen-{rank}"));
+                        let run = RunDir::create(&tmp.0, format!("rank-{rank}")).unwrap();
+                        let cfg = TrainerConfig {
+                            reward_group_scope: RewardGroupScope::DistributedSamePrompt,
+                            scale_rewards: ScaleRewards::Group,
+                            ..TrainerConfig::default()
+                        };
+                        let trainer = Trainer::with_comm(cfg, &run, comm).unwrap();
+                        trainer.reward_group_advantages(&[2.0]).unwrap()
+                    })
+                })
+                .collect();
+            for h in handles {
+                assert_eq!(h.join().unwrap(), vec![0.0]);
+            }
+        });
+    }
+
+    #[test]
+    fn local_group_one_remains_degenerate_without_distributed_scope() {
+        let tmp = WireTmp::new("local-g1");
+        let run = RunDir::create(&tmp.0, "local").unwrap();
+        let cfg = TrainerConfig {
+            reward_group_scope: RewardGroupScope::Local,
+            ..TrainerConfig::default()
+        };
+        let trainer = Trainer::new(cfg, &run).unwrap();
+        assert_eq!(trainer.reward_group_advantages(&[3.0]).unwrap(), vec![0.0]);
     }
 
     #[test]
