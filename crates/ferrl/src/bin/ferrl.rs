@@ -373,6 +373,37 @@ struct BaselineCfg {
     gpu: String,
 }
 
+/// The prompt envelope used for the single TriMul discovery prompt.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TrimulPromptFormat {
+    /// ferrl's original raw instruction prompt.
+    #[default]
+    Raw,
+    /// Qwen3.5's native chat template, with thinking generation enabled.
+    Qwen3_5ChatThinking,
+}
+
+impl TrimulPromptFormat {
+    /// Build the configured TriMul prompt.
+    fn build_prompt(self, task_prompt: &str) -> String {
+        match self {
+            Self::Raw => ferrl::trimul::build_raw_prompt(task_prompt),
+            Self::Qwen3_5ChatThinking => {
+                ferrl::trimul::build_qwen3_5_chat_thinking_prompt(task_prompt)
+            }
+        }
+    }
+
+    /// The extraction contract paired with this prompt format.
+    fn submission_extract_mode(self) -> ferrl::trimul::SubmissionExtractMode {
+        match self {
+            Self::Raw => ferrl::trimul::SubmissionExtractMode::FinalFence,
+            Self::Qwen3_5ChatThinking => ferrl::trimul::SubmissionExtractMode::ThinkingAfterThink,
+        }
+    }
+}
+
 /// TriMul task knobs (read only when `task == "trimul"`): the sandboxed eval image and
 /// the pinned GPU Mode bundle, bounded scratch, the held-out secret seed, the
 /// per-candidate wall budget, and the optional baseline pin. The concrete case list is
@@ -380,6 +411,12 @@ struct BaselineCfg {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct TrimulCfg {
+    /// Prompt wrapper for the single TriMul instruction.
+    prompt_format: TrimulPromptFormat,
+    /// Optional UTF-8 text appended to the TriMul instruction before chat wrapping.
+    /// This lets private runs provide a complete reference/baseline example without
+    /// vendoring third-party task materials into ferrl.
+    prompt_suffix_path: Option<PathBuf>,
     /// The eval image — the pinned PyTorch+Triton `.sif`.
     image: PathBuf,
     /// The pinned GPU Mode eval bundle (`eval.py`/`reference.py`/`task.py`/`utils.py` +
@@ -498,15 +535,27 @@ impl RunConfig {
     /// cycles prompts mod the train length, so a one-prompt train set *is* the
     /// single-task regime. `eval` (held-out) runs the same prompt through the reward, so a
     /// non-zero `data.eval_n` gives an adapter-vs-base reward comparison.
-    fn trimul_splits(&self) -> Splits<()> {
-        let prompt = ferrl::trimul::build_prompt();
+    fn trimul_splits(&self) -> Result<Splits<()>, CliError> {
+        let mut task_prompt = ferrl::trimul::build_prompt();
+        if let Some(path) = &self.trimul.prompt_suffix_path {
+            let suffix = std::fs::read_to_string(path).map_err(|source| CliError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            if !suffix.trim().is_empty() {
+                task_prompt.push_str("\n\n");
+                task_prompt.push_str(suffix.trim());
+                task_prompt.push('\n');
+            }
+        }
+        let prompt = self.trimul.prompt_format.build_prompt(&task_prompt);
         let train = std::iter::repeat_with(|| Sample::new(prompt.clone(), ()))
             .take(self.data.train_n.max(1))
             .collect();
         let eval = std::iter::repeat_with(|| Sample::new(prompt.clone(), ()))
             .take(self.data.eval_n)
             .collect();
-        (train, eval)
+        Ok((train, eval))
     }
 
     /// Build the TriMul reward *without* a baseline: load the case list from
@@ -520,7 +569,8 @@ impl RunConfig {
         let mut reward = TrimulReward::new(&t.image, &t.eval_dir, &t.scratch_root)
             .with_cases(tests, benches)
             .with_secret_seed(t.secret_seed)
-            .with_wall(wall);
+            .with_wall(wall)
+            .with_submission_extract_mode(t.prompt_format.submission_extract_mode());
         if t.scratch_max_bytes != 0 {
             reward = reward.with_scratch_max_bytes(t.scratch_max_bytes);
         }
@@ -557,7 +607,7 @@ fn train(args: &TrainArgs) -> Result<(), CliError> {
             run_training(&cfg, &device, &MathReward::default(), &train, &eval)
         }
         "trimul" => {
-            let (train, eval) = cfg.trimul_splits();
+            let (train, eval) = cfg.trimul_splits()?;
             let reward = cfg.build_trimul_reward()?;
             run_training(&cfg, &device, &reward, &train, &eval)
         }
@@ -912,11 +962,11 @@ fn trimul_artifact(args: &TrimulArtifactArgs) -> Result<(), CliError> {
             args.completion.display()
         ))
     })?;
-    let submission = ferrl::trimul::extract_submission(&completion).ok_or_else(|| {
+    let mut reward = cfg.build_trimul_reward_base()?;
+    let submission = reward.extract_submission(&completion).ok_or_else(|| {
         CliError::msg("completion does not contain a closed non-empty fenced code block")
     })?;
 
-    let mut reward = cfg.build_trimul_reward_base()?;
     reward = reward
         .with_secret_seed(args.audit_secret_seed)
         .with_baseline_ns(baseline_median);
@@ -1687,7 +1737,7 @@ mod tests {
         let b = cfg.trimul.baseline.as_ref().expect("baseline present");
         assert_eq!((b.ns, b.gpu.as_str()), (5_200_000.0, "H100"));
         // The single-prompt splits honour train_n / eval_n without deduping to one row.
-        let (train, eval) = cfg.trimul_splits();
+        let (train, eval) = cfg.trimul_splits().unwrap();
         assert_eq!((train.len(), eval.len()), (8, 2));
         assert!(train[0].prompt.contains("custom_kernel"));
     }
