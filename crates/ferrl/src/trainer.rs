@@ -285,10 +285,11 @@ pub struct TrainerConfig {
     /// How to scale group-centered rewards into advantages.
     pub scale_rewards: ScaleRewards,
     /// Where reward-normalization groups are formed. Defaults to local GRPO
-    /// behavior for old configs and single-rank runs. The distributed option is
-    /// valid only when every rank is sampling the same prompt/reward group; it is
-    /// rejected for multi-prompt accumulation until group-key-aware aggregation is
-    /// implemented.
+    /// behavior for old configs and single-rank runs. The distributed option
+    /// samples the same logical prompt at each accumulation position across ranks,
+    /// while keeping rollout rows rank-sharded so ranks draw distinct completions.
+    /// Lockstep multi-prompt accumulation is allowed; arbitrary packed or
+    /// non-lockstep distributed batches still need group-key-aware aggregation.
     #[serde(default)]
     pub reward_group_scope: RewardGroupScope,
     /// Number of prompts whose gradients are accumulated into a single optimizer
