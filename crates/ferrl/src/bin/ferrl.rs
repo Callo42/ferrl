@@ -220,6 +220,9 @@ enum CliError {
     /// A run-directory / metrics IO error.
     #[error(transparent)]
     Telemetry(#[from] ferrl::telemetry::TelemetryError),
+    /// A data-parallel collective or launch-configuration error.
+    #[error(transparent)]
+    Comm(#[from] ferrl::CommError),
     /// A CUDA device error (only on a `--features cuda` build).
     #[cfg(feature = "cuda")]
     #[error("{0}")]
@@ -234,7 +237,7 @@ impl CliError {
 }
 
 /// Which device to run on.
-#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum DeviceSel {
     /// The CPU (the default; the only device a `--features cuda`-less build supports).
@@ -436,6 +439,17 @@ struct TrimulCfg {
     baseline: Option<BaselineCfg>,
 }
 
+/// Data-parallel launch knobs for `ferrl train`.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct DistributedCfg {
+    /// When true, run this process as one rank of a Slurm/NCCL data-parallel
+    /// world. Requires `--features nccl`, `device = "cuda"`, and the Slurm
+    /// variables plus `FERRL_NCCL_RENDEZVOUS` expected by `NcclConfig`.
+    /// Run directories are rank-suffixed to keep per-rank telemetry separate.
+    enabled: bool,
+}
+
 /// A `ferrl train` run, deserialized from JSON.
 ///
 /// The wire shape is a flat object: a `task` selector, the `model_dir` checkpoint,
@@ -460,6 +474,9 @@ struct RunConfig {
     /// Dataset knobs.
     #[serde(default)]
     data: DataCfg,
+    /// Data-parallel launch knobs.
+    #[serde(default)]
+    distributed: DistributedCfg,
     /// TriMul task knobs (only read when `task == "trimul"`).
     #[serde(default)]
     trimul: TrimulCfg,
@@ -473,6 +490,19 @@ fn default_out_dir() -> PathBuf {
 }
 
 impl RunConfig {
+    fn open_device(&self) -> Result<Device, CliError> {
+        if self.distributed.enabled {
+            if self.device != DeviceSel::Cuda {
+                return Err(CliError::msg(
+                    "distributed.enabled requires device = \"cuda\"",
+                ));
+            }
+            open_distributed_device()
+        } else {
+            self.device.open()
+        }
+    }
+
     /// Read and parse a run config from `path`.
     fn load(path: &Path) -> Result<Self, CliError> {
         let bytes = std::fs::read(path).map_err(|source| CliError::Io {
@@ -497,12 +527,18 @@ impl RunConfig {
         }
     }
 
-    /// A unique run id for this invocation: `<task>-<unix-seconds>`.
+    /// A unique run id for this invocation: `<task>-<unix-seconds>` plus rank suffix under DP.
     fn run_id(&self) -> String {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
-        format!("{}-{stamp}", self.task)
+        let base = format!("{}-{stamp}", self.task);
+        if self.distributed.enabled {
+            let rank = std::env::var("SLURM_PROCID").unwrap_or_else(|_| "unknown".to_owned());
+            format!("{base}-rank{rank}")
+        } else {
+            base
+        }
     }
 
     /// Build the Countdown train/eval splits: generate `train_n + eval_n` problems
@@ -596,7 +632,7 @@ impl RunConfig {
 fn train(args: &TrainArgs) -> Result<(), CliError> {
     let _ = ferrl::init_tracing();
     let cfg = RunConfig::load(&args.config)?;
-    let device = cfg.device.open()?;
+    let device = cfg.open_device()?;
     match cfg.task.as_str() {
         "countdown" => {
             let (train, eval) = cfg.countdown_splits();
@@ -641,7 +677,7 @@ fn run_training<R: RewardFn>(
     );
 
     let run = RunDir::create(&cfg.out_dir, cfg.run_id())?;
-    let mut trainer = Trainer::new(tcfg, &run)?;
+    let mut trainer = open_trainer(tcfg, &run, cfg.distributed.enabled)?;
     let (history, _stop) = trainer.train(&mut policy, reward, &tok, train)?;
     if let Some(summary) = summarize(&history) {
         info!(steps = summary.steps, "ferrl train: complete");
@@ -663,6 +699,52 @@ fn run_training<R: RewardFn>(
         run.root().display()
     );
     Ok(())
+}
+
+fn open_trainer(
+    config: TrainerConfig,
+    run: &RunDir,
+    distributed: bool,
+) -> Result<Trainer, CliError> {
+    if distributed {
+        open_distributed_trainer(config, run)
+    } else {
+        Ok(Trainer::new(config, run)?)
+    }
+}
+
+#[cfg(feature = "nccl")]
+fn open_distributed_device() -> Result<Device, CliError> {
+    let nccl = ferrl::NcclConfig::from_env()?;
+    let device = Device::new_cuda(nccl.local_rank())?;
+    if let Some(w) = ferrl::check_driver_compat(&device).warning() {
+        tracing::warn!("{w}");
+    }
+    ferrl::guard_first_kernel(&device)?;
+    Ok(device)
+}
+
+#[cfg(not(feature = "nccl"))]
+fn open_distributed_device() -> Result<Device, CliError> {
+    Err(CliError::msg(
+        "distributed.enabled requires building ferrl with --features nccl",
+    ))
+}
+
+#[cfg(feature = "nccl")]
+fn open_distributed_trainer(config: TrainerConfig, run: &RunDir) -> Result<Trainer, CliError> {
+    Ok(Trainer::with_comm(
+        config,
+        run,
+        ferrl::NcclComm::from_slurm_env()?,
+    )?)
+}
+
+#[cfg(not(feature = "nccl"))]
+fn open_distributed_trainer(_config: TrainerConfig, _run: &RunDir) -> Result<Trainer, CliError> {
+    Err(CliError::msg(
+        "distributed.enabled requires building ferrl with --features nccl",
+    ))
 }
 
 /// This node's first GPU product name, read from `nvidia-smi`, or `None` if it cannot
