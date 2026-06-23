@@ -388,10 +388,18 @@ impl TrimulPromptFormat {
     /// Build the configured TriMul prompt.
     fn build_prompt(self, task_prompt: &str) -> String {
         match self {
-            Self::Raw => task_prompt.to_string(),
+            Self::Raw => ferrl::trimul::build_raw_prompt(task_prompt),
             Self::Qwen3_5ChatThinking => {
                 ferrl::trimul::build_qwen3_5_chat_thinking_prompt(task_prompt)
             }
+        }
+    }
+
+    /// The extraction contract paired with this prompt format.
+    fn submission_extract_mode(self) -> ferrl::trimul::SubmissionExtractMode {
+        match self {
+            Self::Raw => ferrl::trimul::SubmissionExtractMode::FinalFence,
+            Self::Qwen3_5ChatThinking => ferrl::trimul::SubmissionExtractMode::ThinkingAfterThink,
         }
     }
 }
@@ -561,7 +569,8 @@ impl RunConfig {
         let mut reward = TrimulReward::new(&t.image, &t.eval_dir, &t.scratch_root)
             .with_cases(tests, benches)
             .with_secret_seed(t.secret_seed)
-            .with_wall(wall);
+            .with_wall(wall)
+            .with_submission_extract_mode(t.prompt_format.submission_extract_mode());
         if t.scratch_max_bytes != 0 {
             reward = reward.with_scratch_max_bytes(t.scratch_max_bytes);
         }
@@ -953,11 +962,11 @@ fn trimul_artifact(args: &TrimulArtifactArgs) -> Result<(), CliError> {
             args.completion.display()
         ))
     })?;
-    let submission = ferrl::trimul::extract_submission(&completion).ok_or_else(|| {
+    let mut reward = cfg.build_trimul_reward_base()?;
+    let submission = reward.extract_submission(&completion).ok_or_else(|| {
         CliError::msg("completion does not contain a closed non-empty fenced code block")
     })?;
 
-    let mut reward = cfg.build_trimul_reward_base()?;
     reward = reward
         .with_secret_seed(args.audit_secret_seed)
         .with_baseline_ns(baseline_median);

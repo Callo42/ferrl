@@ -8,8 +8,9 @@
 //!
 //! ## Flow (per candidate)
 //!
-//! 1. Extract the `custom_kernel` source from the completion (the final fenced
-//!    Python code block, after `</think>` when present) — [`extract_submission`].
+//! 1. Extract the `custom_kernel` source from the completion according to the
+//!    configured [`SubmissionExtractMode`] — the final fenced Python code block, or
+//!    for thinking prompts, the final fenced block after `</think>`.
 //! 2. Stage a node-local scratch dir: the candidate as `submission.py`, plus a
 //!    generated test-spec and benchmark-spec file ([`render_spec`]).
 //! 3. Run the eval in the sandbox ([`crate::sandbox::ApptainerSandbox`]): the pinned
@@ -138,19 +139,44 @@ pub fn render_spec(cases: &[TrimulCase]) -> String {
         .join("\n")
 }
 
+/// Which completion region is eligible for TriMul submission extraction.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum SubmissionExtractMode {
+    /// Extract the final fenced code block from the whole completion.
+    FinalFence,
+    /// Require a closing `</think>` marker, then extract from the final-answer region.
+    ThinkingAfterThink,
+}
+
 /// Extract the candidate `custom_kernel` source from a completion.
 ///
-/// For Qwen thinking completions, everything through the final `</think>` marker is
-/// ignored and the answer is read from the final-answer region. For non-thinking and
-/// raw completions, the whole completion is the answer region. The extracted candidate
-/// is the body of the final fenced code block in that region, and the block must be the
-/// last non-whitespace content in the region. Returns `None` if there is no closed,
-/// final, non-empty block.
+/// This is the raw/non-thinking extractor: the whole completion is the answer region.
+/// The extracted candidate is the body of the final fenced code block in that region,
+/// and the block must be the last non-whitespace content in the region. Returns
+/// `None` if there is no closed, final, non-empty block.
 #[must_use]
 pub fn extract_submission(completion: &str) -> Option<String> {
-    let answer = completion
-        .rsplit_once("</think>")
-        .map_or(completion, |(_, after)| after);
+    extract_submission_with_mode(completion, SubmissionExtractMode::FinalFence)
+}
+
+/// Extract a candidate according to the configured prompt/extraction contract.
+///
+/// `ThinkingAfterThink` fails closed when the completion never exits the thinking
+/// region with `</think>`.
+#[must_use]
+pub fn extract_submission_with_mode(
+    completion: &str,
+    mode: SubmissionExtractMode,
+) -> Option<String> {
+    let answer = match mode {
+        SubmissionExtractMode::FinalFence => completion,
+        SubmissionExtractMode::ThinkingAfterThink => completion.rsplit_once("</think>")?.1,
+    };
+    extract_final_fenced_block(answer)
+}
+
+/// Extract the final closed fenced block from `answer`.
+fn extract_final_fenced_block(answer: &str) -> Option<String> {
     let close = answer.rfind("```")?;
     let trailing = &answer[close + 3..];
     if !trailing.trim().is_empty() {
@@ -423,6 +449,20 @@ pub fn build_prompt() -> String {
         .to_string()
 }
 
+/// Build ferrl's raw prompt: task description plus the extraction/output contract.
+#[must_use]
+pub fn build_raw_prompt(task: &str) -> String {
+    format!(
+        "{}\n\n{}",
+        task.trim(),
+        "Output contract:\n\
+         - Output exactly one closed fenced Python code block.\n\
+         - The code block must contain only the complete custom_kernel(data) implementation.\n\
+         - Do not include prose, comments, docstrings, or Markdown outside the code block.\n\
+         - Stop after the closing code fence."
+    )
+}
+
 fn qwen3_5_thinking_system_prompt() -> &'static str {
     "You generate Python code for a strict evaluator.\n\
      Output contract:\n\
@@ -479,6 +519,8 @@ pub struct TrimulReward {
     /// grade — the candidate scores zero. Defence-in-depth against absurd reward
     /// gaming, on top of the off-filesystem grade channel.
     min_plausible_ns: f64,
+    /// Which completion region may contain the final submitted code block.
+    submission_extract_mode: SubmissionExtractMode,
     /// The sandbox backend.
     sandbox: ApptainerSandbox,
 }
@@ -526,6 +568,7 @@ impl TrimulReward {
             baseline_ns: None,
             wall: Duration::from_secs(600),
             min_plausible_ns: 1_000.0,
+            submission_extract_mode: SubmissionExtractMode::FinalFence,
             sandbox: ApptainerSandbox::default(),
         }
     }
@@ -578,6 +621,13 @@ impl TrimulReward {
         self
     }
 
+    /// Set the completion extraction contract.
+    #[must_use]
+    pub fn with_submission_extract_mode(mut self, mode: SubmissionExtractMode) -> Self {
+        self.submission_extract_mode = mode;
+        self
+    }
+
     /// The geometric mean of the benchmark `means`, or `None` if any is implausibly
     /// fast (below the configured floor) — a measurement glitch or a forged grade, which
     /// must not earn a reward.
@@ -617,6 +667,12 @@ impl TrimulReward {
     /// sandbox launch/supervision failure).
     pub fn verify_submission(&self, submission: &str) -> Result<TrimulVerification, RewardError> {
         self.run_eval(submission)
+    }
+
+    /// Extract a completion using this reward's configured prompt/extraction contract.
+    #[must_use]
+    pub fn extract_submission(&self, completion: &str) -> Option<String> {
+        extract_submission_with_mode(completion, self.submission_extract_mode)
     }
 
     /// Resource ceilings for one eval. `address_space` is left unset — a CUDA process
@@ -792,7 +848,7 @@ impl RewardFn for TrimulReward {
     type Target = ();
 
     fn reward(&self, _sample: &Sample<()>, completion: &str) -> Result<f32, RewardError> {
-        match extract_submission(completion) {
+        match self.extract_submission(completion) {
             Some(code) => {
                 let outcome = self.run_eval(&code)?;
                 Ok(self.reward_value(outcome.correct, outcome.geomean_ns))
@@ -864,6 +920,21 @@ mod tests {
     #[test]
     fn extract_submission_ignores_thinking_and_uses_final_answer_region() {
         let completion = "reasoning:\n```python\nx = 1\n```\n</think>\n\n```python\ndef custom_kernel(data):\n    return data\n```\n";
+        assert_eq!(
+            extract_submission_with_mode(completion, SubmissionExtractMode::ThinkingAfterThink)
+                .as_deref(),
+            Some("def custom_kernel(data):\n    return data")
+        );
+    }
+
+    #[test]
+    fn extract_submission_thinking_mode_requires_think_close() {
+        let completion =
+            "reasoning only:\n```python\ndef custom_kernel(data):\n    return data\n```\n";
+        assert_eq!(
+            extract_submission_with_mode(completion, SubmissionExtractMode::ThinkingAfterThink),
+            None
+        );
         assert_eq!(
             extract_submission(completion).as_deref(),
             Some("def custom_kernel(data):\n    return data")
@@ -1134,6 +1205,15 @@ benchmarks:
         assert!(p.contains("does not contain `norm.bias`"));
         assert!(!p.contains("AlphaFold"));
         assert!(!p.contains("```python"));
+    }
+
+    #[test]
+    fn build_raw_prompt_restores_the_output_contract() {
+        let p = build_raw_prompt(&build_prompt());
+        assert!(p.contains("Output contract:"));
+        assert!(p.contains("closed fenced Python code block"));
+        assert!(p.contains("complete custom_kernel(data) implementation"));
+        assert!(p.contains("Stop after the closing code fence."));
     }
 
     #[test]
