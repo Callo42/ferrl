@@ -436,6 +436,7 @@ pub fn build_prompt() -> String {
      \n\
      Allowed weight keys:\n\
      \x20 - norm.weight\n\
+     \x20 - norm.bias\n\
      \x20 - left_proj.weight\n\
      \x20 - right_proj.weight\n\
      \x20 - left_gate.weight\n\
@@ -444,9 +445,8 @@ pub fn build_prompt() -> String {
      \x20 - to_out_norm.weight\n\
      \x20 - to_out_norm.bias\n\
      \x20 - to_out.weight\n\
-     \n\
-     Important: `weights` does not contain `norm.bias`.\n"
-        .to_string()
+     \n"
+    .to_string()
 }
 
 /// Build ferrl's raw prompt: task description plus the extraction/output contract.
@@ -1200,9 +1200,10 @@ benchmarks:
     #[test]
     fn build_prompt_lists_weight_constraints_without_domain_framing() {
         let p = build_prompt();
-        assert!(p.contains("norm.weight"));
-        assert!(p.contains("to_out.weight"));
-        assert!(p.contains("does not contain `norm.bias`"));
+        assert!(p.contains(" - norm.weight\n"));
+        assert!(p.contains(" - norm.bias\n"));
+        assert!(p.contains(" - to_out.weight\n"));
+        assert!(!p.contains("does not contain `norm.bias`"));
         assert!(!p.contains("AlphaFold"));
         assert!(!p.contains("```python"));
     }
@@ -1240,6 +1241,7 @@ benchmarks:
         assert!(p.contains("After finishing the reasoning, close </think>."));
         assert!(p.contains("Immediately after </think>"));
         assert!(p.contains("Stop after the closing code fence."));
-        assert!(p.contains("Important: `weights` does not contain `norm.bias`."));
+        assert!(p.contains(" - norm.bias\n"));
+        assert!(!p.contains("does not contain `norm.bias`"));
     }
 }
