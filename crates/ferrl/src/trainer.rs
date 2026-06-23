@@ -129,11 +129,12 @@ pub trait TokenizerLike {
 ///
 /// `Local` is the classic GRPO behavior: each rank samples and normalizes a full
 /// group independently. `DistributedSamePrompt` is the memory-saving distributed
-/// mode: every rank's local completions are assumed to be shards of the same
-/// prompt's reward group, so the trainer all-reduces the group's finite reward
-/// statistics before computing advantages. It is intentionally narrow; future
-/// multi-prompt distributed batches need explicit group-key-aware aggregation,
-/// not silent mixing across unrelated prompts or tasks.
+/// mode: for each accumulation position, every rank samples the same prompt with
+/// rank-distinct rollout RNG row bases, then all-reduces the group's finite
+/// reward statistics before computing advantages. This is a lockstep
+/// same-position grouping contract; future non-lockstep or packed distributed
+/// batches need explicit group-key-aware aggregation, not silent mixing across
+/// unrelated prompts or tasks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RewardGroupScope {
@@ -728,11 +729,6 @@ impl TrainerConfig {
             "tis is a token-level correction and cannot combine with sequence-level \
              importance sampling (GSPO) — pick one",
         )?;
-        require(
-            self.reward_group_scope == RewardGroupScope::Local || self.grad_accum_steps == 1,
-            "reward_group_scope = distributed_same_prompt requires grad_accum_steps = 1 until \
-             group-key-aware distributed aggregation exists",
-        )?;
         Ok(())
     }
 
@@ -838,6 +834,12 @@ struct RewardStatsAcc {
     count: f64,
     sum: f64,
     sumsq: f64,
+}
+
+struct PromptSelection {
+    sample_idx: usize,
+    prompt_index: u64,
+    rollout_global_row_base: u64,
 }
 
 /// Per-prompt quantities aggregated into a window's [`Metrics`] (the reward
@@ -954,18 +956,23 @@ impl Trainer {
     /// weights** (same checkpoint or same seed); each rank owns its **own**
     /// `run` directory (the config and metrics writes would otherwise
     /// collide). `config.grad_accum_steps` is the **per-rank** accumulation
-    /// count: window `step` consumes the `grad_accum_steps × world_size`
-    /// prompts starting at `step × grad_accum_steps × world_size` (mod len),
-    /// rank `r` taking the `r`-th contiguous slice — the union across ranks
-    /// is exactly the window a single-rank run with the global accumulation
-    /// count would consume.
+    /// count. With [`RewardGroupScope::Local`], window `step` consumes the
+    /// `grad_accum_steps × world_size` prompts starting at
+    /// `step × grad_accum_steps × world_size` (mod len), rank `r` taking the
+    /// `r`-th contiguous slice — the union across ranks is exactly the window a
+    /// single-rank run with the global accumulation count would consume. With
+    /// [`RewardGroupScope::DistributedSamePrompt`], each accumulation position
+    /// selects one prompt shared by every rank, while each rank still gets a
+    /// distinct rollout RNG row range for its local completions.
     ///
     /// Per-rank weights stay in bitwise lockstep (same start + all-reduced
     /// gradients + same optimizer arithmetic). Metrics: `kl`, `clip_ratio`
     /// and `grad_norm` are **global** (reduced); everything else —
     /// reward/length statistics, `frac_reward_zero_std`, `dropped_rows`,
     /// `frac_truncated`, and the `rollout_*` off-policy telemetry — describes
-    /// the rank's **local shard**. Checkpoints are written by rank 0 only —
+    /// the rank's **local shard**; under `DistributedSamePrompt`, those local
+    /// shards are completions for the same prompt. Checkpoints are written by
+    /// rank 0 only —
     /// to resume, every rank loads rank 0's checkpoint directory (weights and
     /// optimizer moments are rank-identical by lockstep; rank 0's rollout-sampler
     /// RNG blob is now SUFFICIENT for a bit-exact stochastic resume. Under
@@ -1486,28 +1493,15 @@ impl Trainer {
         let mut stats = Vec::with_capacity(accum);
         let mut live = Vec::with_capacity(accum);
         for j in 0..accum {
-            // Continuous prompt cycling across windows: window `step` consumes the
-            // `accum × world` prompts starting at `step*accum*world` (mod len),
-            // rank `r` taking the contiguous slice at offset `r*accum` — so a
-            // resume at window `start_step` continues the order an uninterrupted
-            // run would have seen, and the union of the ranks' shards is exactly
-            // the window a single-rank run at the global accumulation count
-            // consumes (the DP sharding contract the equivalence oracle pins).
-            // At world 1 this is the legacy `step*accum + j`.
-            // The prompt's GLOBAL ordinal in the flattened rollout stream — the same
-            // for a given (step, window position) regardless of world size / rank, so
-            // seeding the rollout by it (in `collect_sample`) makes a world-W run
-            // reproduce the single-process draws. `idx` (mod len) selects which sample;
-            // `g` (unbounded) seeds it, so re-cycling the dataset across windows still
-            // gives fresh per-window rollout RNG.
-            let local = self.comm.rank() * accum + j;
-            // `g` (u64, the seed base) and `idx` (usize) use the same plain
-            // arithmetic; for any real run neither overflows, so they stay
-            // consistent by construction.
-            let g = step * (accum * world) as u64 + local as u64;
-            let idx = (step as usize * (accum * world) + local) % samples.len();
-            let (stat, item) =
-                self.collect_sample(step, policy, reward_fn, tokenizer, &samples[idx], g)?;
+            let sel = self.select_prompt(step, j, samples.len());
+            let (stat, item) = self.collect_sample(
+                step,
+                policy,
+                reward_fn,
+                tokenizer,
+                &samples[sel.sample_idx],
+                &sel,
+            )?;
             stats.push(stat);
             if let Some(item) = item {
                 live.push(item);
@@ -1549,6 +1543,43 @@ impl Trainer {
             self.build_window_metrics(step, &stats, &agg, opt),
             local_tokens,
         ))
+    }
+
+    fn select_prompt(&self, step: u64, j: usize, samples_len: usize) -> PromptSelection {
+        let accum = self.config.grad_accum_steps;
+        let world = self.comm.world_size();
+        let rank = self.comm.rank();
+        match self.config.reward_group_scope {
+            RewardGroupScope::Local => {
+                // Continuous prompt cycling across windows: window `step` consumes
+                // the `accum × world` prompts starting at `step*accum*world` (mod
+                // len), rank `r` taking the contiguous slice at offset `r*accum`.
+                // At world 1 this is the legacy `step*accum + j`.
+                let local = rank * accum + j;
+                let prompt_index = step * (accum * world) as u64 + local as u64;
+                PromptSelection {
+                    sample_idx: (step as usize * (accum * world) + local) % samples_len,
+                    prompt_index,
+                    rollout_global_row_base: prompt_index
+                        .wrapping_mul(self.config.group_size as u64),
+                }
+            }
+            RewardGroupScope::DistributedSamePrompt => {
+                // Lockstep same-group mode: every rank's accumulation position `j`
+                // selects the same logical prompt, so the all-reduced reward stats
+                // normalize shards of one group. The rollout row base still includes
+                // rank/world so ranks sample distinct completions rather than clones.
+                let prompt_index = step * accum as u64 + j as u64;
+                let local = rank * accum + j;
+                let shard_index = step * (accum * world) as u64 + local as u64;
+                PromptSelection {
+                    sample_idx: (step as usize * accum + j) % samples_len,
+                    prompt_index,
+                    rollout_global_row_base: shard_index
+                        .wrapping_mul(self.config.group_size as u64),
+                }
+            }
+        }
     }
 
     /// Persist this prompt group's top-K decoded completions when the candidate
@@ -1704,7 +1735,7 @@ impl Trainer {
         reward_fn: &R,
         tokenizer: &dyn TokenizerLike,
         sample: &Sample<R::Target>,
-        global_prompt_index: u64,
+        selection: &PromptSelection,
     ) -> Result<(PromptStat, Option<LiveItem>), TrainerError> {
         // Rollout with the adapter on, then score it.
         policy.set_adapter_enabled(true);
@@ -1723,12 +1754,9 @@ impl Trainer {
         // Derive the rollout config from the trainer config (single source of truth;
         // see `impl From<&TrainerConfig> for GenConfig`) so the two cannot drift.
         let gen = GenConfig::from(&self.config);
-        // Seed the rollout's per-row substreams from this prompt's GLOBAL row base
-        // (its ordinal in the flattened world-global stream × group_size), so the
-        // sampled tokens are invariant to the data-parallel shard layout and a resume
-        // re-derives them — see `Policy::generate_at`.
-        let global_row_base = global_prompt_index.wrapping_mul(self.config.group_size as u64);
-        let rollout = policy.generate_at(&prompt_ids, &gen, global_row_base)?;
+        // See `select_prompt`: prompt selection and rollout RNG row ranges differ
+        // in distributed same-prompt mode.
+        let rollout = policy.generate_at(&prompt_ids, &gen, selection.rollout_global_row_base)?;
         // Validate the rollout BEFORE decoding/scoring it: completion_dims rejects
         // an empty, ragged, or shorter-than-prompt rollout (and a misaligned
         // behavior-log-prob capture), so the decode slice `ids[prompt_len..]`
@@ -1764,7 +1792,13 @@ impl Trainer {
                 rollout.len()
             )));
         }
-        self.write_candidate_records(step, global_prompt_index, &completions, &rewards, &rollout)?;
+        self.write_candidate_records(
+            step,
+            selection.prompt_index,
+            &completions,
+            &rewards,
+            &rollout,
+        )?;
 
         // Length-aware loss mask: column j of sequence i is a real completion token
         // (kept, 1.0) iff j < completion_lens[i]; the EOS padding at and beyond that
@@ -4098,17 +4132,13 @@ mod tests {
     }
 
     #[test]
-    fn distributed_reward_group_scope_rejects_multi_prompt_accumulation() {
+    fn distributed_reward_group_scope_allows_lockstep_multi_prompt_accumulation() {
         let cfg = TrainerConfig {
             reward_group_scope: RewardGroupScope::DistributedSamePrompt,
             grad_accum_steps: 2,
             ..TrainerConfig::default()
         };
-        let err = cfg.validate().unwrap_err();
-        assert!(
-            err.to_string().contains("distributed_same_prompt"),
-            "unexpected error: {err}"
-        );
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
@@ -4194,6 +4224,137 @@ mod tests {
         };
         let trainer = Trainer::new(cfg, &run).unwrap();
         assert_eq!(trainer.reward_group_advantages(&[3.0]).unwrap(), vec![0.0]);
+    }
+
+    struct PromptSelectionCodec;
+    impl TokenizerLike for PromptSelectionCodec {
+        fn encode(&self, _text: &str) -> Vec<u32> {
+            vec![1]
+        }
+        fn decode(&self, ids: &[u32]) -> String {
+            ids.iter().map(u32::to_string).collect::<Vec<_>>().join(",")
+        }
+    }
+
+    struct PromptSelectionPolicy {
+        logp: Var,
+    }
+    impl Policy for PromptSelectionPolicy {
+        fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
+            self.generate_at(prompt, cfg, 0)
+        }
+
+        fn generate_at(
+            &mut self,
+            _prompt: &[u32],
+            _cfg: &GenConfig,
+            global_row_base: u64,
+        ) -> CandleResult<Rollout> {
+            Ok(Rollout {
+                token_ids: vec![vec![1, 10 + global_row_base as u32]],
+                prompt_len: 1,
+                completion_lens: vec![1],
+                rollout_logprobs: None,
+            })
+        }
+
+        fn token_logprobs(&self, _rollout: &Rollout) -> CandleResult<Tensor> {
+            Ok(self.logp.as_tensor().clone())
+        }
+
+        fn set_adapter_enabled(&mut self, _enabled: bool) {}
+        fn adapter_enabled(&self) -> bool {
+            true
+        }
+        fn trainable_vars(&self) -> Vec<Var> {
+            vec![self.logp.clone()]
+        }
+        fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+            Ok(Vec::new())
+        }
+        fn restore_sampler_state(&mut self, _state: &[u8]) -> CandleResult<()> {
+            Ok(())
+        }
+    }
+
+    struct PromptSelectionReward {
+        rank: usize,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<(usize, String, String)>>>,
+    }
+    impl RewardFn for PromptSelectionReward {
+        type Target = ();
+
+        fn reward(&self, sample: &Sample<()>, completion: &str) -> Result<f32, RewardError> {
+            self.seen.lock().unwrap().push((
+                self.rank,
+                sample.prompt.clone(),
+                completion.to_owned(),
+            ));
+            Ok(1.0)
+        }
+    }
+
+    #[test]
+    fn distributed_same_prompt_train_selects_same_prompt_across_ranks() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let samples: Vec<_> = ["p0", "p1", "p2", "p3"]
+            .into_iter()
+            .map(|p| Sample::new(p, ()))
+            .collect();
+        std::thread::scope(|scope| {
+            let comms = crate::comm::LocalComm::world(2);
+            let handles: Vec<_> = comms
+                .into_iter()
+                .enumerate()
+                .map(|(rank, comm)| {
+                    let seen = std::sync::Arc::clone(&seen);
+                    let samples = samples.clone();
+                    scope.spawn(move || {
+                        let tmp = WireTmp::new(&format!("dist-select-{rank}"));
+                        let run = RunDir::create(&tmp.0, format!("rank-{rank}")).unwrap();
+                        let cfg = TrainerConfig {
+                            steps: 2,
+                            group_size: 1,
+                            grad_accum_steps: 2,
+                            max_new_tokens: 1,
+                            lr: 0.0,
+                            reward_group_scope: RewardGroupScope::DistributedSamePrompt,
+                            ..TrainerConfig::default()
+                        };
+                        let mut trainer = Trainer::with_comm(cfg, &run, comm).unwrap();
+                        let logp = Var::from_tensor(&mat(&[&[-1.0]])).unwrap();
+                        let mut policy = PromptSelectionPolicy { logp };
+                        trainer
+                            .train(
+                                &mut policy,
+                                &PromptSelectionReward { rank, seen },
+                                &PromptSelectionCodec,
+                                &samples,
+                            )
+                            .unwrap();
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+        });
+
+        let mut got = seen.lock().unwrap().clone();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                (0, "p0".to_string(), "10".to_string()),
+                (0, "p1".to_string(), "11".to_string()),
+                (0, "p2".to_string(), "14".to_string()),
+                (0, "p3".to_string(), "15".to_string()),
+                (1, "p0".to_string(), "12".to_string()),
+                (1, "p1".to_string(), "13".to_string()),
+                (1, "p2".to_string(), "16".to_string()),
+                (1, "p3".to_string(), "17".to_string()),
+            ]
+        );
     }
 
     #[test]
