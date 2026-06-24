@@ -84,7 +84,7 @@ use crate::gdn::{
     causal_depthwise_conv1d, gated_delta_rule_chunked, gated_delta_rule_recurrent, stable_softplus,
 };
 use crate::lora::Proj;
-use crate::model::{CachedDecoder, GradModel};
+use crate::model::{chunked_logprobs_from_logits, CachedDecoder, GradModel};
 use crate::nn::{RmsNormGated, RmsNormZeroCentered};
 use crate::remat::{stitched_backward, RematTape};
 
@@ -1996,6 +1996,54 @@ impl Qwen3_5GradModel {
         }
     }
 
+    /// Shared detached scoring tail: narrow the hidden states first, then run
+    /// final norm + head + F32 log-softmax/gather in position chunks. This
+    /// keeps old/ref value scoring from materializing a full
+    /// `[batch, window, vocab]` logits tensor.
+    fn norm_head_gather_logprobs(
+        &self,
+        h: &Tensor,
+        targets: &Tensor,
+        window: (usize, usize),
+        temperature: f64,
+        chunk: usize,
+    ) -> CandleResult<Tensor> {
+        let h = windowed(h, Some(window))?;
+        let (b, len, _hidden) = h.dims3()?;
+        let (tb, tw) = targets.dims2()?;
+        if tb != b || tw != len {
+            bail!(
+                "Qwen3_5GradModel::token_logprobs_narrowed: targets must be \
+                 [{b}, {len}], got {:?}",
+                targets.dims()
+            );
+        }
+        if len == 0 {
+            bail!("Qwen3_5GradModel::token_logprobs_narrowed: zero-length scoring window");
+        }
+
+        let chunk = chunk.max(1);
+        let mut parts = Vec::with_capacity(len.div_ceil(chunk));
+        let mut pos = 0;
+        while pos < len {
+            let n = chunk.min(len - pos);
+            let h = self.norm.forward(&h.narrow(1, pos, n)?)?;
+            let logits = match &self.lm_head {
+                Some(w) => frozen_linear(&h, w)?,
+                None => frozen_linear(&h, &self.embed)?,
+            };
+            let targets = targets.narrow(1, pos, n)?;
+            parts.push(chunked_logprobs_from_logits(
+                &logits,
+                &targets,
+                temperature,
+                n,
+            )?);
+            pos += n;
+        }
+        Tensor::cat(&parts, 1)
+    }
+
     /// The checkpointed forward — boundary [`Var`] per layer plus the tail;
     /// same scheme and contract as
     /// [`QwenGradModel`](crate::qwen::QwenGradModel)'s, including the
@@ -2057,6 +2105,53 @@ impl Qwen3_5GradModel {
         len: usize,
     ) -> CandleResult<Tensor> {
         self.forward_detached_window(input_ids, Some((start, len)))
+    }
+
+    /// Gather completion log-probabilities from a narrowed scoring window on
+    /// the live update path. This intentionally preserves the generic
+    /// full-window-logits backward route; update peak memory is controlled by
+    /// trainer row microbatching.
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if the window exceeds the sequence, `targets`
+    /// does not match `[batch, len]`, or any tensor op fails.
+    pub fn token_logprobs_narrowed(
+        &self,
+        input_ids: &Tensor,
+        targets: &Tensor,
+        start: usize,
+        len: usize,
+        temperature: f64,
+        chunk: usize,
+    ) -> CandleResult<Tensor> {
+        let logits = self.forward_narrowed(input_ids, start, len)?;
+        chunked_logprobs_from_logits(&logits, targets, temperature, chunk)
+    }
+
+    /// Detached/value-only variant of
+    /// [`token_logprobs_narrowed`](Self::token_logprobs_narrowed).
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if the window exceeds the sequence, `targets`
+    /// does not match `[batch, len]`, or any tensor op fails.
+    pub fn token_logprobs_detached_narrowed(
+        &self,
+        input_ids: &Tensor,
+        targets: &Tensor,
+        start: usize,
+        len: usize,
+        temperature: f64,
+        chunk: usize,
+    ) -> CandleResult<Tensor> {
+        let (mut h, mask) = self.embed_and_mask(input_ids)?;
+        for layer in &self.layers {
+            h = layer.forward(&h, mask.as_ref(), &self.rot)?.detach();
+        }
+        Ok(self
+            .norm_head_gather_logprobs(&h, targets, (start, len), temperature, chunk)?
+            .detach())
     }
 
     /// The shared detached walk behind
@@ -2225,6 +2320,46 @@ impl GradModel for Qwen3_5GradModel {
         len: usize,
     ) -> CandleResult<Tensor> {
         Qwen3_5GradModel::forward_detached_narrowed(self, input_ids, start, len)
+    }
+
+    fn token_logprobs_narrowed(
+        &self,
+        input_ids: &Tensor,
+        targets: &Tensor,
+        start: usize,
+        len: usize,
+        temperature: f64,
+        chunk: usize,
+    ) -> CandleResult<Tensor> {
+        Qwen3_5GradModel::token_logprobs_narrowed(
+            self,
+            input_ids,
+            targets,
+            start,
+            len,
+            temperature,
+            chunk,
+        )
+    }
+
+    fn token_logprobs_detached_narrowed(
+        &self,
+        input_ids: &Tensor,
+        targets: &Tensor,
+        start: usize,
+        len: usize,
+        temperature: f64,
+        chunk: usize,
+    ) -> CandleResult<Tensor> {
+        Qwen3_5GradModel::token_logprobs_detached_narrowed(
+            self,
+            input_ids,
+            targets,
+            start,
+            len,
+            temperature,
+            chunk,
+        )
     }
 
     fn backward(&self, loss: &Tensor) -> CandleResult<GradStore> {
@@ -4097,6 +4232,85 @@ mod tests {
 
         // The narrowed detached walk captures no tape.
         let _ = model.forward_detached_narrowed(&input, start, len).unwrap();
+        let scalar = Tensor::zeros((), DType::F32, &dev()).unwrap();
+        let err = model.backward(&scalar).unwrap_err();
+        assert!(err.to_string().contains("no checkpointed forward"));
+    }
+
+    /// Qwen3.5 token-logprob scoring must match the old full-window logits path
+    /// in values and trainable-var gradients. The checkpointed route must still
+    /// stitch through the live scoring path, and the detached route must not
+    /// capture a tape.
+    #[test]
+    fn token_logprobs_narrowed_matches_full_window_logits() {
+        let mut model = armed_model();
+        let input = ids(9);
+        let (start, len) = (3, 4);
+        let targets = Tensor::from_vec(vec![5u32, 11, 17, 23], (1, len), &dev()).unwrap();
+        let vars = model.trainable_vars();
+        let temperature = 1.3;
+
+        let full_logits = model
+            .forward(&input)
+            .unwrap()
+            .narrow(1, start, len)
+            .unwrap();
+        let full =
+            crate::model::chunked_logprobs_from_logits(&full_logits, &targets, temperature, len)
+                .unwrap();
+        let gathered = GradModel::token_logprobs_narrowed(
+            &model,
+            &input,
+            &targets,
+            start,
+            len,
+            temperature,
+            2,
+        )
+        .unwrap();
+        assert_eq!(full.dims(), gathered.dims());
+        assert_eq!(
+            max_abs_diff(&full, &gathered),
+            0.0,
+            "chunked gathered log-probs diverged"
+        );
+
+        let g_full = model.backward(&probe_loss(&full)).unwrap();
+        let g_gathered = model.backward(&probe_loss(&gathered)).unwrap();
+        assert_grads_match(&g_full, &g_gathered, &vars, 0.0);
+
+        model.set_activation_checkpointing(true);
+        let stitched = model
+            .backward(&probe_loss(
+                &GradModel::token_logprobs_narrowed(
+                    &model,
+                    &input,
+                    &targets,
+                    start,
+                    len,
+                    temperature,
+                    2,
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+        assert_grads_match(&g_gathered, &stitched, &vars, 1e-5);
+
+        let detached = GradModel::token_logprobs_detached_narrowed(
+            &model,
+            &input,
+            &targets,
+            start,
+            len,
+            temperature,
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            max_abs_diff(&full, &detached),
+            0.0,
+            "detached gathered log-probs diverged"
+        );
         let scalar = Tensor::zeros((), DType::F32, &dev()).unwrap();
         let err = model.backward(&scalar).unwrap_err();
         assert!(err.to_string().contains("no checkpointed forward"));

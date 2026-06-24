@@ -306,6 +306,14 @@ pub struct TrainerConfig {
     /// the `default_grad_accum_steps` fn so an older `config.json` still deserializes.
     #[serde(default = "default_grad_accum_steps")]
     pub grad_accum_steps: usize,
+    /// Optional microbatch size for the update backward within a single reward
+    /// group. `0` (the default) keeps the existing full-group backward. A
+    /// positive value splits a live group's rows into chunks of at most this
+    /// size, accumulates their trainable-var gradients, and then hands the same
+    /// logical group gradient to the outer prompt/window accumulator. This trades
+    /// extra forwards for a lower activation peak on long-completion runs.
+    #[serde(default)]
+    pub backward_microbatch_size: usize,
     /// If set, write an adapter checkpoint to `checkpoints/step-<n>/` (with a
     /// resumable manifest) every `checkpoint_every` completed steps **and** after
     /// the final step (so a completed run always persists its final adapter, even
@@ -401,6 +409,7 @@ impl Default for TrainerConfig {
             scale_rewards: ScaleRewards::Group,
             reward_group_scope: RewardGroupScope::Local,
             grad_accum_steps: 1,
+            backward_microbatch_size: 0,
             checkpoint_every: None,
             candidate_log_top_k: 0,
             gpu_memory_probe: false,
@@ -615,6 +624,13 @@ impl TrainerConfigBuilder {
         self
     }
 
+    /// Set [`TrainerConfig::backward_microbatch_size`].
+    #[must_use]
+    pub fn backward_microbatch_size(mut self, backward_microbatch_size: usize) -> Self {
+        self.cfg.backward_microbatch_size = backward_microbatch_size;
+        self
+    }
+
     /// Set [`TrainerConfig::checkpoint_every`].
     #[must_use]
     pub fn checkpoint_every(mut self, checkpoint_every: Option<u64>) -> Self {
@@ -826,6 +842,35 @@ struct LiveItem {
     logp_ref: Option<Tensor>,
     mask: Tensor,
     tis_w: Option<Tensor>,
+}
+
+fn slice_live_item(item: &LiveItem, start: usize, len: usize) -> CandleResult<LiveItem> {
+    let end = start + len;
+    let rollout = Rollout::new(
+        item.rollout.token_ids[start..end].to_vec(),
+        item.rollout.prompt_len,
+        item.rollout.completion_lens[start..end].to_vec(),
+        item.rollout
+            .rollout_logprobs
+            .as_ref()
+            .map(|rows| rows[start..end].to_vec()),
+    );
+    Ok(LiveItem {
+        rollout,
+        advantages: item.advantages.narrow(0, start, len)?,
+        logp_old: item.logp_old.narrow(0, start, len)?,
+        logp_ref: item
+            .logp_ref
+            .as_ref()
+            .map(|t| t.narrow(0, start, len))
+            .transpose()?,
+        mask: item.mask.narrow(0, start, len)?,
+        tis_w: item
+            .tis_w
+            .as_ref()
+            .map(|t| t.narrow(0, start, len))
+            .transpose()?,
+    })
 }
 
 /// Masked-token rollout-ratio aggregates for one live group, computed at collect
@@ -2095,7 +2140,7 @@ impl Trainer {
         let mut sum_clip = 0.0_f32;
         for item in live {
             ctx.gpu_mem.record("item_backward_start");
-            let (grads, kl, clip_frac) = self.item_backward(policy, item, window_tokens)?;
+            let (grads, kl, clip_frac) = self.item_backward(policy, item, window_tokens, vars)?;
             ctx.gpu_mem.record("item_backward_end");
             sum_kl += kl;
             sum_clip += clip_frac;
@@ -2231,6 +2276,53 @@ impl Trainer {
         policy: &P,
         item: &LiveItem,
         window_tokens: f64,
+        vars: &[Var],
+    ) -> Result<(GradStore, f32, f32), TrainerError> {
+        let g = item.rollout.len();
+        let mb = self.config.backward_microbatch_size;
+        if mb > 0 && mb < g {
+            return self.item_backward_microbatched(policy, item, window_tokens, vars, mb);
+        }
+        self.item_backward_uncut(policy, item, window_tokens, vars, 1.0)
+    }
+
+    fn item_backward_microbatched<P: Policy>(
+        &self,
+        policy: &P,
+        item: &LiveItem,
+        window_tokens: f64,
+        vars: &[Var],
+        microbatch_size: usize,
+    ) -> Result<(GradStore, f32, f32), TrainerError> {
+        let logp_diag = policy.token_logprobs_detached(&item.rollout)?;
+        let (kl, clip_frac) = self.item_diagnostics(&logp_diag, item)?;
+
+        let mut acc: Vec<Option<Tensor>> = vec![None; vars.len()];
+        let mut covered = vec![true; vars.len()];
+        let total_rows = item.rollout.len();
+        for start in (0..total_rows).step_by(microbatch_size) {
+            let len = microbatch_size.min(total_rows - start);
+            let slice = slice_live_item(item, start, len)?;
+            let loss_scale = match self.config.loss_type {
+                LossType::Dapo => 1.0,
+                LossType::Grpo | LossType::DrGrpo => len as f64 / total_rows as f64,
+            };
+            let (grads, _, _) =
+                self.item_backward_uncut(policy, &slice, window_tokens, vars, loss_scale)?;
+            fold_var_grads(vars, &grads, &mut acc, &mut covered)?;
+        }
+        let store = empty_grad_store(vars)?;
+        let store = combine_into_store(vars, store, &mut acc, &covered);
+        Ok((store, kl, clip_frac))
+    }
+
+    fn item_backward_uncut<P: Policy>(
+        &self,
+        policy: &P,
+        item: &LiveItem,
+        window_tokens: f64,
+        vars: &[Var],
+        loss_scale: f64,
     ) -> Result<(GradStore, f32, f32), TrainerError> {
         let logp = policy.token_logprobs(&item.rollout)?;
         let cfg = LossCfg {
@@ -2250,16 +2342,28 @@ impl Trainer {
             &item.mask,
             &cfg,
         )?;
+        if (loss_scale - 1.0).abs() > f64::EPSILON {
+            loss = loss.affine(loss_scale, 0.0)?;
+        }
         let global_items = self.config.grad_accum_steps * self.comm.world_size();
         if global_items > 1 && self.config.loss_type != LossType::Dapo {
             loss = loss.affine(1.0 / global_items as f64, 0.0)?;
         }
+        let (kl, clip_frac) = self.item_diagnostics(&logp.detach(), item)?;
+        // Through the policy seam (default: exactly `loss.backward()`): under
+        // activation checkpointing the policy stitches the full gradient from
+        // its boundary tape — the canary downstream holds either way.
+        let raw = policy.backward(&loss)?;
+        let grads = compact_trainable_grad_store(vars, raw)?;
+        Ok((grads, kl, clip_frac))
+    }
+
+    fn item_diagnostics(&self, logp_diag: &Tensor, item: &LiveItem) -> CandleResult<(f32, f32)> {
         // Scalar diagnostics, off the differentiated path. The ratio is formed at
         // the configured level over the same padding-substituted log-probs the
         // loss uses, so the clip-fraction metric reports the ratio the surrogate
         // actually clipped.
-        let logp_diag = logp.detach();
-        let logp_sub = substitute_padding(&logp_diag, &item.logp_old, &item.mask)?;
+        let logp_sub = substitute_padding(logp_diag, &item.logp_old, &item.mask)?;
         let ratio = level_ratio(
             &logp_sub,
             &item.logp_old,
@@ -2273,12 +2377,8 @@ impl Trainer {
             self.config.clip_eps_high_eff(),
             &item.mask,
         )?;
-        let kl = self.kl_metric(&logp, item.logp_ref.as_ref(), &item.mask)?;
-        // Through the policy seam (default: exactly `loss.backward()`): under
-        // activation checkpointing the policy stitches the full gradient from
-        // its boundary tape — the canary downstream holds either way.
-        let grads = policy.backward(&loss)?;
-        Ok((grads, kl, clip_frac))
+        let kl = self.kl_metric(logp_diag, item.logp_ref.as_ref(), &item.mask)?;
+        Ok((kl, clip_frac))
     }
 
     /// Mean masked k3 KL for the step's metrics — the diagnostic counterpart of the
@@ -2631,6 +2731,25 @@ fn fold_var_grads(
         }
     }
     Ok(())
+}
+
+/// Copy only trainable-var entries from a raw backward store into a fresh store.
+///
+/// Candle's raw [`GradStore`] can retain gradients for intermediate autograd
+/// nodes. The trainer never consumes those entries: only trainable [`Var`]
+/// gradients feed accumulation, coverage, clipping, and the optimizer. Compacting
+/// immediately after a backward lets those intermediate entries drop before the
+/// next memory probe phase while preserving missing-var semantics — absent
+/// trainable grads stay absent so [`grad_coverage`] still fails loud.
+fn compact_trainable_grad_store(vars: &[Var], mut raw: GradStore) -> CandleResult<GradStore> {
+    let mut store = empty_grad_store(vars)?;
+    for v in vars {
+        store.remove(v.as_tensor());
+        if let Some(g) = raw.remove(v.as_tensor()) {
+            store.insert(v.as_tensor(), g);
+        }
+    }
+    Ok(store)
 }
 
 /// Build the optimizer's gradient store for an accumulation window by moving the accumulated
@@ -3212,6 +3331,7 @@ mod tests {
             .scale_rewards(ScaleRewards::None)
             .reward_group_scope(RewardGroupScope::Local)
             .grad_accum_steps(4)
+            .backward_microbatch_size(2)
             .checkpoint_every(Some(50))
             .candidate_log_top_k(2)
             .gpu_memory_probe(true)
@@ -3240,6 +3360,7 @@ mod tests {
             scale_rewards: ScaleRewards::None,
             reward_group_scope: RewardGroupScope::Local,
             grad_accum_steps: 4,
+            backward_microbatch_size: 2,
             checkpoint_every: Some(50),
             candidate_log_top_k: 2,
             gpu_memory_probe: true,
@@ -3783,6 +3904,40 @@ mod tests {
         }
     }
 
+    /// A policy backed by a full `[G, T]` trainable log-prob table, selecting
+    /// rows by the first token id in each rollout row. This lets the
+    /// microbatch test prove that row-sliced rollouts hit the same gradient
+    /// coordinates as the full-group backward.
+    struct RowAwarePolicy {
+        logp: Var,
+    }
+    impl Policy for RowAwarePolicy {
+        fn generate(&mut self, _p: &[u32], _c: &GenConfig) -> CandleResult<Rollout> {
+            unreachable!("wiring tests never roll out")
+        }
+        fn token_logprobs(&self, r: &Rollout) -> CandleResult<Tensor> {
+            let rows: Vec<u32> = r.token_ids.iter().map(|ids| ids[0]).collect();
+            let idx = Tensor::from_vec(rows, r.len(), self.logp.as_tensor().device())?;
+            self.logp.as_tensor().index_select(&idx, 0)
+        }
+        fn token_logprobs_detached(&self, r: &Rollout) -> CandleResult<Tensor> {
+            Ok(self.token_logprobs(r)?.detach())
+        }
+        fn set_adapter_enabled(&mut self, _e: bool) {}
+        fn adapter_enabled(&self) -> bool {
+            true
+        }
+        fn trainable_vars(&self) -> Vec<Var> {
+            vec![self.logp.clone()]
+        }
+        fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+            Ok(Vec::new())
+        }
+        fn restore_sampler_state(&mut self, _s: &[u8]) -> CandleResult<()> {
+            Ok(())
+        }
+    }
+
     /// Run `item_backward` under `cfg` over a fixed crafted item (ratios
     /// straddling the clip bands, ragged mask) and return the flat gradient of
     /// the logp Var. This pins that each config knob actually reaches the
@@ -3806,10 +3961,23 @@ mod tests {
         cfg: &TrainerConfig,
         window_tokens: f64,
     ) -> Vec<f32> {
+        let grads = wire_store_via(policy, logp, cfg, window_tokens);
+        grads
+            .get(logp.as_tensor())
+            .expect("logp var must be in the grad store")
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    }
+
+    fn wire_store_via<P: Policy>(
+        policy: &P,
+        logp: &Var,
+        cfg: &TrainerConfig,
+        window_tokens: f64,
+    ) -> GradStore {
         let dev = cpu();
-        let tmp = WireTmp::new("grad");
-        let run = RunDir::create(&tmp.0, "wire").unwrap();
-        let trainer = Trainer::new(cfg.clone(), &run).unwrap();
         // Shifts 0.22 / -0.30 straddle both bands (1.246 / 0.74); ratio != 1
         // even at mu = 1 because logp_old is crafted, not snapshotted.
         let shift = mat(&[&[0.22, -0.30, 0.05], &[0.05, 0.22, -0.30]]);
@@ -3827,13 +3995,30 @@ mod tests {
             mask: mat(&[&[1.0, 1.0, 1.0], &[1.0, 1.0, 0.0]]),
             tis_w: None,
         };
-        let (grads, _, _) = trainer.item_backward(policy, &item, window_tokens).unwrap();
-        grads
-            .get(logp.as_tensor())
-            .expect("logp var must be in the grad store")
-            .flatten_all()
-            .unwrap()
-            .to_vec1::<f32>()
+        item_store_via(policy, &item, cfg, window_tokens)
+    }
+
+    fn item_store_via<P: Policy>(
+        policy: &P,
+        item: &LiveItem,
+        cfg: &TrainerConfig,
+        window_tokens: f64,
+    ) -> GradStore {
+        item_backward_via(policy, item, cfg, window_tokens).0
+    }
+
+    fn item_backward_via<P: Policy>(
+        policy: &P,
+        item: &LiveItem,
+        cfg: &TrainerConfig,
+        window_tokens: f64,
+    ) -> (GradStore, f32, f32) {
+        let tmp = WireTmp::new("grad");
+        let run = RunDir::create(&tmp.0, "wire").unwrap();
+        let trainer = Trainer::new(cfg.clone(), &run).unwrap();
+        let vars = policy.trainable_vars();
+        trainer
+            .item_backward(policy, item, window_tokens, &vars)
             .unwrap()
     }
 
@@ -3895,6 +4080,42 @@ mod tests {
         }
     }
 
+    struct NoisyBackwardPolicy {
+        inner: StubPolicy,
+        stray: Var,
+    }
+    impl Policy for NoisyBackwardPolicy {
+        fn generate(&mut self, p: &[u32], c: &GenConfig) -> CandleResult<Rollout> {
+            self.inner.generate(p, c)
+        }
+        fn token_logprobs(&self, r: &Rollout) -> CandleResult<Tensor> {
+            self.inner.token_logprobs(r)
+        }
+        fn set_adapter_enabled(&mut self, e: bool) {
+            self.inner.set_adapter_enabled(e);
+        }
+        fn adapter_enabled(&self) -> bool {
+            self.inner.adapter_enabled()
+        }
+        fn trainable_vars(&self) -> Vec<Var> {
+            self.inner.trainable_vars()
+        }
+        fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+            self.inner.sampler_state()
+        }
+        fn restore_sampler_state(&mut self, s: &[u8]) -> CandleResult<()> {
+            self.inner.restore_sampler_state(s)
+        }
+        fn backward(&self, loss: &Tensor) -> CandleResult<GradStore> {
+            let mut store = loss.backward()?;
+            store.insert(
+                self.stray.as_tensor(),
+                Tensor::ones_like(self.stray.as_tensor())?,
+            );
+            Ok(store)
+        }
+    }
+
     #[test]
     fn wiring_item_backward_runs_through_the_policy_backward_seam() {
         let cfg = TrainerConfig::default();
@@ -3905,6 +4126,26 @@ mod tests {
         };
         let doubled = wire_grad_via(&policy, &logp, &cfg, 5.0);
         assert_grads_scaled(&base, &doubled, 2.0, "policy backward seam");
+    }
+
+    #[test]
+    fn wiring_item_backward_returns_a_compact_trainable_store() {
+        let cfg = TrainerConfig::default();
+        let logp = wire_logp();
+        let stray = Var::zeros(1, DType::F32, &cpu()).unwrap();
+        let policy = NoisyBackwardPolicy {
+            inner: StubPolicy { logp: logp.clone() },
+            stray: stray.clone(),
+        };
+        let grads = wire_store_via(&policy, &logp, &cfg, 5.0);
+        assert!(
+            grads.get(logp.as_tensor()).is_some(),
+            "the trainable logp gradient must survive compaction"
+        );
+        assert!(
+            grads.get(stray.as_tensor()).is_none(),
+            "non-trainable raw-store entries must not survive item_backward"
+        );
     }
 
     #[test]
@@ -3946,6 +4187,120 @@ mod tests {
             5.0,
         );
         assert_grads_scaled(&dapo1, &dapo2, 1.0, "dapo must skip the accum scale");
+    }
+
+    fn assert_grad_mats_match(full: &[Vec<f32>], micro: &[Vec<f32>], ctx: &str) {
+        for (full_row, micro_row) in full.iter().zip(micro) {
+            for (f, m) in full_row.iter().zip(micro_row) {
+                assert_relative_eq!(f, m, epsilon = 1e-6, max_relative = 1e-5);
+            }
+        }
+        assert!(
+            full.iter().flatten().any(|g| g.abs() > 1e-8),
+            "{ctx}: baseline gradient is all-zero — the comparison is vacuous"
+        );
+    }
+
+    fn assert_microbatch_matches_full(
+        policy: &RowAwarePolicy,
+        item: &LiveItem,
+        logp: &Var,
+        cfg: &TrainerConfig,
+        ctx: &str,
+    ) {
+        let full_cfg = TrainerConfig {
+            backward_microbatch_size: 0,
+            ..cfg.clone()
+        };
+        let micro_cfg = TrainerConfig {
+            backward_microbatch_size: 1,
+            ..cfg.clone()
+        };
+        let (full_store, full_kl, full_clip) = item_backward_via(policy, item, &full_cfg, 5.0);
+        let (micro_store, micro_kl, micro_clip) = item_backward_via(policy, item, &micro_cfg, 5.0);
+        let full = full_store
+            .get(logp.as_tensor())
+            .expect("full-group trainable gradient must remain present")
+            .to_vec2::<f32>()
+            .unwrap();
+        let micro = micro_store
+            .get(logp.as_tensor())
+            .expect("microbatched trainable gradient must remain present")
+            .to_vec2::<f32>()
+            .unwrap();
+        assert_grad_mats_match(&full, &micro, ctx);
+        assert_relative_eq!(full_kl, micro_kl, epsilon = 1e-6, max_relative = 1e-5);
+        assert_relative_eq!(full_clip, micro_clip, epsilon = 1e-6, max_relative = 1e-5);
+    }
+
+    #[test]
+    fn wiring_backward_microbatch_matches_full_group_gradients_and_diagnostics() {
+        let dev = cpu();
+        let logp = Var::from_tensor(&mat(&[&[-1.0, -2.0, -0.4], &[-0.5, -0.25, -0.75]])).unwrap();
+        let policy = RowAwarePolicy { logp: logp.clone() };
+        let shift = mat(&[&[0.22, -0.30, 0.05], &[0.05, 0.22, -0.30]]);
+        let item = LiveItem {
+            rollout: Rollout {
+                token_ids: vec![vec![0, 7, 8, 9], vec![1, 10, 11, 12]],
+                prompt_len: 1,
+                completion_lens: vec![3, 0],
+                rollout_logprobs: None,
+            },
+            advantages: Tensor::from_vec(vec![0.8f32, -0.7], (2, 1), &dev).unwrap(),
+            logp_old: logp.as_tensor().sub(&shift).unwrap().detach(),
+            logp_ref: Some(
+                logp.as_tensor()
+                    .add(&mat(&[&[0.08, -0.04, 0.03], &[-0.02, 0.06, -0.01]]))
+                    .unwrap()
+                    .detach(),
+            ),
+            mask: mat(&[&[1.0, 1.0, 1.0], &[0.0, 0.0, 0.0]]),
+            tis_w: Some(mat(&[&[1.0, 0.7, 1.3], &[0.0, 0.0, 0.0]])),
+        };
+        assert_microbatch_matches_full(
+            &policy,
+            &item,
+            &logp,
+            &TrainerConfig {
+                loss_type: LossType::Grpo,
+                ..TrainerConfig::default()
+            },
+            "grpo",
+        );
+        assert_microbatch_matches_full(
+            &policy,
+            &item,
+            &logp,
+            &TrainerConfig {
+                loss_type: LossType::DrGrpo,
+                beta: 0.2,
+                ..TrainerConfig::default()
+            },
+            "dr_grpo beta",
+        );
+        assert_microbatch_matches_full(
+            &policy,
+            &item,
+            &logp,
+            &TrainerConfig {
+                loss_type: LossType::Dapo,
+                beta: 0.2,
+                ..TrainerConfig::default()
+            },
+            "dapo beta",
+        );
+        assert_microbatch_matches_full(
+            &policy,
+            &item,
+            &logp,
+            &TrainerConfig {
+                loss_type: LossType::Grpo,
+                importance_sampling_level: ImportanceSamplingLevel::Sequence,
+                beta: 0.2,
+                ..TrainerConfig::default()
+            },
+            "sequence-level beta tis",
+        );
     }
 
     #[test]
@@ -4193,12 +4548,10 @@ mod tests {
         let cfg = TrainerConfig::default();
         let j = serde_json::to_string(&cfg).unwrap();
         let back: TrainerConfig = serde_json::from_str(&j).unwrap();
-        assert_eq!(back.mu, cfg.mu);
-        assert_eq!(back.beta, cfg.beta);
-        assert_eq!(back.loss_type, cfg.loss_type);
-        assert_eq!(back.scale_rewards, cfg.scale_rewards);
-        assert_eq!(back.grad_accum_steps, cfg.grad_accum_steps);
-        assert_eq!(back.candidate_log_top_k, cfg.candidate_log_top_k);
+        assert_eq!(
+            serde_json::to_value(&back).unwrap(),
+            serde_json::to_value(&cfg).unwrap()
+        );
     }
 
     #[test]
@@ -4252,6 +4605,7 @@ mod tests {
         // (no accumulation), not fail — the serde default keeps old runs loadable.
         let cfg: TrainerConfig = serde_json::from_str(OLD_CONFIG_JSON).unwrap();
         assert_eq!(cfg.grad_accum_steps, 1);
+        assert_eq!(cfg.backward_microbatch_size, 0);
         assert_eq!(cfg.candidate_log_top_k, 0);
         assert_eq!(cfg.reward_group_scope, RewardGroupScope::Local);
         // The EOS field also predates the JSON above; serde fills it from the default.
@@ -5195,6 +5549,34 @@ mod tests {
         assert!(
             !covered[1] && acc[1].is_none(),
             "y must be flagged uncovered"
+        );
+    }
+
+    #[test]
+    fn compact_trainable_grad_store_preserves_absent_vars() {
+        let dev = cpu();
+        let x = Var::from_tensor(&Tensor::from_vec(vec![2.0f64], (1,), &dev).unwrap()).unwrap();
+        let y = Var::from_tensor(&Tensor::from_vec(vec![3.0f64], (1,), &dev).unwrap()).unwrap();
+        let raw = x
+            .as_tensor()
+            .sqr()
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .backward()
+            .unwrap();
+        let compact = compact_trainable_grad_store(&[x.clone(), y.clone()], raw).unwrap();
+        assert_eq!(
+            compact
+                .get(x.as_tensor())
+                .unwrap()
+                .to_vec1::<f64>()
+                .unwrap(),
+            vec![4.0]
+        );
+        assert!(
+            compact.get(y.as_tensor()).is_none(),
+            "an absent trainable var must remain absent so the canary can fail loud"
         );
     }
 
