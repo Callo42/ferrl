@@ -89,9 +89,10 @@
 //!
 //! [`Trainer`]: crate::trainer::Trainer
 
-use candle_core::{DType, IndexOp, Result as CandleResult, Tensor, Var, D};
-use candle_nn::ops::log_softmax;
+use candle_core::{IndexOp, Result as CandleResult, Tensor, Var};
 
+#[cfg(test)]
+use crate::model::chunked_logprobs_from_logits;
 use crate::model::{CachedDecoder, GradModel};
 use crate::policy::{GenConfig, Policy, Rollout};
 use crate::qwen::QwenGradModel;
@@ -234,6 +235,7 @@ impl<M: GradModel> LmPolicy<M> {
     /// as the loop advances. `log_softmax` reduces over the vocab axis only
     /// and `gather` is positionwise, so chunking over positions is exact: the
     /// concatenated result is identical to the unchunked one.
+    #[cfg(test)]
     fn completion_logprobs_chunked(
         &self,
         rollout: &Rollout,
@@ -260,39 +262,20 @@ impl<M: GradModel> LmPolicy<M> {
             );
         }
 
+        let targets = self.scoring_targets(rollout)?;
+        chunked_logprobs_from_logits(pred, &targets, self.temperature, chunk)
+    }
+
+    fn scoring_targets(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+        let prompt_len = rollout.prompt_len;
+        let seq_len = rollout.token_ids[0].len();
+        let comp_len = seq_len - prompt_len;
+        let g = rollout.token_ids.len();
         let mut tgt_data = Vec::with_capacity(g * comp_len);
         for ids in &rollout.token_ids {
             tgt_data.extend_from_slice(&ids[prompt_len..seq_len]);
         }
-        let targets = Tensor::from_vec(tgt_data, (g, comp_len), self.model.device())?;
-        let idx = targets.unsqueeze(D::Minus1)?;
-
-        let chunk = chunk.max(1);
-        let mut parts = Vec::with_capacity(comp_len.div_ceil(chunk));
-        let mut pos = 0;
-        while pos < comp_len {
-            let n = chunk.min(comp_len - pos);
-            // Upcast one chunk of window logits to F32 before the log-softmax,
-            // so the surrogate's log-probs keep F32 precision even when the
-            // model runs in BF16 (the dtype split); the model-dtype window
-            // logits are the only full-window tensor.
-            let mut p = pred.narrow(1, pos, n)?.to_dtype(DType::F32)?;
-            // Temperature-consistent scoring (TRL parity): divide the logits
-            // by the policy's rollout temperature before the log-softmax, so
-            // the distribution being optimized IS the one the rollout sampled
-            // from. Guarded so the T = 1.0 default adds no op and stays
-            // bit-identical to the pre-R2 path.
-            if (self.temperature - 1.0).abs() > f64::EPSILON {
-                p = (p / self.temperature)?;
-            }
-            let logp = log_softmax(&p, D::Minus1)?;
-            let part = logp
-                .gather(&idx.narrow(1, pos, n)?.contiguous()?, D::Minus1)?
-                .squeeze(D::Minus1)?;
-            parts.push(part);
-            pos += n;
-        }
-        Tensor::cat(&parts, 1)
+        Tensor::from_vec(tgt_data, (g, comp_len), self.model.device())
     }
 
     /// The **sequential, uncached** rollout oracle: fork the SAME per-row
@@ -576,11 +559,17 @@ impl<M: GradModel> Policy for LmPolicy<M> {
         // completion-predicting window alone. Same CUDA-compat translation as
         // `generate` (see there): a no-op off the `cuda` build and on the
         // success path.
-        let pred = self
-            .model
-            .forward_narrowed(&input, start, len)
-            .map_err(crate::cuda_compat::translate_ptx_error)?; // [g, comp_len, vocab]
-        self.completion_logprobs_chunked(rollout, &pred, SCORING_CHUNK)
+        let targets = self.scoring_targets(rollout)?;
+        self.model
+            .token_logprobs_narrowed(
+                &input,
+                &targets,
+                start,
+                len,
+                self.temperature,
+                SCORING_CHUNK,
+            )
+            .map_err(crate::cuda_compat::translate_ptx_error)
     }
 
     fn token_logprobs_detached(&self, rollout: &Rollout) -> CandleResult<Tensor> {
@@ -592,15 +581,17 @@ impl<M: GradModel> Policy for LmPolicy<M> {
         // applied to the scoring window alone, and no checkpoint tape is
         // captured (so the tape of the NEXT update forward — the one
         // `backward` consumes — can never be clobbered by a value scoring).
-        let pred = self
-            .model
-            .forward_detached_narrowed(&input, start, len)
-            .map_err(crate::cuda_compat::translate_ptx_error)?;
-        // Already tape-free; the explicit detach states the trait contract
-        // rather than trusting every model impl.
-        Ok(self
-            .completion_logprobs_chunked(rollout, &pred, SCORING_CHUNK)?
-            .detach())
+        let targets = self.scoring_targets(rollout)?;
+        self.model
+            .token_logprobs_detached_narrowed(
+                &input,
+                &targets,
+                start,
+                len,
+                self.temperature,
+                SCORING_CHUNK,
+            )
+            .map_err(crate::cuda_compat::translate_ptx_error)
     }
 
     fn backward(&self, loss: &Tensor) -> CandleResult<candle_core::backprop::GradStore> {
@@ -665,7 +656,8 @@ mod tests {
     use super::*;
     use crate::nn::grad_coverage;
     use candle_core::backprop::GradStore;
-    use candle_core::{DType, Device};
+    use candle_core::{DType, Device, D};
+    use candle_nn::ops::log_softmax;
     use candle_nn::{Activation, VarBuilder};
     use candle_transformers::models::qwen3::Config;
     use std::collections::HashMap;

@@ -23,7 +23,8 @@
 //! trait only carries the obligations.
 
 use candle_core::backprop::GradStore;
-use candle_core::{Device, Result as CandleResult, Tensor, Var};
+use candle_core::{DType, Device, Result as CandleResult, Tensor, Var, D};
+use candle_nn::ops::log_softmax;
 
 /// A stateful, grad-free incremental decoder over a snapshot of a
 /// [`GradModel`]'s effective weights.
@@ -222,6 +223,56 @@ pub trait GradModel {
         self.forward_detached(input_ids)?.narrow(1, start, len)
     }
 
+    /// Gather temperature-scaled log-probabilities for `targets`
+    /// (`[batch, len]`) from the narrowed scoring window without requiring
+    /// callers to materialize or own the chunking policy.
+    ///
+    /// The default preserves the existing model contract: run
+    /// [`forward_narrowed`](Self::forward_narrowed) to produce
+    /// `[batch, len, vocab]` logits, then chunk the F32
+    /// `log_softmax`/gather stage over positions. Implementors with access
+    /// to the hidden-state tail can override this to chunk the final
+    /// norm/head projection too, so a full `[batch, len, vocab]` tensor never
+    /// exists on the update path.
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if the window exceeds the sequence, `targets`
+    /// does not match `[batch, len]`, or any tensor op fails.
+    fn token_logprobs_narrowed(
+        &self,
+        input_ids: &Tensor,
+        targets: &Tensor,
+        start: usize,
+        len: usize,
+        temperature: f64,
+        chunk: usize,
+    ) -> CandleResult<Tensor> {
+        let logits = self.forward_narrowed(input_ids, start, len)?;
+        chunked_logprobs_from_logits(&logits, targets, temperature, chunk)
+    }
+
+    /// Detached/value-only variant of
+    /// [`token_logprobs_narrowed`](Self::token_logprobs_narrowed). It must not
+    /// capture checkpoint tape.
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if the window exceeds the sequence, `targets`
+    /// does not match `[batch, len]`, or any tensor op fails.
+    fn token_logprobs_detached_narrowed(
+        &self,
+        input_ids: &Tensor,
+        targets: &Tensor,
+        start: usize,
+        len: usize,
+        temperature: f64,
+        chunk: usize,
+    ) -> CandleResult<Tensor> {
+        let logits = self.forward_detached_narrowed(input_ids, start, len)?;
+        Ok(chunked_logprobs_from_logits(&logits, targets, temperature, chunk)?.detach())
+    }
+
     /// Back-propagate a loss built from this model's [`forward`](Self::forward)
     /// logits.
     ///
@@ -261,6 +312,56 @@ pub trait GradModel {
     fn lora_recipe(&self) -> Option<String> {
         None
     }
+}
+
+/// Gather target log-probabilities from already-windowed logits
+/// `[batch, len, vocab]`, chunking the F32 `log_softmax` over positions.
+///
+/// Chunking is exact because `log_softmax` reduces only over the vocab axis
+/// and the gather is positionwise. The helper is shared by the generic model
+/// default, [`crate::lm_policy::LmPolicy`] tests, and model overrides that
+/// chunk their final head projection before calling into the same math.
+///
+/// # Errors
+///
+/// Returns a candle error if `targets` is not `[batch, len]`, if `len == 0`,
+/// or if any tensor op fails.
+pub(crate) fn chunked_logprobs_from_logits(
+    logits: &Tensor,
+    targets: &Tensor,
+    temperature: f64,
+    chunk: usize,
+) -> CandleResult<Tensor> {
+    let (b, len, _vocab) = logits.dims3()?;
+    if len == 0 {
+        candle_core::bail!("token_logprobs: zero-length scoring window");
+    }
+    let (tb, tw) = targets.dims2()?;
+    if tb != b || tw != len {
+        candle_core::bail!(
+            "token_logprobs: targets must be [{b}, {len}], got {:?}",
+            targets.dims()
+        );
+    }
+
+    let idx = targets.unsqueeze(D::Minus1)?;
+    let chunk = chunk.max(1);
+    let mut parts = Vec::with_capacity(len.div_ceil(chunk));
+    let mut pos = 0;
+    while pos < len {
+        let n = chunk.min(len - pos);
+        let mut p = logits.narrow(1, pos, n)?.to_dtype(DType::F32)?;
+        if (temperature - 1.0).abs() > f64::EPSILON {
+            p = (p / temperature)?;
+        }
+        let logp = log_softmax(&p, D::Minus1)?;
+        let part = logp
+            .gather(&idx.narrow(1, pos, n)?.contiguous()?, D::Minus1)?
+            .squeeze(D::Minus1)?;
+        parts.push(part);
+        pos += n;
+    }
+    Tensor::cat(&parts, 1)
 }
 
 #[cfg(test)]
