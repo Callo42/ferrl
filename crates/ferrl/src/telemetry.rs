@@ -1432,6 +1432,9 @@ fn required_positive_mean(history: &[Metrics], f: impl Fn(&Metrics) -> f32) -> O
 }
 
 fn required_peak(history: &[Metrics], f: impl Fn(&Metrics) -> u64) -> Option<u64> {
+    if history.is_empty() || history.iter().any(|m| f(m) == 0) {
+        return None;
+    }
     let peak = history.iter().map(f).max()?;
     (peak > 0).then_some(peak)
 }
@@ -2176,6 +2179,28 @@ mod tests {
             )),
             "failures: {:?}",
             memory.failures
+        );
+    }
+
+    #[test]
+    fn compare_metrics_fails_partial_missing_cuda_memory_telemetry() {
+        let base = vec![
+            perf_metric(0, 1.0, 2.0, 1000, 100),
+            perf_metric(1, 1.0, 2.0, 1000, 100),
+            perf_metric(2, 1.0, 2.0, 1000, 100),
+        ];
+        let mut cand = base.clone();
+        cand[1].cuda_mem_peak_used_bytes = 0;
+        let report = compare_metrics(&base, &cand, &perf_budget());
+        assert!(
+            report.failures.iter().any(|f| matches!(
+                f,
+                RegressionFailure::CudaMemoryMissing {
+                    stream: "candidate"
+                }
+            )),
+            "failures: {:?}",
+            report.failures
         );
     }
 

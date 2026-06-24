@@ -1720,6 +1720,11 @@ fn perf_budget(args: &PerfGateArgs) -> Result<RegressionBudget, CliError> {
             ));
         }
     }
+    if args.min_positive_grad_steps == 0 {
+        return Err(CliError::msg(
+            "--min-positive-grad-steps must be >= 1 for the strict perf gate",
+        ));
+    }
     Ok(RegressionBudget {
         require_live_update: true,
         require_timing: !args.skip_step_time_check,
@@ -1923,6 +1928,29 @@ mod tests {
             Command::PerfGate(a) => a,
             _ => panic!("expected perf-gate"),
         }
+    }
+
+    #[test]
+    fn perf_gate_rejects_zero_positive_grad_requirement() {
+        let args = PerfGateArgs {
+            baseline: PathBuf::from("main/rank0"),
+            candidate: PathBuf::from("pr/rank0"),
+            max_peak_mem_regression_pct: 0.0,
+            peak_mem_slack_bytes: 0,
+            max_step_secs_regression_pct: 10.0,
+            step_secs_slack: 0.0,
+            min_positive_grad_steps: 0,
+            max_final_grad_norm_rel_drift: None,
+            skip_memory_check: false,
+            skip_step_time_check: false,
+            allow_health_warnings: false,
+            json: false,
+        };
+        let err = perf_budget(&args).unwrap_err().to_string();
+        assert!(
+            err.contains("--min-positive-grad-steps"),
+            "unexpected error: {err}"
+        );
     }
 
     /// The clap surface parses the artifact subcommand.
