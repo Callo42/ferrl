@@ -47,9 +47,10 @@ use tracing::info;
 use ferrl::countdown::{build_prompt, generate_dataset, CountdownConfig, CountdownProblem};
 use ferrl::policy::GenConfig;
 use ferrl::{
-    compare_metrics, evaluate, load_auto_policy, read_jsonl, summarize, train_eval_split,
-    CountdownReward, LoaderOpts, MathProblem, MathReward, RegressionBudget, RegressionReport,
-    RewardFn, RunDir, Sample, Trainer, TrainerConfig, TrimulReward,
+    compare_distributed_metrics, compare_metrics, evaluate, load_auto_policy, read_jsonl,
+    summarize, train_eval_split, CountdownReward, LoaderOpts, MathProblem, MathReward,
+    RegressionBudget, RegressionReport, RewardFn, RunDir, Sample, Trainer, TrainerConfig,
+    TrimulReward,
 };
 
 /// A task's train/eval split: `(train, eval)` samples of the task's target type.
@@ -190,12 +191,20 @@ struct RunreportArgs {
 /// Arguments for `ferrl perf-gate`.
 #[derive(Debug, Args)]
 struct PerfGateArgs {
-    /// Baseline run directory or `metrics.jsonl`.
+    /// Baseline run directory or `metrics.jsonl`. Repeat once per rank with
+    /// `--distributed-world-max`.
     #[arg(long)]
-    baseline: PathBuf,
-    /// Candidate run directory or `metrics.jsonl`.
+    baseline: Vec<PathBuf>,
+    /// Candidate run directory or `metrics.jsonl`. Repeat once per rank with
+    /// `--distributed-world-max`.
     #[arg(long)]
-    candidate: PathBuf,
+    candidate: Vec<PathBuf>,
+    /// Aggregate repeated baseline/candidate rank streams as one distributed world.
+    #[arg(long)]
+    distributed_world_max: bool,
+    /// Required expected rank count when `--distributed-world-max` is set.
+    #[arg(long)]
+    distributed_world_size: Option<usize>,
     /// Maximum allowed candidate peak-memory regression versus baseline.
     #[arg(long, default_value_t = 0.0)]
     max_peak_mem_regression_pct: f64,
@@ -220,7 +229,7 @@ struct PerfGateArgs {
     /// Do not require step timing telemetry to be present and within threshold.
     #[arg(long)]
     skip_step_time_check: bool,
-    /// Permit runreport health warnings in either stream.
+    /// Permit candidate health warnings to differ from the baseline.
     #[arg(long)]
     allow_health_warnings: bool,
     /// Emit the gate report as JSON.
@@ -1680,9 +1689,49 @@ fn runreport(args: &RunreportArgs) -> Result<ExitCode, CliError> {
 /// Dispatch `ferrl perf-gate`: compare baseline and candidate metrics streams.
 fn perf_gate(args: &PerfGateArgs) -> Result<ExitCode, CliError> {
     let budget = perf_budget(args)?;
-    let baseline = ferrl::read_metrics(resolve_metrics_path(&args.baseline))?;
-    let candidate = ferrl::read_metrics(resolve_metrics_path(&args.candidate))?;
-    let report = compare_metrics(&baseline, &candidate, &budget);
+    let report = if args.distributed_world_max {
+        if args.baseline.is_empty() || args.candidate.is_empty() {
+            return Err(CliError::msg(
+                "--distributed-world-max requires at least one --baseline and one --candidate",
+            ));
+        }
+        if args.baseline.len() != args.candidate.len() {
+            return Err(CliError::msg(format!(
+                "--distributed-world-max requires matching rank counts: baseline={} candidate={}",
+                args.baseline.len(),
+                args.candidate.len()
+            )));
+        }
+        let Some(expected) = args.distributed_world_size else {
+            return Err(CliError::msg(
+                "--distributed-world-max requires --distributed-world-size",
+            ));
+        };
+        if expected == 0 {
+            return Err(CliError::msg("--distributed-world-size must be positive"));
+        }
+        if args.baseline.len() != expected {
+            return Err(CliError::msg(format!(
+                "--distributed-world-size {expected} does not match supplied ranks: \
+                 baseline={} candidate={}",
+                args.baseline.len(),
+                args.candidate.len()
+            )));
+        }
+        let baseline = read_metrics_inputs(&args.baseline)?;
+        let candidate = read_metrics_inputs(&args.candidate)?;
+        compare_distributed_metrics(&baseline, &candidate, &budget)
+    } else {
+        if args.baseline.len() != 1 || args.candidate.len() != 1 {
+            return Err(CliError::msg(
+                "perf-gate requires exactly one --baseline and one --candidate unless \
+                 --distributed-world-max is set",
+            ));
+        }
+        let baseline = ferrl::read_metrics(resolve_metrics_path(&args.baseline[0]))?;
+        let candidate = ferrl::read_metrics(resolve_metrics_path(&args.candidate[0]))?;
+        compare_metrics(&baseline, &candidate, &budget)
+    };
     if args.json {
         let s = serde_json::to_string_pretty(&report)
             .map_err(|e| CliError::msg(format!("serialize perf gate: {e}")))?;
@@ -1695,6 +1744,13 @@ fn perf_gate(args: &PerfGateArgs) -> Result<ExitCode, CliError> {
     } else {
         Ok(ExitCode::from(2))
     }
+}
+
+fn read_metrics_inputs(paths: &[PathBuf]) -> Result<Vec<Vec<ferrl::Metrics>>, CliError> {
+    Ok(paths
+        .iter()
+        .map(|path| ferrl::read_metrics(resolve_metrics_path(path)))
+        .collect::<Result<Vec<_>, _>>()?)
 }
 
 fn perf_budget(args: &PerfGateArgs) -> Result<RegressionBudget, CliError> {
@@ -1914,13 +1970,116 @@ mod tests {
         ])
         .unwrap();
         let a = expect_perf_gate(p.cmd);
-        assert_eq!(a.baseline, PathBuf::from("main/rank0"));
-        assert_eq!(a.candidate, PathBuf::from("pr/rank0"));
+        assert_eq!(a.baseline, vec![PathBuf::from("main/rank0")]);
+        assert_eq!(a.candidate, vec![PathBuf::from("pr/rank0")]);
+        assert!(!a.distributed_world_max);
         assert!(a.json);
-        let budget = perf_budget(&a).unwrap();
+    }
+
+    #[test]
+    fn perf_gate_budget_reflects_cli_thresholds() {
+        let args = PerfGateArgs {
+            max_peak_mem_regression_pct: 1.5,
+            max_step_secs_regression_pct: 5.0,
+            max_final_grad_norm_rel_drift: Some(0.001),
+            json: true,
+            ..perf_gate_test_args()
+        };
+        let budget = perf_budget(&args).unwrap();
         assert!(budget.require_cuda_memory);
         assert!(budget.require_timing);
         assert_eq!(budget.max_cuda_peak_used_ratio, 1.015);
+        assert_eq!(budget.max_mean_step_secs_ratio, 1.05);
+        assert_eq!(budget.max_final_grad_norm_rel_drift, Some(0.001));
+    }
+
+    #[test]
+    fn clap_parses_distributed_perf_gate() {
+        let p = Cli::try_parse_from([
+            "ferrl",
+            "perf-gate",
+            "--distributed-world-max",
+            "--baseline",
+            "main/rank0",
+            "--baseline",
+            "main/rank1",
+            "--candidate",
+            "pr/rank0",
+            "--candidate",
+            "pr/rank1",
+        ])
+        .unwrap();
+        let a = expect_perf_gate(p.cmd);
+        assert_eq!(
+            a.baseline,
+            vec![PathBuf::from("main/rank0"), PathBuf::from("main/rank1")]
+        );
+        assert_eq!(
+            a.candidate,
+            vec![PathBuf::from("pr/rank0"), PathBuf::from("pr/rank1")]
+        );
+        assert!(a.distributed_world_max);
+        assert_eq!(a.distributed_world_size, None);
+    }
+
+    #[test]
+    fn clap_parses_distributed_world_size() {
+        let p = Cli::try_parse_from([
+            "ferrl",
+            "perf-gate",
+            "--distributed-world-max",
+            "--distributed-world-size",
+            "2",
+            "--baseline",
+            "main/rank0",
+            "--baseline",
+            "main/rank1",
+            "--candidate",
+            "pr/rank0",
+            "--candidate",
+            "pr/rank1",
+        ])
+        .unwrap();
+        let a = expect_perf_gate(p.cmd);
+        assert_eq!(a.distributed_world_size, Some(2));
+    }
+
+    #[test]
+    fn perf_gate_rejects_repeated_rank_paths_without_distributed_mode() {
+        let mut args = perf_gate_test_args();
+        args.baseline.push(PathBuf::from("main/rank1"));
+        args.candidate.push(PathBuf::from("pr/rank1"));
+
+        let err = perf_gate(&args).unwrap_err().to_string();
+        assert!(
+            err.contains("exactly one --baseline"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn perf_gate_rejects_distributed_mode_without_world_size() {
+        let mut args = perf_gate_test_args();
+        args.distributed_world_max = true;
+
+        let err = perf_gate(&args).unwrap_err().to_string();
+        assert!(
+            err.contains("--distributed-world-size"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn perf_gate_rejects_missing_expected_distributed_rank() {
+        let mut args = perf_gate_test_args();
+        args.distributed_world_max = true;
+        args.distributed_world_size = Some(2);
+
+        let err = perf_gate(&args).unwrap_err().to_string();
+        assert!(
+            err.contains("--distributed-world-size 2"),
+            "unexpected error: {err}"
+        );
     }
 
     fn expect_perf_gate(cmd: Command) -> PerfGateArgs {
@@ -1932,25 +2091,32 @@ mod tests {
 
     #[test]
     fn perf_gate_rejects_zero_positive_grad_requirement() {
-        let args = PerfGateArgs {
-            baseline: PathBuf::from("main/rank0"),
-            candidate: PathBuf::from("pr/rank0"),
-            max_peak_mem_regression_pct: 0.0,
-            peak_mem_slack_bytes: 0,
-            max_step_secs_regression_pct: 10.0,
-            step_secs_slack: 0.0,
-            min_positive_grad_steps: 0,
-            max_final_grad_norm_rel_drift: None,
-            skip_memory_check: false,
-            skip_step_time_check: false,
-            allow_health_warnings: false,
-            json: false,
-        };
+        let mut args = perf_gate_test_args();
+        args.min_positive_grad_steps = 0;
         let err = perf_budget(&args).unwrap_err().to_string();
         assert!(
             err.contains("--min-positive-grad-steps"),
             "unexpected error: {err}"
         );
+    }
+
+    fn perf_gate_test_args() -> PerfGateArgs {
+        PerfGateArgs {
+            baseline: vec![PathBuf::from("main/rank0")],
+            candidate: vec![PathBuf::from("pr/rank0")],
+            distributed_world_max: false,
+            distributed_world_size: None,
+            max_peak_mem_regression_pct: 0.0,
+            peak_mem_slack_bytes: 0,
+            max_step_secs_regression_pct: 10.0,
+            step_secs_slack: 0.0,
+            min_positive_grad_steps: 1,
+            max_final_grad_norm_rel_drift: None,
+            skip_memory_check: false,
+            skip_step_time_check: false,
+            allow_health_warnings: false,
+            json: false,
+        }
     }
 
     /// The clap surface parses the artifact subcommand.

@@ -306,10 +306,27 @@ ferrl perf-gate --baseline runs/main-rank0 --candidate runs/pr-rank0 \
   --max-final-grad-norm-rel-drift 0.0001
 ```
 
-The gate fails closed if the streams are empty, steps are misaligned, `grad_norm` never
-goes positive, or required timing / CUDA memory probes are absent. Run baseline and
-candidate on the same GPU model, world size, cargo features, and command. DP metrics are
-per rank for memory and throughput, so compare matching rank streams; the stable
+The gate fails closed if the streams are empty, steps are misaligned, candidate health warnings
+change, `grad_norm` never goes positive, or required timing / CUDA memory probes are absent. Run
+baseline and candidate on the same GPU model, world size, cargo features, and command.
+
+For data-parallel resource gates where a high-water rank can move between baseline and candidate,
+repeat `--baseline` / `--candidate` once per rank and provide the expected world size explicitly:
+
+```sh
+ferrl perf-gate --distributed-world-max \
+  --distributed-world-size 2 \
+  --baseline runs/main-rank0 --baseline runs/main-rank1 \
+  --candidate runs/pr-rank0 --candidate runs/pr-rank1 \
+  --max-peak-mem-regression-pct 0 \
+  --max-step-secs-regression-pct 10 \
+  --max-final-grad-norm-rel-drift 0.0001
+```
+
+`--distributed-world-max` requires `--distributed-world-size`; together they fail closed for
+missing supplied rank streams, rank-count mismatches, missing required telemetry, rank-local health
+regressions, and rank/step misalignment, but compare CUDA memory by world maximum and step time by
+the slowest rank. The stable
 `NCCL_TINY_QWEN35_SMOKE` rows are still useful for humans, but the public comparator reads
 `metrics.jsonl`.
 
