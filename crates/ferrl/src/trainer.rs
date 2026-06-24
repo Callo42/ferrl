@@ -4220,12 +4220,12 @@ mod tests {
         let (micro_store, micro_kl, micro_clip) = item_backward_via(policy, item, &micro_cfg, 5.0);
         let full = full_store
             .get(logp.as_tensor())
-            .unwrap()
+            .expect("full-group trainable gradient must remain present")
             .to_vec2::<f32>()
             .unwrap();
         let micro = micro_store
             .get(logp.as_tensor())
-            .unwrap()
+            .expect("microbatched trainable gradient must remain present")
             .to_vec2::<f32>()
             .unwrap();
         assert_grad_mats_match(&full, &micro, ctx);
@@ -4243,7 +4243,7 @@ mod tests {
             rollout: Rollout {
                 token_ids: vec![vec![0, 7, 8, 9], vec![1, 10, 11, 12]],
                 prompt_len: 1,
-                completion_lens: vec![3, 2],
+                completion_lens: vec![3, 0],
                 rollout_logprobs: None,
             },
             advantages: Tensor::from_vec(vec![0.8f32, -0.7], (2, 1), &dev).unwrap(),
@@ -4254,8 +4254,8 @@ mod tests {
                     .unwrap()
                     .detach(),
             ),
-            mask: mat(&[&[1.0, 1.0, 1.0], &[1.0, 1.0, 0.0]]),
-            tis_w: Some(mat(&[&[1.0, 0.7, 1.3], &[1.1, 0.9, 0.0]])),
+            mask: mat(&[&[1.0, 1.0, 1.0], &[0.0, 0.0, 0.0]]),
+            tis_w: Some(mat(&[&[1.0, 0.7, 1.3], &[0.0, 0.0, 0.0]])),
         };
         assert_microbatch_matches_full(
             &policy,
