@@ -933,7 +933,7 @@ pub struct RegressionBudget {
     /// Require non-zero CUDA memory probes and enforce
     /// [`Self::max_cuda_peak_used_ratio`].
     pub require_cuda_memory: bool,
-    /// Permit [`RunSummary`] health anomalies in either stream.
+    /// Permit candidate [`RunSummary`] health anomalies to differ from baseline.
     pub allow_health_warnings: bool,
     /// Number of leading aligned rows to ignore for timing/memory/grad checks.
     pub warmup_steps: usize,
@@ -992,6 +992,37 @@ pub enum RegressionFailure {
         baseline: usize,
         /// Candidate metrics rows.
         candidate: usize,
+    },
+    /// Distributed baseline and candidate worlds have different rank counts.
+    RankCountMismatch {
+        /// Baseline rank streams.
+        baseline: usize,
+        /// Candidate rank streams.
+        candidate: usize,
+    },
+    /// Ranks within one distributed world have different row counts.
+    RankStepCountMismatch {
+        /// Which stream failed (`baseline` or `candidate`).
+        stream: &'static str,
+        /// Rank whose row count differed from rank 0.
+        rank: usize,
+        /// Rank-0 row count.
+        expected: usize,
+        /// This rank's row count.
+        observed: usize,
+    },
+    /// Ranks within one distributed world disagree on the step at one row.
+    RankStepIndexMismatch {
+        /// Which stream failed (`baseline` or `candidate`).
+        stream: &'static str,
+        /// Row index in the metrics stream.
+        row: usize,
+        /// Rank whose step differed from rank 0.
+        rank: usize,
+        /// Rank-0 `step`.
+        expected: u64,
+        /// This rank's `step`.
+        observed: u64,
     },
     /// The configured warmup leaves no comparable rows.
     WarmupElidesAll {
@@ -1066,11 +1097,22 @@ pub enum RegressionFailure {
         /// Allowed relative drift.
         limit: f32,
     },
-    /// Health anomalies were present while `allow_health_warnings` was false.
+    /// Candidate health anomalies differ from the baseline while
+    /// `allow_health_warnings` is false.
     HealthWarnings {
         /// Baseline anomaly count.
         baseline: usize,
         /// Candidate anomaly count.
+        candidate: usize,
+    },
+    /// Candidate rank-local health anomalies differ from the baseline while
+    /// `allow_health_warnings` is false.
+    RankHealthWarnings {
+        /// Rank whose anomaly set differs.
+        rank: usize,
+        /// Baseline anomaly count for the rank.
+        baseline: usize,
+        /// Candidate anomaly count for the rank.
         candidate: usize,
     },
 }
@@ -1085,6 +1127,33 @@ impl std::fmt::Display for RegressionFailure {
             } => write!(
                 f,
                 "step-count mismatch: baseline={baseline} candidate={candidate}"
+            ),
+            Self::RankCountMismatch {
+                baseline,
+                candidate,
+            } => write!(
+                f,
+                "rank-count mismatch: baseline={baseline} candidate={candidate}"
+            ),
+            Self::RankStepCountMismatch {
+                stream,
+                rank,
+                expected,
+                observed,
+            } => write!(
+                f,
+                "{stream} rank {rank} row-count mismatch: expected={expected} observed={observed}"
+            ),
+            Self::RankStepIndexMismatch {
+                stream,
+                row,
+                rank,
+                expected,
+                observed,
+            } => write!(
+                f,
+                "{stream} rank {rank} step-index mismatch at row {row}: \
+                 expected={expected} observed={observed}"
             ),
             Self::WarmupElidesAll { warmup_steps, len } => {
                 write!(
@@ -1154,7 +1223,15 @@ impl std::fmt::Display for RegressionFailure {
                 candidate,
             } => write!(
                 f,
-                "health warnings present: baseline={baseline} candidate={candidate}"
+                "health warning regression: baseline={baseline} candidate={candidate}"
+            ),
+            Self::RankHealthWarnings {
+                rank,
+                baseline,
+                candidate,
+            } => write!(
+                f,
+                "rank {rank} health warning regression: baseline={baseline} candidate={candidate}"
             ),
         }
     }
@@ -1212,6 +1289,44 @@ pub fn compare_metrics(
     }
 }
 
+/// Compare distributed baseline and candidate metric streams after aggregating
+/// each world row-by-row.
+///
+/// This is the data-parallel counterpart to [`compare_metrics`]. It fails
+/// closed when either world is empty, rank counts differ, rank streams are
+/// misaligned, or a required rank-level timing/CUDA-memory/live-update probe is
+/// missing. CUDA memory is aggregated as the per-step world maximum, step time
+/// as the slowest rank, throughput as the world sum, and `grad_norm` remains
+/// positive only when every rank reports a finite positive value for that step.
+/// Rank-local health anomaly sets are compared before aggregation.
+#[must_use]
+pub fn compare_distributed_metrics(
+    baseline_ranks: &[Vec<Metrics>],
+    candidate_ranks: &[Vec<Metrics>],
+    budget: &RegressionBudget,
+) -> RegressionReport {
+    let mut failures = Vec::new();
+    if baseline_ranks.len() != candidate_ranks.len() {
+        failures.push(RegressionFailure::RankCountMismatch {
+            baseline: baseline_ranks.len(),
+            candidate: candidate_ranks.len(),
+        });
+    }
+    compare_rank_health(baseline_ranks, candidate_ranks, budget, &mut failures);
+    let baseline = aggregate_distributed_metrics("baseline", baseline_ranks, budget, &mut failures);
+    let candidate =
+        aggregate_distributed_metrics("candidate", candidate_ranks, budget, &mut failures);
+    let mut report = compare_metrics(&baseline, &candidate, budget);
+    failures.append(&mut report.failures);
+    RegressionReport {
+        passed: failures.is_empty(),
+        budget: report.budget,
+        baseline: report.baseline,
+        candidate: report.candidate,
+        failures,
+    }
+}
+
 fn compare_health(
     baseline: &RunSummary,
     candidate: &RunSummary,
@@ -1221,12 +1336,202 @@ fn compare_health(
     if budget.allow_health_warnings {
         return;
     }
-    if !baseline.anomalies.is_empty() || !candidate.anomalies.is_empty() {
+    if baseline.anomalies != candidate.anomalies {
         failures.push(RegressionFailure::HealthWarnings {
             baseline: baseline.anomalies.len(),
             candidate: candidate.anomalies.len(),
         });
     }
+}
+
+fn compare_rank_health(
+    baseline_ranks: &[Vec<Metrics>],
+    candidate_ranks: &[Vec<Metrics>],
+    budget: &RegressionBudget,
+    failures: &mut Vec<RegressionFailure>,
+) {
+    if budget.allow_health_warnings || baseline_ranks.len() != candidate_ranks.len() {
+        return;
+    }
+
+    for (rank, (baseline, candidate)) in baseline_ranks.iter().zip(candidate_ranks).enumerate() {
+        let Some(baseline) = summarize(baseline) else {
+            continue;
+        };
+        let Some(candidate) = summarize(candidate) else {
+            continue;
+        };
+        if baseline.anomalies != candidate.anomalies {
+            failures.push(RegressionFailure::RankHealthWarnings {
+                rank,
+                baseline: baseline.anomalies.len(),
+                candidate: candidate.anomalies.len(),
+            });
+        }
+    }
+}
+
+fn aggregate_distributed_metrics(
+    stream: &'static str,
+    ranks: &[Vec<Metrics>],
+    budget: &RegressionBudget,
+    failures: &mut Vec<RegressionFailure>,
+) -> Vec<Metrics> {
+    let Some(len) = validate_distributed_rank_shape(stream, ranks, failures) else {
+        return Vec::new();
+    };
+    check_required_rank_telemetry(stream, ranks, budget, failures);
+
+    let mut aggregated = Vec::with_capacity(len);
+    for row in 0..len {
+        validate_distributed_step_index(stream, ranks, row, failures);
+        aggregated.push(aggregate_world_row(ranks, row));
+    }
+    aggregated
+}
+
+fn validate_distributed_rank_shape(
+    stream: &'static str,
+    ranks: &[Vec<Metrics>],
+    failures: &mut Vec<RegressionFailure>,
+) -> Option<usize> {
+    let Some(first) = ranks.first() else {
+        failures.push(RegressionFailure::EmptyStream { stream });
+        return None;
+    };
+    if first.is_empty() {
+        failures.push(RegressionFailure::EmptyStream { stream });
+        return None;
+    }
+    let expected_len = first.len();
+    let len = ranks
+        .iter()
+        .enumerate()
+        .map(|(rank, rows)| {
+            if rows.len() != expected_len {
+                failures.push(RegressionFailure::RankStepCountMismatch {
+                    stream,
+                    rank,
+                    expected: expected_len,
+                    observed: rows.len(),
+                });
+            }
+            rows.len()
+        })
+        .min()
+        .unwrap_or(0);
+    if len == 0 {
+        failures.push(RegressionFailure::EmptyStream { stream });
+        None
+    } else {
+        Some(len)
+    }
+}
+
+fn check_required_rank_telemetry(
+    stream: &'static str,
+    ranks: &[Vec<Metrics>],
+    budget: &RegressionBudget,
+    failures: &mut Vec<RegressionFailure>,
+) {
+    if budget.require_timing
+        && ranks
+            .iter()
+            .flat_map(|rows| rows.iter())
+            .any(|m| !m.step_secs.is_finite() || m.step_secs <= 0.0)
+    {
+        failures.push(RegressionFailure::TimingMissing { stream });
+    }
+    if budget.require_cuda_memory
+        && ranks
+            .iter()
+            .flat_map(|rows| rows.iter())
+            .any(|m| m.cuda_mem_peak_used_bytes == 0)
+    {
+        failures.push(RegressionFailure::CudaMemoryMissing { stream });
+    }
+    if budget.max_cuda_peak_delta_ratio.is_some()
+        && ranks
+            .iter()
+            .flat_map(|rows| rows.iter())
+            .any(|m| m.cuda_mem_peak_delta_bytes == 0)
+    {
+        failures.push(RegressionFailure::CudaMemoryMissing { stream });
+    }
+}
+
+fn validate_distributed_step_index(
+    stream: &'static str,
+    ranks: &[Vec<Metrics>],
+    row: usize,
+    failures: &mut Vec<RegressionFailure>,
+) {
+    let expected_step = ranks[0][row].step;
+    for (rank, rows) in ranks.iter().enumerate().skip(1) {
+        let observed = rows[row].step;
+        if observed != expected_step {
+            failures.push(RegressionFailure::RankStepIndexMismatch {
+                stream,
+                row,
+                rank,
+                expected: expected_step,
+                observed,
+            });
+        }
+    }
+}
+
+fn aggregate_world_row(ranks: &[Vec<Metrics>], row: usize) -> Metrics {
+    let mut out = ranks[0][row].clone();
+    let rank_count = ranks.len() as f32;
+    let rows = ranks.iter().map(|rank| &rank[row]);
+
+    out.reward_mean = mean_f32(rows.clone().map(|m| m.reward_mean));
+    out.reward_std = max_f32(rows.clone().map(|m| m.reward_std));
+    out.frac_reward_zero_std = max_f32(rows.clone().map(|m| m.frac_reward_zero_std));
+    out.kl = mean_f32(rows.clone().map(|m| m.kl));
+    out.clip_ratio = mean_f32(rows.clone().map(|m| m.clip_ratio));
+    out.frac_truncated = mean_f32(rows.clone().map(|m| m.frac_truncated));
+    out.completion_len = mean_f32(rows.clone().map(|m| m.completion_len));
+    out.rollout_ratio_mean = mean_f32(rows.clone().map(|m| m.rollout_ratio_mean));
+    out.rollout_logratio_mean = mean_f32(rows.clone().map(|m| m.rollout_logratio_mean));
+    out.rollout_ratio_max = max_f32(rows.clone().map(|m| m.rollout_ratio_max));
+    out.frac_rollout_ratio_capped = mean_f32(rows.clone().map(|m| m.frac_rollout_ratio_capped));
+    out.rollout_capture_tokens = rows.clone().map(|m| m.rollout_capture_tokens).sum();
+    out.dropped_rows = rows.clone().map(|m| m.dropped_rows).sum();
+    out.grad_norm = if rows
+        .clone()
+        .all(|m| m.grad_norm.is_finite() && m.grad_norm > 0.0)
+    {
+        rows.clone().map(|m| m.grad_norm).sum::<f32>() / rank_count
+    } else {
+        0.0
+    };
+    out.lr = mean_f32(rows.clone().map(|m| m.lr));
+    out.step_secs = max_f32(rows.clone().map(|m| m.step_secs));
+    out.tokens_per_sec = rows.clone().map(|m| m.tokens_per_sec).sum();
+    out.cuda_mem_start_used_bytes = rows
+        .clone()
+        .map(|m| m.cuda_mem_start_used_bytes)
+        .max()
+        .unwrap_or(0);
+    out.cuda_mem_peak_used_bytes = rows
+        .clone()
+        .map(|m| m.cuda_mem_peak_used_bytes)
+        .max()
+        .unwrap_or(0);
+    out.cuda_mem_end_used_bytes = rows
+        .clone()
+        .map(|m| m.cuda_mem_end_used_bytes)
+        .max()
+        .unwrap_or(0);
+    out.cuda_mem_total_bytes = rows
+        .clone()
+        .map(|m| m.cuda_mem_total_bytes)
+        .min()
+        .unwrap_or(0);
+    out.cuda_mem_peak_delta_bytes = rows.map(|m| m.cuda_mem_peak_delta_bytes).max().unwrap_or(0);
+    out
 }
 
 fn compare_aligned_rows(
@@ -1441,6 +1746,24 @@ fn required_peak(history: &[Metrics], f: impl Fn(&Metrics) -> u64) -> Option<u64
 
 fn allowed_bytes(baseline: u64, ratio: f64, slack: u64) -> u64 {
     ((baseline as f64) * ratio).ceil() as u64 + slack
+}
+
+fn mean_f32(values: impl IntoIterator<Item = f32>) -> f32 {
+    let mut count = 0_usize;
+    let mut sum = 0.0_f32;
+    for value in values {
+        count += 1;
+        sum += value;
+    }
+    if count == 0 {
+        0.0
+    } else {
+        sum / count as f32
+    }
+}
+
+fn max_f32(values: impl IntoIterator<Item = f32>) -> f32 {
+    values.into_iter().reduce(f32::max).unwrap_or(0.0)
 }
 
 fn relative_drift(baseline: f32, candidate: f32) -> f32 {
@@ -2107,6 +2430,37 @@ mod tests {
     }
 
     #[test]
+    fn compare_metrics_allows_unchanged_health_warnings() {
+        let mut hist = vec![perf_metric(0, 1.0, 2.0, 1000, 100)];
+        hist[0].dropped_rows = 2;
+
+        let report = compare_metrics(&hist, &hist, &perf_budget());
+        assert!(report.passed, "failures: {:?}", report.failures);
+        assert_eq!(
+            report.baseline.as_ref().unwrap().anomalies,
+            vec![Anomaly::DroppedRows { total: 2 }]
+        );
+    }
+
+    #[test]
+    fn compare_metrics_fails_health_warning_regressions() {
+        let mut base = vec![perf_metric(0, 1.0, 2.0, 1000, 100)];
+        base[0].dropped_rows = 1;
+        let mut candidate = vec![perf_metric(0, 1.0, 2.0, 1000, 100)];
+        candidate[0].dropped_rows = 2;
+
+        let report = compare_metrics(&base, &candidate, &perf_budget());
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|f| matches!(f, RegressionFailure::HealthWarnings { .. })),
+            "failures: {:?}",
+            report.failures
+        );
+    }
+
+    #[test]
     fn compare_metrics_fails_empty_and_misaligned_streams() {
         let hist = vec![perf_metric(0, 1.0, 2.0, 1000, 100)];
         let empty = compare_metrics(&[], &hist, &perf_budget());
@@ -2199,6 +2553,163 @@ mod tests {
                     stream: "candidate"
                 }
             )),
+            "failures: {:?}",
+            report.failures
+        );
+    }
+
+    #[test]
+    fn compare_distributed_metrics_uses_world_max_cuda_peak() {
+        let base_rank0 = vec![perf_metric(0, 1.0, 2.0, 1000, 100)];
+        let base_rank1 = vec![perf_metric(0, 1.0, 2.0, 2000, 200)];
+        let cand_rank0 = vec![perf_metric(0, 1.0, 2.0, 2000, 200)];
+        let cand_rank1 = vec![perf_metric(0, 1.0, 2.0, 2000, 200)];
+        let budget = RegressionBudget {
+            max_cuda_peak_used_ratio: 1.0,
+            max_cuda_peak_used_abs_slack_bytes: 0,
+            max_cuda_peak_delta_ratio: Some(1.0),
+            max_cuda_peak_delta_abs_slack_bytes: 0,
+            ..perf_budget()
+        };
+
+        let rankwise = compare_metrics(&base_rank0, &cand_rank0, &budget);
+        assert!(
+            rankwise
+                .failures
+                .iter()
+                .any(|f| matches!(f, RegressionFailure::CudaPeakRegression { .. })),
+            "rank-wise comparison should fail: {:?}",
+            rankwise.failures
+        );
+
+        let distributed = compare_distributed_metrics(
+            &[base_rank0, base_rank1],
+            &[cand_rank0, cand_rank1],
+            &budget,
+        );
+        assert!(
+            distributed.passed,
+            "world-max comparison should pass: {:?}",
+            distributed.failures
+        );
+        assert_eq!(
+            distributed
+                .baseline
+                .as_ref()
+                .unwrap()
+                .max_cuda_mem_peak_used_bytes,
+            2000
+        );
+        assert_eq!(
+            distributed
+                .candidate
+                .as_ref()
+                .unwrap()
+                .max_cuda_mem_peak_used_bytes,
+            2000
+        );
+    }
+
+    #[test]
+    fn compare_distributed_metrics_fails_missing_rank_cuda_memory() {
+        let base = vec![
+            vec![perf_metric(0, 1.0, 2.0, 1000, 100)],
+            vec![perf_metric(0, 1.0, 2.0, 2000, 200)],
+        ];
+        let candidate = vec![
+            vec![perf_metric(0, 1.0, 2.0, 1000, 100)],
+            vec![perf_metric(0, 1.0, 2.0, 0, 200)],
+        ];
+
+        let report = compare_distributed_metrics(&base, &candidate, &perf_budget());
+        assert!(
+            report.failures.iter().any(|f| matches!(
+                f,
+                RegressionFailure::CudaMemoryMissing {
+                    stream: "candidate"
+                }
+            )),
+            "failures: {:?}",
+            report.failures
+        );
+    }
+
+    #[test]
+    fn compare_distributed_metrics_fails_rank_local_health_regressions() {
+        let base = vec![
+            vec![perf_metric(0, 1.0, 2.0, 1000, 100)],
+            vec![perf_metric(0, 1.0, 2.0, 1000, 100)],
+        ];
+        let mut candidate = base.clone();
+        candidate[0][0].rollout_capture_tokens = 0;
+
+        let report = compare_distributed_metrics(&base, &candidate, &perf_budget());
+        assert!(
+            report.failures.iter().any(|f| matches!(
+                f,
+                RegressionFailure::RankHealthWarnings {
+                    rank: 0,
+                    baseline: 0,
+                    candidate: 1,
+                }
+            )),
+            "failures: {:?}",
+            report.failures
+        );
+        assert!(
+            !report
+                .failures
+                .iter()
+                .any(|f| matches!(f, RegressionFailure::HealthWarnings { .. })),
+            "aggregate health should not be the failing signal: {:?}",
+            report.failures
+        );
+
+        let permissive = RegressionBudget {
+            allow_health_warnings: true,
+            ..perf_budget()
+        };
+        let allowed = compare_distributed_metrics(&base, &candidate, &permissive);
+        assert!(allowed.passed, "failures: {:?}", allowed.failures);
+    }
+
+    #[test]
+    fn compare_distributed_metrics_fails_rank_shape_mismatches() {
+        let base = vec![
+            vec![perf_metric(0, 1.0, 2.0, 1000, 100)],
+            vec![
+                perf_metric(0, 1.0, 2.0, 1000, 100),
+                perf_metric(1, 1.0, 2.0, 1000, 100),
+            ],
+        ];
+        let candidate = vec![
+            vec![perf_metric(0, 1.0, 2.0, 1000, 100)],
+            vec![perf_metric(7, 1.0, 2.0, 1000, 100)],
+            vec![perf_metric(0, 1.0, 2.0, 1000, 100)],
+        ];
+
+        let report = compare_distributed_metrics(&base, &candidate, &perf_budget());
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|f| matches!(f, RegressionFailure::RankCountMismatch { .. })),
+            "failures: {:?}",
+            report.failures
+        );
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|f| matches!(f, RegressionFailure::RankStepCountMismatch { .. })),
+            "failures: {:?}",
+            report.failures
+        );
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|f| matches!(f, RegressionFailure::RankStepIndexMismatch { .. })),
             "failures: {:?}",
             report.failures
         );
