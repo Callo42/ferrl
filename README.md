@@ -283,7 +283,7 @@ runs/<run_id>/
 │                     #   rollout_ratio_mean, rollout_logratio_mean,
 │                     #   rollout_ratio_max, frac_rollout_ratio_capped,
 │                     #   rollout_capture_tokens, dropped_rows, grad_norm, lr,
-│                     #   step_secs, tokens_per_sec
+│                     #   step_secs, tokens_per_sec, cuda_mem_* when enabled
 ├── checkpoints/      # LoRA checkpoints
 └── run.log           # human-readable log
 ```
@@ -295,6 +295,23 @@ is git-ignored. The on-disk layout is created by [`ferrl::telemetry::RunDir`] an
 are appended by `ferrl::telemetry::MetricsWriter`; the `ferrl runreport` subcommand reads a
 run's `metrics.jsonl` and prints a health summary — reward trend, throughput, and grad-norm
 anomalies (human, `--json`, or `--strict`).
+
+For manual GPU resource gates, run the same smoke or training command on a baseline
+commit and a candidate commit, then compare their per-rank metrics with `perf-gate`:
+
+```sh
+ferrl perf-gate --baseline runs/main-rank0 --candidate runs/pr-rank0 \
+  --max-peak-mem-regression-pct 0 \
+  --max-step-secs-regression-pct 10 \
+  --max-final-grad-norm-rel-drift 0.0001
+```
+
+The gate fails closed if the streams are empty, steps are misaligned, `grad_norm` never
+goes positive, or required timing / CUDA memory probes are absent. Run baseline and
+candidate on the same GPU model, world size, cargo features, and command. DP metrics are
+per rank for memory and throughput, so compare matching rank streams; the stable
+`NCCL_TINY_QWEN35_SMOKE` rows are still useful for humans, but the public comparator reads
+`metrics.jsonl`.
 
 ---
 
