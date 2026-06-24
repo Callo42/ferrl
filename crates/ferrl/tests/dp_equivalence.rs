@@ -31,7 +31,10 @@
 //! (deterministic policies here; and under global-index seeding the rank-0
 //! sampler-blob is anyway sufficient — a stochastic resume re-derives every
 //! rank's per-row draws from the restored run seed and the recomputed global
-//! index, with no per-rank RNG state to capture).
+//! index, with no per-rank RNG state to capture). A manual ignored
+//! `--features nccl` smoke at the bottom runs the same tiny qwen3.5 path over
+//! real CUDA/NCCL ranks and prints memory/timing fields for resource regression
+//! checks.
 
 use candle_core::{DType, Device, Result as CandleResult, Tensor, Var, D};
 use candle_nn::ops::log_softmax;
@@ -1266,6 +1269,32 @@ fn lora_policy(seed: u64) -> Qwen3_5Policy {
     policy
 }
 
+#[cfg(feature = "nccl")]
+fn lora_policy_on_device(seed: u64, dtype: DType, device: &Device) -> Qwen3_5Policy {
+    let dir = fixture_dir();
+    let cfg = Qwen3_5Config::from_json_file(dir.join("config.json")).unwrap();
+    let vb = varbuilder_from_pretrained(&dir, dtype, device).unwrap();
+    let mut model =
+        Qwen3_5GradModel::load_with_adapter_dtype(&cfg, &vb, 2, 4.0, DType::F32).unwrap();
+    model.set_activation_checkpointing(true);
+    let policy = Qwen3_5Policy::new(model, seed, 1.0);
+    for (k, v) in policy.trainable_vars().iter().enumerate() {
+        let dims = v.as_tensor().dims().to_vec();
+        let n: usize = dims.iter().product();
+        let fill: Vec<f32> = (0..n)
+            .map(|i| {
+                let z = (i as u64)
+                    .wrapping_mul(2_654_435_761)
+                    .wrapping_add((k as u64 + 1).wrapping_mul(seed.wrapping_mul(40_503)));
+                ((z % 1000) as f32 / 1000.0 - 0.5) * 0.04
+            })
+            .collect();
+        v.set(&Tensor::from_vec(fill, dims, device).unwrap())
+            .unwrap();
+    }
+    policy
+}
+
 fn full_ft_policy(seed: u64) -> Qwen3_5Policy {
     let dir = fixture_dir();
     let cfg = Qwen3_5Config::from_json_file(dir.join("config.json")).unwrap();
@@ -1340,4 +1369,84 @@ fn dp_ranks_stay_in_bitwise_lockstep_on_real_qwen35_lora() {
 #[test]
 fn dp_ranks_stay_in_bitwise_lockstep_on_real_qwen35_full_ft() {
     assert_real_model_lockstep("lockstep-full-ft", full_ft_policy);
+}
+
+/// Manual resource-regression smoke for the trainer's CUDA/NCCL update path.
+///
+/// Launch one process per rank under Slurm, with a shared `FERRL_NCCL_RENDEZVOUS`.
+/// The test uses the committed tiny qwen3.5 fixture so it is cheap, deterministic,
+/// and asset-free, while still reaching rollout -> backward -> gradient all-reduce
+/// -> optimizer over real CUDA tensors. The printed `NCCL_TINY_QWEN35_SMOKE` rows
+/// are intentionally stable for external branch-vs-main parsers.
+#[cfg(feature = "nccl")]
+#[test]
+#[ignore = "manual CUDA/NCCL resource gate; launch one process per rank under Slurm"]
+#[allow(clippy::print_stderr)] // manual gate: the printed memory/timing rows are the deliverable
+fn nccl_tiny_qwen35_lora_smoke_reaches_update_path() {
+    let comm = ferrl::NcclComm::from_slurm_env().expect("bootstrap NCCL from Slurm env");
+    let rank = comm.rank();
+    let world = comm.world_size();
+    let device = comm.device().clone();
+    if let Some(warning) = ferrl::check_driver_compat(&device).warning() {
+        eprintln!("{warning}");
+    }
+    ferrl::guard_first_kernel(&device).expect("CUDA first-kernel guard");
+
+    let mut policy = lora_policy_on_device(7, DType::BF16, &device);
+    let cfg = TrainerConfig {
+        steps: 2,
+        group_size: 2,
+        max_new_tokens: 3,
+        temperature: 1.0,
+        beta: 0.0,
+        mu: 1,
+        lr: 1e-3,
+        loss_type: LossType::Grpo,
+        gpu_memory_probe: true,
+        ..TrainerConfig::default()
+    };
+    let root = std::env::var_os("FERRL_NCCL_SMOKE_RUN_ROOT").map_or_else(
+        || std::env::temp_dir().join(format!("ferrl-nccl-smoke-{}", std::process::id())),
+        PathBuf::from,
+    );
+    std::fs::create_dir_all(&root).unwrap();
+    let run = RunDir::create(&root, format!("rank{rank}")).unwrap();
+    let mut trainer = Trainer::with_comm(cfg, &run, comm).unwrap();
+    let samples = ["abc", "bcd"]
+        .map(|s| Sample::new(s, ()))
+        .into_iter()
+        .collect::<Vec<Sample<()>>>();
+
+    let history = trainer
+        .train(&mut policy, &SpreadReward, &ByteCodec, &samples)
+        .expect("NCCL tiny qwen3.5 GRPO smoke failed")
+        .0;
+
+    assert_eq!(history.len(), 2);
+    assert!(
+        history
+            .iter()
+            .any(|m| m.grad_norm > 0.0 && m.grad_norm.is_finite()),
+        "NCCL smoke reached no real optimizer update"
+    );
+    for m in history {
+        assert!(
+            m.cuda_mem_peak_used_bytes >= m.cuda_mem_start_used_bytes,
+            "memory probe did not record a valid peak at step {}",
+            m.step
+        );
+        eprintln!(
+            "NCCL_TINY_QWEN35_SMOKE rank={rank} world={world} step={} grad_norm={} \
+             step_secs={} tokens_per_sec={} cuda_start={} cuda_peak={} cuda_end={} \
+             cuda_delta={}",
+            m.step,
+            m.grad_norm,
+            m.step_secs,
+            m.tokens_per_sec,
+            m.cuda_mem_start_used_bytes,
+            m.cuda_mem_peak_used_bytes,
+            m.cuda_mem_end_used_bytes,
+            m.cuda_mem_peak_delta_bytes
+        );
+    }
 }
