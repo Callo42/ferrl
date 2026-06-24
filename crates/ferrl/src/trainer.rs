@@ -961,6 +961,13 @@ struct UpdateCtx<'a> {
     gpu_mem: &'a mut StepGpuMemory,
 }
 
+/// Bound the number of per-var gradient tensors reduced in one DP collective.
+///
+/// The real NCCL path materializes a reduced destination buffer for each source tensor, so a
+/// single all-vars collective briefly doubles the accumulated-gradient footprint. Chunking keeps
+/// that peak bounded while preserving a deterministic collective order across ranks.
+const GRAD_REDUCE_CHUNK: usize = 16;
+
 /// Why a preemption-aware run returned — distinguishes a run that reached
 /// `config.steps` from one the cooperative preemption flag stopped early.
 ///
@@ -2084,7 +2091,6 @@ impl Trainer {
         let vars = ctx.vars;
         let mut acc: Vec<Option<Tensor>> = vec![None; vars.len()];
         let mut covered = vec![true; vars.len()];
-        let mut container: Option<GradStore> = None;
         let mut sum_kl = 0.0_f32;
         let mut sum_clip = 0.0_f32;
         for item in live {
@@ -2094,7 +2100,6 @@ impl Trainer {
             sum_kl += kl;
             sum_clip += clip_frac;
             fold_var_grads(vars, &grads, &mut acc, &mut covered)?;
-            container = Some(grads);
         }
         let (kl, clip_frac, uncovered_global) = if self.comm.world_size() > 1 {
             ctx.gpu_mem.record("grad_all_reduce_start");
@@ -2107,18 +2112,13 @@ impl Trainer {
             )
         };
         ctx.gpu_mem.record("grad_all_reduce_end");
-        // Reuse the last backward's store as the optimizer container, overwriting its
-        // trainable-var entries with the accumulated sums (and dropping any var absent
-        // from some prompt so the canary catches the silent-skip). A rank whose local
-        // shard is empty (DP, all-degenerate shard) has no backward to reuse — candle
-        // exposes no public `GradStore` constructor, so mint one from a throwaway
-        // one-node backward (its stray entry is harmless: only var entries are read
-        // downstream).
-        let store = match container {
-            Some(store) => store,
-            None => empty_grad_store(vars)?,
-        };
-        let mut store = combine_into_store(vars, store, &acc, &covered);
+        ctx.gpu_mem.record("grad_store_compact_start");
+        // Build a fresh tiny store instead of reusing the last backward's full store. Candle's
+        // backward store also contains unrelated intermediate-node gradients; keeping it alive
+        // through the reduce/optimizer handoff was pure peak-memory pressure.
+        let store = empty_grad_store(vars)?;
+        let mut store = combine_into_store(vars, store, &mut acc, &covered);
+        ctx.gpu_mem.record("grad_store_compact_end");
         let cov = grad_coverage(vars, &store)?;
         // Fatal: a missing var (candle's silent-skip landmine — an absent grad entry)
         // or a non-finite accumulated gradient (a blowup).
@@ -2186,16 +2186,19 @@ impl Trainer {
         sum_clip: f32,
         n_live_global: f64,
     ) -> Result<(f32, f32, f64), TrainerError> {
-        let mut flat = Vec::with_capacity(vars.len());
-        for (i, v) in vars.iter().enumerate() {
-            flat.push(match &acc[i] {
-                Some(g) => g.clone(),
-                None => v.as_tensor().zeros_like()?,
-            });
-        }
-        self.comm.all_reduce_sum(&mut flat)?;
-        for (slot, g) in acc.iter_mut().zip(flat) {
-            *slot = Some(g);
+        for start in (0..vars.len()).step_by(GRAD_REDUCE_CHUNK) {
+            let end = (start + GRAD_REDUCE_CHUNK).min(vars.len());
+            let mut flat = Vec::with_capacity(end - start);
+            for i in start..end {
+                flat.push(match acc[i].take() {
+                    Some(g) => g,
+                    None => vars[i].as_tensor().zeros_like()?,
+                });
+            }
+            self.comm.all_reduce_sum(&mut flat)?;
+            for (slot, g) in acc[start..end].iter_mut().zip(flat) {
+                *slot = Some(g);
+            }
         }
         let uncovered_local = covered.iter().filter(|c| !**c).count() as f64;
         let uncovered_global = self.comm.all_reduce_scalar_sum(uncovered_local)?;
@@ -2630,23 +2633,22 @@ fn fold_var_grads(
     Ok(())
 }
 
-/// Build the optimizer's gradient store for an accumulation window by overwriting
-/// `store`'s trainable-var entries with the accumulated sums in `acc`. A var marked
-/// uncovered (absent from some prompt's backward) is left out entirely so
-/// [`grad_coverage`] flags it. `store` (reused from the last prompt's backward) also
-/// carries unrelated intermediate-node grads; the optimizer and canary read only the
-/// var entries, so those are harmless.
+/// Build the optimizer's gradient store for an accumulation window by moving the accumulated
+/// per-var sums out of `acc`. A var marked uncovered (absent from some prompt's backward) is left
+/// out entirely so [`grad_coverage`] flags it; its accumulator slot is still consumed because the
+/// window will abort before any optimizer step.
 fn combine_into_store(
     vars: &[Var],
     mut store: GradStore,
-    acc: &[Option<Tensor>],
+    acc: &mut [Option<Tensor>],
     covered: &[bool],
 ) -> GradStore {
     for (i, v) in vars.iter().enumerate() {
         store.remove(v.as_tensor());
+        let grad = acc[i].take();
         if covered[i] {
-            if let Some(g) = &acc[i] {
-                store.insert(v.as_tensor(), g.clone());
+            if let Some(g) = grad {
+                store.insert(v.as_tensor(), g);
             }
         }
     }
@@ -5194,6 +5196,153 @@ mod tests {
             !covered[1] && acc[1].is_none(),
             "y must be flagged uncovered"
         );
+    }
+
+    #[test]
+    fn combine_into_store_consumes_accumulators_and_omits_uncovered_vars() {
+        let dev = cpu();
+        let x = Var::from_tensor(&Tensor::from_vec(vec![1.0f64], (1,), &dev).unwrap()).unwrap();
+        let y = Var::from_tensor(&Tensor::from_vec(vec![2.0f64], (1,), &dev).unwrap()).unwrap();
+        let vars = vec![x.clone(), y.clone()];
+        let mut acc = vec![
+            Some(Tensor::from_vec(vec![3.0f64], (1,), &dev).unwrap()),
+            Some(Tensor::from_vec(vec![4.0f64], (1,), &dev).unwrap()),
+        ];
+        let covered = vec![true, false];
+
+        let store = empty_grad_store(&vars).unwrap();
+        let store = combine_into_store(&vars, store, &mut acc, &covered);
+
+        assert!(
+            acc.iter().all(Option::is_none),
+            "all accumulator slots are moved out"
+        );
+        assert_eq!(
+            store.get(x.as_tensor()).unwrap().to_vec1::<f64>().unwrap(),
+            vec![3.0]
+        );
+        assert!(
+            store.get(y.as_tensor()).is_none(),
+            "uncovered vars must stay absent so the canary fails loud"
+        );
+    }
+
+    #[test]
+    fn reduce_epoch_reduces_gradients_across_chunk_boundary() {
+        std::thread::scope(|scope| {
+            let comms = crate::comm::LocalComm::world(2);
+            let handles: Vec<_> = comms
+                .into_iter()
+                .enumerate()
+                .map(|(rank, comm)| {
+                    scope.spawn(move || {
+                        let tmp = WireTmp::new(&format!("chunked-reduce-{rank}"));
+                        let run = RunDir::create(&tmp.0, format!("rank-{rank}")).unwrap();
+                        let trainer =
+                            Trainer::with_comm(TrainerConfig::default(), &run, comm).unwrap();
+                        let dev = cpu();
+                        let vars: Vec<Var> = (0..(GRAD_REDUCE_CHUNK + 2))
+                            .map(|i| {
+                                Var::from_tensor(
+                                    &Tensor::from_vec(vec![i as f32], (1,), &dev).unwrap(),
+                                )
+                                .unwrap()
+                            })
+                            .collect();
+                        let mut acc: Vec<Option<Tensor>> = (0..vars.len())
+                            .map(|i| {
+                                let local = if rank == 0 {
+                                    i as f32
+                                } else {
+                                    100.0 + i as f32
+                                };
+                                Some(Tensor::from_vec(vec![local], (1,), &dev).unwrap())
+                            })
+                            .collect();
+                        let covered = vec![true; vars.len()];
+
+                        let (kl, clip, uncovered) = trainer
+                            .reduce_epoch(&vars, &mut acc, &covered, rank as f32 + 1.0, 4.0, 2.0)
+                            .unwrap();
+                        let got: Vec<f32> = acc
+                            .iter()
+                            .map(|slot| slot.as_ref().unwrap().to_vec1::<f32>().unwrap()[0])
+                            .collect();
+                        (kl, clip, uncovered, got)
+                    })
+                })
+                .collect();
+
+            for h in handles {
+                let (kl, clip, uncovered, got) = h.join().unwrap();
+                assert_eq!(uncovered, 0.0);
+                assert_relative_eq!(kl, 1.5, epsilon = 1e-6);
+                assert_relative_eq!(clip, 4.0, epsilon = 1e-6);
+                for (i, value) in got.iter().enumerate() {
+                    assert_relative_eq!(*value, 100.0 + 2.0 * i as f32, epsilon = 1e-6);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn reduce_epoch_treats_empty_peer_shard_as_zeros_across_chunk_boundary() {
+        std::thread::scope(|scope| {
+            let comms = crate::comm::LocalComm::world(2);
+            let handles: Vec<_> = comms
+                .into_iter()
+                .enumerate()
+                .map(|(rank, comm)| {
+                    scope.spawn(move || {
+                        let tmp = WireTmp::new(&format!("chunked-empty-shard-{rank}"));
+                        let run = RunDir::create(&tmp.0, format!("rank-{rank}")).unwrap();
+                        let trainer =
+                            Trainer::with_comm(TrainerConfig::default(), &run, comm).unwrap();
+                        let dev = cpu();
+                        let vars: Vec<Var> = (0..(GRAD_REDUCE_CHUNK + 2))
+                            .map(|i| {
+                                Var::from_tensor(
+                                    &Tensor::from_vec(vec![i as f32], (1,), &dev).unwrap(),
+                                )
+                                .unwrap()
+                            })
+                            .collect();
+                        let mut acc: Vec<Option<Tensor>> = if rank == 0 {
+                            (0..vars.len())
+                                .map(|i| {
+                                    Some(
+                                        Tensor::from_vec(vec![10.0 + i as f32], (1,), &dev)
+                                            .unwrap(),
+                                    )
+                                })
+                                .collect()
+                        } else {
+                            vec![None; vars.len()]
+                        };
+                        let covered = vec![true; vars.len()];
+
+                        let (kl, clip, uncovered) = trainer
+                            .reduce_epoch(&vars, &mut acc, &covered, rank as f32 + 1.0, 4.0, 2.0)
+                            .unwrap();
+                        let got: Vec<f32> = acc
+                            .iter()
+                            .map(|slot| slot.as_ref().unwrap().to_vec1::<f32>().unwrap()[0])
+                            .collect();
+                        (kl, clip, uncovered, got)
+                    })
+                })
+                .collect();
+
+            for h in handles {
+                let (kl, clip, uncovered, got) = h.join().unwrap();
+                assert_eq!(uncovered, 0.0);
+                assert_relative_eq!(kl, 1.5, epsilon = 1e-6);
+                assert_relative_eq!(clip, 4.0, epsilon = 1e-6);
+                for (i, value) in got.iter().enumerate() {
+                    assert_relative_eq!(*value, 10.0 + i as f32, epsilon = 1e-6);
+                }
+            }
+        });
     }
 
     // ---- finite-difference gradcheck of the GRPO loss ----------------------
