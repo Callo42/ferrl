@@ -1772,6 +1772,7 @@ impl Trainer {
         prompt_index: u64,
         completions: &[String],
         rewards: &[f32],
+        reward_diagnostics: &[Option<String>],
         rollout: &Rollout,
     ) -> Result<(), TrainerError> {
         let k = self.config.candidate_log_top_k.min(completions.len());
@@ -1796,6 +1797,7 @@ impl Trainer {
                 group_index,
                 reward: rewards[group_index],
                 completion_len_tokens: rollout.completion_lens[group_index],
+                reward_diagnostic: reward_diagnostics[group_index].clone(),
                 completion: completions[group_index].clone(),
             })?;
         }
@@ -1971,11 +1973,19 @@ impl Trainer {
         }
         let completions = decode_completions(&rollout, tokenizer);
         gpu_mem.record("reward_start");
-        let rewards = reward_fn.reward_group(selected.sample, &completions)?;
+        let reward_outcomes = reward_fn.reward_group_detailed(selected.sample, &completions)?;
         gpu_mem.record("reward_end");
+        let rewards: Vec<f32> = reward_outcomes
+            .iter()
+            .map(|outcome| outcome.reward)
+            .collect();
+        let reward_diagnostics: Vec<Option<String>> = reward_outcomes
+            .into_iter()
+            .map(|outcome| outcome.diagnostic)
+            .collect();
         if rewards.len() != rollout.len() {
             return Err(TrainerError::Contract(format!(
-                "reward_group returned {} rewards for {} completions",
+                "reward_group_detailed returned {} rewards for {} completions",
                 rewards.len(),
                 rollout.len()
             )));
@@ -1985,6 +1995,7 @@ impl Trainer {
             selected.selection.prompt_index,
             &completions,
             &rewards,
+            &reward_diagnostics,
             &rollout,
         )?;
 
@@ -4941,6 +4952,23 @@ mod tests {
                 _ => 1.0,
             })
         }
+
+        fn reward_group_detailed(
+            &self,
+            sample: &Sample<()>,
+            completions: &[String],
+        ) -> Result<Vec<crate::RewardOutcome>, RewardError> {
+            completions
+                .iter()
+                .map(|completion| {
+                    let reward = self.reward(sample, completion)?;
+                    Ok(crate::RewardOutcome {
+                        reward,
+                        diagnostic: Some(format!("candidate:{completion}")),
+                    })
+                })
+                .collect()
+        }
     }
 
     #[test]
@@ -4984,10 +5012,12 @@ mod tests {
             ),
             (0, 0, 1, 2.0, 2, "9,9")
         );
+        assert_eq!(rec0.reward_diagnostic.as_deref(), Some("candidate:9,9"));
         assert_eq!(
             (rec1.group_index, rec1.reward, rec1.completion.as_str()),
             (2, 1.0, "2,2")
         );
+        assert_eq!(rec1.reward_diagnostic.as_deref(), Some("candidate:2,2"));
     }
 
     // ---- completion_lens consumption (length-aware mask / decode / metric) --

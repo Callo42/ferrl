@@ -9,7 +9,11 @@ The contract applies to runs of `ferrl train --config <run.json>` where `task` i
 `trainer.candidate_log_top_k` high enough to persist the best sampled completions
 in `candidates.jsonl`; that ledger is the source for the raw completion and the
 `--step` / `--prompt-index` / `--group-index` / `--rank` / `--world-size`
-coordinates passed to artifact extraction. The extraction command is `ferrl
+coordinates passed to artifact extraction. TriMul candidate rows may also include
+`reward_diagnostic` (for example no submission, test failure, no pass grade, sandbox
+timeout, or missing/implausible benchmark data); preserve it in the run report when
+explaining zero-reward tails. For zero-tail triage, set `candidate_log_top_k >=
+group_size` so every sampled completion is retained. The extraction command is `ferrl
 trimul-artifact --config <run.json> --completion <raw.txt> --out <artifact-dir>
 --run-id <run-id> --step <step> --prompt-index <prompt-index> --group-index
 <group-index> --rank <rank> --world-size <world-size> --training-reward <reward>
@@ -33,7 +37,7 @@ with the final report:
 | cases | `task.yml` identity and the loaded counts for `tests` and `benchmarks`. |
 | seeds | `data.seed`, `policy.seed`, trainer seed-bearing knobs, and the training `trimul.secret_seed`. |
 | scratch cap | `trimul.scratch_max_bytes`; `0` means the ferrl default, currently 1 GiB. |
-| candidate ledger | `trainer.candidate_log_top_k`; use a positive value for discovery runs so top completions are persisted in `candidates.jsonl`. |
+| candidate ledger | `trainer.candidate_log_top_k`; use a positive value for discovery runs, and use at least `group_size` when diagnosing zero-reward tails so all completions are persisted in `candidates.jsonl`; retain any `reward_diagnostic` values in the report. |
 | hardware | GPU product name reported by the baseline command and visible CUDA device count. |
 | budget | Trainer `steps`, `group_size`, wall-clock allocation, and the stop condition chosen below. |
 

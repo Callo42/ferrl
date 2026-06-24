@@ -45,6 +45,30 @@ impl RewardError {
     }
 }
 
+/// Scalar reward plus an optional operator-facing diagnostic.
+///
+/// `diagnostic` is intentionally plain text: it is persisted in candidate ledgers to
+/// explain low/zero rewards from external verifiers without making the core trainer
+/// depend on task-specific status enums.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RewardOutcome {
+    /// Scalar reward assigned to one completion.
+    pub reward: f32,
+    /// Optional low-cardinality reason when the reward path can explain the score.
+    pub diagnostic: Option<String>,
+}
+
+impl RewardOutcome {
+    /// Construct an outcome with no diagnostic.
+    #[must_use]
+    pub fn reward(reward: f32) -> Self {
+        Self {
+            reward,
+            diagnostic: None,
+        }
+    }
+}
+
 /// Scores model completions against a typed ground-truth [`Sample`].
 ///
 /// Implementors return one `f32` per completion. Rewards may be any real value
@@ -90,6 +114,28 @@ pub trait RewardFn {
     ) -> Result<Vec<f32>, RewardError> {
         completions.iter().map(|c| self.reward(sample, c)).collect()
     }
+
+    /// Score a batch and optionally explain each score.
+    ///
+    /// The default preserves the historical API by delegating to
+    /// [`Self::reward_group`] and attaching no diagnostics. Verifier-backed rewards
+    /// can override this to make zero rewards fail-visible without running the
+    /// verifier twice.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RewardError`] under the same conditions as [`Self::reward_group`].
+    fn reward_group_detailed(
+        &self,
+        sample: &Sample<Self::Target>,
+        completions: &[String],
+    ) -> Result<Vec<RewardOutcome>, RewardError> {
+        Ok(self
+            .reward_group(sample, completions)?
+            .into_iter()
+            .map(RewardOutcome::reward)
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -122,6 +168,18 @@ mod tests {
             .reward_group(&s, &["a".to_string(), "abcd".to_string()])
             .unwrap();
         assert_eq!(got, vec![1.0, 4.0]);
+    }
+
+    #[test]
+    fn detailed_reward_group_defaults_to_rewards_without_diagnostics() {
+        let r = LenReward;
+        let s = Sample::new("p", ());
+        let got = r
+            .reward_group_detailed(&s, &["a".to_string(), "abcd".to_string()])
+            .unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0], RewardOutcome::reward(1.0));
+        assert_eq!(got[1], RewardOutcome::reward(4.0));
     }
 
     /// Verifies the override path is reachable and used in place of the default.

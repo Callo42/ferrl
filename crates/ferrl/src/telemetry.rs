@@ -587,6 +587,7 @@ pub struct MetricsWriter {
 /// artifact-extraction command without reconstructing candidates from aggregate
 /// metrics.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct CandidateRecord {
     /// Global optimizer step (0-based).
     pub step: u64,
@@ -602,6 +603,13 @@ pub struct CandidateRecord {
     pub reward: f32,
     /// Real completion length in tokens, EOS-inclusive.
     pub completion_len_tokens: usize,
+    /// Optional reward-path diagnostic for this candidate.
+    ///
+    /// Verifier-backed tasks use this to make zero rewards explainable in
+    /// `candidates.jsonl` without bloating aggregate step metrics. Missing means the
+    /// reward implementation did not provide a diagnostic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reward_diagnostic: Option<String>,
     /// Decoded completion text, exactly as passed to the reward.
     pub completion: String,
 }
@@ -2118,6 +2126,7 @@ mod tests {
             group_index: 0,
             reward: 1.0,
             completion_len_tokens: 2,
+            reward_diagnostic: Some("test:fixture".to_string()),
             completion: "candidate".to_string(),
         })
         .unwrap();
@@ -2171,6 +2180,7 @@ mod tests {
             group_index: 1,
             reward: f32::NAN,
             completion_len_tokens: 42,
+            reward_diagnostic: Some("trimul:no_submission".to_string()),
             completion: "```python\ndef custom_kernel(data):\n    return data\n```".to_string(),
         };
         w.append(&rec).unwrap();
@@ -2183,6 +2193,10 @@ mod tests {
         assert_eq!(parsed.step, 3);
         assert_eq!(parsed.group_index, 1);
         assert_eq!(parsed.reward, 0.0);
+        assert_eq!(
+            parsed.reward_diagnostic.as_deref(),
+            Some("trimul:no_submission")
+        );
         assert!(parsed.completion.contains("custom_kernel"));
     }
 
