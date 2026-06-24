@@ -6,6 +6,7 @@
 //! ferrl trimul-baseline --config run.json   # measure the TriMul reference baseline (ns) on this GPU
 //! ferrl trimul-artifact --config run.json --completion raw.txt --out artifact/ ...
 //! ferrl runreport <run-dir> [--json] [--strict]   # one-glance run health summary
+//! ferrl perf-gate --baseline <run-dir> --candidate <run-dir>   # resource regression check
 //! ```
 //!
 //! `train` reads a `RunConfig` (a serialized [`TrainerConfig`](ferrl::TrainerConfig)
@@ -24,6 +25,10 @@
 //! `runreport` folds in the standalone run-summary tool: it reads a run's
 //! `metrics.jsonl` and prints (or emits as JSON) a [`RunSummary`](ferrl::RunSummary),
 //! optionally failing (`--strict`, exit code 2) when any health anomaly is flagged.
+//!
+//! `perf-gate` compares a baseline and candidate metrics stream, failing when
+//! the update path goes dark or peak memory / step time exceed configured
+//! regression thresholds.
 
 // A CLI whose interface *is* its stdout/stderr; the library logs via `tracing`.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
@@ -42,9 +47,9 @@ use tracing::info;
 use ferrl::countdown::{build_prompt, generate_dataset, CountdownConfig, CountdownProblem};
 use ferrl::policy::GenConfig;
 use ferrl::{
-    evaluate, load_auto_policy, read_jsonl, summarize, train_eval_split, CountdownReward,
-    LoaderOpts, MathProblem, MathReward, RewardFn, RunDir, Sample, Trainer, TrainerConfig,
-    TrimulReward,
+    compare_metrics, evaluate, load_auto_policy, read_jsonl, summarize, train_eval_split,
+    CountdownReward, LoaderOpts, MathProblem, MathReward, RegressionBudget, RegressionReport,
+    RewardFn, RunDir, Sample, Trainer, TrainerConfig, TrimulReward,
 };
 
 /// A task's train/eval split: `(train, eval)` samples of the task's target type.
@@ -74,6 +79,8 @@ enum Command {
     TrimulArtifact(Box<TrimulArtifactArgs>),
     /// Print a one-glance health summary for a finished run.
     Runreport(RunreportArgs),
+    /// Compare two finished runs and fail on behavior/resource regression.
+    PerfGate(PerfGateArgs),
 }
 
 /// Arguments for `ferrl train`.
@@ -178,6 +185,47 @@ struct RunreportArgs {
     /// Exit non-zero (code 2) if any health anomaly is flagged.
     #[arg(long)]
     strict: bool,
+}
+
+/// Arguments for `ferrl perf-gate`.
+#[derive(Debug, Args)]
+struct PerfGateArgs {
+    /// Baseline run directory or `metrics.jsonl`.
+    #[arg(long)]
+    baseline: PathBuf,
+    /// Candidate run directory or `metrics.jsonl`.
+    #[arg(long)]
+    candidate: PathBuf,
+    /// Maximum allowed candidate peak-memory regression versus baseline.
+    #[arg(long, default_value_t = 0.0)]
+    max_peak_mem_regression_pct: f64,
+    /// Absolute peak-memory slack in bytes, added after the percent threshold.
+    #[arg(long, default_value_t = 64 * 1024 * 1024)]
+    peak_mem_slack_bytes: u64,
+    /// Maximum allowed candidate mean-step-time regression versus baseline.
+    #[arg(long, default_value_t = 10.0)]
+    max_step_secs_regression_pct: f64,
+    /// Absolute mean-step-time slack in seconds, added after the percent threshold.
+    #[arg(long, default_value_t = 0.0)]
+    step_secs_slack: f64,
+    /// Minimum number of finite positive-grad steps required in each stream.
+    #[arg(long, default_value_t = 1)]
+    min_positive_grad_steps: usize,
+    /// Optional bound for final grad-norm drift, relative to the baseline final grad norm.
+    #[arg(long)]
+    max_final_grad_norm_rel_drift: Option<f64>,
+    /// Do not require CUDA memory telemetry to be present and within threshold.
+    #[arg(long)]
+    skip_memory_check: bool,
+    /// Do not require step timing telemetry to be present and within threshold.
+    #[arg(long)]
+    skip_step_time_check: bool,
+    /// Permit runreport health warnings in either stream.
+    #[arg(long)]
+    allow_health_warnings: bool,
+    /// Emit the gate report as JSON.
+    #[arg(long)]
+    json: bool,
 }
 
 /// Errors surfaced by the `ferrl` CLI.
@@ -1629,6 +1677,96 @@ fn runreport(args: &RunreportArgs) -> Result<ExitCode, CliError> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Dispatch `ferrl perf-gate`: compare baseline and candidate metrics streams.
+fn perf_gate(args: &PerfGateArgs) -> Result<ExitCode, CliError> {
+    let budget = perf_budget(args)?;
+    let baseline = ferrl::read_metrics(resolve_metrics_path(&args.baseline))?;
+    let candidate = ferrl::read_metrics(resolve_metrics_path(&args.candidate))?;
+    let report = compare_metrics(&baseline, &candidate, &budget);
+    if args.json {
+        let s = serde_json::to_string_pretty(&report)
+            .map_err(|e| CliError::msg(format!("serialize perf gate: {e}")))?;
+        println!("{s}");
+    } else {
+        print_perf_gate_report(&report);
+    }
+    if report.passed {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Ok(ExitCode::from(2))
+    }
+}
+
+fn perf_budget(args: &PerfGateArgs) -> Result<RegressionBudget, CliError> {
+    for (label, value) in [
+        (
+            "--max-peak-mem-regression-pct",
+            args.max_peak_mem_regression_pct,
+        ),
+        (
+            "--max-step-secs-regression-pct",
+            args.max_step_secs_regression_pct,
+        ),
+        ("--step-secs-slack", args.step_secs_slack),
+    ] {
+        if !value.is_finite() || value < 0.0 {
+            return Err(CliError::msg(format!("{label} must be finite and >= 0")));
+        }
+    }
+    if let Some(value) = args.max_final_grad_norm_rel_drift {
+        if !value.is_finite() || value < 0.0 {
+            return Err(CliError::msg(
+                "--max-final-grad-norm-rel-drift must be finite and >= 0",
+            ));
+        }
+    }
+    if args.min_positive_grad_steps == 0 {
+        return Err(CliError::msg(
+            "--min-positive-grad-steps must be >= 1 for the strict perf gate",
+        ));
+    }
+    Ok(RegressionBudget {
+        require_live_update: true,
+        require_timing: !args.skip_step_time_check,
+        require_cuda_memory: !args.skip_memory_check,
+        allow_health_warnings: args.allow_health_warnings,
+        warmup_steps: 0,
+        min_positive_grad_steps: args.min_positive_grad_steps,
+        max_mean_step_secs_ratio: 1.0 + (args.max_step_secs_regression_pct as f32 / 100.0),
+        max_mean_step_secs_abs_slack: args.step_secs_slack as f32,
+        max_cuda_peak_used_ratio: 1.0 + args.max_peak_mem_regression_pct / 100.0,
+        max_cuda_peak_used_abs_slack_bytes: args.peak_mem_slack_bytes,
+        max_cuda_peak_delta_ratio: None,
+        max_cuda_peak_delta_abs_slack_bytes: args.peak_mem_slack_bytes,
+        max_final_grad_norm_rel_drift: args.max_final_grad_norm_rel_drift.map(|v| v as f32),
+    })
+}
+
+fn print_perf_gate_report(report: &RegressionReport) {
+    let verdict = if report.passed { "PASS" } else { "FAIL" };
+    println!("perf gate — {verdict}");
+    print_summary_line("baseline", report.baseline.as_ref());
+    print_summary_line("candidate", report.candidate.as_ref());
+    for failure in &report.failures {
+        println!("  FAIL {failure}");
+    }
+}
+
+fn print_summary_line(label: &str, summary: Option<&ferrl::RunSummary>) {
+    let Some(summary) = summary else {
+        println!("  {label:<9} <no metrics>");
+        return;
+    };
+    println!(
+        "  {label:<9} steps={} peak={}MiB delta={}MiB step={:.3}s grad={:.6}",
+        summary.steps,
+        summary.max_cuda_mem_peak_used_bytes / (1024 * 1024),
+        summary.max_cuda_mem_peak_delta_bytes / (1024 * 1024),
+        summary.mean_step_secs,
+        summary.final_grad_norm
+    );
+}
+
 /// If `arg` is a directory, append the run's `metrics.jsonl`; otherwise treat it as
 /// the metrics file path directly.
 fn resolve_metrics_path(arg: &Path) -> PathBuf {
@@ -1646,6 +1784,7 @@ fn main() -> ExitCode {
         Command::TrimulBaseline(args) => trimul_baseline(args).map(|()| ExitCode::SUCCESS),
         Command::TrimulArtifact(args) => trimul_artifact(args).map(|()| ExitCode::SUCCESS),
         Command::Runreport(args) => runreport(args),
+        Command::PerfGate(args) => perf_gate(args),
     };
     match result {
         Ok(code) => code,
@@ -1753,6 +1892,65 @@ mod tests {
             }
             _ => panic!("expected runreport"),
         }
+    }
+
+    /// The clap surface parses the performance-regression gate.
+    #[test]
+    fn clap_parses_perf_gate() {
+        let p = Cli::try_parse_from([
+            "ferrl",
+            "perf-gate",
+            "--baseline",
+            "main/rank0",
+            "--candidate",
+            "pr/rank0",
+            "--max-peak-mem-regression-pct",
+            "1.5",
+            "--max-step-secs-regression-pct",
+            "5",
+            "--max-final-grad-norm-rel-drift",
+            "0.001",
+            "--json",
+        ])
+        .unwrap();
+        let a = expect_perf_gate(p.cmd);
+        assert_eq!(a.baseline, PathBuf::from("main/rank0"));
+        assert_eq!(a.candidate, PathBuf::from("pr/rank0"));
+        assert!(a.json);
+        let budget = perf_budget(&a).unwrap();
+        assert!(budget.require_cuda_memory);
+        assert!(budget.require_timing);
+        assert_eq!(budget.max_cuda_peak_used_ratio, 1.015);
+    }
+
+    fn expect_perf_gate(cmd: Command) -> PerfGateArgs {
+        match cmd {
+            Command::PerfGate(a) => a,
+            _ => panic!("expected perf-gate"),
+        }
+    }
+
+    #[test]
+    fn perf_gate_rejects_zero_positive_grad_requirement() {
+        let args = PerfGateArgs {
+            baseline: PathBuf::from("main/rank0"),
+            candidate: PathBuf::from("pr/rank0"),
+            max_peak_mem_regression_pct: 0.0,
+            peak_mem_slack_bytes: 0,
+            max_step_secs_regression_pct: 10.0,
+            step_secs_slack: 0.0,
+            min_positive_grad_steps: 0,
+            max_final_grad_norm_rel_drift: None,
+            skip_memory_check: false,
+            skip_step_time_check: false,
+            allow_health_warnings: false,
+            json: false,
+        };
+        let err = perf_budget(&args).unwrap_err().to_string();
+        assert!(
+            err.contains("--min-positive-grad-steps"),
+            "unexpected error: {err}"
+        );
     }
 
     /// The clap surface parses the artifact subcommand.

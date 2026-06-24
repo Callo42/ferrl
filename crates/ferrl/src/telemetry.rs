@@ -917,6 +917,537 @@ impl std::fmt::Display for RunSummary {
     }
 }
 
+/// Resource and behavior budget for [`compare_metrics`].
+///
+/// Ratios are expressed as candidate / baseline. For example, a
+/// `max_mean_step_secs_ratio` of `1.10` allows the candidate to be at most 10%
+/// slower than the baseline after warmup.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RegressionBudget {
+    /// Require both streams to contain at least [`Self::min_positive_grad_steps`]
+    /// finite `grad_norm > 0` rows after warmup.
+    pub require_live_update: bool,
+    /// Require non-zero `step_secs` values and enforce
+    /// [`Self::max_mean_step_secs_ratio`].
+    pub require_timing: bool,
+    /// Require non-zero CUDA memory probes and enforce
+    /// [`Self::max_cuda_peak_used_ratio`].
+    pub require_cuda_memory: bool,
+    /// Permit [`RunSummary`] health anomalies in either stream.
+    pub allow_health_warnings: bool,
+    /// Number of leading aligned rows to ignore for timing/memory/grad checks.
+    pub warmup_steps: usize,
+    /// Minimum finite positive-gradient rows required when
+    /// [`Self::require_live_update`] is true.
+    pub min_positive_grad_steps: usize,
+    /// Maximum allowed candidate/baseline mean `step_secs` ratio.
+    pub max_mean_step_secs_ratio: f32,
+    /// Absolute slack added to the mean `step_secs` limit.
+    pub max_mean_step_secs_abs_slack: f32,
+    /// Maximum allowed candidate/baseline peak CUDA used-memory ratio.
+    pub max_cuda_peak_used_ratio: f64,
+    /// Absolute slack added to the peak CUDA used-memory limit.
+    pub max_cuda_peak_used_abs_slack_bytes: u64,
+    /// Optional candidate/baseline peak CUDA step-delta ratio.
+    pub max_cuda_peak_delta_ratio: Option<f64>,
+    /// Absolute slack added to the peak CUDA step-delta limit when the delta
+    /// check is enabled.
+    pub max_cuda_peak_delta_abs_slack_bytes: u64,
+    /// Optional relative drift bound for final `grad_norm`.
+    pub max_final_grad_norm_rel_drift: Option<f32>,
+}
+
+impl Default for RegressionBudget {
+    fn default() -> Self {
+        Self {
+            require_live_update: true,
+            require_timing: true,
+            require_cuda_memory: true,
+            allow_health_warnings: false,
+            warmup_steps: 0,
+            min_positive_grad_steps: 1,
+            max_mean_step_secs_ratio: 1.10,
+            max_mean_step_secs_abs_slack: 0.0,
+            max_cuda_peak_used_ratio: 1.0,
+            max_cuda_peak_used_abs_slack_bytes: 64 * 1024 * 1024,
+            max_cuda_peak_delta_ratio: None,
+            max_cuda_peak_delta_abs_slack_bytes: 64 * 1024 * 1024,
+            max_final_grad_norm_rel_drift: None,
+        }
+    }
+}
+
+/// One failed behavior/resource regression check.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[non_exhaustive]
+pub enum RegressionFailure {
+    /// A metrics stream was empty.
+    EmptyStream {
+        /// Which stream was empty (`baseline` or `candidate`).
+        stream: &'static str,
+    },
+    /// The candidate and baseline have different row counts.
+    StepCountMismatch {
+        /// Baseline metrics rows.
+        baseline: usize,
+        /// Candidate metrics rows.
+        candidate: usize,
+    },
+    /// The configured warmup leaves no comparable rows.
+    WarmupElidesAll {
+        /// Configured warmup row count.
+        warmup_steps: usize,
+        /// Available aligned row count.
+        len: usize,
+    },
+    /// An aligned row has a different `step` value.
+    StepIndexMismatch {
+        /// Row index in the metrics stream.
+        row: usize,
+        /// Baseline `step`.
+        baseline: u64,
+        /// Candidate `step`.
+        candidate: u64,
+    },
+    /// A stream had too few finite positive-gradient rows.
+    LiveUpdateMissing {
+        /// Which stream failed (`baseline` or `candidate`).
+        stream: &'static str,
+        /// Observed finite positive-gradient rows.
+        observed: usize,
+        /// Required finite positive-gradient rows.
+        required: usize,
+    },
+    /// A stream was missing non-zero timing telemetry.
+    TimingMissing {
+        /// Which stream failed (`baseline` or `candidate`).
+        stream: &'static str,
+    },
+    /// Candidate mean step time exceeded the budget.
+    StepTimeRegression {
+        /// Baseline mean `step_secs`.
+        baseline_mean: f32,
+        /// Candidate mean `step_secs`.
+        candidate_mean: f32,
+        /// Allowed candidate mean.
+        limit: f32,
+    },
+    /// A stream was missing non-zero CUDA memory telemetry.
+    CudaMemoryMissing {
+        /// Which stream failed (`baseline` or `candidate`).
+        stream: &'static str,
+    },
+    /// Candidate peak CUDA used-memory exceeded the budget.
+    CudaPeakRegression {
+        /// Baseline peak used bytes.
+        baseline_peak: u64,
+        /// Candidate peak used bytes.
+        candidate_peak: u64,
+        /// Allowed candidate peak bytes.
+        limit: u64,
+    },
+    /// Candidate peak CUDA step-delta exceeded the optional budget.
+    CudaDeltaRegression {
+        /// Baseline peak delta bytes.
+        baseline_delta: u64,
+        /// Candidate peak delta bytes.
+        candidate_delta: u64,
+        /// Allowed candidate delta bytes.
+        limit: u64,
+    },
+    /// Final gradient norm drift exceeded the optional budget.
+    GradNormDrift {
+        /// Baseline final `grad_norm`.
+        baseline: f32,
+        /// Candidate final `grad_norm`.
+        candidate: f32,
+        /// Observed relative drift.
+        relative_drift: f32,
+        /// Allowed relative drift.
+        limit: f32,
+    },
+    /// Health anomalies were present while `allow_health_warnings` was false.
+    HealthWarnings {
+        /// Baseline anomaly count.
+        baseline: usize,
+        /// Candidate anomaly count.
+        candidate: usize,
+    },
+}
+
+impl std::fmt::Display for RegressionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyStream { stream } => write!(f, "{stream} metrics stream is empty"),
+            Self::StepCountMismatch {
+                baseline,
+                candidate,
+            } => write!(
+                f,
+                "step-count mismatch: baseline={baseline} candidate={candidate}"
+            ),
+            Self::WarmupElidesAll { warmup_steps, len } => {
+                write!(
+                    f,
+                    "warmup_steps={warmup_steps} leaves no rows from len={len}"
+                )
+            }
+            Self::StepIndexMismatch {
+                row,
+                baseline,
+                candidate,
+            } => write!(
+                f,
+                "step-index mismatch at row {row}: baseline={baseline} candidate={candidate}"
+            ),
+            Self::LiveUpdateMissing {
+                stream,
+                observed,
+                required,
+            } => write!(
+                f,
+                "{stream} has {observed} finite positive-grad rows, required {required}"
+            ),
+            Self::TimingMissing { stream } => write!(f, "{stream} timing telemetry is missing"),
+            Self::StepTimeRegression {
+                baseline_mean,
+                candidate_mean,
+                limit,
+            } => write!(
+                f,
+                "mean step_secs regression: baseline={baseline_mean:.6} \
+                 candidate={candidate_mean:.6} limit={limit:.6}"
+            ),
+            Self::CudaMemoryMissing { stream } => {
+                write!(f, "{stream} CUDA memory telemetry is missing")
+            }
+            Self::CudaPeakRegression {
+                baseline_peak,
+                candidate_peak,
+                limit,
+            } => write!(
+                f,
+                "CUDA peak regression: baseline={baseline_peak} candidate={candidate_peak} \
+                 limit={limit}"
+            ),
+            Self::CudaDeltaRegression {
+                baseline_delta,
+                candidate_delta,
+                limit,
+            } => write!(
+                f,
+                "CUDA delta regression: baseline={baseline_delta} candidate={candidate_delta} \
+                 limit={limit}"
+            ),
+            Self::GradNormDrift {
+                baseline,
+                candidate,
+                relative_drift,
+                limit,
+            } => write!(
+                f,
+                "final grad_norm drift: baseline={baseline:.9} candidate={candidate:.9} \
+                 rel={relative_drift:.9} limit={limit}"
+            ),
+            Self::HealthWarnings {
+                baseline,
+                candidate,
+            } => write!(
+                f,
+                "health warnings present: baseline={baseline} candidate={candidate}"
+            ),
+        }
+    }
+}
+
+/// Structured result from [`compare_metrics`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[non_exhaustive]
+pub struct RegressionReport {
+    /// Whether every configured check passed.
+    pub passed: bool,
+    /// Budget used for this comparison.
+    pub budget: RegressionBudget,
+    /// Baseline run summary, when the baseline stream was non-empty.
+    pub baseline: Option<RunSummary>,
+    /// Candidate run summary, when the candidate stream was non-empty.
+    pub candidate: Option<RunSummary>,
+    /// Failed checks. Empty means pass.
+    pub failures: Vec<RegressionFailure>,
+}
+
+/// Compare baseline and candidate metrics streams under a behavior/resource budget.
+///
+/// The comparator fails closed for absent timing or CUDA memory fields when the
+/// corresponding budget requirement is enabled. It also aligns raw rows by
+/// position and `step`, so a candidate cannot pass by dropping or appending rows
+/// that a summary average would hide.
+#[must_use]
+pub fn compare_metrics(
+    baseline: &[Metrics],
+    candidate: &[Metrics],
+    budget: &RegressionBudget,
+) -> RegressionReport {
+    let mut failures = Vec::new();
+    let baseline_summary = summarize(baseline);
+    let candidate_summary = summarize(candidate);
+    if baseline_summary.is_none() {
+        failures.push(RegressionFailure::EmptyStream { stream: "baseline" });
+    }
+    if candidate_summary.is_none() {
+        failures.push(RegressionFailure::EmptyStream {
+            stream: "candidate",
+        });
+    }
+    if let (Some(base), Some(cand)) = (&baseline_summary, &candidate_summary) {
+        compare_health(base, cand, budget, &mut failures);
+    }
+    compare_aligned_rows(baseline, candidate, budget, &mut failures);
+    RegressionReport {
+        passed: failures.is_empty(),
+        budget: budget.clone(),
+        baseline: baseline_summary,
+        candidate: candidate_summary,
+        failures,
+    }
+}
+
+fn compare_health(
+    baseline: &RunSummary,
+    candidate: &RunSummary,
+    budget: &RegressionBudget,
+    failures: &mut Vec<RegressionFailure>,
+) {
+    if budget.allow_health_warnings {
+        return;
+    }
+    if !baseline.anomalies.is_empty() || !candidate.anomalies.is_empty() {
+        failures.push(RegressionFailure::HealthWarnings {
+            baseline: baseline.anomalies.len(),
+            candidate: candidate.anomalies.len(),
+        });
+    }
+}
+
+fn compare_aligned_rows(
+    baseline: &[Metrics],
+    candidate: &[Metrics],
+    budget: &RegressionBudget,
+    failures: &mut Vec<RegressionFailure>,
+) {
+    if baseline.len() != candidate.len() {
+        failures.push(RegressionFailure::StepCountMismatch {
+            baseline: baseline.len(),
+            candidate: candidate.len(),
+        });
+    }
+    let len = baseline.len().min(candidate.len());
+    if len == 0 {
+        return;
+    }
+    for i in 0..len {
+        if baseline[i].step != candidate[i].step {
+            failures.push(RegressionFailure::StepIndexMismatch {
+                row: i,
+                baseline: baseline[i].step,
+                candidate: candidate[i].step,
+            });
+        }
+    }
+    if budget.warmup_steps >= len {
+        failures.push(RegressionFailure::WarmupElidesAll {
+            warmup_steps: budget.warmup_steps,
+            len,
+        });
+        return;
+    }
+    let base = &baseline[budget.warmup_steps..len];
+    let cand = &candidate[budget.warmup_steps..len];
+    compare_live_update(base, cand, budget, failures);
+    compare_timing(base, cand, budget, failures);
+    compare_cuda_memory(base, cand, budget, failures);
+    compare_grad_norm(base, cand, budget, failures);
+}
+
+fn compare_live_update(
+    baseline: &[Metrics],
+    candidate: &[Metrics],
+    budget: &RegressionBudget,
+    failures: &mut Vec<RegressionFailure>,
+) {
+    if !budget.require_live_update {
+        return;
+    }
+    let required = budget.min_positive_grad_steps;
+    for (stream, observed) in [
+        ("baseline", positive_grad_steps(baseline)),
+        ("candidate", positive_grad_steps(candidate)),
+    ] {
+        if observed < required {
+            failures.push(RegressionFailure::LiveUpdateMissing {
+                stream,
+                observed,
+                required,
+            });
+        }
+    }
+}
+
+fn compare_timing(
+    baseline: &[Metrics],
+    candidate: &[Metrics],
+    budget: &RegressionBudget,
+    failures: &mut Vec<RegressionFailure>,
+) {
+    if !budget.require_timing {
+        return;
+    }
+    let Some(base_mean) = required_positive_mean(baseline, |m| m.step_secs) else {
+        failures.push(RegressionFailure::TimingMissing { stream: "baseline" });
+        return;
+    };
+    let Some(cand_mean) = required_positive_mean(candidate, |m| m.step_secs) else {
+        failures.push(RegressionFailure::TimingMissing {
+            stream: "candidate",
+        });
+        return;
+    };
+    let limit = base_mean * budget.max_mean_step_secs_ratio + budget.max_mean_step_secs_abs_slack;
+    if cand_mean > limit {
+        failures.push(RegressionFailure::StepTimeRegression {
+            baseline_mean: base_mean,
+            candidate_mean: cand_mean,
+            limit,
+        });
+    }
+}
+
+fn compare_cuda_memory(
+    baseline: &[Metrics],
+    candidate: &[Metrics],
+    budget: &RegressionBudget,
+    failures: &mut Vec<RegressionFailure>,
+) {
+    if !budget.require_cuda_memory {
+        return;
+    }
+    let Some(base_peak) = required_peak(baseline, |m| m.cuda_mem_peak_used_bytes) else {
+        failures.push(RegressionFailure::CudaMemoryMissing { stream: "baseline" });
+        return;
+    };
+    let Some(cand_peak) = required_peak(candidate, |m| m.cuda_mem_peak_used_bytes) else {
+        failures.push(RegressionFailure::CudaMemoryMissing {
+            stream: "candidate",
+        });
+        return;
+    };
+    let limit = allowed_bytes(
+        base_peak,
+        budget.max_cuda_peak_used_ratio,
+        budget.max_cuda_peak_used_abs_slack_bytes,
+    );
+    if cand_peak > limit {
+        failures.push(RegressionFailure::CudaPeakRegression {
+            baseline_peak: base_peak,
+            candidate_peak: cand_peak,
+            limit,
+        });
+    }
+    compare_cuda_delta(baseline, candidate, budget, failures);
+}
+
+fn compare_cuda_delta(
+    baseline: &[Metrics],
+    candidate: &[Metrics],
+    budget: &RegressionBudget,
+    failures: &mut Vec<RegressionFailure>,
+) {
+    let Some(ratio) = budget.max_cuda_peak_delta_ratio else {
+        return;
+    };
+    let Some(base_delta) = required_peak(baseline, |m| m.cuda_mem_peak_delta_bytes) else {
+        failures.push(RegressionFailure::CudaMemoryMissing { stream: "baseline" });
+        return;
+    };
+    let Some(cand_delta) = required_peak(candidate, |m| m.cuda_mem_peak_delta_bytes) else {
+        failures.push(RegressionFailure::CudaMemoryMissing {
+            stream: "candidate",
+        });
+        return;
+    };
+    let limit = allowed_bytes(
+        base_delta,
+        ratio,
+        budget.max_cuda_peak_delta_abs_slack_bytes,
+    );
+    if cand_delta > limit {
+        failures.push(RegressionFailure::CudaDeltaRegression {
+            baseline_delta: base_delta,
+            candidate_delta: cand_delta,
+            limit,
+        });
+    }
+}
+
+fn compare_grad_norm(
+    baseline: &[Metrics],
+    candidate: &[Metrics],
+    budget: &RegressionBudget,
+    failures: &mut Vec<RegressionFailure>,
+) {
+    let Some(limit) = budget.max_final_grad_norm_rel_drift else {
+        return;
+    };
+    let (Some(base), Some(cand)) = (baseline.last(), candidate.last()) else {
+        return;
+    };
+    let drift = relative_drift(base.grad_norm, cand.grad_norm);
+    if !base.grad_norm.is_finite() || !cand.grad_norm.is_finite() || drift > limit {
+        failures.push(RegressionFailure::GradNormDrift {
+            baseline: base.grad_norm,
+            candidate: cand.grad_norm,
+            relative_drift: drift,
+            limit,
+        });
+    }
+}
+
+fn positive_grad_steps(history: &[Metrics]) -> usize {
+    history
+        .iter()
+        .filter(|m| m.grad_norm.is_finite() && m.grad_norm > 0.0)
+        .count()
+}
+
+fn required_positive_mean(history: &[Metrics], f: impl Fn(&Metrics) -> f32) -> Option<f32> {
+    if history.is_empty()
+        || history.iter().any(|m| {
+            let value = f(m);
+            !value.is_finite() || value <= 0.0
+        })
+    {
+        return None;
+    }
+    Some(mean_of(history, f))
+}
+
+fn required_peak(history: &[Metrics], f: impl Fn(&Metrics) -> u64) -> Option<u64> {
+    if history.is_empty() || history.iter().any(|m| f(m) == 0) {
+        return None;
+    }
+    let peak = history.iter().map(f).max()?;
+    (peak > 0).then_some(peak)
+}
+
+fn allowed_bytes(baseline: u64, ratio: f64, slack: u64) -> u64 {
+    ((baseline as f64) * ratio).ceil() as u64 + slack
+}
+
+fn relative_drift(baseline: f32, candidate: f32) -> f32 {
+    let denom = baseline.abs().max(1e-12);
+    (candidate - baseline).abs() / denom
+}
+
 /// Reduce a run's [`Metrics`] stream into a [`RunSummary`] — reward trend,
 /// throughput, gradient health, and any [`Anomaly`] flags. **Pure**: no I/O, no
 /// clock (the timing was measured when the metrics were written), so it is fully
@@ -1542,6 +2073,171 @@ mod tests {
         m.tokens_per_sec = toks;
         m.rollout_capture_tokens = 1;
         m
+    }
+
+    fn perf_metric(step: u64, grad_norm: f32, step_secs: f32, peak: u64, delta: u64) -> Metrics {
+        let mut m = metric(step, 0.1 * step as f32, grad_norm, step_secs, 100.0);
+        m.cuda_mem_peak_used_bytes = peak;
+        m.cuda_mem_peak_delta_bytes = delta;
+        m
+    }
+
+    fn perf_budget() -> RegressionBudget {
+        RegressionBudget {
+            max_mean_step_secs_ratio: 1.10,
+            max_cuda_peak_used_ratio: 1.05,
+            max_cuda_peak_used_abs_slack_bytes: 0,
+            max_cuda_peak_delta_ratio: Some(1.05),
+            max_cuda_peak_delta_abs_slack_bytes: 0,
+            max_final_grad_norm_rel_drift: Some(1e-6),
+            ..RegressionBudget::default()
+        }
+    }
+
+    #[test]
+    fn compare_metrics_identical_streams_pass() {
+        let hist = vec![
+            perf_metric(0, 1.0, 2.0, 1000, 100),
+            perf_metric(1, 1.0, 2.0, 1100, 120),
+        ];
+        let report = compare_metrics(&hist, &hist, &perf_budget());
+        assert!(report.passed, "failures: {:?}", report.failures);
+        assert!(report.failures.is_empty());
+        assert_eq!(report.baseline.as_ref().unwrap().steps, 2);
+    }
+
+    #[test]
+    fn compare_metrics_fails_empty_and_misaligned_streams() {
+        let hist = vec![perf_metric(0, 1.0, 2.0, 1000, 100)];
+        let empty = compare_metrics(&[], &hist, &perf_budget());
+        assert!(
+            empty
+                .failures
+                .iter()
+                .any(|f| matches!(f, RegressionFailure::EmptyStream { stream: "baseline" })),
+            "failures: {:?}",
+            empty.failures
+        );
+
+        let mut shifted = hist.clone();
+        shifted[0].step = 7;
+        let mismatch = compare_metrics(&hist, &shifted, &perf_budget());
+        assert!(
+            mismatch
+                .failures
+                .iter()
+                .any(|f| matches!(f, RegressionFailure::StepIndexMismatch { .. })),
+            "failures: {:?}",
+            mismatch.failures
+        );
+    }
+
+    #[test]
+    fn compare_metrics_requires_live_update() {
+        let base = vec![perf_metric(0, 1.0, 2.0, 1000, 100)];
+        let cand = vec![perf_metric(0, 0.0, 2.0, 1000, 100)];
+        let report = compare_metrics(&base, &cand, &perf_budget());
+        assert!(
+            report.failures.iter().any(|f| matches!(
+                f,
+                RegressionFailure::LiveUpdateMissing {
+                    stream: "candidate",
+                    ..
+                }
+            )),
+            "failures: {:?}",
+            report.failures
+        );
+    }
+
+    #[test]
+    fn compare_metrics_fails_missing_required_telemetry() {
+        let base = vec![perf_metric(0, 1.0, 2.0, 1000, 100)];
+        let mut cand = vec![perf_metric(0, 1.0, 2.0, 1000, 100)];
+        cand[0].step_secs = 0.0;
+        let timing = compare_metrics(&base, &cand, &perf_budget());
+        assert!(
+            timing.failures.iter().any(|f| matches!(
+                f,
+                RegressionFailure::TimingMissing {
+                    stream: "candidate"
+                }
+            )),
+            "failures: {:?}",
+            timing.failures
+        );
+
+        cand[0].step_secs = 2.0;
+        cand[0].cuda_mem_peak_used_bytes = 0;
+        let memory = compare_metrics(&base, &cand, &perf_budget());
+        assert!(
+            memory.failures.iter().any(|f| matches!(
+                f,
+                RegressionFailure::CudaMemoryMissing {
+                    stream: "candidate"
+                }
+            )),
+            "failures: {:?}",
+            memory.failures
+        );
+    }
+
+    #[test]
+    fn compare_metrics_fails_partial_missing_cuda_memory_telemetry() {
+        let base = vec![
+            perf_metric(0, 1.0, 2.0, 1000, 100),
+            perf_metric(1, 1.0, 2.0, 1000, 100),
+            perf_metric(2, 1.0, 2.0, 1000, 100),
+        ];
+        let mut cand = base.clone();
+        cand[1].cuda_mem_peak_used_bytes = 0;
+        let report = compare_metrics(&base, &cand, &perf_budget());
+        assert!(
+            report.failures.iter().any(|f| matches!(
+                f,
+                RegressionFailure::CudaMemoryMissing {
+                    stream: "candidate"
+                }
+            )),
+            "failures: {:?}",
+            report.failures
+        );
+    }
+
+    #[test]
+    fn compare_metrics_fails_resource_regressions() {
+        let base = vec![
+            perf_metric(0, 1.0, 2.0, 1000, 100),
+            perf_metric(1, 1.0, 2.0, 1000, 100),
+        ];
+        let slow = vec![
+            perf_metric(0, 1.0, 2.3, 1000, 100),
+            perf_metric(1, 1.0, 2.3, 1000, 100),
+        ];
+        let slow_report = compare_metrics(&base, &slow, &perf_budget());
+        assert!(
+            slow_report
+                .failures
+                .iter()
+                .any(|f| matches!(f, RegressionFailure::StepTimeRegression { .. })),
+            "failures: {:?}",
+            slow_report.failures
+        );
+
+        let high_mem = vec![
+            perf_metric(0, 1.0, 2.0, 1200, 130),
+            perf_metric(1, 1.0, 2.0, 1200, 130),
+        ];
+        let mem_report = compare_metrics(&base, &high_mem, &perf_budget());
+        assert!(
+            mem_report.failures.iter().any(|f| matches!(
+                f,
+                RegressionFailure::CudaPeakRegression { .. }
+                    | RegressionFailure::CudaDeltaRegression { .. }
+            )),
+            "failures: {:?}",
+            mem_report.failures
+        );
     }
 
     #[test]
