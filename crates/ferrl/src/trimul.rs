@@ -862,8 +862,12 @@ impl TrimulReward {
         if !eval.status.is_success() {
             return 0.0;
         }
-        if eval.test_exit.is_some_and(|code| code != 0)
-            || eval.benchmark_exit.is_some_and(|code| code != 0)
+        if eval.test_exit != Some(0) {
+            return 0.0;
+        }
+        if eval.verification.correct
+            && eval.verification.geomean_ns.is_some()
+            && eval.benchmark_exit != Some(0)
         {
             return 0.0;
         }
@@ -874,14 +878,20 @@ impl TrimulReward {
         if !eval.status.is_success() {
             return Some(format!("trimul:sandbox_{}", run_status_label(eval.status)));
         }
-        if eval.test_exit.is_some_and(|code| code != 0) {
-            return Some("trimul:test_process_failed".to_string());
+        match eval.test_exit {
+            Some(0) => {}
+            Some(_) => return Some("trimul:test_process_failed".to_string()),
+            None => return Some("trimul:missing_test_exit".to_string()),
         }
         if eval.benchmark_exit.is_some_and(|code| code != 0) {
             return Some("trimul:benchmark_process_failed".to_string());
         }
         if eval.verification.correct && eval.verification.geomean_ns.is_some() {
-            return None;
+            return if eval.benchmark_exit == Some(0) {
+                None
+            } else {
+                Some("trimul:missing_benchmark_exit".to_string())
+            };
         }
         if !eval.verification.correct {
             return Some(if eval.test_check.is_some() {
@@ -1288,7 +1298,7 @@ mod tests {
             },
             status: RunStatus::Exited(0),
             test_check: None,
-            test_exit: None,
+            test_exit: Some(0),
             benchmark_exit: None,
             has_benchmark_section: false,
         };
@@ -1446,6 +1456,40 @@ mod tests {
             r.reward_diagnostic(&plausible_benchmark_process_failed)
                 .as_deref(),
             Some("trimul:benchmark_process_failed")
+        );
+    }
+
+    #[test]
+    fn reward_requires_success_exit_markers_for_positive_scores() {
+        let r = reward();
+        let missing_test_exit = TrimulEval {
+            verification: TrimulVerification {
+                correct: true,
+                benchmark_means_ns: vec![500.0],
+                geomean_ns: Some(500.0),
+                speedup: Some(2.0),
+            },
+            status: RunStatus::Exited(0),
+            test_check: Some("pass".to_string()),
+            test_exit: None,
+            benchmark_exit: Some(0),
+            has_benchmark_section: true,
+        };
+        assert_eq!(r.reward_from_eval(&missing_test_exit), 0.0);
+        assert_eq!(
+            r.reward_diagnostic(&missing_test_exit).as_deref(),
+            Some("trimul:missing_test_exit")
+        );
+
+        let missing_benchmark_exit = TrimulEval {
+            test_exit: Some(0),
+            benchmark_exit: None,
+            ..missing_test_exit.clone()
+        };
+        assert_eq!(r.reward_from_eval(&missing_benchmark_exit), 0.0);
+        assert_eq!(
+            r.reward_diagnostic(&missing_benchmark_exit).as_deref(),
+            Some("trimul:missing_benchmark_exit")
         );
     }
 
