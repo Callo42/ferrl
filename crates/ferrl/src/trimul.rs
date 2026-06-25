@@ -484,6 +484,26 @@ fn qwen3_5_thinking_system_prompt() -> &'static str {
      - Stop after the closing code fence."
 }
 
+fn qwen3_5_concise_thinking_system_prompt() -> &'static str {
+    "You generate Python code for a strict evaluator.\n\
+     Output contract:\n\
+     - Use at most 8 short reasoning lines inside <think>.\n\
+     - Prefer a complete valid implementation over further analysis.\n\
+     - Close </think> before writing code; do not continue reasoning after </think>.\n\
+     - Immediately after </think>, output exactly one closed fenced Python code block.\n\
+     - The code block must contain only the complete custom_kernel(data) implementation.\n\
+     - Do not include prose, comments, docstrings, or Markdown outside the final code block.\n\
+     - Stop after the closing code fence."
+}
+
+fn build_qwen3_5_chat_prompt(task: &str, system_prompt: &str) -> String {
+    format!(
+        "<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n",
+        system_prompt,
+        task.trim()
+    )
+}
+
 /// Build the Qwen3.5 native thinking chat-template prompt for a TriMul instruction.
 ///
 /// This mirrors the released Qwen3.5 `chat_template.jinja` for system + user messages with
@@ -492,11 +512,17 @@ fn qwen3_5_thinking_system_prompt() -> &'static str {
 /// system message carries the output/extraction contract.
 #[must_use]
 pub fn build_qwen3_5_chat_thinking_prompt(task: &str) -> String {
-    format!(
-        "<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n",
-        qwen3_5_thinking_system_prompt(),
-        task.trim()
-    )
+    build_qwen3_5_chat_prompt(task, qwen3_5_thinking_system_prompt())
+}
+
+/// Build the Qwen3.5 thinking prompt with a short reasoning budget.
+///
+/// This preserves the same chat template and `</think>` extraction contract as
+/// [`build_qwen3_5_chat_thinking_prompt`], but biases generation toward finishing the
+/// final fenced implementation before the completion budget is exhausted.
+#[must_use]
+pub fn build_qwen3_5_chat_concise_thinking_prompt(task: &str) -> String {
+    build_qwen3_5_chat_prompt(task, qwen3_5_concise_thinking_system_prompt())
 }
 
 /// The TriMul discovery reward: runs a candidate kernel in the sandboxed eval image
@@ -1635,6 +1661,25 @@ benchmarks:
         assert!(p.contains("Immediately after </think>"));
         assert!(p.contains("Stop after the closing code fence."));
         assert!(p.contains(" - norm.bias\n"));
+        assert!(!p.contains("Use at most 8 short reasoning lines"));
         assert!(!p.contains("does not contain `norm.bias`"));
+    }
+
+    #[test]
+    fn build_qwen3_5_chat_concise_thinking_prompt_limits_reasoning() {
+        let task = build_prompt();
+        let p = build_qwen3_5_chat_concise_thinking_prompt(&task);
+        assert!(p.starts_with("<|im_start|>system\n"));
+        assert!(p.ends_with("<|im_start|>assistant\n<think>\n"));
+        for needle in [
+            "Use at most 8 short reasoning lines inside <think>.",
+            "Prefer a complete valid implementation over further analysis.",
+            "Immediately after </think>",
+            "Stop after the closing code fence.",
+            "custom_kernel(data)",
+            " - norm.bias\n",
+        ] {
+            assert!(p.contains(needle), "missing {needle:?}");
+        }
     }
 }
