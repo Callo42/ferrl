@@ -201,7 +201,10 @@ Set `trainer.candidate_log_top_k` to a positive value for discovery runs so the 
 sampled completions are persisted in `candidates.jsonl`; pass that ledger row's raw
 completion plus its step/prompt/group/rank coordinates to `ferrl trimul-artifact`
 (see the contract for the full command) to extract `submission.py`, re-verify with
-an audit seed, and write the manifest/report.
+an audit seed, and write the manifest/report. Verifier-backed rewards may also attach
+`reward_diagnostic` to candidate rows so zero rewards remain explainable without
+re-running the whole training step; for zero-tail triage, set `candidate_log_top_k` at
+least as high as `group_size` so every sampled completion is retained.
 
 ### From Rust — a task that isn't built in
 

@@ -218,7 +218,7 @@ pub use qwen35::{
 #[doc(inline)]
 pub use remat::{stitched_backward, RematTape};
 #[doc(inline)]
-pub use reward::{RewardError, RewardFn};
+pub use reward::{RewardError, RewardFn, RewardOutcome};
 #[doc(inline)]
 pub use sample::Sample;
 #[doc(inline)]

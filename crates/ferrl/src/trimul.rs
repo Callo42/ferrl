@@ -67,9 +67,9 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::reward::{RewardError, RewardFn};
+use crate::reward::{RewardError, RewardFn, RewardOutcome};
 use crate::sample::Sample;
-use crate::sandbox::{ApptainerSandbox, Bind, ResourceLimits, RunSpec, Sandbox};
+use crate::sandbox::{ApptainerSandbox, Bind, ResourceLimits, RunSpec, RunStatus, Sandbox};
 
 /// The input distribution for a TriMul case (mirrors the GPUMODE task's `distribution`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -742,7 +742,9 @@ impl TrimulReward {
     /// `0.0` reward, not an error.
     fn run_eval(&self, submission: &str) -> Result<TrimulVerification, RewardError> {
         let scratch = self.make_scratch()?;
-        let result = self.eval_in(&scratch, submission);
+        let result = self
+            .eval_in(&scratch, submission)
+            .map(|outcome| outcome.verification);
         // Best-effort cleanup; the scratch is node-local and disposable.
         let _ = std::fs::remove_dir_all(&scratch);
         result
@@ -768,7 +770,7 @@ impl TrimulReward {
 
     /// The body of [`run_eval`](Self::run_eval), split out so the scratch is always
     /// cleaned up.
-    fn eval_in(&self, scratch: &Path, submission: &str) -> Result<TrimulVerification, RewardError> {
+    fn eval_in(&self, scratch: &Path, submission: &str) -> Result<TrimulEval, RewardError> {
         std::fs::create_dir_all(scratch.join("cache")).map_err(RewardError::verifier)?;
         write(scratch, "submission.py", submission)?;
         write(scratch, "test_spec.txt", &render_spec(&self.test_cases))?;
@@ -787,8 +789,10 @@ impl TrimulReward {
             .run(&self.build_run_spec(scratch))
             .map_err(RewardError::verifier)?;
 
+        let has_benchmark_section = outcome.stdout.contains(RESULT_SPLIT);
         let (test_log, bench_log) = split_result(&outcome.stdout);
-        let correct = test_passed(test_log);
+        let test_check = log_value(test_log, "check").map(str::to_string);
+        let correct = test_check.as_deref() == Some("pass");
         let benchmark_means_ns = if correct {
             benchmark_means_ns(bench_log)
         } else {
@@ -803,12 +807,64 @@ impl TrimulReward {
             .baseline_ns
             .zip(geomean_ns)
             .map(|(baseline, geo)| baseline / geo);
-        Ok(TrimulVerification {
-            correct,
-            benchmark_means_ns,
-            geomean_ns,
-            speedup,
+        Ok(TrimulEval {
+            verification: TrimulVerification {
+                correct,
+                benchmark_means_ns,
+                geomean_ns,
+                speedup,
+            },
+            status: outcome.status,
+            test_check,
+            has_benchmark_section,
         })
+    }
+
+    fn reward_outcome(&self, completion: &str) -> Result<RewardOutcome, RewardError> {
+        let Some(code) = self.extract_submission(completion) else {
+            return Ok(RewardOutcome {
+                reward: 0.0,
+                diagnostic: Some("trimul:no_submission".to_string()),
+            });
+        };
+        let scratch = self.make_scratch()?;
+        let result = self.eval_in(&scratch, &code);
+        // Best-effort cleanup; the scratch is node-local and disposable.
+        let _ = std::fs::remove_dir_all(&scratch);
+        let eval = result?;
+        let reward = self.reward_from_eval(&eval);
+        let diagnostic = self.reward_diagnostic(&eval);
+        Ok(RewardOutcome { reward, diagnostic })
+    }
+
+    fn reward_from_eval(&self, eval: &TrimulEval) -> f32 {
+        if !eval.status.is_success() {
+            return 0.0;
+        }
+        self.reward_value(eval.verification.correct, eval.verification.geomean_ns)
+    }
+
+    fn reward_diagnostic(&self, eval: &TrimulEval) -> Option<String> {
+        if !eval.status.is_success() {
+            return Some(format!("trimul:sandbox_{}", run_status_label(eval.status)));
+        }
+        if eval.verification.correct && eval.verification.geomean_ns.is_some() {
+            return None;
+        }
+        if !eval.verification.correct {
+            return Some(if eval.test_check.is_some() {
+                "trimul:test_failed".to_string()
+            } else {
+                "trimul:no_pass_grade".to_string()
+            });
+        }
+        if !eval.has_benchmark_section {
+            return Some("trimul:no_benchmark_section".to_string());
+        }
+        if eval.verification.benchmark_means_ns.is_empty() {
+            return Some("trimul:no_benchmark_means".to_string());
+        }
+        Some("trimul:implausible_benchmark".to_string())
     }
 
     /// Create a fresh, uniquely-named scratch dir under `scratch_root`. The
@@ -833,6 +889,23 @@ fn write(dir: &Path, name: &str, contents: &str) -> Result<(), RewardError> {
     std::fs::write(dir.join(name), contents).map_err(RewardError::verifier)
 }
 
+#[derive(Debug, Clone)]
+struct TrimulEval {
+    verification: TrimulVerification,
+    status: RunStatus,
+    test_check: Option<String>,
+    has_benchmark_section: bool,
+}
+
+fn run_status_label(status: RunStatus) -> String {
+    match status {
+        RunStatus::Exited(code) => format!("exited_{code}"),
+        RunStatus::TimedOut => "timed_out".to_string(),
+        RunStatus::Signaled(signal) => format!("signaled_{signal}"),
+        RunStatus::ScratchExceeded => "scratch_exceeded".to_string(),
+    }
+}
+
 /// The marker the in-container command echoes between the `test` and `benchmark`
 /// result sections on the grade channel.
 const RESULT_SPLIT: &str = "===FERRL-BENCH===";
@@ -848,17 +921,21 @@ impl RewardFn for TrimulReward {
     type Target = ();
 
     fn reward(&self, _sample: &Sample<()>, completion: &str) -> Result<f32, RewardError> {
-        match self.extract_submission(completion) {
-            Some(code) => {
-                let outcome = self.run_eval(&code)?;
-                Ok(self.reward_value(outcome.correct, outcome.geomean_ns))
-            }
-            // No code block at all: nothing to run, a zero reward.
-            None => Ok(0.0),
-        }
+        Ok(self.reward_outcome(completion)?.reward)
+    }
+
+    fn reward_group_detailed(
+        &self,
+        _sample: &Sample<()>,
+        completions: &[String],
+    ) -> Result<Vec<RewardOutcome>, RewardError> {
+        completions
+            .iter()
+            .map(|completion| self.reward_outcome(completion))
+            .collect()
     }
     // No `reward_group` override: a shared GPU scores candidates one at a time, so the
-    // default (map `reward` over the group) is what we want.
+    // detailed path maps over the group while preserving per-candidate diagnostics.
 }
 
 #[cfg(test)]
@@ -1011,6 +1088,28 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_failure_cannot_keep_positive_parsed_reward() {
+        let r = reward().with_baseline_ns(1000.0);
+        let eval = TrimulEval {
+            verification: TrimulVerification {
+                correct: true,
+                benchmark_means_ns: vec![500.0],
+                geomean_ns: Some(500.0),
+                speedup: Some(2.0),
+            },
+            status: RunStatus::TimedOut,
+            test_check: Some("pass".to_string()),
+            has_benchmark_section: true,
+        };
+
+        assert_eq!(r.reward_from_eval(&eval), 0.0);
+        assert_eq!(
+            r.reward_diagnostic(&eval).as_deref(),
+            Some("trimul:sandbox_timed_out")
+        );
+    }
+
+    #[test]
     fn reward_falls_back_to_inverse_time_without_a_baseline() {
         // 1e9 / geo: a faster (smaller) geo yields a larger reward.
         let r = reward();
@@ -1097,6 +1196,106 @@ mod tests {
                 .reward(&s, "Sorry, I can't help with that.")
                 .unwrap(),
             0.0
+        );
+    }
+
+    #[test]
+    fn detailed_reward_reports_missing_submission_without_sandbox() {
+        let s = Sample::new("write a faster TriMul kernel", ());
+        let outcomes = reward()
+            .reward_group_detailed(&s, &["Sorry, no code.".to_string()])
+            .unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].reward, 0.0);
+        assert_eq!(
+            outcomes[0].diagnostic.as_deref(),
+            Some("trimul:no_submission")
+        );
+    }
+
+    #[test]
+    fn reward_diagnostic_classifies_zero_eval_outcomes() {
+        let r = reward();
+        let test_failed = TrimulEval {
+            verification: TrimulVerification {
+                correct: false,
+                benchmark_means_ns: Vec::new(),
+                geomean_ns: None,
+                speedup: None,
+            },
+            status: RunStatus::Exited(0),
+            test_check: None,
+            has_benchmark_section: false,
+        };
+        assert_eq!(
+            r.reward_diagnostic(&test_failed).as_deref(),
+            Some("trimul:no_pass_grade")
+        );
+
+        let graded_failure = TrimulEval {
+            test_check: Some("fail".to_string()),
+            ..test_failed.clone()
+        };
+        assert_eq!(
+            r.reward_diagnostic(&graded_failure).as_deref(),
+            Some("trimul:test_failed")
+        );
+
+        let timed_out = TrimulEval {
+            status: RunStatus::TimedOut,
+            ..test_failed.clone()
+        };
+        assert_eq!(
+            r.reward_diagnostic(&timed_out).as_deref(),
+            Some("trimul:sandbox_timed_out")
+        );
+
+        let no_benchmark_section = TrimulEval {
+            verification: TrimulVerification {
+                correct: true,
+                benchmark_means_ns: vec![],
+                geomean_ns: None,
+                speedup: None,
+            },
+            status: RunStatus::Exited(0),
+            test_check: Some("pass".to_string()),
+            has_benchmark_section: false,
+        };
+        assert_eq!(
+            r.reward_diagnostic(&no_benchmark_section).as_deref(),
+            Some("trimul:no_benchmark_section")
+        );
+
+        let no_benchmark_means = TrimulEval {
+            verification: TrimulVerification {
+                correct: true,
+                benchmark_means_ns: vec![],
+                geomean_ns: None,
+                speedup: None,
+            },
+            status: RunStatus::Exited(0),
+            test_check: Some("pass".to_string()),
+            has_benchmark_section: true,
+        };
+        assert_eq!(
+            r.reward_diagnostic(&no_benchmark_means).as_deref(),
+            Some("trimul:no_benchmark_means")
+        );
+
+        let implausible_benchmark = TrimulEval {
+            verification: TrimulVerification {
+                correct: true,
+                benchmark_means_ns: vec![0.001],
+                geomean_ns: None,
+                speedup: None,
+            },
+            status: RunStatus::Exited(0),
+            test_check: Some("pass".to_string()),
+            has_benchmark_section: true,
+        };
+        assert_eq!(
+            r.reward_diagnostic(&implausible_benchmark).as_deref(),
+            Some("trimul:implausible_benchmark")
         );
     }
 
