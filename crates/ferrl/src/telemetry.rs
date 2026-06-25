@@ -2201,6 +2201,35 @@ mod tests {
     }
 
     #[test]
+    fn candidate_record_reward_diagnostic_is_jsonl_compatible() {
+        let old_row = r#"{"step":3,"rank":0,"world_size":1,"prompt_index":12,"group_index":1,"reward":0.0,"completion_len_tokens":42,"completion":"old"}"#;
+        let parsed: CandidateRecord = serde_json::from_str(old_row).unwrap();
+        assert_eq!(parsed.reward_diagnostic, None);
+
+        let tmp = TempDir::new("candidates-compat");
+        let rd = RunDir::create(tmp.path(), "run-candidates-compat").unwrap();
+        let mut w = rd.candidate_writer().unwrap();
+        let rec = CandidateRecord {
+            step: 3,
+            rank: 0,
+            world_size: 1,
+            prompt_index: 12,
+            group_index: 1,
+            reward: 0.0,
+            completion_len_tokens: 42,
+            reward_diagnostic: None,
+            completion: "new".to_string(),
+        };
+        w.append(&rec).unwrap();
+        drop(w);
+
+        let raw = std::fs::read_to_string(rd.candidates_path()).unwrap();
+        assert!(!raw.contains("reward_diagnostic"));
+        let written: CandidateRecord = serde_json::from_str(raw.trim()).unwrap();
+        assert_eq!(written.reward_diagnostic, None);
+    }
+
+    #[test]
     fn read_metrics_skips_blank_lines_and_fails_loud_on_garbage() {
         let tmp = TempDir::new("read-metrics-bad");
         let good = serde_json::to_string(&Metrics::at_step(0)).unwrap();
