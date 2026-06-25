@@ -204,6 +204,17 @@ fn log_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
     })
 }
 
+fn log_last_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    text.lines().rev().find_map(|line| {
+        let (k, v) = line.split_once(": ")?;
+        (k.trim() == key).then_some(v.trim())
+    })
+}
+
+fn log_i32_value(text: &str, key: &str) -> Option<i32> {
+    log_last_value(text, key)?.parse().ok()
+}
+
 /// Whether a `test`-mode result log reports overall `check: pass`.
 #[must_use]
 pub fn test_passed(test_log: &str) -> bool {
@@ -691,8 +702,8 @@ impl TrimulReward {
     }
 
     /// The `bash -c` program run inside the image: copy the read-only eval files next
-    /// to the staged `submission.py`, run `test`, and — only if it passes — `benchmark`,
-    /// each writing its result via fd 3 (`POPCORN_FD`). A trailing `true` keeps the
+    /// to the staged `submission.py`, run `test`, and — only if it exits cleanly —
+    /// `benchmark`, each writing its result via fd 3 (`POPCORN_FD`). A trailing `true` keeps the
     /// shell's exit status clean; ferrl reads the result files, not the exit code.
     fn in_container_command() -> String {
         // Route the grade (POPCORN fd 3) to the *captured stdout pipe* (`3>&1`) and
@@ -701,11 +712,17 @@ impl TrimulReward {
         // candidate cannot reach: its spawn-worker does not inherit fd 3 (eval.py marks
         // it non-inheritable) and its stdout is discarded, so it cannot forge a pass by
         // writing files or printing. A separator splits the two sections; benchmark runs
-        // only if `test` passed.
+        // only if `test` exits cleanly.
         "cp /eval/eval.py /eval/reference.py /eval/task.py /eval/utils.py . && \
-         { POPCORN_FD=3 python eval.py test test_spec.txt 3>&1 1>/dev/null && \
-           echo '===FERRL-BENCH===' && \
-           POPCORN_FD=3 python eval.py benchmark bench_spec.txt 3>&1 1>/dev/null; }; \
+         { POPCORN_FD=3 python eval.py test test_spec.txt 3>&1 1>/dev/null; \
+           test_rc=$?; \
+           echo \"test-exit: $test_rc\"; \
+           if [ \"$test_rc\" -eq 0 ]; then \
+             echo '===FERRL-BENCH==='; \
+             POPCORN_FD=3 python eval.py benchmark bench_spec.txt 3>&1 1>/dev/null; \
+             bench_rc=$?; \
+             echo \"benchmark-exit: $bench_rc\"; \
+           fi; }; \
          true"
             .to_string()
     }
@@ -792,6 +809,8 @@ impl TrimulReward {
         let has_benchmark_section = outcome.stdout.contains(RESULT_SPLIT);
         let (test_log, bench_log) = split_result(&outcome.stdout);
         let test_check = log_value(test_log, "check").map(str::to_string);
+        let test_exit = log_i32_value(test_log, "test-exit");
+        let benchmark_exit = log_i32_value(bench_log, "benchmark-exit");
         let correct = test_check.as_deref() == Some("pass");
         let benchmark_means_ns = if correct {
             benchmark_means_ns(bench_log)
@@ -816,6 +835,8 @@ impl TrimulReward {
             },
             status: outcome.status,
             test_check,
+            test_exit,
+            benchmark_exit,
             has_benchmark_section,
         })
     }
@@ -841,12 +862,23 @@ impl TrimulReward {
         if !eval.status.is_success() {
             return 0.0;
         }
+        if eval.test_exit.is_some_and(|code| code != 0)
+            || eval.benchmark_exit.is_some_and(|code| code != 0)
+        {
+            return 0.0;
+        }
         self.reward_value(eval.verification.correct, eval.verification.geomean_ns)
     }
 
     fn reward_diagnostic(&self, eval: &TrimulEval) -> Option<String> {
         if !eval.status.is_success() {
             return Some(format!("trimul:sandbox_{}", run_status_label(eval.status)));
+        }
+        if eval.test_exit.is_some_and(|code| code != 0) {
+            return Some("trimul:test_process_failed".to_string());
+        }
+        if eval.benchmark_exit.is_some_and(|code| code != 0) {
+            return Some("trimul:benchmark_process_failed".to_string());
         }
         if eval.verification.correct && eval.verification.geomean_ns.is_some() {
             return None;
@@ -894,6 +926,8 @@ struct TrimulEval {
     verification: TrimulVerification,
     status: RunStatus,
     test_check: Option<String>,
+    test_exit: Option<i32>,
+    benchmark_exit: Option<i32>,
     has_benchmark_section: bool,
 }
 
@@ -914,7 +948,7 @@ const RESULT_SPLIT: &str = "===FERRL-BENCH===";
 /// separator is absent (the `test` run failed, so `benchmark` never ran), the whole
 /// stream is the test section and the benchmark section is empty.
 fn split_result(stdout: &str) -> (&str, &str) {
-    stdout.split_once(RESULT_SPLIT).unwrap_or((stdout, ""))
+    stdout.rsplit_once(RESULT_SPLIT).unwrap_or((stdout, ""))
 }
 
 impl RewardFn for TrimulReward {
@@ -1099,6 +1133,8 @@ mod tests {
             },
             status: RunStatus::TimedOut,
             test_check: Some("pass".to_string()),
+            test_exit: Some(0),
+            benchmark_exit: Some(0),
             has_benchmark_section: true,
         };
 
@@ -1171,8 +1207,18 @@ mod tests {
         // is discarded, so a forged file or print cannot influence the score.
         assert!(cmd.contains("eval.py test test_spec.txt 3>&1 1>/dev/null"));
         assert!(cmd.contains("eval.py benchmark bench_spec.txt 3>&1 1>/dev/null"));
-        // The separator runs, and benchmark after it, only if `test` passed.
-        assert!(cmd.contains("1>/dev/null && echo '===FERRL-BENCH===' &&"));
+        assert!(cmd.contains("if [ \"$test_rc\" -eq 0 ]; then"));
+    }
+
+    #[test]
+    fn in_container_command_reports_eval_exit_statuses() {
+        let cmd = TrimulReward::in_container_command();
+        // The shell reports eval process exits on the same controlled grade channel,
+        // so missing grade output can be distinguished from eval process failure.
+        assert!(cmd.contains("test_rc=$?"));
+        assert!(cmd.contains("echo \"test-exit: $test_rc\""));
+        assert!(cmd.contains("bench_rc=$?"));
+        assert!(cmd.contains("echo \"benchmark-exit: $bench_rc\""));
     }
 
     #[test]
@@ -1184,6 +1230,23 @@ mod tests {
         let (test2, bench2) = split_result("check: fail\n");
         assert_eq!(test2, "check: fail\n");
         assert_eq!(bench2, "");
+    }
+
+    #[test]
+    fn exit_markers_use_the_last_grade_value() {
+        assert_eq!(
+            log_i32_value("test-exit: 7\ntest-exit: 0\n", "test-exit"),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn split_result_uses_the_last_separator() {
+        let (test, bench) = split_result(
+            "noise\n===FERRL-BENCH===\ncheck: pass\ntest-exit: 0\n===FERRL-BENCH===\nbenchmark.0.mean: 5.0\n",
+        );
+        assert!(test.contains("check: pass"));
+        assert!(bench.contains("benchmark.0.mean: 5.0"));
     }
 
     #[test]
@@ -1225,6 +1288,8 @@ mod tests {
             },
             status: RunStatus::Exited(0),
             test_check: None,
+            test_exit: None,
+            benchmark_exit: None,
             has_benchmark_section: false,
         };
         assert_eq!(
@@ -1259,6 +1324,8 @@ mod tests {
             },
             status: RunStatus::Exited(0),
             test_check: Some("pass".to_string()),
+            test_exit: Some(0),
+            benchmark_exit: None,
             has_benchmark_section: false,
         };
         assert_eq!(
@@ -1275,6 +1342,8 @@ mod tests {
             },
             status: RunStatus::Exited(0),
             test_check: Some("pass".to_string()),
+            test_exit: Some(0),
+            benchmark_exit: Some(0),
             has_benchmark_section: true,
         };
         assert_eq!(
@@ -1291,11 +1360,92 @@ mod tests {
             },
             status: RunStatus::Exited(0),
             test_check: Some("pass".to_string()),
+            test_exit: Some(0),
+            benchmark_exit: Some(0),
             has_benchmark_section: true,
         };
         assert_eq!(
             r.reward_diagnostic(&implausible_benchmark).as_deref(),
             Some("trimul:implausible_benchmark")
+        );
+    }
+
+    #[test]
+    fn reward_diagnostic_classifies_eval_process_failures() {
+        let r = reward();
+        let test_process_failed = TrimulEval {
+            verification: TrimulVerification {
+                correct: false,
+                benchmark_means_ns: Vec::new(),
+                geomean_ns: None,
+                speedup: None,
+            },
+            status: RunStatus::Exited(0),
+            test_check: None,
+            test_exit: Some(1),
+            benchmark_exit: None,
+            has_benchmark_section: false,
+        };
+        assert_eq!(
+            r.reward_diagnostic(&test_process_failed).as_deref(),
+            Some("trimul:test_process_failed")
+        );
+
+        let test_process_failed_after_pass_grade = TrimulEval {
+            verification: TrimulVerification {
+                correct: true,
+                benchmark_means_ns: vec![],
+                geomean_ns: None,
+                speedup: None,
+            },
+            status: RunStatus::Exited(0),
+            test_check: Some("pass".to_string()),
+            test_exit: Some(1),
+            benchmark_exit: None,
+            has_benchmark_section: false,
+        };
+        assert_eq!(
+            r.reward_diagnostic(&test_process_failed_after_pass_grade)
+                .as_deref(),
+            Some("trimul:test_process_failed")
+        );
+
+        let benchmark_process_failed = TrimulEval {
+            verification: TrimulVerification {
+                correct: true,
+                benchmark_means_ns: vec![],
+                geomean_ns: None,
+                speedup: None,
+            },
+            status: RunStatus::Exited(0),
+            test_check: Some("pass".to_string()),
+            test_exit: Some(0),
+            benchmark_exit: Some(2),
+            has_benchmark_section: true,
+        };
+        assert_eq!(
+            r.reward_diagnostic(&benchmark_process_failed).as_deref(),
+            Some("trimul:benchmark_process_failed")
+        );
+
+        let plausible_benchmark_process_failed = TrimulEval {
+            verification: TrimulVerification {
+                correct: true,
+                benchmark_means_ns: vec![500.0],
+                geomean_ns: Some(500.0),
+                speedup: Some(2.0),
+            },
+            status: RunStatus::Exited(0),
+            test_check: Some("pass".to_string()),
+            test_exit: Some(0),
+            benchmark_exit: Some(1),
+            has_benchmark_section: true,
+        };
+        assert_eq!(r.reward_from_eval(&plausible_benchmark_process_failed), 0.0);
+        assert_eq!(
+            r.reward_diagnostic(&plausible_benchmark_process_failed)
+                .as_deref(),
+            Some("trimul:benchmark_process_failed")
         );
     }
 
