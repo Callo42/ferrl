@@ -54,6 +54,8 @@ pub struct LoaderOpts {
     pub seed: u64,
     /// Rollout sampling temperature; must match the trainer's configured temperature.
     pub temperature: f64,
+    /// Use the experimental grouped cached-GQA rollout path for Qwen3.5 models.
+    pub memory_efficient_cached_gqa: bool,
 }
 
 impl Default for LoaderOpts {
@@ -65,6 +67,7 @@ impl Default for LoaderOpts {
             adapter_dtype: DType::F32,
             seed: 1234,
             temperature: 1.0,
+            memory_efficient_cached_gqa: false,
         }
     }
 }
@@ -102,6 +105,16 @@ pub enum LoaderError {
     UnsupportedModelType {
         /// The `config.json` `model_type` value, or `None` if the field was absent.
         model_type: Option<String>,
+    },
+    /// A loader option was requested for a model family that does not implement it.
+    #[error("loader option {option} is only supported for {supported}; checkpoint model is {model_type}")]
+    UnsupportedLoaderOption {
+        /// The unsupported run-config / loader option.
+        option: String,
+        /// The model family that implements the option.
+        supported: String,
+        /// The model family selected by the checkpoint.
+        model_type: String,
     },
 }
 
@@ -254,6 +267,13 @@ pub fn load_qwen_policy(
         path: cfg_path,
         source,
     })?;
+    if opts.memory_efficient_cached_gqa {
+        return Err(LoaderError::UnsupportedLoaderOption {
+            option: "policy.memory_efficient_cached_gqa".to_string(),
+            supported: "qwen3_5".to_string(),
+            model_type: "qwen3".to_string(),
+        });
+    }
 
     let weights_path = dir.join("model.safetensors");
     let weights = std::fs::read(&weights_path).map_err(|source| LoaderError::Io {
@@ -342,7 +362,7 @@ fn load_qwen35_policy(
 ) -> Result<(Qwen3_5Policy, HfTokenizer), LoaderError> {
     let cfg = Qwen3_5Config::from_json_file(dir.join("config.json"))?;
     let vb = varbuilder_from_pretrained(dir, opts.base_dtype, device)?;
-    let model = Qwen3_5GradModel::load_with_targets(
+    let mut model = Qwen3_5GradModel::load_with_targets(
         &cfg,
         &vb,
         opts.lora_rank,
@@ -350,6 +370,7 @@ fn load_qwen35_policy(
         opts.adapter_dtype,
         Qwen35LoraTargets::industrial(),
     )?;
+    model.set_memory_efficient_cached_gqa(opts.memory_efficient_cached_gqa);
     let policy = Qwen3_5Policy::new(model, opts.seed, opts.temperature);
     let tok = HfTokenizer::from_file(dir.join("tokenizer.json"))?;
     Ok((policy, tok))
@@ -375,6 +396,7 @@ mod tests {
         assert_eq!(o.lora_rank, 16);
         assert_eq!(o.base_dtype, DType::F32);
         assert_eq!(o.adapter_dtype, DType::F32);
+        assert!(!o.memory_efficient_cached_gqa);
     }
 
     #[test]
@@ -391,6 +413,40 @@ mod tests {
             }
             Err(other) => panic!("expected UnsupportedModelType, got {other:?}"),
             Ok(_) => panic!("expected UnsupportedModelType, got loaded policy"),
+        }
+    }
+
+    #[test]
+    fn qwen_loader_rejects_qwen35_cached_gqa_option() {
+        let tmp = TempDir::new("loader-qwen3-gqa-option");
+        std::fs::write(
+            tmp.path().join("config.json"),
+            r#"{ "model_type": "qwen3", "vocab_size": 16, "hidden_size": 8,
+                "intermediate_size": 16, "num_hidden_layers": 2,
+                "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 4,
+                "attention_bias": false, "max_position_embeddings": 32,
+                "sliding_window": null, "max_window_layers": 0,
+                "tie_word_embeddings": true, "rope_theta": 10000.0,
+                "rms_norm_eps": 1e-6, "use_sliding_window": false,
+                "hidden_act": "silu" }"#,
+        )
+        .unwrap();
+        let opts = LoaderOpts {
+            memory_efficient_cached_gqa: true,
+            ..LoaderOpts::default()
+        };
+        match load_auto_policy(tmp.path(), &Device::Cpu, &opts) {
+            Err(LoaderError::UnsupportedLoaderOption {
+                option,
+                supported,
+                model_type,
+            }) => {
+                assert_eq!(option, "policy.memory_efficient_cached_gqa");
+                assert_eq!(supported, "qwen3_5");
+                assert_eq!(model_type, "qwen3");
+            }
+            Err(other) => panic!("expected UnsupportedLoaderOption, got {other:?}"),
+            Ok(_) => panic!("expected UnsupportedLoaderOption, got loaded policy"),
         }
     }
 

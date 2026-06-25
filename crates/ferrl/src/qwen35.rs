@@ -1186,11 +1186,56 @@ impl AttnDims {
     }
 }
 
+/// Cached GQA attention without materializing the repeated K/V cache.
+///
+/// `q` is already grouped by full query heads (`[B, H, Lq, D]`), while `k`/`v`
+/// keep the compact KV-head cache (`[B, Hkv, Lk, D]`). The eager reference
+/// computes attention after `repeat_kv`, but cached rollout only has `Lq = 1` on
+/// decode steps and can compute each KV-head group directly. This preserves the
+/// same per-query-head math while avoiding a growing contiguous `[B, H, Lk, D]`
+/// allocation for K and V at every generated token.
+fn cached_gqa_context_grouped(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: Option<&Tensor>,
+    scale: f64,
+    in_dtype: DType,
+    num_kv_groups: usize,
+) -> CandleResult<Tensor> {
+    let (b, num_heads, _, _) = q.dims4()?;
+    let (_, num_kv_heads, kv_len, head_dim) = k.dims4()?;
+    debug_assert_eq!(num_heads, num_kv_heads * num_kv_groups);
+
+    let mut heads = Vec::with_capacity(num_kv_heads);
+    for kv_head in 0..num_kv_heads {
+        let q_start = kv_head * num_kv_groups;
+        let q_group = q.narrow(1, q_start, num_kv_groups)?.contiguous()?;
+        let k_group = k
+            .narrow(1, kv_head, 1)?
+            .broadcast_as((b, num_kv_groups, kv_len, head_dim))?
+            .contiguous()?;
+        let v_group = v
+            .narrow(1, kv_head, 1)?
+            .broadcast_as((b, num_kv_groups, kv_len, head_dim))?
+            .contiguous()?;
+
+        let mut scores = (q_group.matmul(&k_group.transpose(2, 3)?.contiguous()?)? * scale)?;
+        if let Some(m) = mask {
+            scores = scores.broadcast_add(m)?;
+        }
+        let probs = softmax(&scores.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(in_dtype)?;
+        heads.push(probs.matmul(&v_group)?);
+    }
+
+    Tensor::cat(&heads, 1)
+}
+
 /// The shared attention math from the doubled-`q_proj` output onward, over
 /// already-projected tensors — used by both the grad side (no cache) and the
 /// merged side (KV-cached): per-head `[query | gate]` split → QK-norm →
-/// partial rope at `offset` → (cache append) → GQA repeat → SDPA with fp32
-/// softmax → `* sigmoid(gate)` — returning the pre-`o_proj` context.
+/// partial rope at `offset` → (cache append) → GQA SDPA with fp32 softmax →
+/// `* sigmoid(gate)` — returning the pre-`o_proj` context.
 #[allow(clippy::too_many_arguments)]
 fn gated_attention_core(
     dims: &AttnDims,
@@ -1203,6 +1248,7 @@ fn gated_attention_core(
     rot: &RotaryTables,
     offset: usize,
     cache: Option<&mut ConcatKvCache>,
+    memory_efficient_cached_gqa: bool,
 ) -> CandleResult<Tensor> {
     let (b, l, _) = qg.dims3()?;
     let h = dims.num_heads;
@@ -1233,25 +1279,33 @@ fn gated_attention_core(
     let q = rope_partial(&q.contiguous()?, &cos, &sin, dims.rot_dim)?;
     let k = rope_partial(&k.contiguous()?, &cos, &sin, dims.rot_dim)?;
 
-    // Append the UN-repeated K/V when cached, then GQA-repeat what attention
-    // consumes (the cache stays compact, the shipped order).
-    let (k, v) = match cache {
-        Some(c) => c.append(&k.contiguous()?, &v.contiguous()?)?,
-        None => (k, v.contiguous()?),
+    // Append the UN-repeated K/V when cached. The cache stays compact; cached
+    // rollout computes GQA per KV-head group below instead of materializing the
+    // repeated K/V tensors for every decode token.
+    let (k, v, cached) = match cache {
+        Some(c) => {
+            let (k, v) = c.append(&k.contiguous()?, &v.contiguous()?)?;
+            (k, v, true)
+        }
+        None => (k, v.contiguous()?, false),
     };
-    let k = repeat_kv(&k, dims.num_kv_groups)?.contiguous()?;
-    let v = repeat_kv(&v, dims.num_kv_groups)?.contiguous()?;
 
     // SDPA in the activation dtype with the fp32 softmax round-trip — the
     // reference eager path computes scores in the model dtype, softmaxes in
     // fp32, and casts the probabilities back before the value matmul.
     let scale = 1.0 / (d as f64).sqrt();
-    let mut scores = (q.contiguous()?.matmul(&k.transpose(2, 3)?.contiguous()?)? * scale)?;
-    if let Some(m) = mask {
-        scores = scores.broadcast_add(m)?;
-    }
-    let probs = softmax(&scores.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(in_dtype)?;
-    let ctx = probs.matmul(&v)?;
+    let ctx = if cached && memory_efficient_cached_gqa && l == 1 && dims.num_kv_groups > 1 {
+        cached_gqa_context_grouped(&q, &k, &v, mask, scale, in_dtype, dims.num_kv_groups)?
+    } else {
+        let k = repeat_kv(&k, dims.num_kv_groups)?.contiguous()?;
+        let v = repeat_kv(&v, dims.num_kv_groups)?.contiguous()?;
+        let mut scores = (q.contiguous()?.matmul(&k.transpose(2, 3)?.contiguous()?)? * scale)?;
+        if let Some(m) = mask {
+            scores = scores.broadcast_add(m)?;
+        }
+        let probs = softmax(&scores.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(in_dtype)?;
+        probs.matmul(&v)?
+    };
 
     // Back to [B, L, H*D], then the output gate.
     let ctx = ctx.transpose(1, 2)?.contiguous()?.reshape((b, l, h * d))?;
@@ -1314,6 +1368,7 @@ impl Qwen3_5Attention {
             rot,
             0,
             None,
+            false,
         )?;
         self.o_proj.forward(&ctx)
     }
@@ -1684,6 +1739,7 @@ pub struct Qwen3_5GradModel {
     targets: LoraTargets,
     adapter_enabled: bool,
     remat: bool,
+    memory_efficient_cached_gqa: bool,
     /// `Some` iff loaded via [`load_full_ft`](Self::load_full_ft): every base
     /// weight var in registry (load) order — the full-FT positional
     /// checkpoint contract. Doubles as the mode flag.
@@ -1903,6 +1959,7 @@ impl Qwen3_5GradModel {
             },
             adapter_enabled: true,
             remat: false,
+            memory_efficient_cached_gqa: false,
             full_ft_vars: None,
             tape: RefCell::new(None),
         })
@@ -2225,13 +2282,22 @@ impl Qwen3_5GradModel {
         self.remat
     }
 
-    /// Enable/disable the `LoRA` adapter on every targeted projection
-    /// (disabled == the frozen base model == the GRPO reference policy).
-    ///
-    /// **No-op in full-FT mode** (per the [`GradModel`] contract): there are
-    /// no adapters and no frozen base policy to toggle back to, so the flag
-    /// stays `true` — callers that need the toggle (eval's base-vs-trained
-    /// comparison) observe it did not take and fail loud.
+    /// Use the experimental grouped cached-GQA rollout path instead of materializing
+    /// repeated K/V cache tensors. Default is off to preserve the existing decoder
+    /// arithmetic and strict behavior gates; enable only for explicit memory probes.
+    pub fn set_memory_efficient_cached_gqa(&mut self, on: bool) {
+        self.memory_efficient_cached_gqa = on;
+    }
+
+    /// Whether the experimental grouped cached-GQA rollout path is enabled.
+    #[must_use]
+    pub fn memory_efficient_cached_gqa(&self) -> bool {
+        self.memory_efficient_cached_gqa
+    }
+
+    /// Enable or disable the `LoRA` adapter on every targeted projection.
+    /// Disabled means the frozen base model, which GRPO uses as its reference policy.
+    /// In full-FT mode this is a no-op because there is no adapter to toggle.
     pub fn set_adapter_enabled(&mut self, enabled: bool) {
         if self.is_full_ft() {
             self.adapter_enabled = true;
@@ -2569,10 +2635,15 @@ struct MergedAttention {
     dims: AttnDims,
     /// Un-repeated K/V, concatenated on the sequence axis (dim 2).
     cache: ConcatKvCache,
+    memory_efficient_cached_gqa: bool,
 }
 
 impl MergedAttention {
-    fn from_layer(l: &Qwen3_5Attention, full_ft: bool) -> CandleResult<Self> {
+    fn from_layer(
+        l: &Qwen3_5Attention,
+        full_ft: bool,
+        memory_efficient_cached_gqa: bool,
+    ) -> CandleResult<Self> {
         Ok(Self {
             q_w: snap_proj(&l.q_proj, full_ft)?,
             k_w: snap_proj(&l.k_proj, full_ft)?,
@@ -2590,6 +2661,7 @@ impl MergedAttention {
             },
             dims: l.dims,
             cache: ConcatKvCache::new(2),
+            memory_efficient_cached_gqa,
         })
     }
 
@@ -2614,6 +2686,7 @@ impl MergedAttention {
             rot,
             offset,
             Some(&mut self.cache),
+            self.memory_efficient_cached_gqa,
         )?;
         frozen_linear(&ctx, &self.o_w)
     }
@@ -2799,7 +2872,11 @@ impl Qwen3_5MergedDecoder {
         for layer in &model.layers {
             let mixer = match &layer.mixer {
                 Mixer::Linear(gdn) => MergedMixer::Linear(MergedGdn::from_layer(gdn, full_ft)?),
-                Mixer::Full(attn) => MergedMixer::Full(MergedAttention::from_layer(attn, full_ft)?),
+                Mixer::Full(attn) => MergedMixer::Full(MergedAttention::from_layer(
+                    attn,
+                    full_ft,
+                    model.memory_efficient_cached_gqa,
+                )?),
             };
             layers.push(MergedLayer {
                 ln1: if full_ft {
@@ -3818,6 +3895,81 @@ mod tests {
     #[test]
     fn batched_decode_equals_per_row_single_decode_dense() {
         assert_batched_decode_matches_per_row(&armed_model());
+    }
+
+    #[test]
+    fn memory_efficient_cached_gqa_matches_default_cached_decoder_paths() {
+        let mut model = armed_model();
+        let full = ids(9);
+
+        model.set_memory_efficient_cached_gqa(false);
+        let mut default_dec = model.merged_decoder().unwrap();
+        model.set_memory_efficient_cached_gqa(true);
+        let mut efficient_dec = model.merged_decoder().unwrap();
+        let default_prefill = default_dec.forward(&full, 0).unwrap();
+        let efficient_prefill = efficient_dec.forward(&full, 0).unwrap();
+        let d = max_abs_diff(&default_prefill, &efficient_prefill);
+        assert!(d <= MERGED_TOL, "memory-efficient prefill diff {d}");
+
+        model.set_memory_efficient_cached_gqa(false);
+        let mut default_dec = model.merged_decoder().unwrap();
+        model.set_memory_efficient_cached_gqa(true);
+        let mut efficient_dec = model.merged_decoder().unwrap();
+        let prefix = full.narrow(1, 0, 5).unwrap();
+        let mut default_parts = vec![default_dec.forward(&prefix, 0).unwrap()];
+        let mut efficient_parts = vec![efficient_dec.forward(&prefix, 0).unwrap()];
+        for t in 5..9 {
+            let tok = full.narrow(1, t, 1).unwrap();
+            default_parts.push(default_dec.forward(&tok, t).unwrap());
+            efficient_parts.push(efficient_dec.forward(&tok, t).unwrap());
+        }
+        let d = max_abs_diff(
+            &Tensor::cat(&default_parts, 1).unwrap(),
+            &Tensor::cat(&efficient_parts, 1).unwrap(),
+        );
+        assert!(
+            d <= MERGED_TOL,
+            "memory-efficient single-token decode diff {d}"
+        );
+
+        for p in [1usize, 2, 5] {
+            model.set_memory_efficient_cached_gqa(false);
+            let mut default_dec = model.merged_decoder().unwrap();
+            model.set_memory_efficient_cached_gqa(true);
+            let mut efficient_dec = model.merged_decoder().unwrap();
+            let prefix = full.narrow(1, 0, p).unwrap();
+            let rest = full.narrow(1, p, 9 - p).unwrap();
+            let default_cached = Tensor::cat(
+                &[
+                    default_dec.forward(&prefix, 0).unwrap(),
+                    default_dec.forward(&rest, p).unwrap(),
+                ],
+                1,
+            )
+            .unwrap();
+            let efficient_cached = Tensor::cat(
+                &[
+                    efficient_dec.forward(&prefix, 0).unwrap(),
+                    efficient_dec.forward(&rest, p).unwrap(),
+                ],
+                1,
+            )
+            .unwrap();
+            let d = max_abs_diff(&default_cached, &efficient_cached);
+            assert!(
+                d <= MERGED_TOL,
+                "memory-efficient chunked continuation split {p} diff {d}"
+            );
+        }
+    }
+
+    #[test]
+    fn memory_efficient_cached_gqa_preserves_batched_decode_invariant() {
+        let mut model = armed_model();
+        assert!(!model.memory_efficient_cached_gqa());
+        model.set_memory_efficient_cached_gqa(true);
+        assert!(model.memory_efficient_cached_gqa());
+        assert_batched_decode_matches_per_row(&model);
     }
 
     #[test]

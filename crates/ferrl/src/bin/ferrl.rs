@@ -380,6 +380,8 @@ struct PolicyCfg {
     /// This trades extra recompute for a lower activation peak and is the main
     /// CLI-accessible memory lever for long Qwen-family GPU training runs.
     activation_checkpointing: bool,
+    /// Enable the experimental grouped cached-GQA rollout memory path for Qwen3.5.
+    memory_efficient_cached_gqa: bool,
 }
 
 impl Default for PolicyCfg {
@@ -390,6 +392,7 @@ impl Default for PolicyCfg {
             base_dtype: DtypeSel::F32,
             seed: 1234,
             activation_checkpointing: false,
+            memory_efficient_cached_gqa: false,
         }
     }
 }
@@ -594,6 +597,7 @@ impl RunConfig {
             adapter_dtype: DType::F32,
             seed: self.policy.seed,
             temperature: self.trainer.temperature,
+            memory_efficient_cached_gqa: self.policy.memory_efficient_cached_gqa,
         }
     }
 
@@ -1880,6 +1884,7 @@ mod tests {
         assert_eq!(cfg.out_dir, PathBuf::from("runs"));
         assert_eq!(cfg.policy.lora_rank, 16);
         assert!(!cfg.policy.activation_checkpointing);
+        assert!(!cfg.policy.memory_efficient_cached_gqa);
         assert_eq!(cfg.data.train_n, 64);
         // The loader temperature mirrors the trainer's (cannot drift).
         assert!((cfg.loader_opts().temperature - cfg.trainer.temperature).abs() < f64::EPSILON);
@@ -1892,7 +1897,11 @@ mod tests {
             "task": "math",
             "model_dir": "/m",
             "device": "cuda",
-            "policy": { "base_dtype": "bf16", "activation_checkpointing": true },
+            "policy": {
+                "base_dtype": "bf16",
+                "activation_checkpointing": true,
+                "memory_efficient_cached_gqa": true
+            },
             "data": { "path": "data.jsonl", "eval_n": 4 },
             "trainer": { "steps": 1, "group_size": 2, "max_new_tokens": 8,
                          "temperature": 0.7, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
@@ -1903,6 +1912,7 @@ mod tests {
         assert!(matches!(cfg.device, DeviceSel::Cuda));
         assert_eq!(cfg.loader_opts().base_dtype, DType::BF16);
         assert!(cfg.policy.activation_checkpointing);
+        assert!(cfg.loader_opts().memory_efficient_cached_gqa);
         assert_eq!(cfg.data.path.as_deref(), Some(Path::new("data.jsonl")));
     }
 
