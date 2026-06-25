@@ -448,6 +448,8 @@ enum TrimulPromptFormat {
     Raw,
     /// Qwen3.5's native chat template, with thinking generation enabled.
     Qwen3_5ChatThinking,
+    /// Qwen3.5 thinking prompt with a concise reasoning budget.
+    Qwen3_5ChatThinkingConcise,
 }
 
 impl TrimulPromptFormat {
@@ -458,6 +460,9 @@ impl TrimulPromptFormat {
             Self::Qwen3_5ChatThinking => {
                 ferrl::trimul::build_qwen3_5_chat_thinking_prompt(task_prompt)
             }
+            Self::Qwen3_5ChatThinkingConcise => {
+                ferrl::trimul::build_qwen3_5_chat_concise_thinking_prompt(task_prompt)
+            }
         }
     }
 
@@ -465,7 +470,9 @@ impl TrimulPromptFormat {
     fn submission_extract_mode(self) -> ferrl::trimul::SubmissionExtractMode {
         match self {
             Self::Raw => ferrl::trimul::SubmissionExtractMode::FinalFence,
-            Self::Qwen3_5ChatThinking => ferrl::trimul::SubmissionExtractMode::ThinkingAfterThink,
+            Self::Qwen3_5ChatThinking | Self::Qwen3_5ChatThinkingConcise => {
+                ferrl::trimul::SubmissionExtractMode::ThinkingAfterThink
+            }
         }
     }
 }
@@ -2196,6 +2203,36 @@ mod tests {
         let (train, eval) = cfg.trimul_splits().unwrap();
         assert_eq!((train.len(), eval.len()), (8, 2));
         assert!(train[0].prompt.contains("custom_kernel"));
+    }
+
+    /// The concise Qwen3.5 thinking prompt is opt-in and keeps the thinking extractor.
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // assertion-heavy regression over config, prompt, and extractor
+    fn trimul_config_selects_concise_qwen35_thinking_prompt() {
+        let json = r#"{ "task": "trimul", "model_dir": "/m",
+                        "trimul": { "prompt_format": "qwen3_5_chat_thinking_concise" },
+                        "trainer": { "steps": 1, "group_size": 2, "max_new_tokens": 8,
+                          "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
+                          "lr": 1e-5, "weight_decay": 0.0,
+                          "loss_type": "grpo", "scale_rewards": "group" } }"#;
+        let cfg: RunConfig = serde_json::from_str(json).unwrap();
+        let (train, eval) = cfg.trimul_splits().unwrap();
+        assert_eq!((train.len(), eval.len()), (64, 0));
+        assert!(matches!(
+            cfg.trimul.prompt_format.submission_extract_mode(),
+            ferrl::trimul::SubmissionExtractMode::ThinkingAfterThink
+        ));
+        assert!(train[0].prompt.starts_with("<|im_start|>system\n"));
+        assert!(train[0]
+            .prompt
+            .ends_with("<|im_start|>assistant\n<think>\n"));
+        for needle in [
+            "Use at most 8 short reasoning lines inside <think>.",
+            "Prefer a complete valid implementation over further analysis.",
+            "custom_kernel(data)",
+        ] {
+            assert!(train[0].prompt.contains(needle), "missing {needle:?}");
+        }
     }
 
     /// A `trimul` config with no `trimul` block still parses (the defaults), and the
