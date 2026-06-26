@@ -2226,6 +2226,49 @@ mod tests {
         assert!(train[0].prompt.contains("custom_kernel"));
     }
 
+    /// The verifier CUDA pin is not just parsed: it reaches the reward run spec.
+    #[test]
+    fn trimul_config_pins_verifier_cuda_visibility_in_reward() {
+        let eval_dir =
+            std::env::temp_dir().join(format!("ferrl-trimul-config-test-{}", std::process::id()));
+        std::fs::create_dir_all(&eval_dir).unwrap();
+        std::fs::write(
+            eval_dir.join("task.yml"),
+            r#"
+tests:
+  - {"seqlen": 8, "bs": 1, "dim": 16, "hiddendim": 16, "seed": 100, "nomask": True, "distribution": "normal"}
+benchmarks:
+  - {"seqlen": 16, "bs": 1, "dim": 32, "hiddendim": 16, "seed": 200, "nomask": True, "distribution": "normal"}
+"#,
+        )
+        .unwrap();
+        let json = format!(
+            r#"{{
+                "task": "trimul",
+                "model_dir": "/m",
+                "trimul": {{
+                  "image": "/img.sif",
+                  "eval_dir": "{}",
+                  "scratch_root": "/tmp",
+                  "verifier_cuda_visible_devices": "1"
+                }},
+                "trainer": {{ "steps": 1, "group_size": 2, "max_new_tokens": 8,
+                  "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
+                  "lr": 1e-5, "weight_decay": 0.0,
+                  "loss_type": "grpo", "scale_rewards": "group" }}
+            }}"#,
+            eval_dir.display()
+        );
+        let cfg: RunConfig = serde_json::from_str(&json).unwrap();
+        let reward = cfg.build_trimul_reward_base().unwrap();
+        let spec = reward.build_run_spec(std::path::Path::new("/tmp/scratch"));
+
+        assert!(spec
+            .env
+            .iter()
+            .any(|(k, v)| k == "CUDA_VISIBLE_DEVICES" && v == "1"));
+    }
+
     /// The concise Qwen3.5 thinking prompt is opt-in and keeps the thinking extractor.
     #[test]
     #[allow(clippy::cognitive_complexity)] // assertion-heavy regression over config, prompt, and extractor
