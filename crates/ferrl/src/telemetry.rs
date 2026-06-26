@@ -610,6 +610,12 @@ pub struct CandidateRecord {
     /// reward implementation did not provide a diagnostic.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reward_diagnostic: Option<String>,
+    /// Optional structured reward-path metadata for this candidate.
+    ///
+    /// The trainer treats this as opaque task-owned JSON. Old candidate ledgers do
+    /// not have the field; empty metadata is omitted when writing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reward_metadata: Option<serde_json::Value>,
     /// Decoded completion text, exactly as passed to the reward.
     pub completion: String,
 }
@@ -2127,6 +2133,7 @@ mod tests {
             reward: 1.0,
             completion_len_tokens: 2,
             reward_diagnostic: Some("test:fixture".to_string()),
+            reward_metadata: Some(serde_json::json!({ "fixture": true })),
             completion: "candidate".to_string(),
         })
         .unwrap();
@@ -2168,6 +2175,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cognitive_complexity)] // compact JSONL regression over field omission/presence
     fn candidate_writer_appends_jsonl_records() {
         let tmp = TempDir::new("candidates");
         let rd = RunDir::create(tmp.path(), "run-candidates").unwrap();
@@ -2181,6 +2189,7 @@ mod tests {
             reward: f32::NAN,
             completion_len_tokens: 42,
             reward_diagnostic: Some("trimul:no_submission".to_string()),
+            reward_metadata: Some(serde_json::json!({ "task": "trimul" })),
             completion: "```python\ndef custom_kernel(data):\n    return data\n```".to_string(),
         };
         w.append(&rec).unwrap();
@@ -2197,14 +2206,19 @@ mod tests {
             parsed.reward_diagnostic.as_deref(),
             Some("trimul:no_submission")
         );
+        assert_eq!(
+            parsed.reward_metadata.as_ref().and_then(|m| m.get("task")),
+            Some(&serde_json::json!("trimul"))
+        );
         assert!(parsed.completion.contains("custom_kernel"));
     }
 
     #[test]
-    fn candidate_record_reward_diagnostic_is_jsonl_compatible() {
+    fn candidate_record_reward_diagnostics_are_jsonl_compatible() {
         let old_row = r#"{"step":3,"rank":0,"world_size":1,"prompt_index":12,"group_index":1,"reward":0.0,"completion_len_tokens":42,"completion":"old"}"#;
         let parsed: CandidateRecord = serde_json::from_str(old_row).unwrap();
         assert_eq!(parsed.reward_diagnostic, None);
+        assert_eq!(parsed.reward_metadata, None);
 
         let tmp = TempDir::new("candidates-compat");
         let rd = RunDir::create(tmp.path(), "run-candidates-compat").unwrap();
@@ -2218,6 +2232,7 @@ mod tests {
             reward: 0.0,
             completion_len_tokens: 42,
             reward_diagnostic: None,
+            reward_metadata: None,
             completion: "new".to_string(),
         };
         w.append(&rec).unwrap();
@@ -2225,8 +2240,10 @@ mod tests {
 
         let raw = std::fs::read_to_string(rd.candidates_path()).unwrap();
         assert!(!raw.contains("reward_diagnostic"));
+        assert!(!raw.contains("reward_metadata"));
         let written: CandidateRecord = serde_json::from_str(raw.trim()).unwrap();
         assert_eq!(written.reward_diagnostic, None);
+        assert_eq!(written.reward_metadata, None);
     }
 
     #[test]

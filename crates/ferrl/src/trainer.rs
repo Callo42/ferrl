@@ -72,7 +72,7 @@ use crate::grpo::{
 use crate::nn::grad_coverage;
 use crate::optim::{FerrlAdamW, OptimizerState};
 use crate::policy::{GenConfig, Policy, Rollout};
-use crate::reward::{RewardError, RewardFn};
+use crate::reward::{RewardError, RewardFn, RewardOutcome};
 use crate::sample::Sample;
 use crate::telemetry::{
     cuda_memory_snapshot, CandidateRecord, CandidateWriter, GpuMemorySnapshot, Metrics,
@@ -1772,7 +1772,7 @@ impl Trainer {
         prompt_index: u64,
         completions: &[String],
         rewards: &[f32],
-        reward_diagnostics: &[Option<String>],
+        reward_outcomes: &[RewardOutcome],
         rollout: &Rollout,
     ) -> Result<(), TrainerError> {
         let k = self.config.candidate_log_top_k.min(completions.len());
@@ -1797,7 +1797,8 @@ impl Trainer {
                 group_index,
                 reward: rewards[group_index],
                 completion_len_tokens: rollout.completion_lens[group_index],
-                reward_diagnostic: reward_diagnostics[group_index].clone(),
+                reward_diagnostic: reward_outcomes[group_index].diagnostic.clone(),
+                reward_metadata: reward_outcomes[group_index].metadata.clone(),
                 completion: completions[group_index].clone(),
             })?;
         }
@@ -1979,10 +1980,6 @@ impl Trainer {
             .iter()
             .map(|outcome| outcome.reward)
             .collect();
-        let reward_diagnostics: Vec<Option<String>> = reward_outcomes
-            .into_iter()
-            .map(|outcome| outcome.diagnostic)
-            .collect();
         if rewards.len() != rollout.len() {
             return Err(TrainerError::Contract(format!(
                 "reward_group_detailed returned {} rewards for {} completions",
@@ -1995,7 +1992,7 @@ impl Trainer {
             selected.selection.prompt_index,
             &completions,
             &rewards,
-            &reward_diagnostics,
+            &reward_outcomes,
             &rollout,
         )?;
 
@@ -4965,6 +4962,7 @@ mod tests {
                     Ok(crate::RewardOutcome {
                         reward,
                         diagnostic: Some(format!("candidate:{completion}")),
+                        metadata: Some(serde_json::json!({ "completion": completion })),
                     })
                 })
                 .collect()
@@ -4972,6 +4970,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cognitive_complexity)] // ledger regression checks ordered fields plus metadata
     fn trainer_writes_top_candidate_records_when_enabled() {
         let tmp = WireTmp::new("candidates");
         let run = RunDir::create(&tmp.0, "candidate-run").unwrap();
@@ -5014,10 +5013,22 @@ mod tests {
         );
         assert_eq!(rec0.reward_diagnostic.as_deref(), Some("candidate:9,9"));
         assert_eq!(
+            rec0.reward_metadata
+                .as_ref()
+                .and_then(|m| m.get("completion")),
+            Some(&serde_json::json!("9,9"))
+        );
+        assert_eq!(
             (rec1.group_index, rec1.reward, rec1.completion.as_str()),
             (2, 1.0, "2,2")
         );
         assert_eq!(rec1.reward_diagnostic.as_deref(), Some("candidate:2,2"));
+        assert_eq!(
+            rec1.reward_metadata
+                .as_ref()
+                .and_then(|m| m.get("completion")),
+            Some(&serde_json::json!("2,2"))
+        );
     }
 
     // ---- completion_lens consumption (length-aware mask / decode / metric) --
