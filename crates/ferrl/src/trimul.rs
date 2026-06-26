@@ -861,6 +861,10 @@ impl TrimulReward {
                 speedup,
             },
             status: outcome.status,
+            output: TrimulEvalOutput {
+                stdout: outcome.stdout,
+                stderr: outcome.stderr,
+            },
             test_check,
             test_exit,
             benchmark_exit,
@@ -895,13 +899,15 @@ impl TrimulReward {
     }
 
     fn reward_metadata(&self, submission: &str, eval: &TrimulEval) -> serde_json::Value {
-        serde_json::json!({
+        let mut metadata = serde_json::json!({
             "task": "trimul",
             "submission_extracted": true,
             "source_sha256": sha256_hex(submission.as_bytes()),
             "source_len_bytes": submission.len(),
             "sandbox_status": run_status_label(eval.status),
             "sandbox_success": eval.status.is_success(),
+            "sandbox_stdout_len_bytes": eval.output.stdout.len(),
+            "sandbox_stderr_len_bytes": eval.output.stderr.len(),
             "test_check": eval.test_check.as_deref(),
             "test_exit": eval.test_exit,
             "benchmark_exit": eval.benchmark_exit,
@@ -910,7 +916,33 @@ impl TrimulReward {
             "benchmark_mean_count": eval.verification.benchmark_means_ns.len(),
             "geomean_ns": eval.verification.geomean_ns,
             "speedup": eval.verification.speedup,
-        })
+        });
+
+        if eval.should_preserve_output_tail() {
+            let object = metadata
+                .as_object_mut()
+                .expect("TriMul reward metadata is a JSON object");
+            if let Some(stdout_tail) =
+                bounded_tail(&eval.output.stdout, EVAL_OUTPUT_TAIL_LIMIT_BYTES)
+            {
+                object.insert("sandbox_stdout_tail".to_string(), stdout_tail.into());
+                object.insert(
+                    "sandbox_stdout_tail_truncated".to_string(),
+                    (eval.output.stdout.len() > EVAL_OUTPUT_TAIL_LIMIT_BYTES).into(),
+                );
+            }
+            if let Some(stderr_tail) =
+                bounded_tail(&eval.output.stderr, EVAL_OUTPUT_TAIL_LIMIT_BYTES)
+            {
+                object.insert("sandbox_stderr_tail".to_string(), stderr_tail.into());
+                object.insert(
+                    "sandbox_stderr_tail_truncated".to_string(),
+                    (eval.output.stderr.len() > EVAL_OUTPUT_TAIL_LIMIT_BYTES).into(),
+                );
+            }
+        }
+
+        metadata
     }
 
     fn reward_from_eval(&self, eval: &TrimulEval) -> f32 {
@@ -990,10 +1022,25 @@ fn write(dir: &Path, name: &str, contents: &str) -> Result<(), RewardError> {
 struct TrimulEval {
     verification: TrimulVerification,
     status: RunStatus,
+    output: TrimulEvalOutput,
     test_check: Option<String>,
     test_exit: Option<i32>,
     benchmark_exit: Option<i32>,
     has_benchmark_section: bool,
+}
+
+impl TrimulEval {
+    fn should_preserve_output_tail(&self) -> bool {
+        !self.status.is_success()
+            || self.test_exit != Some(0)
+            || (self.verification.correct && self.benchmark_exit != Some(0))
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct TrimulEvalOutput {
+    stdout: String,
+    stderr: String,
 }
 
 fn run_status_label(status: RunStatus) -> String {
@@ -1014,11 +1061,28 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// result sections on the grade channel.
 const RESULT_SPLIT: &str = "===FERRL-BENCH===";
 
+/// Maximum captured eval output text stored in candidate metadata.
+const EVAL_OUTPUT_TAIL_LIMIT_BYTES: usize = 4096;
+
 /// Split the captured grade stream into its `(test, benchmark)` sections. If the
 /// separator is absent (the `test` run failed, so `benchmark` never ran), the whole
 /// stream is the test section and the benchmark section is empty.
 fn split_result(stdout: &str) -> (&str, &str) {
     stdout.rsplit_once(RESULT_SPLIT).unwrap_or((stdout, ""))
+}
+
+fn bounded_tail(text: &str, limit: usize) -> Option<String> {
+    if text.is_empty() {
+        return None;
+    }
+    if text.len() <= limit {
+        return Some(text.to_string());
+    }
+    let mut start = text.len() - limit;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    Some(text[start..].to_string())
 }
 
 impl RewardFn for TrimulReward {
@@ -1202,6 +1266,7 @@ mod tests {
                 speedup: Some(2.0),
             },
             status: RunStatus::TimedOut,
+            output: TrimulEvalOutput::default(),
             test_check: Some("pass".to_string()),
             test_exit: Some(0),
             benchmark_exit: Some(0),
@@ -1228,6 +1293,13 @@ mod tests {
                 speedup: Some(1.581_138_830_084_189_8),
             },
             status: RunStatus::Exited(0),
+            output: TrimulEvalOutput {
+                stdout: "check: pass\ntest-exit: 1\n".to_string(),
+                stderr: format!(
+                    "Traceback: candidate crashed\n{}",
+                    "x".repeat(EVAL_OUTPUT_TAIL_LIMIT_BYTES + 8)
+                ),
+            },
             test_check: Some("pass".to_string()),
             test_exit: Some(1),
             benchmark_exit: None,
@@ -1247,12 +1319,100 @@ mod tests {
         );
         assert_eq!(metadata["sandbox_status"], serde_json::json!("exited_0"));
         assert_eq!(metadata["sandbox_success"], serde_json::json!(true));
+        assert_eq!(
+            metadata["sandbox_stdout_len_bytes"],
+            serde_json::json!("check: pass\ntest-exit: 1\n".len())
+        );
+        assert_eq!(
+            metadata["sandbox_stderr_len_bytes"],
+            serde_json::json!(eval.output.stderr.len())
+        );
+        assert_eq!(
+            metadata["sandbox_stdout_tail"],
+            serde_json::json!("check: pass\ntest-exit: 1\n")
+        );
+        assert_eq!(
+            metadata["sandbox_stdout_tail_truncated"],
+            serde_json::json!(false)
+        );
+        let stderr_tail = metadata["sandbox_stderr_tail"].as_str().unwrap();
+        assert_eq!(stderr_tail.len(), EVAL_OUTPUT_TAIL_LIMIT_BYTES);
+        assert!(stderr_tail.chars().all(|ch| ch == 'x'));
+        assert_eq!(
+            metadata["sandbox_stderr_tail_truncated"],
+            serde_json::json!(true)
+        );
         assert_eq!(metadata["test_check"], serde_json::json!("pass"));
         assert_eq!(metadata["test_exit"], serde_json::json!(1));
         assert_eq!(metadata["benchmark_exit"], serde_json::Value::Null);
         assert_eq!(metadata["has_benchmark_section"], serde_json::json!(false));
         assert_eq!(metadata["correct"], serde_json::json!(true));
         assert_eq!(metadata["benchmark_mean_count"], serde_json::json!(2));
+    }
+
+    #[test]
+    fn reward_metadata_omits_empty_output_tails_for_successful_eval() {
+        let r = reward().with_baseline_ns(1000.0);
+        let eval = TrimulEval {
+            verification: TrimulVerification {
+                correct: true,
+                benchmark_means_ns: vec![500.0],
+                geomean_ns: Some(500.0),
+                speedup: Some(2.0),
+            },
+            status: RunStatus::Exited(0),
+            output: TrimulEvalOutput::default(),
+            test_check: Some("pass".to_string()),
+            test_exit: Some(0),
+            benchmark_exit: Some(0),
+            has_benchmark_section: true,
+        };
+
+        let metadata = r.reward_metadata("def custom_kernel(data): return data", &eval);
+        assert_eq!(metadata["sandbox_stdout_len_bytes"], serde_json::json!(0));
+        assert_eq!(metadata["sandbox_stderr_len_bytes"], serde_json::json!(0));
+        assert!(metadata.get("sandbox_stdout_tail").is_none());
+        assert!(metadata.get("sandbox_stderr_tail").is_none());
+    }
+
+    #[test]
+    fn reward_metadata_preserves_output_tail_for_test_process_failure() {
+        let r = reward().with_baseline_ns(1000.0);
+        let eval = TrimulEval {
+            verification: TrimulVerification {
+                correct: false,
+                benchmark_means_ns: Vec::new(),
+                geomean_ns: None,
+                speedup: None,
+            },
+            status: RunStatus::Exited(0),
+            output: TrimulEvalOutput {
+                stdout: "test-exit: 1\n".to_string(),
+                stderr: "RuntimeError: candidate test failed\n".to_string(),
+            },
+            test_check: None,
+            test_exit: Some(1),
+            benchmark_exit: None,
+            has_benchmark_section: false,
+        };
+
+        assert_eq!(
+            r.reward_diagnostic(&eval).as_deref(),
+            Some("trimul:test_process_failed")
+        );
+        let metadata = r.reward_metadata("def custom_kernel(data): return data", &eval);
+        assert_eq!(
+            metadata["sandbox_stdout_tail"],
+            serde_json::json!("test-exit: 1\n")
+        );
+        assert_eq!(
+            metadata["sandbox_stderr_tail"],
+            serde_json::json!("RuntimeError: candidate test failed\n")
+        );
+        assert_eq!(
+            metadata["sandbox_stderr_tail_truncated"],
+            serde_json::json!(false)
+        );
     }
 
     #[test]
@@ -1404,6 +1564,7 @@ mod tests {
                 speedup: None,
             },
             status: RunStatus::Exited(0),
+            output: TrimulEvalOutput::default(),
             test_check: None,
             test_exit: Some(0),
             benchmark_exit: None,
@@ -1440,6 +1601,7 @@ mod tests {
                 speedup: None,
             },
             status: RunStatus::Exited(0),
+            output: TrimulEvalOutput::default(),
             test_check: Some("pass".to_string()),
             test_exit: Some(0),
             benchmark_exit: None,
@@ -1458,6 +1620,7 @@ mod tests {
                 speedup: None,
             },
             status: RunStatus::Exited(0),
+            output: TrimulEvalOutput::default(),
             test_check: Some("pass".to_string()),
             test_exit: Some(0),
             benchmark_exit: Some(0),
@@ -1476,6 +1639,7 @@ mod tests {
                 speedup: None,
             },
             status: RunStatus::Exited(0),
+            output: TrimulEvalOutput::default(),
             test_check: Some("pass".to_string()),
             test_exit: Some(0),
             benchmark_exit: Some(0),
@@ -1498,6 +1662,7 @@ mod tests {
                 speedup: None,
             },
             status: RunStatus::Exited(0),
+            output: TrimulEvalOutput::default(),
             test_check: None,
             test_exit: Some(1),
             benchmark_exit: None,
@@ -1516,6 +1681,7 @@ mod tests {
                 speedup: None,
             },
             status: RunStatus::Exited(0),
+            output: TrimulEvalOutput::default(),
             test_check: Some("pass".to_string()),
             test_exit: Some(1),
             benchmark_exit: None,
@@ -1535,6 +1701,7 @@ mod tests {
                 speedup: None,
             },
             status: RunStatus::Exited(0),
+            output: TrimulEvalOutput::default(),
             test_check: Some("pass".to_string()),
             test_exit: Some(0),
             benchmark_exit: Some(2),
@@ -1553,6 +1720,7 @@ mod tests {
                 speedup: Some(2.0),
             },
             status: RunStatus::Exited(0),
+            output: TrimulEvalOutput::default(),
             test_check: Some("pass".to_string()),
             test_exit: Some(0),
             benchmark_exit: Some(1),
@@ -1577,6 +1745,7 @@ mod tests {
                 speedup: Some(2.0),
             },
             status: RunStatus::Exited(0),
+            output: TrimulEvalOutput::default(),
             test_check: Some("pass".to_string()),
             test_exit: None,
             benchmark_exit: Some(0),
