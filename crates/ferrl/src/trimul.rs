@@ -559,6 +559,8 @@ pub struct TrimulReward {
     min_plausible_ns: f64,
     /// Which completion region may contain the final submitted code block.
     submission_extract_mode: SubmissionExtractMode,
+    /// Optional CUDA device visibility override for the sandboxed verifier.
+    verifier_cuda_visible_devices: Option<String>,
     /// The sandbox backend.
     sandbox: ApptainerSandbox,
 }
@@ -607,6 +609,7 @@ impl TrimulReward {
             wall: Duration::from_secs(600),
             min_plausible_ns: 1_000.0,
             submission_extract_mode: SubmissionExtractMode::FinalFence,
+            verifier_cuda_visible_devices: None,
             sandbox: ApptainerSandbox::default(),
         }
     }
@@ -663,6 +666,19 @@ impl TrimulReward {
     #[must_use]
     pub fn with_submission_extract_mode(mut self, mode: SubmissionExtractMode) -> Self {
         self.submission_extract_mode = mode;
+        self
+    }
+
+    /// Set the CUDA-visible device list for the sandboxed verifier process.
+    ///
+    /// This is intentionally scoped to the verifier only: the trainer keeps its
+    /// own device choice, while the eval image can be pointed at a separate
+    /// Slurm-visible GPU when verifier memory would otherwise contend with the
+    /// resident policy.
+    #[must_use]
+    pub fn with_verifier_cuda_visible_devices(mut self, devices: impl Into<String>) -> Self {
+        let devices = devices.into();
+        self.verifier_cuda_visible_devices = (!devices.trim().is_empty()).then_some(devices);
         self
     }
 
@@ -759,6 +775,15 @@ impl TrimulReward {
     /// read-write, the network denied (the default), and only the env the eval needs.
     #[must_use]
     pub fn build_run_spec(&self, scratch: &Path) -> RunSpec {
+        let mut env = vec![
+            ("HOME".into(), "/work/cache".into()),
+            ("TRITON_CACHE_DIR".into(), "/work/cache/triton".into()),
+            ("POPCORN_SEED".into(), self.secret_seed.to_string()),
+        ];
+        if let Some(devices) = &self.verifier_cuda_visible_devices {
+            env.push(("CUDA_VISIBLE_DEVICES".into(), devices.clone()));
+        }
+
         RunSpec::new(
             &self.image,
             vec!["bash".into(), "-c".into(), Self::in_container_command()],
@@ -769,11 +794,7 @@ impl TrimulReward {
             Bind::rw(scratch, "/work").with_total_limit(self.scratch_max_bytes),
         ])
         .with_workdir("/work")
-        .with_env(vec![
-            ("HOME".into(), "/work/cache".into()),
-            ("TRITON_CACHE_DIR".into(), "/work/cache/triton".into()),
-            ("POPCORN_SEED".into(), self.secret_seed.to_string()),
-        ])
+        .with_env(env)
         .with_limits(self.limits())
     }
 
@@ -1450,6 +1471,23 @@ mod tests {
             spec.limits.address_space.is_none(),
             "an address-space cap is hostile to CUDA"
         );
+    }
+
+    #[test]
+    fn build_run_spec_can_pin_verifier_cuda_visibility() {
+        let spec = reward()
+            .with_verifier_cuda_visible_devices("1")
+            .build_run_spec(Path::new("/tmp/scratch"));
+        assert!(spec
+            .env
+            .iter()
+            .any(|(k, v)| k == "CUDA_VISIBLE_DEVICES" && v == "1"));
+
+        let default_spec = reward().build_run_spec(Path::new("/tmp/scratch"));
+        assert!(!default_spec
+            .env
+            .iter()
+            .any(|(k, _)| k == "CUDA_VISIBLE_DEVICES"));
     }
 
     #[test]
