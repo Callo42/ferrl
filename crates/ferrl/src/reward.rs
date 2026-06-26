@@ -15,6 +15,8 @@
 
 use crate::sample::Sample;
 
+use serde_json::Value;
+
 /// Error returned by a [`RewardFn`] when a reward cannot be computed.
 ///
 /// A failure here is distinct from a *low* reward: it means the verifier could not
@@ -45,7 +47,7 @@ impl RewardError {
     }
 }
 
-/// Scalar reward plus an optional operator-facing diagnostic.
+/// Scalar reward plus optional operator-facing diagnostics.
 ///
 /// `diagnostic` is intentionally plain text: it is persisted in candidate ledgers to
 /// explain low/zero rewards from external verifiers without making the core trainer
@@ -56,6 +58,12 @@ pub struct RewardOutcome {
     pub reward: f32,
     /// Optional low-cardinality reason when the reward path can explain the score.
     pub diagnostic: Option<String>,
+    /// Optional task-specific diagnostic payload for candidate ledgers.
+    ///
+    /// This is deliberately JSON-shaped and optional so verifier-backed tasks can
+    /// preserve replay/debug evidence without forcing the trainer to understand
+    /// task-specific enums or process statuses.
+    pub metadata: Option<Value>,
 }
 
 impl RewardOutcome {
@@ -65,6 +73,7 @@ impl RewardOutcome {
         Self {
             reward,
             diagnostic: None,
+            metadata: None,
         }
     }
 }

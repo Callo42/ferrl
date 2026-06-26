@@ -66,6 +66,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::reward::{RewardError, RewardFn, RewardOutcome};
 use crate::sample::Sample;
@@ -872,6 +873,10 @@ impl TrimulReward {
             return Ok(RewardOutcome {
                 reward: 0.0,
                 diagnostic: Some("trimul:no_submission".to_string()),
+                metadata: Some(serde_json::json!({
+                    "task": "trimul",
+                    "submission_extracted": false,
+                })),
             });
         };
         let scratch = self.make_scratch()?;
@@ -881,7 +886,31 @@ impl TrimulReward {
         let eval = result?;
         let reward = self.reward_from_eval(&eval);
         let diagnostic = self.reward_diagnostic(&eval);
-        Ok(RewardOutcome { reward, diagnostic })
+        let metadata = Some(self.reward_metadata(&code, &eval));
+        Ok(RewardOutcome {
+            reward,
+            diagnostic,
+            metadata,
+        })
+    }
+
+    fn reward_metadata(&self, submission: &str, eval: &TrimulEval) -> serde_json::Value {
+        serde_json::json!({
+            "task": "trimul",
+            "submission_extracted": true,
+            "source_sha256": sha256_hex(submission.as_bytes()),
+            "source_len_bytes": submission.len(),
+            "sandbox_status": run_status_label(eval.status),
+            "sandbox_success": eval.status.is_success(),
+            "test_check": eval.test_check.as_deref(),
+            "test_exit": eval.test_exit,
+            "benchmark_exit": eval.benchmark_exit,
+            "has_benchmark_section": eval.has_benchmark_section,
+            "correct": eval.verification.correct,
+            "benchmark_mean_count": eval.verification.benchmark_means_ns.len(),
+            "geomean_ns": eval.verification.geomean_ns,
+            "speedup": eval.verification.speedup,
+        })
     }
 
     fn reward_from_eval(&self, eval: &TrimulEval) -> f32 {
@@ -974,6 +1003,11 @@ fn run_status_label(status: RunStatus) -> String {
         RunStatus::Signaled(signal) => format!("signaled_{signal}"),
         RunStatus::ScratchExceeded => "scratch_exceeded".to_string(),
     }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    format!("{digest:x}")
 }
 
 /// The marker the in-container command echoes between the `test` and `benchmark`
@@ -1182,6 +1216,46 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cognitive_complexity)] // metadata regression intentionally checks each preserved marker
+    fn reward_metadata_preserves_source_hash_and_eval_markers() {
+        let r = reward().with_baseline_ns(1000.0);
+        let source = "def custom_kernel(data):\n    return data\n";
+        let eval = TrimulEval {
+            verification: TrimulVerification {
+                correct: true,
+                benchmark_means_ns: vec![500.0, 800.0],
+                geomean_ns: Some(632.455_532_033_675_9),
+                speedup: Some(1.581_138_830_084_189_8),
+            },
+            status: RunStatus::Exited(0),
+            test_check: Some("pass".to_string()),
+            test_exit: Some(1),
+            benchmark_exit: None,
+            has_benchmark_section: false,
+        };
+
+        let metadata = r.reward_metadata(source, &eval);
+        assert_eq!(metadata["task"], serde_json::json!("trimul"));
+        assert_eq!(metadata["submission_extracted"], serde_json::json!(true));
+        assert_eq!(
+            metadata["source_sha256"],
+            serde_json::json!(sha256_hex(source.as_bytes()))
+        );
+        assert_eq!(
+            metadata["source_len_bytes"],
+            serde_json::json!(source.len())
+        );
+        assert_eq!(metadata["sandbox_status"], serde_json::json!("exited_0"));
+        assert_eq!(metadata["sandbox_success"], serde_json::json!(true));
+        assert_eq!(metadata["test_check"], serde_json::json!("pass"));
+        assert_eq!(metadata["test_exit"], serde_json::json!(1));
+        assert_eq!(metadata["benchmark_exit"], serde_json::Value::Null);
+        assert_eq!(metadata["has_benchmark_section"], serde_json::json!(false));
+        assert_eq!(metadata["correct"], serde_json::json!(true));
+        assert_eq!(metadata["benchmark_mean_count"], serde_json::json!(2));
+    }
+
+    #[test]
     fn reward_falls_back_to_inverse_time_without_a_baseline() {
         // 1e9 / geo: a faster (smaller) geo yields a larger reward.
         let r = reward();
@@ -1309,6 +1383,13 @@ mod tests {
         assert_eq!(
             outcomes[0].diagnostic.as_deref(),
             Some("trimul:no_submission")
+        );
+        assert_eq!(
+            outcomes[0]
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("submission_extracted")),
+            Some(&serde_json::json!(false))
         );
     }
 
