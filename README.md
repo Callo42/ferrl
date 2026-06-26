@@ -313,6 +313,13 @@ The gate fails closed if the streams are empty, steps are misaligned, candidate 
 change, `grad_norm` never goes positive, or required timing / CUDA memory probes are absent. Run
 baseline and candidate on the same GPU model, world size, cargo features, and command.
 
+Qwen3.5 runs also expose an experimental rollout-memory lever under the run config policy
+block: set policy.memory_efficient_cached_gqa to true. It keeps the cached K/V store
+compact during grouped-query attention decode instead of materializing repeated K/V tensors.
+The default is false so existing runs keep the shipped cached decoder arithmetic; treat true
+as an opt-in optimization and gate it against a same-prompt, same-GPU baseline with CUDA
+memory telemetry enabled.
+
 For data-parallel resource gates where a high-water rank can move between baseline and candidate,
 repeat `--baseline` / `--candidate` once per rank and provide the expected world size explicitly:
 
