@@ -508,6 +508,8 @@ struct TrimulCfg {
     secret_seed: u64,
     /// Per-candidate wall-clock budget in seconds (`0` → the reward default, 600 s).
     wall_secs: u64,
+    /// Optional CUDA-visible device list for the sandboxed verifier process only.
+    verifier_cuda_visible_devices: Option<String>,
     /// The reference baseline pin (omit to fall back to an inverse-time reward).
     baseline: Option<BaselineCfg>,
 }
@@ -681,6 +683,9 @@ impl RunConfig {
             .with_secret_seed(t.secret_seed)
             .with_wall(wall)
             .with_submission_extract_mode(t.prompt_format.submission_extract_mode());
+        if let Some(devices) = &t.verifier_cuda_visible_devices {
+            reward = reward.with_verifier_cuda_visible_devices(devices.clone());
+        }
         if t.scratch_max_bytes != 0 {
             reward = reward.with_scratch_max_bytes(t.scratch_max_bytes);
         }
@@ -2191,6 +2196,7 @@ mod tests {
 
     /// A `trimul` run config parses, with its task block and a baseline pin.
     #[test]
+    #[allow(clippy::cognitive_complexity)]
     fn parses_a_trimul_config() {
         let json = r#"{ "task": "trimul", "model_dir": "/m",
                         "device": "cuda",
@@ -2198,6 +2204,7 @@ mod tests {
                         "trimul": { "image": "/img.sif", "eval_dir": "/eval",
                           "scratch_root": "/tmp", "scratch_max_bytes": 1048576,
                           "secret_seed": 123, "wall_secs": 300,
+                          "verifier_cuda_visible_devices": "1",
                           "baseline": { "ns": 5200000.0, "gpu": "H100" } },
                         "trainer": { "steps": 1, "group_size": 2, "max_new_tokens": 8,
                           "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
@@ -2207,12 +2214,59 @@ mod tests {
         assert_eq!(cfg.task, "trimul");
         assert_eq!((cfg.trimul.secret_seed, cfg.trimul.wall_secs), (123, 300));
         assert_eq!(cfg.trimul.scratch_max_bytes, 1_048_576);
+        assert_eq!(
+            cfg.trimul.verifier_cuda_visible_devices.as_deref(),
+            Some("1")
+        );
         let b = cfg.trimul.baseline.as_ref().expect("baseline present");
         assert_eq!((b.ns, b.gpu.as_str()), (5_200_000.0, "H100"));
         // The single-prompt splits honour train_n / eval_n without deduping to one row.
         let (train, eval) = cfg.trimul_splits().unwrap();
         assert_eq!((train.len(), eval.len()), (8, 2));
         assert!(train[0].prompt.contains("custom_kernel"));
+    }
+
+    /// The verifier CUDA pin is not just parsed: it reaches the reward run spec.
+    #[test]
+    fn trimul_config_pins_verifier_cuda_visibility_in_reward() {
+        let eval_dir =
+            std::env::temp_dir().join(format!("ferrl-trimul-config-test-{}", std::process::id()));
+        std::fs::create_dir_all(&eval_dir).unwrap();
+        std::fs::write(
+            eval_dir.join("task.yml"),
+            r#"
+tests:
+  - {"seqlen": 8, "bs": 1, "dim": 16, "hiddendim": 16, "seed": 100, "nomask": True, "distribution": "normal"}
+benchmarks:
+  - {"seqlen": 16, "bs": 1, "dim": 32, "hiddendim": 16, "seed": 200, "nomask": True, "distribution": "normal"}
+"#,
+        )
+        .unwrap();
+        let json = format!(
+            r#"{{
+                "task": "trimul",
+                "model_dir": "/m",
+                "trimul": {{
+                  "image": "/img.sif",
+                  "eval_dir": "{}",
+                  "scratch_root": "/tmp",
+                  "verifier_cuda_visible_devices": "1"
+                }},
+                "trainer": {{ "steps": 1, "group_size": 2, "max_new_tokens": 8,
+                  "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
+                  "lr": 1e-5, "weight_decay": 0.0,
+                  "loss_type": "grpo", "scale_rewards": "group" }}
+            }}"#,
+            eval_dir.display()
+        );
+        let cfg: RunConfig = serde_json::from_str(&json).unwrap();
+        let reward = cfg.build_trimul_reward_base().unwrap();
+        let spec = reward.build_run_spec(std::path::Path::new("/tmp/scratch"));
+
+        assert!(spec
+            .env
+            .iter()
+            .any(|(k, v)| k == "CUDA_VISIBLE_DEVICES" && v == "1"));
     }
 
     /// The concise Qwen3.5 thinking prompt is opt-in and keeps the thinking extractor.
