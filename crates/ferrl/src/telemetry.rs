@@ -1129,6 +1129,19 @@ pub enum RegressionFailure {
         /// Candidate anomaly count for the rank.
         candidate: usize,
     },
+    /// One stream has candidate ledgers while the other does not.
+    CandidateLedgerMissing {
+        /// Which stream is missing candidate ledgers (`baseline` or `candidate`).
+        stream: &'static str,
+    },
+    /// Candidate reward diagnostics differ from the baseline while
+    /// `allow_health_warnings` is false.
+    CandidateDiagnostics {
+        /// Baseline candidate rows with a reward diagnostic.
+        baseline: usize,
+        /// Candidate rows with a reward diagnostic.
+        candidate: usize,
+    },
 }
 
 impl std::fmt::Display for RegressionFailure {
@@ -1246,6 +1259,16 @@ impl std::fmt::Display for RegressionFailure {
             } => write!(
                 f,
                 "rank {rank} health warning regression: baseline={baseline} candidate={candidate}"
+            ),
+            Self::CandidateLedgerMissing { stream } => {
+                write!(f, "{stream} candidate ledger is missing")
+            }
+            Self::CandidateDiagnostics {
+                baseline,
+                candidate,
+            } => write!(
+                f,
+                "candidate diagnostic regression: baseline={baseline} candidate={candidate}"
             ),
         }
     }

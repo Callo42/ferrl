@@ -559,8 +559,12 @@ pub struct TrimulReward {
     min_plausible_ns: f64,
     /// Which completion region may contain the final submitted code block.
     submission_extract_mode: SubmissionExtractMode,
-    /// Optional CUDA device visibility override for the sandboxed verifier.
+    /// Optional CUDA device visibility override for every sandboxed verifier.
     verifier_cuda_visible_devices: Option<String>,
+    /// Optional per-worker CUDA device visibility pool for concurrent verifiers.
+    verifier_cuda_device_pool: Vec<String>,
+    /// Maximum number of candidates from one GRPO group to verify concurrently.
+    verifier_parallelism: usize,
     /// The sandbox backend.
     sandbox: ApptainerSandbox,
 }
@@ -610,6 +614,8 @@ impl TrimulReward {
             min_plausible_ns: 1_000.0,
             submission_extract_mode: SubmissionExtractMode::FinalFence,
             verifier_cuda_visible_devices: None,
+            verifier_cuda_device_pool: Vec::new(),
+            verifier_parallelism: 1,
             sandbox: ApptainerSandbox::default(),
         }
     }
@@ -679,6 +685,33 @@ impl TrimulReward {
     pub fn with_verifier_cuda_visible_devices(mut self, devices: impl Into<String>) -> Self {
         let devices = devices.into();
         self.verifier_cuda_visible_devices = (!devices.trim().is_empty()).then_some(devices);
+        self
+    }
+
+    /// Set per-worker CUDA-visible device lists for concurrent verifier workers.
+    ///
+    /// When non-empty, worker `i` receives `devices[i % devices.len()]` instead of the
+    /// global verifier CUDA visibility override. Use one physical GPU per concurrent
+    /// worker for memory-heavy evals; an empty list keeps the global setting.
+    #[must_use]
+    pub fn with_verifier_cuda_device_pool(mut self, devices: Vec<String>) -> Self {
+        self.verifier_cuda_device_pool = devices
+            .into_iter()
+            .map(|devices| devices.trim().to_string())
+            .filter(|devices| !devices.is_empty())
+            .collect();
+        self
+    }
+
+    /// Set the maximum number of candidates in one GRPO group to verify concurrently.
+    ///
+    /// The default is `1`, preserving the historical sequential verifier behavior. A
+    /// higher value is useful only when the verifier has isolated GPU capacity; the
+    /// implementation still returns outcomes in input order and propagates verifier
+    /// errors fail-closed.
+    #[must_use]
+    pub fn with_verifier_parallelism(mut self, parallelism: usize) -> Self {
+        self.verifier_parallelism = parallelism.max(1);
         self
     }
 
@@ -775,13 +808,28 @@ impl TrimulReward {
     /// read-write, the network denied (the default), and only the env the eval needs.
     #[must_use]
     pub fn build_run_spec(&self, scratch: &Path) -> RunSpec {
+        self.build_run_spec_with_devices(scratch, self.verifier_cuda_visible_devices.as_deref())
+    }
+
+    fn verifier_devices_for_worker(&self, worker_index: usize) -> Option<&str> {
+        self.verifier_cuda_device_pool
+            .get(worker_index % self.verifier_cuda_device_pool.len().max(1))
+            .map(String::as_str)
+            .or(self.verifier_cuda_visible_devices.as_deref())
+    }
+
+    fn build_run_spec_for_worker(&self, scratch: &Path, worker_index: usize) -> RunSpec {
+        self.build_run_spec_with_devices(scratch, self.verifier_devices_for_worker(worker_index))
+    }
+
+    fn build_run_spec_with_devices(&self, scratch: &Path, devices: Option<&str>) -> RunSpec {
         let mut env = vec![
             ("HOME".into(), "/work/cache".into()),
             ("TRITON_CACHE_DIR".into(), "/work/cache/triton".into()),
             ("POPCORN_SEED".into(), self.secret_seed.to_string()),
         ];
-        if let Some(devices) = &self.verifier_cuda_visible_devices {
-            env.push(("CUDA_VISIBLE_DEVICES".into(), devices.clone()));
+        if let Some(devices) = devices {
+            env.push(("CUDA_VISIBLE_DEVICES".into(), devices.to_string()));
         }
 
         RunSpec::new(
@@ -836,6 +884,28 @@ impl TrimulReward {
     /// The body of [`run_eval`](Self::run_eval), split out so the scratch is always
     /// cleaned up.
     fn eval_in(&self, scratch: &Path, submission: &str) -> Result<TrimulEval, RewardError> {
+        self.eval_in_with_spec(scratch, submission, &self.build_run_spec(scratch))
+    }
+
+    fn eval_in_for_worker(
+        &self,
+        scratch: &Path,
+        submission: &str,
+        worker_index: usize,
+    ) -> Result<TrimulEval, RewardError> {
+        self.eval_in_with_spec(
+            scratch,
+            submission,
+            &self.build_run_spec_for_worker(scratch, worker_index),
+        )
+    }
+
+    fn eval_in_with_spec(
+        &self,
+        scratch: &Path,
+        submission: &str,
+        spec: &RunSpec,
+    ) -> Result<TrimulEval, RewardError> {
         std::fs::create_dir_all(scratch.join("cache")).map_err(RewardError::verifier)?;
         write(scratch, "submission.py", submission)?;
         write(scratch, "test_spec.txt", &render_spec(&self.test_cases))?;
@@ -849,10 +919,7 @@ impl TrimulReward {
         // `in_container_command`), NOT on a candidate-writable file — so a forged
         // `/work` file or a printed `check: pass` cannot influence the score. A
         // crashing candidate yields no grade lines, scored a failure.
-        let outcome = self
-            .sandbox
-            .run(&self.build_run_spec(scratch))
-            .map_err(RewardError::verifier)?;
+        let outcome = self.sandbox.run(spec).map_err(RewardError::verifier)?;
 
         let has_benchmark_section = outcome.stdout.contains(RESULT_SPLIT);
         let (test_log, bench_log) = split_result(&outcome.stdout);
@@ -894,6 +961,14 @@ impl TrimulReward {
     }
 
     fn reward_outcome(&self, completion: &str) -> Result<RewardOutcome, RewardError> {
+        self.reward_outcome_for_worker(completion, 0)
+    }
+
+    fn reward_outcome_for_worker(
+        &self,
+        completion: &str,
+        worker_index: usize,
+    ) -> Result<RewardOutcome, RewardError> {
         let Some(code) = self.extract_submission(completion) else {
             return Ok(RewardOutcome {
                 reward: 0.0,
@@ -905,7 +980,7 @@ impl TrimulReward {
             });
         };
         let scratch = self.make_scratch()?;
-        let result = self.eval_in(&scratch, &code);
+        let result = self.eval_in_for_worker(&scratch, &code, worker_index);
         // Best-effort cleanup; the scratch is node-local and disposable.
         let _ = std::fs::remove_dir_all(&scratch);
         let eval = result?;
@@ -1118,13 +1193,55 @@ impl RewardFn for TrimulReward {
         _sample: &Sample<()>,
         completions: &[String],
     ) -> Result<Vec<RewardOutcome>, RewardError> {
-        completions
-            .iter()
-            .map(|completion| self.reward_outcome(completion))
-            .collect()
+        if self.verifier_parallelism <= 1 || completions.len() <= 1 {
+            return completions
+                .iter()
+                .enumerate()
+                .map(|(index, completion)| self.reward_outcome_for_worker(completion, index))
+                .collect();
+        }
+        map_bounded_reward_outcomes(
+            completions,
+            self.verifier_parallelism,
+            |index, completion| self.reward_outcome_for_worker(completion, index),
+        )
     }
-    // No `reward_group` override: a shared GPU scores candidates one at a time, so the
-    // detailed path maps over the group while preserving per-candidate diagnostics.
+    // No `reward_group` override: the detailed path preserves per-candidate diagnostics.
+}
+
+fn map_bounded_reward_outcomes<T, F>(
+    items: &[T],
+    parallelism: usize,
+    f: F,
+) -> Result<Vec<RewardOutcome>, RewardError>
+where
+    T: Sync,
+    F: Fn(usize, &T) -> Result<RewardOutcome, RewardError> + Sync,
+{
+    let width = parallelism.max(1);
+    let mut out = Vec::with_capacity(items.len());
+    for (chunk_index, chunk) in items.chunks(width).enumerate() {
+        let base = chunk_index * width;
+        let results = std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(chunk.len());
+            for (offset, item) in chunk.iter().enumerate() {
+                let f = &f;
+                handles.push(scope.spawn(move || f(base + offset, item)));
+            }
+            handles
+                .into_iter()
+                .map(std::thread::ScopedJoinHandle::join)
+                .collect::<Vec<_>>()
+        });
+        for result in results {
+            match result {
+                Ok(Ok(outcome)) => out.push(outcome),
+                Ok(Err(err)) => return Err(err),
+                Err(_) => return Err(RewardError::msg("trimul reward worker panicked")),
+            }
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -1145,6 +1262,53 @@ mod tests {
 
     fn reward() -> TrimulReward {
         TrimulReward::new("/img.sif", "/eval", "/tmp")
+    }
+
+    #[test]
+    fn verifier_parallelism_defaults_to_one_and_clamps_zero() {
+        assert_eq!(reward().verifier_parallelism, 1);
+        assert_eq!(
+            reward().with_verifier_parallelism(0).verifier_parallelism,
+            1
+        );
+        assert_eq!(
+            reward().with_verifier_parallelism(3).verifier_parallelism,
+            3
+        );
+    }
+
+    #[test]
+    fn bounded_reward_map_preserves_input_order() {
+        let items = [3_i32, 1, 2, 0];
+        let got = map_bounded_reward_outcomes(&items, 3, |index, item| {
+            std::thread::sleep(Duration::from_millis((3 - index.min(3)) as u64));
+            Ok(RewardOutcome {
+                reward: (*item * 10 + index as i32) as f32,
+                diagnostic: Some(format!("{index}:{item}")),
+                metadata: None,
+            })
+        })
+        .unwrap();
+
+        assert_eq!(
+            got.iter().map(|outcome| outcome.reward).collect::<Vec<_>>(),
+            vec![30.0, 11.0, 22.0, 3.0]
+        );
+        assert_eq!(got[2].diagnostic.as_deref(), Some("2:2"));
+    }
+
+    #[test]
+    fn bounded_reward_map_returns_first_error_in_input_order() {
+        let items = [0_i32, 1, 2, 3];
+        let err = map_bounded_reward_outcomes(&items, 4, |index, _| {
+            if index >= 2 {
+                return Err(RewardError::msg(format!("boom-{index}")));
+            }
+            Ok(RewardOutcome::reward(index as f32))
+        })
+        .unwrap_err();
+
+        assert_eq!(err.to_string(), "boom-2");
     }
 
     #[test]
@@ -1488,6 +1652,47 @@ mod tests {
             .env
             .iter()
             .any(|(k, _)| k == "CUDA_VISIBLE_DEVICES"));
+    }
+
+    #[test]
+    fn build_run_spec_assigns_verifier_device_pool_by_worker() {
+        let reward = reward()
+            .with_verifier_cuda_visible_devices("9")
+            .with_verifier_cuda_device_pool(vec![
+                " 1 ".to_string(),
+                "2".to_string(),
+                "".to_string(),
+            ]);
+
+        let worker0 = reward.build_run_spec_for_worker(Path::new("/tmp/scratch0"), 0);
+        let worker1 = reward.build_run_spec_for_worker(Path::new("/tmp/scratch1"), 1);
+        let worker2 = reward.build_run_spec_for_worker(Path::new("/tmp/scratch2"), 2);
+
+        assert!(worker0
+            .env
+            .iter()
+            .any(|(k, v)| k == "CUDA_VISIBLE_DEVICES" && v == "1"));
+        assert!(worker1
+            .env
+            .iter()
+            .any(|(k, v)| k == "CUDA_VISIBLE_DEVICES" && v == "2"));
+        assert!(worker2
+            .env
+            .iter()
+            .any(|(k, v)| k == "CUDA_VISIBLE_DEVICES" && v == "1"));
+    }
+
+    #[test]
+    fn build_run_spec_empty_device_pool_keeps_global_visibility() {
+        let spec = reward()
+            .with_verifier_cuda_visible_devices("9")
+            .with_verifier_cuda_device_pool(vec!["".to_string(), "  ".to_string()])
+            .build_run_spec_for_worker(Path::new("/tmp/scratch"), 3);
+
+        assert!(spec
+            .env
+            .iter()
+            .any(|(k, v)| k == "CUDA_VISIBLE_DEVICES" && v == "9"));
     }
 
     #[test]
