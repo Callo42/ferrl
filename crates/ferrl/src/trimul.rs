@@ -446,6 +446,12 @@ pub fn build_prompt() -> String {
      Produce numerically the same result as the baseline for every test case, then make\n\
      the implementation as fast as possible.\n\
      \n\
+     Shape-safety rules:\n\
+     \x20 - Preserve the [batch, seq_len, seq_len] pair axes from input to output.\n\
+     \x20 - Projection weights act on the final dim only; do not reshape into incompatible\n\
+     \x20   inner dimensions before matrix multiplication.\n\
+     \x20 - Apply norm.weight and norm.bias only to tensors whose final dimension is dim.\n\
+     \n\
      Allowed weight keys:\n\
      \x20 - norm.weight\n\
      \x20 - norm.bias\n\
@@ -1063,6 +1069,9 @@ impl TrimulReward {
         }
         match eval.test_exit {
             Some(0) => {}
+            Some(_) if eval_has_shape_failure(eval) => {
+                return Some("trimul:test_shape_mismatch".to_string());
+            }
             Some(_) => return Some("trimul:test_process_failed".to_string()),
             None => return Some("trimul:missing_test_exit".to_string()),
         }
@@ -1137,6 +1146,22 @@ impl TrimulEval {
 struct TrimulEvalOutput {
     stdout: String,
     stderr: String,
+}
+
+fn eval_has_shape_failure(eval: &TrimulEval) -> bool {
+    text_has_shape_failure(&eval.output.stderr) || text_has_shape_failure(&eval.output.stdout)
+}
+
+fn text_has_shape_failure(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    text.contains("shapes cannot be multiplied")
+        || text.contains("shape mismatch")
+        || text.contains("size mismatch")
+        || text.contains("invalid shape")
+        || text.contains("normalized_shape")
+        || text.contains("same shape as normalized_shape")
+        || (text.contains("size of tensor")
+            && (text.contains("must match") || text.contains("mismatch")))
 }
 
 fn run_status_label(status: RunStatus) -> String {
@@ -1978,6 +2003,51 @@ mod tests {
     }
 
     #[test]
+    fn reward_diagnostic_classifies_shape_test_failures() {
+        let r = reward();
+        let base = TrimulEval {
+            verification: TrimulVerification {
+                correct: true,
+                benchmark_means_ns: vec![],
+                geomean_ns: None,
+                speedup: None,
+            },
+            status: RunStatus::Exited(0),
+            output: TrimulEvalOutput::default(),
+            test_check: Some("pass".to_string()),
+            test_exit: Some(1),
+            benchmark_exit: None,
+            has_benchmark_section: false,
+        };
+
+        let shape_mismatch = TrimulEval {
+            output: TrimulEvalOutput {
+                stdout: String::new(),
+                stderr: "RuntimeError: mat1 and mat2 shapes cannot be multiplied".to_string(),
+            },
+            ..base.clone()
+        };
+        assert_eq!(r.reward_from_eval(&shape_mismatch), 0.0);
+        assert_eq!(
+            r.reward_diagnostic(&shape_mismatch).as_deref(),
+            Some("trimul:test_shape_mismatch")
+        );
+
+        let norm_shape_mismatch = TrimulEval {
+            output: TrimulEvalOutput {
+                stdout: String::new(),
+                stderr: "RuntimeError: Expected weight to be of same shape as normalized_shape"
+                    .to_string(),
+            },
+            ..base
+        };
+        assert_eq!(
+            r.reward_diagnostic(&norm_shape_mismatch).as_deref(),
+            Some("trimul:test_shape_mismatch")
+        );
+    }
+
+    #[test]
     fn reward_requires_success_exit_markers_for_positive_scores() {
         let r = reward();
         let missing_test_exit = TrimulEval {
@@ -2107,6 +2177,9 @@ benchmarks:
         assert!(p.contains("custom_kernel(data)"));
         assert!(p.contains("(input, mask, weights, config)"));
         assert!(p.contains("[batch, seq_len, seq_len, dim]"));
+        assert!(p.contains("Shape-safety rules:"));
+        assert!(p.contains("Projection weights act on the final dim only"));
+        assert!(p.contains("Apply norm.weight and norm.bias only"));
     }
 
     #[test]
