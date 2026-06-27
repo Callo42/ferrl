@@ -46,6 +46,7 @@ use tracing::info;
 
 use ferrl::countdown::{build_prompt, generate_dataset, CountdownConfig, CountdownProblem};
 use ferrl::policy::GenConfig;
+use ferrl::telemetry::{CandidateRecord, RegressionFailure};
 use ferrl::{
     compare_distributed_metrics, compare_metrics, evaluate, load_auto_policy, read_jsonl,
     summarize, train_eval_split, CountdownReward, LoaderOpts, MathProblem, MathReward,
@@ -508,8 +509,12 @@ struct TrimulCfg {
     secret_seed: u64,
     /// Per-candidate wall-clock budget in seconds (`0` → the reward default, 600 s).
     wall_secs: u64,
-    /// Optional CUDA-visible device list for the sandboxed verifier process only.
+    /// Optional CUDA-visible device list for every sandboxed verifier process.
     verifier_cuda_visible_devices: Option<String>,
+    /// Optional per-worker CUDA-visible device lists for concurrent verifier processes.
+    verifier_cuda_device_pool: Vec<String>,
+    /// Maximum number of candidates in one GRPO group to verify concurrently (`0` -> 1).
+    verifier_parallelism: usize,
     /// The reference baseline pin (omit to fall back to an inverse-time reward).
     baseline: Option<BaselineCfg>,
 }
@@ -685,6 +690,12 @@ impl RunConfig {
             .with_submission_extract_mode(t.prompt_format.submission_extract_mode());
         if let Some(devices) = &t.verifier_cuda_visible_devices {
             reward = reward.with_verifier_cuda_visible_devices(devices.clone());
+        }
+        if !t.verifier_cuda_device_pool.is_empty() {
+            reward = reward.with_verifier_cuda_device_pool(t.verifier_cuda_device_pool.clone());
+        }
+        if t.verifier_parallelism != 0 {
+            reward = reward.with_verifier_parallelism(t.verifier_parallelism);
         }
         if t.scratch_max_bytes != 0 {
             reward = reward.with_scratch_max_bytes(t.scratch_max_bytes);
@@ -1046,6 +1057,10 @@ struct ArtifactConfigManifest {
     audit_secret_seed: u64,
     /// Candidate scratch cap in bytes.
     scratch_max_bytes: u64,
+    /// Maximum number of candidates in one GRPO group verified concurrently.
+    verifier_parallelism: usize,
+    /// Per-worker verifier CUDA visibility pool used during training.
+    verifier_cuda_device_pool: Vec<String>,
 }
 
 /// Eval harness provenance fields.
@@ -1314,6 +1329,8 @@ fn build_manifest(
             training_secret_seed: cfg.trimul.secret_seed,
             audit_secret_seed: args.audit_secret_seed,
             scratch_max_bytes: trimul_scratch_cap(cfg),
+            verifier_parallelism: cfg.trimul.verifier_parallelism.max(1),
+            verifier_cuda_device_pool: cfg.trimul.verifier_cuda_device_pool.clone(),
         },
         eval: EvalManifest {
             bundle: args
@@ -1705,7 +1722,7 @@ fn runreport(args: &RunreportArgs) -> Result<ExitCode, CliError> {
 /// Dispatch `ferrl perf-gate`: compare baseline and candidate metrics streams.
 fn perf_gate(args: &PerfGateArgs) -> Result<ExitCode, CliError> {
     let budget = perf_budget(args)?;
-    let report = if args.distributed_world_max {
+    let mut report = if args.distributed_world_max {
         if args.baseline.is_empty() || args.candidate.is_empty() {
             return Err(CliError::msg(
                 "--distributed-world-max requires at least one --baseline and one --candidate",
@@ -1748,6 +1765,7 @@ fn perf_gate(args: &PerfGateArgs) -> Result<ExitCode, CliError> {
         let candidate = ferrl::read_metrics(resolve_metrics_path(&args.candidate[0]))?;
         compare_metrics(&baseline, &candidate, &budget)
     };
+    apply_candidate_health_gate(&mut report, args)?;
     if args.json {
         let s = serde_json::to_string_pretty(&report)
             .map_err(|e| CliError::msg(format!("serialize perf gate: {e}")))?;
@@ -1767,6 +1785,85 @@ fn read_metrics_inputs(paths: &[PathBuf]) -> Result<Vec<Vec<ferrl::Metrics>>, Cl
         .iter()
         .map(|path| ferrl::read_metrics(resolve_metrics_path(path)))
         .collect::<Result<Vec<_>, _>>()?)
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CandidateHealth {
+    diagnostics: usize,
+}
+
+fn apply_candidate_health_gate(
+    report: &mut RegressionReport,
+    args: &PerfGateArgs,
+) -> Result<(), CliError> {
+    if args.allow_health_warnings {
+        return Ok(());
+    }
+    let baseline = read_candidate_health_inputs(&args.baseline)?;
+    let candidate = read_candidate_health_inputs(&args.candidate)?;
+    compare_candidate_health(baseline, candidate, &mut report.failures);
+    report.passed = report.failures.is_empty();
+    Ok(())
+}
+
+fn read_candidate_health_inputs(paths: &[PathBuf]) -> Result<Option<CandidateHealth>, CliError> {
+    let mut health = CandidateHealth::default();
+    let mut found = false;
+    for path in paths {
+        let path = resolve_candidates_path(path);
+        if !path.exists() {
+            continue;
+        }
+        found = true;
+        let raw = std::fs::read_to_string(&path).map_err(|source| CliError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        for (idx, line) in raw.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let record: CandidateRecord = serde_json::from_str(line).map_err(|e| {
+                CliError::msg(format!("parse {} line {}: {e}", path.display(), idx + 1))
+            })?;
+            health.diagnostics += usize::from(record.reward_diagnostic.is_some());
+        }
+    }
+    Ok(found.then_some(health))
+}
+
+fn resolve_candidates_path(input: &Path) -> PathBuf {
+    if input.file_name().and_then(|name| name.to_str()) == Some("candidates.jsonl") {
+        return input.to_path_buf();
+    }
+    if input.is_dir() {
+        return input.join("candidates.jsonl");
+    }
+    input.with_file_name("candidates.jsonl")
+}
+
+fn compare_candidate_health(
+    baseline: Option<CandidateHealth>,
+    candidate: Option<CandidateHealth>,
+    failures: &mut Vec<RegressionFailure>,
+) {
+    match (baseline, candidate) {
+        (None, None) => {}
+        (None, Some(_)) => {
+            failures.push(RegressionFailure::CandidateLedgerMissing { stream: "baseline" });
+        }
+        (Some(_), None) => failures.push(RegressionFailure::CandidateLedgerMissing {
+            stream: "candidate",
+        }),
+        (Some(baseline), Some(candidate)) => {
+            if baseline.diagnostics != candidate.diagnostics {
+                failures.push(RegressionFailure::CandidateDiagnostics {
+                    baseline: baseline.diagnostics,
+                    candidate: candidate.diagnostics,
+                });
+            }
+        }
+    }
 }
 
 fn perf_budget(args: &PerfGateArgs) -> Result<RegressionBudget, CliError> {
@@ -2141,6 +2238,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn candidate_health_gate_fails_diagnostic_regressions() {
+        let mut failures = Vec::new();
+        compare_candidate_health(
+            Some(CandidateHealth { diagnostics: 0 }),
+            Some(CandidateHealth { diagnostics: 1 }),
+            &mut failures,
+        );
+
+        assert_eq!(
+            failures,
+            vec![RegressionFailure::CandidateDiagnostics {
+                baseline: 0,
+                candidate: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn candidate_health_gate_is_inert_without_ledgers() {
+        let mut failures = Vec::new();
+        compare_candidate_health(None, None, &mut failures);
+        assert!(failures.is_empty());
+    }
+
     /// The clap surface parses the artifact subcommand.
     #[test]
     fn clap_parses_trimul_artifact() {
@@ -2205,6 +2327,8 @@ mod tests {
                           "scratch_root": "/tmp", "scratch_max_bytes": 1048576,
                           "secret_seed": 123, "wall_secs": 300,
                           "verifier_cuda_visible_devices": "1",
+                          "verifier_cuda_device_pool": ["1", "2"],
+                          "verifier_parallelism": 2,
                           "baseline": { "ns": 5200000.0, "gpu": "H100" } },
                         "trainer": { "steps": 1, "group_size": 2, "max_new_tokens": 8,
                           "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
@@ -2218,6 +2342,8 @@ mod tests {
             cfg.trimul.verifier_cuda_visible_devices.as_deref(),
             Some("1")
         );
+        assert_eq!(cfg.trimul.verifier_cuda_device_pool, ["1", "2"]);
+        assert_eq!(cfg.trimul.verifier_parallelism, 2);
         let b = cfg.trimul.baseline.as_ref().expect("baseline present");
         assert_eq!((b.ns, b.gpu.as_str()), (5_200_000.0, "H100"));
         // The single-prompt splits honour train_n / eval_n without deduping to one row.
@@ -2403,6 +2529,8 @@ benchmarks:
                 training_secret_seed: 33,
                 audit_secret_seed: 44,
                 scratch_max_bytes: 1024,
+                verifier_parallelism: 1,
+                verifier_cuda_device_pool: Vec::new(),
             },
             eval: EvalManifest {
                 bundle: "eval-bundle".to_string(),

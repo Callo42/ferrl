@@ -204,7 +204,11 @@ completion plus its step/prompt/group/rank coordinates to `ferrl trimul-artifact
 an audit seed, and write the manifest/report. Verifier-backed rewards may also attach
 `reward_diagnostic` to candidate rows so zero rewards remain explainable without
 re-running the whole training step; for zero-tail triage, set `candidate_log_top_k` at
-least as high as `group_size` so every sampled completion is retained.
+least as high as `group_size` so every sampled completion is retained. The optional
+`trimul.verifier_parallelism` knob keeps the default sequential verifier path at `1`;
+raise it only with a matching `trimul.verifier_cuda_device_pool` that gives each
+concurrent verifier worker its own GPU, and record both settings in the artifact
+manifest for like-for-like comparisons.
 
 ### From Rust — a task that isn't built in
 
