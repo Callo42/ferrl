@@ -201,18 +201,23 @@ Set `trainer.candidate_log_top_k` to a positive value for discovery runs so the 
 sampled completions are persisted in `candidates.jsonl`; pass that ledger row's raw
 completion plus its step/prompt/group/rank coordinates to `ferrl trimul-artifact`
 (see the contract for the full command) to extract `submission.py`, re-verify with
-an audit seed, and write the manifest/report. Verifier-backed rewards may also attach
-`reward_diagnostic` to candidate rows so zero rewards remain explainable without
-re-running the whole training step; for zero-tail triage, set `candidate_log_top_k` at
-least as high as `group_size` so every sampled completion is retained. The optional
-`trimul.verifier_parallelism` knob keeps the default sequential verifier path at `1`;
-raise it only with a matching `trimul.verifier_cuda_device_pool` that gives each
-concurrent verifier worker its own GPU, and record both settings in the artifact
-manifest for like-for-like comparisons.
+an audit seed, and write the manifest/report. Include `--prompt-copy
+<run-dir>/prompt.txt` so the artifact uses the prompt bytes frozen at training
+launch. Verifier-backed rewards may also attach `reward_diagnostic` to candidate
+rows so zero rewards remain explainable without re-running the whole training step;
+for zero-tail triage, set `candidate_log_top_k` at least as high as `group_size` so
+every sampled completion is retained. The optional `trimul.verifier_parallelism` knob
+keeps the default sequential verifier path at `1`; raise it only with a matching
+`trimul.verifier_cuda_device_pool` that gives each concurrent verifier worker its own
+GPU, and record both settings in the artifact manifest for like-for-like comparisons.
 For prompt experiments, set `trimul.prompt_path` to a UTF-8 file containing the
 complete TriMul user prompt; ferrl then wraps that text with the selected
 `trimul.prompt_format`. TriMul training has no built-in prompt fallback and no
-suffix prompt path, so the prompt is owned in one editable file.
+suffix prompt path, so the prompt is owned in one editable file at launch time.
+`ferrl train` freezes the bytes into the run directory as `prompt.txt` with
+`prompt.sha256`; artifact bundles copy that frozen file and record `prompt_sha256`.
+Reports should use that copy/hash or another stable non-private identifier, not the
+mutable local `trimul.prompt_path`.
 
 ### From Rust — a task that isn't built in
 
