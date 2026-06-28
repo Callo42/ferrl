@@ -4,7 +4,7 @@
 //! ```text
 //! ferrl train --config run.json     # GRPO-train a built-in task (countdown | math | trimul)
 //! ferrl trimul-baseline --config run.json   # measure the TriMul reference baseline (ns) on this GPU
-//! ferrl trimul-artifact --config run.json --completion raw.txt --out artifact/ ...
+//! ferrl trimul-artifact --config run.json --prompt-copy runs/trimul-1/prompt.txt --completion raw.txt --out artifact/ ...
 //! ferrl runreport <run-dir> [--json] [--strict]   # one-glance run health summary
 //! ferrl perf-gate --baseline <run-dir> --candidate <run-dir>   # resource regression check
 //! ```
@@ -107,6 +107,9 @@ struct TrimulArtifactArgs {
     /// Path to the JSON run config used for the discovery run.
     #[arg(long)]
     config: PathBuf,
+    /// Immutable prompt copy frozen at training launch, usually `<run-dir>/prompt.txt`.
+    #[arg(long)]
+    prompt_copy: PathBuf,
     /// Raw model completion to extract `custom_kernel` from.
     #[arg(long)]
     completion: PathBuf,
@@ -490,10 +493,11 @@ impl TrimulPromptFormat {
 struct TrimulCfg {
     /// Prompt wrapper for the single TriMul instruction.
     prompt_format: TrimulPromptFormat,
-    /// Optional UTF-8 text appended to the TriMul instruction before chat wrapping.
-    /// This lets private runs provide a complete reference/baseline example without
-    /// vendoring third-party task materials into ferrl.
-    prompt_suffix_path: Option<PathBuf>,
+    /// UTF-8 file used as the complete TriMul user prompt before chat wrapping.
+    ///
+    /// The CLI intentionally has one prompt owner: this file. ferrl does not prepend
+    /// built-in task text or append suffix text for TriMul training runs.
+    prompt_path: Option<PathBuf>,
     /// The eval image — the pinned PyTorch+Triton `.sif`.
     image: PathBuf,
     /// The pinned GPU Mode eval bundle (`eval.py`/`reference.py`/`task.py`/`utils.py` +
@@ -652,27 +656,43 @@ impl RunConfig {
     /// cycles prompts mod the train length, so a one-prompt train set *is* the
     /// single-task regime. `eval` (held-out) runs the same prompt through the reward, so a
     /// non-zero `data.eval_n` gives an adapter-vs-base reward comparison.
+    #[cfg(test)]
     fn trimul_splits(&self) -> Result<Splits<()>, CliError> {
-        let mut task_prompt = ferrl::trimul::build_prompt();
-        if let Some(path) = &self.trimul.prompt_suffix_path {
-            let suffix = std::fs::read_to_string(path).map_err(|source| CliError::Io {
-                path: path.clone(),
-                source,
-            })?;
-            if !suffix.trim().is_empty() {
-                task_prompt.push_str("\n\n");
-                task_prompt.push_str(suffix.trim());
-                task_prompt.push('\n');
-            }
+        let prompt_file_bytes = self.trimul_prompt_file_bytes()?;
+        let rendered_prompt = self.trimul_render_prompt(&prompt_file_bytes)?;
+        Ok(self.trimul_splits_from_rendered_prompt(&rendered_prompt))
+    }
+
+    /// Read the complete TriMul user prompt file bytes from the configured prompt file.
+    fn trimul_prompt_file_bytes(&self) -> Result<Vec<u8>, CliError> {
+        let Some(path) = &self.trimul.prompt_path else {
+            return Err(CliError::msg(
+                "task \"trimul\" requires trimul.prompt_path (the complete user prompt file)",
+            ));
+        };
+        read_bytes(path)
+    }
+
+    /// Render the exact TriMul prompt text fed to the model from launch-file bytes.
+    fn trimul_render_prompt(&self, prompt_file_bytes: &[u8]) -> Result<String, CliError> {
+        let task_prompt = std::str::from_utf8(prompt_file_bytes)
+            .map_err(|e| CliError::msg(format!("trimul prompt is not valid UTF-8: {e}")))?;
+        let task_prompt = task_prompt.trim();
+        if task_prompt.is_empty() {
+            return Err(CliError::msg("trimul prompt is empty"));
         }
-        let prompt = self.trimul.prompt_format.build_prompt(&task_prompt);
-        let train = std::iter::repeat_with(|| Sample::new(prompt.clone(), ()))
+        Ok(self.trimul.prompt_format.build_prompt(task_prompt))
+    }
+
+    /// Build the repeated TriMul train/eval splits from the exact rendered model prompt.
+    fn trimul_splits_from_rendered_prompt(&self, rendered_prompt: &str) -> Splits<()> {
+        let train = std::iter::repeat_with(|| Sample::new(rendered_prompt.to_owned(), ()))
             .take(self.data.train_n.max(1))
             .collect();
-        let eval = std::iter::repeat_with(|| Sample::new(prompt.clone(), ()))
+        let eval = std::iter::repeat_with(|| Sample::new(rendered_prompt.to_owned(), ()))
             .take(self.data.eval_n)
             .collect();
-        Ok((train, eval))
+        (train, eval)
     }
 
     /// Build the TriMul reward *without* a baseline: load the case list from
@@ -726,16 +746,32 @@ fn train(args: &TrainArgs) -> Result<(), CliError> {
     match cfg.task.as_str() {
         "countdown" => {
             let (train, eval) = cfg.countdown_splits();
-            run_training(&cfg, &device, &CountdownReward::default(), &train, &eval)
+            run_training(
+                &cfg,
+                &device,
+                &CountdownReward::default(),
+                &train,
+                &eval,
+                None,
+            )
         }
         "math" => {
             let (train, eval) = cfg.math_splits()?;
-            run_training(&cfg, &device, &MathReward::default(), &train, &eval)
+            run_training(&cfg, &device, &MathReward::default(), &train, &eval, None)
         }
         "trimul" => {
-            let (train, eval) = cfg.trimul_splits()?;
+            let prompt_file_bytes = cfg.trimul_prompt_file_bytes()?;
+            let rendered_prompt = cfg.trimul_render_prompt(&prompt_file_bytes)?;
+            let (train, eval) = cfg.trimul_splits_from_rendered_prompt(&rendered_prompt);
             let reward = cfg.build_trimul_reward()?;
-            run_training(&cfg, &device, &reward, &train, &eval)
+            run_training(
+                &cfg,
+                &device,
+                &reward,
+                &train,
+                &eval,
+                Some(rendered_prompt.as_bytes()),
+            )
         }
         other => Err(CliError::msg(format!(
             "unknown task {other:?}; built-in tasks are \"countdown\", \"math\", and \"trimul\""
@@ -753,6 +789,7 @@ fn run_training<R: RewardFn>(
     reward: &R,
     train: &[Sample<R::Target>],
     eval: &[Sample<R::Target>],
+    rendered_prompt_bytes: Option<&[u8]>,
 ) -> Result<(), CliError> {
     let (mut policy, tok) = load_auto_policy(&cfg.model_dir, device, &cfg.loader_opts())?;
     policy.set_activation_checkpointing(cfg.policy.activation_checkpointing);
@@ -769,6 +806,13 @@ fn run_training<R: RewardFn>(
     );
 
     let run = RunDir::create(&cfg.out_dir, cfg.run_id())?;
+    if let Some(prompt_bytes) = rendered_prompt_bytes {
+        write_bytes(&run.root().join("prompt.txt"), prompt_bytes)?;
+        write_text(
+            &run.root().join("prompt.sha256"),
+            &format!("{}\n", sha256_hex(prompt_bytes)),
+        )?;
+    }
     let mut trainer = open_trainer(tcfg, &run, cfg.distributed.enabled)?;
     let (history, _stop) = trainer.train(&mut policy, reward, &tok, train)?;
     if let Some(summary) = summarize(&history) {
@@ -1041,6 +1085,10 @@ struct ModelManifest {
 struct ArtifactConfigManifest {
     /// SHA-256 of the run config bytes passed to this command.
     run_config_sha256: String,
+    /// SHA-256 of the exact rendered TriMul model prompt bytes.
+    prompt_sha256: String,
+    /// Artifact-relative prompt copy used for audit.
+    prompt_file: &'static str,
     /// Trainer step budget.
     trainer_steps: u64,
     /// GRPO group size.
@@ -1116,6 +1164,7 @@ fn trimul_artifact(args: &TrimulArtifactArgs) -> Result<(), CliError> {
             "trimul-artifact requires a config with task \"trimul\"",
         ));
     }
+    let prompt_bytes = read_verified_prompt_copy(&args.prompt_copy)?;
     if args.audit_secret_seed == cfg.trimul.secret_seed {
         return Err(CliError::msg(
             "audit secret seed must differ from trimul.secret_seed used during training",
@@ -1161,6 +1210,7 @@ fn trimul_artifact(args: &TrimulArtifactArgs) -> Result<(), CliError> {
             completion: &completion,
             completion_bytes: &completion_bytes,
             config_bytes: &config_bytes,
+            prompt_bytes: &prompt_bytes,
             submission: &submission,
             baseline_median,
             test_cases: test_cases.len(),
@@ -1186,6 +1236,8 @@ struct ArtifactInputs<'a> {
     completion_bytes: &'a [u8],
     /// Raw config bytes.
     config_bytes: &'a [u8],
+    /// Rendered TriMul model prompt bytes.
+    prompt_bytes: &'a [u8],
     /// Extracted source.
     submission: &'a str,
     /// Median baseline runtime, in ns.
@@ -1206,6 +1258,35 @@ fn read_bytes(path: &Path) -> Result<Vec<u8>, CliError> {
         path: path.to_path_buf(),
         source,
     })
+}
+
+/// Read a frozen run prompt copy and verify it against the adjacent launch hash.
+fn read_verified_prompt_copy(path: &Path) -> Result<Vec<u8>, CliError> {
+    let bytes = read_bytes(path)?;
+    let actual = sha256_hex(&bytes);
+    let hash_path = path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("prompt.sha256");
+    let raw_expected = std::fs::read_to_string(&hash_path).map_err(|source| CliError::Io {
+        path: hash_path.clone(),
+        source,
+    })?;
+    let expected = raw_expected.split_whitespace().next().unwrap_or_default();
+    if expected != actual {
+        return Err(CliError::msg(format!(
+            "prompt copy hash mismatch: {} records {}, but {} hashes to {}",
+            hash_path.display(),
+            if expected.is_empty() {
+                "<empty>"
+            } else {
+                expected
+            },
+            path.display(),
+            actual
+        )));
+    }
+    Ok(bytes)
 }
 
 /// Parse a [`RunConfig`] from already-read bytes.
@@ -1266,6 +1347,7 @@ fn write_artifact_bundle(
     })?;
     write_text(&args.out.join("submission.py"), inputs.submission)?;
     write_text(&args.out.join("completion.txt"), inputs.completion)?;
+    write_bytes(&args.out.join("prompt.txt"), inputs.prompt_bytes)?;
     for (i, run) in inputs.runs.iter().enumerate() {
         write_json(&args.out.join(format!("verification/run-{i:03}.json")), run)?;
     }
@@ -1321,6 +1403,8 @@ fn build_manifest(
         },
         config: ArtifactConfigManifest {
             run_config_sha256: sha256_hex(inputs.config_bytes),
+            prompt_sha256: sha256_hex(inputs.prompt_bytes),
+            prompt_file: "prompt.txt",
             trainer_steps: cfg.trainer.steps,
             group_size: cfg.trainer.group_size,
             run_health: args.run_health.clone(),
@@ -1372,6 +1456,14 @@ fn trimul_scratch_cap(cfg: &RunConfig) -> u64 {
 /// Write UTF-8 text to `path`.
 fn write_text(path: &Path, text: &str) -> Result<(), CliError> {
     std::fs::write(path, text).map_err(|source| CliError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// Write bytes to `path`.
+fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
+    std::fs::write(path, bytes).map_err(|source| CliError::Io {
         path: path.to_path_buf(),
         source,
     })
@@ -1464,6 +1556,12 @@ fn artifact_report(
     .expect("writing to String cannot fail");
     writeln!(
         &mut out,
+        "- Prompt copy: {} ({})",
+        manifest.config.prompt_file, manifest.config.prompt_sha256
+    )
+    .expect("writing to String cannot fail");
+    writeln!(
+        &mut out,
         "- Model: family={}, checkpoint={}, tokenizer={}, lora_rank={}, lora_alpha={}, base_dtype={}",
         manifest.model.family,
         manifest.model.checkpoint,
@@ -1543,6 +1641,11 @@ fn artifact_report(
         &mut out,
         !manifest.config.run_config_sha256.is_empty(),
         "config hash recorded",
+    );
+    push_check(
+        &mut out,
+        !manifest.config.prompt_sha256.is_empty() && manifest.config.prompt_file == "prompt.txt",
+        "prompt copy and hash recorded",
     );
     push_check(
         &mut out,
@@ -2271,6 +2374,8 @@ mod tests {
             "trimul-artifact",
             "--config",
             "run.json",
+            "--prompt-copy",
+            "runs/trimul-1/prompt.txt",
             "--completion",
             "completion.txt",
             "--out",
@@ -2311,6 +2416,7 @@ mod tests {
                     (a.prompt_index, a.group_index, a.rank, a.world_size),
                     (5, 1, 0, 1)
                 );
+                assert_eq!(a.prompt_copy, PathBuf::from("runs/trimul-1/prompt.txt"));
             }
             _ => panic!("expected trimul-artifact"),
         }
@@ -2320,10 +2426,16 @@ mod tests {
     #[test]
     #[allow(clippy::cognitive_complexity)]
     fn parses_a_trimul_config() {
+        let prompt_path = std::env::temp_dir().join(format!(
+            "ferrl-trimul-prompt-parse-{}.txt",
+            std::process::id()
+        ));
+        std::fs::write(&prompt_path, "Parse-test custom_kernel(data) prompt.").unwrap();
         let json = r#"{ "task": "trimul", "model_dir": "/m",
                         "device": "cuda",
                         "data": { "train_n": 8, "eval_n": 2 },
                         "trimul": { "image": "/img.sif", "eval_dir": "/eval",
+                          "prompt_path": "__PROMPT_PATH__",
                           "scratch_root": "/tmp", "scratch_max_bytes": 1048576,
                           "secret_seed": 123, "wall_secs": 300,
                           "verifier_cuda_visible_devices": "1",
@@ -2333,8 +2445,9 @@ mod tests {
                         "trainer": { "steps": 1, "group_size": 2, "max_new_tokens": 8,
                           "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
                           "lr": 1e-5, "weight_decay": 0.0,
-                          "loss_type": "grpo", "scale_rewards": "group" } }"#;
-        let cfg: RunConfig = serde_json::from_str(json).unwrap();
+                          "loss_type": "grpo", "scale_rewards": "group" } }"#
+            .replace("__PROMPT_PATH__", &prompt_path.display().to_string());
+        let cfg: RunConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(cfg.task, "trimul");
         assert_eq!((cfg.trimul.secret_seed, cfg.trimul.wall_secs), (123, 300));
         assert_eq!(cfg.trimul.scratch_max_bytes, 1_048_576);
@@ -2350,6 +2463,7 @@ mod tests {
         let (train, eval) = cfg.trimul_splits().unwrap();
         assert_eq!((train.len(), eval.len()), (8, 2));
         assert!(train[0].prompt.contains("custom_kernel"));
+        std::fs::remove_file(prompt_path).unwrap();
     }
 
     /// The verifier CUDA pin is not just parsed: it reaches the reward run spec.
@@ -2399,13 +2513,22 @@ benchmarks:
     #[test]
     #[allow(clippy::cognitive_complexity)] // assertion-heavy regression over config, prompt, and extractor
     fn trimul_config_selects_concise_qwen35_thinking_prompt() {
+        let prompt_path = std::env::temp_dir().join(format!(
+            "ferrl-trimul-prompt-concise-{}.txt",
+            std::process::id()
+        ));
+        std::fs::write(&prompt_path, "Concise custom_kernel(data) prompt.").unwrap();
         let json = r#"{ "task": "trimul", "model_dir": "/m",
-                        "trimul": { "prompt_format": "qwen3_5_chat_thinking_concise" },
+                        "trimul": {
+                          "prompt_format": "qwen3_5_chat_thinking_concise",
+                          "prompt_path": "__PROMPT_PATH__"
+                        },
                         "trainer": { "steps": 1, "group_size": 2, "max_new_tokens": 8,
                           "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
                           "lr": 1e-5, "weight_decay": 0.0,
-                          "loss_type": "grpo", "scale_rewards": "group" } }"#;
-        let cfg: RunConfig = serde_json::from_str(json).unwrap();
+                          "loss_type": "grpo", "scale_rewards": "group" } }"#
+            .replace("__PROMPT_PATH__", &prompt_path.display().to_string());
+        let cfg: RunConfig = serde_json::from_str(&json).unwrap();
         let (train, eval) = cfg.trimul_splits().unwrap();
         assert_eq!((train.len(), eval.len()), (64, 0));
         assert!(matches!(
@@ -2423,6 +2546,68 @@ benchmarks:
         ] {
             assert!(train[0].prompt.contains(needle), "missing {needle:?}");
         }
+        std::fs::remove_file(prompt_path).unwrap();
+    }
+
+    /// `prompt_path` owns the whole TriMul user prompt; ferrl must not prepend the
+    /// built-in task/shape prompt when it is set.
+    #[test]
+    fn trimul_prompt_path_replaces_builtin_user_prompt() {
+        let prompt_path = std::env::temp_dir().join(format!(
+            "ferrl-trimul-prompt-replace-{}.txt",
+            std::process::id()
+        ));
+        std::fs::write(
+            &prompt_path,
+            "Invent a fast custom_kernel(data). Return correct values.",
+        )
+        .unwrap();
+        let json = format!(
+            r#"{{
+                "task": "trimul",
+                "model_dir": "/m",
+                "trimul": {{
+                  "prompt_format": "qwen3_5_chat_thinking_concise",
+                  "prompt_path": "{}"
+                }},
+                "trainer": {{ "steps": 1, "group_size": 2, "max_new_tokens": 8,
+                  "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
+                  "lr": 1e-5, "weight_decay": 0.0,
+                  "loss_type": "grpo", "scale_rewards": "group" }}
+            }}"#,
+            prompt_path.display()
+        );
+        let cfg: RunConfig = serde_json::from_str(&json).unwrap();
+        let (train, eval) = cfg.trimul_splits().unwrap();
+
+        assert_eq!((train.len(), eval.len()), (64, 0));
+        assert!(train[0]
+            .prompt
+            .contains("Invent a fast custom_kernel(data). Return correct values."));
+        assert!(!train[0]
+            .prompt
+            .contains("Input contract: `data` is a tuple"));
+        assert!(!train[0].prompt.contains("Shape-safety rules:"));
+
+        std::fs::remove_file(prompt_path).unwrap();
+    }
+
+    /// TriMul training has a single prompt owner, so `prompt_path` is required.
+    #[test]
+    fn trimul_prompt_path_is_required() {
+        let json = r#"{
+                "task": "trimul",
+                "model_dir": "/m",
+                "trimul": {},
+                "trainer": { "steps": 1, "group_size": 2, "max_new_tokens": 8,
+                  "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
+                  "lr": 1e-5, "weight_decay": 0.0,
+                  "loss_type": "grpo", "scale_rewards": "group" }
+            }"#;
+        let cfg: RunConfig = serde_json::from_str(json).unwrap();
+        let err = cfg.trimul_splits().unwrap_err().to_string();
+
+        assert!(err.contains("requires trimul.prompt_path"));
     }
 
     /// A `trimul` config with no `trimul` block still parses (the defaults), and the
@@ -2476,6 +2661,35 @@ benchmarks:
     }
 
     #[test]
+    fn prompt_copy_must_match_adjacent_launch_hash() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("ferrl-prompt-copy-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prompt_path = dir.join("prompt.txt");
+        let hash_path = dir.join("prompt.sha256");
+        let prompt = b"<|im_start|>user\nrendered prompt<|im_end|>\n";
+
+        std::fs::write(&prompt_path, prompt).unwrap();
+        std::fs::write(&hash_path, format!("{}\n", sha256_hex(prompt))).unwrap();
+        assert_eq!(
+            read_verified_prompt_copy(&prompt_path).unwrap(),
+            prompt.to_vec()
+        );
+
+        std::fs::write(&hash_path, "0000\n").unwrap();
+        let err = read_verified_prompt_copy(&prompt_path)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("prompt copy hash mismatch"));
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn median_checked_requires_three_positive_values() {
         assert_eq!(median_checked(&[3.0, 1.0, 2.0], "x").unwrap(), 2.0);
         assert!(median_checked(&[1.0, 2.0], "x").is_err());
@@ -2521,6 +2735,8 @@ benchmarks:
             },
             config: ArtifactConfigManifest {
                 run_config_sha256: "config-hash".to_string(),
+                prompt_sha256: "prompt-hash".to_string(),
+                prompt_file: "prompt.txt",
                 trainer_steps: 100,
                 group_size: 4,
                 run_health: "healthy".to_string(),
@@ -2576,6 +2792,7 @@ benchmarks:
             "Command used: `ferrl trimul-baseline --config run.json`",
             "ferrl commit: abc123",
             "Config hash: config-hash",
+            "Prompt copy: prompt.txt (prompt-hash)",
             "Run health: healthy",
             "| source hash | training reward | source inspection | clean correctness | median runtime ns | speedup | accept/reject reason |",
             "| source-hash | 1.500000 | clean | 3/3 | 9.000000 | 1.222222 | accepted: all clean runs correct and median runtime beats baseline |",
