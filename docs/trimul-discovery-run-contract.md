@@ -42,6 +42,29 @@ built-in prompt fallback, no suffix prompt path, and no prompt wrapper, so the r
 prompt is fully owned in one editable file before launch and frozen by the
 run/artifact copy and hash after launch.
 
+### Preparing a Qwen rendered prompt
+
+For Qwen3.5/3.6 instruct checkpoints that use ChatML, `trimul.prompt_path` should
+already contain the rendered chat-template bytes. ferrl will not call a chat-template
+renderer for TriMul. A thinking prompt has this structure:
+
+```text
+<|im_start|>system
+{system/output contract}<|im_end|>
+<|im_start|>user
+{TriMul task prompt}<|im_end|>
+<|im_start|>assistant
+<think>
+```
+
+Set `trimul.submission_extract_mode` to `thinking_after_think` for that prompt shape:
+the extractor requires the model to emit `</think>`, then extracts the final fenced
+Python code block from the answer region. For a non-thinking prompt whose completion
+is just the final answer region, use `final_fence` instead and omit the `<think>`
+assistant prefill. If a checkpoint uses a different chat template, render that
+checkpoint's complete prompt format yourself and keep it in the single
+`trimul.prompt_path` file.
+
 ## Pre-Run Lock
 
 Before training starts, record these values in the run notes and keep an immutable copy

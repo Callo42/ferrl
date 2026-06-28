@@ -222,6 +222,30 @@ setting never constructs prompt text. Artifact bundles copy the verified frozen
 prompt and record `prompt_sha256`. Reports should use that copy/hash or another
 stable non-private identifier, not the mutable local `trimul.prompt_path`.
 
+For Qwen3.5/3.6 instruct checkpoints that use ChatML, the prompt file itself should
+already be rendered in the tokenizer's chat format. A thinking TriMul prompt usually
+has this shape:
+
+```text
+<|im_start|>system
+You generate Python code for a strict evaluator.
+Output contract:
+- Close </think> before writing code.
+- Immediately after </think>, output exactly one closed fenced Python code block.
+- The code block must contain only the complete custom_kernel(data) implementation.<|im_end|>
+<|im_start|>user
+Implement `custom_kernel(data)` for the TriMul evaluator.
+...task details...<|im_end|>
+<|im_start|>assistant
+<think>
+```
+
+Use `trimul.submission_extract_mode = "thinking_after_think"` for that form, because
+the reward extractor waits for `</think>` and then reads the final fenced code block.
+If the model/checkpoint does not use ChatML, do not copy these markers blindly; render
+the complete prompt according to that checkpoint's tokenizer/chat template and point
+`trimul.prompt_path` at those exact bytes.
+
 ### From Rust — a task that isn't built in
 
 Implement `RewardFn` over your own typed target and hand the trainer a
