@@ -209,6 +209,10 @@ least as high as `group_size` so every sampled completion is retained. The optio
 raise it only with a matching `trimul.verifier_cuda_device_pool` that gives each
 concurrent verifier worker its own GPU, and record both settings in the artifact
 manifest for like-for-like comparisons.
+For prompt experiments, set `trimul.prompt_path` to a UTF-8 file containing the
+complete TriMul user prompt; ferrl then wraps that text with the selected
+`trimul.prompt_format`. TriMul training has no built-in prompt fallback and no
+suffix prompt path, so the prompt is owned in one editable file.
 
 ### From Rust — a task that isn't built in
 

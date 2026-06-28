@@ -22,6 +22,10 @@ trimul-artifact --config <run.json> --completion <raw.txt> --out <artifact-dir>
 --source-inspection-notes <notes>` with run provenance, audit seed,
 source-inspection evidence, and repeated `--baseline-ns` values.
 
+For prompt-controlled runs, record the `trimul.prompt_path` file used as the
+complete TriMul user prompt. TriMul training has no built-in prompt fallback and
+no suffix prompt path, so the run prompt is owned in one editable file.
+
 ## Pre-Run Lock
 
 Before training starts, record these values in the run notes and keep an immutable copy

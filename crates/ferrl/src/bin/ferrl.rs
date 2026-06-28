@@ -490,10 +490,11 @@ impl TrimulPromptFormat {
 struct TrimulCfg {
     /// Prompt wrapper for the single TriMul instruction.
     prompt_format: TrimulPromptFormat,
-    /// Optional UTF-8 text appended to the TriMul instruction before chat wrapping.
-    /// This lets private runs provide a complete reference/baseline example without
-    /// vendoring third-party task materials into ferrl.
-    prompt_suffix_path: Option<PathBuf>,
+    /// UTF-8 file used as the complete TriMul user prompt before chat wrapping.
+    ///
+    /// The CLI intentionally has one prompt owner: this file. ferrl does not prepend
+    /// built-in task text or append suffix text for TriMul training runs.
+    prompt_path: Option<PathBuf>,
     /// The eval image — the pinned PyTorch+Triton `.sif`.
     image: PathBuf,
     /// The pinned GPU Mode eval bundle (`eval.py`/`reference.py`/`task.py`/`utils.py` +
@@ -653,19 +654,21 @@ impl RunConfig {
     /// single-task regime. `eval` (held-out) runs the same prompt through the reward, so a
     /// non-zero `data.eval_n` gives an adapter-vs-base reward comparison.
     fn trimul_splits(&self) -> Result<Splits<()>, CliError> {
-        let mut task_prompt = ferrl::trimul::build_prompt();
-        if let Some(path) = &self.trimul.prompt_suffix_path {
-            let suffix = std::fs::read_to_string(path).map_err(|source| CliError::Io {
+        let task_prompt = if let Some(path) = &self.trimul.prompt_path {
+            std::fs::read_to_string(path).map_err(|source| CliError::Io {
                 path: path.clone(),
                 source,
-            })?;
-            if !suffix.trim().is_empty() {
-                task_prompt.push_str("\n\n");
-                task_prompt.push_str(suffix.trim());
-                task_prompt.push('\n');
-            }
+            })?
+        } else {
+            return Err(CliError::msg(
+                "task \"trimul\" requires trimul.prompt_path (the complete user prompt file)",
+            ));
+        };
+        let task_prompt = task_prompt.trim();
+        if task_prompt.is_empty() {
+            return Err(CliError::msg("trimul prompt is empty"));
         }
-        let prompt = self.trimul.prompt_format.build_prompt(&task_prompt);
+        let prompt = self.trimul.prompt_format.build_prompt(task_prompt);
         let train = std::iter::repeat_with(|| Sample::new(prompt.clone(), ()))
             .take(self.data.train_n.max(1))
             .collect();
@@ -2320,10 +2323,16 @@ mod tests {
     #[test]
     #[allow(clippy::cognitive_complexity)]
     fn parses_a_trimul_config() {
+        let prompt_path = std::env::temp_dir().join(format!(
+            "ferrl-trimul-prompt-parse-{}.txt",
+            std::process::id()
+        ));
+        std::fs::write(&prompt_path, "Parse-test custom_kernel(data) prompt.").unwrap();
         let json = r#"{ "task": "trimul", "model_dir": "/m",
                         "device": "cuda",
                         "data": { "train_n": 8, "eval_n": 2 },
                         "trimul": { "image": "/img.sif", "eval_dir": "/eval",
+                          "prompt_path": "__PROMPT_PATH__",
                           "scratch_root": "/tmp", "scratch_max_bytes": 1048576,
                           "secret_seed": 123, "wall_secs": 300,
                           "verifier_cuda_visible_devices": "1",
@@ -2333,8 +2342,9 @@ mod tests {
                         "trainer": { "steps": 1, "group_size": 2, "max_new_tokens": 8,
                           "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
                           "lr": 1e-5, "weight_decay": 0.0,
-                          "loss_type": "grpo", "scale_rewards": "group" } }"#;
-        let cfg: RunConfig = serde_json::from_str(json).unwrap();
+                          "loss_type": "grpo", "scale_rewards": "group" } }"#
+            .replace("__PROMPT_PATH__", &prompt_path.display().to_string());
+        let cfg: RunConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(cfg.task, "trimul");
         assert_eq!((cfg.trimul.secret_seed, cfg.trimul.wall_secs), (123, 300));
         assert_eq!(cfg.trimul.scratch_max_bytes, 1_048_576);
@@ -2350,6 +2360,7 @@ mod tests {
         let (train, eval) = cfg.trimul_splits().unwrap();
         assert_eq!((train.len(), eval.len()), (8, 2));
         assert!(train[0].prompt.contains("custom_kernel"));
+        std::fs::remove_file(prompt_path).unwrap();
     }
 
     /// The verifier CUDA pin is not just parsed: it reaches the reward run spec.
@@ -2399,13 +2410,22 @@ benchmarks:
     #[test]
     #[allow(clippy::cognitive_complexity)] // assertion-heavy regression over config, prompt, and extractor
     fn trimul_config_selects_concise_qwen35_thinking_prompt() {
+        let prompt_path = std::env::temp_dir().join(format!(
+            "ferrl-trimul-prompt-concise-{}.txt",
+            std::process::id()
+        ));
+        std::fs::write(&prompt_path, "Concise custom_kernel(data) prompt.").unwrap();
         let json = r#"{ "task": "trimul", "model_dir": "/m",
-                        "trimul": { "prompt_format": "qwen3_5_chat_thinking_concise" },
+                        "trimul": {
+                          "prompt_format": "qwen3_5_chat_thinking_concise",
+                          "prompt_path": "__PROMPT_PATH__"
+                        },
                         "trainer": { "steps": 1, "group_size": 2, "max_new_tokens": 8,
                           "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
                           "lr": 1e-5, "weight_decay": 0.0,
-                          "loss_type": "grpo", "scale_rewards": "group" } }"#;
-        let cfg: RunConfig = serde_json::from_str(json).unwrap();
+                          "loss_type": "grpo", "scale_rewards": "group" } }"#
+            .replace("__PROMPT_PATH__", &prompt_path.display().to_string());
+        let cfg: RunConfig = serde_json::from_str(&json).unwrap();
         let (train, eval) = cfg.trimul_splits().unwrap();
         assert_eq!((train.len(), eval.len()), (64, 0));
         assert!(matches!(
@@ -2423,6 +2443,68 @@ benchmarks:
         ] {
             assert!(train[0].prompt.contains(needle), "missing {needle:?}");
         }
+        std::fs::remove_file(prompt_path).unwrap();
+    }
+
+    /// `prompt_path` owns the whole TriMul user prompt; ferrl must not prepend the
+    /// built-in task/shape prompt when it is set.
+    #[test]
+    fn trimul_prompt_path_replaces_builtin_user_prompt() {
+        let prompt_path = std::env::temp_dir().join(format!(
+            "ferrl-trimul-prompt-replace-{}.txt",
+            std::process::id()
+        ));
+        std::fs::write(
+            &prompt_path,
+            "Invent a fast custom_kernel(data). Return correct values.",
+        )
+        .unwrap();
+        let json = format!(
+            r#"{{
+                "task": "trimul",
+                "model_dir": "/m",
+                "trimul": {{
+                  "prompt_format": "qwen3_5_chat_thinking_concise",
+                  "prompt_path": "{}"
+                }},
+                "trainer": {{ "steps": 1, "group_size": 2, "max_new_tokens": 8,
+                  "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
+                  "lr": 1e-5, "weight_decay": 0.0,
+                  "loss_type": "grpo", "scale_rewards": "group" }}
+            }}"#,
+            prompt_path.display()
+        );
+        let cfg: RunConfig = serde_json::from_str(&json).unwrap();
+        let (train, eval) = cfg.trimul_splits().unwrap();
+
+        assert_eq!((train.len(), eval.len()), (64, 0));
+        assert!(train[0]
+            .prompt
+            .contains("Invent a fast custom_kernel(data). Return correct values."));
+        assert!(!train[0]
+            .prompt
+            .contains("Input contract: `data` is a tuple"));
+        assert!(!train[0].prompt.contains("Shape-safety rules:"));
+
+        std::fs::remove_file(prompt_path).unwrap();
+    }
+
+    /// TriMul training has a single prompt owner, so `prompt_path` is required.
+    #[test]
+    fn trimul_prompt_path_is_required() {
+        let json = r#"{
+                "task": "trimul",
+                "model_dir": "/m",
+                "trimul": {},
+                "trainer": { "steps": 1, "group_size": 2, "max_new_tokens": 8,
+                  "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
+                  "lr": 1e-5, "weight_decay": 0.0,
+                  "loss_type": "grpo", "scale_rewards": "group" }
+            }"#;
+        let cfg: RunConfig = serde_json::from_str(json).unwrap();
+        let err = cfg.trimul_splits().unwrap_err().to_string();
+
+        assert!(err.contains("requires trimul.prompt_path"));
     }
 
     /// A `trimul` config with no `trimul` block still parses (the defaults), and the
