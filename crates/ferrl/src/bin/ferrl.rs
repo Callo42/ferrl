@@ -446,44 +446,6 @@ struct BaselineCfg {
     gpu: String,
 }
 
-/// The prompt envelope used for the single TriMul discovery prompt.
-#[derive(Debug, Clone, Copy, Default, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum TrimulPromptFormat {
-    /// ferrl's original raw instruction prompt.
-    #[default]
-    Raw,
-    /// Qwen3.5's native chat template, with thinking generation enabled.
-    Qwen3_5ChatThinking,
-    /// Qwen3.5 thinking prompt with a concise reasoning budget.
-    Qwen3_5ChatThinkingConcise,
-}
-
-impl TrimulPromptFormat {
-    /// Build the configured TriMul prompt.
-    fn build_prompt(self, task_prompt: &str) -> String {
-        match self {
-            Self::Raw => ferrl::trimul::build_raw_prompt(task_prompt),
-            Self::Qwen3_5ChatThinking => {
-                ferrl::trimul::build_qwen3_5_chat_thinking_prompt(task_prompt)
-            }
-            Self::Qwen3_5ChatThinkingConcise => {
-                ferrl::trimul::build_qwen3_5_chat_concise_thinking_prompt(task_prompt)
-            }
-        }
-    }
-
-    /// The extraction contract paired with this prompt format.
-    fn submission_extract_mode(self) -> ferrl::trimul::SubmissionExtractMode {
-        match self {
-            Self::Raw => ferrl::trimul::SubmissionExtractMode::FinalFence,
-            Self::Qwen3_5ChatThinking | Self::Qwen3_5ChatThinkingConcise => {
-                ferrl::trimul::SubmissionExtractMode::ThinkingAfterThink
-            }
-        }
-    }
-}
-
 /// TriMul task knobs (read only when `task == "trimul"`): the sandboxed eval image and
 /// the pinned GPU Mode bundle, bounded scratch, the held-out secret seed, the
 /// per-candidate wall budget, and the optional baseline pin. The concrete case list is
@@ -491,13 +453,13 @@ impl TrimulPromptFormat {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct TrimulCfg {
-    /// Prompt wrapper for the single TriMul instruction.
-    prompt_format: TrimulPromptFormat,
-    /// UTF-8 file used as the complete TriMul user prompt before chat wrapping.
+    /// UTF-8 file used as the exact rendered model prompt.
     ///
-    /// The CLI intentionally has one prompt owner: this file. ferrl does not prepend
-    /// built-in task text or append suffix text for TriMul training runs.
+    /// The CLI intentionally has one prompt owner: this file. ferrl does not prepend,
+    /// append, trim, or wrap prompt text for TriMul training runs.
     prompt_path: Option<PathBuf>,
+    /// Completion parser used by the reward. This never constructs prompt text.
+    submission_extract_mode: Option<ferrl::trimul::SubmissionExtractMode>,
     /// The eval image — the pinned PyTorch+Triton `.sif`.
     image: PathBuf,
     /// The pinned GPU Mode eval bundle (`eval.py`/`reference.py`/`task.py`/`utils.py` +
@@ -659,40 +621,51 @@ impl RunConfig {
     #[cfg(test)]
     fn trimul_splits(&self) -> Result<Splits<()>, CliError> {
         let prompt_file_bytes = self.trimul_prompt_file_bytes()?;
-        let rendered_prompt = self.trimul_render_prompt(&prompt_file_bytes)?;
-        Ok(self.trimul_splits_from_rendered_prompt(&rendered_prompt))
+        let prompt = self.trimul_prompt_text(&prompt_file_bytes)?;
+        Ok(self.trimul_splits_from_prompt(&prompt))
     }
 
-    /// Read the complete TriMul user prompt file bytes from the configured prompt file.
+    /// Read the complete rendered TriMul model prompt file bytes.
     fn trimul_prompt_file_bytes(&self) -> Result<Vec<u8>, CliError> {
         let Some(path) = &self.trimul.prompt_path else {
             return Err(CliError::msg(
-                "task \"trimul\" requires trimul.prompt_path (the complete user prompt file)",
+                "task \"trimul\" requires trimul.prompt_path (the complete rendered model prompt file)",
             ));
         };
         read_bytes(path)
     }
 
-    /// Render the exact TriMul prompt text fed to the model from launch-file bytes.
-    fn trimul_render_prompt(&self, prompt_file_bytes: &[u8]) -> Result<String, CliError> {
-        let task_prompt = std::str::from_utf8(prompt_file_bytes)
+    /// Decode the exact TriMul prompt text fed to the model from launch-file bytes.
+    fn trimul_prompt_text(&self, prompt_file_bytes: &[u8]) -> Result<String, CliError> {
+        let prompt = std::str::from_utf8(prompt_file_bytes)
             .map_err(|e| CliError::msg(format!("trimul prompt is not valid UTF-8: {e}")))?;
-        let task_prompt = task_prompt.trim();
-        if task_prompt.is_empty() {
+        if prompt.is_empty() {
             return Err(CliError::msg("trimul prompt is empty"));
         }
-        Ok(self.trimul.prompt_format.build_prompt(task_prompt))
+        Ok(prompt.to_owned())
     }
 
-    /// Build the repeated TriMul train/eval splits from the exact rendered model prompt.
-    fn trimul_splits_from_rendered_prompt(&self, rendered_prompt: &str) -> Splits<()> {
-        let train = std::iter::repeat_with(|| Sample::new(rendered_prompt.to_owned(), ()))
+    /// Build the repeated TriMul train/eval splits from the exact model prompt.
+    fn trimul_splits_from_prompt(&self, prompt: &str) -> Splits<()> {
+        let train = std::iter::repeat_with(|| Sample::new(prompt.to_owned(), ()))
             .take(self.data.train_n.max(1))
             .collect();
-        let eval = std::iter::repeat_with(|| Sample::new(rendered_prompt.to_owned(), ()))
+        let eval = std::iter::repeat_with(|| Sample::new(prompt.to_owned(), ()))
             .take(self.data.eval_n)
             .collect();
         (train, eval)
+    }
+
+    /// Completion extraction mode for TriMul rewards.
+    fn trimul_submission_extract_mode(
+        &self,
+    ) -> Result<ferrl::trimul::SubmissionExtractMode, CliError> {
+        self.trimul.submission_extract_mode.ok_or_else(|| {
+            CliError::msg(
+                "task \"trimul\" requires trimul.submission_extract_mode \
+                 (\"final_fence\" or \"thinking_after_think\")",
+            )
+        })
     }
 
     /// Build the TriMul reward *without* a baseline: load the case list from
@@ -706,8 +679,7 @@ impl RunConfig {
         let mut reward = TrimulReward::new(&t.image, &t.eval_dir, &t.scratch_root)
             .with_cases(tests, benches)
             .with_secret_seed(t.secret_seed)
-            .with_wall(wall)
-            .with_submission_extract_mode(t.prompt_format.submission_extract_mode());
+            .with_wall(wall);
         if let Some(devices) = &t.verifier_cuda_visible_devices {
             reward = reward.with_verifier_cuda_visible_devices(devices.clone());
         }
@@ -728,7 +700,10 @@ impl RunConfig {
     /// node's GPU matches the GPU the baseline was measured on. With no baseline the
     /// reward falls back to an inverse-time signal (faster still scores higher).
     fn build_trimul_reward(&self) -> Result<TrimulReward, CliError> {
-        let mut reward = self.build_trimul_reward_base()?;
+        let mode = self.trimul_submission_extract_mode()?;
+        let mut reward = self
+            .build_trimul_reward_base()?
+            .with_submission_extract_mode(mode);
         if let Some(b) = &self.trimul.baseline {
             guard_baseline_gpu(&b.gpu)?;
             reward = reward.with_baseline_ns(b.ns);
@@ -761,8 +736,8 @@ fn train(args: &TrainArgs) -> Result<(), CliError> {
         }
         "trimul" => {
             let prompt_file_bytes = cfg.trimul_prompt_file_bytes()?;
-            let rendered_prompt = cfg.trimul_render_prompt(&prompt_file_bytes)?;
-            let (train, eval) = cfg.trimul_splits_from_rendered_prompt(&rendered_prompt);
+            let prompt = cfg.trimul_prompt_text(&prompt_file_bytes)?;
+            let (train, eval) = cfg.trimul_splits_from_prompt(&prompt);
             let reward = cfg.build_trimul_reward()?;
             run_training(
                 &cfg,
@@ -770,7 +745,7 @@ fn train(args: &TrainArgs) -> Result<(), CliError> {
                 &reward,
                 &train,
                 &eval,
-                Some(rendered_prompt.as_bytes()),
+                Some(&prompt_file_bytes),
             )
         }
         other => Err(CliError::msg(format!(
@@ -1189,7 +1164,10 @@ fn trimul_artifact(args: &TrimulArtifactArgs) -> Result<(), CliError> {
             args.completion.display()
         ))
     })?;
-    let mut reward = cfg.build_trimul_reward_base()?;
+    let extract_mode = cfg.trimul_submission_extract_mode()?;
+    let mut reward = cfg
+        .build_trimul_reward_base()?
+        .with_submission_extract_mode(extract_mode);
     let submission = reward.extract_submission(&completion).ok_or_else(|| {
         CliError::msg("completion does not contain a closed non-empty fenced code block")
     })?;
@@ -2430,12 +2408,13 @@ mod tests {
             "ferrl-trimul-prompt-parse-{}.txt",
             std::process::id()
         ));
-        std::fs::write(&prompt_path, "Parse-test custom_kernel(data) prompt.").unwrap();
+        std::fs::write(&prompt_path, "Parse-test custom_kernel(data) prompt.\n").unwrap();
         let json = r#"{ "task": "trimul", "model_dir": "/m",
                         "device": "cuda",
                         "data": { "train_n": 8, "eval_n": 2 },
                         "trimul": { "image": "/img.sif", "eval_dir": "/eval",
                           "prompt_path": "__PROMPT_PATH__",
+                          "submission_extract_mode": "thinking_after_think",
                           "scratch_root": "/tmp", "scratch_max_bytes": 1048576,
                           "secret_seed": 123, "wall_secs": 300,
                           "verifier_cuda_visible_devices": "1",
@@ -2462,7 +2441,7 @@ mod tests {
         // The single-prompt splits honour train_n / eval_n without deduping to one row.
         let (train, eval) = cfg.trimul_splits().unwrap();
         assert_eq!((train.len(), eval.len()), (8, 2));
-        assert!(train[0].prompt.contains("custom_kernel"));
+        assert_eq!(train[0].prompt, "Parse-test custom_kernel(data) prompt.\n");
         std::fs::remove_file(prompt_path).unwrap();
     }
 
@@ -2509,19 +2488,21 @@ benchmarks:
             .any(|(k, v)| k == "CUDA_VISIBLE_DEVICES" && v == "1"));
     }
 
-    /// The concise Qwen3.5 thinking prompt is opt-in and keeps the thinking extractor.
+    /// TriMul prompt loading is exact; extraction mode is parser-only and does not wrap text.
     #[test]
-    #[allow(clippy::cognitive_complexity)] // assertion-heavy regression over config, prompt, and extractor
-    fn trimul_config_selects_concise_qwen35_thinking_prompt() {
+    fn trimul_prompt_path_is_exact_and_extraction_mode_is_parser_only() {
         let prompt_path = std::env::temp_dir().join(format!(
-            "ferrl-trimul-prompt-concise-{}.txt",
+            "ferrl-trimul-prompt-exact-{}.txt",
             std::process::id()
         ));
-        std::fs::write(&prompt_path, "Concise custom_kernel(data) prompt.").unwrap();
+        let prompt = "<|im_start|>system\nManaged system prompt.<|im_end|>\n\
+<|im_start|>user\nManaged custom_kernel(data) task.\n<|im_end|>\n\
+<|im_start|>assistant\n<think>\n";
+        std::fs::write(&prompt_path, prompt).unwrap();
         let json = r#"{ "task": "trimul", "model_dir": "/m",
                         "trimul": {
-                          "prompt_format": "qwen3_5_chat_thinking_concise",
-                          "prompt_path": "__PROMPT_PATH__"
+                          "prompt_path": "__PROMPT_PATH__",
+                          "submission_extract_mode": "thinking_after_think"
                         },
                         "trainer": { "steps": 1, "group_size": 2, "max_new_tokens": 8,
                           "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
@@ -2532,43 +2513,33 @@ benchmarks:
         let (train, eval) = cfg.trimul_splits().unwrap();
         assert_eq!((train.len(), eval.len()), (64, 0));
         assert!(matches!(
-            cfg.trimul.prompt_format.submission_extract_mode(),
+            cfg.trimul_submission_extract_mode().unwrap(),
             ferrl::trimul::SubmissionExtractMode::ThinkingAfterThink
         ));
-        assert!(train[0].prompt.starts_with("<|im_start|>system\n"));
-        assert!(train[0]
+        assert_eq!(train[0].prompt, prompt);
+        assert!(!train[0]
             .prompt
-            .ends_with("<|im_start|>assistant\n<think>\n"));
-        for needle in [
-            "Use at most 8 short reasoning lines inside <think>.",
-            "Prefer a complete valid implementation over further analysis.",
-            "custom_kernel(data)",
-        ] {
-            assert!(train[0].prompt.contains(needle), "missing {needle:?}");
-        }
+            .contains("Use at most 8 short reasoning lines"));
+        assert!(!train[0].prompt.contains("Output contract:"));
         std::fs::remove_file(prompt_path).unwrap();
     }
 
-    /// `prompt_path` owns the whole TriMul user prompt; ferrl must not prepend the
-    /// built-in task/shape prompt when it is set.
+    /// `prompt_path` owns the whole rendered model prompt; ferrl must not trim or wrap it.
     #[test]
-    fn trimul_prompt_path_replaces_builtin_user_prompt() {
+    fn trimul_prompt_path_replaces_all_prompt_construction() {
         let prompt_path = std::env::temp_dir().join(format!(
             "ferrl-trimul-prompt-replace-{}.txt",
             std::process::id()
         ));
-        std::fs::write(
-            &prompt_path,
-            "Invent a fast custom_kernel(data). Return correct values.",
-        )
-        .unwrap();
+        let prompt = "\n  Invent a fast custom_kernel(data). Return correct values.  \n";
+        std::fs::write(&prompt_path, prompt).unwrap();
         let json = format!(
             r#"{{
                 "task": "trimul",
                 "model_dir": "/m",
                 "trimul": {{
-                  "prompt_format": "qwen3_5_chat_thinking_concise",
-                  "prompt_path": "{}"
+                  "prompt_path": "{}",
+                  "submission_extract_mode": "final_fence"
                 }},
                 "trainer": {{ "steps": 1, "group_size": 2, "max_new_tokens": 8,
                   "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
@@ -2581,13 +2552,12 @@ benchmarks:
         let (train, eval) = cfg.trimul_splits().unwrap();
 
         assert_eq!((train.len(), eval.len()), (64, 0));
-        assert!(train[0]
-            .prompt
-            .contains("Invent a fast custom_kernel(data). Return correct values."));
+        assert_eq!(train[0].prompt, prompt);
         assert!(!train[0]
             .prompt
             .contains("Input contract: `data` is a tuple"));
         assert!(!train[0].prompt.contains("Shape-safety rules:"));
+        assert!(!train[0].prompt.starts_with("<|im_start|>system"));
 
         std::fs::remove_file(prompt_path).unwrap();
     }
@@ -2608,6 +2578,47 @@ benchmarks:
         let err = cfg.trimul_splits().unwrap_err().to_string();
 
         assert!(err.contains("requires trimul.prompt_path"));
+    }
+
+    /// TriMul train/artifact rewards need an explicit parser because prompt text is no
+    /// longer allowed to imply extraction behavior.
+    #[test]
+    fn trimul_submission_extract_mode_is_required_for_train_reward() {
+        let json = r#"{
+                "task": "trimul",
+                "model_dir": "/m",
+                "trimul": {},
+                "trainer": { "steps": 1, "group_size": 2, "max_new_tokens": 8,
+                  "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
+                  "lr": 1e-5, "weight_decay": 0.0,
+                  "loss_type": "grpo", "scale_rewards": "group" }
+            }"#;
+        let cfg: RunConfig = serde_json::from_str(json).unwrap();
+        let err = cfg.build_trimul_reward().unwrap_err().to_string();
+
+        assert!(err.contains("requires trimul.submission_extract_mode"));
+    }
+
+    /// Wrapper-based TriMul configs are intentionally rejected; prompt text is
+    /// owned byte-for-byte by `prompt_path` now.
+    #[test]
+    fn trimul_prompt_format_config_is_rejected() {
+        let json = r#"{
+                "task": "trimul",
+                "model_dir": "/m",
+                "trimul": {
+                  "prompt_format": "qwen3_5_chat_thinking_concise",
+                  "prompt_path": "/prompt.txt",
+                  "submission_extract_mode": "thinking_after_think"
+                },
+                "trainer": { "steps": 1, "group_size": 2, "max_new_tokens": 8,
+                  "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
+                  "lr": 1e-5, "weight_decay": 0.0,
+                  "loss_type": "grpo", "scale_rewards": "group" }
+            }"#;
+        let err = serde_json::from_str::<RunConfig>(json).unwrap_err();
+
+        assert!(err.to_string().contains("unknown field `prompt_format`"));
     }
 
     /// A `trimul` config with no `trimul` block still parses (the defaults), and the

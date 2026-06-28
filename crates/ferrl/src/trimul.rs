@@ -141,7 +141,8 @@ pub fn render_spec(cases: &[TrimulCase]) -> String {
 }
 
 /// Which completion region is eligible for TriMul submission extraction.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SubmissionExtractMode {
     /// Extract the final fenced code block from the whole completion.
     FinalFence,
@@ -417,119 +418,6 @@ fn parse_distribution(raw: Option<&String>) -> Result<Distribution, TrimulError>
             "field \"distribution\" is not normal|cauchy: {other:?}"
         ))),
     }
-}
-
-/// The discovery task prompt: describe the tensor program and evaluator contract.
-///
-/// This is ferrl's own wording — the GPU Mode task description is **not** vendored. It
-/// states the exact call contract the eval harness expects (the `(input, mask, weights,
-/// config)` tuple). Chat-format wrappers add the output-format contract separately.
-#[must_use]
-pub fn build_prompt() -> String {
-    // A self-contained task description; kept deliberately small and stable. Prompt
-    // refinement for the discovery run is a later, separate concern.
-    "Implement `custom_kernel(data)` for this tensor program.\n\
-     \n\
-     Define exactly one Python function with this signature:\n\
-     \n\
-     \x20   def custom_kernel(data):\n\
-     \x20       ...\n\
-     \x20       return output\n\
-     \n\
-     Input contract: `data` is a tuple `(input, mask, weights, config)`:\n\
-     \x20 - input:   a float tensor of shape [batch, seq_len, seq_len, dim]\n\
-     \x20 - mask:    a tensor of shape [batch, seq_len, seq_len]\n\
-     \x20 - weights: a dict of the module's parameter tensors\n\
-     \x20 - config:  a dict of configuration values\n\
-     \n\
-     Return a tensor of shape [batch, seq_len, seq_len, dim].\n\
-     Produce numerically the same result as the baseline for every test case, then make\n\
-     the implementation as fast as possible.\n\
-     \n\
-     Shape-safety rules:\n\
-     \x20 - Preserve the [batch, seq_len, seq_len] pair axes from input to output.\n\
-     \x20 - Projection weights act on the final dim only; do not reshape into incompatible\n\
-     \x20   inner dimensions before matrix multiplication.\n\
-     \x20 - Apply norm.weight and norm.bias only to tensors whose final dimension is dim.\n\
-     \n\
-     Allowed weight keys:\n\
-     \x20 - norm.weight\n\
-     \x20 - norm.bias\n\
-     \x20 - left_proj.weight\n\
-     \x20 - right_proj.weight\n\
-     \x20 - left_gate.weight\n\
-     \x20 - right_gate.weight\n\
-     \x20 - out_gate.weight\n\
-     \x20 - to_out_norm.weight\n\
-     \x20 - to_out_norm.bias\n\
-     \x20 - to_out.weight\n\
-     \n"
-    .to_string()
-}
-
-/// Build ferrl's raw prompt: task description plus the extraction/output contract.
-#[must_use]
-pub fn build_raw_prompt(task: &str) -> String {
-    format!(
-        "{}\n\n{}",
-        task.trim(),
-        "Output contract:\n\
-         - Output exactly one closed fenced Python code block.\n\
-         - The code block must contain only the complete custom_kernel(data) implementation.\n\
-         - Do not include prose, comments, docstrings, or Markdown outside the code block.\n\
-         - Stop after the closing code fence."
-    )
-}
-
-fn qwen3_5_thinking_system_prompt() -> &'static str {
-    "You generate Python code for a strict evaluator.\n\
-     Output contract:\n\
-     - After finishing the reasoning, close </think>.\n\
-     - Immediately after </think>, output exactly one closed fenced Python code block.\n\
-     - The code block must contain only the complete custom_kernel(data) implementation.\n\
-     - Do not include prose, comments, docstrings, or Markdown outside the final code block.\n\
-     - Stop after the closing code fence."
-}
-
-fn qwen3_5_concise_thinking_system_prompt() -> &'static str {
-    "You generate Python code for a strict evaluator.\n\
-     Output contract:\n\
-     - Use at most 8 short reasoning lines inside <think>.\n\
-     - Prefer a complete valid implementation over further analysis.\n\
-     - Close </think> before writing code; do not continue reasoning after </think>.\n\
-     - Immediately after </think>, output exactly one closed fenced Python code block.\n\
-     - The code block must contain only the complete custom_kernel(data) implementation.\n\
-     - Do not include prose, comments, docstrings, or Markdown outside the final code block.\n\
-     - Stop after the closing code fence."
-}
-
-fn build_qwen3_5_chat_prompt(task: &str, system_prompt: &str) -> String {
-    format!(
-        "<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n",
-        system_prompt,
-        task.trim()
-    )
-}
-
-/// Build the Qwen3.5 native thinking chat-template prompt for a TriMul instruction.
-///
-/// This mirrors the released Qwen3.5 `chat_template.jinja` for system + user messages with
-/// `add_generation_prompt = true` and thinking mode (`enable_thinking = true`): the
-/// assistant prefix opens `<think>` and lets the model generate its reasoning. The
-/// system message carries the output/extraction contract.
-#[must_use]
-pub fn build_qwen3_5_chat_thinking_prompt(task: &str) -> String {
-    build_qwen3_5_chat_prompt(task, qwen3_5_thinking_system_prompt())
-}
-
-/// Build the Qwen3.5 thinking prompt with a short reasoning budget.
-///
-/// This preserves the same chat template and `</think>` extraction contract as
-/// [`build_qwen3_5_chat_thinking_prompt`], but biases generation toward finishing the
-/// final fenced implementation before the completion budget is exhausted.
-#[must_use]
-pub fn build_qwen3_5_chat_concise_thinking_prompt(task: &str) -> String {
-    build_qwen3_5_chat_prompt(task, qwen3_5_concise_thinking_system_prompt())
 }
 
 /// The TriMul discovery reward: runs a candidate kernel in the sandboxed eval image
@@ -2169,83 +2057,5 @@ benchmarks:
         }
         assert!(parse_bool(Some(&"maybe".to_string())).is_err());
         assert!(parse_bool(None).is_err());
-    }
-
-    #[test]
-    fn build_prompt_states_the_function_contract() {
-        let p = build_prompt();
-        assert!(p.contains("custom_kernel(data)"));
-        assert!(p.contains("(input, mask, weights, config)"));
-        assert!(p.contains("[batch, seq_len, seq_len, dim]"));
-        assert!(p.contains("Shape-safety rules:"));
-        assert!(p.contains("Projection weights act on the final dim only"));
-        assert!(p.contains("Apply norm.weight and norm.bias only"));
-    }
-
-    #[test]
-    fn build_prompt_lists_weight_constraints_without_domain_framing() {
-        let p = build_prompt();
-        assert!(p.contains(" - norm.weight\n"));
-        assert!(p.contains(" - norm.bias\n"));
-        assert!(p.contains(" - to_out.weight\n"));
-        assert!(!p.contains("does not contain `norm.bias`"));
-        assert!(!p.contains("AlphaFold"));
-        assert!(!p.contains("```python"));
-    }
-
-    #[test]
-    fn build_raw_prompt_restores_the_output_contract() {
-        let p = build_raw_prompt(&build_prompt());
-        assert!(p.contains("Output contract:"));
-        assert!(p.contains("closed fenced Python code block"));
-        assert!(p.contains("complete custom_kernel(data) implementation"));
-        assert!(p.contains("Stop after the closing code fence."));
-    }
-
-    #[test]
-    fn build_qwen3_5_chat_thinking_prompt_uses_system_user_roles() {
-        let task = build_prompt();
-        let p = build_qwen3_5_chat_thinking_prompt(&task);
-        assert!(p.starts_with("<|im_start|>system\n"));
-        assert!(p.contains("<|im_end|>\n<|im_start|>user\n"));
-        assert!(p.contains("custom_kernel(data)"));
-    }
-
-    #[test]
-    fn build_qwen3_5_chat_thinking_prompt_opens_thinking_prefix() {
-        let task = build_prompt();
-        let p = build_qwen3_5_chat_thinking_prompt(&task);
-        assert!(p.ends_with("<|im_start|>assistant\n<think>\n"));
-        assert!(!p.ends_with("</think>\n\n"));
-    }
-
-    #[test]
-    fn build_qwen3_5_chat_thinking_prompt_states_final_answer_contract() {
-        let task = build_prompt();
-        let p = build_qwen3_5_chat_thinking_prompt(&task);
-        assert!(p.contains("After finishing the reasoning, close </think>."));
-        assert!(p.contains("Immediately after </think>"));
-        assert!(p.contains("Stop after the closing code fence."));
-        assert!(p.contains(" - norm.bias\n"));
-        assert!(!p.contains("Use at most 8 short reasoning lines"));
-        assert!(!p.contains("does not contain `norm.bias`"));
-    }
-
-    #[test]
-    fn build_qwen3_5_chat_concise_thinking_prompt_limits_reasoning() {
-        let task = build_prompt();
-        let p = build_qwen3_5_chat_concise_thinking_prompt(&task);
-        assert!(p.starts_with("<|im_start|>system\n"));
-        assert!(p.ends_with("<|im_start|>assistant\n<think>\n"));
-        for needle in [
-            "Use at most 8 short reasoning lines inside <think>.",
-            "Prefer a complete valid implementation over further analysis.",
-            "Immediately after </think>",
-            "Stop after the closing code fence.",
-            "custom_kernel(data)",
-            " - norm.bias\n",
-        ] {
-            assert!(p.contains(needle), "missing {needle:?}");
-        }
     }
 }
