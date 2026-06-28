@@ -212,14 +212,15 @@ the default sequential verifier path at `1`; raise it only with a matching
 `trimul.verifier_cuda_device_pool` that gives each concurrent verifier worker its own
 GPU, and record both settings in the artifact manifest for like-for-like comparisons.
 For prompt experiments, set `trimul.prompt_path` to a UTF-8 file containing the
-complete TriMul user prompt; ferrl then wraps that text with the selected
-`trimul.prompt_format`. TriMul training has no built-in prompt fallback and no
-suffix prompt path, so the prompt is owned in one editable file at launch time.
-`ferrl train` trims outer whitespace, applies `trimul.prompt_format`, and freezes the
-exact rendered model prompt into the run directory as `prompt.txt` with
-`prompt.sha256`; artifact bundles copy that verified frozen file and record
-`prompt_sha256`. Reports should use that copy/hash or another stable non-private
-identifier, not the mutable local `trimul.prompt_path`.
+complete rendered model prompt, including any system text, chat markers, assistant
+prefill, and reasoning prefix required by the model. TriMul training has no
+built-in prompt fallback, suffix path, or prompt wrapper: `ferrl train` sends that
+file as-is and freezes the same bytes into the run directory as `prompt.txt` with
+`prompt.sha256`. Select the completion parser separately with
+`trimul.submission_extract_mode` (`final_fence` or `thinking_after_think`); this
+setting never constructs prompt text. Artifact bundles copy the verified frozen
+prompt and record `prompt_sha256`. Reports should use that copy/hash or another
+stable non-private identifier, not the mutable local `trimul.prompt_path`.
 
 ### From Rust — a task that isn't built in
 
