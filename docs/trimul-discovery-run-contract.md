@@ -14,8 +14,10 @@ coordinates passed to artifact extraction. TriMul candidate rows may also includ
 timeout, or missing/implausible benchmark data); preserve it in the run report when
 explaining zero-reward tails. For zero-tail triage, set `candidate_log_top_k >=
 group_size` so every sampled completion is retained. At launch, `ferrl train`
-freezes the complete TriMul user prompt to `<run-dir>/prompt.txt` and writes its
-digest to `<run-dir>/prompt.sha256`. The extraction command is `ferrl
+freezes the exact rendered model prompt to `<run-dir>/prompt.txt` and writes its
+digest to `<run-dir>/prompt.sha256`. The rendered prompt is the configured
+`trimul.prompt_path` file after ferrl trims outer whitespace and applies
+`trimul.prompt_format`. The extraction command is `ferrl
 trimul-artifact --config <run.json> --prompt-copy <run-dir>/prompt.txt
 --completion <raw.txt> --out <artifact-dir> --run-id <run-id> --step <step>
 --prompt-index <prompt-index> --group-index <group-index> --rank <rank>
@@ -23,14 +25,17 @@ trimul-artifact --config <run.json> --prompt-copy <run-dir>/prompt.txt
 --baseline-ns <ns> --baseline-ns <ns> --baseline-ns <ns> --ferrl-commit <sha>
 --run-health <summary> --source-inspection clean --source-inspection-notes
 <notes>` with run provenance, audit seed, source-inspection evidence, the frozen
-prompt copy, and repeated `--baseline-ns` values.
+prompt copy, and repeated `--baseline-ns` values. Artifact extraction verifies
+that `--prompt-copy` matches the adjacent launch-time `prompt.sha256`.
 
 For prompt-controlled runs, `trimul.prompt_path` is only the launch-time input
 that supplies the complete TriMul user prompt. Do not use that local path as
 artifact provenance: it is mutable and may expose private filesystem layout.
-`ferrl train` freezes those bytes into the run directory as `prompt.txt` and
-records `prompt.sha256`; `ferrl trimul-artifact` copies that immutable prompt into
-the artifact bundle as `prompt.txt` and records `prompt_sha256`. Any
+`ferrl train` trims outer whitespace, applies the selected `trimul.prompt_format`,
+then freezes that rendered model prompt into the run directory as `prompt.txt` and
+records `prompt.sha256`; `ferrl trimul-artifact` verifies the adjacent
+`prompt.sha256`, copies the immutable rendered prompt into the artifact bundle as
+`prompt.txt`, and records `prompt_sha256`. Any
 operator-facing path in notes should be redacted or replaced by a stable
 non-private identifier. TriMul training has no built-in prompt fallback and no
 suffix prompt path, so the run prompt is owned in one editable file before launch
@@ -45,7 +50,7 @@ with the final report:
 |---|---|
 | ferrl revision | Full git commit SHA. |
 | run config | The exact JSON config passed to `ferrl train`. |
-| prompt | The complete TriMul user prompt bytes, frozen as `<run-dir>/prompt.txt` plus `prompt.sha256`; do not rely on a mutable local `trimul.prompt_path` for provenance. |
+| prompt | The exact rendered model prompt bytes, frozen as `<run-dir>/prompt.txt` plus `prompt.sha256`; do not rely on a mutable local `trimul.prompt_path` for provenance. |
 | model | Model family, checkpoint identity, tokenizer identity, LoRA rank/alpha, base dtype, and rollout seed. |
 | TriMul eval bundle | Immutable identity of the GPUMODE `bioml/trimul` bundle used for `eval_dir` (commit, release, or digest). |
 | sandbox image | Immutable identity of the Apptainer image used by `trimul.image` (path plus digest when available). |
@@ -66,8 +71,8 @@ median `ns` in the config. Keep all raw baseline measurements in the report.
 A candidate is an accepted artifact only when the final bundle contains all of:
 
 - `submission.py`: the exact extracted `custom_kernel` source.
-- `prompt.txt`: the exact complete TriMul user prompt bytes used for training,
-  copied from `<run-dir>/prompt.txt`.
+- `prompt.txt`: the exact rendered TriMul model prompt used for generation,
+  copied from `<run-dir>/prompt.txt` after verifying `<run-dir>/prompt.sha256`.
 - `manifest.json`: a machine-readable manifest with the fields below.
 - `verification/`: the clean re-verification logs and benchmark summaries.
 - `report.md`: the human summary and reviewer checklist outcome.

@@ -4,7 +4,7 @@
 //! ```text
 //! ferrl train --config run.json     # GRPO-train a built-in task (countdown | math | trimul)
 //! ferrl trimul-baseline --config run.json   # measure the TriMul reference baseline (ns) on this GPU
-//! ferrl trimul-artifact --config run.json --completion raw.txt --out artifact/ ...
+//! ferrl trimul-artifact --config run.json --prompt-copy runs/trimul-1/prompt.txt --completion raw.txt --out artifact/ ...
 //! ferrl runreport <run-dir> [--json] [--strict]   # one-glance run health summary
 //! ferrl perf-gate --baseline <run-dir> --candidate <run-dir>   # resource regression check
 //! ```
@@ -658,12 +658,13 @@ impl RunConfig {
     /// non-zero `data.eval_n` gives an adapter-vs-base reward comparison.
     #[cfg(test)]
     fn trimul_splits(&self) -> Result<Splits<()>, CliError> {
-        let prompt_bytes = self.trimul_prompt_bytes()?;
-        self.trimul_splits_from_prompt_bytes(&prompt_bytes)
+        let prompt_file_bytes = self.trimul_prompt_file_bytes()?;
+        let rendered_prompt = self.trimul_render_prompt(&prompt_file_bytes)?;
+        Ok(self.trimul_splits_from_rendered_prompt(&rendered_prompt))
     }
 
-    /// Read the complete TriMul user prompt bytes from the configured prompt file.
-    fn trimul_prompt_bytes(&self) -> Result<Vec<u8>, CliError> {
+    /// Read the complete TriMul user prompt file bytes from the configured prompt file.
+    fn trimul_prompt_file_bytes(&self) -> Result<Vec<u8>, CliError> {
         let Some(path) = &self.trimul.prompt_path else {
             return Err(CliError::msg(
                 "task \"trimul\" requires trimul.prompt_path (the complete user prompt file)",
@@ -672,22 +673,26 @@ impl RunConfig {
         read_bytes(path)
     }
 
-    /// Build the repeated TriMul train/eval splits from already-frozen prompt bytes.
-    fn trimul_splits_from_prompt_bytes(&self, prompt_bytes: &[u8]) -> Result<Splits<()>, CliError> {
-        let task_prompt = std::str::from_utf8(prompt_bytes)
+    /// Render the exact TriMul prompt text fed to the model from launch-file bytes.
+    fn trimul_render_prompt(&self, prompt_file_bytes: &[u8]) -> Result<String, CliError> {
+        let task_prompt = std::str::from_utf8(prompt_file_bytes)
             .map_err(|e| CliError::msg(format!("trimul prompt is not valid UTF-8: {e}")))?;
         let task_prompt = task_prompt.trim();
         if task_prompt.is_empty() {
             return Err(CliError::msg("trimul prompt is empty"));
         }
-        let prompt = self.trimul.prompt_format.build_prompt(task_prompt);
-        let train = std::iter::repeat_with(|| Sample::new(prompt.clone(), ()))
+        Ok(self.trimul.prompt_format.build_prompt(task_prompt))
+    }
+
+    /// Build the repeated TriMul train/eval splits from the exact rendered model prompt.
+    fn trimul_splits_from_rendered_prompt(&self, rendered_prompt: &str) -> Splits<()> {
+        let train = std::iter::repeat_with(|| Sample::new(rendered_prompt.to_owned(), ()))
             .take(self.data.train_n.max(1))
             .collect();
-        let eval = std::iter::repeat_with(|| Sample::new(prompt.clone(), ()))
+        let eval = std::iter::repeat_with(|| Sample::new(rendered_prompt.to_owned(), ()))
             .take(self.data.eval_n)
             .collect();
-        Ok((train, eval))
+        (train, eval)
     }
 
     /// Build the TriMul reward *without* a baseline: load the case list from
@@ -755,10 +760,18 @@ fn train(args: &TrainArgs) -> Result<(), CliError> {
             run_training(&cfg, &device, &MathReward::default(), &train, &eval, None)
         }
         "trimul" => {
-            let prompt_bytes = cfg.trimul_prompt_bytes()?;
-            let (train, eval) = cfg.trimul_splits_from_prompt_bytes(&prompt_bytes)?;
+            let prompt_file_bytes = cfg.trimul_prompt_file_bytes()?;
+            let rendered_prompt = cfg.trimul_render_prompt(&prompt_file_bytes)?;
+            let (train, eval) = cfg.trimul_splits_from_rendered_prompt(&rendered_prompt);
             let reward = cfg.build_trimul_reward()?;
-            run_training(&cfg, &device, &reward, &train, &eval, Some(&prompt_bytes))
+            run_training(
+                &cfg,
+                &device,
+                &reward,
+                &train,
+                &eval,
+                Some(rendered_prompt.as_bytes()),
+            )
         }
         other => Err(CliError::msg(format!(
             "unknown task {other:?}; built-in tasks are \"countdown\", \"math\", and \"trimul\""
@@ -776,7 +789,7 @@ fn run_training<R: RewardFn>(
     reward: &R,
     train: &[Sample<R::Target>],
     eval: &[Sample<R::Target>],
-    prompt_bytes: Option<&[u8]>,
+    rendered_prompt_bytes: Option<&[u8]>,
 ) -> Result<(), CliError> {
     let (mut policy, tok) = load_auto_policy(&cfg.model_dir, device, &cfg.loader_opts())?;
     policy.set_activation_checkpointing(cfg.policy.activation_checkpointing);
@@ -793,7 +806,7 @@ fn run_training<R: RewardFn>(
     );
 
     let run = RunDir::create(&cfg.out_dir, cfg.run_id())?;
-    if let Some(prompt_bytes) = prompt_bytes {
+    if let Some(prompt_bytes) = rendered_prompt_bytes {
         write_bytes(&run.root().join("prompt.txt"), prompt_bytes)?;
         write_text(
             &run.root().join("prompt.sha256"),
@@ -1072,7 +1085,7 @@ struct ModelManifest {
 struct ArtifactConfigManifest {
     /// SHA-256 of the run config bytes passed to this command.
     run_config_sha256: String,
-    /// SHA-256 of the complete TriMul user prompt bytes.
+    /// SHA-256 of the exact rendered TriMul model prompt bytes.
     prompt_sha256: String,
     /// Artifact-relative prompt copy used for audit.
     prompt_file: &'static str,
@@ -1151,7 +1164,7 @@ fn trimul_artifact(args: &TrimulArtifactArgs) -> Result<(), CliError> {
             "trimul-artifact requires a config with task \"trimul\"",
         ));
     }
-    let prompt_bytes = read_bytes(&args.prompt_copy)?;
+    let prompt_bytes = read_verified_prompt_copy(&args.prompt_copy)?;
     if args.audit_secret_seed == cfg.trimul.secret_seed {
         return Err(CliError::msg(
             "audit secret seed must differ from trimul.secret_seed used during training",
@@ -1223,7 +1236,7 @@ struct ArtifactInputs<'a> {
     completion_bytes: &'a [u8],
     /// Raw config bytes.
     config_bytes: &'a [u8],
-    /// Complete TriMul user prompt bytes.
+    /// Rendered TriMul model prompt bytes.
     prompt_bytes: &'a [u8],
     /// Extracted source.
     submission: &'a str,
@@ -1245,6 +1258,35 @@ fn read_bytes(path: &Path) -> Result<Vec<u8>, CliError> {
         path: path.to_path_buf(),
         source,
     })
+}
+
+/// Read a frozen run prompt copy and verify it against the adjacent launch hash.
+fn read_verified_prompt_copy(path: &Path) -> Result<Vec<u8>, CliError> {
+    let bytes = read_bytes(path)?;
+    let actual = sha256_hex(&bytes);
+    let hash_path = path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("prompt.sha256");
+    let raw_expected = std::fs::read_to_string(&hash_path).map_err(|source| CliError::Io {
+        path: hash_path.clone(),
+        source,
+    })?;
+    let expected = raw_expected.split_whitespace().next().unwrap_or_default();
+    if expected != actual {
+        return Err(CliError::msg(format!(
+            "prompt copy hash mismatch: {} records {}, but {} hashes to {}",
+            hash_path.display(),
+            if expected.is_empty() {
+                "<empty>"
+            } else {
+                expected
+            },
+            path.display(),
+            actual
+        )));
+    }
+    Ok(bytes)
 }
 
 /// Parse a [`RunConfig`] from already-read bytes.
@@ -2616,6 +2658,35 @@ benchmarks:
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn prompt_copy_must_match_adjacent_launch_hash() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("ferrl-prompt-copy-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prompt_path = dir.join("prompt.txt");
+        let hash_path = dir.join("prompt.sha256");
+        let prompt = b"<|im_start|>user\nrendered prompt<|im_end|>\n";
+
+        std::fs::write(&prompt_path, prompt).unwrap();
+        std::fs::write(&hash_path, format!("{}\n", sha256_hex(prompt))).unwrap();
+        assert_eq!(
+            read_verified_prompt_copy(&prompt_path).unwrap(),
+            prompt.to_vec()
+        );
+
+        std::fs::write(&hash_path, "0000\n").unwrap();
+        let err = read_verified_prompt_copy(&prompt_path)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("prompt copy hash mismatch"));
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
