@@ -196,7 +196,7 @@ candidate GPU kernels, and success is an emitted artifact rather than just a ris
 reward curve. Before spending GPU time on a TriMul run, use the
 [TriMul Discovery Run Contract](docs/trimul-discovery-run-contract.md). It defines the
 artifact bundle, provenance fields, same-GPU baseline pin, held-out verification,
-dynamic reward-hacking checks, and the no-win stopping report that the reviewer audits.
+dynamic reward-hacking checks, and the no-win stopping report that the operator audits.
 Set `trainer.candidate_log_top_k` to a positive value for discovery runs so the best
 sampled completions are persisted in `candidates.jsonl`; pass that ledger row's raw
 completion plus its step/prompt/group/rank coordinates to `ferrl trimul-artifact`
@@ -205,10 +205,13 @@ an audit seed, and write the manifest/report. Include `--prompt-copy
 <run-dir>/prompt.txt` so the artifact uses the rendered model prompt frozen at
 training launch; extraction verifies the adjacent `<run-dir>/prompt.sha256`.
 Verifier-backed rewards may also attach `reward_diagnostic` to candidate rows so
-zero rewards remain explainable without re-running the whole training step; for
-zero-tail triage, set `candidate_log_top_k` at least as high as `group_size` so every
-sampled completion is retained. The optional `trimul.verifier_parallelism` knob keeps
-the default sequential verifier path at `1`; raise it only with a matching
+low or zero rewards remain explainable without re-running the whole training step; for
+reward-tail triage, set `candidate_log_top_k` at least as high as `group_size` so every
+sampled completion is retained. TriMul's training reward is shaped for search density;
+test-passing candidates whose eval reaches a benchmark marker get a correctness floor,
+and artifact acceptance still requires clean held-out correctness plus repeated measured
+speedup through `ferrl trimul-artifact`. The optional `trimul.verifier_parallelism` knob
+keeps the default sequential verifier path at `1`; raise it only with a matching
 `trimul.verifier_cuda_device_pool` that gives each concurrent verifier worker its own
 GPU, and record both settings in the artifact manifest for like-for-like comparisons.
 For prompt experiments, set `trimul.prompt_path` to a UTF-8 file containing the
