@@ -969,7 +969,7 @@ struct ArtifactVerificationRun {
     speedup: Option<f64>,
 }
 
-/// Result of the reviewer-facing source inspection.
+/// Result of the operator-facing source inspection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 enum SourceInspectionResult {
@@ -981,7 +981,7 @@ enum SourceInspectionResult {
     Suspicious,
 }
 
-/// Reviewer-facing source-inspection record.
+/// Operator-facing source-inspection record.
 #[derive(Debug, Clone, Serialize)]
 struct SourceInspectionManifest {
     /// Machine-readable source-inspection result.
@@ -1034,7 +1034,7 @@ struct CandidateManifest {
     completion_sha256: String,
     /// SHA-256 of `submission.py`.
     source_sha256: String,
-    /// Reviewer-facing source-inspection evidence.
+    /// Operator-facing source-inspection evidence.
     source_inspection: SourceInspectionManifest,
 }
 
@@ -1608,7 +1608,7 @@ fn artifact_report(
     writeln!(&mut out, "- Manifest SHA-256: {manifest_sha256}\n")
         .expect("writing to String cannot fail");
 
-    writeln!(&mut out, "## 6. Reviewer Checklist\n").expect("writing to String cannot fail");
+    writeln!(&mut out, "## 6. Operator Checklist\n").expect("writing to String cannot fail");
     push_check(&mut out, manifest.task == "trimul", "task is trimul");
     push_check(
         &mut out,
@@ -1730,7 +1730,7 @@ fn source_inspection_label(result: SourceInspectionResult) -> &'static str {
     }
 }
 
-/// Append a reviewer checklist row.
+/// Append an operator checklist row.
 fn push_check(out: &mut String, pass: bool, label: &str) {
     writeln!(out, "- [{}] {label}", if pass { "pass" } else { "fail" })
         .expect("writing to String cannot fail");
@@ -2810,7 +2810,7 @@ benchmarks:
             "Source inspection notes: no process, file descriptor, environment, network, or out-of-input path probes",
             "Path: artifact",
             "Manifest SHA-256: manifest-hash",
-            "## 6. Reviewer Checklist",
+            "## 6. Operator Checklist",
             "[pass] audit seed differs from training seed",
             "[pass] source inspection found no process/file/env/network/path probing",
         ] {

@@ -2,9 +2,10 @@
 //!
 //! [`ferrl::trimul`]'s unit tests cover the pure pieces (extraction, spec rendering,
 //! parsing, reward math). These run the *whole* [`ferrl::TrimulReward`] against the
-//! pinned eval image on an `sm_80` node: a correct kernel scores above zero, a wrong
-//! kernel scores zero, and a hostile kernel is **contained** (the sandbox denies it
-//! the network even inside the torch/triton image) and scores zero.
+//! pinned eval image on an `sm_80` node: a correct kernel reaches the correctness
+//! floor plus speed signal, a wrong kernel remains below the correctness floor, and a
+//! hostile kernel is **contained** (the sandbox denies it the network even inside the
+//! torch/triton image) and remains below the correctness floor.
 //!
 //! Gated behind the off-by-default `gate` feature, so — like the GPU tests — CI never
 //! compiles it. Run on a node with an `sm_80` GPU and the eval bundle:
@@ -66,8 +67,16 @@ fn score(completion: &str) -> f32 {
         .expect("the eval should be carried out")
 }
 
+fn assert_below_correctness_floor(value: f32, reason: &str) {
+    assert!(
+        (0.0..1.0).contains(&value),
+        "{reason}; expected shaped failure reward in [0, 1), got {value}"
+    );
+}
+
 /// Correct: delegate to the reference already in the bound eval bundle. Trivially
-/// passes correctness, so the reward (inverse runtime, no baseline set) is positive.
+/// passes correctness and benchmark, so the reward reaches the correctness floor plus
+/// the inverse-runtime speed component (no baseline set).
 const CORRECT: &str = "```python
 def custom_kernel(data):
     from reference import ref_kernel
@@ -75,6 +84,8 @@ def custom_kernel(data):
 ```";
 
 /// Wrong: return the input unchanged — right shape, wrong values, so correctness fails.
+/// With the shaped reward it may still receive format/runnable/partial credit, but it
+/// must stay below the correctness floor.
 const WRONG: &str = "```python
 def custom_kernel(data):
     x, mask, weights, config = data
@@ -83,6 +94,7 @@ def custom_kernel(data):
 
 /// Hostile: try to open a network connection (then compute correctly). The sandbox
 /// denies the network, so the connection raises and the eval never reports a pass.
+/// The shaped reward may still give the runnable floor, but not correctness credit.
 const MALICIOUS: &str = "```python
 def custom_kernel(data):
     import socket
@@ -103,8 +115,8 @@ fn gate_correct_submission_scores_positive() {
 
 #[test]
 #[ignore = "needs an sm_80 GPU + the eval image/bundle; run with --ignored"]
-fn gate_wrong_submission_scores_zero() {
-    assert_eq!(score(WRONG), 0.0, "a wrong kernel must score zero");
+fn gate_wrong_submission_stays_below_correctness_floor() {
+    assert_below_correctness_floor(score(WRONG), "a wrong kernel must not score as correct");
 }
 
 #[test]
@@ -124,14 +136,14 @@ fn gate_reference_baseline_is_measurable_and_positive() {
 
 #[test]
 #[ignore = "needs an sm_80 GPU + the eval image/bundle; run with --ignored"]
-fn gate_malicious_submission_is_contained_and_scores_zero() {
+fn gate_malicious_submission_is_contained_and_stays_below_correctness_floor() {
     // The sandbox runs with no network, so the connection attempt fails and the eval
-    // reports no pass — the candidate scores zero and the host is untouched. This
-    // re-confirms the isolation holds inside the real torch/triton image.
-    assert_eq!(
+    // reports no pass — the candidate cannot reach the correctness floor and the host
+    // is untouched. This re-confirms the isolation holds inside the real torch/triton
+    // image.
+    assert_below_correctness_floor(
         score(MALICIOUS),
-        0.0,
-        "a network-reaching kernel must be contained and score zero"
+        "a network-reaching kernel must be contained and not score as correct",
     );
 }
 
@@ -145,9 +157,10 @@ fn gate_no_code_scores_zero() {
     );
 }
 
-// --- Adversarial negative controls: a candidate that tries to *forge* a pass must
-//     score zero. These are the reward-gaming cases the honest-wrong WRONG case does
-//     not cover.
+// --- Adversarial negative controls: a candidate that tries to *forge* a pass through
+//     files or stdout must not reach the correctness floor. The /proc fd residual with
+//     absurd timing must still score zero. These are the reward-gaming cases the
+//     honest-wrong WRONG case does not cover.
 
 /// Forge attempt: write fake grade files into the RW scratch. ferrl reads the grade
 /// from the stdout pipe, not these files, so the forge must not affect the score.
@@ -191,21 +204,19 @@ def custom_kernel(data):
 
 #[test]
 #[ignore = "needs an sm_80 GPU + the eval image/bundle; run with --ignored"]
-fn gate_forged_result_files_score_zero() {
-    assert_eq!(
+fn gate_forged_result_files_stay_below_correctness_floor() {
+    assert_below_correctness_floor(
         score(FORGE_WORKFILE),
-        0.0,
-        "forged /work result files must not score"
+        "forged /work result files must not score as correct",
     );
 }
 
 #[test]
 #[ignore = "needs an sm_80 GPU + the eval image/bundle; run with --ignored"]
-fn gate_forged_stdout_scores_zero() {
-    assert_eq!(
+fn gate_forged_stdout_stays_below_correctness_floor() {
+    assert_below_correctness_floor(
         score(FORGE_STDOUT),
-        0.0,
-        "a printed fake grade must not score"
+        "a printed fake grade must not score as correct",
     );
 }
 

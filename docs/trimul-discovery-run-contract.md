@@ -12,7 +12,7 @@ in `candidates.jsonl`; that ledger is the source for the raw completion and the
 coordinates passed to artifact extraction. TriMul candidate rows may also include
 `reward_diagnostic` (for example no submission, test failure, no pass grade, sandbox
 timeout, or missing/implausible benchmark data); preserve it in the run report when
-explaining zero-reward tails. For zero-tail triage, set `candidate_log_top_k >=
+explaining low- or zero-reward tails. For reward-tail triage, set `candidate_log_top_k >=
 group_size` so every sampled completion is retained. At launch, `ferrl train`
 freezes the exact configured model prompt to `<run-dir>/prompt.txt` and writes its
 digest to `<run-dir>/prompt.sha256`. `trimul.prompt_path` is the complete rendered
@@ -41,6 +41,15 @@ be redacted or replaced by a stable non-private identifier. TriMul training has 
 built-in prompt fallback, no suffix prompt path, and no prompt wrapper, so the run
 prompt is fully owned in one editable file before launch and frozen by the
 run/artifact copy and hash after launch.
+
+TriMul training reward is shaped for search density, not artifact acceptance. The
+current reward scheme gives tiny credit for extractable code, small credit for
+reaching the test harness, bounded partial credit for passing individual test cases,
+and then the correctness floor for test-passing candidates whose eval reaches a
+benchmark exit marker. A successful plausible benchmark adds a capped speed
+component. Implausibly fast benchmark timings still score zero. The artifact
+acceptance rule below stays strict: held-out correctness, repeated same-GPU
+benchmarking, and measured speedup over the pinned baseline.
 
 ### Preparing a Qwen rendered prompt
 
@@ -82,7 +91,7 @@ with the final report:
 | cases | `task.yml` identity and the loaded counts for `tests` and `benchmarks`. |
 | seeds | `data.seed`, `policy.seed`, trainer seed-bearing knobs, and the training `trimul.secret_seed`. |
 | scratch cap | `trimul.scratch_max_bytes`; `0` means the ferrl default, currently 1 GiB. |
-| candidate ledger | `trainer.candidate_log_top_k`; use a positive value for discovery runs, and use at least `group_size` when diagnosing zero-reward tails so all completions are persisted in `candidates.jsonl`; retain any `reward_diagnostic` values in the report. |
+| candidate ledger | `trainer.candidate_log_top_k`; use a positive value for discovery runs, and use at least `group_size` when diagnosing low- or zero-reward tails so all completions are persisted in `candidates.jsonl`; retain any `reward_diagnostic` values in the report. |
 | hardware | GPU product name reported by the baseline command and visible CUDA device count. |
 | budget | Trainer `steps`, `group_size`, wall-clock allocation, and the stop condition chosen below. |
 
@@ -100,7 +109,7 @@ A candidate is an accepted artifact only when the final bundle contains all of:
   copied from `<run-dir>/prompt.txt` after verifying `<run-dir>/prompt.sha256`.
 - `manifest.json`: a machine-readable manifest with the fields below.
 - `verification/`: the clean re-verification logs and benchmark summaries.
-- `report.md`: the human summary and reviewer checklist outcome.
+- `report.md`: the human summary and operator checklist outcome.
 
 The manifest schema is versioned from the first run:
 
@@ -172,7 +181,7 @@ The manifest schema is versioned from the first run:
 ```
 
 The artifact extractor may add fields, but it must keep the fields above stable for
-the first run so a reviewer can audit the result without reading training logs by hand.
+the first run so an operator can audit the result without reading training logs by hand.
 
 ## Acceptance Rule
 
@@ -209,7 +218,7 @@ For every candidate included in the final report:
 - Include rejected high-reward candidates in the report when they explain why the
   accepted candidate was not simply the highest training reward.
 
-These checks are deliberately reviewer-facing. They are not a proof against arbitrary
+These checks are deliberately operator-facing. They are not a proof against arbitrary
 malicious code; they are the Phase-1 guardrail for deciding whether the first run found
 a real faster kernel or a reward artifact.
 
@@ -238,6 +247,6 @@ The final report must fit this outline:
 4. Candidate table: source hash, training reward, source-inspection result, clean
    correctness, median runtime, speedup, and accept/reject reason.
 5. Artifact bundle path and manifest hash, when accepted.
-6. Reviewer checklist: each acceptance and reward-hacking check marked pass/fail.
+6. Operator checklist: each acceptance and reward-hacking check marked pass/fail.
 
-Use `ferrl trimul-artifact` after training to persist the best correct-and-fast candidates with enough provenance to fill this manifest and produce the reviewer-facing report.
+Use `ferrl trimul-artifact` after training to persist the best correct-and-fast candidates with enough provenance to fill this manifest and produce the operator-facing report.

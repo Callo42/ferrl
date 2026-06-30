@@ -21,11 +21,14 @@
 //!    pipe** while the candidate's own stdout goes to `/dev/null` — so the grade rides
 //!    a channel the untrusted candidate cannot reach (its worker neither inherits the
 //!    fd nor can target it by path), foreclosing a forged pass.
-//! 4. Map the captured grade to a reward: **`0` if the candidate is missing, crashes,
-//!    fails any correctness case, or reports an implausibly fast time (below the
-//!    kernel-launch floor — a glitch or forged grade); otherwise the geometric-mean
-//!    speedup over a reference baseline.** GRPO normalizes rewards within a group, so a
-//!    monotone-in-speed signal is what the search needs.
+//! 4. Map the captured grade to a shaped training reward: missing submissions score
+//!    `0`, extracted-but-broken submissions get only a tiny format reward, runnable
+//!    candidates get a small floor, partially correct candidates scale below the
+//!    correctness floor, and test-passing candidates whose eval reaches a benchmark
+//!    exit marker score the correctness floor plus any capped speed component.
+//!    Implausibly fast timings (below the kernel-launch floor — a glitch or forged
+//!    grade) still score `0`. The final artifact gate remains stricter than the
+//!    training reward: held-out correctness plus repeated speedup audit.
 //!
 //! ## What lives where
 //!
@@ -40,18 +43,19 @@
 //! ## Reward integrity
 //!
 //! The grade rides a channel the candidate cannot reach by file or by print, and an
-//! implausibly fast time is rejected — so the trivial gaming routes (forge a `/work`
-//! result file, print a fake pass, report a 0 ns kernel) all score zero, gated by the
-//! negative-control suite. **Known residual (PoC):** a candidate that scans `/proc` for
-//! the grader's grade fd *and* reports a physically plausible fake time could still
-//! forge a pass — its worker shares the grader's PID namespace and uid, so only
-//! per-candidate PID-namespace isolation closes it (earned when untrusted external
-//! submissions arrive, not this PoC, whose kernel-writing policy is extremely unlikely
-//! to emit such an exploit). The held-out `POPCORN_SEED` is likewise candidate-readable;
-//! both are moot against an attacker who can already forge the grade and close together
-//! with that isolation. The dynamic guard — watching the discovery run for implausible
-//! wins and re-verifying top candidates — is the spec's Phase-1 instrumentation, done
-//! in the run, not the reward.
+//! implausibly fast time is rejected — so trivial fake-pass routes (forge a `/work`
+//! result file, print a fake pass, report a 0 ns kernel) cannot reach the correctness
+//! floor; the absurd-time path still scores zero. The negative-control suite gates
+//! those cases. **Known residual (PoC):** a candidate that scans `/proc` for the
+//! grader's grade fd *and* reports a physically plausible fake time could still forge
+//! a pass — its worker shares the grader's PID namespace and uid, so only per-candidate
+//! PID-namespace isolation closes it (earned when untrusted external submissions
+//! arrive, not this PoC, whose kernel-writing policy is extremely unlikely to emit such
+//! an exploit). The held-out `POPCORN_SEED` is likewise candidate-readable; both are
+//! moot against an attacker who can already forge the grade and close together with
+//! that isolation. The dynamic guard — watching the discovery run for implausible wins
+//! and re-verifying top candidates — is the spec's Phase-1 instrumentation, done in the
+//! run, not the reward.
 //!
 //! ## Testing split (as in [`crate::sandbox`])
 //!
@@ -442,7 +446,8 @@ pub struct TrimulReward {
     /// inputs (passed as `POPCORN_SEED`).
     secret_seed: u64,
     /// Reference geometric-mean runtime (ns) on the target GPU; the speedup
-    /// denominator. `None` falls back to an inverse-time signal.
+    /// denominator for the shaped reward's speed component. `None` falls back to an
+    /// inverse-time signal.
     baseline_ns: Option<f64>,
     /// Wall-clock budget for one candidate's full eval.
     wall: Duration,
@@ -620,9 +625,10 @@ impl TrimulReward {
         geomean(means)
     }
 
-    /// Map a parsed `(correct, geom-mean ns)` outcome to a scalar reward: `0` unless
-    /// the candidate is correct and produced a positive runtime; otherwise the
-    /// speedup over the baseline (or an inverse-time proxy when no baseline is set).
+    /// Map a parsed `(correct, geom-mean ns)` outcome to the speed component of the
+    /// training reward: `0` unless the candidate is correct and produced a positive
+    /// runtime; otherwise the speedup over the baseline (or an inverse-time proxy when
+    /// no baseline is set).
     #[must_use]
     pub fn reward_value(&self, correct: bool, geomean_ns: Option<f64>) -> f32 {
         if !correct {
@@ -878,9 +884,9 @@ impl TrimulReward {
         // Best-effort cleanup; the scratch is node-local and disposable.
         let _ = std::fs::remove_dir_all(&scratch);
         let eval = result?;
-        let reward = self.reward_from_eval(&eval);
+        let reward = self.reward_from_extracted_eval(&eval);
         let diagnostic = self.reward_diagnostic(&eval);
-        let metadata = Some(self.reward_metadata(&code, &eval));
+        let metadata = Some(self.reward_metadata(&code, &eval, reward));
         Ok(RewardOutcome {
             reward,
             diagnostic,
@@ -888,24 +894,41 @@ impl TrimulReward {
         })
     }
 
-    fn reward_metadata(&self, submission: &str, eval: &TrimulEval) -> serde_json::Value {
+    fn reward_metadata(
+        &self,
+        submission: &str,
+        eval: &TrimulEval,
+        training_reward: f32,
+    ) -> serde_json::Value {
+        let test_progress = eval.test_progress();
+        let speed_component = if eval.verification.correct && eval.benchmark_exit == Some(0) {
+            self.speed_reward_component(eval.verification.geomean_ns)
+        } else {
+            0.0
+        };
         let mut metadata = serde_json::json!({
             "task": "trimul",
+            "reward_scheme": "trimul_shaped_v1",
             "submission_extracted": true,
             "source_sha256": sha256_hex(submission.as_bytes()),
             "source_len_bytes": submission.len(),
+            "training_reward": training_reward,
             "sandbox_status": run_status_label(eval.status),
             "sandbox_success": eval.status.is_success(),
             "sandbox_stdout_len_bytes": eval.output.stdout.len(),
             "sandbox_stderr_len_bytes": eval.output.stderr.len(),
             "test_check": eval.test_check.as_deref(),
             "test_exit": eval.test_exit,
+            "test_pass_count": test_progress.pass_count,
+            "test_case_count": test_progress.case_count,
+            "test_pass_fraction": test_progress.fraction(),
             "benchmark_exit": eval.benchmark_exit,
             "has_benchmark_section": eval.has_benchmark_section,
             "correct": eval.verification.correct,
             "benchmark_mean_count": eval.verification.benchmark_means_ns.len(),
             "geomean_ns": eval.verification.geomean_ns,
             "speedup": eval.verification.speedup,
+            "speed_reward_component": speed_component,
         });
 
         if eval.should_preserve_output_tail() {
@@ -935,20 +958,43 @@ impl TrimulReward {
         metadata
     }
 
+    fn reward_from_extracted_eval(&self, eval: &TrimulEval) -> f32 {
+        if eval_has_implausible_benchmark(eval) {
+            return 0.0;
+        }
+        self.reward_from_eval(eval).max(FORMAT_EXTRACTED_REWARD)
+    }
+
     fn reward_from_eval(&self, eval: &TrimulEval) -> f32 {
         if !eval.status.is_success() {
             return 0.0;
         }
+        if eval.test_exit.is_none() {
+            return 0.0;
+        }
+        if eval_has_implausible_benchmark(eval) {
+            // A candidate with sub-floor benchmark timings is suspicious (or a
+            // measurement glitch). Keep this fail-closed at zero instead of giving
+            // the extraction, runnable, or correctness floors.
+            return 0.0;
+        }
         if eval.test_exit != Some(0) {
-            return 0.0;
+            return runnable_progress_reward(eval);
         }
-        if eval.verification.correct
-            && eval.verification.geomean_ns.is_some()
-            && eval.benchmark_exit != Some(0)
+        if eval.verification.correct && eval.has_benchmark_section && eval.benchmark_exit.is_some()
         {
-            return 0.0;
+            if eval.benchmark_exit == Some(0) {
+                return CORRECTNESS_REWARD
+                    + self.speed_reward_component(eval.verification.geomean_ns);
+            }
+            return CORRECTNESS_REWARD;
         }
-        self.reward_value(eval.verification.correct, eval.verification.geomean_ns)
+        runnable_progress_reward(eval)
+    }
+
+    fn speed_reward_component(&self, geomean_ns: Option<f64>) -> f32 {
+        self.reward_value(true, geomean_ns)
+            .clamp(0.0, SPEED_REWARD_CAP)
     }
 
     fn reward_diagnostic(&self, eval: &TrimulEval) -> Option<String> {
@@ -1028,6 +1074,11 @@ impl TrimulEval {
             || self.test_exit != Some(0)
             || (self.verification.correct && self.benchmark_exit != Some(0))
     }
+
+    fn test_progress(&self) -> TestProgress {
+        let (test_log, _) = split_result(&self.output.stdout);
+        test_progress(test_log)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1036,8 +1087,73 @@ struct TrimulEvalOutput {
     stderr: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TestProgress {
+    pass_count: usize,
+    case_count: usize,
+}
+
+impl TestProgress {
+    fn fraction(self) -> f64 {
+        if self.case_count == 0 {
+            0.0
+        } else {
+            (self.pass_count.min(self.case_count) as f64 / self.case_count as f64).clamp(0.0, 1.0)
+        }
+    }
+}
+
+fn test_progress(test_log: &str) -> TestProgress {
+    let declared_count = log_value(test_log, "test-count").and_then(|value| value.parse().ok());
+    let mut statuses: HashMap<usize, bool> = HashMap::new();
+    for line in test_log.lines() {
+        let Some((key, value)) = line.split_once(": ") else {
+            continue;
+        };
+        let key = key.trim();
+        let Some(index) = key
+            .strip_prefix("test.")
+            .and_then(|key| key.strip_suffix(".status"))
+            .and_then(|index| index.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        let passed = value.trim() == "pass";
+        if let Some(seen) = statuses.get_mut(&index) {
+            *seen &= passed;
+        } else {
+            statuses.insert(index, passed);
+        }
+    }
+    if declared_count == Some(0) && test_passed(test_log) {
+        return TestProgress {
+            pass_count: 1,
+            case_count: 1,
+        };
+    }
+    let pass_count = statuses
+        .iter()
+        .filter(|(index, passed)| {
+            **passed && declared_count.is_none_or(|case_count| **index < case_count)
+        })
+        .count();
+    TestProgress {
+        pass_count,
+        case_count: declared_count.unwrap_or(statuses.len()),
+    }
+}
+
 fn eval_has_shape_failure(eval: &TrimulEval) -> bool {
     text_has_shape_failure(&eval.output.stderr) || text_has_shape_failure(&eval.output.stdout)
+}
+
+fn eval_has_implausible_benchmark(eval: &TrimulEval) -> bool {
+    !eval.verification.benchmark_means_ns.is_empty() && eval.verification.geomean_ns.is_none()
+}
+
+fn runnable_progress_reward(eval: &TrimulEval) -> f32 {
+    let progress = eval.test_progress();
+    RUNNABLE_REWARD + PARTIAL_CORRECTNESS_REWARD * progress.fraction() as f32
 }
 
 fn text_has_shape_failure(text: &str) -> bool {
@@ -1072,6 +1188,20 @@ const RESULT_SPLIT: &str = "===FERRL-BENCH===";
 
 /// Maximum captured eval output text stored in candidate metadata.
 const EVAL_OUTPUT_TAIL_LIMIT_BYTES: usize = 4096;
+
+/// Tiny credit for emitting an extractable final submission. This separates
+/// truncation/parser failures from candidates worth running, without letting format-only
+/// completions compete with runnable or correct code.
+const FORMAT_EXTRACTED_REWARD: f32 = 0.02;
+/// Credit for reaching the test harness and producing a test-exit marker.
+const RUNNABLE_REWARD: f32 = 0.05;
+/// Maximum sub-correctness credit. Kept below [`CORRECTNESS_REWARD`] so any fully
+/// correct candidate outranks every partial candidate.
+const PARTIAL_CORRECTNESS_REWARD: f32 = 0.75;
+/// Fully correct candidates get this floor before speed is considered.
+const CORRECTNESS_REWARD: f32 = 1.0;
+/// Cap the speed component so one lucky timing run cannot swamp correctness progress.
+const SPEED_REWARD_CAP: f32 = 2.0;
 
 /// Split the captured grade stream into its `(test, benchmark)` sections. If the
 /// separator is absent (the `test` run failed, so `benchmark` never ran), the whole
@@ -1309,6 +1439,26 @@ mod tests {
     }
 
     #[test]
+    fn test_progress_counts_declared_case_passes() {
+        let progress = test_progress(
+            "test-count: 4\n\
+             test.0.status: pass\n\
+             test.0.status: pass\n\
+             test.1.status: fail\n\
+             test.2.status: pass\n\
+             test.99.status: pass\n",
+        );
+        assert_eq!(
+            progress,
+            TestProgress {
+                pass_count: 2,
+                case_count: 4,
+            }
+        );
+        assert!((progress.fraction() - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn benchmark_geomean_collects_the_means() {
         let log = "benchmark-count: 2\nbenchmark.0.mean: 100.0\nbenchmark.0.std: 5\nbenchmark.1.mean: 400.0\ncheck: pass";
         let means = benchmark_means_ns(log);
@@ -1351,6 +1501,133 @@ mod tests {
         // Twice as fast as baseline -> reward 2.0; half as fast -> 0.5.
         assert!((r.reward_value(true, Some(500.0)) - 2.0).abs() < 1e-5);
         assert!((r.reward_value(true, Some(2000.0)) - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // one table-like ladder check is clearer than scattered cases
+    fn shaped_reward_orders_format_runnable_correctness_and_speed() {
+        let r = reward().with_baseline_ns(1000.0);
+        let partial = TrimulEval {
+            verification: TrimulVerification {
+                correct: false,
+                benchmark_means_ns: Vec::new(),
+                geomean_ns: None,
+                speedup: None,
+            },
+            status: RunStatus::Exited(0),
+            output: TrimulEvalOutput {
+                stdout: "test-count: 4\ntest.0.status: pass\ntest.1.status: pass\ntest-exit: 1\n"
+                    .to_string(),
+                stderr: String::new(),
+            },
+            test_check: Some("fail".to_string()),
+            test_exit: Some(1),
+            benchmark_exit: None,
+            has_benchmark_section: false,
+        };
+        let partial_reward = r.reward_from_eval(&partial);
+        assert!(
+            (partial_reward - (RUNNABLE_REWARD + PARTIAL_CORRECTNESS_REWARD * 0.5)).abs() < 1e-6
+        );
+
+        let correct_benchmark_failed = TrimulEval {
+            verification: TrimulVerification {
+                correct: true,
+                benchmark_means_ns: Vec::new(),
+                geomean_ns: None,
+                speedup: None,
+            },
+            status: RunStatus::Exited(0),
+            output: TrimulEvalOutput::default(),
+            test_check: Some("pass".to_string()),
+            test_exit: Some(0),
+            benchmark_exit: Some(1),
+            has_benchmark_section: true,
+        };
+        let correct_reward = r.reward_from_eval(&correct_benchmark_failed);
+        assert_eq!(correct_reward, CORRECTNESS_REWARD);
+
+        let slow = TrimulEval {
+            verification: TrimulVerification {
+                correct: true,
+                benchmark_means_ns: vec![2000.0],
+                geomean_ns: Some(2000.0),
+                speedup: Some(0.5),
+            },
+            status: RunStatus::Exited(0),
+            output: TrimulEvalOutput::default(),
+            test_check: Some("pass".to_string()),
+            test_exit: Some(0),
+            benchmark_exit: Some(0),
+            has_benchmark_section: true,
+        };
+        let slow_reward = r.reward_from_eval(&slow);
+        assert!((slow_reward - 1.5).abs() < 1e-6);
+
+        let fast = TrimulEval {
+            verification: TrimulVerification {
+                correct: true,
+                benchmark_means_ns: vec![250.0],
+                geomean_ns: Some(250.0),
+                speedup: Some(4.0),
+            },
+            status: RunStatus::Exited(0),
+            output: TrimulEvalOutput::default(),
+            test_check: Some("pass".to_string()),
+            test_exit: Some(0),
+            benchmark_exit: Some(0),
+            has_benchmark_section: true,
+        };
+        let fast_reward = r.reward_from_eval(&fast);
+        assert_eq!(fast_reward, CORRECTNESS_REWARD + SPEED_REWARD_CAP);
+
+        assert!(partial_reward < correct_reward);
+        assert!(correct_reward < slow_reward);
+        assert!(slow_reward < fast_reward);
+    }
+
+    #[test]
+    fn implausible_benchmark_scores_zero_even_after_extraction() {
+        let r = reward().with_baseline_ns(1000.0);
+        let eval = TrimulEval {
+            verification: TrimulVerification {
+                correct: true,
+                benchmark_means_ns: vec![0.001],
+                geomean_ns: None,
+                speedup: None,
+            },
+            status: RunStatus::Exited(0),
+            output: TrimulEvalOutput::default(),
+            test_check: Some("pass".to_string()),
+            test_exit: Some(0),
+            benchmark_exit: Some(0),
+            has_benchmark_section: true,
+        };
+
+        assert_eq!(r.reward_from_eval(&eval), 0.0);
+        assert_eq!(r.reward_from_extracted_eval(&eval), 0.0);
+    }
+
+    #[test]
+    fn extracted_submission_gets_format_floor_for_eval_failure() {
+        let r = reward();
+        let eval = TrimulEval {
+            verification: TrimulVerification {
+                correct: false,
+                benchmark_means_ns: Vec::new(),
+                geomean_ns: None,
+                speedup: None,
+            },
+            status: RunStatus::TimedOut,
+            output: TrimulEvalOutput::default(),
+            test_check: None,
+            test_exit: None,
+            benchmark_exit: None,
+            has_benchmark_section: false,
+        };
+
+        assert_eq!(r.reward_from_eval(&eval), 0.0);
+        assert_eq!(r.reward_from_extracted_eval(&eval), FORMAT_EXTRACTED_REWARD);
     }
 
     #[test]
@@ -1404,8 +1681,13 @@ mod tests {
             has_benchmark_section: false,
         };
 
-        let metadata = r.reward_metadata(source, &eval);
+        let training_reward = r.reward_from_extracted_eval(&eval);
+        let metadata = r.reward_metadata(source, &eval, training_reward);
         assert_eq!(metadata["task"], serde_json::json!("trimul"));
+        assert_eq!(
+            metadata["reward_scheme"],
+            serde_json::json!("trimul_shaped_v1")
+        );
         assert_eq!(metadata["submission_extracted"], serde_json::json!(true));
         assert_eq!(
             metadata["source_sha256"],
@@ -1442,10 +1724,18 @@ mod tests {
         );
         assert_eq!(metadata["test_check"], serde_json::json!("pass"));
         assert_eq!(metadata["test_exit"], serde_json::json!(1));
+        assert_eq!(
+            metadata["training_reward"],
+            serde_json::json!(training_reward)
+        );
+        assert_eq!(metadata["test_pass_count"], serde_json::json!(0));
+        assert_eq!(metadata["test_case_count"], serde_json::json!(0));
+        assert_eq!(metadata["test_pass_fraction"], serde_json::json!(0.0));
         assert_eq!(metadata["benchmark_exit"], serde_json::Value::Null);
         assert_eq!(metadata["has_benchmark_section"], serde_json::json!(false));
         assert_eq!(metadata["correct"], serde_json::json!(true));
         assert_eq!(metadata["benchmark_mean_count"], serde_json::json!(2));
+        assert_eq!(metadata["speed_reward_component"], serde_json::json!(0.0));
     }
 
     #[test]
@@ -1466,9 +1756,16 @@ mod tests {
             has_benchmark_section: true,
         };
 
-        let metadata = r.reward_metadata("def custom_kernel(data): return data", &eval);
+        let training_reward = r.reward_from_extracted_eval(&eval);
+        let metadata = r.reward_metadata(
+            "def custom_kernel(data): return data",
+            &eval,
+            training_reward,
+        );
         assert_eq!(metadata["sandbox_stdout_len_bytes"], serde_json::json!(0));
         assert_eq!(metadata["sandbox_stderr_len_bytes"], serde_json::json!(0));
+        assert_eq!(metadata["training_reward"], serde_json::json!(3.0));
+        assert_eq!(metadata["speed_reward_component"], serde_json::json!(2.0));
         assert!(metadata.get("sandbox_stdout_tail").is_none());
         assert!(metadata.get("sandbox_stderr_tail").is_none());
     }
@@ -1498,7 +1795,16 @@ mod tests {
             r.reward_diagnostic(&eval).as_deref(),
             Some("trimul:test_process_failed")
         );
-        let metadata = r.reward_metadata("def custom_kernel(data): return data", &eval);
+        let training_reward = r.reward_from_extracted_eval(&eval);
+        let metadata = r.reward_metadata(
+            "def custom_kernel(data): return data",
+            &eval,
+            training_reward,
+        );
+        assert_eq!(
+            metadata["training_reward"],
+            serde_json::json!(RUNNABLE_REWARD)
+        );
         assert_eq!(
             metadata["sandbox_stdout_tail"],
             serde_json::json!("test-exit: 1\n")
@@ -1882,7 +2188,10 @@ mod tests {
             benchmark_exit: Some(1),
             has_benchmark_section: true,
         };
-        assert_eq!(r.reward_from_eval(&plausible_benchmark_process_failed), 0.0);
+        assert_eq!(
+            r.reward_from_eval(&plausible_benchmark_process_failed),
+            CORRECTNESS_REWARD
+        );
         assert_eq!(
             r.reward_diagnostic(&plausible_benchmark_process_failed)
                 .as_deref(),
@@ -1915,7 +2224,7 @@ mod tests {
             },
             ..base.clone()
         };
-        assert_eq!(r.reward_from_eval(&shape_mismatch), 0.0);
+        assert_eq!(r.reward_from_eval(&shape_mismatch), RUNNABLE_REWARD);
         assert_eq!(
             r.reward_diagnostic(&shape_mismatch).as_deref(),
             Some("trimul:test_shape_mismatch")
@@ -1936,7 +2245,7 @@ mod tests {
     }
 
     #[test]
-    fn reward_requires_success_exit_markers_for_positive_scores() {
+    fn reward_requires_test_exit_and_benchmark_marker_for_correctness_floor() {
         let r = reward();
         let missing_test_exit = TrimulEval {
             verification: TrimulVerification {
@@ -1963,7 +2272,7 @@ mod tests {
             benchmark_exit: None,
             ..missing_test_exit.clone()
         };
-        assert_eq!(r.reward_from_eval(&missing_benchmark_exit), 0.0);
+        assert!(r.reward_from_eval(&missing_benchmark_exit) < CORRECTNESS_REWARD);
         assert_eq!(
             r.reward_diagnostic(&missing_benchmark_exit).as_deref(),
             Some("trimul:missing_benchmark_exit")
