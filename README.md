@@ -204,6 +204,16 @@ completion plus its step/prompt/group/rank coordinates to `ferrl trimul-artifact
 an audit seed, and write the manifest/report. Include `--prompt-copy
 <run-dir>/prompt.txt` so the artifact uses the rendered model prompt frozen at
 training launch; extraction verifies the adjacent `<run-dir>/prompt.sha256`.
+For rollout-only diagnostics from an external inference runtime, use
+`ferrl trimul-score --config <run.json> --prompt-copy <prompt.txt>
+--completion <raw.txt> --out <scores.jsonl> --score-secret-seed <seed>` (or
+`--completions-jsonl`) to score raw completions once with the same shaped TriMul
+reward and persist external-score JSONL. The scoring seed must differ from the
+training `trimul.secret_seed`. `trimul-score` records opaque `source_id` values,
+not input file paths; use `--source-label <public-id>` or JSONL `source_id` values
+that are safe to copy into public reports. Then run `ferrl trimul-artifact` only
+on promising extracted candidates; `trimul-score` is diagnostic evidence, not
+the strict artifact gate.
 Verifier-backed rewards may also attach `reward_diagnostic` to candidate rows so
 low or zero rewards remain explainable without re-running the whole training step; for
 reward-tail triage, set `candidate_log_top_k` at least as high as `group_size` so every

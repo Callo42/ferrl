@@ -4,6 +4,7 @@
 //! ```text
 //! ferrl train --config run.json     # GRPO-train a built-in task (countdown | math | trimul)
 //! ferrl trimul-baseline --config run.json   # measure the TriMul reference baseline (ns) on this GPU
+//! ferrl trimul-score --config run.json --prompt-copy prompt.txt --completion raw.txt --out scores.jsonl
 //! ferrl trimul-artifact --config run.json --prompt-copy runs/trimul-1/prompt.txt --completion raw.txt --out artifact/ ...
 //! ferrl runreport <run-dir> [--json] [--strict]   # one-glance run health summary
 //! ferrl perf-gate --baseline <run-dir> --candidate <run-dir>   # resource regression check
@@ -22,6 +23,10 @@
 //! to paste into the run config's `trimul.baseline` (the guarded-pin baseline — a
 //! `train` run refuses a baseline measured on a different GPU than it is running on).
 //!
+//! `trimul-score` scores raw external completions with the same shaped TriMul reward
+//! used during training and writes external-score JSONL. It is for rollout diagnostics;
+//! `trimul-artifact` remains the strict repeated audit gate.
+//!
 //! `runreport` folds in the standalone run-summary tool: it reads a run's
 //! `metrics.jsonl` and prints (or emits as JSON) a [`RunSummary`](ferrl::RunSummary),
 //! optionally failing (`--strict`, exit code 2) when any health anomaly is flagged.
@@ -33,7 +38,10 @@
 // A CLI whose interface *is* its stdout/stderr; the library logs via `tracing`.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::fs::OpenOptions;
+use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -77,6 +85,8 @@ enum Command {
     Train(TrainArgs),
     /// Measure the TriMul reference baseline (ns) on this node's GPU for the guarded pin.
     TrimulBaseline(TrimulBaselineArgs),
+    /// Score external TriMul completions once with the shaped reward.
+    TrimulScore(Box<TrimulScoreArgs>),
     /// Extract and verify a TriMul artifact bundle from a raw model completion.
     TrimulArtifact(Box<TrimulArtifactArgs>),
     /// Print a one-glance health summary for a finished run.
@@ -99,6 +109,59 @@ struct TrimulBaselineArgs {
     /// Path to the JSON run config (the same `trimul` block `ferrl train` reads).
     #[arg(long)]
     config: PathBuf,
+}
+
+/// Arguments for `ferrl trimul-score`.
+#[derive(Debug, Args)]
+struct TrimulScoreArgs {
+    /// Path to the JSON run config used to configure the TriMul reward.
+    #[arg(long)]
+    config: PathBuf,
+    /// Immutable prompt copy used for generation; verifies adjacent `prompt.sha256`.
+    #[arg(long)]
+    prompt_copy: PathBuf,
+    /// Raw completion file to score. May be passed multiple times.
+    #[arg(long)]
+    completion: Vec<PathBuf>,
+    /// JSONL file containing objects with at least `{ "completion": "..." }`.
+    ///
+    /// Optional fields are `step`, `prompt_index`, `group_index`, `rank`, `world_size`,
+    /// `completion_len_tokens`, `source_id`, `metadata`, and `reward_metadata`.
+    #[arg(long)]
+    completions_jsonl: Vec<PathBuf>,
+    /// Output external-score JSONL file. Fails if it already exists.
+    #[arg(long)]
+    out: PathBuf,
+    /// Secret seed for diagnostic scoring. Must differ from `trimul.secret_seed`.
+    #[arg(long)]
+    score_secret_seed: u64,
+    /// External rollout id recorded in score metadata.
+    #[arg(long, default_value = "external-rollout")]
+    run_id: String,
+    /// Public-safe label used to form opaque source ids for input files.
+    #[arg(long, default_value = "external")]
+    source_label: String,
+    /// Default candidate step for raw completion files.
+    #[arg(long, default_value_t = 0)]
+    step: u64,
+    /// Default prompt ordinal for raw completion files.
+    #[arg(long, default_value_t = 0)]
+    prompt_index: u64,
+    /// Default data-parallel rank for raw completion files.
+    #[arg(long, default_value_t = 0)]
+    rank: usize,
+    /// Default data-parallel world size for raw completion files.
+    #[arg(long, default_value_t = 1)]
+    world_size: usize,
+    /// Model family label recorded in score metadata.
+    #[arg(long, default_value = "external")]
+    model_family: String,
+    /// Operator-supplied checkpoint identity recorded in score metadata.
+    #[arg(long)]
+    checkpoint: Option<String>,
+    /// Operator-supplied tokenizer identity recorded in score metadata.
+    #[arg(long)]
+    tokenizer: Option<String>,
 }
 
 /// Arguments for `ferrl trimul-artifact`.
@@ -177,6 +240,85 @@ struct TrimulArtifactArgs {
     /// Immutable identity of the Apptainer image. Defaults to `trimul.image`.
     #[arg(long)]
     sandbox_image: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TrimulScoreJsonlRecord {
+    completion: String,
+    #[serde(default)]
+    step: Option<u64>,
+    #[serde(default)]
+    prompt_index: Option<u64>,
+    #[serde(default)]
+    group_index: Option<usize>,
+    #[serde(default)]
+    rank: Option<usize>,
+    #[serde(default)]
+    world_size: Option<usize>,
+    #[serde(default)]
+    completion_len_tokens: Option<usize>,
+    #[serde(default)]
+    source_id: Option<String>,
+    #[serde(default)]
+    metadata: Option<serde_json::Value>,
+    #[serde(default)]
+    reward_metadata: Option<serde_json::Value>,
+}
+
+#[derive(Debug)]
+struct TrimulScoreInput {
+    completion: String,
+    source_id: String,
+    source_index: usize,
+    step: u64,
+    prompt_index: u64,
+    group_index: usize,
+    rank: usize,
+    world_size: usize,
+    completion_len_tokens: Option<usize>,
+    metadata: Option<serde_json::Value>,
+    reward_metadata: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+struct TrimulScoreRecord {
+    task: &'static str,
+    score_scheme: &'static str,
+    run_id: String,
+    step: u64,
+    rank: usize,
+    world_size: usize,
+    prompt_index: u64,
+    group_index: usize,
+    reward: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reward_diagnostic: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reward_metadata: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_metadata: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_reward_metadata: Option<serde_json::Value>,
+    completion_len_tokens: Option<usize>,
+    completion_len_bytes: usize,
+    completion_sha256: String,
+    completion: String,
+    external_score: TrimulExternalScoreMetadata,
+}
+
+#[derive(Debug, Serialize)]
+struct TrimulExternalScoreMetadata {
+    model_family: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    checkpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tokenizer: Option<String>,
+    prompt_sha256: String,
+    run_config_sha256: String,
+    source_id: String,
+    source_index: usize,
+    score_secret_seed: u64,
+    used_training_secret_seed: bool,
 }
 
 /// Arguments for `ferrl runreport`.
@@ -954,6 +1096,293 @@ fn trimul_baseline(args: &TrimulBaselineArgs) -> Result<(), CliError> {
     );
     eprintln!("ferrl: paste the above into your run config's trimul.baseline");
     Ok(())
+}
+
+/// Dispatch `ferrl trimul-score`: score raw external completions with TriMul's
+/// shaped reward and persist external-score JSONL for rollout diagnostics.
+fn trimul_score(args: &TrimulScoreArgs) -> Result<(), CliError> {
+    let _ = ferrl::init_tracing();
+    let config_bytes = read_bytes(&args.config)?;
+    let cfg = parse_run_config(&args.config, &config_bytes)?;
+    if cfg.task != "trimul" {
+        return Err(CliError::msg(
+            "trimul-score requires a config with task \"trimul\"",
+        ));
+    }
+    if args.score_secret_seed == cfg.trimul.secret_seed {
+        return Err(CliError::msg(
+            "trimul-score requires --score-secret-seed to differ from trimul.secret_seed",
+        ));
+    }
+    let prompt_bytes = read_verified_prompt_copy(&args.prompt_copy)?;
+    let prompt_sha256 = sha256_hex(&prompt_bytes);
+    let config_sha256 = sha256_hex(&config_bytes);
+    let inputs = read_trimul_score_inputs(args)?;
+    if inputs.is_empty() {
+        return Err(CliError::msg(
+            "trimul-score requires at least one --completion or --completions-jsonl row",
+        ));
+    }
+    validate_trimul_score_inputs(&inputs)?;
+
+    let reward = cfg
+        .build_trimul_reward()?
+        .with_secret_seed(args.score_secret_seed);
+    let sample = Sample::new(String::new(), ());
+    let completions: Vec<String> = inputs.iter().map(|i| i.completion.clone()).collect();
+    let outcomes = reward
+        .reward_group_detailed(&sample, &completions)
+        .map_err(|e| CliError::msg(format!("trimul scoring failed: {e}")))?;
+    if outcomes.len() != inputs.len() {
+        return Err(CliError::msg(format!(
+            "trimul scoring returned {} outcomes for {} completions",
+            outcomes.len(),
+            inputs.len()
+        )));
+    }
+
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&args.out)
+        .map_err(|source| CliError::Io {
+            path: args.out.clone(),
+            source,
+        })?;
+
+    let mut diagnostics = BTreeMap::<String, usize>::new();
+    let mut positive = 0usize;
+    let mut max_reward = f32::NEG_INFINITY;
+    for (input, outcome) in inputs.iter().zip(outcomes.iter()) {
+        if outcome.reward > 0.0 {
+            positive += 1;
+        }
+        max_reward = max_reward.max(outcome.reward);
+        if let Some(diagnostic) = &outcome.diagnostic {
+            *diagnostics.entry(diagnostic.clone()).or_default() += 1;
+        }
+
+        let record = trimul_score_record(
+            args,
+            input,
+            outcome.reward,
+            outcome.diagnostic.clone(),
+            outcome.metadata.clone(),
+            &prompt_sha256,
+            &config_sha256,
+        );
+        let line = serde_json::to_string(&record)
+            .map_err(|e| CliError::msg(format!("serialize trimul score row: {e}")))?;
+        file.write_all(line.as_bytes())
+            .and_then(|()| file.write_all(b"\n"))
+            .map_err(|source| CliError::Io {
+                path: args.out.clone(),
+                source,
+            })?;
+    }
+    file.flush().map_err(|source| CliError::Io {
+        path: args.out.clone(),
+        source,
+    })?;
+
+    println!(
+        "ferrl: scored {} TriMul completions -> {}",
+        inputs.len(),
+        args.out.display()
+    );
+    println!("ferrl: positives {positive}/{}", inputs.len());
+    if max_reward.is_finite() {
+        println!("ferrl: max_reward {max_reward}");
+    }
+    if !diagnostics.is_empty() {
+        println!(
+            "ferrl: diagnostics {}",
+            serde_json::to_string(&diagnostics).unwrap_or_else(|_| "<unserializable>".to_string())
+        );
+    }
+    Ok(())
+}
+
+fn read_trimul_score_inputs(args: &TrimulScoreArgs) -> Result<Vec<TrimulScoreInput>, CliError> {
+    validate_public_source_id("--source-label", &args.source_label)?;
+    let mut inputs = Vec::new();
+    for path in &args.completion {
+        let bytes = read_bytes(path)?;
+        let completion = String::from_utf8(bytes).map_err(|e| {
+            CliError::msg(format!(
+                "completion file {} is not valid UTF-8: {e}",
+                path.display()
+            ))
+        })?;
+        let source_index = inputs.len();
+        inputs.push(TrimulScoreInput {
+            completion,
+            source_id: default_trimul_score_source_id(
+                &args.source_label,
+                "completion",
+                source_index,
+            ),
+            source_index,
+            step: args.step,
+            prompt_index: args.prompt_index,
+            group_index: source_index,
+            rank: args.rank,
+            world_size: args.world_size,
+            completion_len_tokens: None,
+            metadata: None,
+            reward_metadata: None,
+        });
+    }
+    for (jsonl_index, path) in args.completions_jsonl.iter().enumerate() {
+        let raw = std::fs::read_to_string(path).map_err(|source| CliError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        for (line_index, line) in raw.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let record: TrimulScoreJsonlRecord = serde_json::from_str(line).map_err(|e| {
+                CliError::msg(format!(
+                    "parse {} line {} as trimul-score JSONL: {e}",
+                    path.display(),
+                    line_index + 1
+                ))
+            })?;
+            let source_index = inputs.len();
+            let source_id = match record.source_id {
+                Some(source_id) => {
+                    validate_public_source_id("trimul-score JSONL source_id", &source_id)?;
+                    source_id
+                }
+                None => default_trimul_score_jsonl_source_id(
+                    &args.source_label,
+                    jsonl_index,
+                    line_index + 1,
+                ),
+            };
+            inputs.push(TrimulScoreInput {
+                completion: record.completion,
+                source_id,
+                source_index,
+                step: record.step.unwrap_or(args.step),
+                prompt_index: record.prompt_index.unwrap_or(args.prompt_index),
+                group_index: record.group_index.unwrap_or(source_index),
+                rank: record.rank.unwrap_or(args.rank),
+                world_size: record.world_size.unwrap_or(args.world_size),
+                completion_len_tokens: record.completion_len_tokens,
+                metadata: record.metadata,
+                reward_metadata: record.reward_metadata,
+            });
+        }
+    }
+    Ok(inputs)
+}
+
+fn validate_trimul_score_inputs(inputs: &[TrimulScoreInput]) -> Result<(), CliError> {
+    for input in inputs {
+        if input.world_size == 0 {
+            return Err(CliError::msg(format!(
+                "trimul-score input {} has world_size = 0",
+                input.source_id
+            )));
+        }
+        if input.rank >= input.world_size {
+            return Err(CliError::msg(format!(
+                "trimul-score input {} has rank {} outside world_size {}",
+                input.source_id, input.rank, input.world_size
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_public_source_id(label: &str, value: &str) -> Result<(), CliError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(CliError::msg(format!("{label} must not be empty")));
+    }
+    if trimmed != value {
+        return Err(CliError::msg(format!(
+            "{label} must not have leading or trailing whitespace"
+        )));
+    }
+    if value.len() > 128 {
+        return Err(CliError::msg(format!("{label} must be at most 128 bytes")));
+    }
+    if value.contains('/') || value.contains('\\') || value.contains("..") {
+        return Err(CliError::msg(format!(
+            "{label} must be a public-safe id, not a filesystem path"
+        )));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(CliError::msg(format!(
+            "{label} must not contain control characters"
+        )));
+    }
+    Ok(())
+}
+
+fn default_trimul_score_source_id(label: &str, kind: &str, index: usize) -> String {
+    format!("{label}:{kind}:{index}")
+}
+
+fn default_trimul_score_jsonl_source_id(label: &str, file_index: usize, line: usize) -> String {
+    format!("{label}:jsonl:{file_index}:line:{line}")
+}
+
+fn finite_score_reward(reward: f32) -> f32 {
+    if reward.is_finite() {
+        reward
+    } else if reward.is_nan() {
+        0.0
+    } else if reward.is_sign_positive() {
+        f32::MAX
+    } else {
+        f32::MIN
+    }
+}
+
+fn trimul_score_record(
+    args: &TrimulScoreArgs,
+    input: &TrimulScoreInput,
+    reward: f32,
+    reward_diagnostic: Option<String>,
+    reward_metadata: Option<serde_json::Value>,
+    prompt_sha256: &str,
+    config_sha256: &str,
+) -> TrimulScoreRecord {
+    let completion_sha256 = sha256_hex(input.completion.as_bytes());
+    TrimulScoreRecord {
+        task: "trimul",
+        score_scheme: "trimul_external_score_v1",
+        run_id: args.run_id.clone(),
+        step: input.step,
+        rank: input.rank,
+        world_size: input.world_size,
+        prompt_index: input.prompt_index,
+        group_index: input.group_index,
+        reward: finite_score_reward(reward),
+        reward_diagnostic,
+        reward_metadata,
+        input_metadata: input.metadata.clone(),
+        input_reward_metadata: input.reward_metadata.clone(),
+        completion_len_tokens: input.completion_len_tokens,
+        completion_len_bytes: input.completion.len(),
+        completion_sha256,
+        completion: input.completion.clone(),
+        external_score: TrimulExternalScoreMetadata {
+            model_family: args.model_family.clone(),
+            checkpoint: args.checkpoint.clone(),
+            tokenizer: args.tokenizer.clone(),
+            prompt_sha256: prompt_sha256.to_string(),
+            run_config_sha256: config_sha256.to_string(),
+            source_id: input.source_id.clone(),
+            source_index: input.source_index,
+            score_secret_seed: args.score_secret_seed,
+            used_training_secret_seed: false,
+        },
+    }
 }
 
 /// One clean artifact-verification run written under `verification/`.
@@ -2032,6 +2461,7 @@ fn main() -> ExitCode {
     let result = match &cli.cmd {
         Command::Train(args) => train(args).map(|()| ExitCode::SUCCESS),
         Command::TrimulBaseline(args) => trimul_baseline(args).map(|()| ExitCode::SUCCESS),
+        Command::TrimulScore(args) => trimul_score(args).map(|()| ExitCode::SUCCESS),
         Command::TrimulArtifact(args) => trimul_artifact(args).map(|()| ExitCode::SUCCESS),
         Command::Runreport(args) => runreport(args),
         Command::PerfGate(args) => perf_gate(args),
@@ -2048,6 +2478,99 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(tag: &str) -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path =
+                std::env::temp_dir().join(format!("ferrl-{tag}-{}-{nonce}", std::process::id()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn trimul_score_test_config(secret_seed: u64) -> String {
+        format!(
+            r#"{{
+                "task": "trimul",
+                "model_dir": "/m",
+                "trimul": {{
+                  "prompt_path": "/prompt.txt",
+                  "submission_extract_mode": "final_fence",
+                  "image": "/image.sif",
+                  "eval_dir": "/eval",
+                  "scratch_root": "/scratch",
+                  "secret_seed": {secret_seed}
+                }},
+                "trainer": {{ "steps": 1, "group_size": 2, "max_new_tokens": 8,
+                  "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
+                  "lr": 1e-5, "weight_decay": 0.0,
+                  "loss_type": "grpo", "scale_rewards": "group" }}
+            }}"#
+        )
+    }
+
+    fn trimul_score_args_for_test(dir: &Path) -> TrimulScoreArgs {
+        TrimulScoreArgs {
+            config: dir.join("run.json"),
+            prompt_copy: dir.join("prompt.txt"),
+            completion: Vec::new(),
+            completions_jsonl: Vec::new(),
+            out: dir.join("scores.jsonl"),
+            score_secret_seed: 999,
+            run_id: "test-run".to_string(),
+            source_label: "public-batch".to_string(),
+            step: 9,
+            prompt_index: 8,
+            rank: 2,
+            world_size: 3,
+            model_family: "gemma4".to_string(),
+            checkpoint: None,
+            tokenizer: None,
+        }
+    }
+
+    fn trimul_score_input_for_test(
+        source_id: &str,
+        rank: usize,
+        world_size: usize,
+    ) -> TrimulScoreInput {
+        TrimulScoreInput {
+            completion: "completion".to_string(),
+            source_id: source_id.to_string(),
+            source_index: 0,
+            step: 0,
+            prompt_index: 0,
+            group_index: 0,
+            rank,
+            world_size,
+            completion_len_tokens: None,
+            metadata: None,
+            reward_metadata: None,
+        }
+    }
+
+    fn write_prompt_copy(dir: &Path, prompt: &[u8], hash: &str) -> PathBuf {
+        let prompt_path = dir.join("prompt.txt");
+        std::fs::write(&prompt_path, prompt).unwrap();
+        std::fs::write(dir.join("prompt.sha256"), format!("{hash}\n")).unwrap();
+        prompt_path
+    }
 
     /// A minimal countdown run config parses with sensible defaults.
     #[test]
@@ -2132,14 +2655,214 @@ mod tests {
         );
     }
 
-    /// The clap surface parses every subcommand.
+    /// The clap surface parses the train and TriMul baseline subcommands.
     #[test]
-    fn clap_parses_subcommands() {
+    fn clap_parses_train_and_trimul_baseline() {
         let c = Cli::try_parse_from(["ferrl", "train", "--config", "run.json"]).unwrap();
         assert!(matches!(c.cmd, Command::Train(_)));
         // The `TrimulBaseline` variant renders as the `trimul-baseline` subcommand.
         let b = Cli::try_parse_from(["ferrl", "trimul-baseline", "--config", "run.json"]).unwrap();
         assert!(matches!(b.cmd, Command::TrimulBaseline(_)));
+    }
+
+    /// The clap surface parses the TriMul external scoring subcommand.
+    #[test]
+    fn clap_parses_trimul_score() {
+        let s = Cli::try_parse_from([
+            "ferrl",
+            "trimul-score",
+            "--config",
+            "run.json",
+            "--prompt-copy",
+            "runs/trimul-1/prompt.txt",
+            "--completion",
+            "raw.txt",
+            "--out",
+            "scores.jsonl",
+            "--score-secret-seed",
+            "424399",
+            "--run-id",
+            "gemma4-rollout",
+            "--model-family",
+            "gemma4",
+            "--source-label",
+            "gemma4-batch",
+        ])
+        .unwrap();
+        let Command::TrimulScore(a) = s.cmd else {
+            panic!("expected trimul-score");
+        };
+        let a = *a;
+        assert_eq!(
+            (
+                a.config,
+                a.prompt_copy,
+                a.completion,
+                a.out,
+                a.score_secret_seed,
+                a.run_id,
+                a.model_family,
+                a.source_label,
+            ),
+            (
+                PathBuf::from("run.json"),
+                PathBuf::from("runs/trimul-1/prompt.txt"),
+                vec![PathBuf::from("raw.txt")],
+                PathBuf::from("scores.jsonl"),
+                424399,
+                "gemma4-rollout".to_string(),
+                "gemma4".to_string(),
+                "gemma4-batch".to_string(),
+            )
+        );
+    }
+
+    #[test]
+    fn trimul_score_rejects_training_secret_seed_before_prompt_io() {
+        let tmp = TestDir::new("trimul-score-seed");
+        std::fs::write(tmp.path().join("run.json"), trimul_score_test_config(4242)).unwrap();
+        let mut args = trimul_score_args_for_test(tmp.path());
+        args.score_secret_seed = 4242;
+
+        let err = trimul_score(&args).unwrap_err().to_string();
+
+        assert!(err.contains("requires --score-secret-seed to differ"));
+    }
+
+    #[test]
+    fn trimul_score_verifies_prompt_copy_before_reading_inputs() {
+        let tmp = TestDir::new("trimul-score-prompt");
+        std::fs::write(tmp.path().join("run.json"), trimul_score_test_config(4242)).unwrap();
+        write_prompt_copy(tmp.path(), b"prompt", "0000");
+        let mut args = trimul_score_args_for_test(tmp.path());
+        args.score_secret_seed = 4243;
+
+        let err = trimul_score(&args).unwrap_err().to_string();
+
+        assert!(err.contains("prompt copy hash mismatch"));
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // compact table-style coverage for parsing defaults
+    fn trimul_score_jsonl_defaults_and_source_ids_are_public_safe() {
+        let tmp = TestDir::new("trimul-score-jsonl");
+        let raw_path = tmp.path().join("private-raw-completion.txt");
+        let jsonl_path = tmp.path().join("private-inputs.jsonl");
+        std::fs::write(&raw_path, "raw-completion").unwrap();
+        std::fs::write(
+            &jsonl_path,
+            concat!(
+                r#"{"completion":"row-one","completion_len_tokens":13,"metadata":{"kind":"defaulted"}}"#,
+                "\n",
+                r#"{"completion":"row-two","step":22,"prompt_index":3,"group_index":5,"rank":1,"world_size":2,"source_id":"public-row-2","reward_metadata":{"raw":true}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let mut args = trimul_score_args_for_test(tmp.path());
+        args.completion = vec![raw_path.clone()];
+        args.completions_jsonl = vec![jsonl_path];
+        args.source_label = "gemma4-public".to_string();
+
+        let inputs = read_trimul_score_inputs(&args).unwrap();
+        let observed: Vec<_> = inputs
+            .iter()
+            .map(|i| {
+                (
+                    i.source_id.as_str(),
+                    i.step,
+                    i.prompt_index,
+                    i.group_index,
+                    i.rank,
+                    i.world_size,
+                    i.completion_len_tokens,
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            observed,
+            vec![
+                ("gemma4-public:completion:0", 9, 8, 0, 2, 3, None),
+                ("gemma4-public:jsonl:0:line:1", 9, 8, 1, 2, 3, Some(13)),
+                ("public-row-2", 22, 3, 5, 1, 2, None),
+            ]
+        );
+        assert!(!inputs[0]
+            .source_id
+            .contains(raw_path.to_string_lossy().as_ref()));
+        assert_eq!(inputs[1].metadata.as_ref().unwrap()["kind"], "defaulted");
+        assert_eq!(inputs[2].reward_metadata.as_ref().unwrap()["raw"], true);
+    }
+
+    #[test]
+    fn trimul_score_rejects_path_like_source_ids() {
+        let tmp = TestDir::new("trimul-score-source-id");
+        let jsonl_path = tmp.path().join("inputs.jsonl");
+        std::fs::write(
+            &jsonl_path,
+            r#"{"completion":"row","source_id":"/private/path/completion.txt"}"#,
+        )
+        .unwrap();
+        let mut args = trimul_score_args_for_test(tmp.path());
+        args.completions_jsonl = vec![jsonl_path];
+
+        let err = read_trimul_score_inputs(&args).unwrap_err().to_string();
+
+        assert!(err.contains("public-safe id"));
+    }
+
+    #[test]
+    fn trimul_score_validates_rank_world_coordinates() {
+        let zero_world = vec![trimul_score_input_for_test("candidate-0", 0, 0)];
+        let bad_rank = vec![trimul_score_input_for_test("candidate-1", 2, 2)];
+
+        let err_zero = validate_trimul_score_inputs(&zero_world)
+            .unwrap_err()
+            .to_string();
+        let err_rank = validate_trimul_score_inputs(&bad_rank)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err_zero.contains("world_size = 0") && err_rank.contains("rank 2 outside world_size 2")
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // validates the public JSON row shape in one place
+    fn trimul_score_record_serializes_external_provenance_without_paths() {
+        let tmp = TestDir::new("trimul-score-record");
+        let args = trimul_score_args_for_test(tmp.path());
+        let mut input = trimul_score_input_for_test("public-source-7", 1, 4);
+        input.source_index = 7;
+        input.completion = "abc".to_string();
+        input.completion_len_tokens = Some(3);
+        input.metadata = Some(serde_json::json!({"input": "meta"}));
+        let record = trimul_score_record(
+            &args,
+            &input,
+            f32::NAN,
+            Some("trimul:no_code".to_string()),
+            Some(serde_json::json!({"reward_scheme": "trimul_shaped_v1"})),
+            "prompt-hash",
+            "config-hash",
+        );
+
+        let row = serde_json::to_value(record).unwrap();
+
+        assert_eq!(row["reward"], 0.0);
+        assert_eq!(row["reward_metadata"]["reward_scheme"], "trimul_shaped_v1");
+        assert_eq!(row["input_metadata"]["input"], "meta");
+        assert_eq!(row["completion_sha256"], sha256_hex(b"abc"));
+        assert_eq!(row["external_score"]["source_id"], "public-source-7");
+        assert_eq!(row["external_score"]["source_index"], 7);
+        assert!(row["external_score"].get("source").is_none());
+    }
+
+    /// The clap surface parses the run-report subcommand.
+    #[test]
+    fn clap_parses_runreport() {
         let r =
             Cli::try_parse_from(["ferrl", "runreport", "runs/x", "--json", "--strict"]).unwrap();
         match r.cmd {
