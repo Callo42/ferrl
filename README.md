@@ -211,9 +211,13 @@ For rollout-only diagnostics from an external inference runtime, use
 reward and persist external-score JSONL. The scoring seed must differ from the
 training `trimul.secret_seed`. `trimul-score` records opaque `source_id` values,
 not input file paths; use `--source-label <public-id>` or JSONL `source_id` values
-that are safe to copy into public reports. Then run `ferrl trimul-artifact` only
-on promising extracted candidates; `trimul-score` is diagnostic evidence, not
-the strict artifact gate.
+that are safe to copy into public reports. The default completion contract is strict:
+ferrl scores exactly the completion bytes supplied. For GGUF rollouts served through
+llama.cpp, pass `--completion-normalization llama-cpp` to `trimul-score` and
+`trimul-artifact`; this strips only llama.cpp's trailing `[end of text]` stdout
+sentinel before extraction and records raw and normalized hashes in the score/artifact
+metadata. Then run `ferrl trimul-artifact` only on promising extracted candidates;
+`trimul-score` is diagnostic evidence, not the strict artifact gate.
 Verifier-backed rewards may also attach `reward_diagnostic` to candidate rows so
 low or zero rewards remain explainable without re-running the whole training step; for
 reward-tail triage, set `candidate_log_top_k` at least as high as `group_size` so every
