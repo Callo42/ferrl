@@ -30,6 +30,19 @@ trimul-artifact --config <run.json> --prompt-copy <run-dir>/prompt.txt
 prompt copy, and repeated `--baseline-ns` values. Artifact extraction verifies
 that `--prompt-copy` matches the adjacent launch-time `prompt.sha256`.
 
+For rollout-only diagnostics from an external inference runtime, use `ferrl
+trimul-score --config <run.json> --prompt-copy <prompt.txt> --completion <raw.txt>
+--out <scores.jsonl> --score-secret-seed <seed>` or pass `--completions-jsonl
+<jsonl>`. The scoring seed must differ from the training `trimul.secret_seed`.
+The JSONL input rows must contain `completion` and may include `step`,
+`prompt_index`, `group_index`, `rank`, `world_size`, `completion_len_tokens`,
+`metadata`, and `reward_metadata`; `world_size` must be nonzero and `rank` must be
+inside it. The output is external-score JSONL with the shaped reward, reward
+diagnostic, top-level TriMul reward metadata, prompt/config hashes, completion
+hash, and namespaced external rollout provenance. `trimul-score` is a
+search-quality diagnostic for comparing external rollouts; it does not replace
+`trimul-artifact` and cannot by itself satisfy the artifact acceptance rule.
+
 For prompt-controlled runs, `trimul.prompt_path` is only the mutable launch-time
 path for the complete rendered model prompt. Do not use that local path as artifact
 provenance: it may change and may expose private filesystem layout. `ferrl train`
