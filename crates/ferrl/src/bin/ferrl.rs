@@ -126,7 +126,7 @@ struct TrimulScoreArgs {
     /// JSONL file containing objects with at least `{ "completion": "..." }`.
     ///
     /// Optional fields are `step`, `prompt_index`, `group_index`, `rank`, `world_size`,
-    /// `completion_len_tokens`, `metadata`, and `reward_metadata`.
+    /// `completion_len_tokens`, `source_id`, `metadata`, and `reward_metadata`.
     #[arg(long)]
     completions_jsonl: Vec<PathBuf>,
     /// Output external-score JSONL file. Fails if it already exists.
@@ -138,6 +138,9 @@ struct TrimulScoreArgs {
     /// External rollout id recorded in score metadata.
     #[arg(long, default_value = "external-rollout")]
     run_id: String,
+    /// Public-safe label used to form opaque source ids for input files.
+    #[arg(long, default_value = "external")]
+    source_label: String,
     /// Default candidate step for raw completion files.
     #[arg(long, default_value_t = 0)]
     step: u64,
@@ -255,6 +258,8 @@ struct TrimulScoreJsonlRecord {
     #[serde(default)]
     completion_len_tokens: Option<usize>,
     #[serde(default)]
+    source_id: Option<String>,
+    #[serde(default)]
     metadata: Option<serde_json::Value>,
     #[serde(default)]
     reward_metadata: Option<serde_json::Value>,
@@ -263,7 +268,7 @@ struct TrimulScoreJsonlRecord {
 #[derive(Debug)]
 struct TrimulScoreInput {
     completion: String,
-    source: String,
+    source_id: String,
     source_index: usize,
     step: u64,
     prompt_index: u64,
@@ -310,7 +315,7 @@ struct TrimulExternalScoreMetadata {
     tokenizer: Option<String>,
     prompt_sha256: String,
     run_config_sha256: String,
-    source: String,
+    source_id: String,
     source_index: usize,
     score_secret_seed: u64,
     used_training_secret_seed: bool,
@@ -1199,6 +1204,7 @@ fn trimul_score(args: &TrimulScoreArgs) -> Result<(), CliError> {
 }
 
 fn read_trimul_score_inputs(args: &TrimulScoreArgs) -> Result<Vec<TrimulScoreInput>, CliError> {
+    validate_public_source_id("--source-label", &args.source_label)?;
     let mut inputs = Vec::new();
     for path in &args.completion {
         let bytes = read_bytes(path)?;
@@ -1208,13 +1214,18 @@ fn read_trimul_score_inputs(args: &TrimulScoreArgs) -> Result<Vec<TrimulScoreInp
                 path.display()
             ))
         })?;
+        let source_index = inputs.len();
         inputs.push(TrimulScoreInput {
             completion,
-            source: path.display().to_string(),
-            source_index: inputs.len(),
+            source_id: default_trimul_score_source_id(
+                &args.source_label,
+                "completion",
+                source_index,
+            ),
+            source_index,
             step: args.step,
             prompt_index: args.prompt_index,
-            group_index: inputs.len(),
+            group_index: source_index,
             rank: args.rank,
             world_size: args.world_size,
             completion_len_tokens: None,
@@ -1222,7 +1233,7 @@ fn read_trimul_score_inputs(args: &TrimulScoreArgs) -> Result<Vec<TrimulScoreInp
             reward_metadata: None,
         });
     }
-    for path in &args.completions_jsonl {
+    for (jsonl_index, path) in args.completions_jsonl.iter().enumerate() {
         let raw = std::fs::read_to_string(path).map_err(|source| CliError::Io {
             path: path.clone(),
             source,
@@ -1238,13 +1249,25 @@ fn read_trimul_score_inputs(args: &TrimulScoreArgs) -> Result<Vec<TrimulScoreInp
                     line_index + 1
                 ))
             })?;
+            let source_index = inputs.len();
+            let source_id = match record.source_id {
+                Some(source_id) => {
+                    validate_public_source_id("trimul-score JSONL source_id", &source_id)?;
+                    source_id
+                }
+                None => default_trimul_score_jsonl_source_id(
+                    &args.source_label,
+                    jsonl_index,
+                    line_index + 1,
+                ),
+            };
             inputs.push(TrimulScoreInput {
                 completion: record.completion,
-                source: format!("{}:{}", path.display(), line_index + 1),
-                source_index: inputs.len(),
+                source_id,
+                source_index,
                 step: record.step.unwrap_or(args.step),
                 prompt_index: record.prompt_index.unwrap_or(args.prompt_index),
-                group_index: record.group_index.unwrap_or(inputs.len()),
+                group_index: record.group_index.unwrap_or(source_index),
                 rank: record.rank.unwrap_or(args.rank),
                 world_size: record.world_size.unwrap_or(args.world_size),
                 completion_len_tokens: record.completion_len_tokens,
@@ -1261,17 +1284,51 @@ fn validate_trimul_score_inputs(inputs: &[TrimulScoreInput]) -> Result<(), CliEr
         if input.world_size == 0 {
             return Err(CliError::msg(format!(
                 "trimul-score input {} has world_size = 0",
-                input.source
+                input.source_id
             )));
         }
         if input.rank >= input.world_size {
             return Err(CliError::msg(format!(
                 "trimul-score input {} has rank {} outside world_size {}",
-                input.source, input.rank, input.world_size
+                input.source_id, input.rank, input.world_size
             )));
         }
     }
     Ok(())
+}
+
+fn validate_public_source_id(label: &str, value: &str) -> Result<(), CliError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(CliError::msg(format!("{label} must not be empty")));
+    }
+    if trimmed != value {
+        return Err(CliError::msg(format!(
+            "{label} must not have leading or trailing whitespace"
+        )));
+    }
+    if value.len() > 128 {
+        return Err(CliError::msg(format!("{label} must be at most 128 bytes")));
+    }
+    if value.contains('/') || value.contains('\\') || value.contains("..") {
+        return Err(CliError::msg(format!(
+            "{label} must be a public-safe id, not a filesystem path"
+        )));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(CliError::msg(format!(
+            "{label} must not contain control characters"
+        )));
+    }
+    Ok(())
+}
+
+fn default_trimul_score_source_id(label: &str, kind: &str, index: usize) -> String {
+    format!("{label}:{kind}:{index}")
+}
+
+fn default_trimul_score_jsonl_source_id(label: &str, file_index: usize, line: usize) -> String {
+    format!("{label}:jsonl:{file_index}:line:{line}")
 }
 
 fn finite_score_reward(reward: f32) -> f32 {
@@ -1320,7 +1377,7 @@ fn trimul_score_record(
             tokenizer: args.tokenizer.clone(),
             prompt_sha256: prompt_sha256.to_string(),
             run_config_sha256: config_sha256.to_string(),
-            source: input.source.clone(),
+            source_id: input.source_id.clone(),
             source_index: input.source_index,
             score_secret_seed: args.score_secret_seed,
             used_training_secret_seed: false,
@@ -2422,6 +2479,99 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
 
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(tag: &str) -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path =
+                std::env::temp_dir().join(format!("ferrl-{tag}-{}-{nonce}", std::process::id()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn trimul_score_test_config(secret_seed: u64) -> String {
+        format!(
+            r#"{{
+                "task": "trimul",
+                "model_dir": "/m",
+                "trimul": {{
+                  "prompt_path": "/prompt.txt",
+                  "submission_extract_mode": "final_fence",
+                  "image": "/image.sif",
+                  "eval_dir": "/eval",
+                  "scratch_root": "/scratch",
+                  "secret_seed": {secret_seed}
+                }},
+                "trainer": {{ "steps": 1, "group_size": 2, "max_new_tokens": 8,
+                  "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
+                  "lr": 1e-5, "weight_decay": 0.0,
+                  "loss_type": "grpo", "scale_rewards": "group" }}
+            }}"#
+        )
+    }
+
+    fn trimul_score_args_for_test(dir: &Path) -> TrimulScoreArgs {
+        TrimulScoreArgs {
+            config: dir.join("run.json"),
+            prompt_copy: dir.join("prompt.txt"),
+            completion: Vec::new(),
+            completions_jsonl: Vec::new(),
+            out: dir.join("scores.jsonl"),
+            score_secret_seed: 999,
+            run_id: "test-run".to_string(),
+            source_label: "public-batch".to_string(),
+            step: 9,
+            prompt_index: 8,
+            rank: 2,
+            world_size: 3,
+            model_family: "gemma4".to_string(),
+            checkpoint: None,
+            tokenizer: None,
+        }
+    }
+
+    fn trimul_score_input_for_test(
+        source_id: &str,
+        rank: usize,
+        world_size: usize,
+    ) -> TrimulScoreInput {
+        TrimulScoreInput {
+            completion: "completion".to_string(),
+            source_id: source_id.to_string(),
+            source_index: 0,
+            step: 0,
+            prompt_index: 0,
+            group_index: 0,
+            rank,
+            world_size,
+            completion_len_tokens: None,
+            metadata: None,
+            reward_metadata: None,
+        }
+    }
+
+    fn write_prompt_copy(dir: &Path, prompt: &[u8], hash: &str) -> PathBuf {
+        let prompt_path = dir.join("prompt.txt");
+        std::fs::write(&prompt_path, prompt).unwrap();
+        std::fs::write(dir.join("prompt.sha256"), format!("{hash}\n")).unwrap();
+        prompt_path
+    }
+
     /// A minimal countdown run config parses with sensible defaults.
     #[test]
     #[allow(clippy::cognitive_complexity)] // assertion-heavy test: many small checks, no real branching
@@ -2535,6 +2685,8 @@ mod tests {
             "gemma4-rollout",
             "--model-family",
             "gemma4",
+            "--source-label",
+            "gemma4-batch",
         ])
         .unwrap();
         let Command::TrimulScore(a) = s.cmd else {
@@ -2550,6 +2702,7 @@ mod tests {
                 a.score_secret_seed,
                 a.run_id,
                 a.model_family,
+                a.source_label,
             ),
             (
                 PathBuf::from("run.json"),
@@ -2559,8 +2712,152 @@ mod tests {
                 424399,
                 "gemma4-rollout".to_string(),
                 "gemma4".to_string(),
+                "gemma4-batch".to_string(),
             )
         );
+    }
+
+    #[test]
+    fn trimul_score_rejects_training_secret_seed_before_prompt_io() {
+        let tmp = TestDir::new("trimul-score-seed");
+        std::fs::write(tmp.path().join("run.json"), trimul_score_test_config(4242)).unwrap();
+        let mut args = trimul_score_args_for_test(tmp.path());
+        args.score_secret_seed = 4242;
+
+        let err = trimul_score(&args).unwrap_err().to_string();
+
+        assert!(err.contains("requires --score-secret-seed to differ"));
+    }
+
+    #[test]
+    fn trimul_score_verifies_prompt_copy_before_reading_inputs() {
+        let tmp = TestDir::new("trimul-score-prompt");
+        std::fs::write(tmp.path().join("run.json"), trimul_score_test_config(4242)).unwrap();
+        write_prompt_copy(tmp.path(), b"prompt", "0000");
+        let mut args = trimul_score_args_for_test(tmp.path());
+        args.score_secret_seed = 4243;
+
+        let err = trimul_score(&args).unwrap_err().to_string();
+
+        assert!(err.contains("prompt copy hash mismatch"));
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // compact table-style coverage for parsing defaults
+    fn trimul_score_jsonl_defaults_and_source_ids_are_public_safe() {
+        let tmp = TestDir::new("trimul-score-jsonl");
+        let raw_path = tmp.path().join("private-raw-completion.txt");
+        let jsonl_path = tmp.path().join("private-inputs.jsonl");
+        std::fs::write(&raw_path, "raw-completion").unwrap();
+        std::fs::write(
+            &jsonl_path,
+            concat!(
+                r#"{"completion":"row-one","completion_len_tokens":13,"metadata":{"kind":"defaulted"}}"#,
+                "\n",
+                r#"{"completion":"row-two","step":22,"prompt_index":3,"group_index":5,"rank":1,"world_size":2,"source_id":"public-row-2","reward_metadata":{"raw":true}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let mut args = trimul_score_args_for_test(tmp.path());
+        args.completion = vec![raw_path.clone()];
+        args.completions_jsonl = vec![jsonl_path];
+        args.source_label = "gemma4-public".to_string();
+
+        let inputs = read_trimul_score_inputs(&args).unwrap();
+        let observed: Vec<_> = inputs
+            .iter()
+            .map(|i| {
+                (
+                    i.source_id.as_str(),
+                    i.step,
+                    i.prompt_index,
+                    i.group_index,
+                    i.rank,
+                    i.world_size,
+                    i.completion_len_tokens,
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            observed,
+            vec![
+                ("gemma4-public:completion:0", 9, 8, 0, 2, 3, None),
+                ("gemma4-public:jsonl:0:line:1", 9, 8, 1, 2, 3, Some(13)),
+                ("public-row-2", 22, 3, 5, 1, 2, None),
+            ]
+        );
+        assert!(!inputs[0]
+            .source_id
+            .contains(raw_path.to_string_lossy().as_ref()));
+        assert_eq!(inputs[1].metadata.as_ref().unwrap()["kind"], "defaulted");
+        assert_eq!(inputs[2].reward_metadata.as_ref().unwrap()["raw"], true);
+    }
+
+    #[test]
+    fn trimul_score_rejects_path_like_source_ids() {
+        let tmp = TestDir::new("trimul-score-source-id");
+        let jsonl_path = tmp.path().join("inputs.jsonl");
+        std::fs::write(
+            &jsonl_path,
+            r#"{"completion":"row","source_id":"/private/path/completion.txt"}"#,
+        )
+        .unwrap();
+        let mut args = trimul_score_args_for_test(tmp.path());
+        args.completions_jsonl = vec![jsonl_path];
+
+        let err = read_trimul_score_inputs(&args).unwrap_err().to_string();
+
+        assert!(err.contains("public-safe id"));
+    }
+
+    #[test]
+    fn trimul_score_validates_rank_world_coordinates() {
+        let zero_world = vec![trimul_score_input_for_test("candidate-0", 0, 0)];
+        let bad_rank = vec![trimul_score_input_for_test("candidate-1", 2, 2)];
+
+        let err_zero = validate_trimul_score_inputs(&zero_world)
+            .unwrap_err()
+            .to_string();
+        let err_rank = validate_trimul_score_inputs(&bad_rank)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err_zero.contains("world_size = 0") && err_rank.contains("rank 2 outside world_size 2")
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // validates the public JSON row shape in one place
+    fn trimul_score_record_serializes_external_provenance_without_paths() {
+        let tmp = TestDir::new("trimul-score-record");
+        let args = trimul_score_args_for_test(tmp.path());
+        let mut input = trimul_score_input_for_test("public-source-7", 1, 4);
+        input.source_index = 7;
+        input.completion = "abc".to_string();
+        input.completion_len_tokens = Some(3);
+        input.metadata = Some(serde_json::json!({"input": "meta"}));
+        let record = trimul_score_record(
+            &args,
+            &input,
+            f32::NAN,
+            Some("trimul:no_code".to_string()),
+            Some(serde_json::json!({"reward_scheme": "trimul_shaped_v1"})),
+            "prompt-hash",
+            "config-hash",
+        );
+
+        let row = serde_json::to_value(record).unwrap();
+
+        assert_eq!(row["reward"], 0.0);
+        assert_eq!(row["reward_metadata"]["reward_scheme"], "trimul_shaped_v1");
+        assert_eq!(row["input_metadata"]["input"], "meta");
+        assert_eq!(row["completion_sha256"], sha256_hex(b"abc"));
+        assert_eq!(row["external_score"]["source_id"], "public-source-7");
+        assert_eq!(row["external_score"]["source_index"], 7);
+        assert!(row["external_score"].get("source").is_none());
     }
 
     /// The clap surface parses the run-report subcommand.

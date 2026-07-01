@@ -36,12 +36,15 @@ trimul-score --config <run.json> --prompt-copy <prompt.txt> --completion <raw.tx
 <jsonl>`. The scoring seed must differ from the training `trimul.secret_seed`.
 The JSONL input rows must contain `completion` and may include `step`,
 `prompt_index`, `group_index`, `rank`, `world_size`, `completion_len_tokens`,
-`metadata`, and `reward_metadata`; `world_size` must be nonzero and `rank` must be
-inside it. The output is external-score JSONL with the shaped reward, reward
-diagnostic, top-level TriMul reward metadata, prompt/config hashes, completion
-hash, and namespaced external rollout provenance. `trimul-score` is a
-search-quality diagnostic for comparing external rollouts; it does not replace
-`trimul-artifact` and cannot by itself satisfy the artifact acceptance rule.
+`source_id`, `metadata`, and `reward_metadata`; `world_size` must be nonzero and
+`rank` must be inside it. The output is external-score JSONL with the shaped
+reward, reward diagnostic, top-level TriMul reward metadata, prompt/config
+hashes, completion hash, opaque/public-safe `source_id`, and namespaced external
+rollout provenance. Input file paths are not persisted into diagnostic evidence;
+use `--source-label <public-id>` or row-level `source_id` values that are safe to
+copy into public reports. `trimul-score` is a search-quality diagnostic for
+comparing external rollouts; it does not replace `trimul-artifact` and cannot by
+itself satisfy the artifact acceptance rule.
 
 For prompt-controlled runs, `trimul.prompt_path` is only the mutable launch-time
 path for the complete rendered model prompt. Do not use that local path as artifact

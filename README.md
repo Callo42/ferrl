@@ -209,8 +209,11 @@ For rollout-only diagnostics from an external inference runtime, use
 --completion <raw.txt> --out <scores.jsonl> --score-secret-seed <seed>` (or
 `--completions-jsonl`) to score raw completions once with the same shaped TriMul
 reward and persist external-score JSONL. The scoring seed must differ from the
-training `trimul.secret_seed`. Then run `ferrl trimul-artifact` only on promising
-extracted candidates; `trimul-score` is diagnostic evidence, not the strict artifact gate.
+training `trimul.secret_seed`. `trimul-score` records opaque `source_id` values,
+not input file paths; use `--source-label <public-id>` or JSONL `source_id` values
+that are safe to copy into public reports. Then run `ferrl trimul-artifact` only
+on promising extracted candidates; `trimul-score` is diagnostic evidence, not
+the strict artifact gate.
 Verifier-backed rewards may also attach `reward_diagnostic` to candidate rows so
 low or zero rewards remain explainable without re-running the whole training step; for
 reward-tail triage, set `candidate_log_top_k` at least as high as `group_size` so every
