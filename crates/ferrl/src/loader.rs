@@ -87,7 +87,7 @@ pub enum LoaderError {
         /// The underlying IO error.
         source: std::io::Error,
     },
-    /// `config.json` could not be parsed into a Qwen3 [`Config`].
+    /// `config.json` could not be parsed into the selected model config.
     #[error("parse {path}: {source}")]
     Config {
         /// The config file that failed to parse.
@@ -402,6 +402,21 @@ fn load_qwen35_policy(
     Ok((policy, tok))
 }
 
+fn read_gemma4_config(dir: &Path) -> Result<Gemma4Config, LoaderError> {
+    let cfg_path = dir.join("config.json");
+    let cfg_bytes = std::fs::read(&cfg_path).map_err(|source| LoaderError::Io {
+        path: cfg_path.clone(),
+        source,
+    })?;
+    let cfg: Gemma4Config =
+        serde_json::from_slice(&cfg_bytes).map_err(|source| LoaderError::Config {
+            path: cfg_path,
+            source,
+        })?;
+    cfg.validate()?;
+    Ok(cfg)
+}
+
 /// Load a dense Gemma 4 text policy and its tokenizer from a checkpoint `dir`.
 ///
 /// The public Gemma 4 checkpoints are conditional-generation wrappers whose
@@ -427,7 +442,7 @@ pub fn load_gemma4_policy(
         });
     }
 
-    let cfg = Gemma4Config::from_json_file(dir.join("config.json"))?;
+    let cfg = read_gemma4_config(dir)?;
     let vb = gemma4_varbuilder_from_pretrained(dir, opts.base_dtype, device)?;
     let model = Gemma4GradModel::load_with_adapter_dtype(
         &cfg,
@@ -452,6 +467,27 @@ mod tests {
         match err {
             LoaderError::Io { path, .. } => assert!(path.ends_with("config.json")),
             other => panic!("expected Io error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gemma4_loader_missing_config_is_an_io_error_naming_the_path() {
+        let tmp = TempDir::new("loader-gemma4-missing-config");
+        let err = load_gemma4_policy(tmp.path(), &Device::Cpu, &LoaderOpts::default()).unwrap_err();
+        match err {
+            LoaderError::Io { path, .. } => assert!(path.ends_with("config.json")),
+            other => panic!("expected Io error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gemma4_loader_malformed_config_is_a_config_error() {
+        let tmp = TempDir::new("loader-gemma4-malformed-config");
+        std::fs::write(tmp.path().join("config.json"), "{ not json").unwrap();
+        let err = load_gemma4_policy(tmp.path(), &Device::Cpu, &LoaderOpts::default()).unwrap_err();
+        match err {
+            LoaderError::Config { path, .. } => assert!(path.ends_with("config.json")),
+            other => panic!("expected Config error, got {other:?}"),
         }
     }
 

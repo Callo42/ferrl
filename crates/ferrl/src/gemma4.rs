@@ -481,7 +481,17 @@ pub fn tensors_from_pretrained(
             .map_err(|e| candle_core::Error::Msg(format!("read {}: {e}", index_path.display())))?;
         let index: Index = serde_json::from_str(&raw)
             .map_err(|e| candle_core::Error::Msg(format!("parse {}: {e}", index_path.display())))?;
-        let mut names: Vec<String> = index.weight_map.into_values().collect();
+        let mut names: Vec<String> = index
+            .weight_map
+            .into_iter()
+            .filter_map(|(tensor, shard)| is_gemma4_text_tensor(&tensor).then_some(shard))
+            .collect();
+        if names.is_empty() {
+            bail!(
+                "gemma4 loader: no {CKPT_PREFIX}.* tensors listed in {}",
+                index_path.display()
+            );
+        }
         names.sort();
         names.dedup();
         names.into_iter().map(|n| dir.join(n)).collect()
@@ -499,7 +509,19 @@ pub fn tensors_from_pretrained(
         let shard = candle_core::safetensors::load(&file, device)?;
         tensors.extend(shard);
     }
+    tensors.retain(|name, _| is_gemma4_text_tensor(name));
+    if tensors.is_empty() {
+        bail!(
+            "gemma4 loader: no {CKPT_PREFIX}.* tensors loaded from {}",
+            dir.display()
+        );
+    }
     Ok(tensors)
+}
+
+fn is_gemma4_text_tensor(name: &str) -> bool {
+    name.strip_prefix(CKPT_PREFIX)
+        .is_some_and(|suffix| suffix.starts_with('.'))
 }
 
 // ---------------------------------------------------------------------------
@@ -617,6 +639,26 @@ fn masks_at(
     Ok(Gemma4Masks { full, sliding })
 }
 
+fn merged_masks_at(
+    offset: usize,
+    chunk_len: usize,
+    dtype: DType,
+    device: &Device,
+) -> CandleResult<Gemma4Masks> {
+    let total = offset + chunk_len;
+    let full = if chunk_len == 1 {
+        None
+    } else {
+        Some(attention_mask_at(
+            offset, chunk_len, total, None, dtype, device,
+        )?)
+    };
+    Ok(Gemma4Masks {
+        full,
+        sliding: None,
+    })
+}
+
 fn attention_mask_at(
     offset: usize,
     chunk_len: usize,
@@ -625,12 +667,33 @@ fn attention_mask_at(
     dtype: DType,
     device: &Device,
 ) -> CandleResult<Tensor> {
-    let mut data = Vec::with_capacity(chunk_len * total_keys);
+    attention_mask_for_keys(
+        offset,
+        chunk_len,
+        0,
+        total_keys,
+        sliding_window,
+        dtype,
+        device,
+    )
+}
+
+fn attention_mask_for_keys(
+    offset: usize,
+    chunk_len: usize,
+    key_start: usize,
+    key_len: usize,
+    sliding_window: Option<usize>,
+    dtype: DType,
+    device: &Device,
+) -> CandleResult<Tensor> {
+    let mut data = Vec::with_capacity(chunk_len * key_len);
     for i in 0..chunk_len {
         let q_abs = offset + i;
-        for j in 0..total_keys {
-            let causal = j <= q_abs;
-            let in_window = sliding_window.is_none_or(|w| q_abs.saturating_sub(j) < w);
+        for j in 0..key_len {
+            let k_abs = key_start + j;
+            let causal = k_abs <= q_abs;
+            let in_window = sliding_window.is_none_or(|w| q_abs.saturating_sub(k_abs) < w);
             data.push(if causal && in_window {
                 0f32
             } else {
@@ -638,7 +701,7 @@ fn attention_mask_at(
             });
         }
     }
-    Tensor::from_vec(data, (1, 1, chunk_len, total_keys), device)?.to_dtype(dtype)
+    Tensor::from_vec(data, (1, 1, chunk_len, key_len), device)?.to_dtype(dtype)
 }
 
 /// One Gemma 4 text attention block, supporting both local sliding-window and
@@ -1326,6 +1389,72 @@ impl GradModel for Gemma4GradModel {
 }
 
 #[derive(Debug)]
+struct Gemma4KvCache {
+    k: Option<Tensor>,
+    v: Option<Tensor>,
+    dim: usize,
+    max_retained: Option<usize>,
+    seen_len: usize,
+}
+
+impl Gemma4KvCache {
+    fn new(dim: usize, max_retained: Option<usize>) -> Self {
+        Self {
+            k: None,
+            v: None,
+            dim,
+            max_retained,
+            seen_len: 0,
+        }
+    }
+
+    fn current_seq_len(&self) -> usize {
+        self.seen_len
+    }
+
+    fn retained_seq_len(&self) -> usize {
+        self.k.as_ref().map_or(0, |k| k.dims()[self.dim])
+    }
+
+    fn append(&mut self, k: &Tensor, v: &Tensor) -> CandleResult<(Tensor, Tensor, usize)> {
+        let chunk_len = k.dim(self.dim)?;
+        let old_retained = self.retained_seq_len();
+        let key_start = self.seen_len.saturating_sub(old_retained);
+        let k = k.contiguous()?;
+        let v = v.contiguous()?;
+        let attn_k = match &self.k {
+            Some(prev) => Tensor::cat(&[prev, &k], self.dim)?,
+            None => k,
+        };
+        let attn_v = match &self.v {
+            Some(prev) => Tensor::cat(&[prev, &v], self.dim)?,
+            None => v,
+        };
+        self.seen_len += chunk_len;
+        let retained = attn_k.dim(self.dim)?;
+        let (store_k, store_v) = match self.max_retained {
+            Some(max) if retained > max => {
+                let start = retained - max;
+                (
+                    attn_k.narrow(self.dim, start, max)?.contiguous()?,
+                    attn_v.narrow(self.dim, start, max)?.contiguous()?,
+                )
+            }
+            _ => (attn_k.clone(), attn_v.clone()),
+        };
+        self.k = Some(store_k);
+        self.v = Some(store_v);
+        Ok((attn_k, attn_v, key_start))
+    }
+
+    fn reset(&mut self) {
+        self.k = None;
+        self.v = None;
+        self.seen_len = 0;
+    }
+}
+
+#[derive(Debug)]
 struct Gemma4MergedAttention {
     kind: Gemma4LayerType,
     q_weight: Tensor,
@@ -1340,11 +1469,12 @@ struct Gemma4MergedAttention {
     num_kv_groups: usize,
     head_dim: usize,
     attn_hidden: usize,
-    cache: ConcatKvCache,
+    cache: Gemma4KvCache,
 }
 
 impl Gemma4MergedAttention {
-    fn from_attention(a: &Gemma4Attention) -> CandleResult<Self> {
+    fn from_attention(a: &Gemma4Attention, sliding_window: usize) -> CandleResult<Self> {
+        let max_retained = (a.kind == Gemma4LayerType::SlidingAttention).then_some(sliding_window);
         Ok(Self {
             kind: a.kind,
             q_weight: a.q_proj.merged_weight()?,
@@ -1359,12 +1489,17 @@ impl Gemma4MergedAttention {
             num_kv_groups: a.num_kv_groups,
             head_dim: a.head_dim,
             attn_hidden: a.attn_hidden,
-            cache: ConcatKvCache::new(2),
+            cache: Gemma4KvCache::new(2, max_retained),
         })
     }
 
     fn current_seq_len(&self) -> usize {
         self.cache.current_seq_len()
+    }
+
+    #[cfg(test)]
+    fn retained_seq_len(&self) -> usize {
+        self.cache.retained_seq_len()
     }
 
     fn forward(
@@ -1390,7 +1525,21 @@ impl Gemma4MergedAttention {
         let v = self.v_norm.forward(&v)?.transpose(1, 2)?;
         let k = rot.apply(self.kind, &k.transpose(1, 2)?, offset, l)?;
         let q = rot.apply(self.kind, &q, offset, l)?;
-        let (k, v) = self.cache.append(&k.contiguous()?, &v.contiguous()?)?;
+        let (k, v, key_start) = self.cache.append(&k, &v)?;
+        let sliding_mask = if self.kind == Gemma4LayerType::SlidingAttention {
+            Some(attention_mask_for_keys(
+                offset,
+                l,
+                key_start,
+                k.dim(2)?,
+                self.cache.max_retained,
+                in_dtype,
+                x.device(),
+            )?)
+        } else {
+            None
+        };
+        let mask = sliding_mask.as_ref().or(mask);
         let k = repeat_kv(&k, self.num_kv_groups)?.contiguous()?;
         let v = repeat_kv(&v, self.num_kv_groups)?.contiguous()?;
         let mut scores = q.contiguous()?.matmul(&k.transpose(2, 3)?.contiguous()?)?;
@@ -1450,11 +1599,11 @@ struct Gemma4MergedLayer {
 }
 
 impl Gemma4MergedLayer {
-    fn from_layer(layer: &Gemma4Layer) -> CandleResult<Self> {
+    fn from_layer(layer: &Gemma4Layer, sliding_window: usize) -> CandleResult<Self> {
         Ok(Self {
             kind: layer.kind,
             input_layernorm: layer.input_layernorm.clone(),
-            attn: Gemma4MergedAttention::from_attention(&layer.attn)?,
+            attn: Gemma4MergedAttention::from_attention(&layer.attn, sliding_window)?,
             post_attention_layernorm: layer.post_attention_layernorm.clone(),
             pre_feedforward_layernorm: layer.pre_feedforward_layernorm.clone(),
             mlp: Gemma4MergedMlp::from_mlp(&layer.mlp)?,
@@ -1494,7 +1643,6 @@ pub struct Gemma4MergedDecoder {
     norm: RmsNorm,
     rot: Gemma4Rotary,
     hidden: usize,
-    sliding_window: usize,
     embed_scale: f64,
     final_logit_softcap: f64,
     device: Device,
@@ -1505,7 +1653,7 @@ impl Gemma4MergedDecoder {
     fn from_model(model: &Gemma4GradModel) -> CandleResult<Self> {
         let mut layers = Vec::with_capacity(model.layers.len());
         for layer in &model.layers {
-            layers.push(Gemma4MergedLayer::from_layer(layer)?);
+            layers.push(Gemma4MergedLayer::from_layer(layer, model.sliding_window)?);
         }
         Ok(Self {
             embed: model.embed.clone(),
@@ -1513,7 +1661,6 @@ impl Gemma4MergedDecoder {
             norm: model.norm.clone(),
             rot: model.rot.clone(),
             hidden: model.hidden,
-            sliding_window: model.sliding_window,
             embed_scale: model.embed_scale,
             final_logit_softcap: model.final_logit_softcap,
             device: model.device.clone(),
@@ -1544,7 +1691,7 @@ impl Gemma4MergedDecoder {
             .index_select(&ids, 0)?
             .reshape((b, l, self.hidden))?
             * self.embed_scale)?;
-        let masks = masks_at(offset, l, self.sliding_window, self.dtype, &self.device)?;
+        let masks = merged_masks_at(offset, l, self.dtype, &self.device)?;
         for layer in &mut self.layers {
             h = layer.forward(&h, offset, &masks, &self.rot)?;
         }
@@ -1793,6 +1940,17 @@ mod tests {
         .unwrap()
     }
 
+    fn unique_tmp(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "ferrl-gemma4-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
     fn ids(seq: usize) -> Tensor {
         let v: Vec<u32> = (0..seq as u32).map(|i| i % 7).collect();
         Tensor::from_vec(v, (1, seq), &dev()).unwrap()
@@ -1809,6 +1967,18 @@ mod tests {
             .unwrap()
             .to_scalar()
             .unwrap()
+    }
+
+    fn assert_merged_cache_lens(
+        dec: &Gemma4MergedDecoder,
+        seen: usize,
+        sliding_retained: usize,
+        full_retained: usize,
+    ) {
+        assert_eq!(dec.layers[0].attn.current_seq_len(), seen);
+        assert_eq!(dec.layers[0].attn.retained_seq_len(), sliding_retained);
+        assert_eq!(dec.layers[1].attn.current_seq_len(), seen);
+        assert_eq!(dec.layers[1].attn.retained_seq_len(), full_retained);
     }
 
     #[test]
@@ -1921,6 +2091,13 @@ mod tests {
             "armed Gemma 4 adapter must change the logits"
         );
 
+        let mut prefill = model.merged_decoder().unwrap();
+        let prefill_logits = prefill.forward(&input, 0).unwrap();
+        assert!(
+            max_abs_diff(&prefill_logits, &reference) <= 1e-3,
+            "Gemma 4 cached prefill diverged from uncached forward"
+        );
+
         let mut dec = model.merged_decoder().unwrap();
         let mut worst = 0f32;
         for t in 0..5 {
@@ -1932,6 +2109,130 @@ mod tests {
             worst <= 1e-3,
             "Gemma 4 cached decode diverged from uncached forward: {worst}"
         );
+    }
+
+    #[test]
+    fn merged_decoder_matches_uncached_multi_token_decode_after_prefill() {
+        let model = tiny_model();
+        arm_adapter(&model);
+        let input = ids(7);
+        let reference = model.forward(&input).unwrap();
+        let mut dec = model.merged_decoder().unwrap();
+
+        let prefix = input.narrow(1, 0, 4).unwrap();
+        let prefix_logits = dec.forward(&prefix, 0).unwrap();
+        assert!(
+            max_abs_diff(&prefix_logits, &reference.narrow(1, 0, 4).unwrap()) <= 1e-3,
+            "Gemma 4 cached prefill diverged before multi-token decode"
+        );
+        assert_merged_cache_lens(&dec, 4, 3, 4);
+
+        let chunk = input.narrow(1, 4, 2).unwrap();
+        let chunk_logits = dec.forward(&chunk, 4).unwrap();
+        assert!(
+            max_abs_diff(&chunk_logits, &reference.narrow(1, 4, 2).unwrap()) <= 1e-3,
+            "Gemma 4 cached multi-token decode diverged after prefill"
+        );
+        assert_merged_cache_lens(&dec, 6, 3, 6);
+    }
+
+    #[test]
+    fn merged_decoder_bounds_sliding_cache_without_changing_offsets() {
+        let model = tiny_model();
+        let mut dec = model.merged_decoder().unwrap();
+        let input = ids(5);
+        let _ = dec.forward(&input, 0).unwrap();
+        assert_merged_cache_lens(&dec, 5, 3, 5);
+
+        let tok = Tensor::from_vec(vec![1u32], (1, 1), &dev()).unwrap();
+        let _ = dec.forward(&tok, 5).unwrap();
+        assert_merged_cache_lens(&dec, 6, 3, 6);
+    }
+
+    #[test]
+    fn tensors_from_pretrained_ignores_non_text_shards_and_tensors() {
+        let cfg = tiny_cfg();
+        let mut map = weight_map(&cfg);
+        map.insert(
+            "model.vision.patch_embed.weight".to_string(),
+            Tensor::zeros((2, 2), DType::F32, &dev()).unwrap(),
+        );
+        let base = unique_tmp("loader");
+
+        let single = base.join("single");
+        std::fs::create_dir_all(&single).unwrap();
+        candle_core::safetensors::save(&map, single.join("model.safetensors")).unwrap();
+        let single_loaded = tensors_from_pretrained(&single, &dev()).unwrap();
+        assert!(single_loaded.keys().all(|name| is_gemma4_text_tensor(name)));
+
+        let sharded = base.join("sharded");
+        std::fs::create_dir_all(&sharded).unwrap();
+        let text_only: HashMap<String, Tensor> = map
+            .iter()
+            .filter(|(name, _)| is_gemma4_text_tensor(name))
+            .map(|(name, tensor)| (name.clone(), tensor.clone()))
+            .collect();
+        candle_core::safetensors::save(&text_only, sharded.join("text.safetensors")).unwrap();
+        let mut index_map: HashMap<String, String> = text_only
+            .keys()
+            .map(|name| (name.clone(), "text.safetensors".to_string()))
+            .collect();
+        index_map.insert(
+            "model.vision.patch_embed.weight".to_string(),
+            "missing-vision.safetensors".to_string(),
+        );
+        let index = serde_json::json!({ "metadata": {}, "weight_map": index_map });
+        std::fs::write(
+            sharded.join("model.safetensors.index.json"),
+            serde_json::to_string(&index).unwrap(),
+        )
+        .unwrap();
+        let sharded_loaded = tensors_from_pretrained(&sharded, &dev()).unwrap();
+        assert_eq!(sharded_loaded.len(), text_only.len());
+        assert!(sharded_loaded
+            .keys()
+            .all(|name| is_gemma4_text_tensor(name)));
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn tensors_from_pretrained_rejects_non_text_only_checkpoints() {
+        let base = unique_tmp("loader-empty");
+        let mut non_text: HashMap<String, Tensor> = HashMap::new();
+        non_text.insert(
+            "model.vision.patch_embed.weight".to_string(),
+            Tensor::zeros((2, 2), DType::F32, &dev()).unwrap(),
+        );
+
+        let single = base.join("single");
+        std::fs::create_dir_all(&single).unwrap();
+        candle_core::safetensors::save(&non_text, single.join("model.safetensors")).unwrap();
+        let err = tensors_from_pretrained(&single, &dev())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no model.language_model.* tensors loaded"));
+
+        let sharded = base.join("sharded");
+        std::fs::create_dir_all(&sharded).unwrap();
+        candle_core::safetensors::save(&non_text, sharded.join("vision.safetensors")).unwrap();
+        let index = serde_json::json!({
+            "metadata": {},
+            "weight_map": {
+                "model.vision.patch_embed.weight": "vision.safetensors"
+            }
+        });
+        std::fs::write(
+            sharded.join("model.safetensors.index.json"),
+            serde_json::to_string(&index).unwrap(),
+        )
+        .unwrap();
+        let err = tensors_from_pretrained(&sharded, &dev())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no model.language_model.* tensors listed"));
+
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
