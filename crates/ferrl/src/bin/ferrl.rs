@@ -5,6 +5,7 @@
 //! ferrl train --config run.json     # GRPO-train a built-in task (countdown | math | trimul)
 //! ferrl trimul-baseline --config run.json   # measure the TriMul reference baseline (ns) on this GPU
 //! ferrl trimul-score --config run.json --prompt-copy prompt.txt --completion raw.txt --out scores.jsonl
+//! ferrl trimul-score --config run.json --prompt-copy prompt.txt --completion raw.txt --completion-normalization llama-cpp --out scores.jsonl
 //! ferrl trimul-artifact --config run.json --prompt-copy runs/trimul-1/prompt.txt --completion raw.txt --out artifact/ ...
 //! ferrl runreport <run-dir> [--json] [--strict]   # one-glance run health summary
 //! ferrl perf-gate --baseline <run-dir> --candidate <run-dir>   # resource regression check
@@ -129,6 +130,13 @@ struct TrimulScoreArgs {
     /// `completion_len_tokens`, `source_id`, `metadata`, and `reward_metadata`.
     #[arg(long)]
     completions_jsonl: Vec<PathBuf>,
+    /// Normalize known external-runtime transport text before TriMul extraction.
+    ///
+    /// The default is strict: score the completion bytes exactly as supplied.
+    /// Use `llama-cpp` for GGUF rollouts whose stdout appends llama.cpp's
+    /// trailing `[end of text]` sentinel after the model response.
+    #[arg(long, value_enum, default_value = "none")]
+    completion_normalization: CompletionNormalization,
     /// Output external-score JSONL file. Fails if it already exists.
     #[arg(long)]
     out: PathBuf,
@@ -176,6 +184,13 @@ struct TrimulArtifactArgs {
     /// Raw model completion to extract `custom_kernel` from.
     #[arg(long)]
     completion: PathBuf,
+    /// Normalize known external-runtime transport text before TriMul extraction.
+    ///
+    /// The raw completion is still copied into the artifact bundle. When this is
+    /// not `none`, the normalized text used for extraction is also copied as
+    /// `completion.normalized.txt` and recorded in `manifest.json`.
+    #[arg(long, value_enum, default_value = "none")]
+    completion_normalization: CompletionNormalization,
     /// Output artifact directory. Fails if `manifest.json` already exists.
     #[arg(long)]
     out: PathBuf,
@@ -319,6 +334,39 @@ struct TrimulExternalScoreMetadata {
     source_index: usize,
     score_secret_seed: u64,
     used_training_secret_seed: bool,
+}
+
+/// Optional completion normalization before TriMul submission extraction.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, ValueEnum)]
+enum CompletionNormalization {
+    /// Strict mode: use completion bytes exactly as supplied.
+    #[default]
+    None,
+    /// Strip llama.cpp's trailing stdout transport sentinel.
+    LlamaCpp,
+}
+
+impl CompletionNormalization {
+    /// Stable spelling for metadata and docs.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::LlamaCpp => "llama_cpp",
+        }
+    }
+}
+
+/// A completion after optional public-runtime normalization.
+#[derive(Debug)]
+struct NormalizedCompletion {
+    /// Completion text used for extraction/scoring.
+    text: String,
+    /// SHA-256 of the raw completion bytes before normalization.
+    raw_sha256: String,
+    /// Length of the raw completion bytes before normalization.
+    raw_len_bytes: usize,
+    /// Whether normalization changed the completion text.
+    changed: bool,
 }
 
 /// Arguments for `ferrl runreport`.
@@ -1214,9 +1262,15 @@ fn read_trimul_score_inputs(args: &TrimulScoreArgs) -> Result<Vec<TrimulScoreInp
                 path.display()
             ))
         })?;
+        let completion = normalize_completion(&completion, args.completion_normalization);
         let source_index = inputs.len();
         inputs.push(TrimulScoreInput {
-            completion,
+            metadata: completion_normalization_metadata(
+                None,
+                args.completion_normalization,
+                &completion,
+            ),
+            completion: completion.text,
             source_id: default_trimul_score_source_id(
                 &args.source_label,
                 "completion",
@@ -1229,7 +1283,6 @@ fn read_trimul_score_inputs(args: &TrimulScoreArgs) -> Result<Vec<TrimulScoreInp
             rank: args.rank,
             world_size: args.world_size,
             completion_len_tokens: None,
-            metadata: None,
             reward_metadata: None,
         });
     }
@@ -1261,8 +1314,15 @@ fn read_trimul_score_inputs(args: &TrimulScoreArgs) -> Result<Vec<TrimulScoreInp
                     line_index + 1,
                 ),
             };
+            let completion =
+                normalize_completion(&record.completion, args.completion_normalization);
             inputs.push(TrimulScoreInput {
-                completion: record.completion,
+                metadata: completion_normalization_metadata(
+                    record.metadata,
+                    args.completion_normalization,
+                    &completion,
+                ),
+                completion: completion.text,
                 source_id,
                 source_index,
                 step: record.step.unwrap_or(args.step),
@@ -1271,12 +1331,72 @@ fn read_trimul_score_inputs(args: &TrimulScoreArgs) -> Result<Vec<TrimulScoreInp
                 rank: record.rank.unwrap_or(args.rank),
                 world_size: record.world_size.unwrap_or(args.world_size),
                 completion_len_tokens: record.completion_len_tokens,
-                metadata: record.metadata,
                 reward_metadata: record.reward_metadata,
             });
         }
     }
     Ok(inputs)
+}
+
+fn normalize_completion(raw: &str, mode: CompletionNormalization) -> NormalizedCompletion {
+    let raw_len_bytes = raw.len();
+    let raw_sha256 = sha256_hex(raw.as_bytes());
+    let text = match mode {
+        CompletionNormalization::None => raw.to_string(),
+        CompletionNormalization::LlamaCpp => strip_llama_cpp_end_of_text(raw),
+    };
+    let changed = text != raw;
+    NormalizedCompletion {
+        text,
+        raw_sha256,
+        raw_len_bytes,
+        changed,
+    }
+}
+
+fn strip_llama_cpp_end_of_text(raw: &str) -> String {
+    const LLAMA_CPP_EOT_SENTINEL: &str = "[end of text]";
+    let stripped = raw.trim_end();
+    if let Some(prefix) = stripped.strip_suffix(LLAMA_CPP_EOT_SENTINEL) {
+        let normalized = prefix.trim_end();
+        let mut out = String::with_capacity(normalized.len() + 1);
+        out.push_str(normalized);
+        out.push('\n');
+        out
+    } else {
+        raw.to_owned()
+    }
+}
+
+fn completion_normalization_metadata(
+    metadata: Option<serde_json::Value>,
+    mode: CompletionNormalization,
+    completion: &NormalizedCompletion,
+) -> Option<serde_json::Value> {
+    if mode == CompletionNormalization::None {
+        return metadata;
+    }
+    let normalization = serde_json::json!({
+        "mode": mode.as_str(),
+        "changed": completion.changed,
+        "raw_completion_sha256": completion.raw_sha256,
+        "raw_completion_len_bytes": completion.raw_len_bytes,
+        "normalized_completion_sha256": sha256_hex(completion.text.as_bytes()),
+        "normalized_completion_len_bytes": completion.text.len(),
+    });
+    match metadata {
+        None => Some(serde_json::json!({
+            "ferrl_completion_normalization": normalization,
+        })),
+        Some(serde_json::Value::Object(mut object)) => {
+            object.insert("ferrl_completion_normalization".to_string(), normalization);
+            Some(serde_json::Value::Object(object))
+        }
+        Some(other) => Some(serde_json::json!({
+            "ferrl_completion_normalization": normalization,
+            "operator_metadata": other,
+        })),
+    }
 }
 
 fn validate_trimul_score_inputs(inputs: &[TrimulScoreInput]) -> Result<(), CliError> {
@@ -1461,10 +1581,31 @@ struct CandidateManifest {
     training_reward: f64,
     /// SHA-256 of the raw completion text.
     completion_sha256: String,
+    /// Optional normalization applied before extracting `submission.py`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completion_normalization: Option<ArtifactCompletionNormalization>,
     /// SHA-256 of `submission.py`.
     source_sha256: String,
     /// Operator-facing source-inspection evidence.
     source_inspection: SourceInspectionManifest,
+}
+
+/// Completion normalization provenance for artifact extraction.
+#[derive(Debug, Serialize)]
+struct ArtifactCompletionNormalization {
+    /// Normalization mode requested by the operator.
+    mode: &'static str,
+    /// Whether normalization changed the raw completion text.
+    changed: bool,
+    /// Raw completion length in bytes.
+    raw_completion_len_bytes: usize,
+    /// Normalized completion length in bytes.
+    normalized_completion_len_bytes: usize,
+    /// SHA-256 of the normalized completion text used for extraction.
+    normalized_completion_sha256: String,
+    /// Artifact-relative normalized completion file, present only when changed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    normalized_completion_file: Option<&'static str>,
 }
 
 /// Model provenance fields.
@@ -1587,17 +1728,18 @@ fn trimul_artifact(args: &TrimulArtifactArgs) -> Result<(), CliError> {
     baseline_gpu_matches(&baseline.gpu, Some(&gpu)).map_err(CliError::Msg)?;
 
     let completion_bytes = read_bytes(&args.completion)?;
-    let completion = String::from_utf8(completion_bytes.clone()).map_err(|e| {
+    let raw_completion = String::from_utf8(completion_bytes.clone()).map_err(|e| {
         CliError::msg(format!(
             "completion file {} is not valid UTF-8: {e}",
             args.completion.display()
         ))
     })?;
+    let completion = normalize_completion(&raw_completion, args.completion_normalization);
     let extract_mode = cfg.trimul_submission_extract_mode()?;
     let mut reward = cfg
         .build_trimul_reward_base()?
         .with_submission_extract_mode(extract_mode);
-    let submission = reward.extract_submission(&completion).ok_or_else(|| {
+    let submission = reward.extract_submission(&completion.text).ok_or_else(|| {
         CliError::msg("completion does not contain a closed non-empty fenced code block")
     })?;
 
@@ -1614,7 +1756,10 @@ fn trimul_artifact(args: &TrimulArtifactArgs) -> Result<(), CliError> {
         &cfg,
         &ArtifactInputs {
             gpu,
-            completion: &completion,
+            raw_completion: &raw_completion,
+            normalized_completion: &completion.text,
+            completion_normalization: args.completion_normalization,
+            completion_normalization_changed: completion.changed,
             completion_bytes: &completion_bytes,
             config_bytes: &config_bytes,
             prompt_bytes: &prompt_bytes,
@@ -1637,8 +1782,14 @@ fn trimul_artifact(args: &TrimulArtifactArgs) -> Result<(), CliError> {
 struct ArtifactInputs<'a> {
     /// GPU product name.
     gpu: String,
-    /// Raw completion string.
-    completion: &'a str,
+    /// Raw completion string exactly as read from the operator-provided file.
+    raw_completion: &'a str,
+    /// Completion string used for extraction after optional normalization.
+    normalized_completion: &'a str,
+    /// Completion normalization mode used before extraction.
+    completion_normalization: CompletionNormalization,
+    /// Whether completion normalization changed the raw text.
+    completion_normalization_changed: bool,
     /// Raw completion bytes.
     completion_bytes: &'a [u8],
     /// Raw config bytes.
@@ -1753,7 +1904,13 @@ fn write_artifact_bundle(
         source,
     })?;
     write_text(&args.out.join("submission.py"), inputs.submission)?;
-    write_text(&args.out.join("completion.txt"), inputs.completion)?;
+    write_text(&args.out.join("completion.txt"), inputs.raw_completion)?;
+    if inputs.completion_normalization_changed {
+        write_text(
+            &args.out.join("completion.normalized.txt"),
+            inputs.normalized_completion,
+        )?;
+    }
     write_bytes(&args.out.join("prompt.txt"), inputs.prompt_bytes)?;
     for (i, run) in inputs.runs.iter().enumerate() {
         write_json(&args.out.join(format!("verification/run-{i:03}.json")), run)?;
@@ -1788,6 +1945,7 @@ fn build_manifest(
             world_size: args.world_size,
             training_reward: args.training_reward,
             completion_sha256: sha256_hex(inputs.completion_bytes),
+            completion_normalization: artifact_completion_normalization(inputs),
             source_sha256: sha256_hex(inputs.submission.as_bytes()),
             source_inspection: SourceInspectionManifest {
                 result: args.source_inspection,
@@ -1849,6 +2007,24 @@ fn build_manifest(
             accepted: inputs.accepted,
         },
     }
+}
+
+fn artifact_completion_normalization(
+    inputs: &ArtifactInputs<'_>,
+) -> Option<ArtifactCompletionNormalization> {
+    if inputs.completion_normalization == CompletionNormalization::None {
+        return None;
+    }
+    Some(ArtifactCompletionNormalization {
+        mode: inputs.completion_normalization.as_str(),
+        changed: inputs.completion_normalization_changed,
+        raw_completion_len_bytes: inputs.completion_bytes.len(),
+        normalized_completion_len_bytes: inputs.normalized_completion.len(),
+        normalized_completion_sha256: sha256_hex(inputs.normalized_completion.as_bytes()),
+        normalized_completion_file: inputs
+            .completion_normalization_changed
+            .then_some("completion.normalized.txt"),
+    })
 }
 
 /// The effective TriMul scratch cap in bytes.
@@ -2531,6 +2707,7 @@ mod tests {
             prompt_copy: dir.join("prompt.txt"),
             completion: Vec::new(),
             completions_jsonl: Vec::new(),
+            completion_normalization: CompletionNormalization::None,
             out: dir.join("scores.jsonl"),
             score_secret_seed: 999,
             run_id: "test-run".to_string(),
@@ -2687,6 +2864,8 @@ mod tests {
             "gemma4",
             "--source-label",
             "gemma4-batch",
+            "--completion-normalization",
+            "llama-cpp",
         ])
         .unwrap();
         let Command::TrimulScore(a) = s.cmd else {
@@ -2698,6 +2877,7 @@ mod tests {
                 a.config,
                 a.prompt_copy,
                 a.completion,
+                a.completion_normalization,
                 a.out,
                 a.score_secret_seed,
                 a.run_id,
@@ -2708,6 +2888,7 @@ mod tests {
                 PathBuf::from("run.json"),
                 PathBuf::from("runs/trimul-1/prompt.txt"),
                 vec![PathBuf::from("raw.txt")],
+                CompletionNormalization::LlamaCpp,
                 PathBuf::from("scores.jsonl"),
                 424399,
                 "gemma4-rollout".to_string(),
@@ -2793,6 +2974,53 @@ mod tests {
             .contains(raw_path.to_string_lossy().as_ref()));
         assert_eq!(inputs[1].metadata.as_ref().unwrap()["kind"], "defaulted");
         assert_eq!(inputs[2].reward_metadata.as_ref().unwrap()["raw"], true);
+    }
+
+    #[test]
+    fn trimul_score_normalizes_llama_cpp_completion_sentinel() {
+        let tmp = TestDir::new("trimul-score-normalization");
+        let raw_path = tmp.path().join("candidate.txt");
+        std::fs::write(
+            &raw_path,
+            "prefix\n```python\ndef custom_kernel(data):\n    return data\n``` [end of text]\n\n",
+        )
+        .unwrap();
+        let mut args = trimul_score_args_for_test(tmp.path());
+        args.completion = vec![raw_path];
+        args.completion_normalization = CompletionNormalization::LlamaCpp;
+
+        let inputs = read_trimul_score_inputs(&args).unwrap();
+
+        assert_eq!(
+            inputs[0].completion,
+            "prefix\n```python\ndef custom_kernel(data):\n    return data\n```\n"
+        );
+        let metadata = inputs[0].metadata.as_ref().unwrap();
+        assert_eq!(
+            metadata["ferrl_completion_normalization"]["mode"],
+            "llama_cpp"
+        );
+        assert_eq!(
+            metadata["ferrl_completion_normalization"]["normalized_completion_sha256"],
+            sha256_hex(inputs[0].completion.as_bytes())
+        );
+    }
+
+    #[test]
+    fn trimul_score_records_llama_cpp_mode_even_when_unchanged() {
+        let raw = "```python\ndef custom_kernel(data):\n    return data\n```\n".to_string();
+        let completion = normalize_completion(&raw, CompletionNormalization::LlamaCpp);
+
+        assert_eq!(completion.text, raw);
+        assert!(!completion.changed);
+        let metadata =
+            completion_normalization_metadata(None, CompletionNormalization::LlamaCpp, &completion)
+                .unwrap();
+        assert_eq!(
+            metadata["ferrl_completion_normalization"]["mode"],
+            "llama_cpp"
+        );
+        assert_eq!(metadata["ferrl_completion_normalization"]["changed"], false);
     }
 
     #[test]
@@ -3079,6 +3307,8 @@ mod tests {
             "runs/trimul-1/prompt.txt",
             "--completion",
             "completion.txt",
+            "--completion-normalization",
+            "llama-cpp",
             "--out",
             "artifact",
             "--run-id",
@@ -3118,6 +3348,10 @@ mod tests {
                     (5, 1, 0, 1)
                 );
                 assert_eq!(a.prompt_copy, PathBuf::from("runs/trimul-1/prompt.txt"));
+                assert_eq!(
+                    a.completion_normalization,
+                    CompletionNormalization::LlamaCpp
+                );
             }
             _ => panic!("expected trimul-artifact"),
         }
@@ -3438,6 +3672,43 @@ benchmarks:
     }
 
     #[test]
+    fn trimul_artifact_completion_normalization_records_llama_cpp_manifest_metadata() {
+        let raw = b"```python\npass\n``` [end of text]\n\n";
+        let normalized = "```python\npass\n```\n";
+        let inputs = ArtifactInputs {
+            gpu: "H100".to_string(),
+            raw_completion: std::str::from_utf8(raw).unwrap(),
+            normalized_completion: normalized,
+            completion_normalization: CompletionNormalization::LlamaCpp,
+            completion_normalization_changed: true,
+            completion_bytes: raw,
+            config_bytes: b"{}",
+            prompt_bytes: b"prompt",
+            submission: "pass\n",
+            baseline_median: 1.0,
+            test_cases: 1,
+            benchmark_cases: 1,
+            runs: Vec::new(),
+            accepted: false,
+        };
+
+        let metadata = artifact_completion_normalization(&inputs).unwrap();
+
+        assert_eq!(metadata.mode, "llama_cpp");
+        assert!(metadata.changed);
+        assert_eq!(metadata.raw_completion_len_bytes, raw.len());
+        assert_eq!(metadata.normalized_completion_len_bytes, normalized.len());
+        assert_eq!(
+            metadata.normalized_completion_sha256,
+            sha256_hex(normalized.as_bytes())
+        );
+        assert_eq!(
+            metadata.normalized_completion_file,
+            Some("completion.normalized.txt")
+        );
+    }
+
+    #[test]
     fn artifact_report_matches_the_contract_outline() {
         let manifest = ArtifactManifest {
             contract_version: 1,
@@ -3452,6 +3723,7 @@ benchmarks:
                 world_size: 1,
                 training_reward: 1.5,
                 completion_sha256: "completion-hash".to_string(),
+                completion_normalization: None,
                 source_sha256: "source-hash".to_string(),
                 source_inspection: SourceInspectionManifest {
                     result: SourceInspectionResult::Clean,

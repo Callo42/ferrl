@@ -42,9 +42,19 @@ reward, reward diagnostic, top-level TriMul reward metadata, prompt/config
 hashes, completion hash, opaque/public-safe `source_id`, and namespaced external
 rollout provenance. Input file paths are not persisted into diagnostic evidence;
 use `--source-label <public-id>` or row-level `source_id` values that are safe to
-copy into public reports. `trimul-score` is a search-quality diagnostic for
-comparing external rollouts; it does not replace `trimul-artifact` and cannot by
-itself satisfy the artifact acceptance rule.
+copy into public reports. The default is strict and scores the completion bytes
+exactly as supplied. For GGUF rollouts generated through llama.cpp, pass
+`--completion-normalization llama-cpp`; this strips only llama.cpp's trailing
+`[end of text]` stdout sentinel before extraction and records raw and normalized
+hash/length metadata. `trimul-score` is a search-quality diagnostic for comparing
+external rollouts; it does not replace `trimul-artifact` and cannot by itself satisfy
+the artifact acceptance rule.
+
+Use the same `--completion-normalization` value when promoting an external candidate
+to `ferrl trimul-artifact`. Artifact bundles always preserve the raw model output as
+`completion.txt`; when normalization changes the text used for extraction, they also
+write `completion.normalized.txt` and record the normalization mode plus hashes in
+`manifest.json`.
 
 For prompt-controlled runs, `trimul.prompt_path` is only the mutable launch-time
 path for the complete rendered model prompt. Do not use that local path as artifact
