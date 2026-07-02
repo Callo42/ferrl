@@ -2328,6 +2328,47 @@ mod tests {
         assert_cached_matches_uncached(&mut policy, &[1u32, 2, 3, 4, 5], &cfg);
     }
 
+    #[test]
+    fn gemma4_cached_generate_matches_uncached_with_eos() {
+        let prompt = [1u32, 2, 3, 4, 5];
+        let max_new = 5usize;
+        let mut policy = gemma4_tiny_policy();
+        force_b_nonzero(&policy.trainable_vars());
+        let base = GenConfig {
+            group_size: 4,
+            max_new_tokens: max_new,
+            temperature: 1.0,
+            eos_token_id: None,
+            eval_sampling: None,
+        };
+        let eos = policy.generate_uncached(&prompt, &base).unwrap().token_ids[0][prompt.len()];
+        let cfg_eos = GenConfig {
+            eos_token_id: Some(eos),
+            ..base
+        };
+        assert_cached_matches_uncached(&mut policy, &prompt, &cfg_eos);
+        let rollout = policy.generate(&prompt, &cfg_eos).unwrap();
+        assert_eq!(rollout.completion_lens[0], 1);
+        assert_eos_rollout_invariants(&rollout, eos, max_new);
+    }
+
+    #[test]
+    fn gemma4_cached_generate_matches_uncached_under_eval_override() {
+        let mut policy = gemma4_tiny_policy();
+        force_b_nonzero(&policy.trainable_vars());
+        let cfg = GenConfig {
+            group_size: 4,
+            max_new_tokens: 5,
+            temperature: 1.0,
+            eos_token_id: None,
+            eval_sampling: Some(crate::policy::EvalSampling {
+                temperature: 0.7,
+                top_p: Some(0.9),
+            }),
+        };
+        assert_cached_matches_uncached(&mut policy, &[1u32, 2, 3, 4, 5], &cfg);
+    }
+
     // ---- detached scoring + checkpointed backward (P7) ----------------------
 
     /// Force every adapter `B` nonzero so the adapter path is live in the
