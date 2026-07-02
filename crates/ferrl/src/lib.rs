@@ -2,8 +2,8 @@
 //!
 //! `ferrl` is a [candle](https://github.com/huggingface/candle)-native
 //! [GRPO](https://arxiv.org/abs/2402.03300) reinforcement-learning library for
-//! RL-fine-tuning large language models in Rust. The first target model is
-//! `Qwen3-0.6B-Base`.
+//! RL-fine-tuning large language models in Rust. The current native model
+//! families are Qwen3, Qwen3.5/3.6, and dense Gemma 4 text.
 //!
 //! ## Division of labor
 //!
@@ -132,6 +132,7 @@ pub mod dense;
 pub mod eval;
 mod full_ft;
 pub mod gdn;
+pub mod gemma4;
 pub mod grpo;
 pub mod hf;
 pub mod llama;
@@ -181,6 +182,12 @@ pub use gdn::{
     stable_softplus,
 };
 #[doc(inline)]
+pub use gemma4::{
+    Gemma4Config, Gemma4FullAttentionRope, Gemma4GradModel, Gemma4LayerType, Gemma4MergedDecoder,
+    Gemma4RopeParameters, Gemma4SlidingAttentionRope, Gemma4TextConfig,
+    CKPT_PREFIX as GEMMA4_CKPT_PREFIX,
+};
+#[doc(inline)]
 pub use grpo::{
     clipped_surrogate, group_advantages, k3_kl, masked_mean, tis_weight, zero_mask_rows, LossType,
     ScaleRewards, GROUP_STD_EPS,
@@ -190,9 +197,11 @@ pub use hf::{chatml, eos_from_config, HfError};
 #[doc(inline)]
 pub use llama::{LlamaGradModel, LlamaMergedDecoder};
 #[doc(inline)]
-pub use lm_policy::{LlamaPolicy, LmPolicy, Qwen3_5Policy, QwenPolicy};
+pub use lm_policy::{Gemma4Policy, LlamaPolicy, LmPolicy, Qwen3_5Policy, QwenPolicy};
 #[doc(inline)]
-pub use loader::{load_auto_policy, load_qwen_policy, AutoPolicy, LoaderError, LoaderOpts};
+pub use loader::{
+    load_auto_policy, load_gemma4_policy, load_qwen_policy, AutoPolicy, LoaderError, LoaderOpts,
+};
 #[doc(inline)]
 pub use lora::DenseLoraTargets;
 #[doc(inline)]

@@ -135,6 +135,9 @@ pub type LlamaPolicy = LmPolicy<crate::llama::LlamaGradModel>;
 /// [`CachedDecoder`] contract with zero changes.
 pub type Qwen3_5Policy = LmPolicy<crate::qwen35::Qwen3_5GradModel>;
 
+/// The policy over the dense Gemma 4 text model.
+pub type Gemma4Policy = LmPolicy<crate::gemma4::Gemma4GradModel>;
+
 // Elide the sampler's RNG state and the heavy model fields; show the inspectable
 // scalars. (`GrpoSampler` is `Debug`, but the raw RNG words add only noise.)
 impl<M: GradModel + std::fmt::Debug> std::fmt::Debug for LmPolicy<M> {
