@@ -1,4 +1,4 @@
-//! Load a ready-to-train Qwen-family policy from a Hugging Face checkpoint directory.
+//! Load a ready-to-train policy from a Hugging Face checkpoint directory.
 //!
 //! Every runnable entry point — the `ferrl` CLI, the worked examples, the
 //! "wire your own task" template — needs the same few steps to turn a checkpoint
@@ -6,12 +6,12 @@
 //! [`VarBuilder`], attach a `LoRA` adapter, and load the tokenizer. This module is
 //! that one shared loader, so those call sites do not each hand-roll it (and drift).
 //!
-//! It is deliberately thin glue over [`QwenGradModel`] + [`QwenPolicy`]; the heavy,
-//! correctness-bearing logic lives in those types and is covered there. Loading a
-//! real multi-gigabyte checkpoint needs the asset on disk, so the happy path is
-//! exercised by the runnable harnesses (the CLI's end-to-end smoke), not the unit
-//! tests — this file is therefore excluded from the coverage denominator alongside
-//! the binaries and examples (see `justfile` / `.github/workflows/ci.yml`).
+//! It is deliberately thin glue over each model module; the heavy,
+//! correctness-bearing logic lives in those types and is covered there. Loading
+//! a real multi-gigabyte checkpoint needs the asset on disk, so the happy path
+//! is exercised by the runnable harnesses (the CLI's end-to-end smoke), not the
+//! unit tests — this file is therefore excluded from the coverage denominator
+//! alongside the binaries and examples (see `justfile` / `.github/workflows/ci.yml`).
 
 use std::path::{Path, PathBuf};
 
@@ -20,7 +20,10 @@ use candle_core::{DType, Device, Result as CandleResult, Tensor, Var};
 use candle_nn::VarBuilder;
 use candle_transformers::models::qwen3::Config;
 
-use crate::lm_policy::{Qwen3_5Policy, QwenPolicy};
+use crate::gemma4::{
+    varbuilder_from_pretrained as gemma4_varbuilder_from_pretrained, Gemma4Config, Gemma4GradModel,
+};
+use crate::lm_policy::{Gemma4Policy, Qwen3_5Policy, QwenPolicy};
 use crate::policy::{GenConfig, Policy, Rollout};
 use crate::qwen::QwenGradModel;
 use crate::qwen35::{
@@ -98,9 +101,10 @@ pub enum LoaderError {
     /// The tokenizer could not be loaded.
     #[error("load tokenizer: {0}")]
     Tokenizer(#[from] TokenizerError),
-    /// The checkpoint declares a model family this loader does not support.
+    /// The checkpoint declares a model family this loader does not recognize.
     #[error(
-        "unsupported model_type {model_type:?}; supported values are \"qwen3\" and \"qwen3_5\""
+        "unsupported model_type {model_type:?}; recognized values are \"qwen3\", \"qwen3_5\", \
+         \"qwen3_5_moe\", and \"gemma4\""
     )]
     UnsupportedModelType {
         /// The `config.json` `model_type` value, or `None` if the field was absent.
@@ -127,6 +131,8 @@ pub enum AutoPolicy {
     Qwen(Box<QwenPolicy>),
     /// A `qwen3_5` family policy (Qwen3.5 / Qwen3.6).
     Qwen3_5(Box<Qwen3_5Policy>),
+    /// A dense Gemma 4 text policy.
+    Gemma4(Box<Gemma4Policy>),
 }
 
 impl AutoPolicy {
@@ -140,6 +146,7 @@ impl AutoPolicy {
         match self {
             Self::Qwen(policy) => policy.model_mut().set_activation_checkpointing(on),
             Self::Qwen3_5(policy) => policy.model_mut().set_activation_checkpointing(on),
+            Self::Gemma4(policy) => policy.model_mut().set_activation_checkpointing(on),
         }
     }
 
@@ -149,6 +156,7 @@ impl AutoPolicy {
         match self {
             Self::Qwen(policy) => policy.model().activation_checkpointing(),
             Self::Qwen3_5(policy) => policy.model().activation_checkpointing(),
+            Self::Gemma4(policy) => policy.model().activation_checkpointing(),
         }
     }
 }
@@ -158,6 +166,7 @@ impl Policy for AutoPolicy {
         match self {
             Self::Qwen(policy) => policy.generate(prompt, cfg),
             Self::Qwen3_5(policy) => policy.generate(prompt, cfg),
+            Self::Gemma4(policy) => policy.generate(prompt, cfg),
         }
     }
 
@@ -170,6 +179,7 @@ impl Policy for AutoPolicy {
         match self {
             Self::Qwen(policy) => policy.generate_at(prompt, cfg, global_row_base),
             Self::Qwen3_5(policy) => policy.generate_at(prompt, cfg, global_row_base),
+            Self::Gemma4(policy) => policy.generate_at(prompt, cfg, global_row_base),
         }
     }
 
@@ -177,6 +187,7 @@ impl Policy for AutoPolicy {
         match self {
             Self::Qwen(policy) => policy.token_logprobs(rollout),
             Self::Qwen3_5(policy) => policy.token_logprobs(rollout),
+            Self::Gemma4(policy) => policy.token_logprobs(rollout),
         }
     }
 
@@ -184,6 +195,7 @@ impl Policy for AutoPolicy {
         match self {
             Self::Qwen(policy) => policy.token_logprobs_detached(rollout),
             Self::Qwen3_5(policy) => policy.token_logprobs_detached(rollout),
+            Self::Gemma4(policy) => policy.token_logprobs_detached(rollout),
         }
     }
 
@@ -191,6 +203,7 @@ impl Policy for AutoPolicy {
         match self {
             Self::Qwen(policy) => policy.backward(loss),
             Self::Qwen3_5(policy) => policy.backward(loss),
+            Self::Gemma4(policy) => policy.backward(loss),
         }
     }
 
@@ -198,6 +211,7 @@ impl Policy for AutoPolicy {
         match self {
             Self::Qwen(policy) => policy.set_adapter_enabled(enabled),
             Self::Qwen3_5(policy) => policy.set_adapter_enabled(enabled),
+            Self::Gemma4(policy) => policy.set_adapter_enabled(enabled),
         }
     }
 
@@ -205,6 +219,7 @@ impl Policy for AutoPolicy {
         match self {
             Self::Qwen(policy) => policy.adapter_enabled(),
             Self::Qwen3_5(policy) => policy.adapter_enabled(),
+            Self::Gemma4(policy) => policy.adapter_enabled(),
         }
     }
 
@@ -212,6 +227,7 @@ impl Policy for AutoPolicy {
         match self {
             Self::Qwen(policy) => policy.trainable_vars(),
             Self::Qwen3_5(policy) => policy.trainable_vars(),
+            Self::Gemma4(policy) => policy.trainable_vars(),
         }
     }
 
@@ -219,6 +235,7 @@ impl Policy for AutoPolicy {
         match self {
             Self::Qwen(policy) => policy.sampler_state(),
             Self::Qwen3_5(policy) => policy.sampler_state(),
+            Self::Gemma4(policy) => policy.sampler_state(),
         }
     }
 
@@ -226,6 +243,7 @@ impl Policy for AutoPolicy {
         match self {
             Self::Qwen(policy) => policy.restore_sampler_state(state),
             Self::Qwen3_5(policy) => policy.restore_sampler_state(state),
+            Self::Gemma4(policy) => policy.restore_sampler_state(state),
         }
     }
 
@@ -233,6 +251,7 @@ impl Policy for AutoPolicy {
         match self {
             Self::Qwen(policy) => policy.lora_recipe(),
             Self::Qwen3_5(policy) => policy.lora_recipe(),
+            Self::Gemma4(policy) => policy.lora_recipe(),
         }
     }
 }
@@ -294,11 +313,12 @@ pub fn load_qwen_policy(
     Ok((policy, tok))
 }
 
-/// Load any qwen-family policy supported by the CLI from a checkpoint directory.
+/// Load any policy supported by the CLI from a checkpoint directory.
 ///
-/// Currently dispatches `model_type == "qwen3_5"` / `"qwen3_5_moe"` to the
-/// Qwen3.5/3.6 loader and `model_type == "qwen3"` (or an absent legacy field) to
-/// the original Qwen3 loader.
+/// Dispatches `model_type == "qwen3_5"` / `"qwen3_5_moe"` to the Qwen3.5/3.6
+/// loader, `model_type == "gemma4"` to the dense Gemma 4 text loader, and
+/// `model_type == "qwen3"` (or an absent legacy field) to the original Qwen3
+/// loader.
 ///
 /// # Errors
 ///
@@ -318,6 +338,10 @@ pub fn load_auto_policy(
             let (policy, tok) = load_qwen35_policy(dir, device, opts)?;
             Ok((AutoPolicy::Qwen3_5(Box::new(policy)), tok))
         }
+        Some(ModelType::Gemma4) => {
+            let (policy, tok) = load_gemma4_policy(dir, device, opts)?;
+            Ok((AutoPolicy::Gemma4(Box::new(policy)), tok))
+        }
         Some(ModelType::Unsupported(model_type)) => {
             Err(LoaderError::UnsupportedModelType { model_type })
         }
@@ -328,6 +352,7 @@ pub fn load_auto_policy(
 enum ModelType {
     Qwen3,
     Qwen3_5,
+    Gemma4,
     Unsupported(Option<String>),
 }
 
@@ -351,6 +376,7 @@ fn read_model_type(dir: &Path) -> Result<Option<ModelType>, LoaderError> {
     Ok(Some(match model_type {
         "qwen3" => ModelType::Qwen3,
         "qwen3_5" | "qwen3_5_moe" => ModelType::Qwen3_5,
+        "gemma4" => ModelType::Gemma4,
         other => ModelType::Unsupported(Some(other.to_string())),
     }))
 }
@@ -372,6 +398,45 @@ fn load_qwen35_policy(
     )?;
     model.set_memory_efficient_cached_gqa(opts.memory_efficient_cached_gqa);
     let policy = Qwen3_5Policy::new(model, opts.seed, opts.temperature);
+    let tok = HfTokenizer::from_file(dir.join("tokenizer.json"))?;
+    Ok((policy, tok))
+}
+
+/// Load a dense Gemma 4 text policy and its tokenizer from a checkpoint `dir`.
+///
+/// The public Gemma 4 checkpoints are conditional-generation wrappers whose
+/// text decoder lives under `model.language_model.*`; the native loader validates
+/// the wrapper config, maps only those text tensors, attaches the dense
+/// industrial `LoRA` recipe, and returns a policy ready for the generic trainer.
+///
+/// # Errors
+///
+/// Returns [`LoaderError`] if the config is unsupported, the requested loader
+/// options are incompatible with Gemma 4, the model tensors cannot be mapped, or
+/// the tokenizer cannot be loaded.
+pub fn load_gemma4_policy(
+    dir: &Path,
+    device: &Device,
+    opts: &LoaderOpts,
+) -> Result<(Gemma4Policy, HfTokenizer), LoaderError> {
+    if opts.memory_efficient_cached_gqa {
+        return Err(LoaderError::UnsupportedLoaderOption {
+            option: "policy.memory_efficient_cached_gqa".to_string(),
+            supported: "qwen3_5".to_string(),
+            model_type: "gemma4".to_string(),
+        });
+    }
+
+    let cfg = Gemma4Config::from_json_file(dir.join("config.json"))?;
+    let vb = gemma4_varbuilder_from_pretrained(dir, opts.base_dtype, device)?;
+    let model = Gemma4GradModel::load_with_adapter_dtype(
+        &cfg,
+        &vb,
+        opts.lora_rank,
+        opts.lora_alpha,
+        opts.adapter_dtype,
+    )?;
+    let policy = Gemma4Policy::new(model, opts.seed, opts.temperature);
     let tok = HfTokenizer::from_file(dir.join("tokenizer.json"))?;
     Ok((policy, tok))
 }
@@ -465,6 +530,58 @@ mod tests {
     }
 
     #[test]
+    fn model_type_detection_routes_gemma4_family() {
+        let tmp = TempDir::new("loader-gemma4-model-type");
+        std::fs::write(
+            tmp.path().join("config.json"),
+            r#"{ "model_type": "gemma4" }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_model_type(tmp.path()).unwrap(),
+            Some(ModelType::Gemma4)
+        );
+    }
+
+    #[test]
+    fn auto_loader_reaches_gemma4_weight_load_after_config_validation() {
+        let tmp = TempDir::new("loader-gemma4-recognized");
+        std::fs::write(tmp.path().join("config.json"), gemma4_config_json()).unwrap();
+        match load_auto_policy(tmp.path(), &Device::Cpu, &LoaderOpts::default()) {
+            Err(LoaderError::Model(e)) => {
+                let msg = e.to_string();
+                assert!(msg.contains("gemma4 loader"));
+                assert!(msg.contains("model.safetensors"));
+            }
+            Err(other) => panic!("expected Gemma4 model-load error, got {other:?}"),
+            Ok(_) => panic!("expected Gemma4 model-load error, got loaded policy"),
+        }
+    }
+
+    #[test]
+    fn gemma4_loader_rejects_qwen35_cached_gqa_option() {
+        let tmp = TempDir::new("loader-gemma4-gqa-option");
+        std::fs::write(tmp.path().join("config.json"), gemma4_config_json()).unwrap();
+        let opts = LoaderOpts {
+            memory_efficient_cached_gqa: true,
+            ..LoaderOpts::default()
+        };
+        match load_auto_policy(tmp.path(), &Device::Cpu, &opts) {
+            Err(LoaderError::UnsupportedLoaderOption {
+                option,
+                supported,
+                model_type,
+            }) => {
+                assert_eq!(option, "policy.memory_efficient_cached_gqa");
+                assert_eq!(supported, "qwen3_5");
+                assert_eq!(model_type, "gemma4");
+            }
+            Err(other) => panic!("expected UnsupportedLoaderOption, got {other:?}"),
+            Ok(_) => panic!("expected UnsupportedLoaderOption, got loaded policy"),
+        }
+    }
+
+    #[test]
     fn auto_loader_loads_the_tiny_qwen35_fixture() {
         let tmp = TempDir::new("loader-qwen35-fixture");
         let fixture_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
@@ -533,5 +650,62 @@ mod tests {
             assert!(file_type.is_file(), "fixture copy only supports files");
             std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
         }
+    }
+
+    fn gemma4_config_json() -> &'static str {
+        r#"{
+            "model_type": "gemma4",
+            "tie_word_embeddings": true,
+            "text_config": {
+                "attention_bias": false,
+                "attention_dropout": 0.0,
+                "attention_k_eq_v": true,
+                "enable_moe_block": false,
+                "expert_intermediate_size": null,
+                "final_logit_softcapping": 30.0,
+                "global_head_dim": 512,
+                "head_dim": 256,
+                "hidden_activation": "gelu_pytorch_tanh",
+                "hidden_size": 5376,
+                "hidden_size_per_layer_input": 0,
+                "intermediate_size": 21504,
+                "layer_types": [
+                    "sliding_attention",
+                    "sliding_attention",
+                    "sliding_attention",
+                    "sliding_attention",
+                    "sliding_attention",
+                    "full_attention"
+                ],
+                "max_position_embeddings": 262144,
+                "model_type": "gemma4_text",
+                "num_attention_heads": 32,
+                "num_experts": null,
+                "num_global_key_value_heads": 4,
+                "num_hidden_layers": 6,
+                "num_key_value_heads": 16,
+                "num_kv_shared_layers": 0,
+                "rms_norm_eps": 1e-6,
+                "rope_parameters": {
+                    "full_attention": {
+                        "partial_rotary_factor": 0.25,
+                        "rope_theta": 1000000.0,
+                        "rope_type": "proportional"
+                    },
+                    "sliding_attention": {
+                        "rope_theta": 10000.0,
+                        "rope_type": "default"
+                    }
+                },
+                "sliding_window": 1024,
+                "tie_word_embeddings": true,
+                "top_k_experts": null,
+                "use_bidirectional_attention": "vision",
+                "use_cache": true,
+                "use_double_wide_mlp": false,
+                "vocab_size": 262144,
+                "vocab_size_per_layer_input": 262144
+            }
+        }"#
     }
 }
