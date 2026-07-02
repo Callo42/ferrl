@@ -39,7 +39,7 @@
 //! a row's tokens depend only on its substream, never on whether the group is
 //! decoded together or one row at a time. That invariance is what the CI
 //! batch-invariance gates check, in two regimes. For the **dense-attention**
-//! models (Qwen3, Llama) the cached merged decode equals the uncached forward
+//! models (Qwen3, Llama, Gemma 4) the cached merged decode equals the uncached forward
 //! bit-exactly on CPU, so the sequential, uncached `generate_uncached` oracle
 //! (test-only) reproduces the batched path **token-for-token**
 //! (`cached_generate_matches_uncached*`). The **Qwen3.5 `GatedDeltaNet`** family
@@ -290,8 +290,8 @@ impl<M: GradModel> LmPolicy<M> {
     /// stream, same EOS/padding, same RNG consumption — so it is at once the
     /// KV-cache faithfulness oracle (cached == uncached) and the batch-invariance
     /// oracle (batched == sequential). That bit-exactness holds for the
-    /// **dense-attention** models this is instantiated on (Qwen3, Llama), where the
-    /// cached merged decode equals the uncached forward exactly on CPU; the Qwen3.5
+    /// **dense-attention** models this is instantiated on (Qwen3, Llama, Gemma 4),
+    /// where the cached merged decode equals the uncached forward exactly on CPU; the Qwen3.5
     /// `GatedDeltaNet` family is batch-invariance-gated at the decoder level instead
     /// (see [`crate::qwen35`]), since its cached recurrent decode and uncached
     /// chunked forward differ by an algorithm-level tolerance unrelated to batching.
@@ -657,6 +657,7 @@ impl<M: GradModel> Policy for LmPolicy<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gemma4::{Gemma4Config, Gemma4GradModel, Gemma4LayerType, CKPT_PREFIX};
     use crate::nn::grad_coverage;
     use candle_core::backprop::GradStore;
     use candle_core::{DType, Device, D};
@@ -2168,6 +2169,163 @@ mod tests {
         );
         // The adapter is restored enabled after the (reference-toggling) run.
         assert!(policy.adapter_enabled());
+    }
+
+    // ---- Gemma4Policy: production-shaped cached generation gate --------------
+
+    const GEMMA4_TINY_TEXT_CONFIG: &str = r#"{
+        "model_type": "gemma4",
+        "tie_word_embeddings": true,
+        "text_config": {
+            "attention_bias": false,
+            "attention_dropout": 0.0,
+            "attention_k_eq_v": true,
+            "enable_moe_block": false,
+            "expert_intermediate_size": null,
+            "final_logit_softcapping": 30.0,
+            "global_head_dim": 8,
+            "head_dim": 4,
+            "hidden_activation": "gelu_pytorch_tanh",
+            "hidden_size": 8,
+            "hidden_size_per_layer_input": 0,
+            "intermediate_size": 16,
+            "layer_types": ["sliding_attention", "full_attention"],
+            "max_position_embeddings": 32,
+            "model_type": "gemma4_text",
+            "num_attention_heads": 2,
+            "num_experts": null,
+            "num_global_key_value_heads": 1,
+            "num_hidden_layers": 2,
+            "num_key_value_heads": 1,
+            "num_kv_shared_layers": 0,
+            "rms_norm_eps": 1e-6,
+            "rope_parameters": {
+                "full_attention": {
+                    "partial_rotary_factor": 0.5,
+                    "rope_theta": 1000000.0,
+                    "rope_type": "proportional"
+                },
+                "sliding_attention": {
+                    "rope_theta": 10000.0,
+                    "rope_type": "default"
+                }
+            },
+            "sliding_window": 3,
+            "tie_word_embeddings": true,
+            "top_k_experts": null,
+            "use_bidirectional_attention": "vision",
+            "use_cache": true,
+            "use_double_wide_mlp": false,
+            "vocab_size": 16,
+            "vocab_size_per_layer_input": 16
+        }
+    }"#;
+
+    fn gemma4_tiny_cfg() -> Gemma4Config {
+        Gemma4Config::from_json_str(GEMMA4_TINY_TEXT_CONFIG).unwrap()
+    }
+
+    fn gemma4_put_rand(t: &mut HashMap<String, Tensor>, name: &str, dims: &[usize]) {
+        t.insert(
+            name.to_string(),
+            Tensor::randn(0f32, 0.05f32, dims.to_vec(), &Device::Cpu).unwrap(),
+        );
+    }
+
+    fn gemma4_put_ones(t: &mut HashMap<String, Tensor>, name: &str, dims: &[usize]) {
+        t.insert(
+            name.to_string(),
+            Tensor::ones(dims.to_vec(), DType::F32, &Device::Cpu).unwrap(),
+        );
+    }
+
+    fn gemma4_weight_map(cfg: &Gemma4Config) -> HashMap<String, Tensor> {
+        let mut t: HashMap<String, Tensor> = HashMap::new();
+        let tcfg = &cfg.text_config;
+        let h = tcfg.hidden_size;
+        let i = tcfg.intermediate_size;
+        gemma4_put_rand(
+            &mut t,
+            &format!("{CKPT_PREFIX}.embed_tokens.weight"),
+            &[tcfg.vocab_size, h],
+        );
+        gemma4_put_ones(&mut t, &format!("{CKPT_PREFIX}.norm.weight"), &[h]);
+        for layer in 0..tcfg.num_hidden_layers {
+            let p = format!("{CKPT_PREFIX}.layers.{layer}");
+            let full = tcfg.layer_types[layer] == Gemma4LayerType::FullAttention;
+            let head_dim = if full {
+                tcfg.global_head_dim
+            } else {
+                tcfg.head_dim
+            };
+            let kv_heads = if full {
+                tcfg.num_global_key_value_heads
+            } else {
+                tcfg.num_key_value_heads
+            };
+            let q_out = tcfg.num_attention_heads * head_dim;
+            let kv_out = kv_heads * head_dim;
+
+            gemma4_put_ones(&mut t, &format!("{p}.input_layernorm.weight"), &[h]);
+            gemma4_put_ones(
+                &mut t,
+                &format!("{p}.post_attention_layernorm.weight"),
+                &[h],
+            );
+            gemma4_put_ones(
+                &mut t,
+                &format!("{p}.pre_feedforward_layernorm.weight"),
+                &[h],
+            );
+            gemma4_put_ones(
+                &mut t,
+                &format!("{p}.post_feedforward_layernorm.weight"),
+                &[h],
+            );
+            gemma4_put_ones(&mut t, &format!("{p}.layer_scalar"), &[1]);
+            gemma4_put_rand(&mut t, &format!("{p}.self_attn.q_proj.weight"), &[q_out, h]);
+            gemma4_put_rand(
+                &mut t,
+                &format!("{p}.self_attn.k_proj.weight"),
+                &[kv_out, h],
+            );
+            if !full {
+                gemma4_put_rand(
+                    &mut t,
+                    &format!("{p}.self_attn.v_proj.weight"),
+                    &[kv_out, h],
+                );
+            }
+            gemma4_put_rand(&mut t, &format!("{p}.self_attn.o_proj.weight"), &[h, q_out]);
+            gemma4_put_ones(&mut t, &format!("{p}.self_attn.q_norm.weight"), &[head_dim]);
+            gemma4_put_ones(&mut t, &format!("{p}.self_attn.k_norm.weight"), &[head_dim]);
+            gemma4_put_rand(&mut t, &format!("{p}.mlp.gate_proj.weight"), &[i, h]);
+            gemma4_put_rand(&mut t, &format!("{p}.mlp.up_proj.weight"), &[i, h]);
+            gemma4_put_rand(&mut t, &format!("{p}.mlp.down_proj.weight"), &[h, i]);
+        }
+        t
+    }
+
+    fn gemma4_tiny_policy() -> Gemma4Policy {
+        let cfg = gemma4_tiny_cfg();
+        let vb = VarBuilder::from_tensors(gemma4_weight_map(&cfg), DType::F32, &Device::Cpu);
+        let model =
+            Gemma4GradModel::load_with_adapter_dtype(&cfg, &vb, 2, 4.0, DType::F32).unwrap();
+        Gemma4Policy::new(model, 7, 1.0)
+    }
+
+    #[test]
+    fn gemma4_cached_generate_matches_uncached_batched_prefill_and_decode() {
+        let mut policy = gemma4_tiny_policy();
+        force_b_nonzero(&policy.trainable_vars());
+        let cfg = GenConfig {
+            group_size: 4,
+            max_new_tokens: 5,
+            temperature: 1.0,
+            eos_token_id: None,
+            eval_sampling: None,
+        };
+        assert_cached_matches_uncached(&mut policy, &[1u32, 2, 3, 4, 5], &cfg);
     }
 
     // ---- detached scoring + checkpointed backward (P7) ----------------------
