@@ -1,11 +1,11 @@
 //! Gemma 4 text-model config parsing and validation.
 //!
 //! This module is the native Gemma 4 support surface: it accepts the public
-//! Hugging Face `config.json` shape (`model_type: "gemma4"`, decoder under
-//! `text_config`) and fails loud on text variants the native ferrl forward does
-//! not yet implement. The initial target is the dense Gemma 4 31B text decoder;
-//! vision/audio wrappers are tolerated because text-only RL never requests
-//! those tensors.
+//! Hugging Face `config.json` shapes (`model_type: "gemma4"` or
+//! `"gemma4_unified"`, decoder under `text_config`) and fails loud on text
+//! variants the native ferrl forward does not yet implement. The initial target
+//! is the dense Gemma 4 text decoder; vision/audio wrappers are tolerated
+//! because text-only RL never requests those tensors.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -73,6 +73,14 @@ fn default_gemma4_text_model_type() -> Option<String> {
     Some("gemma4_text".to_string())
 }
 
+fn is_supported_top_level_model_type(model_type: &str) -> bool {
+    matches!(model_type, "gemma4" | "gemma4_unified")
+}
+
+fn is_supported_text_model_type(model_type: &str) -> bool {
+    matches!(model_type, "gemma4_text" | "gemma4_unified_text")
+}
+
 /// The `text_config` object consumed by ferrl's native Gemma 4 path.
 ///
 /// Unknown keys are tolerated: shipped checkpoints include wrapper and modality
@@ -81,7 +89,7 @@ fn default_gemma4_text_model_type() -> Option<String> {
 /// cannot silently load through the wrong architecture.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Gemma4TextConfig {
-    /// Text decoder model type (`"gemma4_text"`).
+    /// Text decoder model type (`"gemma4_text"` or `"gemma4_unified_text"`).
     #[serde(default = "default_gemma4_text_model_type")]
     pub model_type: Option<String>,
     /// Vocabulary size.
@@ -153,12 +161,15 @@ pub struct Gemma4TextConfig {
     /// Per-expert MLP width, if this is an `MoE` member.
     #[serde(default)]
     pub expert_intermediate_size: Option<usize>,
+    /// Alternate upstream name for per-expert MLP width.
+    #[serde(default)]
+    pub moe_intermediate_size: Option<usize>,
 }
 
 /// A full Gemma 4 checkpoint config (`config.json`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct Gemma4Config {
-    /// Top-level model type (`"gemma4"`).
+    /// Top-level model type (`"gemma4"` or `"gemma4_unified"`).
     #[serde(default)]
     pub model_type: Option<String>,
     /// Top-level tied-embedding flag. It must agree with the text config when
@@ -205,8 +216,11 @@ impl Gemma4Config {
     /// Returns a candle error naming the unsupported field/value.
     pub fn validate(&self) -> CandleResult<()> {
         if let Some(mt) = &self.model_type {
-            if mt != "gemma4" {
-                bail!("gemma4 config: model_type {mt:?}, expected \"gemma4\"");
+            if !is_supported_top_level_model_type(mt) {
+                bail!(
+                    "gemma4 config: model_type {mt:?}, expected \"gemma4\" or \
+                     \"gemma4_unified\""
+                );
             }
         }
         if let Some(outer) = self.tie_word_embeddings {
@@ -240,10 +254,17 @@ impl Gemma4TextConfig {
     /// Returns a candle error naming the offending field and value.
     #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> CandleResult<()> {
-        if self.model_type.as_deref() != Some("gemma4_text") {
+        let Some(model_type) = self.model_type.as_deref() else {
             bail!(
-                "gemma4 config: text_config.model_type {:?}, expected \"gemma4_text\"",
-                self.model_type
+                "gemma4 config: text_config.model_type missing, expected \"gemma4_text\" or \
+                 \"gemma4_unified_text\""
+            );
+        };
+        if !is_supported_text_model_type(model_type) {
+            bail!(
+                "gemma4 config: text_config.model_type {:?}, expected \"gemma4_text\" or \
+                 \"gemma4_unified_text\"",
+                model_type
             );
         }
         for (name, v) in [
@@ -273,7 +294,7 @@ impl Gemma4TextConfig {
         if self.hidden_size_per_layer_input != 0 {
             bail!(
                 "gemma4 config: hidden_size_per_layer_input {} unsupported (the initial \
-                 dense 31B text path does not implement per-layer embeddings)",
+                 dense text path does not implement per-layer embeddings)",
                 self.hidden_size_per_layer_input
             );
         }
@@ -289,10 +310,11 @@ impl Gemma4TextConfig {
             || self.num_experts.is_some()
             || self.top_k_experts.is_some()
             || self.expert_intermediate_size.is_some()
+            || self.moe_intermediate_size.is_some()
         {
             bail!(
                 "gemma4 config: MoE fields unsupported in the initial native path (first \
-                 target is dense 31B)"
+                 target is dense text checkpoints)"
             );
         }
         if self.hidden_activation != "gelu_pytorch_tanh" {
@@ -1840,6 +1862,69 @@ mod tests {
         Gemma4Config::from_json_str(TINY_GEMMA4_TEXT_CONFIG).unwrap()
     }
 
+    fn gemma4_unified_12b_config_json() -> String {
+        let layer_types: Vec<&str> = (0..48)
+            .map(|i| {
+                if (i + 1) % 6 == 0 {
+                    "full_attention"
+                } else {
+                    "sliding_attention"
+                }
+            })
+            .collect();
+        serde_json::json!({
+            "model_type": "gemma4_unified",
+            "tie_word_embeddings": true,
+            "audio_config": { "model_type": "gemma4_unified_audio" },
+            "vision_config": { "model_type": "gemma4_unified_vision" },
+            "text_config": {
+                "attention_bias": false,
+                "attention_dropout": 0.0,
+                "attention_k_eq_v": true,
+                "enable_moe_block": false,
+                "expert_intermediate_size": null,
+                "final_logit_softcapping": 30.0,
+                "global_head_dim": 512,
+                "head_dim": 256,
+                "hidden_activation": "gelu_pytorch_tanh",
+                "hidden_size": 3840,
+                "hidden_size_per_layer_input": 0,
+                "intermediate_size": 15360,
+                "layer_types": layer_types,
+                "max_position_embeddings": 262144,
+                "model_type": "gemma4_unified_text",
+                "moe_intermediate_size": null,
+                "num_attention_heads": 16,
+                "num_experts": null,
+                "num_global_key_value_heads": 1,
+                "num_hidden_layers": 48,
+                "num_key_value_heads": 8,
+                "num_kv_shared_layers": 0,
+                "rms_norm_eps": 1e-6,
+                "rope_parameters": {
+                    "full_attention": {
+                        "partial_rotary_factor": 0.25,
+                        "rope_theta": 1000000.0,
+                        "rope_type": "proportional"
+                    },
+                    "sliding_attention": {
+                        "rope_theta": 10000.0,
+                        "rope_type": "default"
+                    }
+                },
+                "sliding_window": 1024,
+                "tie_word_embeddings": true,
+                "top_k_experts": null,
+                "use_bidirectional_attention": "vision",
+                "use_cache": true,
+                "use_double_wide_mlp": false,
+                "vocab_size": 262144,
+                "vocab_size_per_layer_input": 262144
+            }
+        })
+        .to_string()
+    }
+
     fn put_rand(t: &mut HashMap<String, Tensor>, name: &str, dims: &[usize]) {
         t.insert(
             name.to_string(),
@@ -2248,6 +2333,31 @@ mod tests {
     }
 
     #[test]
+    fn parses_unified_12b_dense_text_model_types() {
+        let json = gemma4_unified_12b_config_json();
+        let cfg = Gemma4Config::from_json_str(&json).unwrap();
+        assert_eq!(cfg.model_type.as_deref(), Some("gemma4_unified"));
+        assert_eq!(
+            cfg.text_config.model_type.as_deref(),
+            Some("gemma4_unified_text")
+        );
+    }
+
+    #[test]
+    fn parses_unified_12b_dense_text_geometry() {
+        let json = gemma4_unified_12b_config_json();
+        let cfg = Gemma4Config::from_json_str(&json).unwrap();
+        assert_eq!(cfg.text_config.hidden_size, 3840);
+        assert_eq!(cfg.text_config.num_hidden_layers, 48);
+        assert_eq!(cfg.text_config.sliding_window, 1024);
+        assert_eq!(cfg.text_config.full_attention_rotary_dim(), 128);
+        assert_eq!(
+            cfg.text_config.layer_types.last(),
+            Some(&Gemma4LayerType::FullAttention)
+        );
+    }
+
+    #[test]
     fn rejects_wrong_top_level_model_type() {
         let json = GEMMA4_31B_TEXT_CONFIG.replace("\"gemma4\"", "\"gemma3\"");
         let err = Gemma4Config::from_json_str(&json).unwrap_err().to_string();
@@ -2256,11 +2366,58 @@ mod tests {
     }
 
     #[test]
+    fn rejects_wrong_unified_text_model_type() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&gemma4_unified_12b_config_json()).unwrap();
+        value["text_config"]["model_type"] = serde_json::json!("gemma4_unified_audio");
+        let err = Gemma4Config::from_json_str(&value.to_string())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("text_config.model_type"));
+        assert!(err.contains("gemma4_unified_text"));
+    }
+
+    #[test]
     fn rejects_moe_fields_in_initial_native_path() {
         let json = GEMMA4_31B_TEXT_CONFIG
             .replace("\"enable_moe_block\": false", "\"enable_moe_block\": true")
             .replace("\"num_experts\": null", "\"num_experts\": 128");
         let err = Gemma4Config::from_json_str(&json).unwrap_err().to_string();
+        assert!(err.contains("MoE fields unsupported"));
+    }
+
+    #[test]
+    fn rejects_unified_per_layer_embeddings() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&gemma4_unified_12b_config_json()).unwrap();
+        value["text_config"]["hidden_size_per_layer_input"] = serde_json::json!(128);
+        let err = Gemma4Config::from_json_str(&value.to_string())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("hidden_size_per_layer_input"));
+    }
+
+    #[test]
+    fn rejects_unified_moe_fields() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&gemma4_unified_12b_config_json()).unwrap();
+        value["text_config"]["enable_moe_block"] = serde_json::json!(true);
+        value["text_config"]["num_experts"] = serde_json::json!(128);
+        value["text_config"]["top_k_experts"] = serde_json::json!(8);
+        let err = Gemma4Config::from_json_str(&value.to_string())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("MoE fields unsupported"));
+    }
+
+    #[test]
+    fn rejects_unified_moe_intermediate_size() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&gemma4_unified_12b_config_json()).unwrap();
+        value["text_config"]["moe_intermediate_size"] = serde_json::json!(15360);
+        let err = Gemma4Config::from_json_str(&value.to_string())
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("MoE fields unsupported"));
     }
 

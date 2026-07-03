@@ -18,10 +18,13 @@ candle's.
 > checkpoint primitive), and a held-out eval harness — scales to a **Qwen3.6-27B
 > LoRA-GRPO run end-to-end on a single H200** (forward-equivalent to the reference,
 > rematerialization fits the activation footprint, training reward rises). Grad-bearing
-> forwards exist for **three architectures** — Qwen3 (dense), dense Llama-3.x, and the
-> hybrid `qwen3_5` family (GatedDeltaNet + gated GQA, i.e. Qwen3.5/3.6) — behind the
-> `GradModel`/`CachedDecoder` trait seam, so one generic policy and trainer drive all
-> three unchanged, each pinned by per-position logit-equivalence gates.
+> forwards exist for **four architecture families** — Qwen3 (dense), dense Llama-3.x, the
+> hybrid `qwen3_5` family (GatedDeltaNet + gated GQA, i.e. Qwen3.5/3.6), and dense
+> Gemma 4 text (`gemma4`, with `gemma4_unified` accepted as the same dense text
+> loader shape) — behind the `GradModel`/`CachedDecoder` trait seam, so one generic
+> policy and trainer drive all four unchanged. Gemma 4's committed external oracle
+> covers the upstream dense text `gemma4` / `gemma4_text` reference shape; the unified
+> alias is covered by config/loader gates.
 >
 > **Single-node data parallelism is in and verified on multi-GPU hardware**: an
 > all-reduce of LoRA gradients over an NCCL `Comm` bridge (`--features nccl` — the
@@ -65,10 +68,11 @@ ferrl/
     │   ├── trainer.rs  eval.rs              # training loop + held-out eval harness
     │   ├── lora.rs  optim.rs  sampler.rs  checkpoint.rs
     │   ├── model.rs                         # the GradModel / CachedDecoder trait seam
-    │   ├── qwen.rs  llama.rs  qwen35.rs     # the model layer (grad forwards + cached decoders)
+    │   ├── qwen.rs  llama.rs  qwen35.rs  gemma4.rs
+    │   │                                      # the model layer (grad forwards + cached decoders)
     │   ├── blocks.rs  gdn.rs  remat.rs      # shared blocks, GatedDeltaNet math, activation ckpt
     │   ├── moe.rs                           # qwen3.5/3.6 sparse-MoE kernels (router/experts, M3′)
-    │   ├── lm_policy.rs                     # Policy over any GradModel (Qwen/Llama/Qwen3_5 Policy)
+    │   ├── lm_policy.rs                     # Policy over any GradModel (Qwen/Llama/Qwen3_5/Gemma4)
     │   ├── comm.rs  comm/                   # data-parallel Comm seam (Solo/Local + NCCL bridge)
     │   ├── full_ft.rs                       # opt-in full fine-tune (vs LoRA)
     │   └── {lib,policy,reward,nn,tokenizer,countdown,telemetry,cuda_compat}.rs
@@ -105,12 +109,14 @@ Because ferrl no longer owns autodiff, correctness is pinned against references:
    `scripts/gen_golden.py`. The Rust test `grpo::tests::matches_golden_fixture`
    loads it and asserts agreement (scaled **and** unscaled advantages). See
    [Oracle](#oracle--golden-fixture).
-2. **Model forward vs candle's shipped forward** — per-position logit-equivalence
+2. **Model forward vs model-family references** — per-position logit-equivalence
    gates load our grad-bearing forward and candle's shipped one from the **same**
    weights and compare at **every** position, for both Qwen3 and dense Llama-3.x
    (tiny seeded CPU configs in CI; a real-weights Qwen3-0.6B gate runs manually on
-   GPU). The cached merged-weight decoders are pinned the same way against both the
-   uncached forwards and candle's shipped KV-cached path.
+   GPU). `qwen3_5` / `qwen3_5_moe` and dense Gemma 4 text use committed tiny
+   Transformers fixtures instead. The cached merged-weight decoders are pinned the
+   same way against both the uncached forwards and reference KV-cached paths where a
+   committed cache oracle is present.
 3. **Grad-coverage canary** (`lora::tests::grad_coverage_canary_contract`) — guards a
    real footgun: candle optimizers **silently skip** any parameter missing from the
    `GradStore`. The contract is init-dependent: at standard zero-`B` init only `B`
