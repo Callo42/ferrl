@@ -104,7 +104,7 @@ pub enum LoaderError {
     /// The checkpoint declares a model family this loader does not recognize.
     #[error(
         "unsupported model_type {model_type:?}; recognized values are \"qwen3\", \"qwen3_5\", \
-         \"qwen3_5_moe\", and \"gemma4\""
+         \"qwen3_5_moe\", \"gemma4\", and \"gemma4_unified\""
     )]
     UnsupportedModelType {
         /// The `config.json` `model_type` value, or `None` if the field was absent.
@@ -316,9 +316,9 @@ pub fn load_qwen_policy(
 /// Load any policy supported by the CLI from a checkpoint directory.
 ///
 /// Dispatches `model_type == "qwen3_5"` / `"qwen3_5_moe"` to the Qwen3.5/3.6
-/// loader, `model_type == "gemma4"` to the dense Gemma 4 text loader, and
-/// `model_type == "qwen3"` (or an absent legacy field) to the original Qwen3
-/// loader.
+/// loader, `model_type == "gemma4"` / `"gemma4_unified"` to the dense Gemma 4
+/// text loader, and `model_type == "qwen3"` (or an absent legacy field) to the
+/// original Qwen3 loader.
 ///
 /// # Errors
 ///
@@ -376,7 +376,7 @@ fn read_model_type(dir: &Path) -> Result<Option<ModelType>, LoaderError> {
     Ok(Some(match model_type {
         "qwen3" => ModelType::Qwen3,
         "qwen3_5" | "qwen3_5_moe" => ModelType::Qwen3_5,
-        "gemma4" => ModelType::Gemma4,
+        "gemma4" | "gemma4_unified" => ModelType::Gemma4,
         other => ModelType::Unsupported(Some(other.to_string())),
     }))
 }
@@ -434,15 +434,18 @@ pub fn load_gemma4_policy(
     device: &Device,
     opts: &LoaderOpts,
 ) -> Result<(Gemma4Policy, HfTokenizer), LoaderError> {
+    let cfg = read_gemma4_config(dir)?;
     if opts.memory_efficient_cached_gqa {
         return Err(LoaderError::UnsupportedLoaderOption {
             option: "policy.memory_efficient_cached_gqa".to_string(),
             supported: "qwen3_5".to_string(),
-            model_type: "gemma4".to_string(),
+            model_type: cfg
+                .model_type
+                .clone()
+                .unwrap_or_else(|| "gemma4".to_string()),
         });
     }
 
-    let cfg = read_gemma4_config(dir)?;
     let vb = gemma4_varbuilder_from_pretrained(dir, opts.base_dtype, device)?;
     let model = Gemma4GradModel::load_with_adapter_dtype(
         &cfg,
@@ -580,9 +583,38 @@ mod tests {
     }
 
     #[test]
+    fn model_type_detection_routes_gemma4_unified_family() {
+        let tmp = TempDir::new("loader-gemma4-unified-model-type");
+        std::fs::write(
+            tmp.path().join("config.json"),
+            r#"{ "model_type": "gemma4_unified" }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_model_type(tmp.path()).unwrap(),
+            Some(ModelType::Gemma4)
+        );
+    }
+
+    #[test]
     fn auto_loader_reaches_gemma4_weight_load_after_config_validation() {
         let tmp = TempDir::new("loader-gemma4-recognized");
         std::fs::write(tmp.path().join("config.json"), gemma4_config_json()).unwrap();
+        match load_auto_policy(tmp.path(), &Device::Cpu, &LoaderOpts::default()) {
+            Err(LoaderError::Model(e)) => {
+                let msg = e.to_string();
+                assert!(msg.contains("gemma4 loader"));
+                assert!(msg.contains("model.safetensors"));
+            }
+            Err(other) => panic!("expected Gemma4 model-load error, got {other:?}"),
+            Ok(_) => panic!("expected Gemma4 model-load error, got loaded policy"),
+        }
+    }
+
+    #[test]
+    fn auto_loader_reaches_gemma4_unified_weight_load_after_config_validation() {
+        let tmp = TempDir::new("loader-gemma4-unified-recognized");
+        std::fs::write(tmp.path().join("config.json"), gemma4_unified_config_json()).unwrap();
         match load_auto_policy(tmp.path(), &Device::Cpu, &LoaderOpts::default()) {
             Err(LoaderError::Model(e)) => {
                 let msg = e.to_string();
@@ -611,6 +643,29 @@ mod tests {
                 assert_eq!(option, "policy.memory_efficient_cached_gqa");
                 assert_eq!(supported, "qwen3_5");
                 assert_eq!(model_type, "gemma4");
+            }
+            Err(other) => panic!("expected UnsupportedLoaderOption, got {other:?}"),
+            Ok(_) => panic!("expected UnsupportedLoaderOption, got loaded policy"),
+        }
+    }
+
+    #[test]
+    fn gemma4_unified_loader_rejects_qwen35_cached_gqa_option_with_unified_model_type() {
+        let tmp = TempDir::new("loader-gemma4-unified-gqa-option");
+        std::fs::write(tmp.path().join("config.json"), gemma4_unified_config_json()).unwrap();
+        let opts = LoaderOpts {
+            memory_efficient_cached_gqa: true,
+            ..LoaderOpts::default()
+        };
+        match load_auto_policy(tmp.path(), &Device::Cpu, &opts) {
+            Err(LoaderError::UnsupportedLoaderOption {
+                option,
+                supported,
+                model_type,
+            }) => {
+                assert_eq!(option, "policy.memory_efficient_cached_gqa");
+                assert_eq!(supported, "qwen3_5");
+                assert_eq!(model_type, "gemma4_unified");
             }
             Err(other) => panic!("expected UnsupportedLoaderOption, got {other:?}"),
             Ok(_) => panic!("expected UnsupportedLoaderOption, got loaded policy"),
@@ -743,5 +798,18 @@ mod tests {
                 "vocab_size_per_layer_input": 262144
             }
         }"#
+    }
+
+    fn gemma4_unified_config_json() -> String {
+        gemma4_config_json()
+            .replacen(
+                "\"model_type\": \"gemma4\"",
+                "\"model_type\": \"gemma4_unified\"",
+                1,
+            )
+            .replace(
+                "\"model_type\": \"gemma4_text\"",
+                "\"model_type\": \"gemma4_unified_text\"",
+            )
     }
 }
