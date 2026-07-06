@@ -7,7 +7,7 @@
 //! ferrl trimul-score --config run.json --prompt-copy prompt.txt --completion raw.txt --out scores.jsonl
 //! ferrl trimul-score --config run.json --prompt-copy prompt.txt --completion raw.txt --completion-normalization llama-cpp --out scores.jsonl
 //! ferrl trimul-artifact --config run.json --prompt-copy runs/trimul-1/prompt.txt --completion raw.txt --out artifact/ ...
-//! ferrl runreport <run-dir> [--json] [--strict]   # one-glance run health summary
+//! ferrl runreport <run-dir> [--config run.json] [--json] [--strict]   # one-glance run health summary
 //! ferrl perf-gate --baseline <run-dir> --candidate <run-dir>   # resource regression check
 //! ```
 //!
@@ -29,8 +29,10 @@
 //! `trimul-artifact` remains the strict repeated audit gate.
 //!
 //! `runreport` folds in the standalone run-summary tool: it reads a run's
-//! `metrics.jsonl` and prints (or emits as JSON) a [`RunSummary`](ferrl::RunSummary),
-//! optionally failing (`--strict`, exit code 2) when any health anomaly is flagged.
+//! `metrics.jsonl` and prints (or emits as JSON) a [`RunSummary`](ferrl::RunSummary).
+//! With `--config`, it also applies the run config's post-run `run_health` policy.
+//! It exits with code 2 when a `fail` policy finding is raised, or when `--strict`
+//! sees any summary anomaly or policy finding.
 //!
 //! `perf-gate` compares a baseline and candidate metrics stream, failing when
 //! the update path goes dark or peak memory / step time exceed configured
@@ -39,7 +41,7 @@
 // A CLI whose interface *is* its stdout/stderr; the library logs via `tracing`.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs::OpenOptions;
 use std::io::Write as IoWrite;
@@ -374,10 +376,13 @@ struct NormalizedCompletion {
 struct RunreportArgs {
     /// A run directory (its `metrics.jsonl` is used) or a `metrics.jsonl` file.
     path: PathBuf,
+    /// Top-level `ferrl train --config` JSON whose `run_health` policy is applied.
+    #[arg(long)]
+    config: Option<PathBuf>,
     /// Emit the summary as JSON instead of the human report.
     #[arg(long)]
     json: bool,
-    /// Exit non-zero (code 2) if any health anomaly is flagged.
+    /// Exit with code 2 if summary anomalies or configured policy findings are flagged.
     #[arg(long)]
     strict: bool,
 }
@@ -678,9 +683,6 @@ struct TrimulCfg {
 }
 
 /// Discovery-health policy schema.
-///
-/// PR-A schema lock only: non-empty policies are rejected until the configurable
-/// health-policy follow-up wires this into `runreport` / train gating.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct RunHealthCfg {
@@ -699,12 +701,18 @@ struct RunHealthCfg {
 }
 
 impl RunHealthCfg {
-    fn validate_current_support(&self) -> Result<(), CliError> {
+    fn validate_current_support(&self, trainer: &TrainerConfig) -> Result<(), CliError> {
         if let Some(rule) = &self.reward_collapse {
             rule.validate("run_health.reward_collapse")?;
+            validate_health_window("run_health.reward_collapse", rule.window, trainer.steps)?;
         }
         if let Some(rule) = &self.correctness_collapse {
-            rule.validate("run_health.correctness_collapse")?;
+            rule.validate_fraction_min("run_health.correctness_collapse")?;
+            validate_health_window(
+                "run_health.correctness_collapse",
+                rule.window,
+                trainer.steps,
+            )?;
         }
         if let Some(rule) = &self.dropped_rows {
             rule.validate("run_health.dropped_rows")?;
@@ -713,36 +721,132 @@ impl RunHealthCfg {
             rule.validate("run_health.grad_spike")?;
         }
         if let Some(action) = self.telemetry_dark {
-            validate_health_action(action);
+            validate_post_run_health_action("run_health.telemetry_dark", action)?;
         }
         if let Some(rule) = &self.source_dominance {
             rule.validate("run_health.source_dominance")?;
         }
-        if self != &Self::default() {
-            return Err(CliError::msg(
-                "run_health is schema-reserved but not enforced yet; omit non-default \
-                 run_health policies until the configurable run-health follow-up",
-            ));
+        if self.needs_candidate_ledger() && trainer.candidate_log_top_k < trainer.group_size {
+            return Err(CliError::msg(format!(
+                "run_health correctness/source policies require \
+                 trainer.candidate_log_top_k >= trainer.group_size for full candidate coverage \
+                 (candidate_log_top_k={}, group_size={})",
+                trainer.candidate_log_top_k, trainer.group_size
+            )));
         }
         Ok(())
     }
+
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+
+    fn needs_candidate_ledger(&self) -> bool {
+        self.correctness_collapse.is_some() || self.source_dominance.is_some()
+    }
+
+    fn evaluate(
+        &self,
+        history: &[ferrl::Metrics],
+        summary: &ferrl::RunSummary,
+        ctx: RunHealthEvalCtx,
+        candidates: Option<&CandidateHealth>,
+    ) -> RunHealthReport {
+        let mut report = RunHealthReport::default();
+        self.evaluate_metric_rules(history, summary, &mut report);
+        self.evaluate_candidate_rules(history, ctx, candidates, &mut report);
+        report
+    }
+
+    fn evaluate_metric_rules(
+        &self,
+        history: &[ferrl::Metrics],
+        summary: &ferrl::RunSummary,
+        report: &mut RunHealthReport,
+    ) {
+        if let Some(rule) = &self.reward_collapse {
+            push_reward_collapse_finding(history, rule, report);
+        }
+        if let Some(rule) = &self.dropped_rows {
+            if u64::from(summary.total_dropped_rows) > rule.max {
+                report.push(
+                    "dropped_rows",
+                    rule.action,
+                    format!(
+                        "dropped rows {} exceeded max {}",
+                        summary.total_dropped_rows, rule.max
+                    ),
+                );
+            }
+        }
+        if let Some(rule) = &self.grad_spike {
+            push_grad_spike_finding(history, rule, report);
+        }
+        if let Some(action) = self.telemetry_dark {
+            if !history.is_empty() && history.iter().all(|m| m.rollout_capture_tokens == 0) {
+                report.push(
+                    "telemetry_dark",
+                    action,
+                    "off-policy drift telemetry was dark for every step".to_string(),
+                );
+            }
+        }
+    }
+
+    fn evaluate_candidate_rules(
+        &self,
+        history: &[ferrl::Metrics],
+        ctx: RunHealthEvalCtx,
+        candidates: Option<&CandidateHealth>,
+        report: &mut RunHealthReport,
+    ) {
+        if let Some(rule) = &self.correctness_collapse {
+            push_correctness_collapse_finding(history, ctx, candidates, rule, report);
+        }
+        if let Some(rule) = &self.source_dominance {
+            push_source_dominance_finding(history, ctx, candidates, rule, report);
+        }
+    }
 }
 
-/// Action a future health policy may take.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+fn validate_health_window(label: &str, window: usize, trainer_steps: u64) -> Result<(), CliError> {
+    if window as u64 > trainer_steps {
+        return Err(CliError::msg(format!(
+            "{label}.window ({window}) must be <= trainer.steps ({trainer_steps})"
+        )));
+    }
+    Ok(())
+}
+
+/// Action a post-run health policy may take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum HealthActionCfg {
     /// Report but do not fail.
     Warn,
     /// Fail the post-run health gate.
     Fail,
-    /// Stop a run once in-run gating exists.
+    /// Reserved for a future in-run gate; rejected by the post-run policy.
     Stop,
 }
 
-fn validate_health_action(action: HealthActionCfg) {
+impl HealthActionCfg {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Warn => "WARN",
+            Self::Fail => "FAIL",
+            Self::Stop => "STOP",
+        }
+    }
+}
+
+fn validate_post_run_health_action(label: &str, action: HealthActionCfg) -> Result<(), CliError> {
     match action {
-        HealthActionCfg::Warn | HealthActionCfg::Fail | HealthActionCfg::Stop => {}
+        HealthActionCfg::Warn | HealthActionCfg::Fail => Ok(()),
+        HealthActionCfg::Stop => Err(CliError::msg(format!(
+            "{label}.action = \"stop\" is reserved for future in-run gating; use \"warn\" or \
+             \"fail\" for the post-run policy"
+        ))),
     }
 }
 
@@ -766,7 +870,14 @@ impl WindowThresholdCfg {
         if !self.min.is_finite() {
             return Err(CliError::msg(format!("{label}.min must be finite")));
         }
-        validate_health_action(self.action);
+        validate_post_run_health_action(label, self.action)
+    }
+
+    fn validate_fraction_min(&self, label: &str) -> Result<(), CliError> {
+        self.validate(label)?;
+        if !(0.0..=1.0).contains(&self.min) {
+            return Err(CliError::msg(format!("{label}.min must be in [0, 1]")));
+        }
         Ok(())
     }
 }
@@ -782,10 +893,8 @@ struct CountThresholdCfg {
 }
 
 impl CountThresholdCfg {
-    fn validate(&self, _label: &str) -> Result<(), CliError> {
-        let _max = self.max;
-        validate_health_action(self.action);
-        Ok(())
+    fn validate(&self, label: &str) -> Result<(), CliError> {
+        validate_post_run_health_action(label, self.action)
     }
 }
 
@@ -806,8 +915,7 @@ impl FactorThresholdCfg {
                 "{label}.factor must be finite and > 0"
             )));
         }
-        validate_health_action(self.action);
-        Ok(())
+        validate_post_run_health_action(label, self.action)
     }
 }
 
@@ -828,8 +936,70 @@ impl FractionThresholdCfg {
                 "{label}.max_fraction must be finite and in [0, 1]"
             )));
         }
-        validate_health_action(self.action);
-        Ok(())
+        validate_post_run_health_action(label, self.action)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RunHealthVerdict {
+    #[default]
+    Healthy,
+    Warn,
+    Fail,
+}
+
+impl RunHealthVerdict {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Healthy => "HEALTHY",
+            Self::Warn => "WARN",
+            Self::Fail => "FAIL",
+        }
+    }
+
+    fn observe(&mut self, action: HealthActionCfg) {
+        match action {
+            HealthActionCfg::Warn if *self == Self::Healthy => *self = Self::Warn,
+            HealthActionCfg::Fail => *self = Self::Fail,
+            HealthActionCfg::Warn | HealthActionCfg::Stop => {}
+        }
+    }
+
+    fn is_fail(self) -> bool {
+        self == Self::Fail
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct RunHealthFinding {
+    rule: &'static str,
+    action: HealthActionCfg,
+    message: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+struct RunHealthReport {
+    verdict: RunHealthVerdict,
+    findings: Vec<RunHealthFinding>,
+}
+
+impl RunHealthReport {
+    fn push(&mut self, rule: &'static str, action: HealthActionCfg, message: String) {
+        self.verdict.observe(action);
+        self.findings.push(RunHealthFinding {
+            rule,
+            action,
+            message,
+        });
+    }
+
+    fn has_findings(&self) -> bool {
+        !self.findings.is_empty()
+    }
+
+    fn is_fail(&self) -> bool {
+        self.verdict.is_fail()
     }
 }
 
@@ -874,8 +1044,7 @@ struct RunConfig {
     /// TriMul task knobs (only read when `task == "trimul"`).
     #[serde(default)]
     trimul: TrimulCfg,
-    /// Discovery health policy. Non-default values are schema-reserved until
-    /// the follow-up that wires this into health evaluation.
+    /// Discovery health policy applied after training and by `runreport --config`.
     #[serde(default)]
     run_health: RunHealthCfg,
     /// The GRPO trainer config.
@@ -917,7 +1086,7 @@ impl RunConfig {
 
     fn validate_current_config_support(&self) -> Result<(), CliError> {
         self.trimul.reward.validate().map_err(CliError::msg)?;
-        self.run_health.validate_current_support()
+        self.run_health.validate_current_support(&self.trainer)
     }
 
     /// The loader options for this run (rollout temperature mirrors the trainer's).
@@ -1154,6 +1323,7 @@ fn run_training<R: RewardFn>(
     let (history, _stop) = trainer.train(&mut policy, reward, &tok, train)?;
     if let Some(summary) = summarize(&history) {
         info!(steps = summary.steps, "ferrl train: complete");
+        apply_train_run_health_policy(cfg, &history, &summary, &run)?;
     }
 
     if !eval.is_empty() {
@@ -1171,6 +1341,28 @@ fn run_training<R: RewardFn>(
         "ferrl: inspect with `ferrl runreport {}`",
         run.root().display()
     );
+    Ok(())
+}
+
+fn apply_train_run_health_policy(
+    cfg: &RunConfig,
+    history: &[ferrl::Metrics],
+    summary: &ferrl::RunSummary,
+    run: &RunDir,
+) -> Result<(), CliError> {
+    let health_report = evaluate_run_health_policy(
+        &cfg.run_health,
+        history,
+        summary,
+        RunHealthEvalCtx::from_trainer(&cfg.trainer),
+        run.root(),
+    )?;
+    if !cfg.run_health.is_default() {
+        print_run_health_report(&health_report);
+    }
+    if health_report.is_fail() {
+        return Err(CliError::msg("run_health policy failed"));
+    }
     Ok(())
 }
 
@@ -2580,18 +2772,79 @@ fn runreport(args: &RunreportArgs) -> Result<ExitCode, CliError> {
             metrics_path.display()
         ))
     })?;
+    let health_report = if let Some(config_path) = &args.config {
+        let cfg = RunConfig::load(config_path)?;
+        Some(evaluate_run_health_policy(
+            &cfg.run_health,
+            &history,
+            &summary,
+            RunHealthEvalCtx::from_trainer(&cfg.trainer),
+            &args.path,
+        )?)
+    } else {
+        None
+    };
     if args.json {
-        let s = serde_json::to_string_pretty(&summary)
-            .map_err(|e| CliError::msg(format!("serialize summary: {e}")))?;
+        let s = if let Some(report) = &health_report {
+            serde_json::to_string_pretty(&RunreportJson {
+                summary: &summary,
+                run_health: report,
+            })
+        } else {
+            serde_json::to_string_pretty(&summary)
+        }
+        .map_err(|e| CliError::msg(format!("serialize summary: {e}")))?;
         println!("{s}");
     } else {
         // `RunSummary`'s Display already terminates each line with a newline.
         print!("{summary}");
+        if let Some(report) = &health_report {
+            print_run_health_report(report);
+        }
     }
-    if args.strict && !summary.anomalies.is_empty() {
+    let policy_failed = health_report.as_ref().is_some_and(RunHealthReport::is_fail);
+    let strict_failed = args.strict
+        && (!summary.anomalies.is_empty()
+            || health_report
+                .as_ref()
+                .is_some_and(RunHealthReport::has_findings));
+    if policy_failed || strict_failed {
         return Ok(ExitCode::from(2));
     }
     Ok(ExitCode::SUCCESS)
+}
+
+#[derive(Serialize)]
+struct RunreportJson<'a> {
+    summary: &'a ferrl::RunSummary,
+    run_health: &'a RunHealthReport,
+}
+
+fn evaluate_run_health_policy(
+    policy: &RunHealthCfg,
+    history: &[ferrl::Metrics],
+    summary: &ferrl::RunSummary,
+    ctx: RunHealthEvalCtx,
+    run_path: &Path,
+) -> Result<RunHealthReport, CliError> {
+    let candidates = if policy.needs_candidate_ledger() {
+        read_candidate_health_inputs(&[run_path.to_path_buf()])?
+    } else {
+        None
+    };
+    Ok(policy.evaluate(history, summary, ctx, candidates.as_ref()))
+}
+
+fn print_run_health_report(report: &RunHealthReport) {
+    println!("run health policy — {}", report.verdict.label());
+    for finding in &report.findings {
+        println!(
+            "  {} {}: {}",
+            finding.action.label(),
+            finding.rule,
+            finding.message
+        );
+    }
 }
 
 /// Dispatch `ferrl perf-gate`: compare baseline and candidate metrics streams.
@@ -2662,10 +2915,40 @@ fn read_metrics_inputs(paths: &[PathBuf]) -> Result<Vec<Vec<ferrl::Metrics>>, Cl
         .collect::<Result<Vec<_>, _>>()?)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RunHealthEvalCtx {
+    group_size: usize,
+    prompt_groups_per_step: usize,
+}
+
+impl RunHealthEvalCtx {
+    fn from_trainer(trainer: &TrainerConfig) -> Self {
+        Self {
+            group_size: trainer.group_size,
+            prompt_groups_per_step: trainer.grad_accum_steps,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct CandidateHealth {
+    total: usize,
     diagnostics: usize,
     source_buckets: BTreeMap<String, usize>,
+    steps: BTreeMap<u64, CandidateStepHealth>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CandidateStepHealth {
+    total: usize,
+    correctness_supported: usize,
+    correct: usize,
+    prompt_groups: BTreeMap<u64, CandidatePromptGroupHealth>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CandidatePromptGroupHealth {
+    group_indices: BTreeSet<usize>,
 }
 
 fn apply_candidate_health_gate(
@@ -2702,14 +2985,42 @@ fn read_candidate_health_inputs(paths: &[PathBuf]) -> Result<Option<CandidateHea
             let record: CandidateRecord = serde_json::from_str(line).map_err(|e| {
                 CliError::msg(format!("parse {} line {}: {e}", path.display(), idx + 1))
             })?;
+            health.total += 1;
             health.diagnostics += usize::from(record.reward_diagnostic.is_some());
             *health
                 .source_buckets
                 .entry(candidate_source_bucket(&record))
                 .or_default() += 1;
+            let step = health.steps.entry(record.step).or_default();
+            step.total += 1;
+            step.prompt_groups
+                .entry(record.prompt_index)
+                .or_default()
+                .group_indices
+                .insert(record.group_index);
+            if let Some(correct) = candidate_correctness(&record) {
+                step.correctness_supported += 1;
+                step.correct += usize::from(correct);
+            }
         }
     }
     Ok(found.then_some(health))
+}
+
+fn candidate_correctness(record: &CandidateRecord) -> Option<bool> {
+    let metadata = record.reward_metadata.as_ref()?;
+    if let Some(correct) = metadata.get("correct").and_then(serde_json::Value::as_bool) {
+        return Some(correct);
+    }
+    let task_is_trimul = metadata.get("task").and_then(serde_json::Value::as_str) == Some("trimul");
+    let no_submission = metadata
+        .get("submission_extracted")
+        .and_then(serde_json::Value::as_bool)
+        == Some(false);
+    if task_is_trimul && (no_submission || record.reward_diagnostic.is_some()) {
+        return Some(false);
+    }
+    None
 }
 
 fn candidate_source_bucket(record: &CandidateRecord) -> String {
@@ -2721,6 +3032,329 @@ fn candidate_source_bucket(record: &CandidateRecord) -> String {
         .filter(|source| !source.trim().is_empty())
         .unwrap_or("__unknown_source__")
         .to_string()
+}
+
+fn push_reward_collapse_finding(
+    history: &[ferrl::Metrics],
+    rule: &WindowThresholdCfg,
+    report: &mut RunHealthReport,
+) {
+    if history.len() < rule.window {
+        report.push(
+            "reward_collapse",
+            rule.action,
+            format!(
+                "only {} metric rows available for {}-step reward window",
+                history.len(),
+                rule.window
+            ),
+        );
+        return;
+    }
+    let tail = &history[history.len() - rule.window..];
+    let mean = tail.iter().map(|m| f64::from(m.reward_mean)).sum::<f64>() / tail.len() as f64;
+    if mean < rule.min {
+        report.push(
+            "reward_collapse",
+            rule.action,
+            format!(
+                "trailing {}-step mean reward {mean:.6} fell below min {:.6}",
+                rule.window, rule.min
+            ),
+        );
+    }
+}
+
+fn push_correctness_collapse_finding(
+    history: &[ferrl::Metrics],
+    ctx: RunHealthEvalCtx,
+    candidates: Option<&CandidateHealth>,
+    rule: &WindowThresholdCfg,
+    report: &mut RunHealthReport,
+) {
+    let Some(tail_steps) = trailing_metric_steps(history, rule.window) else {
+        report.push(
+            "correctness_collapse",
+            rule.action,
+            format!(
+                "only {} metric rows available for {}-step correctness window",
+                history.len(),
+                rule.window
+            ),
+        );
+        return;
+    };
+    let Some(candidates) = candidates else {
+        report.push(
+            "correctness_collapse",
+            rule.action,
+            "candidate ledger unavailable; cannot evaluate correctness policy".to_string(),
+        );
+        return;
+    };
+    if candidates.total == 0 {
+        report.push(
+            "correctness_collapse",
+            rule.action,
+            "candidate ledger is empty; cannot evaluate correctness policy".to_string(),
+        );
+        return;
+    }
+    let missing_steps = missing_candidate_steps(candidates, &tail_steps);
+    if !missing_steps.is_empty() {
+        report.push(
+            "correctness_collapse",
+            rule.action,
+            format!(
+                "candidate ledger missing rows for trailing metric steps {}",
+                format_steps(&missing_steps)
+            ),
+        );
+        return;
+    }
+    let partial_steps = partial_candidate_coverage_steps(candidates, &tail_steps, ctx);
+    if !partial_steps.is_empty() {
+        report.push(
+            "correctness_collapse",
+            rule.action,
+            format!(
+                "candidate ledger lacks full group coverage for trailing metric steps {}",
+                format_steps(&partial_steps)
+            ),
+        );
+        return;
+    }
+    let unsupported_steps = unsupported_correctness_steps(candidates, &tail_steps);
+    if !unsupported_steps.is_empty() {
+        report.push(
+            "correctness_collapse",
+            rule.action,
+            format!(
+                "candidate correctness metadata unavailable for trailing metric steps {}",
+                format_steps(&unsupported_steps)
+            ),
+        );
+        return;
+    }
+    let supported = tail_steps
+        .iter()
+        .filter_map(|step| candidates.steps.get(step))
+        .map(|step| step.correctness_supported)
+        .sum::<usize>();
+    if supported == 0 {
+        report.push(
+            "correctness_collapse",
+            rule.action,
+            format!(
+                "no candidate correctness metadata in trailing {} steps",
+                rule.window
+            ),
+        );
+        return;
+    }
+    let correct = tail_steps
+        .iter()
+        .filter_map(|step| candidates.steps.get(step))
+        .map(|step| step.correct)
+        .sum::<usize>();
+    let fraction = correct as f64 / supported as f64;
+    if fraction < rule.min {
+        report.push(
+            "correctness_collapse",
+            rule.action,
+            format!(
+                "trailing {}-step candidate correctness {correct}/{supported} = {fraction:.3} \
+                 fell below min {:.3}",
+                rule.window, rule.min
+            ),
+        );
+    }
+}
+
+fn trailing_metric_steps(history: &[ferrl::Metrics], window: usize) -> Option<Vec<u64>> {
+    if history.len() < window {
+        return None;
+    }
+    Some(
+        history[history.len() - window..]
+            .iter()
+            .map(|m| m.step)
+            .collect(),
+    )
+}
+
+fn missing_candidate_steps(candidates: &CandidateHealth, steps: &[u64]) -> Vec<u64> {
+    steps
+        .iter()
+        .copied()
+        .filter(|step| {
+            candidates
+                .steps
+                .get(step)
+                .is_none_or(|health| health.total == 0)
+        })
+        .collect()
+}
+
+fn partial_candidate_coverage_steps(
+    candidates: &CandidateHealth,
+    steps: &[u64],
+    ctx: RunHealthEvalCtx,
+) -> Vec<u64> {
+    steps
+        .iter()
+        .copied()
+        .filter(|step| {
+            candidates
+                .steps
+                .get(step)
+                .is_some_and(|health| !candidate_step_has_full_coverage(health, ctx))
+        })
+        .collect()
+}
+
+fn candidate_step_has_full_coverage(health: &CandidateStepHealth, ctx: RunHealthEvalCtx) -> bool {
+    health.prompt_groups.len() == ctx.prompt_groups_per_step
+        && health
+            .prompt_groups
+            .values()
+            .all(|group| prompt_group_has_full_coverage(group, ctx.group_size))
+}
+
+fn prompt_group_has_full_coverage(group: &CandidatePromptGroupHealth, group_size: usize) -> bool {
+    group.group_indices.len() == group_size
+        && (0..group_size).all(|idx| group.group_indices.contains(&idx))
+}
+
+fn unsupported_correctness_steps(candidates: &CandidateHealth, steps: &[u64]) -> Vec<u64> {
+    steps
+        .iter()
+        .copied()
+        .filter(|step| {
+            candidates
+                .steps
+                .get(step)
+                .is_some_and(|health| health.correctness_supported == 0)
+        })
+        .collect()
+}
+
+fn format_steps(steps: &[u64]) -> String {
+    steps
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn push_grad_spike_finding(
+    history: &[ferrl::Metrics],
+    rule: &FactorThresholdCfg,
+    report: &mut RunHealthReport,
+) {
+    let median = median_positive_grad_norm(history);
+    if median <= 0.0 {
+        return;
+    }
+    let Some(worst) = history
+        .iter()
+        .max_by(|a, b| a.grad_norm.total_cmp(&b.grad_norm))
+    else {
+        return;
+    };
+    let factor = f64::from(worst.grad_norm) / f64::from(median);
+    if factor > rule.factor {
+        report.push(
+            "grad_spike",
+            rule.action,
+            format!(
+                "grad_norm {:.6} at step {} was {factor:.2}x median {:.6}, above factor {:.2}",
+                worst.grad_norm, worst.step, median, rule.factor
+            ),
+        );
+    }
+}
+
+fn median_positive_grad_norm(history: &[ferrl::Metrics]) -> f32 {
+    let mut values: Vec<f32> = history
+        .iter()
+        .map(|m| m.grad_norm)
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .collect();
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.sort_by(f32::total_cmp);
+    values[values.len() / 2]
+}
+
+fn push_source_dominance_finding(
+    history: &[ferrl::Metrics],
+    ctx: RunHealthEvalCtx,
+    candidates: Option<&CandidateHealth>,
+    rule: &FractionThresholdCfg,
+    report: &mut RunHealthReport,
+) {
+    let Some(candidates) = candidates else {
+        report.push(
+            "source_dominance",
+            rule.action,
+            "candidate ledger unavailable; cannot evaluate source-dominance policy".to_string(),
+        );
+        return;
+    };
+    if candidates.total == 0 {
+        report.push(
+            "source_dominance",
+            rule.action,
+            "candidate ledger is empty; cannot evaluate source-dominance policy".to_string(),
+        );
+        return;
+    }
+    let steps: Vec<u64> = history.iter().map(|metrics| metrics.step).collect();
+    let missing_steps = missing_candidate_steps(candidates, &steps);
+    if !missing_steps.is_empty() {
+        report.push(
+            "source_dominance",
+            rule.action,
+            format!(
+                "candidate ledger missing rows for metric steps {}",
+                format_steps(&missing_steps)
+            ),
+        );
+        return;
+    }
+    let partial_steps = partial_candidate_coverage_steps(candidates, &steps, ctx);
+    if !partial_steps.is_empty() {
+        report.push(
+            "source_dominance",
+            rule.action,
+            format!(
+                "candidate ledger lacks full group coverage for metric steps {}",
+                format_steps(&partial_steps)
+            ),
+        );
+        return;
+    }
+    let Some((source, count)) = candidates
+        .source_buckets
+        .iter()
+        .max_by(|(_, a), (_, b)| a.cmp(b))
+    else {
+        return;
+    };
+    let fraction = *count as f64 / candidates.total as f64;
+    if fraction > rule.max_fraction {
+        report.push(
+            "source_dominance",
+            rule.action,
+            format!(
+                "dominant candidate source {source} covered {count}/{} = {fraction:.3}, above \
+                 max_fraction {:.3}",
+                candidates.total, rule.max_fraction
+            ),
+        );
+    }
 }
 
 fn resolve_candidates_path(input: &Path) -> PathBuf {
@@ -3006,6 +3640,179 @@ mod tests {
         prompt_path
     }
 
+    fn run_health_test_metric(step: u64, reward: f32, grad_norm: f32) -> ferrl::Metrics {
+        let mut m = ferrl::Metrics::at_step(step);
+        m.reward_mean = reward;
+        m.grad_norm = grad_norm;
+        m.rollout_capture_tokens = 8;
+        m.step_secs = 1.0;
+        m.tokens_per_sec = 16.0;
+        m
+    }
+
+    fn write_metrics_jsonl(path: &Path, history: &[ferrl::Metrics]) {
+        let mut raw = String::new();
+        for metrics in history {
+            raw.push_str(&serde_json::to_string(metrics).unwrap());
+            raw.push('\n');
+        }
+        std::fs::write(path, raw).unwrap();
+    }
+
+    fn write_candidate_jsonl(
+        path: &Path,
+        rows: impl IntoIterator<Item = (u64, usize, bool, String)>,
+    ) {
+        write_candidate_jsonl_with_prompts(
+            path,
+            rows.into_iter()
+                .map(|(step, group_index, correct, source_sha256)| {
+                    (step, step, group_index, correct, source_sha256)
+                }),
+        );
+    }
+
+    fn write_candidate_jsonl_with_prompts(
+        path: &Path,
+        rows: impl IntoIterator<Item = (u64, u64, usize, bool, String)>,
+    ) {
+        let mut raw = String::new();
+        for (step, prompt_index, group_index, correct, source_sha256) in rows {
+            let row = serde_json::json!({
+                "step": step,
+                "rank": 0,
+                "world_size": 1,
+                "prompt_index": prompt_index,
+                "group_index": group_index,
+                "reward": if correct { 2.0 } else { 0.05 },
+                "completion_len_tokens": 16,
+                "reward_metadata": {
+                    "task": "trimul",
+                    "source_sha256": source_sha256,
+                    "correct": correct
+                },
+                "completion": "candidate"
+            });
+            raw.push_str(&serde_json::to_string(&row).unwrap());
+            raw.push('\n');
+        }
+        std::fs::write(path, raw).unwrap();
+    }
+
+    fn run_health_eval_ctx(group_size: usize) -> RunHealthEvalCtx {
+        RunHealthEvalCtx {
+            group_size,
+            prompt_groups_per_step: 1,
+        }
+    }
+
+    fn run_health_s50_history() -> Vec<ferrl::Metrics> {
+        (0..50).map(run_health_s50_metric).collect()
+    }
+
+    fn run_health_s50_metric(step: u64) -> ferrl::Metrics {
+        let mut m = run_health_test_metric(step, s50_reward(step), s50_grad_norm(step));
+        m.dropped_rows = s50_dropped_rows(step);
+        m
+    }
+
+    fn s50_reward(step: u64) -> f32 {
+        if step < 25 {
+            2.0
+        } else {
+            0.05
+        }
+    }
+
+    fn s50_grad_norm(step: u64) -> f32 {
+        if step == 30 {
+            20.0
+        } else {
+            1.0
+        }
+    }
+
+    fn s50_dropped_rows(step: u64) -> u32 {
+        if step == 10 {
+            1
+        } else {
+            0
+        }
+    }
+
+    fn run_health_s50_candidate_rows() -> Vec<(u64, usize, bool, String)> {
+        (0..50)
+            .flat_map(|step| {
+                (0..4).map(move |group| {
+                    (
+                        step,
+                        group,
+                        s50_candidate_correct(step, group),
+                        s50_candidate_source(step, group),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    fn s50_candidate_correct(step: u64, group: usize) -> bool {
+        step < 24 || (step == 24 && group < 3)
+    }
+
+    fn s50_candidate_source(step: u64, group: usize) -> String {
+        if step < 30 {
+            "dominant-source".to_string()
+        } else {
+            format!("source-{step}-{group}")
+        }
+    }
+
+    fn s50_run_health_policy() -> RunHealthCfg {
+        RunHealthCfg {
+            reward_collapse: Some(WindowThresholdCfg {
+                window: 10,
+                min: 1.0,
+                action: HealthActionCfg::Fail,
+            }),
+            correctness_collapse: Some(WindowThresholdCfg {
+                window: 10,
+                min: 0.5,
+                action: HealthActionCfg::Fail,
+            }),
+            dropped_rows: Some(CountThresholdCfg {
+                max: 0,
+                action: HealthActionCfg::Warn,
+            }),
+            grad_spike: Some(FactorThresholdCfg {
+                factor: 8.0,
+                action: HealthActionCfg::Warn,
+            }),
+            telemetry_dark: None,
+            source_dominance: Some(FractionThresholdCfg {
+                max_fraction: 0.5,
+                action: HealthActionCfg::Warn,
+            }),
+        }
+    }
+
+    fn assert_run_health_rules(report: &RunHealthReport, expected: &[&str]) {
+        let rules: Vec<_> = report.findings.iter().map(|f| f.rule).collect();
+        for rule in expected {
+            assert!(rules.contains(rule), "{rules:?}");
+        }
+    }
+
+    fn correctness_collapse_policy() -> RunHealthCfg {
+        RunHealthCfg {
+            correctness_collapse: Some(WindowThresholdCfg {
+                window: 2,
+                min: 0.5,
+                action: HealthActionCfg::Fail,
+            }),
+            ..RunHealthCfg::default()
+        }
+    }
+
     /// A minimal countdown run config parses with sensible defaults.
     #[test]
     #[allow(clippy::cognitive_complexity)] // assertion-heavy test: many small checks, no real branching
@@ -3094,7 +3901,85 @@ mod tests {
     }
 
     #[test]
-    fn discovery_control_invalid_reward_ladders_and_run_health_are_rejected() {
+    fn discovery_control_custom_run_health_policy_is_accepted() {
+        let tmp = TestDir::new("discovery-control-health");
+        let health_json = r#"{
+            "task": "countdown",
+            "model_dir": "/m",
+            "run_health": {
+              "reward_collapse": { "window": 10, "min": 1.0, "action": "fail" },
+              "correctness_collapse": { "window": 10, "min": 0.8, "action": "fail" },
+              "dropped_rows": { "max": 0, "action": "warn" },
+              "grad_spike": { "factor": 6.0, "action": "warn" },
+              "telemetry_dark": "warn",
+              "source_dominance": { "max_fraction": 0.6, "action": "warn" }
+            },
+            "trainer": { "steps": 10, "group_size": 2, "candidate_log_top_k": 2,
+              "max_new_tokens": 8,
+              "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
+              "lr": 1e-5, "weight_decay": 0.0,
+              "loss_type": "grpo", "scale_rewards": "group" }
+        }"#;
+        let health_path = tmp.path().join("health.json");
+        std::fs::write(&health_path, health_json).unwrap();
+
+        let cfg = RunConfig::load(&health_path).unwrap();
+
+        assert!(cfg.run_health.reward_collapse.is_some());
+        assert!(cfg.run_health.correctness_collapse.is_some());
+        assert!(cfg.run_health.dropped_rows.is_some());
+        assert!(cfg.run_health.grad_spike.is_some());
+        assert_eq!(cfg.run_health.telemetry_dark, Some(HealthActionCfg::Warn));
+        assert!(cfg.run_health.source_dominance.is_some());
+    }
+
+    #[test]
+    fn discovery_control_candidate_health_requires_full_candidate_logging() {
+        let tmp = TestDir::new("discovery-control-health-topk");
+        let health_json = r#"{
+            "task": "countdown",
+            "model_dir": "/m",
+            "run_health": {
+              "correctness_collapse": { "window": 2, "min": 0.8, "action": "fail" }
+            },
+            "trainer": { "steps": 2, "group_size": 4, "candidate_log_top_k": 1,
+              "max_new_tokens": 8,
+              "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
+              "lr": 1e-5, "weight_decay": 0.0,
+              "loss_type": "grpo", "scale_rewards": "group" }
+        }"#;
+        let health_path = tmp.path().join("health.json");
+        std::fs::write(&health_path, health_json).unwrap();
+
+        let err = RunConfig::load(&health_path).unwrap_err().to_string();
+
+        assert!(err.contains("candidate_log_top_k >= trainer.group_size"));
+    }
+
+    #[test]
+    fn discovery_control_windowed_run_health_requires_enough_steps() {
+        let tmp = TestDir::new("discovery-control-health-window");
+        let health_json = r#"{
+            "task": "countdown",
+            "model_dir": "/m",
+            "run_health": {
+              "reward_collapse": { "window": 5, "min": 1.0, "action": "fail" }
+            },
+            "trainer": { "steps": 2, "group_size": 2, "max_new_tokens": 8,
+              "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
+              "lr": 1e-5, "weight_decay": 0.0,
+              "loss_type": "grpo", "scale_rewards": "group" }
+        }"#;
+        let health_path = tmp.path().join("health.json");
+        std::fs::write(&health_path, health_json).unwrap();
+
+        let err = RunConfig::load(&health_path).unwrap_err().to_string();
+
+        assert!(err.contains("window (5) must be <= trainer.steps (2)"));
+    }
+
+    #[test]
+    fn discovery_control_invalid_reward_ladders_and_run_health_stop_are_rejected() {
         let tmp = TestDir::new("discovery-control-invalid");
         let reward_json = r#"{
             "task": "trimul",
@@ -3120,7 +4005,7 @@ mod tests {
             "task": "countdown",
             "model_dir": "/m",
             "run_health": {
-              "reward_collapse": { "window": 5, "min": 1.0, "action": "warn" }
+              "reward_collapse": { "window": 5, "min": 1.0, "action": "stop" }
             },
             "trainer": { "steps": 1, "group_size": 2, "max_new_tokens": 8,
               "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
@@ -3132,7 +4017,7 @@ mod tests {
 
         let health_err = RunConfig::load(&health_path).unwrap_err().to_string();
 
-        assert!(health_err.contains("run_health is schema-reserved"));
+        assert!(health_err.contains("reserved for future in-run gating"));
     }
 
     #[test]
@@ -3473,11 +4358,20 @@ mod tests {
     /// The clap surface parses the run-report subcommand.
     #[test]
     fn clap_parses_runreport() {
-        let r =
-            Cli::try_parse_from(["ferrl", "runreport", "runs/x", "--json", "--strict"]).unwrap();
+        let r = Cli::try_parse_from([
+            "ferrl",
+            "runreport",
+            "runs/x",
+            "--config",
+            "run.json",
+            "--json",
+            "--strict",
+        ])
+        .unwrap();
         match r.cmd {
             Command::Runreport(a) => {
                 assert!(a.json && a.strict);
+                assert_eq!(a.config, Some(PathBuf::from("run.json")));
             }
             _ => panic!("expected runreport"),
         }
@@ -3524,6 +4418,283 @@ mod tests {
         assert_eq!(budget.max_cuda_peak_used_ratio, 1.015);
         assert_eq!(budget.max_mean_step_secs_ratio, 1.05);
         assert_eq!(budget.max_final_grad_norm_rel_drift, Some(0.001));
+    }
+
+    #[test]
+    fn run_health_policy_flags_s50_collapse_shape() {
+        let tmp = TestDir::new("run-health-s50");
+        let candidate_path = tmp.path().join("candidates.jsonl");
+        let history = run_health_s50_history();
+        write_candidate_jsonl(&candidate_path, run_health_s50_candidate_rows());
+        let candidates = read_candidate_health_inputs(&[candidate_path])
+            .unwrap()
+            .unwrap();
+        let summary = summarize(&history).unwrap();
+        let policy = s50_run_health_policy();
+        let report = policy.evaluate(
+            &history,
+            &summary,
+            run_health_eval_ctx(4),
+            Some(&candidates),
+        );
+
+        assert_eq!(report.verdict, RunHealthVerdict::Fail);
+        assert_run_health_rules(
+            &report,
+            &[
+                "reward_collapse",
+                "correctness_collapse",
+                "dropped_rows",
+                "grad_spike",
+                "source_dominance",
+            ],
+        );
+    }
+
+    #[test]
+    fn run_health_correctness_collapse_rejects_stale_candidate_ledger() {
+        let history = vec![
+            run_health_test_metric(0, 2.0, 1.0),
+            run_health_test_metric(1, 2.0, 1.0),
+            run_health_test_metric(2, 2.0, 1.0),
+            run_health_test_metric(3, 2.0, 1.0),
+        ];
+        let summary = summarize(&history).unwrap();
+        let tmp = TestDir::new("run-health-stale-candidates");
+        let candidate_path = tmp.path().join("candidates.jsonl");
+        write_candidate_jsonl(
+            &candidate_path,
+            [
+                (0, 0, true, "source-0".to_string()),
+                (1, 0, true, "source-1".to_string()),
+            ],
+        );
+        let candidates = read_candidate_health_inputs(&[candidate_path])
+            .unwrap()
+            .unwrap();
+
+        let report = correctness_collapse_policy().evaluate(
+            &history,
+            &summary,
+            run_health_eval_ctx(1),
+            Some(&candidates),
+        );
+
+        assert_eq!(report.verdict, RunHealthVerdict::Fail);
+        assert_run_health_rules(&report, &["correctness_collapse"]);
+        assert!(report.findings[0].message.contains("2,3"));
+    }
+
+    #[test]
+    fn run_health_candidate_rules_reject_empty_required_ledger() {
+        let history = vec![
+            run_health_test_metric(0, 2.0, 1.0),
+            run_health_test_metric(1, 2.0, 1.0),
+        ];
+        let summary = summarize(&history).unwrap();
+        let policy = RunHealthCfg {
+            source_dominance: Some(FractionThresholdCfg {
+                max_fraction: 0.8,
+                action: HealthActionCfg::Fail,
+            }),
+            ..correctness_collapse_policy()
+        };
+
+        let report = policy.evaluate(
+            &history,
+            &summary,
+            run_health_eval_ctx(1),
+            Some(&CandidateHealth::default()),
+        );
+
+        assert_eq!(report.verdict, RunHealthVerdict::Fail);
+        assert_run_health_rules(&report, &["correctness_collapse", "source_dominance"]);
+    }
+
+    #[test]
+    fn run_health_correctness_collapse_rejects_unsupported_metadata() {
+        let history = vec![
+            run_health_test_metric(0, 2.0, 1.0),
+            run_health_test_metric(1, 2.0, 1.0),
+        ];
+        let summary = summarize(&history).unwrap();
+        let mut candidates = CandidateHealth {
+            total: 2,
+            ..CandidateHealth::default()
+        };
+        for step in 0..=1 {
+            let mut step_health = CandidateStepHealth {
+                total: 1,
+                ..CandidateStepHealth::default()
+            };
+            step_health
+                .prompt_groups
+                .entry(step)
+                .or_default()
+                .group_indices
+                .insert(0);
+            candidates.steps.insert(step, step_health);
+        }
+
+        let report = correctness_collapse_policy().evaluate(
+            &history,
+            &summary,
+            run_health_eval_ctx(1),
+            Some(&candidates),
+        );
+
+        assert_eq!(report.verdict, RunHealthVerdict::Fail);
+        assert!(report.findings[0].message.contains("metadata unavailable"));
+    }
+
+    #[test]
+    fn run_health_candidate_rules_reject_partial_topk_coverage() {
+        let tmp = TestDir::new("run-health-partial-topk");
+        let candidate_path = tmp.path().join("candidates.jsonl");
+        let history = vec![
+            run_health_test_metric(0, 2.0, 1.0),
+            run_health_test_metric(1, 2.0, 1.0),
+        ];
+        write_candidate_jsonl(
+            &candidate_path,
+            [
+                (0, 0, true, "dominant".to_string()),
+                (1, 0, true, "dominant".to_string()),
+            ],
+        );
+        let candidates = read_candidate_health_inputs(&[candidate_path])
+            .unwrap()
+            .unwrap();
+        let summary = summarize(&history).unwrap();
+        let policy = RunHealthCfg {
+            source_dominance: Some(FractionThresholdCfg {
+                max_fraction: 0.8,
+                action: HealthActionCfg::Fail,
+            }),
+            ..correctness_collapse_policy()
+        };
+
+        let report = policy.evaluate(
+            &history,
+            &summary,
+            run_health_eval_ctx(2),
+            Some(&candidates),
+        );
+
+        assert_eq!(report.verdict, RunHealthVerdict::Fail);
+        assert_run_health_rules(&report, &["correctness_collapse", "source_dominance"]);
+        assert!(report
+            .findings
+            .iter()
+            .all(|finding| finding.message.contains("full group coverage")));
+    }
+
+    #[test]
+    fn run_health_windowed_rules_reject_insufficient_history() {
+        let history = vec![run_health_test_metric(0, 2.0, 1.0)];
+        let summary = summarize(&history).unwrap();
+        let policy = RunHealthCfg {
+            reward_collapse: Some(WindowThresholdCfg {
+                window: 2,
+                min: 1.0,
+                action: HealthActionCfg::Fail,
+            }),
+            ..correctness_collapse_policy()
+        };
+
+        let report = policy.evaluate(&history, &summary, run_health_eval_ctx(1), None);
+
+        assert_eq!(report.verdict, RunHealthVerdict::Fail);
+        assert_run_health_rules(&report, &["reward_collapse", "correctness_collapse"]);
+        assert!(report
+            .findings
+            .iter()
+            .all(|finding| finding.message.contains("only 1 metric rows")));
+    }
+
+    #[test]
+    fn runreport_config_policy_exits_two_on_fail() {
+        let tmp = TestDir::new("runreport-policy");
+        let run = tmp.path().join("run-001");
+        std::fs::create_dir_all(&run).unwrap();
+        let history = vec![
+            run_health_test_metric(0, 2.0, 1.0),
+            run_health_test_metric(1, 0.05, 1.0),
+            run_health_test_metric(2, 0.05, 1.0),
+        ];
+        write_metrics_jsonl(&run.join("metrics.jsonl"), &history);
+        std::fs::write(
+            tmp.path().join("run.json"),
+            r#"{
+                "task": "countdown",
+                "model_dir": "/m",
+                "run_health": {
+                  "reward_collapse": { "window": 2, "min": 1.0, "action": "fail" }
+                },
+                "trainer": { "steps": 3, "group_size": 2, "max_new_tokens": 8,
+                  "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
+                  "lr": 1e-5, "weight_decay": 0.0,
+                  "loss_type": "grpo", "scale_rewards": "group" }
+            }"#,
+        )
+        .unwrap();
+
+        let code = runreport(&RunreportArgs {
+            path: run,
+            config: Some(tmp.path().join("run.json")),
+            json: false,
+            strict: false,
+        })
+        .unwrap();
+
+        assert_eq!(code, ExitCode::from(2));
+    }
+
+    #[test]
+    fn runreport_config_policy_reads_candidate_sibling_for_metrics_file() {
+        let tmp = TestDir::new("runreport-policy-metrics-file");
+        let run = tmp.path().join("run-001");
+        std::fs::create_dir_all(&run).unwrap();
+        let history = vec![
+            run_health_test_metric(0, 2.0, 1.0),
+            run_health_test_metric(1, 2.0, 1.0),
+        ];
+        write_metrics_jsonl(&run.join("metrics.jsonl"), &history);
+        write_candidate_jsonl(
+            &run.join("candidates.jsonl"),
+            [
+                (0, 0, false, "source-0".to_string()),
+                (0, 1, false, "source-0".to_string()),
+                (1, 0, false, "source-1".to_string()),
+                (1, 1, false, "source-1".to_string()),
+            ],
+        );
+        std::fs::write(
+            tmp.path().join("run.json"),
+            r#"{
+                "task": "countdown",
+                "model_dir": "/m",
+                "run_health": {
+                  "correctness_collapse": { "window": 2, "min": 0.5, "action": "fail" }
+                },
+                "trainer": { "steps": 2, "group_size": 2, "candidate_log_top_k": 2,
+                  "max_new_tokens": 8,
+                  "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
+                  "lr": 1e-5, "weight_decay": 0.0,
+                  "loss_type": "grpo", "scale_rewards": "group" }
+            }"#,
+        )
+        .unwrap();
+
+        let code = runreport(&RunreportArgs {
+            path: run.join("metrics.jsonl"),
+            config: Some(tmp.path().join("run.json")),
+            json: false,
+            strict: false,
+        })
+        .unwrap();
+
+        assert_eq!(code, ExitCode::from(2));
     }
 
     #[test]

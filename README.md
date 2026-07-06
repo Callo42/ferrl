@@ -171,7 +171,8 @@ on a finished run:
 ```sh
 cargo build --release            # builds the `ferrl` binary (target/release/ferrl)
 ferrl train --config run.json    # GRPO-train a built-in task; writes a run under runs/
-ferrl runreport runs/<run-id>    # one-glance health summary (--json, --strict available)
+ferrl runreport runs/<run-id> --config run.json
+                                # one-glance health summary + configured post-run policy
 ```
 
 A `run.json` selects a task, points at a Qwen checkpoint, and carries the trainer
@@ -251,8 +252,16 @@ remain fail-closed at zero.
 }
 ```
 
-The top-level `run_health` schema is likewise reserved for discovery health policy
-configuration; non-empty policies are rejected until the run-health follow-up lands.
+The top-level `run_health` schema configures deterministic post-run discovery-health
+policy. `warn` findings are reported; `fail` findings make `ferrl train` fail after
+telemetry is written and make `ferrl runreport --config <run.json>` exit with code `2`.
+The current policy covers trailing reward collapse, trailing TriMul correctness collapse
+from candidate metadata, dropped rows, grad spikes, dark off-policy telemetry, and
+candidate source dominance. The `stop` action is reserved for a future in-run gate and is
+rejected today. Correctness and source-dominance checks require a candidate ledger, so set
+`trainer.candidate_log_top_k >= trainer.group_size` when using them. Partial top-K
+candidate ledgers fail closed for those checks because they cannot represent the whole
+sampled group.
 The optional `trimul.verifier_parallelism` knob
 keeps the default sequential verifier path at `1`; raise it only with a matching
 `trimul.verifier_cuda_device_pool` that gives each concurrent verifier worker its own
@@ -365,7 +374,7 @@ Each training run writes to `runs/<run_id>/`:
 
 ```
 runs/<run_id>/
-├── config.json       # the full resolved run config
+├── config.json       # the trainer config written by the generic Trainer
 ├── metrics.jsonl     # one JSON object per step:
 │                     #   step, reward_mean, reward_std, frac_reward_zero_std,
 │                     #   kl, clip_ratio, frac_truncated, completion_len,
@@ -383,7 +392,8 @@ rank / world / step (at ERROR level, the fields survive even `RUST_LOG=warn`). `
 is git-ignored. The on-disk layout is created by [`ferrl::telemetry::RunDir`] and metrics
 are appended by `ferrl::telemetry::MetricsWriter`; the `ferrl runreport` subcommand reads a
 run's `metrics.jsonl` and prints a health summary — reward trend, throughput, and grad-norm
-anomalies (human, `--json`, or `--strict`).
+anomalies (human, `--json`, or `--strict`). Pass the original top-level run config with
+`--config run.json` to also apply its `run_health` post-run policy.
 
 For manual GPU resource gates, run the same smoke or training command on a baseline
 commit and a candidate commit, then compare their per-rank metrics with `perf-gate`:
