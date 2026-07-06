@@ -247,8 +247,8 @@ pub use telemetry::{
 pub use tokenizer::{HfTokenizer, TokenizerError};
 #[doc(inline)]
 pub use trainer::{
-    RewardGroupScope, RunStop, TokenizerLike, Trainer, TrainerConfig, TrainerConfigBuilder,
-    TrainerError,
+    RewardGroupScope, RunStop, ScalarSchedule, SchedulePoint, TokenizerLike, Trainer,
+    TrainerConfig, TrainerConfigBuilder, TrainerError,
 };
 #[doc(inline)]
 pub use trimul::{Distribution, TrimulCase, TrimulError, TrimulReward};

@@ -192,6 +192,28 @@ default):
 }
 ```
 
+For deterministic trainer-owned scalar control, `trainer.beta_schedule` and
+`trainer.lr_schedule` accept piecewise-linear points:
+
+```jsonc
+{
+  "trainer": {
+    "beta_schedule": { "points": [
+      { "step": 0, "value": 0.0 },
+      { "step": 10, "value": 0.02 }
+    ] },
+    "lr_schedule": { "points": [
+      { "step": 0, "value": 0.0 },
+      { "step": 2, "value": 1e-5 }
+    ] }
+  }
+}
+```
+
+Schedules start at step `0`, have strictly increasing in-range steps, interpolate
+linearly between points, and hold the last value. `lr_schedule` replaces both `lr`
+and `warmup_steps`; encode warmup directly as points.
+
 `countdown` generates its data procedurally; `math` is file-backed — set `data.path`
 to a JSONL dataset of `{"prompt": ..., "target": {"answer": ...}}` lines (see
 `crates/ferrl/tests/fixtures/math_dataset.jsonl`).
@@ -380,7 +402,7 @@ runs/<run_id>/
 │                     #   kl, clip_ratio, frac_truncated, completion_len,
 │                     #   rollout_ratio_mean, rollout_logratio_mean,
 │                     #   rollout_ratio_max, frac_rollout_ratio_capped,
-│                     #   rollout_capture_tokens, dropped_rows, grad_norm, lr,
+│                     #   rollout_capture_tokens, dropped_rows, grad_norm, lr, beta,
 │                     #   step_secs, tokens_per_sec, cuda_mem_* when enabled
 ├── checkpoints/      # LoRA checkpoints
 └── run.log           # human-readable log

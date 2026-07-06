@@ -440,6 +440,9 @@ pub struct Metrics {
     pub grad_norm: f32,
     /// Effective learning rate for this step.
     pub lr: f32,
+    /// Effective KL coefficient for this step.
+    #[serde(default)]
+    pub beta: f32,
     /// Wall-clock seconds this optimizer step took — the whole window (rollout +
     /// reward + the `mu` inner update epochs), measured around
     /// [`Trainer::run`](crate::trainer::Trainer)'s per-step body. Lets an operator
@@ -514,6 +517,7 @@ impl Metrics {
             dropped_rows: 0,
             grad_norm: 0.0,
             lr: 0.0,
+            beta: 0.0,
             step_secs: 0.0,
             tokens_per_sec: 0.0,
             cuda_mem_start_used_bytes: 0,
@@ -561,6 +565,7 @@ impl Metrics {
             &mut m.frac_rollout_ratio_capped,
             &mut m.grad_norm,
             &mut m.lr,
+            &mut m.beta,
             &mut m.step_secs,
             &mut m.tokens_per_sec,
         ] {
@@ -863,6 +868,8 @@ pub struct RunSummary {
     pub final_kl: f32,
     /// `lr` of the last record.
     pub final_lr: f32,
+    /// `beta` of the last record.
+    pub final_beta: f32,
     /// `grad_norm` of the last record.
     pub final_grad_norm: f32,
     /// Largest `grad_norm` seen over the run.
@@ -910,8 +917,8 @@ impl std::fmt::Display for RunSummary {
         )?;
         writeln!(
             f,
-            "  grad_norm   final {:.3}   max {:.3}      kl {:.4}   lr {:.2e}",
-            self.final_grad_norm, self.max_grad_norm, self.final_kl, self.final_lr
+            "  grad_norm   final {:.3}   max {:.3}      kl {:.4}   beta {:.2e}   lr {:.2e}",
+            self.final_grad_norm, self.max_grad_norm, self.final_kl, self.final_beta, self.final_lr
         )?;
         if self.max_cuda_mem_peak_used_bytes > 0 {
             writeln!(
@@ -1831,6 +1838,7 @@ pub fn summarize(history: &[Metrics]) -> Option<RunSummary> {
         reward_trend: trend,
         final_kl: last.kl,
         final_lr: last.lr,
+        final_beta: last.beta,
         final_grad_norm: last.grad_norm,
         max_grad_norm,
         mean_step_secs: mean_of(history, |m| m.step_secs),
@@ -1895,6 +1903,7 @@ fn push_nonfinite(history: &[Metrics], out: &mut Vec<Anomaly>) {
         for (field, v) in [
             ("grad_norm", m.grad_norm),
             ("kl", m.kl),
+            ("beta", m.beta),
             ("reward_mean", m.reward_mean),
         ] {
             if v == f32::MAX || v == f32::MIN {
@@ -2393,6 +2402,7 @@ mod tests {
             dropped_rows: 3,
             grad_norm: 1.23,
             lr: 5e-6,
+            beta: 0.02,
             step_secs: 1.5,
             tokens_per_sec: 128.0,
             cuda_mem_start_used_bytes: 10,
@@ -2454,6 +2464,7 @@ mod tests {
         m.grad_norm = f32::INFINITY;
         m.reward_mean = f32::NEG_INFINITY;
         m.kl = f32::NAN;
+        m.beta = f32::INFINITY;
         m.frac_truncated = f32::NAN;
         m.rollout_ratio_max = f32::INFINITY; // an overflowed exp() telemetry value
         w.append(&m).unwrap();
@@ -2464,6 +2475,7 @@ mod tests {
         assert_eq!(back.grad_norm, f32::MAX);
         assert_eq!(back.reward_mean, f32::MIN);
         assert_eq!(back.kl, 0.0);
+        assert_eq!(back.beta, f32::MAX);
         assert_eq!(back.frac_truncated, 0.0);
         assert_eq!(back.rollout_ratio_max, f32::MAX);
     }
@@ -2845,10 +2857,13 @@ mod tests {
         let hist: Vec<Metrics> = (0..6)
             .map(|i| metric(i, 0.1 * i as f32, 1.0, 2.0, 100.0))
             .collect();
+        let mut hist = hist;
+        hist[5].beta = 0.02;
         let s = summarize(&hist).unwrap();
         assert_eq!((s.steps, s.first_step, s.last_step), (6, 0, 5));
         assert!((s.reward_last - 0.5).abs() < 1e-6, "last {}", s.reward_last);
         assert!(s.reward_trend > 0.0, "trend {}", s.reward_trend);
+        assert_eq!(s.final_beta, 0.02);
     }
 
     #[test]
