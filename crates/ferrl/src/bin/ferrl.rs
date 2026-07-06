@@ -636,93 +636,6 @@ struct BaselineCfg {
     gpu: String,
 }
 
-/// Versioned TriMul training-reward profile.
-///
-/// PR-A schema lock only: custom values are validated but not wired into
-/// `TrimulReward` until the tunable reward-profile follow-up. The defaults
-/// exactly mirror the current `trimul_shaped_v1` constants.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct TrimulRewardCfg {
-    /// Reward scheme identifier.
-    scheme: TrimulRewardScheme,
-    /// Tiny reward for an extractable final submission.
-    format_extracted: f64,
-    /// Reward for reaching the test harness.
-    runnable: f64,
-    /// Maximum sub-correctness reward for partial test progress.
-    partial_correctness: f64,
-    /// Fully correct floor before speed is considered.
-    correctness: f64,
-    /// Cap on the speed reward component.
-    speed_cap: f64,
-    /// Policy for implausibly fast benchmark timings.
-    implausible_benchmark: ImplausibleBenchmarkPolicy,
-}
-
-impl Default for TrimulRewardCfg {
-    fn default() -> Self {
-        Self {
-            scheme: TrimulRewardScheme::TrimulShapedV1,
-            format_extracted: 0.02,
-            runnable: 0.05,
-            partial_correctness: 0.75,
-            correctness: 1.0,
-            speed_cap: 2.0,
-            implausible_benchmark: ImplausibleBenchmarkPolicy::Zero,
-        }
-    }
-}
-
-impl TrimulRewardCfg {
-    fn validate_current_support(&self) -> Result<(), CliError> {
-        match self.scheme {
-            TrimulRewardScheme::TrimulShapedV1 => {}
-        }
-        match self.implausible_benchmark {
-            ImplausibleBenchmarkPolicy::Zero => {}
-        }
-        for (label, value) in [
-            ("trimul.reward.format_extracted", self.format_extracted),
-            ("trimul.reward.runnable", self.runnable),
-            (
-                "trimul.reward.partial_correctness",
-                self.partial_correctness,
-            ),
-            ("trimul.reward.correctness", self.correctness),
-            ("trimul.reward.speed_cap", self.speed_cap),
-        ] {
-            if !value.is_finite() || value < 0.0 {
-                return Err(CliError::msg(format!("{label} must be finite and >= 0")));
-            }
-        }
-        let defaults = Self::default();
-        if self != &defaults {
-            return Err(CliError::msg(
-                "custom trimul.reward values are reserved for the tunable reward-profile \
-                 follow-up; omit trimul.reward or use the trimul_shaped_v1 defaults",
-            ));
-        }
-        Ok(())
-    }
-}
-
-/// TriMul reward scheme identifiers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum TrimulRewardScheme {
-    /// The current shaped training reward: format/runnable/partial/correctness/speed.
-    TrimulShapedV1,
-}
-
-/// Handling for implausibly fast benchmark timings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum ImplausibleBenchmarkPolicy {
-    /// Score the candidate zero.
-    Zero,
-}
-
 /// TriMul task knobs (read only when `task == "trimul"`): the sandboxed eval image and
 /// the pinned GPU Mode bundle, bounded scratch, the held-out secret seed, the
 /// per-candidate wall budget, and the optional baseline pin. The concrete case list is
@@ -760,9 +673,8 @@ struct TrimulCfg {
     verifier_parallelism: usize,
     /// The reference baseline pin (omit to fall back to an inverse-time reward).
     baseline: Option<BaselineCfg>,
-    /// Versioned training-reward profile. Custom values are schema-reserved until
-    /// the follow-up that wires them into `TrimulReward`.
-    reward: TrimulRewardCfg,
+    /// Versioned shaped training-reward profile.
+    reward: ferrl::trimul::TrimulRewardProfile,
 }
 
 /// Discovery-health policy schema.
@@ -1004,7 +916,7 @@ impl RunConfig {
     }
 
     fn validate_current_config_support(&self) -> Result<(), CliError> {
-        self.trimul.reward.validate_current_support()?;
+        self.trimul.reward.validate().map_err(CliError::msg)?;
         self.run_health.validate_current_support()
     }
 
@@ -1127,6 +1039,9 @@ impl RunConfig {
             .with_cases(tests, benches)
             .with_secret_seed(t.secret_seed)
             .with_wall(wall);
+        reward = reward
+            .with_reward_profile(t.reward)
+            .map_err(CliError::msg)?;
         if let Some(devices) = &t.verifier_cuda_visible_devices {
             reward = reward.with_verifier_cuda_visible_devices(devices.clone());
         }
@@ -1891,6 +1806,8 @@ struct ArtifactConfigManifest {
     prompt_sha256: String,
     /// Artifact-relative prompt copy used for audit.
     prompt_file: &'static str,
+    /// Effective shaped training-reward profile.
+    reward_profile: ferrl::trimul::TrimulRewardProfile,
     /// Trainer step budget.
     trainer_steps: u64,
     /// GRPO group size.
@@ -2229,6 +2146,7 @@ fn build_manifest(
             run_config_sha256: sha256_hex(inputs.config_bytes),
             prompt_sha256: sha256_hex(inputs.prompt_bytes),
             prompt_file: "prompt.txt",
+            reward_profile: cfg.trimul.reward,
             trainer_steps: cfg.trainer.steps,
             group_size: cfg.trainer.group_size,
             run_health: args.run_health.clone(),
@@ -2404,6 +2322,13 @@ fn artifact_report(
     .expect("writing to String cannot fail");
     writeln!(
         &mut out,
+        "- Reward profile: `{}`",
+        serde_json::to_string(&manifest.config.reward_profile)
+            .expect("reward profile serializes to JSON")
+    )
+    .expect("writing to String cannot fail");
+    writeln!(
+        &mut out,
         "- Model: family={}, checkpoint={}, tokenizer={}, lora_rank={}, lora_alpha={}, base_dtype={}",
         manifest.model.family,
         manifest.model.checkpoint,
@@ -2488,6 +2413,11 @@ fn artifact_report(
         &mut out,
         !manifest.config.prompt_sha256.is_empty() && manifest.config.prompt_file == "prompt.txt",
         "prompt copy and hash recorded",
+    );
+    push_check(
+        &mut out,
+        manifest.config.reward_profile.validate().is_ok(),
+        "reward profile recorded and valid",
     );
     push_check(
         &mut out,
@@ -2976,7 +2906,7 @@ mod tests {
         )
     }
 
-    fn trimul_reserved_reward_test_config(secret_seed: u64) -> String {
+    fn trimul_invalid_reward_test_config(secret_seed: u64) -> String {
         format!(
             r#"{{
                 "task": "trimul",
@@ -2988,7 +2918,7 @@ mod tests {
                   "eval_dir": "/eval",
                   "scratch_root": "/scratch",
                   "secret_seed": {secret_seed},
-                  "reward": {{ "runnable": 0.07 }}
+                  "reward": {{ "runnable": 0.40 }}
                 }},
                 "trainer": {{ "steps": 1, "group_size": 2, "max_new_tokens": 8,
                   "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
@@ -3130,12 +3060,15 @@ mod tests {
 
         let cfg = RunConfig::load(&path).unwrap();
 
-        assert_eq!(cfg.trimul.reward, TrimulRewardCfg::default());
+        assert_eq!(
+            cfg.trimul.reward,
+            ferrl::trimul::TrimulRewardProfile::default()
+        );
         assert_eq!(cfg.run_health, RunHealthCfg::default());
     }
 
     #[test]
-    fn discovery_control_custom_values_are_rejected_until_wired() {
+    fn discovery_control_custom_reward_values_are_accepted_when_ladder_is_valid() {
         let tmp = TestDir::new("discovery-control-custom");
         let reward_json = r#"{
             "task": "trimul",
@@ -3143,7 +3076,33 @@ mod tests {
             "trimul": {
               "prompt_path": "/prompt.txt",
               "submission_extract_mode": "final_fence",
-              "reward": { "runnable": 0.07 }
+              "reward": { "format_extracted": 0.03, "runnable": 0.07, "partial_correctness": 0.70 }
+            },
+            "trainer": { "steps": 1, "group_size": 2, "max_new_tokens": 8,
+              "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
+              "lr": 1e-5, "weight_decay": 0.0,
+              "loss_type": "grpo", "scale_rewards": "group" }
+        }"#;
+        let reward_path = tmp.path().join("reward.json");
+        std::fs::write(&reward_path, reward_json).unwrap();
+
+        let cfg = RunConfig::load(&reward_path).unwrap();
+
+        assert_eq!(cfg.trimul.reward.format_extracted, 0.03);
+        assert_eq!(cfg.trimul.reward.runnable, 0.07);
+        assert_eq!(cfg.trimul.reward.partial_correctness, 0.70);
+    }
+
+    #[test]
+    fn discovery_control_invalid_reward_ladders_and_run_health_are_rejected() {
+        let tmp = TestDir::new("discovery-control-invalid");
+        let reward_json = r#"{
+            "task": "trimul",
+            "model_dir": "/m",
+            "trimul": {
+              "prompt_path": "/prompt.txt",
+              "submission_extract_mode": "final_fence",
+              "reward": { "runnable": 0.40 }
             },
             "trainer": { "steps": 1, "group_size": 2, "max_new_tokens": 8,
               "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
@@ -3155,7 +3114,7 @@ mod tests {
 
         let reward_err = RunConfig::load(&reward_path).unwrap_err().to_string();
 
-        assert!(reward_err.contains("custom trimul.reward values are reserved"));
+        assert!(reward_err.contains("runnable + trimul.reward.partial_correctness"));
 
         let health_json = r#"{
             "task": "countdown",
@@ -3181,7 +3140,7 @@ mod tests {
         let tmp = TestDir::new("discovery-control-cli-paths");
         std::fs::write(
             tmp.path().join("run.json"),
-            trimul_reserved_reward_test_config(4242),
+            trimul_invalid_reward_test_config(4242),
         )
         .unwrap();
 
@@ -3192,8 +3151,8 @@ mod tests {
             .unwrap_err()
             .to_string();
 
-        assert!(score_err.contains("custom trimul.reward values are reserved"));
-        assert!(artifact_err.contains("custom trimul.reward values are reserved"));
+        assert!(score_err.contains("runnable + trimul.reward.partial_correctness"));
+        assert!(artifact_err.contains("runnable + trimul.reward.partial_correctness"));
     }
 
     /// `device` and `base_dtype` selectors deserialize from lowercase strings.
@@ -3880,7 +3839,8 @@ benchmarks:
                   "image": "/img.sif",
                   "eval_dir": "{}",
                   "scratch_root": "/tmp",
-                  "verifier_cuda_visible_devices": "1"
+                  "verifier_cuda_visible_devices": "1",
+                  "reward": {{ "format_extracted": 0.03, "runnable": 0.07, "partial_correctness": 0.70 }}
                 }},
                 "trainer": {{ "steps": 1, "group_size": 2, "max_new_tokens": 8,
                   "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
@@ -3893,6 +3853,9 @@ benchmarks:
         let reward = cfg.build_trimul_reward_base().unwrap();
         let spec = reward.build_run_spec(std::path::Path::new("/tmp/scratch"));
 
+        assert_eq!(reward.reward_profile().format_extracted, 0.03);
+        assert_eq!(reward.reward_profile().runnable, 0.07);
+        assert_eq!(reward.reward_profile().partial_correctness, 0.70);
         assert!(spec
             .env
             .iter()
@@ -4197,6 +4160,7 @@ benchmarks:
                 run_config_sha256: "config-hash".to_string(),
                 prompt_sha256: "prompt-hash".to_string(),
                 prompt_file: "prompt.txt",
+                reward_profile: ferrl::trimul::TrimulRewardProfile::default(),
                 trainer_steps: 100,
                 group_size: 4,
                 run_health: "healthy".to_string(),
@@ -4253,6 +4217,7 @@ benchmarks:
             "ferrl commit: abc123",
             "Config hash: config-hash",
             "Prompt copy: prompt.txt (prompt-hash)",
+            "Reward profile: `{\"scheme\":\"trimul_shaped_v1\"",
             "Run health: healthy",
             "| source hash | training reward | source inspection | clean correctness | median runtime ns | speedup | accept/reject reason |",
             "| source-hash | 1.500000 | clean | 3/3 | 9.000000 | 1.222222 | accepted: all clean runs correct and median runtime beats baseline |",
@@ -4261,6 +4226,7 @@ benchmarks:
             "Manifest SHA-256: manifest-hash",
             "## 6. Operator Checklist",
             "[pass] audit seed differs from training seed",
+            "[pass] reward profile recorded and valid",
             "[pass] source inspection found no process/file/env/network/path probing",
         ] {
             assert!(report.contains(required), "missing report field: {required}");

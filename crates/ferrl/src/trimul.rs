@@ -76,6 +76,133 @@ use crate::reward::{RewardError, RewardFn, RewardOutcome};
 use crate::sample::Sample;
 use crate::sandbox::{ApptainerSandbox, Bind, ResourceLimits, RunSpec, RunStatus, Sandbox};
 
+/// Versioned TriMul training-reward scheme identifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrimulRewardScheme {
+    /// The shaped training reward: format/runnable/partial/correctness/speed.
+    TrimulShapedV1,
+}
+
+impl TrimulRewardScheme {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::TrimulShapedV1 => "trimul_shaped_v1",
+        }
+    }
+}
+
+/// Handling for implausibly fast benchmark timings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImplausibleBenchmarkPolicy {
+    /// Score the candidate zero.
+    Zero,
+}
+
+impl ImplausibleBenchmarkPolicy {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Zero => "zero",
+        }
+    }
+}
+
+/// Tunable TriMul training-reward profile.
+///
+/// The default exactly matches ferrl's original `trimul_shaped_v1` ladder. Custom
+/// values are allowed when they preserve the core ordering: format-only no higher
+/// than runnable, and all partial-progress rewards no higher than the fully correct
+/// floor. Implausible benchmark timings remain fail-closed at zero.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TrimulRewardProfile {
+    /// Reward scheme identifier.
+    pub scheme: TrimulRewardScheme,
+    /// Tiny reward for an extractable final submission.
+    pub format_extracted: f32,
+    /// Reward for reaching the test harness.
+    pub runnable: f32,
+    /// Maximum sub-correctness reward for partial test progress.
+    pub partial_correctness: f32,
+    /// Fully correct floor before speed is considered.
+    pub correctness: f32,
+    /// Cap on the speed reward component.
+    pub speed_cap: f32,
+    /// Policy for implausibly fast benchmark timings.
+    pub implausible_benchmark: ImplausibleBenchmarkPolicy,
+}
+
+impl Default for TrimulRewardProfile {
+    fn default() -> Self {
+        Self {
+            scheme: TrimulRewardScheme::TrimulShapedV1,
+            format_extracted: FORMAT_EXTRACTED_REWARD,
+            runnable: RUNNABLE_REWARD,
+            partial_correctness: PARTIAL_CORRECTNESS_REWARD,
+            correctness: CORRECTNESS_REWARD,
+            speed_cap: SPEED_REWARD_CAP,
+            implausible_benchmark: ImplausibleBenchmarkPolicy::Zero,
+        }
+    }
+}
+
+impl TrimulRewardProfile {
+    /// Validate that the profile is finite, non-negative, and preserves the reward ladder.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable config error if any value is non-finite, negative, or
+    /// would let format-only/runnable/partial candidates outrank fully correct ones.
+    pub fn validate(&self) -> Result<(), String> {
+        match self.scheme {
+            TrimulRewardScheme::TrimulShapedV1 => {}
+        }
+        match self.implausible_benchmark {
+            ImplausibleBenchmarkPolicy::Zero => {}
+        }
+        for (label, value) in [
+            ("trimul.reward.format_extracted", self.format_extracted),
+            ("trimul.reward.runnable", self.runnable),
+            (
+                "trimul.reward.partial_correctness",
+                self.partial_correctness,
+            ),
+            ("trimul.reward.correctness", self.correctness),
+            ("trimul.reward.speed_cap", self.speed_cap),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(format!("{label} must be finite and >= 0"));
+            }
+        }
+        if self.format_extracted > self.runnable {
+            return Err(
+                "trimul.reward.format_extracted must be <= trimul.reward.runnable".to_string(),
+            );
+        }
+        if self.runnable + self.partial_correctness > self.correctness {
+            return Err(
+                "trimul.reward.runnable + trimul.reward.partial_correctness must be <= \
+                 trimul.reward.correctness"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    fn metadata(self) -> serde_json::Value {
+        serde_json::json!({
+            "scheme": self.scheme.as_str(),
+            "format_extracted": self.format_extracted,
+            "runnable": self.runnable,
+            "partial_correctness": self.partial_correctness,
+            "correctness": self.correctness,
+            "speed_cap": self.speed_cap,
+            "implausible_benchmark": self.implausible_benchmark.as_str(),
+        })
+    }
+}
+
 /// The input distribution for a TriMul case (mirrors the GPUMODE task's `distribution`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Distribution {
@@ -449,6 +576,8 @@ pub struct TrimulReward {
     /// denominator for the shaped reward's speed component. `None` falls back to an
     /// inverse-time signal.
     baseline_ns: Option<f64>,
+    /// Tunable training-reward profile.
+    reward_profile: TrimulRewardProfile,
     /// Wall-clock budget for one candidate's full eval.
     wall: Duration,
     /// Floor (ns) on each benchmark mean: a real GPU kernel cannot run faster than the
@@ -509,6 +638,7 @@ impl TrimulReward {
             benchmark_cases: Vec::new(),
             secret_seed: 0,
             baseline_ns: None,
+            reward_profile: TrimulRewardProfile::default(),
             wall: Duration::from_secs(600),
             min_plausible_ns: 1_000.0,
             submission_extract_mode: SubmissionExtractMode::FinalFence,
@@ -543,6 +673,24 @@ impl TrimulReward {
     pub fn with_baseline_ns(mut self, baseline_ns: f64) -> Self {
         self.baseline_ns = Some(baseline_ns);
         self
+    }
+
+    /// Set the shaped training-reward profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns a config error if `profile` is non-finite, negative, or breaks the
+    /// reward ladder enforced by [`TrimulRewardProfile::validate`].
+    pub fn with_reward_profile(mut self, profile: TrimulRewardProfile) -> Result<Self, String> {
+        profile.validate()?;
+        self.reward_profile = profile;
+        Ok(self)
+    }
+
+    /// The active shaped training-reward profile.
+    #[must_use]
+    pub fn reward_profile(&self) -> TrimulRewardProfile {
+        self.reward_profile
     }
 
     /// Set the per-candidate wall-clock budget.
@@ -875,6 +1023,8 @@ impl TrimulReward {
                 diagnostic: Some("trimul:no_submission".to_string()),
                 metadata: Some(serde_json::json!({
                     "task": "trimul",
+                    "reward_scheme": self.reward_profile.scheme.as_str(),
+                    "reward_profile": self.reward_profile.metadata(),
                     "submission_extracted": false,
                 })),
             });
@@ -908,7 +1058,8 @@ impl TrimulReward {
         };
         let mut metadata = serde_json::json!({
             "task": "trimul",
-            "reward_scheme": "trimul_shaped_v1",
+            "reward_scheme": self.reward_profile.scheme.as_str(),
+            "reward_profile": self.reward_profile.metadata(),
             "submission_extracted": true,
             "source_sha256": sha256_hex(submission.as_bytes()),
             "source_len_bytes": submission.len(),
@@ -962,7 +1113,8 @@ impl TrimulReward {
         if eval_has_implausible_benchmark(eval) {
             return 0.0;
         }
-        self.reward_from_eval(eval).max(FORMAT_EXTRACTED_REWARD)
+        self.reward_from_eval(eval)
+            .max(self.reward_profile.format_extracted)
     }
 
     fn reward_from_eval(&self, eval: &TrimulEval) -> f32 {
@@ -979,22 +1131,28 @@ impl TrimulReward {
             return 0.0;
         }
         if eval.test_exit != Some(0) {
-            return runnable_progress_reward(eval);
+            return self.runnable_progress_reward(eval);
         }
         if eval.verification.correct && eval.has_benchmark_section && eval.benchmark_exit.is_some()
         {
             if eval.benchmark_exit == Some(0) {
-                return CORRECTNESS_REWARD
+                return self.reward_profile.correctness
                     + self.speed_reward_component(eval.verification.geomean_ns);
             }
-            return CORRECTNESS_REWARD;
+            return self.reward_profile.correctness;
         }
-        runnable_progress_reward(eval)
+        self.runnable_progress_reward(eval)
     }
 
     fn speed_reward_component(&self, geomean_ns: Option<f64>) -> f32 {
         self.reward_value(true, geomean_ns)
-            .clamp(0.0, SPEED_REWARD_CAP)
+            .clamp(0.0, self.reward_profile.speed_cap)
+    }
+
+    fn runnable_progress_reward(&self, eval: &TrimulEval) -> f32 {
+        let progress = eval.test_progress();
+        self.reward_profile.runnable
+            + self.reward_profile.partial_correctness * progress.fraction() as f32
     }
 
     fn reward_diagnostic(&self, eval: &TrimulEval) -> Option<String> {
@@ -1151,11 +1309,6 @@ fn eval_has_implausible_benchmark(eval: &TrimulEval) -> bool {
     !eval.verification.benchmark_means_ns.is_empty() && eval.verification.geomean_ns.is_none()
 }
 
-fn runnable_progress_reward(eval: &TrimulEval) -> f32 {
-    let progress = eval.test_progress();
-    RUNNABLE_REWARD + PARTIAL_CORRECTNESS_REWARD * progress.fraction() as f32
-}
-
 fn text_has_shape_failure(text: &str) -> bool {
     let text = text.to_ascii_lowercase();
     text.contains("shapes cannot be multiplied")
@@ -1305,6 +1458,177 @@ mod tests {
 
     fn reward() -> TrimulReward {
         TrimulReward::new("/img.sif", "/eval", "/tmp")
+    }
+
+    #[test]
+    fn reward_profile_default_matches_original_ladder_and_validates() {
+        let profile = TrimulRewardProfile::default();
+
+        assert_eq!(profile.format_extracted, FORMAT_EXTRACTED_REWARD);
+        assert_eq!(profile.runnable, RUNNABLE_REWARD);
+        assert_eq!(profile.partial_correctness, PARTIAL_CORRECTNESS_REWARD);
+        assert_eq!(profile.correctness, CORRECTNESS_REWARD);
+        assert_eq!(profile.speed_cap, SPEED_REWARD_CAP);
+        profile.validate().unwrap();
+    }
+
+    #[test]
+    fn reward_profile_rejects_nonfinite_negative_and_inverted_ladders() {
+        let negative = TrimulRewardProfile {
+            runnable: -0.01,
+            ..TrimulRewardProfile::default()
+        };
+        assert!(negative.validate().unwrap_err().contains("finite and >= 0"));
+
+        let nonfinite = TrimulRewardProfile {
+            speed_cap: f32::NAN,
+            ..TrimulRewardProfile::default()
+        };
+        assert!(nonfinite
+            .validate()
+            .unwrap_err()
+            .contains("finite and >= 0"));
+
+        let format_above_runnable = TrimulRewardProfile {
+            format_extracted: 0.10,
+            ..TrimulRewardProfile::default()
+        };
+        assert!(format_above_runnable
+            .validate()
+            .unwrap_err()
+            .contains("format_extracted"));
+
+        let partial_above_correctness = TrimulRewardProfile {
+            runnable: 0.40,
+            ..TrimulRewardProfile::default()
+        };
+        assert!(partial_above_correctness
+            .validate()
+            .unwrap_err()
+            .contains("partial_correctness"));
+    }
+
+    #[test]
+    fn reward_rejects_invalid_profile_at_builder_boundary() {
+        let invalid = TrimulRewardProfile {
+            runnable: 0.40,
+            ..TrimulRewardProfile::default()
+        };
+
+        assert!(reward()
+            .with_reward_profile(invalid)
+            .unwrap_err()
+            .contains("partial_correctness"));
+    }
+
+    fn custom_reward_profile() -> TrimulRewardProfile {
+        TrimulRewardProfile {
+            format_extracted: 0.03,
+            runnable: 0.10,
+            partial_correctness: 0.20,
+            correctness: 0.50,
+            speed_cap: 0.25,
+            ..TrimulRewardProfile::default()
+        }
+    }
+
+    fn format_only_eval() -> TrimulEval {
+        TrimulEval {
+            verification: TrimulVerification {
+                correct: false,
+                benchmark_means_ns: Vec::new(),
+                geomean_ns: None,
+                speedup: None,
+            },
+            status: RunStatus::TimedOut,
+            output: TrimulEvalOutput::default(),
+            test_check: None,
+            test_exit: None,
+            benchmark_exit: None,
+            has_benchmark_section: false,
+        }
+    }
+
+    fn partial_progress_eval() -> TrimulEval {
+        TrimulEval {
+            verification: TrimulVerification {
+                correct: false,
+                benchmark_means_ns: Vec::new(),
+                geomean_ns: None,
+                speedup: None,
+            },
+            status: RunStatus::Exited(0),
+            output: TrimulEvalOutput {
+                stdout: "test-count: 4\ntest.0.status: pass\ntest.1.status: pass\ntest-exit: 1\n"
+                    .to_string(),
+                stderr: String::new(),
+            },
+            test_check: Some("fail".to_string()),
+            test_exit: Some(1),
+            benchmark_exit: None,
+            has_benchmark_section: false,
+        }
+    }
+
+    fn correct_fast_eval() -> TrimulEval {
+        TrimulEval {
+            verification: TrimulVerification {
+                correct: true,
+                benchmark_means_ns: vec![250.0],
+                geomean_ns: Some(250.0),
+                speedup: Some(4.0),
+            },
+            status: RunStatus::Exited(0),
+            output: TrimulEvalOutput::default(),
+            test_check: Some("pass".to_string()),
+            test_exit: Some(0),
+            benchmark_exit: Some(0),
+            has_benchmark_section: true,
+        }
+    }
+
+    fn assert_profile_number(profile_metadata: &serde_json::Value, key: &str, expected: f64) {
+        assert!((profile_metadata[key].as_f64().unwrap() - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn custom_reward_profile_controls_ladder() {
+        let profile = custom_reward_profile();
+        profile.validate().unwrap();
+        let r = reward()
+            .with_reward_profile(profile)
+            .unwrap()
+            .with_baseline_ns(1000.0);
+
+        assert_eq!(r.reward_from_extracted_eval(&format_only_eval()), 0.03);
+        assert!((r.reward_from_eval(&partial_progress_eval()) - 0.20).abs() < 1e-6);
+        assert_eq!(r.reward_from_extracted_eval(&correct_fast_eval()), 0.75);
+    }
+
+    #[test]
+    fn custom_reward_profile_records_metadata() {
+        let r = reward()
+            .with_reward_profile(custom_reward_profile())
+            .unwrap()
+            .with_baseline_ns(1000.0);
+        let fast = correct_fast_eval();
+        let training_reward = r.reward_from_extracted_eval(&fast);
+        let metadata = r.reward_metadata(
+            "def custom_kernel(data): return data",
+            &fast,
+            training_reward,
+        );
+        let profile_metadata = &metadata["reward_profile"];
+
+        assert_profile_number(profile_metadata, "format_extracted", 0.03);
+        assert_profile_number(profile_metadata, "runnable", 0.10);
+        assert_profile_number(profile_metadata, "partial_correctness", 0.20);
+        assert_profile_number(profile_metadata, "correctness", 0.50);
+        assert_profile_number(profile_metadata, "speed_cap", 0.25);
+        assert_eq!(
+            profile_metadata["implausible_benchmark"],
+            serde_json::json!("zero")
+        );
     }
 
     #[test]
@@ -2012,6 +2336,14 @@ mod tests {
                 .as_ref()
                 .and_then(|m| m.get("submission_extracted")),
             Some(&serde_json::json!(false))
+        );
+        assert_eq!(
+            outcomes[0]
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("reward_profile"))
+                .and_then(|p| p.get("scheme")),
+            Some(&serde_json::json!("trimul_shaped_v1"))
         );
     }
 

@@ -77,10 +77,12 @@ component. Implausibly fast benchmark timings still score zero. The artifact
 acceptance rule below stays strict: held-out correctness, repeated same-GPU
 benchmarking, and measured speedup over the pinned baseline.
 
-The run-config schema reserves the explicit default reward profile below. In the
-current implementation only this default is accepted, so behavior is unchanged;
-custom values are rejected until the tunable reward-profile follow-up wires them
-into `TrimulReward`.
+The run-config schema accepts the explicit reward profile below. Omit `trimul.reward`
+to use these `trimul_shaped_v1` defaults, or tune the numeric values to adjust
+discovery density. Custom profiles must preserve the reward ladder:
+`format_extracted <= runnable` and
+`runnable + partial_correctness <= correctness`; implausibly fast benchmark timings
+remain fail-closed at zero.
 
 ```jsonc
 "trimul": {
@@ -136,7 +138,7 @@ with the final report:
 | run config | The exact JSON config passed to `ferrl train`. |
 | prompt | The exact rendered model prompt bytes, frozen as `<run-dir>/prompt.txt` plus `prompt.sha256`; do not rely on a mutable local `trimul.prompt_path` for provenance. |
 | submission extraction | `trimul.submission_extract_mode` (`final_fence` or `thinking_after_think`); this controls parsing only and must not construct prompt text. |
-| reward profile | `trimul.reward`; currently the accepted default `trimul_shaped_v1` profile only. |
+| reward profile | `trimul.reward`; defaults to `trimul_shaped_v1`, with custom ladder-preserving values allowed. |
 | run-health policy | `run_health`; currently empty/default only, with the intended stop condition recorded separately below. |
 | model | Model family, checkpoint identity, tokenizer identity, LoRA rank/alpha, base dtype, and rollout seed. |
 | TriMul eval bundle | Immutable identity of the GPUMODE `bioml/trimul` bundle used for `eval_dir` (commit, release, or digest). |
@@ -198,6 +200,15 @@ The manifest schema is versioned from the first run:
     "run_config_sha256": "<sha256 of resolved run config>",
     "prompt_sha256": "<sha256 of prompt.txt>",
     "prompt_file": "prompt.txt",
+    "reward_profile": {
+      "scheme": "trimul_shaped_v1",
+      "format_extracted": 0.02,
+      "runnable": 0.05,
+      "partial_correctness": 0.75,
+      "correctness": 1.0,
+      "speed_cap": 2.0,
+      "implausible_benchmark": "zero"
+    },
     "trainer_steps": 0,
     "group_size": 0,
     "run_health": "<runreport summary or run notes>",
