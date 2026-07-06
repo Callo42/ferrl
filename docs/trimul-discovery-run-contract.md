@@ -98,11 +98,15 @@ remain fail-closed at zero.
 }
 ```
 
-The top-level `run_health` schema is reserved for reward/correctness collapse,
-dropped-row, grad-spike, dark-telemetry, and source-dominance policies. Non-empty
-policies are rejected until the configurable run-health follow-up lands; for now,
-record the intended stop condition and use `ferrl runreport` plus candidate-ledger
-diagnostics as the operator-facing health evidence.
+The top-level `run_health` schema configures post-run reward/correctness collapse,
+dropped-row, grad-spike, dark-telemetry, and source-dominance policies. `warn` reports a
+finding; `fail` makes `ferrl train` fail after telemetry is written and makes
+`ferrl runreport --config <run.json>` exit with code `2`. The `stop` action is reserved
+for a future in-run gate and is rejected today. Correctness collapse and source dominance
+depend on `candidates.jsonl`, so set
+`trainer.candidate_log_top_k >= trainer.group_size` when using those rules. Partial
+top-K candidate ledgers fail closed for those checks because they cannot represent the
+whole sampled group.
 
 ### Preparing a Qwen rendered prompt
 
@@ -139,14 +143,14 @@ with the final report:
 | prompt | The exact rendered model prompt bytes, frozen as `<run-dir>/prompt.txt` plus `prompt.sha256`; do not rely on a mutable local `trimul.prompt_path` for provenance. |
 | submission extraction | `trimul.submission_extract_mode` (`final_fence` or `thinking_after_think`); this controls parsing only and must not construct prompt text. |
 | reward profile | `trimul.reward`; defaults to `trimul_shaped_v1`, with custom ladder-preserving values allowed. |
-| run-health policy | `run_health`; currently empty/default only, with the intended stop condition recorded separately below. |
+| run-health policy | `run_health`; post-run warn/fail policy, including the original top-level config passed to `ferrl runreport --config`. |
 | model | Model family, checkpoint identity, tokenizer identity, LoRA rank/alpha, base dtype, and rollout seed. |
 | TriMul eval bundle | Immutable identity of the GPUMODE `bioml/trimul` bundle used for `eval_dir` (commit, release, or digest). |
 | sandbox image | Immutable identity of the Apptainer image used by `trimul.image` (path plus digest when available). |
 | cases | `task.yml` identity and the loaded counts for `tests` and `benchmarks`. |
 | seeds | `data.seed`, `policy.seed`, trainer seed-bearing knobs, and the training `trimul.secret_seed`. |
 | scratch cap | `trimul.scratch_max_bytes`; `0` means the ferrl default, currently 1 GiB. |
-| candidate ledger | `trainer.candidate_log_top_k`; use a positive value for discovery runs, and use at least `group_size` when diagnosing low- or zero-reward tails so all completions are persisted in `candidates.jsonl`; retain any `reward_diagnostic` values in the report. |
+| candidate ledger | `trainer.candidate_log_top_k`; use a positive value for discovery runs, and use at least `group_size` for `run_health.correctness_collapse`, `run_health.source_dominance`, and low- or zero-reward tail diagnosis so all completions are persisted in `candidates.jsonl`; retain any `reward_diagnostic` values in the report. |
 | hardware | GPU product name reported by the baseline command and visible CUDA device count. |
 | budget | Trainer `steps`, `group_size`, wall-clock allocation, and the stop condition chosen below. |
 
