@@ -230,7 +230,28 @@ reward-tail triage, set `candidate_log_top_k` at least as high as `group_size` s
 sampled completion is retained. TriMul's training reward is shaped for search density;
 test-passing candidates whose eval reaches a benchmark marker get a correctness floor,
 and artifact acceptance still requires clean held-out correctness plus repeated measured
-speedup through `ferrl trimul-artifact`. The optional `trimul.verifier_parallelism` knob
+speedup through `ferrl trimul-artifact`. The run-config schema reserves the explicit
+reward profile below; today only these default `trimul_shaped_v1` values are accepted
+and behavior is unchanged. Custom values are rejected until the follow-up that wires
+the profile into `TrimulReward`.
+
+```jsonc
+"trimul": {
+  "reward": {
+    "scheme": "trimul_shaped_v1",
+    "format_extracted": 0.02,
+    "runnable": 0.05,
+    "partial_correctness": 0.75,
+    "correctness": 1.0,
+    "speed_cap": 2.0,
+    "implausible_benchmark": "zero"
+  }
+}
+```
+
+The top-level `run_health` schema is likewise reserved for discovery health policy
+configuration; non-empty policies are rejected until the run-health follow-up lands.
+The optional `trimul.verifier_parallelism` knob
 keeps the default sequential verifier path at `1`; raise it only with a matching
 `trimul.verifier_cuda_device_pool` that gives each concurrent verifier worker its own
 GPU, and record both settings in the artifact manifest for like-for-like comparisons.
