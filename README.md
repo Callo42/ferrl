@@ -230,10 +230,12 @@ reward-tail triage, set `candidate_log_top_k` at least as high as `group_size` s
 sampled completion is retained. TriMul's training reward is shaped for search density;
 test-passing candidates whose eval reaches a benchmark marker get a correctness floor,
 and artifact acceptance still requires clean held-out correctness plus repeated measured
-speedup through `ferrl trimul-artifact`. The run-config schema reserves the explicit
-reward profile below; today only these default `trimul_shaped_v1` values are accepted
-and behavior is unchanged. Custom values are rejected until the follow-up that wires
-the profile into `TrimulReward`.
+speedup through `ferrl trimul-artifact`. The run-config schema accepts the explicit
+reward profile below. Omit `trimul.reward` to use these `trimul_shaped_v1` defaults,
+or tune the numeric values to adjust discovery density. Custom profiles must preserve
+the reward ladder: `format_extracted <= runnable` and
+`runnable + partial_correctness <= correctness`; implausibly fast benchmark timings
+remain fail-closed at zero.
 
 ```jsonc
 "trimul": {
