@@ -636,6 +636,93 @@ struct BaselineCfg {
     gpu: String,
 }
 
+/// Versioned TriMul training-reward profile.
+///
+/// PR-A schema lock only: custom values are validated but not wired into
+/// `TrimulReward` until the tunable reward-profile follow-up. The defaults
+/// exactly mirror the current `trimul_shaped_v1` constants.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct TrimulRewardCfg {
+    /// Reward scheme identifier.
+    scheme: TrimulRewardScheme,
+    /// Tiny reward for an extractable final submission.
+    format_extracted: f64,
+    /// Reward for reaching the test harness.
+    runnable: f64,
+    /// Maximum sub-correctness reward for partial test progress.
+    partial_correctness: f64,
+    /// Fully correct floor before speed is considered.
+    correctness: f64,
+    /// Cap on the speed reward component.
+    speed_cap: f64,
+    /// Policy for implausibly fast benchmark timings.
+    implausible_benchmark: ImplausibleBenchmarkPolicy,
+}
+
+impl Default for TrimulRewardCfg {
+    fn default() -> Self {
+        Self {
+            scheme: TrimulRewardScheme::TrimulShapedV1,
+            format_extracted: 0.02,
+            runnable: 0.05,
+            partial_correctness: 0.75,
+            correctness: 1.0,
+            speed_cap: 2.0,
+            implausible_benchmark: ImplausibleBenchmarkPolicy::Zero,
+        }
+    }
+}
+
+impl TrimulRewardCfg {
+    fn validate_current_support(&self) -> Result<(), CliError> {
+        match self.scheme {
+            TrimulRewardScheme::TrimulShapedV1 => {}
+        }
+        match self.implausible_benchmark {
+            ImplausibleBenchmarkPolicy::Zero => {}
+        }
+        for (label, value) in [
+            ("trimul.reward.format_extracted", self.format_extracted),
+            ("trimul.reward.runnable", self.runnable),
+            (
+                "trimul.reward.partial_correctness",
+                self.partial_correctness,
+            ),
+            ("trimul.reward.correctness", self.correctness),
+            ("trimul.reward.speed_cap", self.speed_cap),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(CliError::msg(format!("{label} must be finite and >= 0")));
+            }
+        }
+        let defaults = Self::default();
+        if self != &defaults {
+            return Err(CliError::msg(
+                "custom trimul.reward values are reserved for the tunable reward-profile \
+                 follow-up; omit trimul.reward or use the trimul_shaped_v1 defaults",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// TriMul reward scheme identifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TrimulRewardScheme {
+    /// The current shaped training reward: format/runnable/partial/correctness/speed.
+    TrimulShapedV1,
+}
+
+/// Handling for implausibly fast benchmark timings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ImplausibleBenchmarkPolicy {
+    /// Score the candidate zero.
+    Zero,
+}
+
 /// TriMul task knobs (read only when `task == "trimul"`): the sandboxed eval image and
 /// the pinned GPU Mode bundle, bounded scratch, the held-out secret seed, the
 /// per-candidate wall budget, and the optional baseline pin. The concrete case list is
@@ -673,6 +760,165 @@ struct TrimulCfg {
     verifier_parallelism: usize,
     /// The reference baseline pin (omit to fall back to an inverse-time reward).
     baseline: Option<BaselineCfg>,
+    /// Versioned training-reward profile. Custom values are schema-reserved until
+    /// the follow-up that wires them into `TrimulReward`.
+    reward: TrimulRewardCfg,
+}
+
+/// Discovery-health policy schema.
+///
+/// PR-A schema lock only: non-empty policies are rejected until the configurable
+/// health-policy follow-up wires this into `runreport` / train gating.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RunHealthCfg {
+    /// Detect mean reward collapse over a trailing window.
+    reward_collapse: Option<WindowThresholdCfg>,
+    /// Detect task correctness collapse over a trailing window, when task metadata supports it.
+    correctness_collapse: Option<WindowThresholdCfg>,
+    /// Detect dropped/all-pad completion rows.
+    dropped_rows: Option<CountThresholdCfg>,
+    /// Detect large gradient spikes relative to a run-local baseline.
+    grad_spike: Option<FactorThresholdCfg>,
+    /// Detect missing off-policy drift telemetry.
+    telemetry_dark: Option<HealthActionCfg>,
+    /// Detect source-hash dominance in candidate ledgers.
+    source_dominance: Option<FractionThresholdCfg>,
+}
+
+impl RunHealthCfg {
+    fn validate_current_support(&self) -> Result<(), CliError> {
+        if let Some(rule) = &self.reward_collapse {
+            rule.validate("run_health.reward_collapse")?;
+        }
+        if let Some(rule) = &self.correctness_collapse {
+            rule.validate("run_health.correctness_collapse")?;
+        }
+        if let Some(rule) = &self.dropped_rows {
+            rule.validate("run_health.dropped_rows")?;
+        }
+        if let Some(rule) = &self.grad_spike {
+            rule.validate("run_health.grad_spike")?;
+        }
+        if let Some(action) = self.telemetry_dark {
+            validate_health_action(action);
+        }
+        if let Some(rule) = &self.source_dominance {
+            rule.validate("run_health.source_dominance")?;
+        }
+        if self != &Self::default() {
+            return Err(CliError::msg(
+                "run_health is schema-reserved but not enforced yet; omit non-default \
+                 run_health policies until the configurable run-health follow-up",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Action a future health policy may take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum HealthActionCfg {
+    /// Report but do not fail.
+    Warn,
+    /// Fail the post-run health gate.
+    Fail,
+    /// Stop a run once in-run gating exists.
+    Stop,
+}
+
+fn validate_health_action(action: HealthActionCfg) {
+    match action {
+        HealthActionCfg::Warn | HealthActionCfg::Fail | HealthActionCfg::Stop => {}
+    }
+}
+
+/// Windowed threshold policy.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WindowThresholdCfg {
+    /// Trailing window size in optimizer steps.
+    window: usize,
+    /// Minimum allowed value.
+    min: f64,
+    /// Policy action.
+    action: HealthActionCfg,
+}
+
+impl WindowThresholdCfg {
+    fn validate(&self, label: &str) -> Result<(), CliError> {
+        if self.window == 0 {
+            return Err(CliError::msg(format!("{label}.window must be >= 1")));
+        }
+        if !self.min.is_finite() {
+            return Err(CliError::msg(format!("{label}.min must be finite")));
+        }
+        validate_health_action(self.action);
+        Ok(())
+    }
+}
+
+/// Count threshold policy.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CountThresholdCfg {
+    /// Maximum allowed count.
+    max: u64,
+    /// Policy action.
+    action: HealthActionCfg,
+}
+
+impl CountThresholdCfg {
+    fn validate(&self, _label: &str) -> Result<(), CliError> {
+        let _max = self.max;
+        validate_health_action(self.action);
+        Ok(())
+    }
+}
+
+/// Factor threshold policy.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FactorThresholdCfg {
+    /// Maximum allowed multiplicative factor.
+    factor: f64,
+    /// Policy action.
+    action: HealthActionCfg,
+}
+
+impl FactorThresholdCfg {
+    fn validate(&self, label: &str) -> Result<(), CliError> {
+        if !self.factor.is_finite() || self.factor <= 0.0 {
+            return Err(CliError::msg(format!(
+                "{label}.factor must be finite and > 0"
+            )));
+        }
+        validate_health_action(self.action);
+        Ok(())
+    }
+}
+
+/// Fraction threshold policy.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FractionThresholdCfg {
+    /// Maximum allowed fraction.
+    max_fraction: f64,
+    /// Policy action.
+    action: HealthActionCfg,
+}
+
+impl FractionThresholdCfg {
+    fn validate(&self, label: &str) -> Result<(), CliError> {
+        if !self.max_fraction.is_finite() || !(0.0..=1.0).contains(&self.max_fraction) {
+            return Err(CliError::msg(format!(
+                "{label}.max_fraction must be finite and in [0, 1]"
+            )));
+        }
+        validate_health_action(self.action);
+        Ok(())
+    }
 }
 
 /// Data-parallel launch knobs for `ferrl train`.
@@ -716,6 +962,10 @@ struct RunConfig {
     /// TriMul task knobs (only read when `task == "trimul"`).
     #[serde(default)]
     trimul: TrimulCfg,
+    /// Discovery health policy. Non-default values are schema-reserved until
+    /// the follow-up that wires this into health evaluation.
+    #[serde(default)]
+    run_health: RunHealthCfg,
     /// The GRPO trainer config.
     trainer: TrainerConfig,
 }
@@ -745,10 +995,17 @@ impl RunConfig {
             path: path.to_path_buf(),
             source,
         })?;
-        serde_json::from_slice(&bytes).map_err(|source| CliError::Config {
+        let cfg: Self = serde_json::from_slice(&bytes).map_err(|source| CliError::Config {
             path: path.to_path_buf(),
             source,
-        })
+        })?;
+        cfg.validate_current_config_support()?;
+        Ok(cfg)
+    }
+
+    fn validate_current_config_support(&self) -> Result<(), CliError> {
+        self.trimul.reward.validate_current_support()?;
+        self.run_health.validate_current_support()
     }
 
     /// The loader options for this run (rollout temperature mirrors the trainer's).
@@ -1849,10 +2106,12 @@ fn read_verified_prompt_copy(path: &Path) -> Result<Vec<u8>, CliError> {
 
 /// Parse a [`RunConfig`] from already-read bytes.
 fn parse_run_config(path: &Path, bytes: &[u8]) -> Result<RunConfig, CliError> {
-    serde_json::from_slice(bytes).map_err(|source| CliError::Config {
+    let cfg: RunConfig = serde_json::from_slice(bytes).map_err(|source| CliError::Config {
         path: path.to_path_buf(),
         source,
-    })
+    })?;
+    cfg.validate_current_config_support()?;
+    Ok(cfg)
 }
 
 /// Run clean verification `repeats` times.
@@ -2473,9 +2732,10 @@ fn read_metrics_inputs(paths: &[PathBuf]) -> Result<Vec<Vec<ferrl::Metrics>>, Cl
         .collect::<Result<Vec<_>, _>>()?)
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct CandidateHealth {
     diagnostics: usize,
+    source_buckets: BTreeMap<String, usize>,
 }
 
 fn apply_candidate_health_gate(
@@ -2513,9 +2773,24 @@ fn read_candidate_health_inputs(paths: &[PathBuf]) -> Result<Option<CandidateHea
                 CliError::msg(format!("parse {} line {}: {e}", path.display(), idx + 1))
             })?;
             health.diagnostics += usize::from(record.reward_diagnostic.is_some());
+            *health
+                .source_buckets
+                .entry(candidate_source_bucket(&record))
+                .or_default() += 1;
         }
     }
     Ok(found.then_some(health))
+}
+
+fn candidate_source_bucket(record: &CandidateRecord) -> String {
+    record
+        .reward_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("source_sha256"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|source| !source.trim().is_empty())
+        .unwrap_or("__unknown_source__")
+        .to_string()
 }
 
 fn resolve_candidates_path(input: &Path) -> PathBuf {
@@ -2701,6 +2976,28 @@ mod tests {
         )
     }
 
+    fn trimul_reserved_reward_test_config(secret_seed: u64) -> String {
+        format!(
+            r#"{{
+                "task": "trimul",
+                "model_dir": "/m",
+                "trimul": {{
+                  "prompt_path": "/prompt.txt",
+                  "submission_extract_mode": "final_fence",
+                  "image": "/image.sif",
+                  "eval_dir": "/eval",
+                  "scratch_root": "/scratch",
+                  "secret_seed": {secret_seed},
+                  "reward": {{ "runnable": 0.07 }}
+                }},
+                "trainer": {{ "steps": 1, "group_size": 2, "max_new_tokens": 8,
+                  "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
+                  "lr": 1e-5, "weight_decay": 0.0,
+                  "loss_type": "grpo", "scale_rewards": "group" }}
+            }}"#
+        )
+    }
+
     fn trimul_score_args_for_test(dir: &Path) -> TrimulScoreArgs {
         TrimulScoreArgs {
             config: dir.join("run.json"),
@@ -2719,6 +3016,36 @@ mod tests {
             model_family: "gemma4".to_string(),
             checkpoint: None,
             tokenizer: None,
+        }
+    }
+
+    fn trimul_artifact_args_for_test(dir: &Path) -> TrimulArtifactArgs {
+        TrimulArtifactArgs {
+            config: dir.join("run.json"),
+            prompt_copy: dir.join("prompt.txt"),
+            completion: dir.join("completion.txt"),
+            completion_normalization: CompletionNormalization::None,
+            out: dir.join("artifact"),
+            run_id: "test-run".to_string(),
+            step: 0,
+            prompt_index: 0,
+            group_index: 0,
+            rank: 0,
+            world_size: 1,
+            training_reward: 0.0,
+            audit_secret_seed: 999,
+            baseline_measurements_ns: vec![1.0, 1.0, 1.0],
+            baseline_command: None,
+            repeats: 3,
+            ferrl_commit: "test-commit".to_string(),
+            run_health: "test".to_string(),
+            source_inspection: SourceInspectionResult::Clean,
+            source_inspection_notes: "clean".to_string(),
+            model_family: "gemma4".to_string(),
+            checkpoint: None,
+            tokenizer: None,
+            eval_bundle: None,
+            sandbox_image: None,
         }
     }
 
@@ -2771,6 +3098,102 @@ mod tests {
         assert_eq!(cfg.data.train_n, 64);
         // The loader temperature mirrors the trainer's (cannot drift).
         assert!((cfg.loader_opts().temperature - cfg.trainer.temperature).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn discovery_control_default_schema_is_accepted() {
+        let tmp = TestDir::new("discovery-control-default");
+        let json = r#"{
+            "task": "trimul",
+            "model_dir": "/m",
+            "trimul": {
+              "prompt_path": "/prompt.txt",
+              "submission_extract_mode": "final_fence",
+              "reward": {
+                "scheme": "trimul_shaped_v1",
+                "format_extracted": 0.02,
+                "runnable": 0.05,
+                "partial_correctness": 0.75,
+                "correctness": 1.0,
+                "speed_cap": 2.0,
+                "implausible_benchmark": "zero"
+              }
+            },
+            "run_health": {},
+            "trainer": { "steps": 1, "group_size": 2, "max_new_tokens": 8,
+              "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
+              "lr": 1e-5, "weight_decay": 0.0,
+              "loss_type": "grpo", "scale_rewards": "group" }
+        }"#;
+        let path = tmp.path().join("run.json");
+        std::fs::write(&path, json).unwrap();
+
+        let cfg = RunConfig::load(&path).unwrap();
+
+        assert_eq!(cfg.trimul.reward, TrimulRewardCfg::default());
+        assert_eq!(cfg.run_health, RunHealthCfg::default());
+    }
+
+    #[test]
+    fn discovery_control_custom_values_are_rejected_until_wired() {
+        let tmp = TestDir::new("discovery-control-custom");
+        let reward_json = r#"{
+            "task": "trimul",
+            "model_dir": "/m",
+            "trimul": {
+              "prompt_path": "/prompt.txt",
+              "submission_extract_mode": "final_fence",
+              "reward": { "runnable": 0.07 }
+            },
+            "trainer": { "steps": 1, "group_size": 2, "max_new_tokens": 8,
+              "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
+              "lr": 1e-5, "weight_decay": 0.0,
+              "loss_type": "grpo", "scale_rewards": "group" }
+        }"#;
+        let reward_path = tmp.path().join("reward.json");
+        std::fs::write(&reward_path, reward_json).unwrap();
+
+        let reward_err = RunConfig::load(&reward_path).unwrap_err().to_string();
+
+        assert!(reward_err.contains("custom trimul.reward values are reserved"));
+
+        let health_json = r#"{
+            "task": "countdown",
+            "model_dir": "/m",
+            "run_health": {
+              "reward_collapse": { "window": 5, "min": 1.0, "action": "warn" }
+            },
+            "trainer": { "steps": 1, "group_size": 2, "max_new_tokens": 8,
+              "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
+              "lr": 1e-5, "weight_decay": 0.0,
+              "loss_type": "grpo", "scale_rewards": "group" }
+        }"#;
+        let health_path = tmp.path().join("health.json");
+        std::fs::write(&health_path, health_json).unwrap();
+
+        let health_err = RunConfig::load(&health_path).unwrap_err().to_string();
+
+        assert!(health_err.contains("run_health is schema-reserved"));
+    }
+
+    #[test]
+    fn discovery_control_validation_reaches_score_and_artifact_paths() {
+        let tmp = TestDir::new("discovery-control-cli-paths");
+        std::fs::write(
+            tmp.path().join("run.json"),
+            trimul_reserved_reward_test_config(4242),
+        )
+        .unwrap();
+
+        let score_err = trimul_score(&trimul_score_args_for_test(tmp.path()))
+            .unwrap_err()
+            .to_string();
+        let artifact_err = trimul_artifact(&trimul_artifact_args_for_test(tmp.path()))
+            .unwrap_err()
+            .to_string();
+
+        assert!(score_err.contains("custom trimul.reward values are reserved"));
+        assert!(artifact_err.contains("custom trimul.reward values are reserved"));
     }
 
     /// `device` and `base_dtype` selectors deserialize from lowercase strings.
@@ -3274,8 +3697,14 @@ mod tests {
     fn candidate_health_gate_fails_diagnostic_regressions() {
         let mut failures = Vec::new();
         compare_candidate_health(
-            Some(CandidateHealth { diagnostics: 0 }),
-            Some(CandidateHealth { diagnostics: 1 }),
+            Some(CandidateHealth {
+                diagnostics: 0,
+                ..CandidateHealth::default()
+            }),
+            Some(CandidateHealth {
+                diagnostics: 1,
+                ..CandidateHealth::default()
+            }),
             &mut failures,
         );
 
@@ -3293,6 +3722,31 @@ mod tests {
         let mut failures = Vec::new();
         compare_candidate_health(None, None, &mut failures);
         assert!(failures.is_empty());
+    }
+
+    #[test]
+    fn candidate_health_buckets_missing_and_null_source_hashes() {
+        let tmp = TestDir::new("candidate-health-source");
+        let candidate_path = tmp.path().join("candidates.jsonl");
+        std::fs::write(
+            &candidate_path,
+            concat!(
+                r#"{"step":0,"rank":0,"world_size":1,"prompt_index":0,"group_index":0,"reward":0.0,"completion_len_tokens":8,"completion":"old"}"#,
+                "\n",
+                r#"{"step":0,"rank":0,"world_size":1,"prompt_index":0,"group_index":1,"reward":0.05,"completion_len_tokens":9,"reward_metadata":{"source_sha256":null},"completion":"null"}"#,
+                "\n",
+                r#"{"step":0,"rank":0,"world_size":1,"prompt_index":0,"group_index":2,"reward":2.0,"completion_len_tokens":10,"reward_metadata":{"source_sha256":"abc123"},"completion":"ok"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let health = read_candidate_health_inputs(&[candidate_path])
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(health.source_buckets["__unknown_source__"], 2);
+        assert_eq!(health.source_buckets["abc123"], 1);
     }
 
     /// The clap surface parses the artifact subcommand.
