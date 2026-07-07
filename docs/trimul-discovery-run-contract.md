@@ -151,6 +151,7 @@ with the final report:
 | seeds | `data.seed`, `policy.seed`, trainer seed-bearing knobs, and the training `trimul.secret_seed`. |
 | scratch cap | `trimul.scratch_max_bytes`; `0` means the ferrl default, currently 1 GiB. |
 | candidate ledger | `trainer.candidate_log_top_k`; use a positive value for discovery runs, and use at least `group_size` for `run_health.correctness_collapse`, `run_health.source_dominance`, and low- or zero-reward tail diagnosis so all completions are persisted in `candidates.jsonl`; retain any `reward_diagnostic` values in the report. |
+| trainer scalar controls | Exact `trainer.lr_schedule` and `trainer.beta_schedule` when present, otherwise the scalar `lr`, `warmup_steps`, and `beta` values. Schedules are deterministic step-index functions and must be copied with the final run config. |
 | hardware | GPU product name reported by the baseline command and visible CUDA device count. |
 | budget | Trainer `steps`, `group_size`, wall-clock allocation, and the stop condition chosen below. |
 

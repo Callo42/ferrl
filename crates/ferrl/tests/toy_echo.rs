@@ -34,7 +34,9 @@ use ferrl::policy::{GenConfig, Policy, Rollout};
 use ferrl::reward::RewardFn;
 use ferrl::sampler::GrpoSampler;
 use ferrl::telemetry::RunDir;
-use ferrl::trainer::{RunStop, TokenizerLike, Trainer, TrainerConfig, TrainerError};
+use ferrl::trainer::{
+    RunStop, ScalarSchedule, SchedulePoint, TokenizerLike, Trainer, TrainerConfig, TrainerError,
+};
 use ferrl::{LossType, Metrics, RewardError, Sample, ScaleRewards};
 
 /// Toy vocabulary size; the (full-rank) `LoRA` rank equals it, so a rank-`VOCAB`
@@ -481,6 +483,16 @@ fn window_mean(ms: &[Metrics]) -> f32 {
     ms.iter().map(|m| m.reward_mean).sum::<f32>() / ms.len() as f32
 }
 
+fn assert_f32_series_close(label: &str, got: &[f32], want: &[f32]) {
+    assert_eq!(got.len(), want.len(), "{label}: length mismatch");
+    for (idx, (&got, &want)) in got.iter().zip(want).enumerate() {
+        assert!(
+            (got - want).abs() < 1e-7,
+            "{label}[{idx}]: got {got}, want {want}"
+        );
+    }
+}
+
 /// Flatten each trainable var to a `Vec<f32>` for bit-exact comparison.
 fn snapshot_vars(vars: &[Var]) -> Vec<Vec<f32>> {
     vars.iter()
@@ -850,6 +862,96 @@ fn warmup_ramps_the_reported_lr_then_holds() {
             w
         );
     }
+}
+
+#[test]
+#[allow(clippy::cognitive_complexity)] // one compact end-to-end schedule wiring regression
+fn scheduled_scalars_reach_run_loss_optimizer_and_metrics() {
+    // A constant reward makes every group degenerate, so the surrogate carries no
+    // update signal. With legacy beta deliberately set to 0, any weight movement
+    // can only come from the scheduled beta reaching reference scoring and LossCfg.
+    let mut policy = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 29, TEMP).unwrap();
+    arm_adapter(&policy);
+    let before = weights_of(&policy);
+    let prompts = echo_prompts(VOCAB);
+    let cfg = TrainerConfig {
+        steps: 3,
+        group_size: 8,
+        max_new_tokens: 2,
+        temperature: TEMP,
+        beta: 0.0,
+        beta_schedule: Some(ScalarSchedule {
+            points: vec![
+                SchedulePoint {
+                    step: 0,
+                    value: 0.02,
+                },
+                SchedulePoint {
+                    step: 1,
+                    value: 0.04,
+                },
+            ],
+        }),
+        lr: 0.5,
+        lr_schedule: Some(ScalarSchedule {
+            points: vec![
+                SchedulePoint {
+                    step: 0,
+                    value: 0.01,
+                },
+                SchedulePoint {
+                    step: 1,
+                    value: 0.03,
+                },
+            ],
+        }),
+        ..TrainerConfig::default()
+    };
+    let tmp = TempDir::new("scheduled-scalars");
+    let run = RunDir::create(tmp.path(), "echo").unwrap();
+    let mut trainer = Trainer::new(cfg, &run).unwrap();
+    let (history, _stop) = trainer
+        .train(&mut policy, &ConstReward, &CharTokenizer, &prompts)
+        .unwrap();
+    let written = ferrl::read_metrics(run.metrics_path()).unwrap();
+
+    let expected_beta = [0.02, 0.04, 0.04];
+    let expected_lr = [0.01, 0.03, 0.03];
+    assert_f32_series_close(
+        "history.beta",
+        &history.iter().map(|m| m.beta).collect::<Vec<_>>(),
+        &expected_beta,
+    );
+    assert_f32_series_close(
+        "history.lr",
+        &history.iter().map(|m| m.lr).collect::<Vec<_>>(),
+        &expected_lr,
+    );
+    assert_f32_series_close(
+        "metrics.beta",
+        &written.iter().map(|m| m.beta).collect::<Vec<_>>(),
+        &expected_beta,
+    );
+    assert_f32_series_close(
+        "metrics.lr",
+        &written.iter().map(|m| m.lr).collect::<Vec<_>>(),
+        &expected_lr,
+    );
+    assert!(
+        history
+            .iter()
+            .all(|m| (m.frac_reward_zero_std - 1.0).abs() < 1e-6),
+        "premise: every group must be degenerate"
+    );
+    assert!(
+        history.iter().any(|m| m.grad_norm > 0.0),
+        "scheduled beta must keep degenerate groups live through the KL path"
+    );
+    assert_ne!(
+        weights_of(&policy),
+        before,
+        "scheduled beta must move weights"
+    );
 }
 
 /// A reward that scores every completion identically — every group is

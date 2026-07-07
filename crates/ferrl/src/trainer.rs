@@ -146,6 +146,127 @@ pub enum RewardGroupScope {
     DistributedSamePrompt,
 }
 
+/// One point in a deterministic scalar schedule.
+///
+/// Schedules are evaluated over 0-based optimizer steps. The first point must be
+/// at step `0`, later points must have strictly increasing steps, and the value
+/// is linearly interpolated between neighboring points. After the final point the
+/// value is held constant.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SchedulePoint {
+    /// Optimizer step where this point's value is exact.
+    pub step: u64,
+    /// Scalar value at [`step`](Self::step).
+    pub value: f64,
+}
+
+/// Deterministic piecewise-linear scalar schedule for trainer-owned knobs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScalarSchedule {
+    /// Piecewise-linear control points. See [`SchedulePoint`] for validation.
+    pub points: Vec<SchedulePoint>,
+}
+
+impl ScalarSchedule {
+    /// A one-point schedule that always returns `value`.
+    #[must_use]
+    pub fn constant(value: f64) -> Self {
+        Self {
+            points: vec![SchedulePoint { step: 0, value }],
+        }
+    }
+
+    /// A linear schedule from `start` at step `0` to `end` at `last_step`, then
+    /// held constant.
+    #[must_use]
+    pub fn linear(start: f64, end: f64, last_step: u64) -> Self {
+        if last_step == 0 {
+            return Self::constant(end);
+        }
+        Self {
+            points: vec![
+                SchedulePoint {
+                    step: 0,
+                    value: start,
+                },
+                SchedulePoint {
+                    step: last_step,
+                    value: end,
+                },
+            ],
+        }
+    }
+
+    /// Value at 0-based optimizer `step`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called before validation on an empty schedule.
+    #[must_use]
+    pub fn at(&self, step: u64) -> f64 {
+        let first = self
+            .points
+            .first()
+            .expect("schedule has at least one point");
+        if step <= first.step {
+            return first.value;
+        }
+        for pair in self.points.windows(2) {
+            let a = pair[0];
+            let b = pair[1];
+            if step <= b.step {
+                let span = (b.step - a.step) as f64;
+                let t = (step - a.step) as f64 / span;
+                return a.value + (b.value - a.value) * t;
+            }
+        }
+        self.points
+            .last()
+            .expect("schedule has at least one point")
+            .value
+    }
+
+    fn validate_nonnegative(&self, label: &str, trainer_steps: u64) -> Result<(), TrainerError> {
+        require(
+            !self.points.is_empty(),
+            &format!("{label}.points must not be empty"),
+        )?;
+        require(
+            trainer_steps > 0,
+            &format!("{label} requires trainer.steps >= 1"),
+        )?;
+        require(
+            self.points[0].step == 0,
+            &format!("{label}.points[0].step must be 0"),
+        )?;
+        let mut prev = None;
+        for (idx, point) in self.points.iter().enumerate() {
+            require(
+                point.step < trainer_steps,
+                &format!("{label}.points[{idx}].step must be < trainer.steps"),
+            )?;
+            require(
+                point.value.is_finite() && point.value >= 0.0,
+                &format!("{label}.points[{idx}].value must be finite and >= 0"),
+            )?;
+            if let Some(prev) = prev {
+                require(
+                    point.step > prev,
+                    &format!("{label}.points must be strictly increasing by step"),
+                )?;
+            }
+            prev = Some(point.step);
+        }
+        Ok(())
+    }
+
+    fn has_positive_value(&self) -> bool {
+        self.points.iter().any(|point| point.value > 0.0)
+    }
+}
+
 /// Configuration for a GRPO training run.
 ///
 /// Serializable so [`RunDir::write_config`] persists it to `config.json`. The
@@ -170,9 +291,15 @@ pub struct TrainerConfig {
     /// exactly `1` (current log-probs equal the frozen snapshot), so the clip is
     /// wired but inert.
     pub mu: usize,
-    /// KL penalty coefficient. The reference (adapter-disabled) log-probs and
-    /// the k3 KL term are computed only when this is `> 0`.
+    /// Legacy constant KL penalty coefficient. The reference (adapter-disabled)
+    /// log-probs and k3 KL term are computed only when the effective beta for a
+    /// step is `> 0`.
     pub beta: f64,
+    /// Optional deterministic piecewise-linear KL schedule. When set, this owns
+    /// the effective per-step beta; [`beta`](Self::beta) remains the legacy
+    /// constant default used when this field is `None`.
+    #[serde(default)]
+    pub beta_schedule: Option<ScalarSchedule>,
     /// PPO clip half-width `epsilon` (e.g. `0.2`) — the **lower** band, and the
     /// upper band too unless [`clip_eps_high`](Self::clip_eps_high) overrides it.
     pub clip_eps: f64,
@@ -192,6 +319,11 @@ pub struct TrainerConfig {
     /// `AdamW` learning rate (the post-warmup constant — see
     /// [`warmup_steps`](Self::warmup_steps)).
     pub lr: f64,
+    /// Optional deterministic piecewise-linear learning-rate schedule. When set,
+    /// this replaces [`lr`](Self::lr) and [`warmup_steps`](Self::warmup_steps);
+    /// encode warmup directly as schedule points.
+    #[serde(default)]
+    pub lr_schedule: Option<ScalarSchedule>,
     /// `AdamW` weight decay. Defaults to `0` (the toy trains pure policy gradient).
     pub weight_decay: f64,
     /// `AdamW` `β₁` (first-moment decay). Defaults to `0.9` — candle / TRL's
@@ -393,10 +525,12 @@ impl Default for TrainerConfig {
             temperature: 1.0,
             mu: 1,
             beta: 0.0,
+            beta_schedule: None,
             clip_eps: 0.2,
             clip_eps_high: None,
             importance_sampling_level: ImportanceSamplingLevel::Token,
             lr: 1e-3,
+            lr_schedule: None,
             weight_decay: 0.0,
             adam_beta1: default_adam_beta1(),
             adam_beta2: default_adam_beta2(),
@@ -512,6 +646,13 @@ impl TrainerConfigBuilder {
         self
     }
 
+    /// Set [`TrainerConfig::beta_schedule`].
+    #[must_use]
+    pub fn beta_schedule(mut self, beta_schedule: Option<ScalarSchedule>) -> Self {
+        self.cfg.beta_schedule = beta_schedule;
+        self
+    }
+
     /// Set [`TrainerConfig::clip_eps`].
     #[must_use]
     pub fn clip_eps(mut self, clip_eps: f64) -> Self {
@@ -537,6 +678,13 @@ impl TrainerConfigBuilder {
     #[must_use]
     pub fn lr(mut self, lr: f64) -> Self {
         self.cfg.lr = lr;
+        self
+    }
+
+    /// Set [`TrainerConfig::lr_schedule`].
+    #[must_use]
+    pub fn lr_schedule(mut self, lr_schedule: Option<ScalarSchedule>) -> Self {
+        self.cfg.lr_schedule = lr_schedule;
         self
     }
 
@@ -732,10 +880,20 @@ impl TrainerConfig {
             self.beta.is_finite() && self.beta >= 0.0,
             "beta must be finite and >= 0",
         )?;
+        if let Some(schedule) = &self.beta_schedule {
+            schedule.validate_nonnegative("beta_schedule", self.steps)?;
+        }
         require(
             self.clip_eps.is_finite() && self.clip_eps >= 0.0 && self.clip_eps < 1.0,
             "clip_eps must be finite and in [0, 1) (>= 1 disables the lower clip)",
         )?;
+        if let Some(schedule) = &self.lr_schedule {
+            schedule.validate_nonnegative("lr_schedule", self.steps)?;
+            require(
+                self.warmup_steps == 0,
+                "lr_schedule cannot be combined with warmup_steps; encode warmup as schedule points",
+            )?;
+        }
         if let Some(high) = self.clip_eps_high {
             require(
                 high.is_finite() && high >= 0.0,
@@ -775,13 +933,30 @@ impl TrainerConfig {
         self.clip_eps_high.unwrap_or(self.clip_eps)
     }
 
-    /// The effective learning rate for 0-based optimizer step `step`: linear
-    /// warmup `lr · (step + 1) / warmup_steps` over the first
-    /// [`warmup_steps`](Self::warmup_steps) steps, then constant [`lr`](Self::lr).
-    /// A pure function of the step index, so a resume re-enters the schedule
-    /// faithfully.
+    /// The effective KL coefficient for 0-based optimizer step `step`.
+    #[must_use]
+    pub fn beta_at(&self, step: u64) -> f64 {
+        self.beta_schedule
+            .as_ref()
+            .map_or(self.beta, |schedule| schedule.at(step))
+    }
+
+    fn requires_reference_policy(&self) -> bool {
+        self.beta_schedule
+            .as_ref()
+            .map_or(self.beta > 0.0, ScalarSchedule::has_positive_value)
+    }
+
+    /// The effective learning rate for 0-based optimizer step `step`. When
+    /// [`lr_schedule`](Self::lr_schedule) is set, it owns the value; otherwise
+    /// this uses the legacy linear warmup over [`warmup_steps`](Self::warmup_steps)
+    /// and then the constant [`lr`](Self::lr). A pure function of the step index,
+    /// so a resume re-enters the schedule faithfully.
     #[must_use]
     pub fn lr_at(&self, step: u64) -> f64 {
+        if let Some(schedule) = &self.lr_schedule {
+            return schedule.at(step);
+        }
         if self.warmup_steps == 0 || step + 1 >= self.warmup_steps {
             self.lr
         } else {
@@ -1535,7 +1710,7 @@ impl Trainer {
         // full-FT runs take `beta = 0` (no frozen reference exists to pull
         // toward; a base-anchored KL needs a separately loaded base policy,
         // which this trainer does not model).
-        if self.config.beta > 0.0 {
+        if self.config.requires_reference_policy() {
             policy.set_adapter_enabled(false);
             let toggleable = !policy.adapter_enabled();
             policy.set_adapter_enabled(true);
@@ -1572,9 +1747,11 @@ impl Trainer {
             // every line. A helper, not an inline `info_span!`, to keep the macro's
             // level-check branch out of this loop's cognitive-complexity budget.
             let _step = crate::telemetry::step_span(step).entered();
-            // Linear warmup, constant after: a pure function of the step index,
-            // so a resume mid-warmup re-enters the schedule exactly.
-            opt.set_learning_rate(self.config.lr_at(step));
+            // Step-owned scalar controls are pure functions of the step index, so
+            // a resume re-enters schedule or warmup state exactly.
+            let step_lr = self.config.lr_at(step);
+            let step_beta = self.config.beta_at(step);
+            opt.set_learning_rate(step_lr);
             // Wall-clock the whole step (rollout + reward + the mu inner update
             // epochs) so a long run is observable: step_secs drives steps/sec and
             // an ETA, tokens_per_sec the rollout throughput. Per-rank — the world
@@ -1585,6 +1762,7 @@ impl Trainer {
             gpu_mem.record("step_start");
             let (mut m, local_tokens) = self.run_window(
                 step,
+                step_beta,
                 policy,
                 reward_fn,
                 tokenizer,
@@ -1641,6 +1819,7 @@ impl Trainer {
     fn run_window<P: Policy, R: RewardFn>(
         &mut self,
         step: u64,
+        beta: f64,
         policy: &mut P,
         reward_fn: &R,
         tokenizer: &dyn TokenizerLike,
@@ -1662,7 +1841,7 @@ impl Trainer {
                 selection: &sel,
             };
             let (stat, item) =
-                self.collect_sample(step, policy, reward_fn, tokenizer, &selected, gpu_mem)?;
+                self.collect_sample(step, beta, policy, reward_fn, tokenizer, &selected, gpu_mem)?;
             stats.push(stat);
             if let Some(item) = item {
                 live.push(item);
@@ -1703,11 +1882,11 @@ impl Trainer {
             InnerAgg::default()
         } else {
             let mut ctx = UpdateCtx { vars, opt, gpu_mem };
-            self.update_window(policy, &live, &mut ctx, window_tokens, n_live_global)?
+            self.update_window(policy, &live, &mut ctx, window_tokens, n_live_global, beta)?
         };
         gpu_mem.record("window_end");
         Ok((
-            self.build_window_metrics(step, &stats, &agg, opt),
+            self.build_window_metrics(step, beta, &stats, &agg, opt),
             local_tokens,
         ))
     }
@@ -1911,9 +2090,11 @@ impl Trainer {
     /// with no snapshot and no update; a live group also snapshots the old / reference
     /// log-probs (taken now, at the window's start) into a [`LiveItem`] for the inner
     /// epochs.
+    #[allow(clippy::too_many_arguments)]
     fn collect_sample<P: Policy, R: RewardFn>(
         &mut self,
         step: u64,
+        beta: f64,
         policy: &mut P,
         reward_fn: &R,
         tokenizer: &dyn TokenizerLike,
@@ -2038,7 +2219,7 @@ impl Trainer {
             ratio_stats: None,
             rewards,
         };
-        if degenerate && self.config.beta <= 0.0 {
+        if degenerate && beta <= 0.0 {
             return Ok((stat, None));
         }
 
@@ -2062,7 +2243,7 @@ impl Trainer {
         let device = logp_old.device().clone();
         let mask = mask_rows_to_tensor(&mask_rows, &device)?;
         gpu_mem.record("logp_ref_start");
-        let logp_ref = self.reference_logprobs(policy, &rollout)?;
+        let logp_ref = self.reference_logprobs(policy, &rollout, beta)?;
         gpu_mem.record("logp_ref_end");
         let advantages = advantages_tensor(&advantages, &device)?;
         let item = LiveItem {
@@ -2113,10 +2294,11 @@ impl Trainer {
         ctx: &mut UpdateCtx<'_>,
         window_tokens: f64,
         n_live_global: f64,
+        beta: f64,
     ) -> Result<InnerAgg, TrainerError> {
         let mut agg = InnerAgg::default();
         for _ in 0..self.config.mu {
-            agg = self.accumulate_step(policy, live, ctx, window_tokens, n_live_global)?;
+            agg = self.accumulate_step(policy, live, ctx, window_tokens, n_live_global, beta)?;
         }
         Ok(agg)
     }
@@ -2140,6 +2322,7 @@ impl Trainer {
         ctx: &mut UpdateCtx<'_>,
         window_tokens: f64,
         n_live_global: f64,
+        beta: f64,
     ) -> Result<InnerAgg, TrainerError> {
         let vars = ctx.vars;
         let mut acc: Vec<Option<Tensor>> = vec![None; vars.len()];
@@ -2148,7 +2331,8 @@ impl Trainer {
         let mut sum_clip = 0.0_f32;
         for item in live {
             ctx.gpu_mem.record("item_backward_start");
-            let (grads, kl, clip_frac) = self.item_backward(policy, item, window_tokens, vars)?;
+            let (grads, kl, clip_frac) =
+                self.item_backward(policy, item, window_tokens, vars, beta)?;
             ctx.gpu_mem.record("item_backward_end");
             sum_kl += kl;
             sum_clip += clip_frac;
@@ -2285,13 +2469,14 @@ impl Trainer {
         item: &LiveItem,
         window_tokens: f64,
         vars: &[Var],
+        beta: f64,
     ) -> Result<(GradStore, f32, f32), TrainerError> {
         let g = item.rollout.len();
         let mb = self.config.backward_microbatch_size;
         if mb > 0 && mb < g {
-            return self.item_backward_microbatched(policy, item, window_tokens, vars, mb);
+            return self.item_backward_microbatched(policy, item, window_tokens, vars, mb, beta);
         }
-        self.item_backward_uncut(policy, item, window_tokens, vars, 1.0)
+        self.item_backward_uncut(policy, item, window_tokens, vars, 1.0, beta)
     }
 
     fn item_backward_microbatched<P: Policy>(
@@ -2301,6 +2486,7 @@ impl Trainer {
         window_tokens: f64,
         vars: &[Var],
         microbatch_size: usize,
+        beta: f64,
     ) -> Result<(GradStore, f32, f32), TrainerError> {
         let logp_diag = policy.token_logprobs_detached(&item.rollout)?;
         let (kl, clip_frac) = self.item_diagnostics(&logp_diag, item)?;
@@ -2316,7 +2502,7 @@ impl Trainer {
                 LossType::Grpo | LossType::DrGrpo => len as f64 / total_rows as f64,
             };
             let (grads, _, _) =
-                self.item_backward_uncut(policy, &slice, window_tokens, vars, loss_scale)?;
+                self.item_backward_uncut(policy, &slice, window_tokens, vars, loss_scale, beta)?;
             fold_var_grads(vars, &grads, &mut acc, &mut covered)?;
         }
         let store = empty_grad_store(vars)?;
@@ -2331,12 +2517,13 @@ impl Trainer {
         window_tokens: f64,
         vars: &[Var],
         loss_scale: f64,
+        beta: f64,
     ) -> Result<(GradStore, f32, f32), TrainerError> {
         let logp = policy.token_logprobs(&item.rollout)?;
         let cfg = LossCfg {
             clip_eps_low: self.config.clip_eps,
             clip_eps_high: self.config.clip_eps_high_eff(),
-            beta: self.config.beta,
+            beta,
             loss_type: self.config.loss_type,
             is_level: self.config.importance_sampling_level,
             dapo_norm: Some(window_tokens),
@@ -2414,8 +2601,9 @@ impl Trainer {
         &self,
         policy: &mut P,
         rollout: &Rollout,
+        beta: f64,
     ) -> Result<Option<Tensor>, TrainerError> {
-        if self.config.beta <= 0.0 {
+        if beta <= 0.0 {
             return Ok(None);
         }
         policy.set_adapter_enabled(false);
@@ -2433,6 +2621,7 @@ impl Trainer {
     fn build_window_metrics(
         &self,
         step: u64,
+        beta: f64,
         stats: &[PromptStat],
         agg: &InnerAgg,
         opt: &FerrlAdamW,
@@ -2472,6 +2661,7 @@ impl Trainer {
         m.rollout_capture_tokens = folded.tokens;
         m.grad_norm = agg.grad_norm;
         m.lr = opt.learning_rate() as f32;
+        m.beta = beta as f32;
         m
     }
 }
@@ -3352,10 +3542,12 @@ mod tests {
             temperature: 0.8,
             mu: 2,
             beta: 0.04,
+            beta_schedule: None,
             clip_eps: 0.2,
             clip_eps_high: Some(0.28),
             importance_sampling_level: ImportanceSamplingLevel::Sequence,
             lr: 1e-6,
+            lr_schedule: None,
             weight_decay: 0.01,
             adam_beta1: 0.9,
             adam_beta2: 0.95,
@@ -3427,6 +3619,13 @@ mod tests {
                 let want = clipped_surrogate(rt, a, 0.2, 0.28) as f32;
                 assert_relative_eq!(got[i][j], want, epsilon = TOL);
             }
+        }
+    }
+
+    fn assert_f64s_close(actual: &[f64], expected: &[f64]) {
+        assert_eq!(actual.len(), expected.len());
+        for (&actual, &expected) in actual.iter().zip(expected) {
+            assert_relative_eq!(actual, expected, epsilon = 1e-12);
         }
     }
 
@@ -3544,6 +3743,41 @@ mod tests {
         bad(|c| c.lr = f64::INFINITY);
         bad(|c| c.weight_decay = -0.1);
         bad(|c| c.beta = -1.0);
+        bad(|c| c.beta_schedule = Some(ScalarSchedule { points: vec![] }));
+        bad(|c| {
+            c.beta_schedule = Some(ScalarSchedule {
+                points: vec![SchedulePoint {
+                    step: 1,
+                    value: 0.0,
+                }],
+            });
+        });
+        bad(|c| {
+            c.beta_schedule = Some(ScalarSchedule {
+                points: vec![
+                    SchedulePoint {
+                        step: 0,
+                        value: 0.0,
+                    },
+                    SchedulePoint {
+                        step: 0,
+                        value: 0.1,
+                    },
+                ],
+            });
+        });
+        bad(|c| {
+            c.beta_schedule = Some(ScalarSchedule {
+                points: vec![SchedulePoint {
+                    step: 0,
+                    value: -0.1,
+                }],
+            });
+        });
+        bad(|c| {
+            c.lr_schedule = Some(ScalarSchedule::constant(0.001));
+            c.warmup_steps = 2;
+        });
         bad(|c| c.clip_eps = f64::NAN);
         bad(|c| c.clip_eps = 1.0);
         bad(|c| c.clip_eps = 2.0);
@@ -3648,6 +3882,70 @@ mod tests {
             ..TrainerConfig::default()
         };
         assert_relative_eq!(off.lr_at(0), 1.0, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn scalar_schedule_interpolates_and_holds_last_point() {
+        let schedule = ScalarSchedule {
+            points: vec![
+                SchedulePoint {
+                    step: 0,
+                    value: 0.0,
+                },
+                SchedulePoint {
+                    step: 4,
+                    value: 0.04,
+                },
+                SchedulePoint {
+                    step: 8,
+                    value: 0.02,
+                },
+            ],
+        };
+        schedule.validate_nonnegative("test", 9).unwrap();
+
+        assert_relative_eq!(schedule.at(0), 0.0, epsilon = 1e-12);
+        assert_relative_eq!(schedule.at(2), 0.02, epsilon = 1e-12);
+        assert_relative_eq!(schedule.at(4), 0.04, epsilon = 1e-12);
+        assert_relative_eq!(schedule.at(6), 0.03, epsilon = 1e-12);
+        assert_relative_eq!(schedule.at(20), 0.02, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn beta_and_lr_schedules_override_legacy_constants() {
+        let cfg = TrainerConfig {
+            beta: 0.2,
+            beta_schedule: Some(ScalarSchedule::linear(0.0, 0.04, 4)),
+            lr: 1.0,
+            lr_schedule: Some(ScalarSchedule::linear(0.0, 0.001, 2)),
+            ..TrainerConfig::default()
+        };
+
+        assert_eq!(
+            (cfg.validate().is_ok(), cfg.requires_reference_policy()),
+            (true, true)
+        );
+        assert_f64s_close(
+            &[cfg.beta_at(0), cfg.beta_at(2), cfg.beta_at(8)],
+            &[0.0, 0.02, 0.04],
+        );
+        assert_f64s_close(
+            &[cfg.lr_at(0), cfg.lr_at(1), cfg.lr_at(3)],
+            &[0.0, 0.0005, 0.001],
+        );
+    }
+
+    #[test]
+    fn all_zero_beta_schedule_does_not_require_reference_policy() {
+        let cfg = TrainerConfig {
+            beta: 0.2,
+            beta_schedule: Some(ScalarSchedule::constant(0.0)),
+            ..TrainerConfig::default()
+        };
+
+        assert!(cfg.validate().is_ok());
+        assert_relative_eq!(cfg.beta_at(0), 0.0, epsilon = 1e-12);
+        assert!(!cfg.requires_reference_policy());
     }
 
     #[test]
@@ -4026,7 +4324,7 @@ mod tests {
         let trainer = Trainer::new(cfg.clone(), &run).unwrap();
         let vars = policy.trainable_vars();
         trainer
-            .item_backward(policy, item, window_tokens, &vars)
+            .item_backward(policy, item, window_tokens, &vars, cfg.beta_at(0))
             .unwrap()
     }
 
@@ -4612,12 +4910,18 @@ mod tests {
         // A config.json written before grad_accum_steps existed must deserialize to 1
         // (no accumulation), not fail — the serde default keeps old runs loadable.
         let cfg: TrainerConfig = serde_json::from_str(OLD_CONFIG_JSON).unwrap();
-        assert_eq!(cfg.grad_accum_steps, 1);
-        assert_eq!(cfg.backward_microbatch_size, 0);
-        assert_eq!(cfg.candidate_log_top_k, 0);
-        assert_eq!(cfg.reward_group_scope, RewardGroupScope::Local);
-        // The EOS field also predates the JSON above; serde fills it from the default.
-        assert_eq!(cfg.eos_token_id, None);
+        assert_eq!(
+            (
+                cfg.grad_accum_steps,
+                cfg.backward_microbatch_size,
+                cfg.candidate_log_top_k,
+                cfg.reward_group_scope,
+                cfg.beta_schedule.as_ref(),
+                cfg.lr_schedule.as_ref(),
+                cfg.eos_token_id,
+            ),
+            (1, 0, 0, RewardGroupScope::Local, None, None, None)
+        );
         assert!(cfg.validate().is_ok());
     }
 
