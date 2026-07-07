@@ -287,7 +287,11 @@ sampled group.
 The optional `trimul.verifier_parallelism` knob
 keeps the default sequential verifier path at `1`; raise it only with a matching
 `trimul.verifier_cuda_device_pool` that gives each concurrent verifier worker its own
-GPU, and record both settings in the artifact manifest for like-for-like comparisons.
+GPU, and record verifier settings in the artifact manifest for like-for-like comparisons.
+`trimul.verifier_max_procs` controls the verifier sandbox process cap (`ulimit -u`);
+`0` or omission uses the TriMul default, currently `1024`. This cap is finite for
+fork-bomb containment, but it must be comfortably above the allocation's ambient
+per-UID task count because `RLIMIT_NPROC` is not per container.
 For prompt experiments, set `trimul.prompt_path` to a UTF-8 file containing the
 complete rendered model prompt, including any system text, chat markers, assistant
 prefill, and reasoning prefix required by the model. TriMul training has no

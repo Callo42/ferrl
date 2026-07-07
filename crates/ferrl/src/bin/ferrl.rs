@@ -676,6 +676,8 @@ struct TrimulCfg {
     verifier_cuda_device_pool: Vec<String>,
     /// Maximum number of candidates in one GRPO group to verify concurrently (`0` -> 1).
     verifier_parallelism: usize,
+    /// Process cap applied to each verifier sandbox (`0` -> TriMul default).
+    verifier_max_procs: u64,
     /// The reference baseline pin (omit to fall back to an inverse-time reward).
     baseline: Option<BaselineCfg>,
     /// Versioned shaped training-reward profile.
@@ -1219,6 +1221,9 @@ impl RunConfig {
         }
         if t.verifier_parallelism != 0 {
             reward = reward.with_verifier_parallelism(t.verifier_parallelism);
+        }
+        if t.verifier_max_procs != 0 {
+            reward = reward.with_verifier_max_procs(t.verifier_max_procs);
         }
         if t.scratch_max_bytes != 0 {
             reward = reward.with_scratch_max_bytes(t.scratch_max_bytes);
@@ -2018,6 +2023,8 @@ struct ArtifactConfigManifest {
     scratch_max_bytes: u64,
     /// Maximum number of candidates in one GRPO group verified concurrently.
     verifier_parallelism: usize,
+    /// Process cap applied to each verifier sandbox.
+    verifier_max_procs: u64,
     /// Per-worker verifier CUDA visibility pool used during training.
     verifier_cuda_device_pool: Vec<String>,
 }
@@ -2348,6 +2355,7 @@ fn build_manifest(
             audit_secret_seed: args.audit_secret_seed,
             scratch_max_bytes: trimul_scratch_cap(cfg),
             verifier_parallelism: cfg.trimul.verifier_parallelism.max(1),
+            verifier_max_procs: trimul_verifier_max_procs(cfg),
             verifier_cuda_device_pool: cfg.trimul.verifier_cuda_device_pool.clone(),
         },
         eval: EvalManifest {
@@ -2402,6 +2410,14 @@ fn trimul_scratch_cap(cfg: &RunConfig) -> u64 {
         1 << 30
     } else {
         cfg.trimul.scratch_max_bytes
+    }
+}
+
+fn trimul_verifier_max_procs(cfg: &RunConfig) -> u64 {
+    if cfg.trimul.verifier_max_procs == 0 {
+        ferrl::trimul::DEFAULT_VERIFIER_MAX_PROCS
+    } else {
+        cfg.trimul.verifier_max_procs
     }
 }
 
@@ -2541,10 +2557,11 @@ fn artifact_report(
     .expect("writing to String cannot fail");
     writeln!(
         &mut out,
-        "- Budget: trainer_steps={}, group_size={}, scratch_max_bytes={}",
+        "- Budget: trainer_steps={}, group_size={}, scratch_max_bytes={}, verifier_max_procs={}",
         manifest.config.trainer_steps,
         manifest.config.group_size,
-        manifest.config.scratch_max_bytes
+        manifest.config.scratch_max_bytes,
+        manifest.config.verifier_max_procs
     )
     .expect("writing to String cannot fail");
     writeln!(&mut out, "- Run health: {}\n", manifest.config.run_health)
@@ -2674,6 +2691,11 @@ fn artifact_report(
         &mut out,
         manifest.config.scratch_max_bytes > 0,
         "scratch cap recorded",
+    );
+    push_check(
+        &mut out,
+        manifest.config.verifier_max_procs > 0,
+        "verifier process cap recorded",
     );
     push_check(
         &mut out,
@@ -4961,6 +4983,7 @@ mod tests {
                           "verifier_cuda_visible_devices": "1",
                           "verifier_cuda_device_pool": ["1", "2"],
                           "verifier_parallelism": 2,
+                          "verifier_max_procs": 2048,
                           "baseline": { "ns": 5200000.0, "gpu": "H100" } },
                         "trainer": { "steps": 1, "group_size": 2, "max_new_tokens": 8,
                           "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
@@ -4977,6 +5000,7 @@ mod tests {
         );
         assert_eq!(cfg.trimul.verifier_cuda_device_pool, ["1", "2"]);
         assert_eq!(cfg.trimul.verifier_parallelism, 2);
+        assert_eq!(cfg.trimul.verifier_max_procs, 2048);
         let b = cfg.trimul.baseline.as_ref().expect("baseline present");
         assert_eq!((b.ns, b.gpu.as_str()), (5_200_000.0, "H100"));
         // The single-prompt splits honour train_n / eval_n without deduping to one row.
@@ -4986,9 +5010,10 @@ mod tests {
         std::fs::remove_file(prompt_path).unwrap();
     }
 
-    /// The verifier CUDA pin is not just parsed: it reaches the reward run spec.
+    /// The verifier sandbox settings are not just parsed: they reach the run spec.
     #[test]
-    fn trimul_config_pins_verifier_cuda_visibility_in_reward() {
+    #[allow(clippy::cognitive_complexity)]
+    fn trimul_config_wires_verifier_sandbox_settings_in_reward() {
         let eval_dir =
             std::env::temp_dir().join(format!("ferrl-trimul-config-test-{}", std::process::id()));
         std::fs::create_dir_all(&eval_dir).unwrap();
@@ -5002,8 +5027,9 @@ benchmarks:
 "#,
         )
         .unwrap();
-        let json = format!(
-            r#"{{
+        let config_json = |verifier_max_procs_field: &str| {
+            format!(
+                r#"{{
                 "task": "trimul",
                 "model_dir": "/m",
                 "trimul": {{
@@ -5011,6 +5037,7 @@ benchmarks:
                   "eval_dir": "{}",
                   "scratch_root": "/tmp",
                   "verifier_cuda_visible_devices": "1",
+                  {}
                   "reward": {{ "format_extracted": 0.03, "runnable": 0.07, "partial_correctness": 0.70 }}
                 }},
                 "trainer": {{ "steps": 1, "group_size": 2, "max_new_tokens": 8,
@@ -5018,8 +5045,11 @@ benchmarks:
                   "lr": 1e-5, "weight_decay": 0.0,
                   "loss_type": "grpo", "scale_rewards": "group" }}
             }}"#,
-            eval_dir.display()
-        );
+                eval_dir.display(),
+                verifier_max_procs_field
+            )
+        };
+        let json = config_json(r#""verifier_max_procs": 2048,"#);
         let cfg: RunConfig = serde_json::from_str(&json).unwrap();
         let reward = cfg.build_trimul_reward_base().unwrap();
         let spec = reward.build_run_spec(std::path::Path::new("/tmp/scratch"));
@@ -5031,6 +5061,28 @@ benchmarks:
             .env
             .iter()
             .any(|(k, v)| k == "CUDA_VISIBLE_DEVICES" && v == "1"));
+        assert_eq!(spec.limits.max_procs, Some(2048));
+
+        let omitted_cfg: RunConfig = serde_json::from_str(&config_json("")).unwrap();
+        let omitted_spec = omitted_cfg
+            .build_trimul_reward_base()
+            .unwrap()
+            .build_run_spec(std::path::Path::new("/tmp/scratch"));
+        assert_eq!(
+            omitted_spec.limits.max_procs,
+            Some(ferrl::trimul::DEFAULT_VERIFIER_MAX_PROCS)
+        );
+
+        let zero_json = config_json(r#""verifier_max_procs": 0,"#);
+        let zero_cfg: RunConfig = serde_json::from_str(&zero_json).unwrap();
+        let zero_spec = zero_cfg
+            .build_trimul_reward_base()
+            .unwrap()
+            .build_run_spec(std::path::Path::new("/tmp/scratch"));
+        assert_eq!(
+            zero_spec.limits.max_procs,
+            Some(ferrl::trimul::DEFAULT_VERIFIER_MAX_PROCS)
+        );
     }
 
     /// TriMul prompt loading is exact; extraction mode is parser-only and does not wrap text.
@@ -5341,6 +5393,7 @@ benchmarks:
                 audit_secret_seed: 44,
                 scratch_max_bytes: 1024,
                 verifier_parallelism: 1,
+                verifier_max_procs: ferrl::trimul::DEFAULT_VERIFIER_MAX_PROCS,
                 verifier_cuda_device_pool: Vec::new(),
             },
             eval: EvalManifest {
@@ -5389,6 +5442,7 @@ benchmarks:
             "Config hash: config-hash",
             "Prompt copy: prompt.txt (prompt-hash)",
             "Reward profile: `{\"scheme\":\"trimul_shaped_v1\"",
+            "Budget: trainer_steps=100, group_size=4, scratch_max_bytes=1024, verifier_max_procs=1024",
             "Run health: healthy",
             "| source hash | training reward | source inspection | clean correctness | median runtime ns | speedup | accept/reject reason |",
             "| source-hash | 1.500000 | clean | 3/3 | 9.000000 | 1.222222 | accepted: all clean runs correct and median runtime beats baseline |",
@@ -5398,6 +5452,7 @@ benchmarks:
             "## 6. Operator Checklist",
             "[pass] audit seed differs from training seed",
             "[pass] reward profile recorded and valid",
+            "[pass] verifier process cap recorded",
             "[pass] source inspection found no process/file/env/network/path probing",
         ] {
             assert!(report.contains(required), "missing report field: {required}");
