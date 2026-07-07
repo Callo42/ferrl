@@ -593,6 +593,8 @@ pub struct TrimulReward {
     verifier_cuda_device_pool: Vec<String>,
     /// Maximum number of candidates from one GRPO group to verify concurrently.
     verifier_parallelism: usize,
+    /// Process cap applied to the verifier sandbox (`ulimit -u`).
+    verifier_max_procs: u64,
     /// The sandbox backend.
     sandbox: ApptainerSandbox,
 }
@@ -618,6 +620,13 @@ pub struct TrimulVerification {
 /// block — it is fed straight to the eval path, bypassing [`extract_submission`].
 const REFERENCE_SUBMISSION: &str =
     "def custom_kernel(data):\n    from reference import ref_kernel\n    return ref_kernel(data)\n";
+
+/// Default process cap for a TriMul verifier sandbox.
+///
+/// The cap is finite for fork-bomb containment, but higher than the generic
+/// sandbox default because `ulimit -u`/`RLIMIT_NPROC` is per UID. Multi-process
+/// GPU training jobs can already exceed small caps before candidate code starts.
+pub const DEFAULT_VERIFIER_MAX_PROCS: u64 = 1024;
 
 impl TrimulReward {
     /// Construct with the eval `image`, the pinned `eval_dir` bundle, and a
@@ -645,6 +654,7 @@ impl TrimulReward {
             verifier_cuda_visible_devices: None,
             verifier_cuda_device_pool: Vec::new(),
             verifier_parallelism: 1,
+            verifier_max_procs: DEFAULT_VERIFIER_MAX_PROCS,
             sandbox: ApptainerSandbox::default(),
         }
     }
@@ -704,6 +714,17 @@ impl TrimulReward {
     #[must_use]
     pub fn with_scratch_max_bytes(mut self, bytes: u64) -> Self {
         self.scratch_max_bytes = bytes;
+        self
+    }
+
+    /// Set the verifier sandbox process cap (`ulimit -u`).
+    ///
+    /// This is a per-UID limit, not a per-container count. Keep it comfortably above
+    /// the expected ambient task count for the training allocation while preserving a
+    /// finite fork-bomb guard.
+    #[must_use]
+    pub fn with_verifier_max_procs(mut self, max_procs: u64) -> Self {
+        self.verifier_max_procs = max_procs.max(1);
         self
     }
 
@@ -821,6 +842,7 @@ impl TrimulReward {
             // (and the still-capped process / file-size limits) is the bound here.
             cpu: None,
             address_space: None,
+            max_procs: Some(self.verifier_max_procs),
             ..ResourceLimits::default()
         }
     }
@@ -1642,6 +1664,25 @@ mod tests {
             reward().with_verifier_parallelism(3).verifier_parallelism,
             3
         );
+    }
+
+    #[test]
+    fn verifier_max_procs_defaults_and_wires_to_run_spec() {
+        let default_spec = reward().build_run_spec(Path::new("/tmp/scratch"));
+        assert_eq!(
+            default_spec.limits.max_procs,
+            Some(DEFAULT_VERIFIER_MAX_PROCS)
+        );
+
+        let custom_spec = reward()
+            .with_verifier_max_procs(2048)
+            .build_run_spec(Path::new("/tmp/scratch"));
+        assert_eq!(custom_spec.limits.max_procs, Some(2048));
+
+        let clamped_spec = reward()
+            .with_verifier_max_procs(0)
+            .build_run_spec(Path::new("/tmp/scratch"));
+        assert_eq!(clamped_spec.limits.max_procs, Some(1));
     }
 
     #[test]
