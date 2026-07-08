@@ -488,7 +488,16 @@ impl Proj {
     pub(crate) fn snapshot(&self) -> CandleResult<FrozenLinearSnapshot> {
         match self {
             Self::Frozen(w) => Ok(FrozenLinearSnapshot::Base(w.clone())),
-            Self::Lora(l) => l.snapshot(),
+            Self::Lora(l) => {
+                if l.base_bias().is_some() {
+                    candle_core::bail!(
+                        "Proj::snapshot: this projection carries a base bias, but the merged \
+                         snapshot is bias-free (extend the merged decoder to apply base_bias() \
+                         before using a biased adapter here)"
+                    );
+                }
+                l.snapshot()
+            }
         }
     }
 
