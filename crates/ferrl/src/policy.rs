@@ -15,6 +15,8 @@
 use candle_core::backprop::GradStore;
 use candle_core::{Result as CandleResult, Tensor, Var};
 
+use crate::telemetry::ModelTelemetryRecorder;
+
 /// A batch of sampled completions: token ids plus the prompt length that
 /// produced them, so callers can slice prompt from completion.
 #[derive(Debug, Clone)]
@@ -265,6 +267,27 @@ pub trait Policy {
     ) -> CandleResult<Rollout> {
         let _ = global_row_base;
         self.generate(prompt, cfg)
+    }
+
+    /// Like [`generate_at`](Self::generate_at), with an optional telemetry sink
+    /// for model-path phase boundaries and decoder-cache snapshots.
+    ///
+    /// The default delegates to [`generate_at`](Self::generate_at), so existing
+    /// policies remain valid. Model-backed policies can override this to expose
+    /// prefill/decode/cache evidence without changing rollout semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if the forward pass or sampling fails.
+    fn generate_at_instrumented(
+        &mut self,
+        prompt: &[u32],
+        cfg: &GenConfig,
+        global_row_base: u64,
+        telemetry: Option<&mut dyn ModelTelemetryRecorder>,
+    ) -> CandleResult<Rollout> {
+        let _ = telemetry;
+        self.generate_at(prompt, cfg, global_row_base)
     }
 
     /// Per-token log-probabilities of `rollout`'s completion tokens under the

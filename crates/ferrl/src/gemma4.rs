@@ -24,6 +24,7 @@ use crate::lora::{DenseLoraTargets, Proj};
 use crate::model::{CachedDecoder, GradModel};
 use crate::nn::RmsNorm;
 use crate::remat::{stitched_backward, RematTape};
+use crate::telemetry::DecoderCacheSnapshot;
 
 /// The checkpoint prefix used by public Gemma 4 conditional-generation
 /// checkpoints for the text decoder.
@@ -1474,6 +1475,10 @@ impl Gemma4KvCache {
         self.v = None;
         self.seen_len = 0;
     }
+
+    fn max_retained_seq_len(&self) -> Option<usize> {
+        self.max_retained
+    }
 }
 
 #[derive(Debug)]
@@ -1737,6 +1742,25 @@ impl CachedDecoder for Gemma4MergedDecoder {
 
     fn reset_cache(&mut self) {
         Gemma4MergedDecoder::reset_cache(self);
+    }
+
+    fn decoder_cache_snapshots(&self, phase: &'static str) -> Vec<DecoderCacheSnapshot> {
+        self.layers
+            .iter()
+            .enumerate()
+            .map(|(layer_index, layer)| DecoderCacheSnapshot {
+                phase: phase.to_string(),
+                layer_index,
+                kind: match layer.kind {
+                    Gemma4LayerType::SlidingAttention => "sliding_attention",
+                    Gemma4LayerType::FullAttention => "full_attention",
+                }
+                .to_string(),
+                seen_tokens: layer.attn.current_seq_len(),
+                retained_tokens: layer.attn.cache.retained_seq_len(),
+                max_retained_tokens: layer.attn.cache.max_retained_seq_len(),
+            })
+            .collect()
     }
 }
 
@@ -2232,6 +2256,37 @@ mod tests {
         let tok = Tensor::from_vec(vec![1u32], (1, 1), &dev()).unwrap();
         let _ = dec.forward(&tok, 5).unwrap();
         assert_merged_cache_lens(&dec, 6, 3, 6);
+    }
+
+    #[test]
+    fn merged_decoder_reports_seen_and_retained_cache_snapshots() {
+        let model = tiny_model();
+        let mut dec = model.merged_decoder().unwrap();
+        let input = ids(5);
+        let _ = dec.forward(&input, 0).unwrap();
+
+        let snapshots = dec.decoder_cache_snapshots("rollout_prefill_end");
+        assert_eq!(
+            snapshots,
+            vec![
+                DecoderCacheSnapshot {
+                    phase: "rollout_prefill_end".to_string(),
+                    layer_index: 0,
+                    kind: "sliding_attention".to_string(),
+                    seen_tokens: 5,
+                    retained_tokens: 3,
+                    max_retained_tokens: Some(3),
+                },
+                DecoderCacheSnapshot {
+                    phase: "rollout_prefill_end".to_string(),
+                    layer_index: 1,
+                    kind: "full_attention".to_string(),
+                    seen_tokens: 5,
+                    retained_tokens: 5,
+                    max_retained_tokens: None,
+                },
+            ]
+        );
     }
 
     #[test]

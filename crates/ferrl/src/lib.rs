@@ -240,8 +240,9 @@ pub use sandbox::{
 #[doc(inline)]
 pub use telemetry::{
     compare_distributed_metrics, compare_metrics, cuda_memory_snapshot, init_tracing, read_metrics,
-    run_span, summarize, Anomaly, GpuMemorySnapshot, Metrics, MetricsWriter, RegressionBudget,
-    RegressionFailure, RegressionReport, RunDir, RunSummary,
+    run_span, summarize, Anomaly, DecoderCacheSnapshot, GpuMemoryProbeEvent, GpuMemorySnapshot,
+    Metrics, MetricsWriter, ModelTelemetryRecorder, RegressionBudget, RegressionFailure,
+    RegressionReport, RunDir, RunSummary,
 };
 #[doc(inline)]
 pub use tokenizer::{HfTokenizer, TokenizerError};
