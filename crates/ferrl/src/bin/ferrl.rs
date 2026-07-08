@@ -579,6 +579,11 @@ impl BaseQuantizationSel {
             Self::Q8_0 => BaseQuantization::Q8_0,
         }
     }
+
+    /// Stable manifest spelling for this frozen-base quantization mode.
+    fn as_str(self) -> &'static str {
+        self.as_base_quantization().as_str()
+    }
 }
 
 /// Policy-load knobs (the `LoRA` shape, base dtype, seed). The rollout temperature
@@ -2016,6 +2021,8 @@ struct ModelManifest {
     lora_alpha: f64,
     /// Frozen base dtype.
     base_dtype: &'static str,
+    /// Frozen base projection quantization.
+    base_quantization: &'static str,
 }
 
 /// Run-config provenance fields.
@@ -2364,6 +2371,7 @@ fn build_manifest(
             lora_rank: cfg.policy.lora_rank,
             lora_alpha: cfg.policy.lora_alpha,
             base_dtype: cfg.policy.base_dtype.as_str(),
+            base_quantization: cfg.policy.base_quantization.as_str(),
         },
         config: ArtifactConfigManifest {
             run_config_sha256: sha256_hex(inputs.config_bytes),
@@ -2561,13 +2569,14 @@ fn artifact_report(
     .expect("writing to String cannot fail");
     writeln!(
         &mut out,
-        "- Model: family={}, checkpoint={}, tokenizer={}, lora_rank={}, lora_alpha={}, base_dtype={}",
+        "- Model: family={}, checkpoint={}, tokenizer={}, lora_rank={}, lora_alpha={}, base_dtype={}, base_quantization={}",
         manifest.model.family,
         manifest.model.checkpoint,
         manifest.model.tokenizer,
         manifest.model.lora_rank,
         manifest.model.lora_alpha,
-        manifest.model.base_dtype
+        manifest.model.base_dtype,
+        manifest.model.base_quantization
     )
     .expect("writing to String cannot fail");
     writeln!(
@@ -5381,6 +5390,57 @@ benchmarks:
     }
 
     #[test]
+    fn artifact_manifest_records_base_quantization() {
+        let cfg: RunConfig = serde_json::from_str(
+            r#"{
+                "task": "trimul",
+                "model_dir": "/m",
+                "policy": {
+                    "base_dtype": "bf16",
+                    "base_quantization": "q8_0"
+                },
+                "trimul": {
+                  "prompt_path": "/prompt.txt",
+                  "submission_extract_mode": "final_fence",
+                  "image": "/image.sif",
+                  "eval_dir": "/eval",
+                  "scratch_root": "/scratch",
+                  "secret_seed": 4242
+                },
+                "trainer": { "steps": 1, "group_size": 2, "max_new_tokens": 8,
+                  "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
+                  "lr": 1e-5, "weight_decay": 0.0,
+                  "loss_type": "grpo", "scale_rewards": "group" }
+            }"#,
+        )
+        .unwrap();
+        let args = trimul_artifact_args_for_test(Path::new("artifact-provenance"));
+        let inputs = ArtifactInputs {
+            gpu: "H100".to_string(),
+            raw_completion: "```python\npass\n```\n",
+            normalized_completion: "```python\npass\n```\n",
+            completion_normalization: CompletionNormalization::None,
+            completion_normalization_changed: false,
+            completion_bytes: b"completion",
+            config_bytes: b"config",
+            prompt_bytes: b"prompt",
+            submission: "pass\n",
+            baseline_median: 1.0,
+            test_cases: 1,
+            benchmark_cases: 1,
+            runs: Vec::new(),
+            accepted: false,
+        };
+
+        let manifest = build_manifest(&args, &cfg, &inputs);
+        let json = serde_json::to_string(&manifest).unwrap();
+
+        assert_eq!(manifest.model.base_dtype, "bf16");
+        assert_eq!(manifest.model.base_quantization, "q8_0");
+        assert!(json.contains(r#""base_quantization":"q8_0""#));
+    }
+
+    #[test]
     fn artifact_report_matches_the_contract_outline() {
         let manifest = ArtifactManifest {
             contract_version: 1,
@@ -5410,6 +5470,7 @@ benchmarks:
                 lora_rank: 8,
                 lora_alpha: 16.0,
                 base_dtype: "bf16",
+                base_quantization: "q8_0",
             },
             config: ArtifactConfigManifest {
                 run_config_sha256: "config-hash".to_string(),
@@ -5474,6 +5535,7 @@ benchmarks:
             "Config hash: config-hash",
             "Prompt copy: prompt.txt (prompt-hash)",
             "Reward profile: `{\"scheme\":\"trimul_shaped_v1\"",
+            "base_quantization=q8_0",
             "Budget: trainer_steps=100, group_size=4, scratch_max_bytes=1024, verifier_max_procs=1024",
             "Run health: healthy",
             "| source hash | training reward | source inspection | clean correctness | median runtime ns | speedup | accept/reject reason |",
