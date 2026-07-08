@@ -60,9 +60,9 @@ use ferrl::policy::GenConfig;
 use ferrl::telemetry::{CandidateRecord, RegressionFailure};
 use ferrl::{
     compare_distributed_metrics, compare_metrics, evaluate, load_auto_policy, read_jsonl,
-    summarize, train_eval_split, CountdownReward, LoaderOpts, MathProblem, MathReward,
-    RegressionBudget, RegressionReport, RewardFn, RunDir, Sample, Trainer, TrainerConfig,
-    TrimulReward,
+    summarize, train_eval_split, BaseQuantization, CountdownReward, LoaderOpts, MathProblem,
+    MathReward, RegressionBudget, RegressionReport, RewardFn, RunDir, Sample, Trainer,
+    TrainerConfig, TrimulReward,
 };
 
 /// A task's train/eval split: `(train, eval)` samples of the task's target type.
@@ -561,6 +561,26 @@ impl DtypeSel {
     }
 }
 
+/// Optional quantization for frozen base projection weights.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum BaseQuantizationSel {
+    /// Store frozen base projections as ordinary tensors.
+    #[default]
+    None,
+    /// Store frozen base projections as GGML `Q8_0`.
+    Q8_0,
+}
+
+impl BaseQuantizationSel {
+    fn as_base_quantization(self) -> BaseQuantization {
+        match self {
+            Self::None => BaseQuantization::None,
+            Self::Q8_0 => BaseQuantization::Q8_0,
+        }
+    }
+}
+
 /// Policy-load knobs (the `LoRA` shape, base dtype, seed). The rollout temperature
 /// is taken from the trainer config so the two cannot disagree.
 #[derive(Debug, Deserialize)]
@@ -572,6 +592,8 @@ struct PolicyCfg {
     lora_alpha: f64,
     /// Dtype the frozen base loads in.
     base_dtype: DtypeSel,
+    /// Optional frozen-base projection quantization.
+    base_quantization: BaseQuantizationSel,
     /// Rollout sampler seed.
     seed: u64,
     /// Enable layer-boundary activation checkpointing for the update forward.
@@ -589,6 +611,7 @@ impl Default for PolicyCfg {
             lora_rank: 16,
             lora_alpha: 32.0,
             base_dtype: DtypeSel::F32,
+            base_quantization: BaseQuantizationSel::None,
             seed: 1234,
             activation_checkpointing: false,
             memory_efficient_cached_gqa: false,
@@ -1101,6 +1124,7 @@ impl RunConfig {
             seed: self.policy.seed,
             temperature: self.trainer.temperature,
             memory_efficient_cached_gqa: self.policy.memory_efficient_cached_gqa,
+            base_quantization: self.policy.base_quantization.as_base_quantization(),
         }
     }
 
@@ -3854,9 +3878,14 @@ mod tests {
         assert_eq!(cfg.policy.lora_rank, 16);
         assert!(!cfg.policy.activation_checkpointing);
         assert!(!cfg.policy.memory_efficient_cached_gqa);
+        assert_eq!(
+            cfg.policy.base_quantization.as_base_quantization(),
+            BaseQuantization::None
+        );
         assert_eq!(cfg.data.train_n, 64);
         // The loader temperature mirrors the trainer's (cannot drift).
         assert!((cfg.loader_opts().temperature - cfg.trainer.temperature).abs() < f64::EPSILON);
+        assert_eq!(cfg.loader_opts().base_quantization, BaseQuantization::None);
     }
 
     #[test]
@@ -4064,6 +4093,7 @@ mod tests {
 
     /// `device` and `base_dtype` selectors deserialize from lowercase strings.
     #[test]
+    #[allow(clippy::cognitive_complexity)] // assertion-heavy config parse coverage
     fn device_and_dtype_selectors_parse() {
         let json = r#"{
             "task": "math",
@@ -4071,6 +4101,7 @@ mod tests {
             "device": "cuda",
             "policy": {
                 "base_dtype": "bf16",
+                "base_quantization": "q8_0",
                 "activation_checkpointing": true,
                 "memory_efficient_cached_gqa": true
             },
@@ -4083,6 +4114,7 @@ mod tests {
         let cfg: RunConfig = serde_json::from_str(json).unwrap();
         assert!(matches!(cfg.device, DeviceSel::Cuda));
         assert_eq!(cfg.loader_opts().base_dtype, DType::BF16);
+        assert_eq!(cfg.loader_opts().base_quantization, BaseQuantization::Q8_0);
         assert!(cfg.policy.activation_checkpointing);
         assert!(cfg.loader_opts().memory_efficient_cached_gqa);
         assert_eq!(cfg.data.path.as_deref(), Some(Path::new("data.jsonl")));

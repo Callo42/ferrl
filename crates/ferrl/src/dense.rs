@@ -51,7 +51,9 @@ use candle_nn::{Activation, VarBuilder};
 use crate::blocks::{
     causal_mask, causal_mask_at, frozen_linear, repeat_kv, windowed, RotaryTables,
 };
-use crate::lora::{DenseLoraTargets, Proj};
+use crate::lora::{
+    BaseQuantization, DenseLoraTargets, FrozenLinearSnapshot, Proj, ProjLoadOptions,
+};
 use crate::model::{CachedDecoder, GradModel};
 use crate::nn::RmsNorm;
 use crate::remat::{stitched_backward, RematTape};
@@ -155,7 +157,9 @@ impl DenseAttention {
         rank: usize,
         alpha: f64,
         adapter_dtype: DType,
+        base_quantization: BaseQuantization,
     ) -> CandleResult<Self> {
+        let proj_opts = ProjLoadOptions::new(rank, alpha, adapter_dtype, base_quantization);
         let h = spec.hidden_size;
         let head_dim = spec.head_dim;
         let q_out = spec.num_attention_heads * head_dim;
@@ -170,42 +174,10 @@ impl DenseAttention {
             None
         };
         Ok(Self {
-            q_proj: Proj::load(
-                vb,
-                "q_proj",
-                (q_out, h),
-                targets.attn_q,
-                rank,
-                alpha,
-                adapter_dtype,
-            )?,
-            k_proj: Proj::load(
-                vb,
-                "k_proj",
-                (kv_out, h),
-                targets.attn_k,
-                rank,
-                alpha,
-                adapter_dtype,
-            )?,
-            v_proj: Proj::load(
-                vb,
-                "v_proj",
-                (kv_out, h),
-                targets.attn_v,
-                rank,
-                alpha,
-                adapter_dtype,
-            )?,
-            o_proj: Proj::load(
-                vb,
-                "o_proj",
-                (h, q_out),
-                targets.attn_o,
-                rank,
-                alpha,
-                adapter_dtype,
-            )?,
+            q_proj: Proj::load_with_options(vb, "q_proj", (q_out, h), targets.attn_q, proj_opts)?,
+            k_proj: Proj::load_with_options(vb, "k_proj", (kv_out, h), targets.attn_k, proj_opts)?,
+            v_proj: Proj::load_with_options(vb, "v_proj", (kv_out, h), targets.attn_v, proj_opts)?,
+            o_proj: Proj::load_with_options(vb, "o_proj", (h, q_out), targets.attn_o, proj_opts)?,
             qk_norm,
             num_heads: spec.num_attention_heads,
             num_kv_heads: spec.num_key_value_heads,
@@ -326,36 +298,26 @@ impl DenseMlp {
         rank: usize,
         alpha: f64,
         adapter_dtype: DType,
+        base_quantization: BaseQuantization,
     ) -> CandleResult<Self> {
+        let proj_opts = ProjLoadOptions::new(rank, alpha, adapter_dtype, base_quantization);
         let h = spec.hidden_size;
         let i = spec.intermediate_size;
         Ok(Self {
-            gate_proj: Proj::load(
+            gate_proj: Proj::load_with_options(
                 vb,
                 "gate_proj",
                 (i, h),
                 targets.mlp_gate,
-                rank,
-                alpha,
-                adapter_dtype,
+                proj_opts,
             )?,
-            up_proj: Proj::load(
-                vb,
-                "up_proj",
-                (i, h),
-                targets.mlp_up,
-                rank,
-                alpha,
-                adapter_dtype,
-            )?,
-            down_proj: Proj::load(
+            up_proj: Proj::load_with_options(vb, "up_proj", (i, h), targets.mlp_up, proj_opts)?,
+            down_proj: Proj::load_with_options(
                 vb,
                 "down_proj",
                 (h, i),
                 targets.mlp_down,
-                rank,
-                alpha,
-                adapter_dtype,
+                proj_opts,
             )?,
             act: spec.activation,
         })
@@ -398,6 +360,7 @@ impl DenseLayer {
         rank: usize,
         alpha: f64,
         adapter_dtype: DType,
+        base_quantization: BaseQuantization,
     ) -> CandleResult<Self> {
         let eps = spec.rms_norm_eps;
         let h = spec.hidden_size;
@@ -410,9 +373,18 @@ impl DenseLayer {
                 rank,
                 alpha,
                 adapter_dtype,
+                base_quantization,
             )?,
             ln2: RmsNorm::new(vb.pp("post_attention_layernorm").get(h, "weight")?, eps),
-            mlp: DenseMlp::load(spec, &vb.pp("mlp"), targets, rank, alpha, adapter_dtype)?,
+            mlp: DenseMlp::load(
+                spec,
+                &vb.pp("mlp"),
+                targets,
+                rank,
+                alpha,
+                adapter_dtype,
+                base_quantization,
+            )?,
         })
     }
 
@@ -539,6 +511,36 @@ impl<A: DenseArch> DenseGradModel<A> {
         adapter_dtype: DType,
         targets: DenseLoraTargets,
     ) -> CandleResult<Self> {
+        Self::load_with_targets_and_base_quantization(
+            cfg,
+            vb,
+            rank,
+            alpha,
+            adapter_dtype,
+            targets,
+            BaseQuantization::None,
+        )
+    }
+
+    /// Load the model with an explicit frozen-base quantization mode.
+    ///
+    /// The adapter recipe and trainable-var order are identical to
+    /// [`load_with_targets`](Self::load_with_targets); only the frozen base
+    /// projection storage changes.
+    ///
+    /// # Errors
+    ///
+    /// As [`load_with_targets`](Self::load_with_targets), plus quantization
+    /// shape/storage errors.
+    pub fn load_with_targets_and_base_quantization(
+        cfg: &A::Config,
+        vb: &VarBuilder,
+        rank: usize,
+        alpha: f64,
+        adapter_dtype: DType,
+        targets: DenseLoraTargets,
+        base_quantization: BaseQuantization,
+    ) -> CandleResult<Self> {
         if !targets.any() {
             candle_core::bail!(
                 "{}: DenseLoraTargets selects no projection — the model would have no \
@@ -568,6 +570,7 @@ impl<A: DenseArch> DenseGradModel<A> {
                 rank,
                 alpha,
                 adapter_dtype,
+                base_quantization,
             )?);
         }
         // The mask dtype follows the attention's score dtype: F32 when q/k/v are
@@ -906,10 +909,10 @@ impl<A: DenseArch> GradModel for DenseGradModel<A> {
 /// so cached logits equal the uncached ones.
 #[derive(Debug)]
 struct DenseMergedAttention {
-    q_weight: Tensor,
-    k_weight: Tensor,
-    v_weight: Tensor,
-    o_weight: Tensor,
+    q_weight: FrozenLinearSnapshot,
+    k_weight: FrozenLinearSnapshot,
+    v_weight: FrozenLinearSnapshot,
+    o_weight: FrozenLinearSnapshot,
     qk_norm: Option<(RmsNorm, RmsNorm)>,
     num_heads: usize,
     num_kv_heads: usize,
@@ -935,9 +938,9 @@ impl DenseMergedAttention {
         let in_dtype = x.dtype();
 
         // 1. Projections over merged weights.
-        let q = frozen_linear(x, &self.q_weight)?;
-        let k = frozen_linear(x, &self.k_weight)?;
-        let v = frozen_linear(x, &self.v_weight)?;
+        let q = self.q_weight.forward(x)?;
+        let k = self.k_weight.forward(x)?;
+        let v = self.v_weight.forward(x)?;
 
         // 2. (B, L, H, D) -> (B, H, L, D).
         let q = q
@@ -996,33 +999,33 @@ impl DenseMergedAttention {
             .transpose(1, 2)?
             .contiguous()?
             .reshape((b, l, self.attn_hidden))?;
-        frozen_linear(&ctx, &self.o_weight)
+        self.o_weight.forward(&ctx)
     }
 }
 
 /// `SwiGLU` MLP over merged weights — the grad-free mirror of [`DenseMlp`].
 #[derive(Debug)]
 struct DenseMergedMlp {
-    gate_weight: Tensor,
-    up_weight: Tensor,
-    down_weight: Tensor,
+    gate_weight: FrozenLinearSnapshot,
+    up_weight: FrozenLinearSnapshot,
+    down_weight: FrozenLinearSnapshot,
     act: Activation,
 }
 
 impl DenseMergedMlp {
     fn from_mlp(mlp: &DenseMlp) -> CandleResult<Self> {
         Ok(Self {
-            gate_weight: mlp.gate_proj.merged_weight()?,
-            up_weight: mlp.up_proj.merged_weight()?,
-            down_weight: mlp.down_proj.merged_weight()?,
+            gate_weight: mlp.gate_proj.snapshot()?,
+            up_weight: mlp.up_proj.snapshot()?,
+            down_weight: mlp.down_proj.snapshot()?,
             act: mlp.act,
         })
     }
 
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
-        let lhs = frozen_linear(x, &self.gate_weight)?.apply(&self.act)?;
-        let rhs = frozen_linear(x, &self.up_weight)?;
-        frozen_linear(&lhs.broadcast_mul(&rhs)?, &self.down_weight)
+        let lhs = self.gate_weight.forward(x)?.apply(&self.act)?;
+        let rhs = self.up_weight.forward(x)?;
+        self.down_weight.forward(&lhs.broadcast_mul(&rhs)?)
     }
 }
 
@@ -1091,10 +1094,10 @@ impl DenseCachedDecoder {
             layers.push(DenseMergedLayer {
                 ln1: layer.ln1.clone(),
                 attn: DenseMergedAttention {
-                    q_weight: a.q_proj.merged_weight()?,
-                    k_weight: a.k_proj.merged_weight()?,
-                    v_weight: a.v_proj.merged_weight()?,
-                    o_weight: a.o_proj.merged_weight()?,
+                    q_weight: a.q_proj.snapshot()?,
+                    k_weight: a.k_proj.snapshot()?,
+                    v_weight: a.v_proj.snapshot()?,
+                    o_weight: a.o_proj.snapshot()?,
                     qk_norm: a.qk_norm.clone(),
                     num_heads: a.num_heads,
                     num_kv_heads: a.num_kv_heads,
