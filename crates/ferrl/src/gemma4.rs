@@ -2146,6 +2146,15 @@ mod tests {
         }
     }
 
+    fn overwrite_adapter(model: &Gemma4GradModel) {
+        for (i, v) in model.trainable_vars().iter().enumerate() {
+            let dims = v.as_tensor().dims().to_vec();
+            let scale = if i % 2 == 0 { 1.25 } else { -0.75 };
+            let replacement = (Tensor::ones(dims, DType::F32, &dev()).unwrap() * scale).unwrap();
+            v.set(&replacement).unwrap();
+        }
+    }
+
     #[test]
     fn tiny_forward_produces_full_seq_logits() {
         let cfg = tiny_cfg();
@@ -2242,6 +2251,42 @@ mod tests {
         assert!(
             max_abs_diff(&got, &reference) <= 0.05,
             "quantized Gemma 4 cached prefill diverged from uncached forward"
+        );
+    }
+
+    #[test]
+    fn quantized_merged_decoder_snapshots_adapter_values_across_var_updates() {
+        let model = quantized_tiny_model();
+        arm_adapter(&model);
+        let input = ids(6);
+        let before_update = model.forward(&input).unwrap();
+        let mut dec = model.merged_decoder().unwrap();
+
+        let prefix_len = 3;
+        let prefix = input.narrow(1, 0, prefix_len).unwrap();
+        let prefix_logits = dec.forward(&prefix, 0).unwrap();
+        assert!(
+            max_abs_diff(
+                &prefix_logits,
+                &before_update.narrow(1, 0, prefix_len).unwrap()
+            ) <= 0.05,
+            "quantized snapshot must match the pre-update adapter before mutation"
+        );
+
+        overwrite_adapter(&model);
+        let after_update = model.forward(&input).unwrap();
+        assert!(
+            max_abs_diff(&after_update, &before_update) > 0.05,
+            "adapter overwrite must move the live model enough to make this gate non-vacuous"
+        );
+
+        let suffix_len = 2;
+        let suffix = input.narrow(1, prefix_len, suffix_len).unwrap();
+        let got = dec.forward(&suffix, prefix_len).unwrap();
+        let want = before_update.narrow(1, prefix_len, suffix_len).unwrap();
+        assert!(
+            max_abs_diff(&got, &want) <= 0.05,
+            "existing quantized decoder observed adapter vars mutated after construction"
         );
     }
 

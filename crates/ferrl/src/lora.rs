@@ -715,8 +715,8 @@ impl LoraLinear {
             FrozenLinearWeight::Quantized { .. } => Ok(FrozenLinearSnapshot::Lora {
                 base: self.base_weight.clone(),
                 base_bias: self.base_bias.clone(),
-                a: self.a.as_tensor().detach(),
-                b: self.b.as_tensor().detach(),
+                a: self.a.as_tensor().copy()?.detach(),
+                b: self.b.as_tensor().copy()?.detach(),
                 scale: self.scale,
                 enabled: self.enabled,
             }),
