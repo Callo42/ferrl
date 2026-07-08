@@ -53,6 +53,51 @@ pub fn cuda_memory_snapshot() -> Option<GpuMemorySnapshot> {
     cuda_memory_snapshot_impl()
 }
 
+/// One CUDA memory probe at a named phase boundary within an optimizer step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpuMemoryProbeEvent {
+    /// Stable phase label, e.g. `rollout_prefill_end` or `item_backward_start`.
+    pub phase: String,
+    /// CUDA memory used by this rank at the probe, in bytes.
+    pub used_bytes: u64,
+    /// CUDA memory free on this rank's current device at the probe, in bytes.
+    pub free_bytes: u64,
+    /// Total CUDA memory reported for this rank's current device, in bytes.
+    pub total_bytes: u64,
+    /// Peak per-step memory increase from the first successful probe, in bytes.
+    pub peak_delta_bytes: u64,
+}
+
+/// A cached decoder's sequence-retention state at a named phase boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecoderCacheSnapshot {
+    /// Stable phase label, e.g. `rollout_prefill_end` or `rollout_decode_end`.
+    pub phase: String,
+    /// Zero-based decoder layer index.
+    pub layer_index: usize,
+    /// Architecture-owned cache kind label, e.g. `full_attention` or
+    /// `sliding_attention`.
+    pub kind: String,
+    /// Absolute number of tokens this layer has consumed since the last reset.
+    pub seen_tokens: usize,
+    /// Number of tokens physically retained in this layer's cache.
+    pub retained_tokens: usize,
+    /// Retention cap for windowed caches. Missing means unbounded/global cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_retained_tokens: Option<usize>,
+}
+
+/// Sink for optional model-path telemetry captured while a [`Policy`](crate::Policy)
+/// generates a rollout.
+pub trait ModelTelemetryRecorder {
+    /// Record a named CUDA-memory phase boundary.
+    fn record_phase(&mut self, phase: &'static str);
+
+    /// Record decoder cache-retention snapshots. Empty slices are ignored by
+    /// conforming recorders.
+    fn record_decoder_cache(&mut self, snapshots: Vec<DecoderCacheSnapshot>);
+}
+
 #[cfg(feature = "cuda")]
 fn cuda_memory_snapshot_impl() -> Option<GpuMemorySnapshot> {
     cudarc::runtime::result::mem_get_info()
@@ -485,6 +530,18 @@ pub struct Metrics {
     /// means unmeasured or no increase.
     #[serde(default)]
     pub cuda_mem_peak_delta_bytes: u64,
+    /// Per-phase CUDA memory probe events for this optimizer step.
+    ///
+    /// Written only when GPU memory probing is enabled and at least one CUDA
+    /// runtime probe succeeds. Empty and absent both mean unmeasured.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cuda_mem_probe_events: Vec<GpuMemoryProbeEvent>,
+    /// Decoder-cache retention snapshots captured during rollout generation.
+    ///
+    /// Empty and absent both mean the policy/model did not provide cache
+    /// snapshots, or memory probing was disabled for the run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decoder_cache_snapshots: Vec<DecoderCacheSnapshot>,
 }
 
 /// `serde` default for the rollout-ratio metrics: `1.0` (exactly on-policy —
@@ -525,6 +582,8 @@ impl Metrics {
             cuda_mem_end_used_bytes: 0,
             cuda_mem_total_bytes: 0,
             cuda_mem_peak_delta_bytes: 0,
+            cuda_mem_probe_events: Vec::new(),
+            decoder_cache_snapshots: Vec::new(),
         }
     }
 
@@ -2410,6 +2469,21 @@ mod tests {
             cuda_mem_end_used_bytes: 20,
             cuda_mem_total_bytes: 100,
             cuda_mem_peak_delta_bytes: 20,
+            cuda_mem_probe_events: vec![GpuMemoryProbeEvent {
+                phase: "rollout_prefill_end".to_string(),
+                used_bytes: 30,
+                free_bytes: 70,
+                total_bytes: 100,
+                peak_delta_bytes: 20,
+            }],
+            decoder_cache_snapshots: vec![DecoderCacheSnapshot {
+                phase: "rollout_decode_end".to_string(),
+                layer_index: 1,
+                kind: "sliding_attention".to_string(),
+                seen_tokens: 12,
+                retained_tokens: 3,
+                max_retained_tokens: Some(3),
+            }],
         };
         let j = serde_json::to_string(&m).unwrap();
         let back: Metrics = serde_json::from_str(&j).unwrap();
@@ -2441,6 +2515,8 @@ mod tests {
             ),
             (0, 0, 0, 0, 0)
         );
+        assert!(m.cuda_mem_probe_events.is_empty());
+        assert!(m.decoder_cache_snapshots.is_empty());
         assert_eq!(
             (
                 m.rollout_ratio_mean,

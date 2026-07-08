@@ -26,6 +26,8 @@ use candle_core::backprop::GradStore;
 use candle_core::{DType, Device, Result as CandleResult, Tensor, Var, D};
 use candle_nn::ops::log_softmax;
 
+use crate::telemetry::DecoderCacheSnapshot;
+
 /// A stateful, grad-free incremental decoder over a snapshot of a
 /// [`GradModel`]'s effective weights.
 ///
@@ -63,6 +65,16 @@ pub trait CachedDecoder {
     /// use `offset == 0`, and a replayed sequence must reproduce the same logits
     /// as a fresh decoder (no stale state may survive the reset).
     fn reset_cache(&mut self);
+
+    /// Optional cache-retention telemetry for the current decoder state.
+    ///
+    /// Implementors with windowed or otherwise memory-sensitive caches can
+    /// report one snapshot per layer. The default keeps non-reporting decoders
+    /// compatible and makes the instrumentation opt-in.
+    fn decoder_cache_snapshots(&self, phase: &'static str) -> Vec<DecoderCacheSnapshot> {
+        let _ = phase;
+        Vec::new()
+    }
 }
 
 /// A trainable (`LoRA`-adapted) language model: the grad-bearing update forward

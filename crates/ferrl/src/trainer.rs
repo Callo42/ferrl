@@ -75,8 +75,9 @@ use crate::policy::{GenConfig, Policy, Rollout};
 use crate::reward::{RewardError, RewardFn, RewardOutcome};
 use crate::sample::Sample;
 use crate::telemetry::{
-    cuda_memory_snapshot, CandidateRecord, CandidateWriter, GpuMemorySnapshot, Metrics,
-    MetricsWriter, RunDir, TelemetryError,
+    cuda_memory_snapshot, CandidateRecord, CandidateWriter, DecoderCacheSnapshot,
+    GpuMemoryProbeEvent, GpuMemorySnapshot, Metrics, MetricsWriter, ModelTelemetryRecorder, RunDir,
+    TelemetryError,
 };
 
 /// An error raised while running a GRPO training step.
@@ -465,9 +466,11 @@ pub struct TrainerConfig {
     ///
     /// When `true`, the trainer samples CUDA runtime free/total memory at coarse
     /// phase boundaries (rollout, reward, detached scoring, backward, gradient
-    /// reduction, optimizer) and persists per-step start/peak/end memory fields
-    /// in `metrics.jsonl`. It is intentionally off by default: the default CPU
-    /// build records zeros, and ordinary training avoids runtime-query overhead.
+    /// reduction, optimizer), persists per-step start/peak/end memory fields, and
+    /// records detailed `cuda_mem_probe_events` plus model-provided
+    /// `decoder_cache_snapshots` in `metrics.jsonl`. It is intentionally off by
+    /// default: the default CPU build records zeros/empty lists, and ordinary
+    /// training avoids runtime-query overhead.
     #[serde(default)]
     pub gpu_memory_probe: bool,
     /// End-of-sequence token id threaded into [`GenConfig::eos_token_id`] for
@@ -1093,6 +1096,8 @@ struct StepGpuMemory {
     start: Option<GpuMemorySnapshot>,
     peak: Option<GpuMemorySnapshot>,
     end: Option<GpuMemorySnapshot>,
+    probe_events: Vec<GpuMemoryProbeEvent>,
+    decoder_cache_snapshots: Vec<DecoderCacheSnapshot>,
 }
 
 impl StepGpuMemory {
@@ -1102,6 +1107,8 @@ impl StepGpuMemory {
             start: None,
             peak: None,
             end: None,
+            probe_events: Vec::new(),
+            decoder_cache_snapshots: Vec::new(),
         }
     }
 
@@ -1113,6 +1120,18 @@ impl StepGpuMemory {
             tracing::warn!(phase, "cuda memory probe unavailable");
             return;
         };
+        self.record_snapshot(phase, snapshot);
+    }
+
+    fn recorder(&mut self) -> Option<&mut dyn ModelTelemetryRecorder> {
+        self.enabled
+            .then_some(self as &mut dyn ModelTelemetryRecorder)
+    }
+
+    fn record_snapshot(&mut self, phase: &'static str, snapshot: GpuMemorySnapshot) {
+        if !self.enabled {
+            return;
+        }
         if self.start.is_none() {
             self.start = Some(snapshot);
         }
@@ -1123,17 +1142,27 @@ impl StepGpuMemory {
             self.peak = Some(snapshot);
         }
         self.end = Some(snapshot);
+        let peak_delta_bytes = self.peak_delta_bytes();
+        self.probe_events.push(GpuMemoryProbeEvent {
+            phase: phase.to_string(),
+            used_bytes: snapshot.used_bytes,
+            free_bytes: snapshot.free_bytes,
+            total_bytes: snapshot.total_bytes,
+            peak_delta_bytes,
+        });
         tracing::info!(
             phase,
             cuda_mem_used_bytes = snapshot.used_bytes,
             cuda_mem_free_bytes = snapshot.free_bytes,
             cuda_mem_total_bytes = snapshot.total_bytes,
-            cuda_mem_peak_delta_bytes = self.peak_delta_bytes(),
+            cuda_mem_peak_delta_bytes = peak_delta_bytes,
             "cuda memory probe"
         );
     }
 
     fn apply(&self, metrics: &mut Metrics) {
+        metrics.cuda_mem_probe_events = self.probe_events.clone();
+        metrics.decoder_cache_snapshots = self.decoder_cache_snapshots.clone();
         let (Some(start), Some(peak), Some(end)) = (self.start, self.peak, self.end) else {
             return;
         };
@@ -1149,6 +1178,30 @@ impl StepGpuMemory {
             (Some(start), Some(peak)) => peak.used_bytes.saturating_sub(start.used_bytes),
             _ => 0,
         }
+    }
+}
+
+impl ModelTelemetryRecorder for StepGpuMemory {
+    fn record_phase(&mut self, phase: &'static str) {
+        self.record(phase);
+    }
+
+    fn record_decoder_cache(&mut self, snapshots: Vec<DecoderCacheSnapshot>) {
+        if !self.enabled || snapshots.is_empty() {
+            return;
+        }
+        for snapshot in &snapshots {
+            tracing::info!(
+                phase = snapshot.phase.as_str(),
+                layer_index = snapshot.layer_index,
+                cache_kind = snapshot.kind.as_str(),
+                cache_seen_tokens = snapshot.seen_tokens,
+                cache_retained_tokens = snapshot.retained_tokens,
+                cache_max_retained_tokens = ?snapshot.max_retained_tokens,
+                "decoder cache probe"
+            );
+        }
+        self.decoder_cache_snapshots.extend(snapshots);
     }
 }
 
@@ -2121,10 +2174,11 @@ impl Trainer {
         // See `select_prompt`: prompt selection and rollout RNG row ranges differ
         // in distributed same-prompt mode.
         gpu_mem.record("rollout_start");
-        let rollout = policy.generate_at(
+        let rollout = policy.generate_at_instrumented(
             &prompt_ids,
             &gen,
             selected.selection.rollout_global_row_base,
+            gpu_mem.recorder(),
         )?;
         gpu_mem.record("rollout_end");
         // Validate the rollout BEFORE decoding/scoring it: completion_dims rejects
@@ -3570,6 +3624,90 @@ mod tests {
             serde_json::to_value(&built).unwrap(),
             serde_json::to_value(&literal).unwrap()
         );
+    }
+
+    fn gpu_memory_snapshot_for_test(used_bytes: u64) -> GpuMemorySnapshot {
+        GpuMemorySnapshot {
+            free_bytes: 100 - used_bytes,
+            total_bytes: 100,
+            used_bytes,
+        }
+    }
+
+    #[test]
+    fn step_gpu_memory_persists_stable_phase_events() {
+        let mut mem = StepGpuMemory::new(true);
+        mem.record_snapshot("step_start", gpu_memory_snapshot_for_test(10));
+        mem.record_snapshot("rollout_prefill_end", gpu_memory_snapshot_for_test(25));
+        mem.record_snapshot("step_end", gpu_memory_snapshot_for_test(20));
+
+        let mut metrics = Metrics::at_step(0);
+        mem.apply(&mut metrics);
+        assert_eq!(
+            (
+                metrics.cuda_mem_start_used_bytes,
+                metrics.cuda_mem_peak_used_bytes,
+                metrics.cuda_mem_end_used_bytes,
+                metrics.cuda_mem_total_bytes,
+                metrics.cuda_mem_peak_delta_bytes,
+            ),
+            (10, 25, 20, 100, 15)
+        );
+        let events: Vec<(&str, u64)> = metrics
+            .cuda_mem_probe_events
+            .iter()
+            .map(|event| (event.phase.as_str(), event.peak_delta_bytes))
+            .collect();
+        assert_eq!(
+            events,
+            [
+                ("step_start", 0),
+                ("rollout_prefill_end", 15),
+                ("step_end", 15),
+            ]
+        );
+    }
+
+    #[test]
+    fn step_gpu_memory_persists_decoder_cache_snapshots_when_enabled() {
+        let mut mem = StepGpuMemory::new(true);
+        ModelTelemetryRecorder::record_decoder_cache(
+            &mut mem,
+            vec![DecoderCacheSnapshot {
+                phase: "rollout_decode_end".to_string(),
+                layer_index: 0,
+                kind: "sliding_attention".to_string(),
+                seen_tokens: 6,
+                retained_tokens: 3,
+                max_retained_tokens: Some(3),
+            }],
+        );
+
+        let mut metrics = Metrics::at_step(0);
+        mem.apply(&mut metrics);
+        assert_eq!(metrics.decoder_cache_snapshots.len(), 1);
+        assert_eq!(
+            metrics.decoder_cache_snapshots[0].phase,
+            "rollout_decode_end"
+        );
+        assert_eq!(metrics.decoder_cache_snapshots[0].seen_tokens, 6);
+        assert_eq!(metrics.decoder_cache_snapshots[0].retained_tokens, 3);
+
+        let mut disabled = StepGpuMemory::new(false);
+        ModelTelemetryRecorder::record_decoder_cache(
+            &mut disabled,
+            vec![DecoderCacheSnapshot {
+                phase: "rollout_decode_end".to_string(),
+                layer_index: 0,
+                kind: "sliding_attention".to_string(),
+                seen_tokens: 6,
+                retained_tokens: 3,
+                max_retained_tokens: Some(3),
+            }],
+        );
+        let mut disabled_metrics = Metrics::at_step(0);
+        disabled.apply(&mut disabled_metrics);
+        assert!(disabled_metrics.decoder_cache_snapshots.is_empty());
     }
 
     fn mat(rows: &[&[f32]]) -> Tensor {
@@ -5271,6 +5409,89 @@ mod tests {
                 })
                 .collect()
         }
+    }
+
+    struct TelemetryProbePolicy {
+        logp: Var,
+        seen_telemetry: std::sync::Arc<std::sync::Mutex<Vec<bool>>>,
+    }
+    impl Policy for TelemetryProbePolicy {
+        fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
+            self.generate_at_instrumented(prompt, cfg, 0, None)
+        }
+
+        fn generate_at_instrumented(
+            &mut self,
+            prompt: &[u32],
+            _cfg: &GenConfig,
+            _global_row_base: u64,
+            telemetry: Option<&mut dyn ModelTelemetryRecorder>,
+        ) -> CandleResult<Rollout> {
+            self.seen_telemetry
+                .lock()
+                .unwrap()
+                .push(telemetry.is_some());
+            Ok(Rollout {
+                token_ids: vec![vec![prompt[0], 7]],
+                prompt_len: prompt.len(),
+                completion_lens: vec![1],
+                rollout_logprobs: None,
+            })
+        }
+
+        fn token_logprobs(&self, _rollout: &Rollout) -> CandleResult<Tensor> {
+            Ok(self.logp.as_tensor().clone())
+        }
+
+        fn set_adapter_enabled(&mut self, _enabled: bool) {}
+        fn adapter_enabled(&self) -> bool {
+            true
+        }
+        fn trainable_vars(&self) -> Vec<Var> {
+            vec![self.logp.clone()]
+        }
+        fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+            Ok(Vec::new())
+        }
+        fn restore_sampler_state(&mut self, _state: &[u8]) -> CandleResult<()> {
+            Ok(())
+        }
+    }
+
+    fn telemetry_probe_seen(gpu_memory_probe: bool) -> Vec<bool> {
+        let tmp = WireTmp::new("telemetry-probe");
+        let run = RunDir::create(&tmp.0, "telemetry-probe-run").unwrap();
+        let cfg = TrainerConfig {
+            steps: 1,
+            group_size: 1,
+            max_new_tokens: 1,
+            lr: 0.0,
+            gpu_memory_probe,
+            ..TrainerConfig::default()
+        };
+        let seen_telemetry = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let logp = Var::from_tensor(&mat(&[&[-1.0]])).unwrap();
+        let mut policy = TelemetryProbePolicy {
+            logp,
+            seen_telemetry: std::sync::Arc::clone(&seen_telemetry),
+        };
+        let mut trainer = Trainer::new(cfg, &run).unwrap();
+        trainer
+            .train(
+                &mut policy,
+                &CandidateReward,
+                &CandidateCodec,
+                &[Sample::new("prompt", ())],
+            )
+            .unwrap();
+        let seen = seen_telemetry.lock().unwrap().clone();
+        seen
+    }
+
+    #[test]
+    fn trainer_passes_model_telemetry_recorder_only_when_gpu_probe_enabled() {
+        assert_eq!(telemetry_probe_seen(false), vec![false]);
+        assert_eq!(telemetry_probe_seen(true), vec![true]);
     }
 
     #[test]

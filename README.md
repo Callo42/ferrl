@@ -407,7 +407,8 @@ runs/<run_id>/
 │                     #   rollout_ratio_mean, rollout_logratio_mean,
 │                     #   rollout_ratio_max, frac_rollout_ratio_capped,
 │                     #   rollout_capture_tokens, dropped_rows, grad_norm, lr, beta,
-│                     #   step_secs, tokens_per_sec, cuda_mem_* when enabled
+│                     #   step_secs, tokens_per_sec, cuda_mem_* when enabled,
+│                     #   cuda_mem_probe_events and decoder_cache_snapshots when present
 ├── checkpoints/      # LoRA checkpoints
 └── run.log           # human-readable log
 ```
@@ -416,7 +417,10 @@ Logging is structured via `tracing` + `tracing-subscriber`: the trainer enters a
 `run{rank=N world=N}` span and a per-step `step{step=N}` span, so every event carries
 rank / world / step (at ERROR level, the fields survive even `RUST_LOG=warn`). `runs/`
 is git-ignored. The on-disk layout is created by [`ferrl::telemetry::RunDir`] and metrics
-are appended by `ferrl::telemetry::MetricsWriter`; the `ferrl runreport` subcommand reads a
+are appended by `ferrl::telemetry::MetricsWriter`; with `gpu_memory_probe: true`,
+CUDA runs also persist stable phase-level memory probe events and any model-provided
+decoder cache snapshots, such as Gemma 4 per-layer seen/retained token counts. The
+`ferrl runreport` subcommand reads a
 run's `metrics.jsonl` and prints a health summary — reward trend, throughput, and grad-norm
 anomalies (human, `--json`, or `--strict`). Pass the original top-level run config with
 `--config run.json` to also apply its `run_health` post-run policy.

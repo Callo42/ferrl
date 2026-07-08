@@ -29,6 +29,7 @@ use crate::qwen::QwenGradModel;
 use crate::qwen35::{
     varbuilder_from_pretrained, LoraTargets as Qwen35LoraTargets, Qwen3_5Config, Qwen3_5GradModel,
 };
+use crate::telemetry::ModelTelemetryRecorder;
 use crate::tokenizer::{HfTokenizer, TokenizerError};
 
 /// Knobs for [`load_qwen_policy`]: the `LoRA` shape, the load dtypes, and the
@@ -180,6 +181,26 @@ impl Policy for AutoPolicy {
             Self::Qwen(policy) => policy.generate_at(prompt, cfg, global_row_base),
             Self::Qwen3_5(policy) => policy.generate_at(prompt, cfg, global_row_base),
             Self::Gemma4(policy) => policy.generate_at(prompt, cfg, global_row_base),
+        }
+    }
+
+    fn generate_at_instrumented(
+        &mut self,
+        prompt: &[u32],
+        cfg: &GenConfig,
+        global_row_base: u64,
+        telemetry: Option<&mut dyn ModelTelemetryRecorder>,
+    ) -> CandleResult<Rollout> {
+        match self {
+            Self::Qwen(policy) => {
+                policy.generate_at_instrumented(prompt, cfg, global_row_base, telemetry)
+            }
+            Self::Qwen3_5(policy) => {
+                policy.generate_at_instrumented(prompt, cfg, global_row_base, telemetry)
+            }
+            Self::Gemma4(policy) => {
+                policy.generate_at_instrumented(prompt, cfg, global_row_base, telemetry)
+            }
         }
     }
 

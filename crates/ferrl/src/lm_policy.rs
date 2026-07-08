@@ -97,6 +97,7 @@ use crate::model::{CachedDecoder, GradModel};
 use crate::policy::{GenConfig, Policy, Rollout};
 use crate::qwen::QwenGradModel;
 use crate::sampler::GrpoSampler;
+use crate::telemetry::ModelTelemetryRecorder;
 
 /// Scoring positions processed per chunk by the log-softmax/gather stage —
 /// bounds the F32 upcast + softmax buffers to `[group, SCORING_CHUNK, vocab]`
@@ -415,6 +416,7 @@ fn batched_group_decode<D: CachedDecoder>(
     cfg: &GenConfig,
     (temperature, top_p): (f64, Option<f64>),
     device: &candle_core::Device,
+    telemetry: &mut Option<&mut dyn ModelTelemetryRecorder>,
 ) -> CandleResult<GroupDecode> {
     let g = cfg.group_size;
     let prompt_len = prompt.len();
@@ -434,9 +436,16 @@ fn batched_group_decode<D: CachedDecoder>(
         prompt_data.extend_from_slice(prompt);
     }
     let prompt_input = Tensor::from_vec(prompt_data, (g, prompt_len), device)?;
+    if let Some(recorder) = telemetry.as_mut() {
+        recorder.record_phase("rollout_prefill_start");
+    }
     let logits = decoder
         .forward(&prompt_input, 0)
         .map_err(crate::cuda_compat::translate_ptx_error)?;
+    if let Some(recorder) = telemetry.as_mut() {
+        recorder.record_phase("rollout_prefill_end");
+        recorder.record_decoder_cache(decoder.decoder_cache_snapshots("rollout_prefill_end"));
+    }
     let mut last = logits.i((.., prompt_len - 1))?; // [g, vocab]
 
     let mut token_ids: Vec<Vec<u32>> = (0..g).map(|_| prompt.to_vec()).collect();
@@ -452,6 +461,9 @@ fn batched_group_decode<D: CachedDecoder>(
     let mut active = vec![true; g];
     let mut offset = prompt_len;
 
+    if let Some(recorder) = telemetry.as_mut() {
+        recorder.record_phase("rollout_decode_start");
+    }
     for step in 0..cfg.max_new_tokens {
         // Sample each still-active row from its OWN substream; a retired row draws
         // nothing (so its log-prob count stays == completion_lens[r], one per real
@@ -491,6 +503,10 @@ fn batched_group_decode<D: CachedDecoder>(
             offset += 1;
         }
     }
+    if let Some(recorder) = telemetry.as_mut() {
+        recorder.record_phase("rollout_decode_end");
+        recorder.record_decoder_cache(decoder.decoder_cache_snapshots("rollout_decode_end"));
+    }
 
     // Right-pad every retired row back to the fixed width with the EOS pad; full-width
     // rows (no early stop) are already `width` and unchanged.
@@ -513,6 +529,16 @@ impl<M: GradModel> Policy for LmPolicy<M> {
         cfg: &GenConfig,
         global_row_base: u64,
     ) -> CandleResult<Rollout> {
+        self.generate_at_instrumented(prompt, cfg, global_row_base, None)
+    }
+
+    fn generate_at_instrumented(
+        &mut self,
+        prompt: &[u32],
+        cfg: &GenConfig,
+        global_row_base: u64,
+        mut telemetry: Option<&mut dyn ModelTelemetryRecorder>,
+    ) -> CandleResult<Rollout> {
         let (temperature, top_p) = self.resolve_sampling(cfg)?;
         let device = self.model.device().clone();
         let prompt_len = prompt.len();
@@ -522,10 +548,18 @@ impl<M: GradModel> Policy for LmPolicy<M> {
         // first forward, so translate a driver-too-old PTX mismatch
         // (`CUDA_ERROR_UNSUPPORTED_PTX_VERSION`) into an actionable rebuild/upgrade
         // message — a no-op off the `cuda` build and on the success path.
+        if let Some(recorder) = telemetry.as_deref_mut() {
+            recorder.record_phase("merged_decoder_build_start");
+        }
         let mut decoder = self
             .model
             .merged_decoder()
             .map_err(crate::cuda_compat::translate_ptx_error)?;
+        if let Some(recorder) = telemetry.as_deref_mut() {
+            recorder.record_phase("merged_decoder_build_end");
+            recorder
+                .record_decoder_cache(decoder.decoder_cache_snapshots("merged_decoder_build_end"));
+        }
         // Per-row independent RNG substreams seeded by GLOBAL row index
         // (`global_row_base + row`): each row draws ONLY from its own substream, so
         // the sampled stream is invariant both to decode order (this batched decode
@@ -542,6 +576,7 @@ impl<M: GradModel> Policy for LmPolicy<M> {
             cfg,
             (temperature, top_p),
             &device,
+            &mut telemetry,
         )?;
         // Built directly (not via `Rollout::rectangular`) so `completion_lens` carries
         // the true per-sequence lengths; under `eos_token_id == None` every entry is
@@ -659,6 +694,7 @@ mod tests {
     use super::*;
     use crate::gemma4::{Gemma4Config, Gemma4GradModel, Gemma4LayerType, CKPT_PREFIX};
     use crate::nn::grad_coverage;
+    use crate::telemetry::DecoderCacheSnapshot;
     use candle_core::backprop::GradStore;
     use candle_core::{DType, Device, D};
     use candle_nn::ops::log_softmax;
@@ -2312,6 +2348,91 @@ mod tests {
         let model =
             Gemma4GradModel::load_with_adapter_dtype(&cfg, &vb, 2, 4.0, DType::F32).unwrap();
         Gemma4Policy::new(model, 7, 1.0)
+    }
+
+    #[derive(Default)]
+    struct CollectingTelemetry {
+        phases: Vec<&'static str>,
+        cache: Vec<DecoderCacheSnapshot>,
+    }
+
+    impl ModelTelemetryRecorder for CollectingTelemetry {
+        fn record_phase(&mut self, phase: &'static str) {
+            self.phases.push(phase);
+        }
+
+        fn record_decoder_cache(&mut self, snapshots: Vec<DecoderCacheSnapshot>) {
+            self.cache.extend(snapshots);
+        }
+    }
+
+    fn snapshots_for_phase(
+        snapshots: &[DecoderCacheSnapshot],
+        phase: &str,
+    ) -> Vec<DecoderCacheSnapshot> {
+        snapshots
+            .iter()
+            .filter(|snapshot| snapshot.phase == phase)
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn gemma4_instrumented_generate_reports_prefill_decode_and_cache_phases() {
+        let mut policy = gemma4_tiny_policy();
+        force_b_nonzero(&policy.trainable_vars());
+        let cfg = GenConfig {
+            group_size: 3,
+            max_new_tokens: 4,
+            temperature: 1.0,
+            eos_token_id: None,
+            eval_sampling: None,
+        };
+        let prompt = [1u32, 2, 3, 4, 5];
+        let mut telemetry = CollectingTelemetry::default();
+
+        let rollout = policy
+            .generate_at_instrumented(&prompt, &cfg, 0, Some(&mut telemetry))
+            .unwrap();
+        assert_eq!(rollout.len(), cfg.group_size);
+        assert_eq!(
+            telemetry.phases,
+            [
+                "merged_decoder_build_start",
+                "merged_decoder_build_end",
+                "rollout_prefill_start",
+                "rollout_prefill_end",
+                "rollout_decode_start",
+                "rollout_decode_end",
+            ]
+        );
+        assert_eq!(
+            snapshots_for_phase(&telemetry.cache, "merged_decoder_build_end").len(),
+            2
+        );
+
+        let seen_tokens = prompt.len() + cfg.max_new_tokens - 1;
+        assert_eq!(
+            snapshots_for_phase(&telemetry.cache, "rollout_decode_end"),
+            vec![
+                DecoderCacheSnapshot {
+                    phase: "rollout_decode_end".to_string(),
+                    layer_index: 0,
+                    kind: "sliding_attention".to_string(),
+                    seen_tokens,
+                    retained_tokens: 3,
+                    max_retained_tokens: Some(3),
+                },
+                DecoderCacheSnapshot {
+                    phase: "rollout_decode_end".to_string(),
+                    layer_index: 1,
+                    kind: "full_attention".to_string(),
+                    seen_tokens,
+                    retained_tokens: seen_tokens,
+                    max_retained_tokens: None,
+                },
+            ]
+        );
     }
 
     #[test]
