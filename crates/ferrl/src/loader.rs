@@ -24,6 +24,7 @@ use crate::gemma4::{
     varbuilder_from_pretrained as gemma4_varbuilder_from_pretrained, Gemma4Config, Gemma4GradModel,
 };
 use crate::lm_policy::{Gemma4Policy, Qwen3_5Policy, QwenPolicy};
+use crate::lora::{BaseQuantization, DenseLoraTargets};
 use crate::policy::{GenConfig, Policy, Rollout};
 use crate::qwen::QwenGradModel;
 use crate::qwen35::{
@@ -60,6 +61,8 @@ pub struct LoaderOpts {
     pub temperature: f64,
     /// Use the experimental grouped cached-GQA rollout path for Qwen3.5 models.
     pub memory_efficient_cached_gqa: bool,
+    /// Optional quantization mode for frozen base projection weights.
+    pub base_quantization: BaseQuantization,
 }
 
 impl Default for LoaderOpts {
@@ -72,6 +75,7 @@ impl Default for LoaderOpts {
             seed: 1234,
             temperature: 1.0,
             memory_efficient_cached_gqa: false,
+            base_quantization: BaseQuantization::None,
         }
     }
 }
@@ -321,12 +325,14 @@ pub fn load_qwen_policy(
         source,
     })?;
     let vb = VarBuilder::from_buffered_safetensors(weights, opts.base_dtype, device)?;
-    let model = QwenGradModel::load_with_adapter_dtype(
+    let model = QwenGradModel::load_with_targets_and_base_quantization(
         &cfg,
         &vb,
         opts.lora_rank,
         opts.lora_alpha,
         opts.adapter_dtype,
+        DenseLoraTargets::legacy(),
+        opts.base_quantization,
     )?;
     let policy = QwenPolicy::new(model, opts.seed, opts.temperature);
 
@@ -407,6 +413,13 @@ fn load_qwen35_policy(
     device: &Device,
     opts: &LoaderOpts,
 ) -> Result<(Qwen3_5Policy, HfTokenizer), LoaderError> {
+    if opts.base_quantization != BaseQuantization::None {
+        return Err(LoaderError::UnsupportedLoaderOption {
+            option: "policy.base_quantization".to_string(),
+            supported: "qwen3 or gemma4".to_string(),
+            model_type: "qwen3_5".to_string(),
+        });
+    }
     let cfg = Qwen3_5Config::from_json_file(dir.join("config.json"))?;
     let vb = varbuilder_from_pretrained(dir, opts.base_dtype, device)?;
     let mut model = Qwen3_5GradModel::load_with_targets(
@@ -468,12 +481,14 @@ pub fn load_gemma4_policy(
     }
 
     let vb = gemma4_varbuilder_from_pretrained(dir, opts.base_dtype, device)?;
-    let model = Gemma4GradModel::load_with_adapter_dtype(
+    let model = Gemma4GradModel::load_with_targets_and_base_quantization(
         &cfg,
         &vb,
         opts.lora_rank,
         opts.lora_alpha,
         opts.adapter_dtype,
+        DenseLoraTargets::industrial(),
+        opts.base_quantization,
     )?;
     let policy = Gemma4Policy::new(model, opts.seed, opts.temperature);
     let tok = HfTokenizer::from_file(dir.join("tokenizer.json"))?;
@@ -522,6 +537,7 @@ mod tests {
         assert_eq!(o.base_dtype, DType::F32);
         assert_eq!(o.adapter_dtype, DType::F32);
         assert!(!o.memory_efficient_cached_gqa);
+        assert_eq!(o.base_quantization, BaseQuantization::None);
     }
 
     #[test]
@@ -587,6 +603,33 @@ mod tests {
             read_model_type(tmp.path()).unwrap(),
             Some(ModelType::Qwen3_5)
         );
+    }
+
+    #[test]
+    fn qwen35_loader_rejects_base_quantization_option_before_weight_load() {
+        let tmp = TempDir::new("loader-qwen35-base-quantization-option");
+        std::fs::write(
+            tmp.path().join("config.json"),
+            r#"{ "model_type": "qwen3_5" }"#,
+        )
+        .unwrap();
+        let opts = LoaderOpts {
+            base_quantization: BaseQuantization::Q8_0,
+            ..LoaderOpts::default()
+        };
+        match load_auto_policy(tmp.path(), &Device::Cpu, &opts) {
+            Err(LoaderError::UnsupportedLoaderOption {
+                option,
+                supported,
+                model_type,
+            }) => {
+                assert_eq!(option, "policy.base_quantization");
+                assert_eq!(supported, "qwen3 or gemma4");
+                assert_eq!(model_type, "qwen3_5");
+            }
+            Err(other) => panic!("expected UnsupportedLoaderOption, got {other:?}"),
+            Ok(_) => panic!("expected UnsupportedLoaderOption, got loaded policy"),
+        }
     }
 
     #[test]

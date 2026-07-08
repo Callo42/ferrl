@@ -203,7 +203,7 @@ pub use loader::{
     load_auto_policy, load_gemma4_policy, load_qwen_policy, AutoPolicy, LoaderError, LoaderOpts,
 };
 #[doc(inline)]
-pub use lora::DenseLoraTargets;
+pub use lora::{BaseQuantization, DenseLoraTargets};
 #[doc(inline)]
 pub use math::{math_prompt, MathProblem, MathReward};
 #[doc(inline)]

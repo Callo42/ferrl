@@ -60,9 +60,9 @@ use ferrl::policy::GenConfig;
 use ferrl::telemetry::{CandidateRecord, RegressionFailure};
 use ferrl::{
     compare_distributed_metrics, compare_metrics, evaluate, load_auto_policy, read_jsonl,
-    summarize, train_eval_split, CountdownReward, LoaderOpts, MathProblem, MathReward,
-    RegressionBudget, RegressionReport, RewardFn, RunDir, Sample, Trainer, TrainerConfig,
-    TrimulReward,
+    summarize, train_eval_split, BaseQuantization, CountdownReward, LoaderOpts, MathProblem,
+    MathReward, RegressionBudget, RegressionReport, RewardFn, RunDir, Sample, Trainer,
+    TrainerConfig, TrimulReward,
 };
 
 /// A task's train/eval split: `(train, eval)` samples of the task's target type.
@@ -561,6 +561,31 @@ impl DtypeSel {
     }
 }
 
+/// Optional quantization for frozen base projection weights.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum BaseQuantizationSel {
+    /// Store frozen base projections as ordinary tensors.
+    #[default]
+    None,
+    /// Store frozen base projections as GGML `Q8_0`.
+    Q8_0,
+}
+
+impl BaseQuantizationSel {
+    fn as_base_quantization(self) -> BaseQuantization {
+        match self {
+            Self::None => BaseQuantization::None,
+            Self::Q8_0 => BaseQuantization::Q8_0,
+        }
+    }
+
+    /// Stable manifest spelling for this frozen-base quantization mode.
+    fn as_str(self) -> &'static str {
+        self.as_base_quantization().as_str()
+    }
+}
+
 /// Policy-load knobs (the `LoRA` shape, base dtype, seed). The rollout temperature
 /// is taken from the trainer config so the two cannot disagree.
 #[derive(Debug, Deserialize)]
@@ -572,6 +597,8 @@ struct PolicyCfg {
     lora_alpha: f64,
     /// Dtype the frozen base loads in.
     base_dtype: DtypeSel,
+    /// Optional frozen-base projection quantization.
+    base_quantization: BaseQuantizationSel,
     /// Rollout sampler seed.
     seed: u64,
     /// Enable layer-boundary activation checkpointing for the update forward.
@@ -589,6 +616,7 @@ impl Default for PolicyCfg {
             lora_rank: 16,
             lora_alpha: 32.0,
             base_dtype: DtypeSel::F32,
+            base_quantization: BaseQuantizationSel::None,
             seed: 1234,
             activation_checkpointing: false,
             memory_efficient_cached_gqa: false,
@@ -1101,6 +1129,7 @@ impl RunConfig {
             seed: self.policy.seed,
             temperature: self.trainer.temperature,
             memory_efficient_cached_gqa: self.policy.memory_efficient_cached_gqa,
+            base_quantization: self.policy.base_quantization.as_base_quantization(),
         }
     }
 
@@ -1992,6 +2021,8 @@ struct ModelManifest {
     lora_alpha: f64,
     /// Frozen base dtype.
     base_dtype: &'static str,
+    /// Frozen base projection quantization.
+    base_quantization: &'static str,
 }
 
 /// Run-config provenance fields.
@@ -2340,6 +2371,7 @@ fn build_manifest(
             lora_rank: cfg.policy.lora_rank,
             lora_alpha: cfg.policy.lora_alpha,
             base_dtype: cfg.policy.base_dtype.as_str(),
+            base_quantization: cfg.policy.base_quantization.as_str(),
         },
         config: ArtifactConfigManifest {
             run_config_sha256: sha256_hex(inputs.config_bytes),
@@ -2537,13 +2569,14 @@ fn artifact_report(
     .expect("writing to String cannot fail");
     writeln!(
         &mut out,
-        "- Model: family={}, checkpoint={}, tokenizer={}, lora_rank={}, lora_alpha={}, base_dtype={}",
+        "- Model: family={}, checkpoint={}, tokenizer={}, lora_rank={}, lora_alpha={}, base_dtype={}, base_quantization={}",
         manifest.model.family,
         manifest.model.checkpoint,
         manifest.model.tokenizer,
         manifest.model.lora_rank,
         manifest.model.lora_alpha,
-        manifest.model.base_dtype
+        manifest.model.base_dtype,
+        manifest.model.base_quantization
     )
     .expect("writing to String cannot fail");
     writeln!(
@@ -3854,9 +3887,14 @@ mod tests {
         assert_eq!(cfg.policy.lora_rank, 16);
         assert!(!cfg.policy.activation_checkpointing);
         assert!(!cfg.policy.memory_efficient_cached_gqa);
+        assert_eq!(
+            cfg.policy.base_quantization.as_base_quantization(),
+            BaseQuantization::None
+        );
         assert_eq!(cfg.data.train_n, 64);
         // The loader temperature mirrors the trainer's (cannot drift).
         assert!((cfg.loader_opts().temperature - cfg.trainer.temperature).abs() < f64::EPSILON);
+        assert_eq!(cfg.loader_opts().base_quantization, BaseQuantization::None);
     }
 
     #[test]
@@ -4064,6 +4102,7 @@ mod tests {
 
     /// `device` and `base_dtype` selectors deserialize from lowercase strings.
     #[test]
+    #[allow(clippy::cognitive_complexity)] // assertion-heavy config parse coverage
     fn device_and_dtype_selectors_parse() {
         let json = r#"{
             "task": "math",
@@ -4071,6 +4110,7 @@ mod tests {
             "device": "cuda",
             "policy": {
                 "base_dtype": "bf16",
+                "base_quantization": "q8_0",
                 "activation_checkpointing": true,
                 "memory_efficient_cached_gqa": true
             },
@@ -4083,6 +4123,7 @@ mod tests {
         let cfg: RunConfig = serde_json::from_str(json).unwrap();
         assert!(matches!(cfg.device, DeviceSel::Cuda));
         assert_eq!(cfg.loader_opts().base_dtype, DType::BF16);
+        assert_eq!(cfg.loader_opts().base_quantization, BaseQuantization::Q8_0);
         assert!(cfg.policy.activation_checkpointing);
         assert!(cfg.loader_opts().memory_efficient_cached_gqa);
         assert_eq!(cfg.data.path.as_deref(), Some(Path::new("data.jsonl")));
@@ -5349,6 +5390,57 @@ benchmarks:
     }
 
     #[test]
+    fn artifact_manifest_records_base_quantization() {
+        let cfg: RunConfig = serde_json::from_str(
+            r#"{
+                "task": "trimul",
+                "model_dir": "/m",
+                "policy": {
+                    "base_dtype": "bf16",
+                    "base_quantization": "q8_0"
+                },
+                "trimul": {
+                  "prompt_path": "/prompt.txt",
+                  "submission_extract_mode": "final_fence",
+                  "image": "/image.sif",
+                  "eval_dir": "/eval",
+                  "scratch_root": "/scratch",
+                  "secret_seed": 4242
+                },
+                "trainer": { "steps": 1, "group_size": 2, "max_new_tokens": 8,
+                  "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
+                  "lr": 1e-5, "weight_decay": 0.0,
+                  "loss_type": "grpo", "scale_rewards": "group" }
+            }"#,
+        )
+        .unwrap();
+        let args = trimul_artifact_args_for_test(Path::new("artifact-provenance"));
+        let inputs = ArtifactInputs {
+            gpu: "H100".to_string(),
+            raw_completion: "```python\npass\n```\n",
+            normalized_completion: "```python\npass\n```\n",
+            completion_normalization: CompletionNormalization::None,
+            completion_normalization_changed: false,
+            completion_bytes: b"completion",
+            config_bytes: b"config",
+            prompt_bytes: b"prompt",
+            submission: "pass\n",
+            baseline_median: 1.0,
+            test_cases: 1,
+            benchmark_cases: 1,
+            runs: Vec::new(),
+            accepted: false,
+        };
+
+        let manifest = build_manifest(&args, &cfg, &inputs);
+        let json = serde_json::to_string(&manifest).unwrap();
+
+        assert_eq!(manifest.model.base_dtype, "bf16");
+        assert_eq!(manifest.model.base_quantization, "q8_0");
+        assert!(json.contains(r#""base_quantization":"q8_0""#));
+    }
+
+    #[test]
     fn artifact_report_matches_the_contract_outline() {
         let manifest = ArtifactManifest {
             contract_version: 1,
@@ -5378,6 +5470,7 @@ benchmarks:
                 lora_rank: 8,
                 lora_alpha: 16.0,
                 base_dtype: "bf16",
+                base_quantization: "q8_0",
             },
             config: ArtifactConfigManifest {
                 run_config_sha256: "config-hash".to_string(),
@@ -5442,6 +5535,7 @@ benchmarks:
             "Config hash: config-hash",
             "Prompt copy: prompt.txt (prompt-hash)",
             "Reward profile: `{\"scheme\":\"trimul_shaped_v1\"",
+            "base_quantization=q8_0",
             "Budget: trainer_steps=100, group_size=4, scratch_max_bytes=1024, verifier_max_procs=1024",
             "Run health: healthy",
             "| source hash | training reward | source inspection | clean correctness | median runtime ns | speedup | accept/reject reason |",

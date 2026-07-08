@@ -20,7 +20,9 @@ use candle_nn::{Activation, Module, VarBuilder};
 use serde::Deserialize;
 
 use crate::blocks::{frozen_linear, repeat_kv, rope_partial, windowed, RotaryTables};
-use crate::lora::{DenseLoraTargets, Proj};
+use crate::lora::{
+    BaseQuantization, DenseLoraTargets, FrozenLinearSnapshot, Proj, ProjLoadOptions,
+};
 use crate::model::{CachedDecoder, GradModel};
 use crate::nn::RmsNorm;
 use crate::remat::{stitched_backward, RematTape};
@@ -752,9 +754,7 @@ impl Gemma4Attention {
         layer_idx: usize,
         vb: &VarBuilder,
         targets: DenseLoraTargets,
-        rank: usize,
-        alpha: f64,
-        adapter_dtype: DType,
+        proj_opts: ProjLoadOptions,
     ) -> CandleResult<Self> {
         let kind = cfg.layer_types[layer_idx];
         let full = kind == Gemma4LayerType::FullAttention;
@@ -774,46 +774,20 @@ impl Gemma4Attention {
         let v_proj = if full {
             None
         } else {
-            Some(Proj::load(
+            Some(Proj::load_with_options(
                 vb,
                 "v_proj",
                 (kv_out, h),
                 targets.attn_v,
-                rank,
-                alpha,
-                adapter_dtype,
+                proj_opts,
             )?)
         };
         Ok(Self {
             kind,
-            q_proj: Proj::load(
-                vb,
-                "q_proj",
-                (q_out, h),
-                targets.attn_q,
-                rank,
-                alpha,
-                adapter_dtype,
-            )?,
-            k_proj: Proj::load(
-                vb,
-                "k_proj",
-                (kv_out, h),
-                targets.attn_k,
-                rank,
-                alpha,
-                adapter_dtype,
-            )?,
+            q_proj: Proj::load_with_options(vb, "q_proj", (q_out, h), targets.attn_q, proj_opts)?,
+            k_proj: Proj::load_with_options(vb, "k_proj", (kv_out, h), targets.attn_k, proj_opts)?,
             v_proj,
-            o_proj: Proj::load(
-                vb,
-                "o_proj",
-                (h, q_out),
-                targets.attn_o,
-                rank,
-                alpha,
-                adapter_dtype,
-            )?,
+            o_proj: Proj::load_with_options(vb, "o_proj", (h, q_out), targets.attn_o, proj_opts)?,
             q_norm: RmsNorm::new(
                 vb.pp("q_norm").get(head_dim, "weight")?,
                 cfg.rms_norm_eps as f32,
@@ -920,39 +894,25 @@ impl Gemma4Mlp {
         cfg: &Gemma4TextConfig,
         vb: &VarBuilder,
         targets: DenseLoraTargets,
-        rank: usize,
-        alpha: f64,
-        adapter_dtype: DType,
+        proj_opts: ProjLoadOptions,
     ) -> CandleResult<Self> {
         let h = cfg.hidden_size;
         let i = cfg.intermediate_size;
         Ok(Self {
-            gate_proj: Proj::load(
+            gate_proj: Proj::load_with_options(
                 vb,
                 "gate_proj",
                 (i, h),
                 targets.mlp_gate,
-                rank,
-                alpha,
-                adapter_dtype,
+                proj_opts,
             )?,
-            up_proj: Proj::load(
-                vb,
-                "up_proj",
-                (i, h),
-                targets.mlp_up,
-                rank,
-                alpha,
-                adapter_dtype,
-            )?,
-            down_proj: Proj::load(
+            up_proj: Proj::load_with_options(vb, "up_proj", (i, h), targets.mlp_up, proj_opts)?,
+            down_proj: Proj::load_with_options(
                 vb,
                 "down_proj",
                 (h, i),
                 targets.mlp_down,
-                rank,
-                alpha,
-                adapter_dtype,
+                proj_opts,
             )?,
             act: Activation::GeluPytorchTanh,
         })
@@ -996,24 +956,14 @@ impl Gemma4Layer {
         layer_idx: usize,
         vb: &VarBuilder,
         targets: DenseLoraTargets,
-        rank: usize,
-        alpha: f64,
-        adapter_dtype: DType,
+        proj_opts: ProjLoadOptions,
     ) -> CandleResult<Self> {
         let h = cfg.hidden_size;
         let eps = cfg.rms_norm_eps as f32;
         Ok(Self {
             kind: cfg.layer_types[layer_idx],
             input_layernorm: RmsNorm::new(vb.pp("input_layernorm").get(h, "weight")?, eps),
-            attn: Gemma4Attention::load(
-                cfg,
-                layer_idx,
-                &vb.pp("self_attn"),
-                targets,
-                rank,
-                alpha,
-                adapter_dtype,
-            )?,
+            attn: Gemma4Attention::load(cfg, layer_idx, &vb.pp("self_attn"), targets, proj_opts)?,
             post_attention_layernorm: RmsNorm::new(
                 vb.pp("post_attention_layernorm").get(h, "weight")?,
                 eps,
@@ -1022,7 +972,7 @@ impl Gemma4Layer {
                 vb.pp("pre_feedforward_layernorm").get(h, "weight")?,
                 eps,
             ),
-            mlp: Gemma4Mlp::load(cfg, &vb.pp("mlp"), targets, rank, alpha, adapter_dtype)?,
+            mlp: Gemma4Mlp::load(cfg, &vb.pp("mlp"), targets, proj_opts)?,
             post_feedforward_layernorm: RmsNorm::new(
                 vb.pp("post_feedforward_layernorm").get(h, "weight")?,
                 eps,
@@ -1125,6 +1075,35 @@ impl Gemma4GradModel {
         adapter_dtype: DType,
         targets: DenseLoraTargets,
     ) -> CandleResult<Self> {
+        Self::load_with_targets_and_base_quantization(
+            cfg,
+            vb,
+            rank,
+            alpha,
+            adapter_dtype,
+            targets,
+            BaseQuantization::None,
+        )
+    }
+
+    /// Load with an explicit frozen-base projection quantization mode.
+    ///
+    /// The trainable adapter recipe and positional checkpoint contract are
+    /// unchanged; only frozen projection storage and rollout application differ.
+    ///
+    /// # Errors
+    ///
+    /// As [`load_with_targets`](Self::load_with_targets), plus quantization
+    /// shape/storage errors.
+    pub fn load_with_targets_and_base_quantization(
+        cfg: &Gemma4Config,
+        vb: &VarBuilder,
+        rank: usize,
+        alpha: f64,
+        adapter_dtype: DType,
+        targets: DenseLoraTargets,
+        base_quantization: BaseQuantization,
+    ) -> CandleResult<Self> {
         cfg.validate()?;
         if !targets.any() {
             bail!("Gemma4GradModel: DenseLoraTargets selects no projection");
@@ -1135,6 +1114,7 @@ impl Gemma4GradModel {
             .pp("embed_tokens")
             .get((t.vocab_size, t.hidden_size), "weight")?;
         let layers_vb = root.pp("layers");
+        let proj_opts = ProjLoadOptions::new(rank, alpha, adapter_dtype, base_quantization);
         let mut layers = Vec::with_capacity(t.num_hidden_layers);
         for i in 0..t.num_hidden_layers {
             layers.push(Gemma4Layer::load(
@@ -1142,9 +1122,7 @@ impl Gemma4GradModel {
                 i,
                 &layers_vb.pp(i),
                 targets,
-                rank,
-                alpha,
-                adapter_dtype,
+                proj_opts,
             )?);
         }
         Ok(Self {
@@ -1484,10 +1462,10 @@ impl Gemma4KvCache {
 #[derive(Debug)]
 struct Gemma4MergedAttention {
     kind: Gemma4LayerType,
-    q_weight: Tensor,
-    k_weight: Tensor,
-    v_weight: Option<Tensor>,
-    o_weight: Tensor,
+    q_weight: FrozenLinearSnapshot,
+    k_weight: FrozenLinearSnapshot,
+    v_weight: Option<FrozenLinearSnapshot>,
+    o_weight: FrozenLinearSnapshot,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
     v_norm: RmsNorm,
@@ -1504,10 +1482,10 @@ impl Gemma4MergedAttention {
         let max_retained = (a.kind == Gemma4LayerType::SlidingAttention).then_some(sliding_window);
         Ok(Self {
             kind: a.kind,
-            q_weight: a.q_proj.merged_weight()?,
-            k_weight: a.k_proj.merged_weight()?,
-            v_weight: a.v_proj.as_ref().map(Proj::merged_weight).transpose()?,
-            o_weight: a.o_proj.merged_weight()?,
+            q_weight: a.q_proj.snapshot()?,
+            k_weight: a.k_proj.snapshot()?,
+            v_weight: a.v_proj.as_ref().map(Proj::snapshot).transpose()?,
+            o_weight: a.o_proj.snapshot()?,
             q_norm: a.q_norm.clone(),
             k_norm: a.k_norm.clone(),
             v_norm: a.v_norm.clone(),
@@ -1538,10 +1516,10 @@ impl Gemma4MergedAttention {
     ) -> CandleResult<Tensor> {
         let (b, l, _) = x.dims3()?;
         let in_dtype = x.dtype();
-        let q = frozen_linear(x, &self.q_weight)?;
-        let k_raw = frozen_linear(x, &self.k_weight)?;
+        let q = self.q_weight.forward(x)?;
+        let k_raw = self.k_weight.forward(x)?;
         let v_raw = match &self.v_weight {
-            Some(w) => frozen_linear(x, w)?,
+            Some(w) => w.forward(x)?,
             None => k_raw.clone(),
         };
         let q = q.reshape((b, l, self.num_heads, self.head_dim))?;
@@ -1579,7 +1557,7 @@ impl Gemma4MergedAttention {
             .transpose(1, 2)?
             .contiguous()?
             .reshape((b, l, self.attn_hidden))?;
-        frozen_linear(&ctx, &self.o_weight)
+        self.o_weight.forward(&ctx)
     }
 
     fn reset_cache(&mut self) {
@@ -1589,27 +1567,27 @@ impl Gemma4MergedAttention {
 
 #[derive(Debug)]
 struct Gemma4MergedMlp {
-    gate_weight: Tensor,
-    up_weight: Tensor,
-    down_weight: Tensor,
+    gate_weight: FrozenLinearSnapshot,
+    up_weight: FrozenLinearSnapshot,
+    down_weight: FrozenLinearSnapshot,
     act: Activation,
 }
 
 impl Gemma4MergedMlp {
     fn from_mlp(mlp: &Gemma4Mlp) -> CandleResult<Self> {
         Ok(Self {
-            gate_weight: mlp.gate_proj.merged_weight()?,
-            up_weight: mlp.up_proj.merged_weight()?,
-            down_weight: mlp.down_proj.merged_weight()?,
+            gate_weight: mlp.gate_proj.snapshot()?,
+            up_weight: mlp.up_proj.snapshot()?,
+            down_weight: mlp.down_proj.snapshot()?,
             act: mlp.act,
         })
     }
 
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
-        let g = frozen_linear(x, &self.gate_weight)?;
-        let u = frozen_linear(x, &self.up_weight)?;
+        let g = self.gate_weight.forward(x)?;
+        let u = self.up_weight.forward(x)?;
         let h = self.act.forward(&g)?.broadcast_mul(&u)?;
-        frozen_linear(&h, &self.down_weight)
+        self.down_weight.forward(&h)
     }
 }
 
@@ -1886,6 +1864,23 @@ mod tests {
         Gemma4Config::from_json_str(TINY_GEMMA4_TEXT_CONFIG).unwrap()
     }
 
+    fn quantized_tiny_cfg() -> Gemma4Config {
+        let mut cfg = tiny_cfg();
+        let t = &mut cfg.text_config;
+        t.vocab_size = 32;
+        t.vocab_size_per_layer_input = 32;
+        t.hidden_size = 32;
+        t.intermediate_size = 64;
+        t.num_attention_heads = 2;
+        t.num_key_value_heads = 1;
+        t.num_global_key_value_heads = 1;
+        t.head_dim = 16;
+        t.global_head_dim = 16;
+        t.max_position_embeddings = 32;
+        cfg.validate().unwrap();
+        cfg
+    }
+
     fn gemma4_unified_12b_config_json() -> String {
         let layer_types: Vec<&str> = (0..48)
             .map(|i| {
@@ -2049,6 +2044,21 @@ mod tests {
         .unwrap()
     }
 
+    fn quantized_tiny_model() -> Gemma4GradModel {
+        let cfg = quantized_tiny_cfg();
+        let vb = tiny_vb(&cfg);
+        Gemma4GradModel::load_with_targets_and_base_quantization(
+            &cfg,
+            &vb,
+            2,
+            4.0,
+            DType::F32,
+            DenseLoraTargets::industrial(),
+            BaseQuantization::Q8_0,
+        )
+        .unwrap()
+    }
+
     fn unique_tmp(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "ferrl-gemma4-{name}-{}-{}",
@@ -2136,6 +2146,15 @@ mod tests {
         }
     }
 
+    fn overwrite_adapter(model: &Gemma4GradModel) {
+        for (i, v) in model.trainable_vars().iter().enumerate() {
+            let dims = v.as_tensor().dims().to_vec();
+            let scale = if i % 2 == 0 { 1.25 } else { -0.75 };
+            let replacement = (Tensor::ones(dims, DType::F32, &dev()).unwrap() * scale).unwrap();
+            v.set(&replacement).unwrap();
+        }
+    }
+
     #[test]
     fn tiny_forward_produces_full_seq_logits() {
         let cfg = tiny_cfg();
@@ -2217,6 +2236,57 @@ mod tests {
         assert!(
             worst <= 1e-3,
             "Gemma 4 cached decode diverged from uncached forward: {worst}"
+        );
+    }
+
+    #[test]
+    fn quantized_merged_decoder_matches_uncached_with_armed_adapters() {
+        let model = quantized_tiny_model();
+        arm_adapter(&model);
+        let input = ids(5);
+        let reference = model.forward(&input).unwrap();
+        let mut dec = model.merged_decoder().unwrap();
+        let got = dec.forward(&input, 0).unwrap();
+        assert_eq!(got.dims(), reference.dims());
+        assert!(
+            max_abs_diff(&got, &reference) <= 0.05,
+            "quantized Gemma 4 cached prefill diverged from uncached forward"
+        );
+    }
+
+    #[test]
+    fn quantized_merged_decoder_snapshots_adapter_values_across_var_updates() {
+        let model = quantized_tiny_model();
+        arm_adapter(&model);
+        let input = ids(6);
+        let before_update = model.forward(&input).unwrap();
+        let mut dec = model.merged_decoder().unwrap();
+
+        let prefix_len = 3;
+        let prefix = input.narrow(1, 0, prefix_len).unwrap();
+        let prefix_logits = dec.forward(&prefix, 0).unwrap();
+        assert!(
+            max_abs_diff(
+                &prefix_logits,
+                &before_update.narrow(1, 0, prefix_len).unwrap()
+            ) <= 0.05,
+            "quantized snapshot must match the pre-update adapter before mutation"
+        );
+
+        overwrite_adapter(&model);
+        let after_update = model.forward(&input).unwrap();
+        assert!(
+            max_abs_diff(&after_update, &before_update) > 0.05,
+            "adapter overwrite must move the live model enough to make this gate non-vacuous"
+        );
+
+        let suffix_len = 2;
+        let suffix = input.narrow(1, prefix_len, suffix_len).unwrap();
+        let got = dec.forward(&suffix, prefix_len).unwrap();
+        let want = before_update.narrow(1, prefix_len, suffix_len).unwrap();
+        assert!(
+            max_abs_diff(&got, &want) <= 0.05,
+            "existing quantized decoder observed adapter vars mutated after construction"
         );
     }
 

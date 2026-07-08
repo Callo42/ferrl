@@ -200,7 +200,8 @@ The manifest schema is versioned from the first run:
     "tokenizer": "<operator supplied identity>",
     "lora_rank": 16,
     "lora_alpha": 32.0,
-    "base_dtype": "bf16"
+    "base_dtype": "bf16",
+    "base_quantization": "none"
   },
   "config": {
     "run_config_sha256": "<sha256 of resolved run config>",

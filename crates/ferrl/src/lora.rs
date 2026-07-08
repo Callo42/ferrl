@@ -33,10 +33,229 @@
 //! opt-ins. The recipe (together with the config) determines the trainable-var
 //! order — the positional checkpoint contract.
 
-use candle_core::{DType, Result as CandleResult, Tensor, Var};
+use std::sync::Arc;
+
+use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
+use candle_core::{DType, Device, Result as CandleResult, Tensor, Var};
 use candle_nn::VarBuilder;
 
 use crate::blocks::frozen_linear;
+
+/// Optional quantization for frozen base projection weights.
+///
+/// The trainable adapter remains ordinary `Var` storage. This knob only changes
+/// how the frozen base weight is stored and applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BaseQuantization {
+    /// Store the frozen base as an ordinary candle tensor.
+    #[default]
+    None,
+    /// Store the frozen base as GGML `Q8_0`.
+    Q8_0,
+}
+
+impl BaseQuantization {
+    /// Stable config/report spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Q8_0 => "q8_0",
+        }
+    }
+
+    fn ggml_dtype(self) -> Option<GgmlDType> {
+        match self {
+            Self::None => None,
+            Self::Q8_0 => Some(GgmlDType::Q8_0),
+        }
+    }
+}
+
+/// Shared projection-load knobs that are independent of a projection's name,
+/// shape, and adaptation flag.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ProjLoadOptions {
+    rank: usize,
+    alpha: f64,
+    adapter_dtype: DType,
+    base_quantization: BaseQuantization,
+}
+
+impl ProjLoadOptions {
+    pub(crate) fn new(
+        rank: usize,
+        alpha: f64,
+        adapter_dtype: DType,
+        base_quantization: BaseQuantization,
+    ) -> Self {
+        Self {
+            rank,
+            alpha,
+            adapter_dtype,
+            base_quantization,
+        }
+    }
+}
+
+/// A frozen linear weight, optionally stored in quantized form.
+#[derive(Debug, Clone)]
+pub(crate) enum FrozenLinearWeight {
+    Dense(Tensor),
+    Quantized {
+        q: Arc<QTensor>,
+        qmatmul: QMatMul,
+        dtype: DType,
+        device: Device,
+        shape: (usize, usize),
+    },
+}
+
+impl FrozenLinearWeight {
+    pub(crate) fn from_tensor(
+        weight: Tensor,
+        quantization: BaseQuantization,
+    ) -> CandleResult<Self> {
+        let shape = weight.dims2()?;
+        let dtype = weight.dtype();
+        let device = weight.device().clone();
+        let Some(qdtype) = quantization.ggml_dtype() else {
+            return Ok(Self::Dense(weight));
+        };
+        if !shape.1.is_multiple_of(qdtype.block_size()) {
+            candle_core::bail!(
+                "base quantization {} requires projection input width to be divisible by \
+                 block size {}, got {:?}",
+                quantization.as_str(),
+                qdtype.block_size(),
+                shape
+            );
+        }
+        let q = Arc::new(QTensor::quantize(&weight, qdtype)?);
+        let qmatmul = QMatMul::from_arc(q.clone())?;
+        Ok(Self::Quantized {
+            q,
+            qmatmul,
+            dtype,
+            device,
+            shape,
+        })
+    }
+
+    pub(crate) fn dims2(&self) -> CandleResult<(usize, usize)> {
+        match self {
+            Self::Dense(w) => w.dims2(),
+            Self::Quantized { shape, .. } => Ok(*shape),
+        }
+    }
+
+    pub(crate) fn dtype(&self) -> DType {
+        match self {
+            Self::Dense(w) => w.dtype(),
+            Self::Quantized { dtype, .. } => *dtype,
+        }
+    }
+
+    pub(crate) fn device(&self) -> &Device {
+        match self {
+            Self::Dense(w) => w.device(),
+            Self::Quantized { device, .. } => device,
+        }
+    }
+
+    fn dequantized_to(&self, dtype: DType) -> CandleResult<Tensor> {
+        match self {
+            Self::Dense(w) => w.to_dtype(dtype),
+            Self::Quantized { q, device, .. } => q.dequantize(device)?.to_dtype(dtype),
+        }
+    }
+
+    pub(crate) fn dequantized(&self) -> CandleResult<Tensor> {
+        self.dequantized_to(self.dtype())
+    }
+
+    /// Tape-bearing frozen linear: gradients still flow to `x`.
+    pub(crate) fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
+        match self {
+            Self::Dense(w) => frozen_linear(x, w),
+            Self::Quantized { .. } => {
+                let w = self.dequantized_to(x.dtype())?;
+                frozen_linear(x, &w)
+            }
+        }
+    }
+
+    /// Tape-free rollout linear. Quantized weights use candle's quantized matmul.
+    pub(crate) fn forward_tape_free(&self, x: &Tensor) -> CandleResult<Tensor> {
+        match self {
+            Self::Dense(w) => frozen_linear(x, w),
+            Self::Quantized { qmatmul, .. } => {
+                let input_dtype = x.dtype();
+                let compute_dtype = match input_dtype {
+                    DType::F32 | DType::F16 => input_dtype,
+                    _ => DType::F32,
+                };
+                let input = if input_dtype == compute_dtype {
+                    x.clone()
+                } else {
+                    x.to_dtype(compute_dtype)?
+                };
+                let y = input.apply(qmatmul)?;
+                if y.dtype() == input_dtype {
+                    Ok(y)
+                } else {
+                    y.to_dtype(input_dtype)
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum FrozenLinearSnapshot {
+    Dense(Tensor),
+    Base(FrozenLinearWeight),
+    Lora {
+        base: FrozenLinearWeight,
+        base_bias: Option<Tensor>,
+        a: Tensor,
+        b: Tensor,
+        scale: f64,
+        enabled: bool,
+    },
+}
+
+impl FrozenLinearSnapshot {
+    pub(crate) fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
+        match self {
+            Self::Dense(w) => frozen_linear(x, w),
+            Self::Base(w) => w.forward_tape_free(x),
+            Self::Lora {
+                base,
+                base_bias,
+                a,
+                b,
+                scale,
+                enabled,
+            } => {
+                let base = base.forward_tape_free(x)?;
+                let base = match base_bias {
+                    Some(bias) => base.broadcast_add(bias)?,
+                    None => base,
+                };
+                if !enabled {
+                    return Ok(base);
+                }
+                let dtype = base.dtype();
+                let a = a.to_dtype(dtype)?;
+                let b = b.to_dtype(dtype)?;
+                let xa = x.broadcast_matmul(&a.t()?)?;
+                let xab = xa.broadcast_matmul(&b.t()?)?;
+                base.broadcast_add(&(xab * *scale)?)
+            }
+        }
+    }
+}
 
 /// Which projections of a **dense** (attention + `SwiGLU`-MLP) transformer
 /// carry the `LoRA` adapter — the recipe for [`crate::qwen::QwenGradModel`]
@@ -170,7 +389,7 @@ impl DenseLoraTargets {
 #[derive(Debug)]
 pub(crate) enum Proj {
     /// The frozen base weight, `[out, in]`.
-    Frozen(Tensor),
+    Frozen(FrozenLinearWeight),
     /// The same weight wrapped with a trainable adapter.
     Lora(LoraLinear),
 }
@@ -186,14 +405,31 @@ impl Proj {
         alpha: f64,
         adapter_dtype: DType,
     ) -> CandleResult<Self> {
+        Self::load_with_options(
+            vb,
+            name,
+            shape,
+            adapted,
+            ProjLoadOptions::new(rank, alpha, adapter_dtype, BaseQuantization::None),
+        )
+    }
+
+    pub(crate) fn load_with_options(
+        vb: &VarBuilder,
+        name: &str,
+        shape: (usize, usize),
+        adapted: bool,
+        opts: ProjLoadOptions,
+    ) -> CandleResult<Self> {
         let w = vb.pp(name).get(shape, "weight")?;
+        let w = FrozenLinearWeight::from_tensor(w, opts.base_quantization)?;
         if adapted {
-            Ok(Self::Lora(LoraLinear::with_adapter_dtype(
+            Ok(Self::Lora(LoraLinear::from_frozen_base(
                 w,
                 None,
-                rank,
-                alpha,
-                adapter_dtype,
+                opts.rank,
+                opts.alpha,
+                opts.adapter_dtype,
             )?))
         } else {
             Ok(Self::Frozen(w))
@@ -203,7 +439,7 @@ impl Proj {
     /// `y = x Wᵀ` (plus the adapter side-path when adapted and enabled).
     pub(crate) fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
         match self {
-            Self::Frozen(w) => frozen_linear(x, w),
+            Self::Frozen(w) => w.forward(x),
             Self::Lora(l) => l.forward(x),
         }
     }
@@ -217,7 +453,7 @@ impl Proj {
     /// the cached rollout diverge from the biased uncached forward.
     pub(crate) fn merged_weight(&self) -> CandleResult<Tensor> {
         match self {
-            Self::Frozen(w) => Ok(w.detach()),
+            Self::Frozen(w) => Ok(w.dequantized()?.detach()),
             Self::Lora(l) => {
                 if l.base_bias().is_some() {
                     candle_core::bail!(
@@ -244,8 +480,24 @@ impl Proj {
     /// As [`merged_weight`](Self::merged_weight), plus a copy failure.
     pub(crate) fn merged_weight_deep(&self) -> CandleResult<Tensor> {
         match self {
-            Self::Frozen(w) => Ok(w.copy()?.detach()),
+            Self::Frozen(w) => Ok(w.dequantized()?.copy()?.detach()),
             Self::Lora(_) => self.merged_weight(),
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> CandleResult<FrozenLinearSnapshot> {
+        match self {
+            Self::Frozen(w) => Ok(FrozenLinearSnapshot::Base(w.clone())),
+            Self::Lora(l) => {
+                if l.base_bias().is_some() {
+                    candle_core::bail!(
+                        "Proj::snapshot: this projection carries a base bias, but the merged \
+                         snapshot is bias-free (extend the merged decoder to apply base_bias() \
+                         before using a biased adapter here)"
+                    );
+                }
+                l.snapshot()
+            }
         }
     }
 
@@ -269,7 +521,7 @@ impl Proj {
 #[derive(Debug, Clone)]
 pub struct LoraLinear {
     /// Frozen base weight, shape `[out, in]`.
-    base_weight: Tensor,
+    base_weight: FrozenLinearWeight,
     /// Frozen optional bias, shape `[out]`.
     base_bias: Option<Tensor>,
     /// Trainable low-rank factor `A`, shape `[rank, in]`.
@@ -326,6 +578,35 @@ impl LoraLinear {
     /// allocated on the base weight's device.
     pub fn with_adapter_dtype(
         base_weight: Tensor,
+        base_bias: Option<Tensor>,
+        rank: usize,
+        alpha: f64,
+        adapter_dtype: DType,
+    ) -> CandleResult<Self> {
+        Self::with_adapter_dtype_and_base_quantization(
+            base_weight,
+            base_bias,
+            rank,
+            alpha,
+            adapter_dtype,
+            BaseQuantization::None,
+        )
+    }
+
+    pub(crate) fn with_adapter_dtype_and_base_quantization(
+        base_weight: Tensor,
+        base_bias: Option<Tensor>,
+        rank: usize,
+        alpha: f64,
+        adapter_dtype: DType,
+        base_quantization: BaseQuantization,
+    ) -> CandleResult<Self> {
+        let base_weight = FrozenLinearWeight::from_tensor(base_weight, base_quantization)?;
+        Self::from_frozen_base(base_weight, base_bias, rank, alpha, adapter_dtype)
+    }
+
+    fn from_frozen_base(
+        base_weight: FrozenLinearWeight,
         base_bias: Option<Tensor>,
         rank: usize,
         alpha: f64,
@@ -415,7 +696,7 @@ impl LoraLinear {
         if !self.enabled {
             // detach() so the result is an op-free leaf even if a caller ever
             // constructed the layer from a tape-tracked base tensor.
-            return Ok(self.base_weight.detach());
+            return Ok(self.base_weight.dequantized()?.detach());
         }
         let dtype = self.base_weight.dtype();
         // The detached/cast factors may still ALIAS the live Var storage (candle's
@@ -425,7 +706,21 @@ impl LoraLinear {
         let a = self.a.as_tensor().detach().to_dtype(dtype)?;
         let b = self.b.as_tensor().detach().to_dtype(dtype)?;
         let delta = (b.matmul(&a)? * self.scale)?;
-        Ok((&self.base_weight + &delta)?.detach())
+        Ok((&self.base_weight.dequantized()? + &delta)?.detach())
+    }
+
+    pub(crate) fn snapshot(&self) -> CandleResult<FrozenLinearSnapshot> {
+        match &self.base_weight {
+            FrozenLinearWeight::Dense(_) => Ok(FrozenLinearSnapshot::Dense(self.merged_weight()?)),
+            FrozenLinearWeight::Quantized { .. } => Ok(FrozenLinearSnapshot::Lora {
+                base: self.base_weight.clone(),
+                base_bias: self.base_bias.clone(),
+                a: self.a.as_tensor().copy()?.detach(),
+                b: self.b.as_tensor().copy()?.detach(),
+                scale: self.scale,
+                enabled: self.enabled,
+            }),
+        }
     }
 
     /// Forward pass `y = x Wᵀ (+ b) [+ scale · (x Aᵀ) Bᵀ]`.
@@ -444,7 +739,7 @@ impl LoraLinear {
         // The adapter matmuls below keep `broadcast_matmul`: the A/B factors
         // are live Vars whose gradient *numerics* (summation order included)
         // are pinned by the optimizer-trajectory gates.
-        let base = frozen_linear(x, &self.base_weight)?;
+        let base = self.base_weight.forward(x)?;
         let base = match &self.base_bias {
             Some(bias) => base.broadcast_add(bias)?,
             None => base,
@@ -513,7 +808,9 @@ mod tests {
     #[test]
     fn proj_frozen_forward_equals_frozen_linear_and_has_no_vars() {
         let w = base(4, 3);
-        let p = Proj::Frozen(w.clone());
+        let p = Proj::Frozen(
+            FrozenLinearWeight::from_tensor(w.clone(), BaseQuantization::None).unwrap(),
+        );
         let x = Tensor::from_vec(vec![1f32, 2.0, 3.0], (1, 1, 3), &Device::Cpu).unwrap();
         let got = p.forward(&x).unwrap();
         let want = crate::blocks::frozen_linear(&x, &w).unwrap();
@@ -542,6 +839,60 @@ mod tests {
             .to_scalar()
             .unwrap();
         assert_eq!(mdiff, 0.0);
+    }
+
+    #[test]
+    fn quantized_frozen_projection_matches_dense_with_tolerance() {
+        let w = Tensor::from_vec(
+            (0..128)
+                .map(|i| (i as f32 - 64.0) * 0.002)
+                .collect::<Vec<_>>(),
+            (4, 32),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let q = FrozenLinearWeight::from_tensor(w.clone(), BaseQuantization::Q8_0).unwrap();
+        match &q {
+            FrozenLinearWeight::Quantized { qmatmul, .. } => {
+                assert!(matches!(qmatmul, QMatMul::QTensor(_)));
+            }
+            FrozenLinearWeight::Dense(_) => panic!("expected quantized frozen weight"),
+        }
+
+        let x2 = Tensor::from_vec(
+            (0..64).map(|i| i as f32 * 0.03 - 0.2).collect::<Vec<_>>(),
+            (2, 32),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let got2 = q.forward_tape_free(&x2).unwrap();
+        let want2 = frozen_linear(&x2, &w).unwrap();
+        assert!(
+            max_abs_diff(&got2, &want2) < 0.03,
+            "rank-2 quantized projection drift too large"
+        );
+
+        let x3 = Tensor::from_vec(
+            (0..192).map(|i| i as f32 * 0.01 - 0.1).collect::<Vec<_>>(),
+            (2, 3, 32),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let got3 = q.forward_tape_free(&x3).unwrap();
+        let want3 = frozen_linear(&x3, &w).unwrap();
+        assert!(
+            max_abs_diff(&got3, &want3) < 0.03,
+            "rank-3 quantized projection drift too large"
+        );
+    }
+
+    #[test]
+    fn quantized_frozen_projection_rejects_unaligned_shapes() {
+        let err = FrozenLinearWeight::from_tensor(base(32, 3), BaseQuantization::Q8_0).unwrap_err();
+        assert!(
+            err.to_string().contains("block size"),
+            "expected block-size rejection, got {err}"
+        );
     }
 
     #[test]
@@ -638,6 +989,68 @@ mod tests {
             .to_scalar()
             .unwrap();
         assert!(d_en > 1e-3);
+    }
+
+    #[test]
+    fn quantized_lora_toggle_and_nonzero_adapter_are_non_vacuous() {
+        let w = base(4, 32);
+        let mut l = LoraLinear::with_adapter_dtype_and_base_quantization(
+            w,
+            None,
+            2,
+            8.0,
+            DType::F32,
+            BaseQuantization::Q8_0,
+        )
+        .unwrap();
+        let x = Tensor::from_vec(
+            (0..64).map(|i| i as f32 * 0.05 - 0.25).collect::<Vec<_>>(),
+            (2, 32),
+            &Device::Cpu,
+        )
+        .unwrap();
+
+        let base_y = l.base_weight.forward(&x).unwrap();
+        let zero_b_y = l.forward(&x).unwrap();
+        assert_eq!(
+            max_abs_diff(&zero_b_y, &base_y),
+            0.0,
+            "zero-B quantized LoRA should equal the quantized base"
+        );
+
+        l.a.set(
+            &Tensor::from_vec(
+                (0..64)
+                    .map(|i| 0.2f32 - i as f32 * 0.006)
+                    .collect::<Vec<_>>(),
+                (2, 32),
+                &Device::Cpu,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        l.b.set(
+            &Tensor::from_vec(
+                vec![0.3f32, -0.2, 0.1, 0.25, -0.15, 0.4, 0.05, -0.3],
+                (4, 2),
+                &Device::Cpu,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let enabled_y = l.forward(&x).unwrap();
+        assert!(
+            max_abs_diff(&enabled_y, &base_y) > 1e-3,
+            "nonzero adapter did not move the quantized-base output"
+        );
+
+        l.set_enabled(false);
+        let disabled_y = l.forward(&x).unwrap();
+        assert_eq!(
+            max_abs_diff(&disabled_y, &base_y),
+            0.0,
+            "disabled quantized LoRA should equal the quantized base"
+        );
     }
 
     #[test]
@@ -918,6 +1331,65 @@ mod tests {
             assert!(
                 mag > 0.0,
                 "trainable var received a zero gradient after a non-zero-B step"
+            );
+        }
+    }
+
+    #[test]
+    fn downstream_quantized_projection_preserves_upstream_adapter_gradients() {
+        // The training/scoring path may store frozen weights quantized, but it
+        // must not use candle's tape-free QMatMul there. A downstream quantized
+        // frozen projection still has to pass dL/dhidden back into an upstream
+        // adapter; otherwise a multi-layer QLoRA model would train only its
+        // final adapted projection.
+        let l1 = LoraLinear::with_adapter_dtype_and_base_quantization(
+            base(32, 32),
+            None,
+            2,
+            4.0,
+            DType::F32,
+            BaseQuantization::Q8_0,
+        )
+        .unwrap();
+        l1.a.set(
+            &Tensor::from_vec(
+                (0..64).map(|i| i as f32 * 0.003 - 0.08).collect::<Vec<_>>(),
+                (2, 32),
+                &Device::Cpu,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        l1.b.set(
+            &Tensor::from_vec(
+                (0..64).map(|i| 0.04 - i as f32 * 0.001).collect::<Vec<_>>(),
+                (32, 2),
+                &Device::Cpu,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let downstream =
+            FrozenLinearWeight::from_tensor(base(1, 32), BaseQuantization::Q8_0).unwrap();
+        let x = Tensor::from_vec(
+            (0..32).map(|i| i as f32 * 0.02 - 0.3).collect::<Vec<_>>(),
+            (1, 32),
+            &Device::Cpu,
+        )
+        .unwrap();
+
+        let h = l1.forward(&x).unwrap();
+        let y = downstream.forward(&h).unwrap();
+        let loss = y.sqr().unwrap().sum_all().unwrap();
+        let grads = loss.backward().unwrap();
+        for v in l1.trainable_vars() {
+            let g = grads
+                .get(v.as_tensor())
+                .expect("upstream adapter var missing from grad store");
+            let mag: f32 = g.abs().unwrap().sum_all().unwrap().to_scalar().unwrap();
+            assert!(
+                mag.is_finite() && mag > 0.0,
+                "upstream adapter gradient was not live through quantized frozen projection"
             );
         }
     }
