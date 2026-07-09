@@ -3026,34 +3026,34 @@ mod tests {
         let model = quantized_tiny_model();
         arm_adapter_deterministic(&model);
         let input = ids(6);
-        let before_update = model.forward(&input).unwrap();
         let mut dec = model.merged_decoder().unwrap();
+        let mut pre_update_dec = model.merged_decoder().unwrap();
 
         let prefix_len = 3;
         let prefix = input.narrow(1, 0, prefix_len).unwrap();
-        let prefix_logits = dec.forward(&prefix, 0).unwrap();
-        assert!(
-            max_abs_diff(
-                &prefix_logits,
-                &before_update.narrow(1, 0, prefix_len).unwrap()
-            ) <= 0.05,
-            "quantized snapshot must match the pre-update adapter before mutation"
-        );
-
-        overwrite_adapter(&model);
-        let after_update = model.forward(&input).unwrap();
-        assert!(
-            max_abs_diff(&after_update, &before_update) > 0.05,
-            "adapter overwrite must move the live model enough to make this gate non-vacuous"
-        );
+        dec.forward(&prefix, 0).unwrap();
+        pre_update_dec.forward(&prefix, 0).unwrap();
 
         let suffix_len = 2;
         let suffix = input.narrow(1, prefix_len, suffix_len).unwrap();
-        let got = dec.forward(&suffix, prefix_len).unwrap();
-        let want = before_update.narrow(1, prefix_len, suffix_len).unwrap();
+        let want = pre_update_dec.forward(&suffix, prefix_len).unwrap();
+        overwrite_adapter(&model);
+        let mut post_update_dec = model.merged_decoder().unwrap();
+        post_update_dec.forward(&prefix, 0).unwrap();
+        let post_update = post_update_dec.forward(&suffix, prefix_len).unwrap();
+        let mutation_delta = max_abs_diff(&post_update, &want);
         assert!(
-            max_abs_diff(&got, &want) <= 0.05,
-            "existing quantized decoder observed adapter vars mutated after construction"
+            mutation_delta > 0.05,
+            "adapter overwrite must move the quantized decoder enough to make this gate \
+             non-vacuous: {mutation_delta}"
+        );
+
+        let got = dec.forward(&suffix, prefix_len).unwrap();
+        let snapshot_delta = max_abs_diff(&got, &want);
+        assert!(
+            snapshot_delta <= 1e-5,
+            "existing quantized decoder observed adapter vars mutated after construction: \
+             snapshot_delta={snapshot_delta}, mutation_delta={mutation_delta}"
         );
     }
 

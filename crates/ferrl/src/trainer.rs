@@ -57,10 +57,11 @@
 //! Tensor-parallel model execution is a separate opt-in path: the
 //! `*_tensor_parallel` methods take an explicit [`Comm`] and require
 //! [`TensorParallelPolicy`]. The trainer's own communicator still represents the
-//! data-parallel gradient-reduction world. Sharded tensor-parallel trainer
-//! execution fails closed for now: the trainer does not yet reduce trainable
-//! gradients over the TP communicator before coverage, clipping, optimizer step,
-//! and checkpointing.
+//! data-parallel gradient-reduction world. Sharded tensor-parallel training is
+//! allowed only without simultaneous sharded data parallelism: `LoRA` trainable
+//! vars stay fully replicated on every TP rank, the trainer all-reduce-sums their
+//! accumulated gradients over the TP communicator before coverage, clipping, and
+//! optimizer step, and TP rank 0 owns shared side effects such as checkpoints.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1092,6 +1093,15 @@ struct PromptSelection {
     rollout_global_row_base: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct CandidateWriteCtx {
+    step: u64,
+    prompt_index: u64,
+    rank: usize,
+    world_size: usize,
+    enabled: bool,
+}
+
 #[derive(Clone, Copy)]
 struct SelectedSample<'a, T> {
     sample: &'a Sample<T>,
@@ -1255,6 +1265,43 @@ trait PolicyExecution<P: Policy> {
     fn token_logprobs(&self, policy: &P, rollout: &Rollout) -> CandleResult<Tensor>;
 
     fn token_logprobs_detached(&self, policy: &P, rollout: &Rollout) -> CandleResult<Tensor>;
+
+    fn execution_rank(&self, trainer_comm: &dyn Comm) -> usize {
+        trainer_comm.rank()
+    }
+
+    fn execution_world_size(&self, trainer_comm: &dyn Comm) -> usize {
+        trainer_comm.world_size()
+    }
+
+    fn is_execution_primary(&self, trainer_comm: &dyn Comm) -> bool {
+        self.execution_rank(trainer_comm) == 0
+    }
+
+    fn writes_rank_local_telemetry(&self, _trainer_comm: &dyn Comm) -> bool {
+        true
+    }
+
+    fn model_parallel_world_size(&self) -> usize {
+        1
+    }
+
+    fn execution_all_reduce_scalar_sum(
+        &self,
+        trainer_comm: &dyn Comm,
+        value: f64,
+    ) -> Result<f64, TrainerError> {
+        Ok(trainer_comm.all_reduce_scalar_sum(value)?)
+    }
+
+    fn reduce_model_parallel_grads(
+        &self,
+        _vars: &[Var],
+        _acc: &mut [Option<Tensor>],
+        _covered: &[bool],
+    ) -> Result<f64, TrainerError> {
+        Ok(0.0)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1310,6 +1357,67 @@ impl<P: TensorParallelPolicy> PolicyExecution<P> for TensorParallelPolicyExecuti
 
     fn token_logprobs_detached(&self, policy: &P, rollout: &Rollout) -> CandleResult<Tensor> {
         policy.token_logprobs_tensor_parallel_detached(rollout, self.comm)
+    }
+
+    fn execution_rank(&self, trainer_comm: &dyn Comm) -> usize {
+        if self.comm.world_size() > 1 {
+            self.comm.rank()
+        } else {
+            trainer_comm.rank()
+        }
+    }
+
+    fn execution_world_size(&self, trainer_comm: &dyn Comm) -> usize {
+        if self.comm.world_size() > 1 {
+            self.comm.world_size()
+        } else {
+            trainer_comm.world_size()
+        }
+    }
+
+    fn is_execution_primary(&self, trainer_comm: &dyn Comm) -> bool {
+        if self.comm.world_size() > 1 {
+            self.comm.rank() == 0 && trainer_comm.rank() == 0
+        } else {
+            trainer_comm.rank() == 0
+        }
+    }
+
+    fn writes_rank_local_telemetry(&self, trainer_comm: &dyn Comm) -> bool {
+        if self.comm.world_size() > 1 {
+            self.comm.rank() == 0 && trainer_comm.rank() == 0
+        } else {
+            true
+        }
+    }
+
+    fn model_parallel_world_size(&self) -> usize {
+        self.comm.world_size()
+    }
+
+    fn execution_all_reduce_scalar_sum(
+        &self,
+        trainer_comm: &dyn Comm,
+        value: f64,
+    ) -> Result<f64, TrainerError> {
+        if self.comm.world_size() > 1 {
+            Ok(self.comm.all_reduce_scalar_sum(value)?)
+        } else {
+            Ok(trainer_comm.all_reduce_scalar_sum(value)?)
+        }
+    }
+
+    fn reduce_model_parallel_grads(
+        &self,
+        vars: &[Var],
+        acc: &mut [Option<Tensor>],
+        covered: &[bool],
+    ) -> Result<f64, TrainerError> {
+        if self.comm.world_size() > 1 {
+            reduce_accumulated_grads(self.comm, vars, acc, covered)
+        } else {
+            Ok(0.0)
+        }
     }
 }
 
@@ -1546,15 +1654,17 @@ impl Trainer {
     /// scoring hooks.
     ///
     /// `tensor_parallel_comm` is separate from the trainer's data-parallel
-    /// communicator installed by [`with_comm`](Self::with_comm). For this slice
-    /// it must be a world-1 communicator. Sharded TP trainer execution fails
-    /// closed until ferrl wires TP gradient reduction or sharded optimizer and
-    /// checkpoint semantics.
+    /// communicator installed by [`with_comm`](Self::with_comm). A sharded TP
+    /// communicator is supported only when the trainer's DP communicator is
+    /// world-1: `LoRA` trainable vars remain fully replicated, their accumulated
+    /// gradients are sum-reduced over the TP communicator before coverage,
+    /// clipping, optimizer step, and checkpointing, and TP rank 0 owns the shared
+    /// checkpoint/candidate/metrics side effects.
     ///
     /// # Errors
     ///
-    /// As [`train`](Self::train), plus a fail-closed contract error when the
-    /// tensor-parallel communicator is sharded.
+    /// As [`train`](Self::train), plus a fail-closed contract error when both
+    /// data parallelism and tensor parallelism are sharded.
     pub fn train_tensor_parallel<P: TensorParallelPolicy, R: RewardFn>(
         &mut self,
         policy: &mut P,
@@ -1684,8 +1794,9 @@ impl Trainer {
         tokenizer: &dyn TokenizerLike,
         samples: &[Sample<R::Target>],
     ) -> Result<(Vec<Metrics>, RunStop), TrainerError> {
-        let (start_step, opt_state) = self.load_resume_point(checkpoint_dir.as_ref(), policy)?;
         let exec = UnshardedPolicyExecution;
+        let loaded = self.load_resume_point(checkpoint_dir.as_ref(), policy);
+        let (start_step, opt_state) = self.coordinate_resume_load::<P, _>(&exec, loaded)?;
         self.run(
             start_step, opt_state, policy, reward_fn, tokenizer, samples, &exec,
         )
@@ -1708,10 +1819,11 @@ impl Trainer {
         tensor_parallel_comm: &dyn Comm,
     ) -> Result<(Vec<Metrics>, RunStop), TrainerError> {
         self.validate_tensor_parallel_comm(tensor_parallel_comm)?;
-        let (start_step, opt_state) = self.load_resume_point(checkpoint_dir.as_ref(), policy)?;
         let exec = TensorParallelPolicyExecution {
             comm: tensor_parallel_comm,
         };
+        let loaded = self.load_resume_point(checkpoint_dir.as_ref(), policy);
+        let (start_step, opt_state) = self.coordinate_resume_load::<P, _>(&exec, loaded)?;
         self.run(
             start_step, opt_state, policy, reward_fn, tokenizer, samples, &exec,
         )
@@ -1775,21 +1887,20 @@ impl Trainer {
     /// gate so the requeue resumes; on [`RunStop::Completed`] the run finished and
     /// eval / gating may proceed.
     ///
-    /// **Data-parallel auto-resume is coordinated through rank 0**, not scanned
-    /// per rank. Only rank 0 writes checkpoints, so a naive per-rank scan would
+    /// **Auto-resume is coordinated through execution rank 0**, not scanned per
+    /// rank. Only that rank writes checkpoints, so a naive per-rank scan would
     /// have non-zero ranks find none, start fresh, and diverge from rank 0 (then
     /// deadlock the next collective once rank 0 finishes its shorter remaining
-    /// steps). Instead, under `world_size > 1`, rank 0 scans the checkpoint
-    /// directory and **broadcasts the resume step** to every rank, so the whole
-    /// world resumes from rank 0's checkpoint — or all start fresh — **in
-    /// lockstep**, then each rank loads it via the same momentum-faithful path the
-    /// explicit `resume(&rank0_ckpt)` requeue uses. This requires every rank to
-    /// point at **one shared checkpoint directory** (a filesystem all ranks read:
-    /// a single node's `/tmp`, or NFS across nodes) via
+    /// steps). Instead, under `world_size > 1`, execution rank 0 scans the
+    /// checkpoint directory and **broadcasts the resume step** to every rank, so
+    /// the whole world resumes from rank 0's checkpoint — or all start fresh —
+    /// **in lockstep**, then each rank loads it via the same momentum-faithful
+    /// path the explicit `resume(&rank0_ckpt)` requeue uses. This requires every
+    /// rank to point at **one shared checkpoint directory** (a filesystem all
+    /// ranks read: a single node's `/tmp`, or NFS across nodes) via
     /// [`with_checkpoints_dir`](Self::with_checkpoints_dir) — rank 0 writes it,
-    /// all read it; per-rank run dirs still own each rank's `metrics.jsonl`. The
-    /// broadcast is a single scalar collective (rank 0's value summed against
-    /// zero-contributing peers), so [`Comm`] needs no dedicated
+    /// all read it. The broadcast is a single scalar collective (rank 0's value
+    /// summed against zero-contributing peers), so [`Comm`] needs no dedicated
     /// broadcast primitive.
     ///
     /// # Errors
@@ -1856,28 +1967,29 @@ impl Trainer {
     {
         // Discover the resume point through rank 0 and broadcast it so the whole world
         // branches identically in lockstep (see `coordinate_resume_step`).
-        match self.coordinate_resume_step()? {
+        match self.coordinate_resume_step(exec)? {
             Some(step) => {
                 // The canonical on-disk layout is `checkpoints_dir/step-<n>` (see
                 // `write_checkpoint`), so every rank reconstructs the identical
                 // directory from the broadcast step — rank 0's checkpoint.
                 let dir = self.checkpoints_dir.join(format!("step-{step}"));
                 tracing::info!(
-                    rank = self.comm.rank(),
+                    rank = exec.execution_rank(self.comm.as_ref()),
                     resume_step = step,
                     dir = %dir.display(),
-                    world_size = self.comm.world_size(),
+                    world_size = exec.execution_world_size(self.comm.as_ref()),
                     "resume_latest: continuing from the newest checkpoint"
                 );
-                let (start_step, opt_state) = self.load_resume_point(&dir, policy)?;
+                let loaded = self.load_resume_point(&dir, policy);
+                let (start_step, opt_state) = self.coordinate_resume_load::<P, _>(exec, loaded)?;
                 self.run(
                     start_step, opt_state, policy, reward_fn, tokenizer, samples, exec,
                 )
             }
             None => {
                 tracing::info!(
-                    rank = self.comm.rank(),
-                    world_size = self.comm.world_size(),
+                    rank = exec.execution_rank(self.comm.as_ref()),
+                    world_size = exec.execution_world_size(self.comm.as_ref()),
                     "resume_latest: no checkpoint found — starting a fresh run"
                 );
                 self.run(0, None, policy, reward_fn, tokenizer, samples, exec)
@@ -1887,21 +1999,22 @@ impl Trainer {
 
     fn validate_tensor_parallel_comm(&self, comm: &dyn Comm) -> Result<(), TrainerError> {
         crate::tensor_parallel::plan_from_comm(comm)?;
-        if comm.world_size() > 1 {
+        if comm.world_size() > 1 && self.comm.world_size() > 1 {
             return Err(TrainerError::Contract(
-                "sharded tensor-parallel trainer execution is not wired yet; the trainer does \
-                 not reduce trainable gradients over the tensor-parallel communicator before \
-                 coverage, clipping, optimizer step, and checkpointing"
+                "simultaneous sharded data-parallel and tensor-parallel trainer execution is \
+                 not wired yet; use a world-1 trainer communicator with sharded tensor \
+                 parallelism until the combined DP×TP optimizer/checkpoint contract lands"
                     .into(),
             ));
         }
         Ok(())
     }
 
-    /// Coordinate the data-parallel resume decision across the world: rank 0 scans for
-    /// the newest checkpoint and **broadcasts** the outcome so every rank agrees in
-    /// lockstep — see [`resume_latest`](Self::resume_latest). Returns the resume step
-    /// (`Some`) or a fresh start (`None`).
+    /// Coordinate the resume decision across the active execution world: execution
+    /// rank 0 scans for the newest checkpoint and **broadcasts** the outcome so
+    /// every DP or TP rank agrees in lockstep — see
+    /// [`resume_latest`](Self::resume_latest). Returns the resume step (`Some`) or
+    /// a fresh start (`None`).
     ///
     /// The outcome is three-way — found / none / scan-FAILED — and all three ride the
     /// one broadcast every rank enters. In particular a rank-0 scan failure must NOT
@@ -1909,14 +2022,22 @@ impl Trainer {
     /// peer in the collective until the timeout. So the failure is broadcast and
     /// surfaced as an error on **every** rank in lockstep — rank 0 the real IO error,
     /// peers a synthesized [`TrainerError::Contract`].
-    fn coordinate_resume_step(&self) -> Result<Option<u64>, TrainerError> {
-        let (local, rank0_scan_err) = self.scan_local_resume();
-        // rank 0 contributes its decision; peers contribute `Fresh` (the additive
-        // identity), so the rank-identical sum decodes to rank 0's decision on every
-        // rank. (`Comm` has no broadcast; this is broadcast-from-rank-0 via the sum
-        // all-reduce — see `ResumeDecision`.) Every rank enters this collective.
-        let decision = if self.comm.world_size() > 1 {
-            ResumeDecision::decode(self.comm.all_reduce_scalar_sum(local.encode())?)
+    fn coordinate_resume_step<P, E>(&self, exec: &E) -> Result<Option<u64>, TrainerError>
+    where
+        P: Policy,
+        E: PolicyExecution<P>,
+    {
+        let (local, rank0_scan_err) =
+            self.scan_local_resume(exec.is_execution_primary(self.comm.as_ref()));
+        // Execution rank 0 contributes its decision; peers contribute `Fresh`
+        // (the additive identity), so the rank-identical sum decodes to rank 0's
+        // decision on every rank. (`Comm` has no broadcast; this is
+        // broadcast-from-rank-0 via the sum all-reduce — see `ResumeDecision`.)
+        // Every rank enters this collective.
+        let decision = if exec.execution_world_size(self.comm.as_ref()) > 1 {
+            ResumeDecision::decode(
+                exec.execution_all_reduce_scalar_sum(self.comm.as_ref(), local.encode())?,
+            )
         } else {
             local
         };
@@ -1926,8 +2047,8 @@ impl Trainer {
             ResumeDecision::ScanFailed => Err(rank0_scan_err.map_or_else(
                 || {
                     TrainerError::Contract(
-                        "resume_latest: rank 0's checkpoint discovery failed; the \
-                         data-parallel resume aborted in lockstep on every rank"
+                        "resume_latest: execution rank 0's checkpoint discovery failed; the \
+                         resume aborted in lockstep on every rank"
                             .into(),
                     )
                 },
@@ -1936,12 +2057,15 @@ impl Trainer {
         }
     }
 
-    /// rank 0's local resume scan (single-rank, or rank 0 of a DP world): the
-    /// [`ResumeDecision`] to broadcast plus rank 0's real scan error, if any. Non-zero
-    /// DP ranks skip the scan and contribute the additive identity
-    /// ([`ResumeDecision::Fresh`]) — only rank 0's scan is authoritative.
-    fn scan_local_resume(&self) -> (ResumeDecision, Option<crate::checkpoint::CheckpointError>) {
-        if self.comm.world_size() > 1 && self.comm.rank() != 0 {
+    /// Execution rank 0's local resume scan: the [`ResumeDecision`] to broadcast
+    /// plus rank 0's real scan error, if any. Non-primary ranks skip the scan and
+    /// contribute the additive identity ([`ResumeDecision::Fresh`]) — only rank
+    /// 0's scan is authoritative.
+    fn scan_local_resume(
+        &self,
+        is_primary: bool,
+    ) -> (ResumeDecision, Option<crate::checkpoint::CheckpointError>) {
+        if !is_primary {
             return (ResumeDecision::Fresh, None);
         }
         match crate::checkpoint::latest_checkpoint(&self.checkpoints_dir) {
@@ -1952,6 +2076,33 @@ impl Trainer {
                 None,
             ),
             Err(e) => (ResumeDecision::ScanFailed, Some(e)),
+        }
+    }
+
+    /// After a coordinated resume decision, every execution rank must also agree
+    /// that the local checkpoint load/restore prelude succeeded before any rank
+    /// enters the next training collective. Rank-local filesystem, tensor, or
+    /// sampler-restore failures are therefore reduced into one lockstep abort.
+    fn coordinate_resume_load<P, E>(
+        &self,
+        exec: &E,
+        local: Result<(u64, Option<OptimizerState>), TrainerError>,
+    ) -> Result<(u64, Option<OptimizerState>), TrainerError>
+    where
+        P: Policy,
+        E: PolicyExecution<P>,
+    {
+        if exec.execution_world_size(self.comm.as_ref()) <= 1 {
+            return local;
+        }
+        let failed_local = if local.is_err() { 1.0 } else { 0.0 };
+        let reduced = exec.execution_all_reduce_scalar_sum(self.comm.as_ref(), failed_local);
+        match (local, reduced) {
+            (Err(err), _) | (Ok(_), Err(err)) => Err(err),
+            (Ok(_), Ok(failed_global)) if failed_global > 0.0 => Err(TrainerError::Contract(
+                "checkpoint load/restore failed on a peer rank; aborting in lockstep".into(),
+            )),
+            (Ok(loaded), Ok(_)) => Ok(loaded),
         }
     }
 
@@ -1980,7 +2131,11 @@ impl Trainer {
         // one stdout, so an unstamped line is unattributable; a nested per-step `step`
         // span is entered inside the loop. All four entry points funnel through `run`,
         // so the stamp covers train / train_from / resume / resume_latest alike.
-        let _run = crate::telemetry::run_span(self.comm.rank(), self.comm.world_size()).entered();
+        let _run = crate::telemetry::run_span(
+            exec.execution_rank(self.comm.as_ref()),
+            exec.execution_world_size(self.comm.as_ref()),
+        )
+        .entered();
         // The KL reference (`beta > 0`) IS the adapter-disabled policy
         // (`reference_logprobs` toggles the adapter off to score it). A policy
         // that cannot disable its adapter — full fine-tuning: the base weights
@@ -2058,9 +2213,9 @@ impl Trainer {
             m.step_secs = secs as f32;
             m.tokens_per_sec = step_throughput(local_tokens, secs);
             gpu_mem.apply(&mut m);
-            self.writer.append(&m)?;
+            self.append_metrics(&m, exec)?;
             history.push(m);
-            self.maybe_checkpoint(step, &vars, &opt, policy)?;
+            self.maybe_checkpoint(step, &vars, &opt, policy, exec)?;
             // Cooperative preemption stop (globalized across the DP world): on a
             // Slurm preempt / timeout grace signal the run binary flips the flag,
             // and we save a final checkpoint at this completed step and stop
@@ -2069,7 +2224,7 @@ impl Trainer {
             // The poll itself runs every step on every rank (lockstep), but the
             // stop-early decision keys on `completed`/`total`, which are identical
             // across ranks — so the whole world stops or continues together.
-            if self.preempt_requested()? {
+            if self.preempt_requested(exec)? {
                 let completed = step + 1;
                 // A preemption that arrives only after the FINAL step is moot: the
                 // loop already ran every configured step, so the run is Completed.
@@ -2079,7 +2234,7 @@ impl Trainer {
                 // checkpoint, run ZERO steps, and gate on an EMPTY history. Only
                 // stop early — and report Preempted — when work actually remains.
                 if completed < total {
-                    self.write_checkpoint(completed, &vars, &opt, policy)?;
+                    self.write_checkpoint(completed, &vars, &opt, policy, exec)?;
                     tracing::warn!(
                         completed_steps = completed,
                         "preemption requested: checkpointed and stopping early"
@@ -2089,6 +2244,19 @@ impl Trainer {
             }
         }
         Ok((history, RunStop::Completed))
+    }
+
+    fn append_metrics<P, E>(&mut self, metrics: &Metrics, exec: &E) -> Result<(), TrainerError>
+    where
+        P: Policy,
+        E: PolicyExecution<P>,
+    {
+        self.coordinate_side_effect(exec, "metrics write", |trainer| {
+            if exec.writes_rank_local_telemetry(trainer.comm.as_ref()) {
+                trainer.writer.append(metrics)?;
+            }
+            Ok(())
+        })
     }
 
     /// One optimizer step over a window of `grad_accum_steps` prompts: collect each
@@ -2242,43 +2410,50 @@ impl Trainer {
     /// ledger is enabled. The ledger is written immediately after rewards are known,
     /// before any later degenerate-group skip, so a no-update run still preserves the
     /// evidence needed for artifact extraction or debugging.
-    fn write_candidate_records(
+    fn write_candidate_records<P, E>(
         &mut self,
-        step: u64,
-        prompt_index: u64,
+        ctx: CandidateWriteCtx,
         completions: &[String],
         rewards: &[f32],
         reward_outcomes: &[RewardOutcome],
         rollout: &Rollout,
-    ) -> Result<(), TrainerError> {
+        exec: &E,
+    ) -> Result<(), TrainerError>
+    where
+        P: Policy,
+        E: PolicyExecution<P>,
+    {
         let k = self.config.candidate_log_top_k.min(completions.len());
         if k == 0 {
             return Ok(());
         }
-        let rank = self.comm.rank();
-        let world_size = self.comm.world_size();
-        let Some(writer) = self.candidate_writer.as_mut() else {
-            return Ok(());
-        };
-        let mut order: Vec<usize> = (0..completions.len()).collect();
-        order.sort_by(|&a, &b| {
-            candidate_reward_order(rewards[a], rewards[b]).then_with(|| a.cmp(&b))
-        });
-        for &group_index in order.iter().take(k) {
-            writer.append(&CandidateRecord {
-                step,
-                rank,
-                world_size,
-                prompt_index,
-                group_index,
-                reward: rewards[group_index],
-                completion_len_tokens: rollout.completion_lens[group_index],
-                reward_diagnostic: reward_outcomes[group_index].diagnostic.clone(),
-                reward_metadata: reward_outcomes[group_index].metadata.clone(),
-                completion: completions[group_index].clone(),
-            })?;
-        }
-        Ok(())
+        self.coordinate_side_effect(exec, "candidate record write", |trainer| {
+            if !ctx.enabled {
+                return Ok(());
+            }
+            let Some(writer) = trainer.candidate_writer.as_mut() else {
+                return Ok(());
+            };
+            let mut order: Vec<usize> = (0..completions.len()).collect();
+            order.sort_by(|&a, &b| {
+                candidate_reward_order(rewards[a], rewards[b]).then_with(|| a.cmp(&b))
+            });
+            for &group_index in order.iter().take(k) {
+                writer.append(&CandidateRecord {
+                    step: ctx.step,
+                    rank: ctx.rank,
+                    world_size: ctx.world_size,
+                    prompt_index: ctx.prompt_index,
+                    group_index,
+                    reward: rewards[group_index],
+                    completion_len_tokens: rollout.completion_lens[group_index],
+                    reward_diagnostic: reward_outcomes[group_index].diagnostic.clone(),
+                    reward_metadata: reward_outcomes[group_index].metadata.clone(),
+                    completion: completions[group_index].clone(),
+                })?;
+            }
+            Ok(())
+        })
     }
 
     /// After completing step `step` (0-based), write a momentum-faithful (v2)
@@ -2290,21 +2465,18 @@ impl Trainer {
     /// taken *after* this window's rollouts and update, so a [`resume`](Self::resume) at
     /// the recorded manifest `step` = `n` continues bit-exactly. (The optimizer's own
     /// `step_t` counts only non-degenerate windows and is captured independently of `n`.)
-    fn maybe_checkpoint<P: Policy>(
-        &self,
+    fn maybe_checkpoint<P, E>(
+        &mut self,
         step: u64,
         vars: &[Var],
         opt: &FerrlAdamW,
         policy: &P,
-    ) -> Result<(), TrainerError> {
-        // Under DP, rank 0 writes the world's checkpoint: the weights and the
-        // optimizer moments are rank-identical by the lockstep invariant, so
-        // N copies would be redundant (and a shared run dir would race). See
-        // `with_comm` for the resume contract (every rank loads rank 0's
-        // checkpoint; the sampler blob is rank 0's).
-        if self.comm.rank() != 0 {
-            return Ok(());
-        }
+        exec: &E,
+    ) -> Result<(), TrainerError>
+    where
+        P: Policy,
+        E: PolicyExecution<P>,
+    {
         let Some(every) = self.config.checkpoint_every else {
             return Ok(());
         };
@@ -2313,69 +2485,106 @@ impl Trainer {
         if !completed.is_multiple_of(every) && !is_final {
             return Ok(());
         }
-        self.write_checkpoint(completed, vars, opt, policy)
+        self.write_checkpoint(completed, vars, opt, policy, exec)
     }
 
     /// Write a momentum-faithful (v3) checkpoint to `checkpoints/step-<completed>/`
     /// unconditionally — the caller decides *when*: the periodic cadence
     /// ([`maybe_checkpoint`](Self::maybe_checkpoint)) or the preemption stop in
     /// [`run`](Self::run), which saves a final checkpoint before a requeue.
-    /// Rank-0-only under DP: weights and optimizer moments are rank-identical by
-    /// lockstep and the sampler blob is rank 0's (see
-    /// [`with_comm`](Self::with_comm)), so a non-zero rank is a no-op. Re-writing
-    /// an already-published `step-<completed>` is idempotent (the writer replaces
-    /// it atomically), so a preemption that coincides with a cadence write is
-    /// harmless.
-    fn write_checkpoint<P: Policy>(
-        &self,
+    /// Execution-rank-0-only under DP or TP: weights and optimizer moments are
+    /// rank-identical by lockstep and the sampler blob is rank 0's, so a
+    /// non-zero rank is a no-op. Re-writing an already-published
+    /// `step-<completed>` is idempotent (the writer replaces it atomically), so a
+    /// preemption that coincides with a cadence write is harmless.
+    fn write_checkpoint<P, E>(
+        &mut self,
         completed: u64,
         vars: &[Var],
         opt: &FerrlAdamW,
         policy: &P,
-    ) -> Result<(), TrainerError> {
-        if self.comm.rank() != 0 {
-            return Ok(());
+        exec: &E,
+    ) -> Result<(), TrainerError>
+    where
+        P: Policy,
+        E: PolicyExecution<P>,
+    {
+        self.coordinate_side_effect(exec, "checkpoint write", |trainer| {
+            if !exec.is_execution_primary(trainer.comm.as_ref()) {
+                return Ok(());
+            }
+            let dir = trainer.checkpoints_dir.join(format!("step-{completed}"));
+            let opt_state = opt.state()?;
+            let sampler_state = policy.sampler_state()?;
+            let recipe = policy.lora_recipe();
+            crate::checkpoint::save_checkpoint(
+                &dir,
+                vars,
+                &opt_state,
+                &sampler_state,
+                completed,
+                recipe.as_deref(),
+            )?;
+            Ok(())
+        })
+    }
+
+    fn coordinate_side_effect<P, E, F>(
+        &mut self,
+        exec: &E,
+        label: &'static str,
+        op: F,
+    ) -> Result<(), TrainerError>
+    where
+        P: Policy,
+        E: PolicyExecution<P>,
+        F: FnOnce(&mut Self) -> Result<(), TrainerError>,
+    {
+        let local = op(self);
+        if exec.execution_world_size(self.comm.as_ref()) <= 1 {
+            return local;
         }
-        let dir = self.checkpoints_dir.join(format!("step-{completed}"));
-        let opt_state = opt.state()?;
-        let sampler_state = policy.sampler_state()?;
-        let recipe = policy.lora_recipe();
-        crate::checkpoint::save_checkpoint(
-            &dir,
-            vars,
-            &opt_state,
-            &sampler_state,
-            completed,
-            recipe.as_deref(),
-        )?;
-        Ok(())
+        let failed_local = if local.is_err() { 1.0 } else { 0.0 };
+        let reduced = exec.execution_all_reduce_scalar_sum(self.comm.as_ref(), failed_local);
+        match (local, reduced) {
+            (Err(err), _) | (Ok(()), Err(err)) => Err(err),
+            (Ok(()), Ok(failed_global)) if failed_global > 0.0 => Err(TrainerError::Contract(
+                format!("{label} failed on a peer rank; aborting in lockstep"),
+            )),
+            (Ok(()), Ok(_)) => Ok(()),
+        }
     }
 
     /// Whether a stop has been requested via the preemption flag
     /// ([`with_preemption_flag`](Self::with_preemption_flag)), decided **globally**
-    /// across the DP world so every rank stops on the same step (a local-only stop
-    /// would deadlock — one rank breaks out while its peers enter the next window's
-    /// collectives and wait forever).
+    /// across the active DP or TP execution world so every rank stops on the same
+    /// step (a local-only stop would deadlock — one rank breaks out while its
+    /// peers enter the next window's collectives and wait forever).
     ///
     /// **Install-invariant:** at `world_size() > 1` *every* rank runs the poll's
     /// scalar reduce every step regardless of whether it holds a flag (a flag-less
     /// rank contributes `0.0`), so the collective sequence never depends on per-rank
-    /// install state — an uneven install across ranks cannot deadlock the world, it
-    /// just means no preemption. The cost is one cheap scalar all-reduce per step
-    /// under DP; world 1 is a plain local read with no collective.
-    fn preempt_requested(&self) -> Result<bool, TrainerError> {
+    /// install state — an uneven install across ranks cannot deadlock the world,
+    /// it just means no preemption. The cost is one cheap scalar all-reduce per
+    /// step under DP or sharded TP; world 1 is a plain local read with no
+    /// collective.
+    fn preempt_requested<P, E>(&self, exec: &E) -> Result<bool, TrainerError>
+    where
+        P: Policy,
+        E: PolicyExecution<P>,
+    {
         let local = self
             .preempt
             .as_ref()
             .is_some_and(|f| f.load(Ordering::Relaxed));
-        if self.comm.world_size() > 1 {
+        if exec.execution_world_size(self.comm.as_ref()) > 1 {
             // Every rank reduces every step (flag-less ranks contribute 0.0), so the
             // collective sequence is identical across ranks no matter who holds a
             // flag — an uneven install can't desync the world.
-            Ok(self
-                .comm
-                .all_reduce_scalar_sum(if local { 1.0 } else { 0.0 })?
-                > 0.0)
+            Ok(exec.execution_all_reduce_scalar_sum(
+                self.comm.as_ref(),
+                if local { 1.0 } else { 0.0 },
+            )? > 0.0)
         } else {
             Ok(local)
         }
@@ -2474,12 +2683,18 @@ impl Trainer {
             )));
         }
         self.write_candidate_records(
-            step,
-            selected.selection.prompt_index,
+            CandidateWriteCtx {
+                step,
+                prompt_index: selected.selection.prompt_index,
+                rank: exec.execution_rank(self.comm.as_ref()),
+                world_size: exec.execution_world_size(self.comm.as_ref()),
+                enabled: exec.writes_rank_local_telemetry(self.comm.as_ref()),
+            },
             &completions,
             &rewards,
             &reward_outcomes,
             &rollout,
+            exec,
         )?;
 
         // Length-aware loss mask: column j of sequence i is a real completion token
@@ -2656,7 +2871,7 @@ impl Trainer {
             sum_clip += clip_frac;
             fold_var_grads(vars, &grads, &mut acc, &mut covered)?;
         }
-        let (kl, clip_frac, uncovered_global) = if self.comm.world_size() > 1 {
+        let (kl, clip_frac, mut uncovered_global) = if self.comm.world_size() > 1 {
             ctx.gpu_mem.record("grad_all_reduce_start");
             self.reduce_epoch(vars, &mut acc, &covered, sum_kl, sum_clip, n_live_global)?
         } else {
@@ -2667,6 +2882,11 @@ impl Trainer {
             )
         };
         ctx.gpu_mem.record("grad_all_reduce_end");
+        if exec.model_parallel_world_size() > 1 {
+            ctx.gpu_mem.record("tp_grad_all_reduce_start");
+            uncovered_global += exec.reduce_model_parallel_grads(vars, &mut acc, &covered)?;
+            ctx.gpu_mem.record("tp_grad_all_reduce_end");
+        }
         ctx.gpu_mem.record("grad_store_compact_start");
         // Build a fresh tiny store instead of reusing the last backward's full store. Candle's
         // backward store also contains unrelated intermediate-node gradients; keeping it alive
@@ -2741,22 +2961,7 @@ impl Trainer {
         sum_clip: f32,
         n_live_global: f64,
     ) -> Result<(f32, f32, f64), TrainerError> {
-        for start in (0..vars.len()).step_by(GRAD_REDUCE_CHUNK) {
-            let end = (start + GRAD_REDUCE_CHUNK).min(vars.len());
-            let mut flat = Vec::with_capacity(end - start);
-            for i in start..end {
-                flat.push(match acc[i].take() {
-                    Some(g) => g,
-                    None => vars[i].as_tensor().zeros_like()?,
-                });
-            }
-            self.comm.all_reduce_sum(&mut flat)?;
-            for (slot, g) in acc[start..end].iter_mut().zip(flat) {
-                *slot = Some(g);
-            }
-        }
-        let uncovered_local = covered.iter().filter(|c| !**c).count() as f64;
-        let uncovered_global = self.comm.all_reduce_scalar_sum(uncovered_local)?;
+        let uncovered_global = reduce_accumulated_grads(self.comm.as_ref(), vars, acc, covered)?;
         let kl_global = self.comm.all_reduce_scalar_sum(f64::from(sum_kl))?;
         let clip_global = self.comm.all_reduce_scalar_sum(f64::from(sum_clip))?;
         Ok((
@@ -3298,6 +3503,30 @@ fn fold_var_grads(
         }
     }
     Ok(())
+}
+
+fn reduce_accumulated_grads(
+    comm: &dyn Comm,
+    vars: &[Var],
+    acc: &mut [Option<Tensor>],
+    covered: &[bool],
+) -> Result<f64, TrainerError> {
+    for start in (0..vars.len()).step_by(GRAD_REDUCE_CHUNK) {
+        let end = (start + GRAD_REDUCE_CHUNK).min(vars.len());
+        let mut flat = Vec::with_capacity(end - start);
+        for i in start..end {
+            flat.push(match acc[i].take() {
+                Some(g) => g,
+                None => vars[i].as_tensor().zeros_like()?,
+            });
+        }
+        comm.all_reduce_sum(&mut flat)?;
+        for (slot, g) in acc[start..end].iter_mut().zip(flat) {
+            *slot = Some(g);
+        }
+    }
+    let uncovered_local = covered.iter().filter(|c| !**c).count() as f64;
+    Ok(comm.all_reduce_scalar_sum(uncovered_local)?)
 }
 
 /// Copy only trainable-var entries from a raw backward store into a fresh store.
@@ -5833,7 +6062,7 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
+    #[derive(Clone, Default)]
     struct TpProbeCalls {
         generate: usize,
         live_logp: usize,
@@ -5966,6 +6195,147 @@ mod tests {
         )
     }
 
+    struct TpSyncPolicy {
+        replicated: Var,
+        sharded: Var,
+        enabled: bool,
+        sampler_state: Vec<u8>,
+        fail_restore: bool,
+    }
+
+    impl TpSyncPolicy {
+        fn new(rank: usize) -> Self {
+            Self {
+                replicated: Var::zeros((2, 1), DType::F32, &cpu()).unwrap(),
+                sharded: Var::zeros((2, 1), DType::F32, &cpu()).unwrap(),
+                enabled: true,
+                sampler_state: vec![rank as u8],
+                fail_restore: false,
+            }
+        }
+
+        fn fail_sampler_restore_on_resume(rank: usize) -> Self {
+            Self {
+                fail_restore: true,
+                ..Self::new(rank)
+            }
+        }
+
+        fn logps(&self, comm: &dyn Comm, detached: bool) -> CandleResult<Tensor> {
+            let device = self.replicated.as_tensor().device().clone();
+            let coeff = if comm.rank() == 0 { 1.0_f32 } else { -3.0_f32 };
+            let replicated_coeff = Tensor::from_vec(vec![coeff, coeff], (2, 1), &device)?;
+            let shard_mask = if comm.rank() == 0 {
+                Tensor::from_vec(vec![1.0_f32, 0.0], (2, 1), &device)?
+            } else {
+                Tensor::from_vec(vec![0.0_f32, 1.0], (2, 1), &device)?
+            };
+            let fixed = Tensor::from_vec(vec![-0.4_f32, -0.6], (2, 1), &device)?;
+            let logp = fixed
+                .add(
+                    &self
+                        .replicated
+                        .as_tensor()
+                        .broadcast_mul(&replicated_coeff)?,
+                )?
+                .add(&self.sharded.as_tensor().broadcast_mul(&shard_mask)?)?;
+            if detached {
+                Ok(logp.detach())
+            } else {
+                Ok(logp)
+            }
+        }
+
+        fn snapshot(&self) -> (Vec<f32>, Vec<f32>) {
+            (
+                self.replicated
+                    .as_tensor()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap(),
+                self.sharded
+                    .as_tensor()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap(),
+            )
+        }
+    }
+
+    impl Policy for TpSyncPolicy {
+        fn generate(&mut self, _prompt: &[u32], _cfg: &GenConfig) -> CandleResult<Rollout> {
+            panic!("train_tensor_parallel must not call Policy::generate")
+        }
+
+        fn token_logprobs(&self, _rollout: &Rollout) -> CandleResult<Tensor> {
+            panic!("train_tensor_parallel must not call Policy::token_logprobs")
+        }
+
+        fn token_logprobs_detached(&self, _rollout: &Rollout) -> CandleResult<Tensor> {
+            panic!("train_tensor_parallel must not call Policy::token_logprobs_detached")
+        }
+
+        fn set_adapter_enabled(&mut self, enabled: bool) {
+            self.enabled = enabled;
+        }
+
+        fn adapter_enabled(&self) -> bool {
+            self.enabled
+        }
+
+        fn trainable_vars(&self) -> Vec<Var> {
+            vec![self.replicated.clone(), self.sharded.clone()]
+        }
+
+        fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+            Ok(self.sampler_state.clone())
+        }
+
+        fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
+            if self.fail_restore {
+                candle_core::bail!("rank-local sampler restore failure");
+            }
+            self.sampler_state = state.to_vec();
+            Ok(())
+        }
+    }
+
+    impl TensorParallelPolicy for TpSyncPolicy {
+        fn generate_at_tensor_parallel_instrumented(
+            &mut self,
+            prompt: &[u32],
+            _cfg: &GenConfig,
+            _global_row_base: u64,
+            _comm: &dyn Comm,
+            _telemetry: Option<&mut dyn ModelTelemetryRecorder>,
+        ) -> CandleResult<Rollout> {
+            Ok(Rollout {
+                token_ids: vec![vec![prompt[0], 1], vec![prompt[0], 2]],
+                prompt_len: prompt.len(),
+                completion_lens: vec![1, 1],
+                rollout_logprobs: Some(vec![vec![-0.5], vec![-0.5]]),
+            })
+        }
+
+        fn token_logprobs_tensor_parallel(
+            &self,
+            _rollout: &Rollout,
+            comm: &dyn Comm,
+        ) -> CandleResult<Tensor> {
+            self.logps(comm, false)
+        }
+
+        fn token_logprobs_tensor_parallel_detached(
+            &self,
+            _rollout: &Rollout,
+            comm: &dyn Comm,
+        ) -> CandleResult<Tensor> {
+            self.logps(comm, true)
+        }
+    }
+
     #[test]
     fn train_tensor_parallel_routes_rollout_and_scoring_through_explicit_comm() {
         let tmp = WireTmp::new("tp-trainer-dispatch");
@@ -6013,15 +6383,15 @@ mod tests {
     }
 
     #[test]
-    fn train_tensor_parallel_rejects_sharded_tp_before_gradient_sync_contract() {
+    fn train_tensor_parallel_rejects_simultaneous_sharded_dp_and_tp() {
         std::thread::scope(|scope| {
             let handles: Vec<_> = crate::comm::LocalComm::world(2)
                 .into_iter()
                 .enumerate()
-                .map(|(rank, comm)| {
+                .map(|(rank, dp_comm)| {
                     scope.spawn(move || {
-                        let tmp = WireTmp::new(&format!("tp-trainer-sharded-guard-{rank}"));
-                        let run = RunDir::create(&tmp.0, format!("tp-trainer-sharded-rank-{rank}"))
+                        let tmp = WireTmp::new(&format!("tp-trainer-dp-tp-guard-{rank}"));
+                        let run = RunDir::create(&tmp.0, format!("tp-trainer-dp-tp-rank-{rank}"))
                             .unwrap();
                         let cfg = TrainerConfig {
                             steps: 1,
@@ -6030,7 +6400,7 @@ mod tests {
                             lr: 0.0,
                             ..TrainerConfig::default()
                         };
-                        let mut trainer = Trainer::new(cfg, &run).unwrap();
+                        let mut trainer = Trainer::with_comm(cfg, &run, dp_comm).unwrap();
                         let (mut policy, calls) = tp_probe_policy();
                         let err = trainer
                             .train_tensor_parallel(
@@ -6038,12 +6408,15 @@ mod tests {
                                 &TpProbeReward,
                                 &TpProbeCodec,
                                 &[Sample::new("prompt", ())],
-                                &comm,
+                                &ProbeTpComm {
+                                    rank,
+                                    world_size: 2,
+                                },
                             )
                             .unwrap_err();
                         assert!(
                             matches!(&err, TrainerError::Contract(msg)
-                                if msg.contains("sharded tensor-parallel trainer execution")),
+                                if msg.contains("simultaneous sharded data-parallel")),
                             "unexpected error on rank {rank}: {err:?}"
                         );
                         let calls = calls.lock().unwrap();
@@ -6060,6 +6433,461 @@ mod tests {
                 handle.join().unwrap();
             }
         });
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // ordered two-rank side-effect + checkpoint contract
+    fn train_tensor_parallel_two_rank_syncs_grads_and_writes_rank0_checkpoint() {
+        let tmp = WireTmp::new("tp-trainer-grad-sync");
+        let shared_checkpoints = tmp.0.join("shared-checkpoints");
+        std::fs::create_dir_all(&shared_checkpoints).unwrap();
+        let results = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = crate::comm::LocalComm::world(2)
+                .into_iter()
+                .enumerate()
+                .map(|(rank, tp_comm)| {
+                    let root = tmp.0.clone();
+                    let shared_checkpoints = shared_checkpoints.clone();
+                    let results = std::sync::Arc::clone(&results);
+                    scope.spawn(move || {
+                        let run =
+                            RunDir::create(&root, format!("tp-trainer-sync-rank-{rank}")).unwrap();
+                        let cfg = TrainerConfig {
+                            steps: 1,
+                            group_size: 2,
+                            max_new_tokens: 1,
+                            lr: 0.01,
+                            max_grad_norm: None,
+                            checkpoint_every: Some(1),
+                            candidate_log_top_k: 1,
+                            ..TrainerConfig::default()
+                        };
+                        let mut trainer = Trainer::new(cfg, &run)
+                            .unwrap()
+                            .with_checkpoints_dir(shared_checkpoints);
+                        let mut policy = TpSyncPolicy::new(rank);
+                        let (history, stop) = trainer
+                            .train_tensor_parallel(
+                                &mut policy,
+                                &TpProbeReward,
+                                &TpProbeCodec,
+                                &[Sample::new("prompt", ())],
+                                &tp_comm,
+                            )
+                            .unwrap();
+                        assert_eq!(stop, RunStop::Completed);
+                        assert_eq!(history.len(), 1);
+                        let metrics_rows =
+                            crate::telemetry::read_metrics(run.metrics_path()).unwrap();
+                        let candidate_bytes =
+                            std::fs::read_to_string(run.candidates_path()).unwrap_or_default();
+                        results.lock().unwrap().push((
+                            rank,
+                            policy.snapshot(),
+                            metrics_rows.len(),
+                            candidate_bytes.lines().count(),
+                        ));
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
+
+        let mut results = std::sync::Arc::try_unwrap(results)
+            .unwrap()
+            .into_inner()
+            .unwrap();
+        results.sort_by_key(|(rank, _, _, _)| *rank);
+        let (_, rank0, rank0_metrics, rank0_candidates) = &results[0];
+        let (_, rank1, rank1_metrics, rank1_candidates) = &results[1];
+        assert_eq!(*rank0_metrics, 1);
+        assert_eq!(
+            *rank1_metrics, 0,
+            "non-primary TP ranks must not duplicate metrics side effects"
+        );
+        assert_eq!(*rank0_candidates, 1);
+        assert_eq!(
+            *rank1_candidates, 0,
+            "non-primary TP ranks must not duplicate candidate side effects"
+        );
+        for (a, b) in rank0.0.iter().zip(&rank1.0) {
+            assert_relative_eq!(*a, *b, epsilon = 1e-6, max_relative = 1e-5);
+        }
+        for (a, b) in rank0.1.iter().zip(&rank1.1) {
+            assert_relative_eq!(*a, *b, epsilon = 1e-6, max_relative = 1e-5);
+        }
+        assert!(
+            rank0.1.iter().all(|v| v.abs() > 0.0),
+            "all logical sharded adapter rows must be updated on every TP rank: {:?}",
+            rank0.1
+        );
+
+        let checkpoint_vars = vec![
+            Var::zeros((2, 1), DType::F32, &cpu()).unwrap(),
+            Var::zeros((2, 1), DType::F32, &cpu()).unwrap(),
+        ];
+        let loaded = crate::checkpoint::load_checkpoint(
+            tmp.0.join("shared-checkpoints/step-1"),
+            &checkpoint_vars,
+        )
+        .unwrap();
+        assert_eq!(loaded.step, 1);
+        assert_eq!(
+            loaded.sampler_state.as_deref(),
+            Some([0_u8].as_slice()),
+            "TP rank 0 must own the checkpoint side effect"
+        );
+        let ckpt_replicated = checkpoint_vars[0]
+            .as_tensor()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let ckpt_sharded = checkpoint_vars[1]
+            .as_tensor()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        for (a, b) in ckpt_replicated.iter().zip(&rank0.0) {
+            assert_relative_eq!(*a, *b, epsilon = 1e-6, max_relative = 1e-5);
+        }
+        for (a, b) in ckpt_sharded.iter().zip(&rank0.1) {
+            assert_relative_eq!(*a, *b, epsilon = 1e-6, max_relative = 1e-5);
+        }
+    }
+
+    fn zero_optimizer_state(vars: &[Var]) -> OptimizerState {
+        OptimizerState {
+            step_t: 0,
+            first_moments: vars
+                .iter()
+                .map(|v| {
+                    Tensor::zeros(v.as_tensor().dims(), v.as_tensor().dtype(), &cpu()).unwrap()
+                })
+                .collect(),
+            second_moments: vars
+                .iter()
+                .map(|v| {
+                    Tensor::zeros(v.as_tensor().dims(), v.as_tensor().dtype(), &cpu()).unwrap()
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn resume_latest_tensor_parallel_load_failure_aborts_world_before_training() {
+        struct PanicReward;
+        impl RewardFn for PanicReward {
+            type Target = ();
+
+            fn reward(&self, _sample: &Sample<()>, _completion: &str) -> Result<f32, RewardError> {
+                panic!("resume load failure must abort before rollout reward")
+            }
+        }
+
+        let tmp = WireTmp::new("tp-trainer-resume-load-failure");
+        let shared_checkpoints = tmp.0.join("shared-checkpoints");
+        let seed_policy = TpSyncPolicy::new(0);
+        let seed_vars = seed_policy.trainable_vars();
+        crate::checkpoint::save_checkpoint(
+            shared_checkpoints.join("step-1"),
+            &seed_vars,
+            &zero_optimizer_state(&seed_vars),
+            &[7_u8],
+            1,
+            None,
+        )
+        .unwrap();
+        let mut results = Vec::new();
+
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = crate::comm::LocalComm::world_with_timeout(
+                2,
+                std::time::Duration::from_millis(250),
+            )
+            .into_iter()
+            .enumerate()
+            .map(|(rank, tp_comm)| {
+                let root = tmp.0.clone();
+                let shared_checkpoints = shared_checkpoints.clone();
+                scope.spawn(move || {
+                    let run =
+                        RunDir::create(&root, format!("tp-resume-load-fail-rank-{rank}")).unwrap();
+                    let cfg = TrainerConfig {
+                        steps: 2,
+                        group_size: 2,
+                        max_new_tokens: 1,
+                        lr: 0.01,
+                        ..TrainerConfig::default()
+                    };
+                    let mut trainer = Trainer::new(cfg, &run)
+                        .unwrap()
+                        .with_checkpoints_dir(shared_checkpoints);
+                    let mut policy = if rank == 0 {
+                        TpSyncPolicy::fail_sampler_restore_on_resume(rank)
+                    } else {
+                        TpSyncPolicy::new(rank)
+                    };
+                    let err = trainer
+                        .resume_latest_tensor_parallel(
+                            &mut policy,
+                            &PanicReward,
+                            &TpProbeCodec,
+                            &[Sample::new("prompt", ())],
+                            &tp_comm,
+                        )
+                        .unwrap_err();
+                    (rank, err)
+                })
+            })
+            .collect();
+            for handle in handles {
+                results.push(handle.join().unwrap());
+            }
+        });
+
+        results.sort_by_key(|(rank, _)| *rank);
+        for (rank, err) in &results {
+            if *rank == 0 {
+                assert!(
+                    matches!(err, TrainerError::Candle(e)
+                        if e.to_string().contains("rank-local sampler restore failure")),
+                    "rank 0 should return the local restore error, got {err:?}"
+                );
+            } else {
+                assert!(
+                    matches!(err, TrainerError::Contract(msg)
+                        if msg.contains("checkpoint load/restore failed on a peer rank")),
+                    "peer rank should abort in lockstep, got {err:?}"
+                );
+            }
+        }
+    }
+
+    fn assert_primary_telemetry_peer_contract(rank: usize, err: &TrainerError, peer_msg: &str) {
+        if rank == 0 {
+            assert!(
+                matches!(err, TrainerError::Telemetry(_)),
+                "rank 0 should return the local telemetry error, got {err:?}"
+            );
+        } else {
+            assert!(
+                matches!(err, TrainerError::Contract(msg) if msg.contains(peer_msg)),
+                "peer rank should abort in lockstep, got {err:?}"
+            );
+        }
+    }
+
+    fn assert_primary_checkpoint_peer_contract(rank: usize, err: &TrainerError, peer_msg: &str) {
+        if rank == 0 {
+            assert!(
+                matches!(err, TrainerError::Checkpoint(_)),
+                "rank 0 should return the local checkpoint error, got {err:?}"
+            );
+        } else {
+            assert!(
+                matches!(err, TrainerError::Contract(msg) if msg.contains(peer_msg)),
+                "peer rank should abort in lockstep, got {err:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn train_tensor_parallel_candidate_write_failure_aborts_world_before_scoring() {
+        let tmp = WireTmp::new("tp-trainer-candidate-side-effect-failure");
+        let mut results = Vec::new();
+
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = crate::comm::LocalComm::world_with_timeout(
+                2,
+                std::time::Duration::from_millis(250),
+            )
+            .into_iter()
+            .enumerate()
+            .map(|(rank, tp_comm)| {
+                let root = tmp.0.clone();
+                scope.spawn(move || {
+                    let run =
+                        RunDir::create(&root, format!("tp-candidate-fail-rank-{rank}")).unwrap();
+                    if rank == 0 {
+                        std::os::unix::fs::symlink("/dev/full", run.candidates_path()).unwrap();
+                    }
+                    let cfg = TrainerConfig {
+                        steps: 1,
+                        group_size: 2,
+                        max_new_tokens: 1,
+                        lr: 0.01,
+                        candidate_log_top_k: 1,
+                        ..TrainerConfig::default()
+                    };
+                    let mut trainer = Trainer::new(cfg, &run).unwrap();
+                    let (mut policy, calls) = tp_probe_policy();
+                    let err = trainer
+                        .train_tensor_parallel(
+                            &mut policy,
+                            &TpProbeReward,
+                            &TpProbeCodec,
+                            &[Sample::new("prompt", ())],
+                            &tp_comm,
+                        )
+                        .unwrap_err();
+                    let calls = calls.lock().unwrap().clone();
+                    (rank, err, calls)
+                })
+            })
+            .collect();
+            for handle in handles {
+                results.push(handle.join().unwrap());
+            }
+        });
+
+        results.sort_by_key(|(rank, _, _)| *rank);
+        for (rank, err, calls) in &results {
+            assert_primary_telemetry_peer_contract(
+                *rank,
+                err,
+                "candidate record write failed on a peer rank",
+            );
+            assert_eq!(calls.generate, 1, "rank {rank} should reach rollout");
+            assert_eq!(
+                calls.detached_logp, 0,
+                "rank {rank} should stop before detached TP scoring"
+            );
+            assert_eq!(
+                calls.live_logp, 0,
+                "rank {rank} should stop before live TP scoring"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn train_tensor_parallel_metrics_write_failure_aborts_world_after_window() {
+        let tmp = WireTmp::new("tp-trainer-metrics-side-effect-failure");
+        let mut results = Vec::new();
+
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = crate::comm::LocalComm::world_with_timeout(
+                2,
+                std::time::Duration::from_millis(250),
+            )
+            .into_iter()
+            .enumerate()
+            .map(|(rank, tp_comm)| {
+                let root = tmp.0.clone();
+                scope.spawn(move || {
+                    let run =
+                        RunDir::create(&root, format!("tp-metrics-fail-rank-{rank}")).unwrap();
+                    if rank == 0 {
+                        std::os::unix::fs::symlink("/dev/full", run.metrics_path()).unwrap();
+                    }
+                    let cfg = TrainerConfig {
+                        steps: 1,
+                        group_size: 2,
+                        max_new_tokens: 1,
+                        lr: 0.01,
+                        max_grad_norm: None,
+                        ..TrainerConfig::default()
+                    };
+                    let mut trainer = Trainer::new(cfg, &run).unwrap();
+                    let mut policy = TpSyncPolicy::new(rank);
+                    let err = trainer
+                        .train_tensor_parallel(
+                            &mut policy,
+                            &TpProbeReward,
+                            &TpProbeCodec,
+                            &[Sample::new("prompt", ())],
+                            &tp_comm,
+                        )
+                        .unwrap_err();
+                    (rank, err)
+                })
+            })
+            .collect();
+            for handle in handles {
+                results.push(handle.join().unwrap());
+            }
+        });
+
+        results.sort_by_key(|(rank, _)| *rank);
+        for (rank, err) in &results {
+            assert_primary_telemetry_peer_contract(
+                *rank,
+                err,
+                "metrics write failed on a peer rank",
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn train_tensor_parallel_checkpoint_write_failure_aborts_world_after_window() {
+        let tmp = WireTmp::new("tp-trainer-checkpoint-side-effect-failure");
+        let bad_checkpoints = tmp.0.join("not-a-checkpoint-dir");
+        std::fs::write(&bad_checkpoints, b"not a directory").unwrap();
+        let mut results = Vec::new();
+
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = crate::comm::LocalComm::world_with_timeout(
+                2,
+                std::time::Duration::from_millis(250),
+            )
+            .into_iter()
+            .enumerate()
+            .map(|(rank, tp_comm)| {
+                let root = tmp.0.clone();
+                let bad_checkpoints = bad_checkpoints.clone();
+                scope.spawn(move || {
+                    let run =
+                        RunDir::create(&root, format!("tp-checkpoint-fail-rank-{rank}")).unwrap();
+                    let cfg = TrainerConfig {
+                        steps: 1,
+                        group_size: 2,
+                        max_new_tokens: 1,
+                        lr: 0.01,
+                        max_grad_norm: None,
+                        checkpoint_every: Some(1),
+                        ..TrainerConfig::default()
+                    };
+                    let mut trainer = Trainer::new(cfg, &run)
+                        .unwrap()
+                        .with_checkpoints_dir(bad_checkpoints);
+                    let mut policy = TpSyncPolicy::new(rank);
+                    let err = trainer
+                        .train_tensor_parallel(
+                            &mut policy,
+                            &TpProbeReward,
+                            &TpProbeCodec,
+                            &[Sample::new("prompt", ())],
+                            &tp_comm,
+                        )
+                        .unwrap_err();
+                    (rank, err)
+                })
+            })
+            .collect();
+            for handle in handles {
+                results.push(handle.join().unwrap());
+            }
+        });
+
+        results.sort_by_key(|(rank, _)| *rank);
+        for (rank, err) in &results {
+            assert_primary_checkpoint_peer_contract(
+                *rank,
+                err,
+                "checkpoint write failed on a peer rank",
+            );
+        }
     }
 
     #[test]
@@ -6857,6 +7685,58 @@ mod tests {
                 for (i, value) in got.iter().enumerate() {
                     assert_relative_eq!(*value, 10.0 + i as f32, epsilon = 1e-6);
                 }
+            }
+        });
+    }
+
+    #[test]
+    fn tensor_parallel_grad_reduce_reconstructs_full_replicated_adapter_grads() {
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = crate::comm::LocalComm::world(2)
+                .into_iter()
+                .enumerate()
+                .map(|(rank, comm)| {
+                    scope.spawn(move || {
+                        let dev = cpu();
+                        let vars = vec![
+                            Var::zeros((2,), DType::F32, &dev).unwrap(),
+                            Var::zeros((2,), DType::F32, &dev).unwrap(),
+                        ];
+                        let mut acc = if rank == 0 {
+                            vec![
+                                Some(Tensor::from_vec(vec![1.0_f32, 2.0], (2,), &dev).unwrap()),
+                                Some(Tensor::from_vec(vec![3.0_f32, 0.0], (2,), &dev).unwrap()),
+                            ]
+                        } else {
+                            vec![
+                                Some(Tensor::from_vec(vec![10.0_f32, 20.0], (2,), &dev).unwrap()),
+                                Some(Tensor::from_vec(vec![0.0_f32, 4.0], (2,), &dev).unwrap()),
+                            ]
+                        };
+                        let covered = vec![true; vars.len()];
+                        let uncovered =
+                            reduce_accumulated_grads(&comm, &vars, &mut acc, &covered).unwrap();
+                        let got: Vec<Vec<f32>> = acc
+                            .iter()
+                            .map(|slot| {
+                                slot.as_ref()
+                                    .unwrap()
+                                    .flatten_all()
+                                    .unwrap()
+                                    .to_vec1::<f32>()
+                                    .unwrap()
+                            })
+                            .collect();
+                        (uncovered, got)
+                    })
+                })
+                .collect();
+
+            for handle in handles {
+                let (uncovered, got) = handle.join().unwrap();
+                assert_eq!(uncovered, 0.0);
+                assert_eq!(got[0], vec![11.0, 22.0]);
+                assert_eq!(got[1], vec![3.0, 4.0]);
             }
         });
     }
