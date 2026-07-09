@@ -738,6 +738,22 @@ impl<A: DenseArch> DenseGradModel<A> {
         self.forward_tensor_parallel_window(input_ids, None, comm)
     }
 
+    /// Windowed logits through the tensor-parallel projection/collective path.
+    ///
+    /// # Errors
+    ///
+    /// As [`forward_tensor_parallel`](Self::forward_tensor_parallel), plus any
+    /// windowing error.
+    pub fn forward_tensor_parallel_narrowed(
+        &self,
+        input_ids: &Tensor,
+        start: usize,
+        len: usize,
+        comm: &dyn Comm,
+    ) -> CandleResult<Tensor> {
+        self.forward_tensor_parallel_window(input_ids, Some((start, len)), comm)
+    }
+
     fn forward_tensor_parallel_window(
         &self,
         input_ids: &Tensor,
@@ -861,6 +877,31 @@ impl<A: DenseArch> DenseGradModel<A> {
         input_ids: &Tensor,
         comm: &dyn Comm,
     ) -> CandleResult<Tensor> {
+        self.forward_tensor_parallel_detached_window(input_ids, None, comm)
+    }
+
+    /// Detached windowed logits through the tensor-parallel path.
+    ///
+    /// # Errors
+    ///
+    /// As [`forward_tensor_parallel`](Self::forward_tensor_parallel), plus any
+    /// windowing error.
+    pub fn forward_tensor_parallel_detached_narrowed(
+        &self,
+        input_ids: &Tensor,
+        start: usize,
+        len: usize,
+        comm: &dyn Comm,
+    ) -> CandleResult<Tensor> {
+        self.forward_tensor_parallel_detached_window(input_ids, Some((start, len)), comm)
+    }
+
+    fn forward_tensor_parallel_detached_window(
+        &self,
+        input_ids: &Tensor,
+        window: Option<(usize, usize)>,
+        comm: &dyn Comm,
+    ) -> CandleResult<Tensor> {
         if self.remat {
             candle_core::bail!(
                 "{}::forward_tensor_parallel_detached: activation checkpointing is not wired for \
@@ -876,7 +917,7 @@ impl<A: DenseArch> DenseGradModel<A> {
                 .forward_tensor_parallel(&h, mask.as_ref(), &self.rot, plan, Some(comm))?
                 .detach();
         }
-        Ok(self.norm_and_head(&h, None)?.detach())
+        Ok(self.norm_and_head(&h, window)?.detach())
     }
 
     /// Back-propagate a loss built from this model's logits: plain
@@ -1016,6 +1057,38 @@ impl<A: DenseArch> GradModel for DenseGradModel<A> {
         len: usize,
     ) -> CandleResult<Tensor> {
         DenseGradModel::forward_detached_narrowed(self, input_ids, start, len)
+    }
+
+    fn forward_tensor_parallel(&self, input_ids: &Tensor, comm: &dyn Comm) -> CandleResult<Tensor> {
+        DenseGradModel::forward_tensor_parallel(self, input_ids, comm)
+    }
+
+    fn forward_tensor_parallel_narrowed(
+        &self,
+        input_ids: &Tensor,
+        start: usize,
+        len: usize,
+        comm: &dyn Comm,
+    ) -> CandleResult<Tensor> {
+        DenseGradModel::forward_tensor_parallel_narrowed(self, input_ids, start, len, comm)
+    }
+
+    fn forward_tensor_parallel_detached(
+        &self,
+        input_ids: &Tensor,
+        comm: &dyn Comm,
+    ) -> CandleResult<Tensor> {
+        DenseGradModel::forward_tensor_parallel_detached(self, input_ids, comm)
+    }
+
+    fn forward_tensor_parallel_detached_narrowed(
+        &self,
+        input_ids: &Tensor,
+        start: usize,
+        len: usize,
+        comm: &dyn Comm,
+    ) -> CandleResult<Tensor> {
+        DenseGradModel::forward_tensor_parallel_detached_narrowed(self, input_ids, start, len, comm)
     }
 
     fn backward(&self, loss: &Tensor) -> CandleResult<GradStore> {
