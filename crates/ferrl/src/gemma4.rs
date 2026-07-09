@@ -1697,6 +1697,18 @@ impl Gemma4MergedAttention {
         self.cache.current_seq_len()
     }
 
+    fn validate_tensor_parallel_plan(&self, plan: TensorParallelPlan) -> CandleResult<()> {
+        tp_shard(plan, "num_attention_heads", self.num_heads)?;
+        tp_shard(plan, "num_key_value_heads", self.num_kv_heads)?;
+        tp_shard(plan, "attention_q_out", self.q_weight.dims2()?.0)?;
+        tp_shard(plan, "attention_k_out", self.k_weight.dims2()?.0)?;
+        if let Some(w) = &self.v_weight {
+            tp_shard(plan, "attention_v_out", w.dims2()?.0)?;
+        }
+        tp_shard(plan, "attention_hidden", self.o_weight.dims2()?.1)?;
+        Ok(())
+    }
+
     #[cfg(test)]
     fn retained_seq_len(&self) -> usize {
         self.cache.retained_seq_len()
@@ -1755,6 +1767,75 @@ impl Gemma4MergedAttention {
         self.o_weight.forward(&ctx)
     }
 
+    fn forward_tensor_parallel(
+        &mut self,
+        x: &Tensor,
+        offset: usize,
+        mask: Option<&Tensor>,
+        rot: &Gemma4Rotary,
+        plan: TensorParallelPlan,
+        comm: &dyn Comm,
+    ) -> CandleResult<Tensor> {
+        let (b, l, _) = x.dims3()?;
+        let in_dtype = x.dtype();
+        let heads = tp_shard(plan, "num_attention_heads", self.num_heads)?.len;
+        let kv_heads = tp_shard(plan, "num_key_value_heads", self.num_kv_heads)?.len;
+        let attn_hidden = heads * self.head_dim;
+
+        let q = self
+            .q_weight
+            .column_parallel_forward(x, plan, "attention_q_out")?;
+        let k_raw = self
+            .k_weight
+            .column_parallel_forward(x, plan, "attention_k_out")?;
+        let v_raw = match &self.v_weight {
+            Some(w) => w.column_parallel_forward(x, plan, "attention_v_out")?,
+            None => k_raw.clone(),
+        };
+
+        let q = q.reshape((b, l, heads, self.head_dim))?;
+        let k = k_raw.reshape((b, l, kv_heads, self.head_dim))?;
+        let v = v_raw.reshape((b, l, kv_heads, self.head_dim))?;
+        let q = self.q_norm.forward(&q)?.transpose(1, 2)?;
+        let k = self.k_norm.forward(&k)?;
+        let v = self.v_norm.forward(&v)?.transpose(1, 2)?;
+        let k = rot.apply(self.kind, &k.transpose(1, 2)?, offset, l)?;
+        let q = rot.apply(self.kind, &q, offset, l)?;
+        let (k, v, key_start) = self.cache.append(&k, &v.contiguous()?)?;
+        let sliding_mask = if self.kind == Gemma4LayerType::SlidingAttention {
+            Some(attention_mask_for_keys(
+                offset,
+                l,
+                key_start,
+                k.dim(2)?,
+                self.cache.max_retained,
+                in_dtype,
+                x.device(),
+            )?)
+        } else {
+            None
+        };
+        let mask = sliding_mask.as_ref().or(mask);
+        let k = repeat_kv(&k, self.num_kv_groups)?.contiguous()?;
+        let v = repeat_kv(&v, self.num_kv_groups)?.contiguous()?;
+        let mut scores = q.contiguous()?.matmul(&k.transpose(2, 3)?.contiguous()?)?;
+        if let Some(m) = mask {
+            scores = scores.broadcast_add(m)?;
+        }
+        let probs = softmax(&scores.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(in_dtype)?;
+        let ctx = probs.matmul(&v)?;
+        let ctx = ctx
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((b, l, attn_hidden))?;
+        let partial = self.o_weight.row_parallel_forward_partial_from_shard(
+            &ctx,
+            plan,
+            "attention_hidden",
+        )?;
+        reduce_row_parallel_output(&partial, plan, Some(comm))
+    }
+
     fn reset_cache(&mut self) {
         self.cache.reset();
     }
@@ -1784,6 +1865,34 @@ impl Gemma4MergedMlp {
         let h = self.act.forward(&g)?.broadcast_mul(&u)?;
         self.down_weight.forward(&h)
     }
+
+    fn validate_tensor_parallel_plan(&self, plan: TensorParallelPlan) -> CandleResult<()> {
+        tp_shard(plan, "intermediate_size", self.gate_weight.dims2()?.0)?;
+        tp_shard(plan, "intermediate_size", self.up_weight.dims2()?.0)?;
+        tp_shard(plan, "intermediate_size", self.down_weight.dims2()?.1)?;
+        Ok(())
+    }
+
+    fn forward_tensor_parallel(
+        &self,
+        x: &Tensor,
+        plan: TensorParallelPlan,
+        comm: &dyn Comm,
+    ) -> CandleResult<Tensor> {
+        let g = self
+            .gate_weight
+            .column_parallel_forward(x, plan, "intermediate_size")?;
+        let u = self
+            .up_weight
+            .column_parallel_forward(x, plan, "intermediate_size")?;
+        let h = self.act.forward(&g)?.broadcast_mul(&u)?;
+        let partial = self.down_weight.row_parallel_forward_partial_from_shard(
+            &h,
+            plan,
+            "intermediate_size",
+        )?;
+        reduce_row_parallel_output(&partial, plan, Some(comm))
+    }
 }
 
 #[derive(Debug)]
@@ -1812,6 +1921,11 @@ impl Gemma4MergedLayer {
         })
     }
 
+    fn validate_tensor_parallel_plan(&self, plan: TensorParallelPlan) -> CandleResult<()> {
+        self.attn.validate_tensor_parallel_plan(plan)?;
+        self.mlp.validate_tensor_parallel_plan(plan)
+    }
+
     fn forward(
         &mut self,
         x: &Tensor,
@@ -1825,6 +1939,28 @@ impl Gemma4MergedLayer {
         let x = x.broadcast_add(&h)?;
         let h2 = self.pre_feedforward_layernorm.forward(&x)?;
         let h2 = self.mlp.forward(&h2)?;
+        let h2 = self.post_feedforward_layernorm.forward(&h2)?;
+        let x = x.broadcast_add(&h2)?;
+        x.broadcast_mul(&self.layer_scalar)
+    }
+
+    fn forward_tensor_parallel(
+        &mut self,
+        x: &Tensor,
+        offset: usize,
+        masks: &Gemma4Masks,
+        rot: &Gemma4Rotary,
+        plan: TensorParallelPlan,
+        comm: &dyn Comm,
+    ) -> CandleResult<Tensor> {
+        let h = self.input_layernorm.forward(x)?;
+        let h =
+            self.attn
+                .forward_tensor_parallel(&h, offset, masks.get(self.kind), rot, plan, comm)?;
+        let h = self.post_attention_layernorm.forward(&h)?;
+        let x = x.broadcast_add(&h)?;
+        let h2 = self.pre_feedforward_layernorm.forward(&x)?;
+        let h2 = self.mlp.forward_tensor_parallel(&h2, plan, comm)?;
         let h2 = self.post_feedforward_layernorm.forward(&h2)?;
         let x = x.broadcast_add(&h2)?;
         x.broadcast_mul(&self.layer_scalar)
@@ -1900,6 +2036,54 @@ impl Gemma4MergedDecoder {
         softcap(&logits, self.final_logit_softcap)
     }
 
+    /// Logits through the tensor-parallel cached projection/collective path,
+    /// driven by the explicit communicator.
+    ///
+    /// # Errors
+    ///
+    /// As [`forward`](Self::forward), plus any rank/world validation or
+    /// collective failure.
+    pub fn forward_tensor_parallel(
+        &mut self,
+        input_ids: &Tensor,
+        offset: usize,
+        comm: &dyn Comm,
+    ) -> CandleResult<Tensor> {
+        let plan = plan_from_comm(comm)?;
+        let (b, l) = input_ids.dims2()?;
+        let cached = self
+            .layers
+            .first()
+            .map_or(0, |layer| layer.attn.current_seq_len());
+        if offset != cached {
+            bail!(
+                "Gemma4MergedDecoder::forward_tensor_parallel: offset {offset} != cached \
+                 sequence length {cached}"
+            );
+        }
+        self.validate_tensor_parallel_plan(plan)?;
+        let ids = input_ids.flatten_all()?;
+        let mut h = (self
+            .embed
+            .index_select(&ids, 0)?
+            .reshape((b, l, self.hidden))?
+            * self.embed_scale)?;
+        let masks = merged_masks_at(offset, l, self.dtype, &self.device)?;
+        for layer in &mut self.layers {
+            h = layer.forward_tensor_parallel(&h, offset, &masks, &self.rot, plan, comm)?;
+        }
+        let h = self.norm.forward(&h)?;
+        let logits = frozen_linear(&h, &self.embed)?;
+        softcap(&logits, self.final_logit_softcap)
+    }
+
+    fn validate_tensor_parallel_plan(&self, plan: TensorParallelPlan) -> CandleResult<()> {
+        for layer in &self.layers {
+            layer.validate_tensor_parallel_plan(plan)?;
+        }
+        Ok(())
+    }
+
     /// Reset all per-layer KV caches.
     pub fn reset_cache(&mut self) {
         for layer in &mut self.layers {
@@ -1911,6 +2095,15 @@ impl Gemma4MergedDecoder {
 impl CachedDecoder for Gemma4MergedDecoder {
     fn forward(&mut self, input_ids: &Tensor, offset: usize) -> CandleResult<Tensor> {
         Gemma4MergedDecoder::forward(self, input_ids, offset)
+    }
+
+    fn forward_tensor_parallel(
+        &mut self,
+        input_ids: &Tensor,
+        offset: usize,
+        comm: &dyn Comm,
+    ) -> CandleResult<Tensor> {
+        Gemma4MergedDecoder::forward_tensor_parallel(self, input_ids, offset, comm)
     }
 
     fn reset_cache(&mut self) {
@@ -2535,6 +2728,191 @@ mod tests {
         }
     }
 
+    #[test]
+    fn gemma4_tensor_parallel_cached_decoder_matches_unsharded_decode() {
+        let mut cfg = tiny_cfg();
+        cfg.text_config.num_key_value_heads = 2;
+        cfg.text_config.num_global_key_value_heads = 2;
+        cfg.validate().unwrap();
+        let vb = tiny_vb(&cfg);
+        let input = ids(5);
+        let prefix_len = 3;
+        let suffix_len = 2;
+
+        let reference_model = Gemma4GradModel::load_with_targets(
+            &cfg,
+            &vb,
+            2,
+            4.0,
+            DType::F32,
+            DenseLoraTargets::industrial(),
+        )
+        .unwrap();
+        arm_adapter_deterministic(&reference_model);
+        let mut reference_decoder = reference_model.merged_decoder().unwrap();
+        let prefix = input.narrow(1, 0, prefix_len).unwrap();
+        let suffix = input.narrow(1, prefix_len, suffix_len).unwrap();
+        let reference_prefix = reference_decoder.forward(&prefix, 0).unwrap();
+        let reference_suffix = reference_decoder.forward(&suffix, prefix_len).unwrap();
+        let reference_prefix_flat = reference_prefix
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let reference_suffix_flat = reference_suffix
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+
+        let comms = LocalComm::world(2);
+        let outputs: Vec<(Vec<f32>, Vec<f32>)> = std::thread::scope(|s| {
+            let handles: Vec<_> = comms
+                .into_iter()
+                .map(|comm| {
+                    let cfg = cfg.clone();
+                    let vb = vb.clone();
+                    let prefix = prefix.clone();
+                    let suffix = suffix.clone();
+                    s.spawn(move || {
+                        let model = Gemma4GradModel::load_with_targets(
+                            &cfg,
+                            &vb,
+                            2,
+                            4.0,
+                            DType::F32,
+                            DenseLoraTargets::industrial(),
+                        )
+                        .unwrap();
+                        arm_adapter_deterministic(&model);
+                        let mut decoder = model.merged_decoder().unwrap();
+                        let prefix_logits =
+                            decoder.forward_tensor_parallel(&prefix, 0, &comm).unwrap();
+                        let suffix_logits = decoder
+                            .forward_tensor_parallel(&suffix, prefix_len, &comm)
+                            .unwrap();
+                        assert_eq!(
+                            prefix_logits.dims(),
+                            &[1, prefix_len, cfg.text_config.vocab_size]
+                        );
+                        assert_eq!(
+                            suffix_logits.dims(),
+                            &[1, suffix_len, cfg.text_config.vocab_size]
+                        );
+                        (
+                            prefix_logits
+                                .flatten_all()
+                                .unwrap()
+                                .to_vec1::<f32>()
+                                .unwrap(),
+                            suffix_logits
+                                .flatten_all()
+                                .unwrap()
+                                .to_vec1::<f32>()
+                                .unwrap(),
+                        )
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        for (rank, (prefix, suffix)) in outputs.iter().enumerate() {
+            let prefix_worst = prefix
+                .iter()
+                .zip(&reference_prefix_flat)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                prefix_worst <= 1e-5,
+                "rank {rank} TP cached Gemma 4 prefill diverged: {prefix_worst}"
+            );
+            let suffix_worst = suffix
+                .iter()
+                .zip(&reference_suffix_flat)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                suffix_worst <= 1e-5,
+                "rank {rank} TP cached Gemma 4 decode diverged: {suffix_worst}"
+            );
+        }
+    }
+
+    #[test]
+    fn gemma4_tensor_parallel_cached_decoder_preflights_layout_before_mutating_cache() {
+        let mut cfg = tiny_cfg();
+        cfg.text_config.num_key_value_heads = 2;
+        cfg.text_config.num_global_key_value_heads = 2;
+        cfg.text_config.intermediate_size = 15;
+        cfg.validate().unwrap();
+        let vb = tiny_vb(&cfg);
+        let input = ids(3);
+
+        let reference_model = Gemma4GradModel::load_with_targets(
+            &cfg,
+            &vb,
+            2,
+            4.0,
+            DType::F32,
+            DenseLoraTargets::industrial(),
+        )
+        .unwrap();
+        arm_adapter_deterministic(&reference_model);
+        let mut reference_decoder = reference_model.merged_decoder().unwrap();
+        let reference = reference_decoder.forward(&input, 0).unwrap();
+        let reference_flat = reference.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+        let comms = LocalComm::world(2);
+        let outputs: Vec<Vec<f32>> = std::thread::scope(|s| {
+            let handles: Vec<_> = comms
+                .into_iter()
+                .map(|comm| {
+                    let cfg = cfg.clone();
+                    let vb = vb.clone();
+                    let input = input.clone();
+                    s.spawn(move || {
+                        let model = Gemma4GradModel::load_with_targets(
+                            &cfg,
+                            &vb,
+                            2,
+                            4.0,
+                            DType::F32,
+                            DenseLoraTargets::industrial(),
+                        )
+                        .unwrap();
+                        arm_adapter_deterministic(&model);
+                        let mut decoder = model.merged_decoder().unwrap();
+                        let err = decoder
+                            .forward_tensor_parallel(&input, 0, &comm)
+                            .unwrap_err()
+                            .to_string();
+                        assert!(
+                            err.contains("intermediate_size"),
+                            "expected MLP intermediate preflight failure, got {err}"
+                        );
+                        let got = decoder.forward(&input, 0).unwrap();
+                        got.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        for (rank, got) in outputs.iter().enumerate() {
+            let worst = got
+                .iter()
+                .zip(&reference_flat)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                worst <= 1e-5,
+                "rank {rank} Gemma 4 decoder cache mutated before unsupported TP layout failed: \
+                 {worst}"
+            );
+        }
+    }
+
     fn overwrite_adapter(model: &Gemma4GradModel) {
         for (i, v) in model.trainable_vars().iter().enumerate() {
             let dims = v.as_tensor().dims().to_vec();
@@ -2646,7 +3024,7 @@ mod tests {
     #[test]
     fn quantized_merged_decoder_snapshots_adapter_values_across_var_updates() {
         let model = quantized_tiny_model();
-        arm_adapter(&model);
+        arm_adapter_deterministic(&model);
         let input = ids(6);
         let before_update = model.forward(&input).unwrap();
         let mut dec = model.merged_decoder().unwrap();

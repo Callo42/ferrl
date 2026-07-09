@@ -1139,6 +1139,16 @@ struct DenseMergedAttention {
 }
 
 impl DenseMergedAttention {
+    fn validate_tensor_parallel_plan(&self, plan: TensorParallelPlan) -> CandleResult<()> {
+        tp_shard(plan, "num_attention_heads", self.num_heads)?;
+        tp_shard(plan, "num_key_value_heads", self.num_kv_heads)?;
+        tp_shard(plan, "attention_q_out", self.q_weight.dims2()?.0)?;
+        tp_shard(plan, "attention_k_out", self.k_weight.dims2()?.0)?;
+        tp_shard(plan, "attention_v_out", self.v_weight.dims2()?.0)?;
+        tp_shard(plan, "attention_hidden", self.o_weight.dims2()?.1)?;
+        Ok(())
+    }
+
     fn forward(
         &mut self,
         x: &Tensor,
@@ -1213,6 +1223,86 @@ impl DenseMergedAttention {
             .reshape((b, l, self.attn_hidden))?;
         self.o_weight.forward(&ctx)
     }
+
+    fn forward_tensor_parallel(
+        &mut self,
+        x: &Tensor,
+        offset: usize,
+        mask: Option<&Tensor>,
+        rot: &RotaryTables,
+        plan: TensorParallelPlan,
+        comm: &dyn Comm,
+    ) -> CandleResult<Tensor> {
+        let (b, l, _) = x.dims3()?;
+        let in_dtype = x.dtype();
+        let heads = tp_shard(plan, "num_attention_heads", self.num_heads)?.len;
+        let kv_heads = tp_shard(plan, "num_key_value_heads", self.num_kv_heads)?.len;
+        let attn_hidden = heads * self.head_dim;
+
+        let q = self
+            .q_weight
+            .column_parallel_forward(x, plan, "attention_q_out")?;
+        let k = self
+            .k_weight
+            .column_parallel_forward(x, plan, "attention_k_out")?;
+        let v = self
+            .v_weight
+            .column_parallel_forward(x, plan, "attention_v_out")?;
+
+        let q = q.reshape((b, l, heads, self.head_dim))?.transpose(1, 2)?;
+        let k = k
+            .reshape((b, l, kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let v = v
+            .reshape((b, l, kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+
+        let (q, k) = match &self.qk_norm {
+            Some((qn, kn)) => (qn.forward(&q.contiguous()?)?, kn.forward(&k.contiguous()?)?),
+            None => (q, k),
+        };
+
+        let (cos, sin) = rot.slice_at(offset, l)?;
+        let q = rope_slow(&q.contiguous()?, &cos, &sin)?;
+        let k = rope_slow(&k.contiguous()?, &cos, &sin)?;
+
+        let (k, v) = self.cache.append(&k.contiguous()?, &v.contiguous()?)?;
+        let k = repeat_kv(&k, self.num_kv_groups)?.contiguous()?;
+        let v = repeat_kv(&v, self.num_kv_groups)?.contiguous()?;
+
+        let (q, k, v) = if self.sdpa_f32 {
+            (
+                q.to_dtype(DType::F32)?,
+                k.to_dtype(DType::F32)?,
+                v.to_dtype(DType::F32)?,
+            )
+        } else {
+            (q, k, v)
+        };
+        let mut scores = (q.contiguous()?.matmul(&k.transpose(2, 3)?.contiguous()?)?
+            / (self.head_dim as f64).sqrt())?;
+        if let Some(m) = mask {
+            scores = scores.broadcast_add(m)?;
+        }
+        let probs = softmax(&scores, D::Minus1)?;
+        let ctx = probs.matmul(&v)?;
+        let ctx = if self.sdpa_f32 {
+            ctx.to_dtype(in_dtype)?
+        } else {
+            ctx
+        };
+
+        let ctx = ctx
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((b, l, attn_hidden))?;
+        let partial = self.o_weight.row_parallel_forward_partial_from_shard(
+            &ctx,
+            plan,
+            "attention_hidden",
+        )?;
+        reduce_row_parallel_output(&partial, plan, Some(comm))
+    }
 }
 
 /// `SwiGLU` MLP over merged weights — the grad-free mirror of [`DenseMlp`].
@@ -1239,6 +1329,35 @@ impl DenseMergedMlp {
         let rhs = self.up_weight.forward(x)?;
         self.down_weight.forward(&lhs.broadcast_mul(&rhs)?)
     }
+
+    fn validate_tensor_parallel_plan(&self, plan: TensorParallelPlan) -> CandleResult<()> {
+        tp_shard(plan, "intermediate_size", self.gate_weight.dims2()?.0)?;
+        tp_shard(plan, "intermediate_size", self.up_weight.dims2()?.0)?;
+        tp_shard(plan, "intermediate_size", self.down_weight.dims2()?.1)?;
+        Ok(())
+    }
+
+    fn forward_tensor_parallel(
+        &self,
+        x: &Tensor,
+        plan: TensorParallelPlan,
+        comm: &dyn Comm,
+    ) -> CandleResult<Tensor> {
+        let lhs = self
+            .gate_weight
+            .column_parallel_forward(x, plan, "intermediate_size")?
+            .apply(&self.act)?;
+        let rhs = self
+            .up_weight
+            .column_parallel_forward(x, plan, "intermediate_size")?;
+        let hidden = lhs.broadcast_mul(&rhs)?;
+        let partial = self.down_weight.row_parallel_forward_partial_from_shard(
+            &hidden,
+            plan,
+            "intermediate_size",
+        )?;
+        reduce_row_parallel_output(&partial, plan, Some(comm))
+    }
 }
 
 /// One decoder layer over merged weights — the grad-free mirror of [`DenseLayer`].
@@ -1251,6 +1370,11 @@ struct DenseMergedLayer {
 }
 
 impl DenseMergedLayer {
+    fn validate_tensor_parallel_plan(&self, plan: TensorParallelPlan) -> CandleResult<()> {
+        self.attn.validate_tensor_parallel_plan(plan)?;
+        self.mlp.validate_tensor_parallel_plan(plan)
+    }
+
     fn forward(
         &mut self,
         x: &Tensor,
@@ -1263,6 +1387,25 @@ impl DenseMergedLayer {
         let x = x.broadcast_add(&h)?;
         let h2 = self.ln2.forward(&x)?;
         let h2 = self.mlp.forward(&h2)?;
+        x.broadcast_add(&h2)
+    }
+
+    fn forward_tensor_parallel(
+        &mut self,
+        x: &Tensor,
+        offset: usize,
+        mask: Option<&Tensor>,
+        rot: &RotaryTables,
+        plan: TensorParallelPlan,
+        comm: &dyn Comm,
+    ) -> CandleResult<Tensor> {
+        let h = self.ln1.forward(x)?;
+        let h = self
+            .attn
+            .forward_tensor_parallel(&h, offset, mask, rot, plan, comm)?;
+        let x = x.broadcast_add(&h)?;
+        let h2 = self.ln2.forward(&x)?;
+        let h2 = self.mlp.forward_tensor_parallel(&h2, plan, comm)?;
         x.broadcast_add(&h2)
     }
 }
@@ -1389,6 +1532,59 @@ impl DenseCachedDecoder {
         }
     }
 
+    /// Logits through the tensor-parallel cached projection/collective path,
+    /// driven by the explicit communicator.
+    ///
+    /// # Errors
+    ///
+    /// As [`forward`](Self::forward), plus any rank/world validation or
+    /// collective failure.
+    pub fn forward_tensor_parallel(
+        &mut self,
+        input_ids: &Tensor,
+        offset: usize,
+        comm: &dyn Comm,
+    ) -> CandleResult<Tensor> {
+        let plan = plan_from_comm(comm)?;
+        let (b, l) = input_ids.dims2()?;
+        let cached = self
+            .layers
+            .first()
+            .map_or(0, |layer| layer.attn.cache.current_seq_len());
+        if offset != cached {
+            candle_core::bail!(
+                "DenseCachedDecoder::forward_tensor_parallel: offset {offset} != cached \
+                 sequence length {cached} (pass offset == tokens already decoded; 0 to prefill)"
+            );
+        }
+        self.validate_tensor_parallel_plan(plan)?;
+        let ids = input_ids.flatten_all()?;
+        let mut h = self
+            .embed
+            .index_select(&ids, 0)?
+            .reshape((b, l, self.hidden))?;
+        let mask = if l == 1 {
+            None
+        } else {
+            Some(causal_mask_at(offset, l, self.mask_dtype, &self.device)?)
+        };
+        for layer in &mut self.layers {
+            h = layer.forward_tensor_parallel(&h, offset, mask.as_ref(), &self.rot, plan, comm)?;
+        }
+        let h = self.norm.forward(&h)?;
+        match &self.lm_head {
+            Some(w) => frozen_linear(&h, w),
+            None => frozen_linear(&h, &self.embed),
+        }
+    }
+
+    fn validate_tensor_parallel_plan(&self, plan: TensorParallelPlan) -> CandleResult<()> {
+        for layer in &self.layers {
+            layer.validate_tensor_parallel_plan(plan)?;
+        }
+        Ok(())
+    }
+
     /// Clear every layer's KV cache so the decoder can start a fresh sequence
     /// (next [`forward`](Self::forward) must use `offset == 0`).
     pub fn reset_cache(&mut self) {
@@ -1404,6 +1600,15 @@ impl DenseCachedDecoder {
 impl CachedDecoder for DenseCachedDecoder {
     fn forward(&mut self, input_ids: &Tensor, offset: usize) -> CandleResult<Tensor> {
         DenseCachedDecoder::forward(self, input_ids, offset)
+    }
+
+    fn forward_tensor_parallel(
+        &mut self,
+        input_ids: &Tensor,
+        offset: usize,
+        comm: &dyn Comm,
+    ) -> CandleResult<Tensor> {
+        DenseCachedDecoder::forward_tensor_parallel(self, input_ids, offset, comm)
     }
 
     fn reset_cache(&mut self) {
