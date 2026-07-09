@@ -93,7 +93,7 @@ use candle_core::{IndexOp, Result as CandleResult, Tensor, Var};
 
 use crate::comm::Comm;
 use crate::model::{chunked_logprobs_from_logits, CachedDecoder, GradModel};
-use crate::policy::{GenConfig, Policy, Rollout};
+use crate::policy::{GenConfig, Policy, Rollout, TensorParallelPolicy};
 use crate::qwen::QwenGradModel;
 use crate::sampler::GrpoSampler;
 use crate::telemetry::ModelTelemetryRecorder;
@@ -199,8 +199,10 @@ impl<M: GradModel> LmPolicy<M> {
     ///
     /// This is deliberately an inherent helper rather than part of
     /// [`Policy`]: callers must supply the communicator at the scoring site,
-    /// while the public trainer/loader/CLI paths continue to reject sharded TP
-    /// until their execution semantics are wired end to end.
+    /// while the ordinary trainer/loader/CLI paths continue to reject sharded
+    /// TP; the explicit trainer TP entry points also reject sharded
+    /// communicators until gradient/optimizer/checkpoint semantics are wired
+    /// end to end.
     ///
     /// # Errors
     ///
@@ -252,8 +254,8 @@ impl<M: GradModel> LmPolicy<M> {
     ///
     /// This is deliberately an inherent helper rather than part of
     /// [`Policy`]: callers must supply the communicator at the generation site,
-    /// while public loaders and the CLI continue to reject sharded TP until the
-    /// end-to-end execution contract is opened.
+    /// while public trainer, loader, and CLI entry points continue to reject
+    /// sharded TP until the end-to-end execution contract is opened.
     ///
     /// # Errors
     ///
@@ -281,7 +283,25 @@ impl<M: GradModel> LmPolicy<M> {
         global_row_base: u64,
         comm: &dyn Comm,
     ) -> CandleResult<Rollout> {
-        self.generate_at_instrumented_inner(prompt, cfg, global_row_base, Some(comm), None)
+        self.generate_tensor_parallel_at_instrumented(prompt, cfg, global_row_base, comm, None)
+    }
+
+    /// As [`generate_tensor_parallel_at`](Self::generate_tensor_parallel_at),
+    /// with an optional telemetry sink for model-path phase boundaries and
+    /// decoder-cache snapshots.
+    ///
+    /// # Errors
+    ///
+    /// As [`generate_tensor_parallel`](Self::generate_tensor_parallel).
+    pub fn generate_tensor_parallel_at_instrumented(
+        &mut self,
+        prompt: &[u32],
+        cfg: &GenConfig,
+        global_row_base: u64,
+        comm: &dyn Comm,
+        telemetry: Option<&mut dyn ModelTelemetryRecorder>,
+    ) -> CandleResult<Rollout> {
+        self.generate_at_instrumented_inner(prompt, cfg, global_row_base, Some(comm), telemetry)
     }
 
     /// The teacher-forcing scoring input: all but the last token of every
@@ -796,6 +816,35 @@ impl<M: GradModel> Policy for LmPolicy<M> {
 
     fn lora_recipe(&self) -> Option<String> {
         self.model.lora_recipe()
+    }
+}
+
+impl<M: GradModel> TensorParallelPolicy for LmPolicy<M> {
+    fn generate_at_tensor_parallel_instrumented(
+        &mut self,
+        prompt: &[u32],
+        cfg: &GenConfig,
+        global_row_base: u64,
+        comm: &dyn Comm,
+        telemetry: Option<&mut dyn ModelTelemetryRecorder>,
+    ) -> CandleResult<Rollout> {
+        self.generate_tensor_parallel_at_instrumented(prompt, cfg, global_row_base, comm, telemetry)
+    }
+
+    fn token_logprobs_tensor_parallel(
+        &self,
+        rollout: &Rollout,
+        comm: &dyn Comm,
+    ) -> CandleResult<Tensor> {
+        LmPolicy::token_logprobs_tensor_parallel(self, rollout, comm)
+    }
+
+    fn token_logprobs_tensor_parallel_detached(
+        &self,
+        rollout: &Rollout,
+        comm: &dyn Comm,
+    ) -> CandleResult<Tensor> {
+        LmPolicy::token_logprobs_tensor_parallel_detached(self, rollout, comm)
     }
 }
 

@@ -53,6 +53,14 @@
 //! (per-item scale `1 / (grad_accum_steps · world)`, the DAPO token normalizer
 //! and the degenerate-window decision all-reduced), checkpoints are written by
 //! rank 0 only, and the world-1 path is byte-for-byte the pre-DP trainer.
+//!
+//! Tensor-parallel model execution is a separate opt-in path: the
+//! `*_tensor_parallel` methods take an explicit [`Comm`] and require
+//! [`TensorParallelPolicy`]. The trainer's own communicator still represents the
+//! data-parallel gradient-reduction world. Sharded tensor-parallel trainer
+//! execution fails closed for now: the trainer does not yet reduce trainable
+//! gradients over the TP communicator before coverage, clipping, optimizer step,
+//! and checkpointing.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -71,7 +79,7 @@ use crate::grpo::{
 };
 use crate::nn::grad_coverage;
 use crate::optim::{FerrlAdamW, OptimizerState};
-use crate::policy::{GenConfig, Policy, Rollout};
+use crate::policy::{GenConfig, Policy, Rollout, TensorParallelPolicy};
 use crate::reward::{RewardError, RewardFn, RewardOutcome};
 use crate::sample::Sample;
 use crate::telemetry::{
@@ -1234,6 +1242,77 @@ struct UpdateCtx<'a> {
     gpu_mem: &'a mut StepGpuMemory,
 }
 
+trait PolicyExecution<P: Policy> {
+    fn generate_at_instrumented(
+        &self,
+        policy: &mut P,
+        prompt: &[u32],
+        cfg: &GenConfig,
+        global_row_base: u64,
+        telemetry: Option<&mut dyn ModelTelemetryRecorder>,
+    ) -> CandleResult<Rollout>;
+
+    fn token_logprobs(&self, policy: &P, rollout: &Rollout) -> CandleResult<Tensor>;
+
+    fn token_logprobs_detached(&self, policy: &P, rollout: &Rollout) -> CandleResult<Tensor>;
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UnshardedPolicyExecution;
+
+impl<P: Policy> PolicyExecution<P> for UnshardedPolicyExecution {
+    fn generate_at_instrumented(
+        &self,
+        policy: &mut P,
+        prompt: &[u32],
+        cfg: &GenConfig,
+        global_row_base: u64,
+        telemetry: Option<&mut dyn ModelTelemetryRecorder>,
+    ) -> CandleResult<Rollout> {
+        policy.generate_at_instrumented(prompt, cfg, global_row_base, telemetry)
+    }
+
+    fn token_logprobs(&self, policy: &P, rollout: &Rollout) -> CandleResult<Tensor> {
+        policy.token_logprobs(rollout)
+    }
+
+    fn token_logprobs_detached(&self, policy: &P, rollout: &Rollout) -> CandleResult<Tensor> {
+        policy.token_logprobs_detached(rollout)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TensorParallelPolicyExecution<'a> {
+    comm: &'a dyn Comm,
+}
+
+impl<P: TensorParallelPolicy> PolicyExecution<P> for TensorParallelPolicyExecution<'_> {
+    fn generate_at_instrumented(
+        &self,
+        policy: &mut P,
+        prompt: &[u32],
+        cfg: &GenConfig,
+        global_row_base: u64,
+        telemetry: Option<&mut dyn ModelTelemetryRecorder>,
+    ) -> CandleResult<Rollout> {
+        policy.generate_at_tensor_parallel_instrumented(
+            prompt,
+            cfg,
+            global_row_base,
+            self.comm,
+            telemetry,
+        )
+    }
+
+    fn token_logprobs(&self, policy: &P, rollout: &Rollout) -> CandleResult<Tensor> {
+        policy.token_logprobs_tensor_parallel(rollout, self.comm)
+    }
+
+    fn token_logprobs_detached(&self, policy: &P, rollout: &Rollout) -> CandleResult<Tensor> {
+        policy.token_logprobs_tensor_parallel_detached(rollout, self.comm)
+    }
+}
+
 /// Bound the number of per-var gradient tensors reduced in one DP collective.
 ///
 /// The real NCCL path materializes a reduced destination buffer for each source tensor, so a
@@ -1459,7 +1538,36 @@ impl Trainer {
         tokenizer: &dyn TokenizerLike,
         samples: &[Sample<R::Target>],
     ) -> Result<(Vec<Metrics>, RunStop), TrainerError> {
-        self.run(0, None, policy, reward_fn, tokenizer, samples)
+        let exec = UnshardedPolicyExecution;
+        self.run(0, None, policy, reward_fn, tokenizer, samples, &exec)
+    }
+
+    /// Run training through a policy's explicit tensor-parallel rollout and
+    /// scoring hooks.
+    ///
+    /// `tensor_parallel_comm` is separate from the trainer's data-parallel
+    /// communicator installed by [`with_comm`](Self::with_comm). For this slice
+    /// it must be a world-1 communicator. Sharded TP trainer execution fails
+    /// closed until ferrl wires TP gradient reduction or sharded optimizer and
+    /// checkpoint semantics.
+    ///
+    /// # Errors
+    ///
+    /// As [`train`](Self::train), plus a fail-closed contract error when the
+    /// tensor-parallel communicator is sharded.
+    pub fn train_tensor_parallel<P: TensorParallelPolicy, R: RewardFn>(
+        &mut self,
+        policy: &mut P,
+        reward_fn: &R,
+        tokenizer: &dyn TokenizerLike,
+        samples: &[Sample<R::Target>],
+        tensor_parallel_comm: &dyn Comm,
+    ) -> Result<(Vec<Metrics>, RunStop), TrainerError> {
+        self.validate_tensor_parallel_comm(tensor_parallel_comm)?;
+        let exec = TensorParallelPolicyExecution {
+            comm: tensor_parallel_comm,
+        };
+        self.run(0, None, policy, reward_fn, tokenizer, samples, &exec)
     }
 
     /// Resume training from `start_step`, running steps `start_step .. config.steps`
@@ -1499,7 +1607,35 @@ impl Trainer {
         tokenizer: &dyn TokenizerLike,
         samples: &[Sample<R::Target>],
     ) -> Result<(Vec<Metrics>, RunStop), TrainerError> {
-        self.run(start_step, None, policy, reward_fn, tokenizer, samples)
+        let exec = UnshardedPolicyExecution;
+        self.run(
+            start_step, None, policy, reward_fn, tokenizer, samples, &exec,
+        )
+    }
+
+    /// Resume from `start_step` while routing rollout and scoring through an
+    /// explicit tensor-parallel communicator.
+    ///
+    /// # Errors
+    ///
+    /// As [`train_from`](Self::train_from), plus the tensor-parallel validation
+    /// described on [`train_tensor_parallel`](Self::train_tensor_parallel).
+    pub fn train_from_tensor_parallel<P: TensorParallelPolicy, R: RewardFn>(
+        &mut self,
+        start_step: u64,
+        policy: &mut P,
+        reward_fn: &R,
+        tokenizer: &dyn TokenizerLike,
+        samples: &[Sample<R::Target>],
+        tensor_parallel_comm: &dyn Comm,
+    ) -> Result<(Vec<Metrics>, RunStop), TrainerError> {
+        self.validate_tensor_parallel_comm(tensor_parallel_comm)?;
+        let exec = TensorParallelPolicyExecution {
+            comm: tensor_parallel_comm,
+        };
+        self.run(
+            start_step, None, policy, reward_fn, tokenizer, samples, &exec,
+        )
     }
 
     /// Resume an interrupted run from a checkpoint directory, **momentum-faithfully**.
@@ -1549,7 +1685,36 @@ impl Trainer {
         samples: &[Sample<R::Target>],
     ) -> Result<(Vec<Metrics>, RunStop), TrainerError> {
         let (start_step, opt_state) = self.load_resume_point(checkpoint_dir.as_ref(), policy)?;
-        self.run(start_step, opt_state, policy, reward_fn, tokenizer, samples)
+        let exec = UnshardedPolicyExecution;
+        self.run(
+            start_step, opt_state, policy, reward_fn, tokenizer, samples, &exec,
+        )
+    }
+
+    /// Momentum-faithful resume through an explicit tensor-parallel
+    /// communicator.
+    ///
+    /// # Errors
+    ///
+    /// As [`resume`](Self::resume), plus the tensor-parallel validation
+    /// described on [`train_tensor_parallel`](Self::train_tensor_parallel).
+    pub fn resume_tensor_parallel<P: TensorParallelPolicy, R: RewardFn>(
+        &mut self,
+        checkpoint_dir: impl AsRef<Path>,
+        policy: &mut P,
+        reward_fn: &R,
+        tokenizer: &dyn TokenizerLike,
+        samples: &[Sample<R::Target>],
+        tensor_parallel_comm: &dyn Comm,
+    ) -> Result<(Vec<Metrics>, RunStop), TrainerError> {
+        self.validate_tensor_parallel_comm(tensor_parallel_comm)?;
+        let (start_step, opt_state) = self.load_resume_point(checkpoint_dir.as_ref(), policy)?;
+        let exec = TensorParallelPolicyExecution {
+            comm: tensor_parallel_comm,
+        };
+        self.run(
+            start_step, opt_state, policy, reward_fn, tokenizer, samples, &exec,
+        )
     }
 
     /// Load `checkpoint_dir` into `policy` and return the resumed loop's
@@ -1648,6 +1813,47 @@ impl Trainer {
         tokenizer: &dyn TokenizerLike,
         samples: &[Sample<R::Target>],
     ) -> Result<(Vec<Metrics>, RunStop), TrainerError> {
+        let exec = UnshardedPolicyExecution;
+        self.resume_latest_with_execution(policy, reward_fn, tokenizer, samples, &exec)
+    }
+
+    /// Auto-resume the newest checkpoint while routing rollout and scoring
+    /// through an explicit tensor-parallel communicator.
+    ///
+    /// # Errors
+    ///
+    /// As [`resume_latest`](Self::resume_latest), plus the tensor-parallel
+    /// validation described on
+    /// [`train_tensor_parallel`](Self::train_tensor_parallel).
+    pub fn resume_latest_tensor_parallel<P: TensorParallelPolicy, R: RewardFn>(
+        &mut self,
+        policy: &mut P,
+        reward_fn: &R,
+        tokenizer: &dyn TokenizerLike,
+        samples: &[Sample<R::Target>],
+        tensor_parallel_comm: &dyn Comm,
+    ) -> Result<(Vec<Metrics>, RunStop), TrainerError> {
+        self.validate_tensor_parallel_comm(tensor_parallel_comm)?;
+        let exec = TensorParallelPolicyExecution {
+            comm: tensor_parallel_comm,
+        };
+        self.resume_latest_with_execution(policy, reward_fn, tokenizer, samples, &exec)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resume_latest_with_execution<P, R, E>(
+        &mut self,
+        policy: &mut P,
+        reward_fn: &R,
+        tokenizer: &dyn TokenizerLike,
+        samples: &[Sample<R::Target>],
+        exec: &E,
+    ) -> Result<(Vec<Metrics>, RunStop), TrainerError>
+    where
+        P: Policy,
+        R: RewardFn,
+        E: PolicyExecution<P>,
+    {
         // Discover the resume point through rank 0 and broadcast it so the whole world
         // branches identically in lockstep (see `coordinate_resume_step`).
         match self.coordinate_resume_step()? {
@@ -1664,7 +1870,9 @@ impl Trainer {
                     "resume_latest: continuing from the newest checkpoint"
                 );
                 let (start_step, opt_state) = self.load_resume_point(&dir, policy)?;
-                self.run(start_step, opt_state, policy, reward_fn, tokenizer, samples)
+                self.run(
+                    start_step, opt_state, policy, reward_fn, tokenizer, samples, exec,
+                )
             }
             None => {
                 tracing::info!(
@@ -1672,9 +1880,22 @@ impl Trainer {
                     world_size = self.comm.world_size(),
                     "resume_latest: no checkpoint found — starting a fresh run"
                 );
-                self.run(0, None, policy, reward_fn, tokenizer, samples)
+                self.run(0, None, policy, reward_fn, tokenizer, samples, exec)
             }
         }
+    }
+
+    fn validate_tensor_parallel_comm(&self, comm: &dyn Comm) -> Result<(), TrainerError> {
+        crate::tensor_parallel::plan_from_comm(comm)?;
+        if comm.world_size() > 1 {
+            return Err(TrainerError::Contract(
+                "sharded tensor-parallel trainer execution is not wired yet; the trainer does \
+                 not reduce trainable gradients over the tensor-parallel communicator before \
+                 coverage, clipping, optimizer step, and checkpointing"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Coordinate the data-parallel resume decision across the world: rank 0 scans for
@@ -1737,7 +1958,8 @@ impl Trainer {
     /// Shared loop for [`train`](Self::train) / [`train_from`](Self::train_from):
     /// run optimizer steps `start_step .. config.steps`, each consuming a window of
     /// `grad_accum_steps` samples, checkpointing on the configured cadence.
-    fn run<P: Policy, R: RewardFn>(
+    #[allow(clippy::too_many_arguments)]
+    fn run<P, R, E>(
         &mut self,
         start_step: u64,
         resume_opt_state: Option<OptimizerState>,
@@ -1745,7 +1967,13 @@ impl Trainer {
         reward_fn: &R,
         tokenizer: &dyn TokenizerLike,
         samples: &[Sample<R::Target>],
-    ) -> Result<(Vec<Metrics>, RunStop), TrainerError> {
+        exec: &E,
+    ) -> Result<(Vec<Metrics>, RunStop), TrainerError>
+    where
+        P: Policy,
+        R: RewardFn,
+        E: PolicyExecution<P>,
+    {
         assert!(!samples.is_empty(), "train: no samples");
         // Stamp every event this run emits — the per-step events below, plus anything
         // the policy/reward logs — with this rank's rank/world. Under DP all ranks share
@@ -1823,6 +2051,7 @@ impl Trainer {
                 &mut opt,
                 &vars,
                 &mut gpu_mem,
+                exec,
             )?;
             gpu_mem.record("step_end");
             let secs = started.elapsed().as_secs_f64();
@@ -1869,7 +2098,7 @@ impl Trainer {
     /// this rank's real completion-token count for the window (the throughput
     /// numerator the caller divides by the step wall-time — local, not world-summed).
     #[allow(clippy::too_many_arguments)]
-    fn run_window<P: Policy, R: RewardFn>(
+    fn run_window<P, R, E>(
         &mut self,
         step: u64,
         beta: f64,
@@ -1880,7 +2109,13 @@ impl Trainer {
         opt: &mut FerrlAdamW,
         vars: &[Var],
         gpu_mem: &mut StepGpuMemory,
-    ) -> Result<(Metrics, usize), TrainerError> {
+        exec: &E,
+    ) -> Result<(Metrics, usize), TrainerError>
+    where
+        P: Policy,
+        R: RewardFn,
+        E: PolicyExecution<P>,
+    {
         gpu_mem.record("window_start");
         let accum = self.config.grad_accum_steps;
         let world = self.comm.world_size();
@@ -1893,8 +2128,9 @@ impl Trainer {
                 sample: &samples[sel.sample_idx],
                 selection: &sel,
             };
-            let (stat, item) =
-                self.collect_sample(step, beta, policy, reward_fn, tokenizer, &selected, gpu_mem)?;
+            let (stat, item) = self.collect_sample(
+                step, beta, policy, reward_fn, tokenizer, &selected, gpu_mem, exec,
+            )?;
             stats.push(stat);
             if let Some(item) = item {
                 live.push(item);
@@ -1935,7 +2171,15 @@ impl Trainer {
             InnerAgg::default()
         } else {
             let mut ctx = UpdateCtx { vars, opt, gpu_mem };
-            self.update_window(policy, &live, &mut ctx, window_tokens, n_live_global, beta)?
+            self.update_window(
+                policy,
+                &live,
+                &mut ctx,
+                window_tokens,
+                n_live_global,
+                beta,
+                exec,
+            )?
         };
         gpu_mem.record("window_end");
         Ok((
@@ -2144,7 +2388,7 @@ impl Trainer {
     /// log-probs (taken now, at the window's start) into a [`LiveItem`] for the inner
     /// epochs.
     #[allow(clippy::too_many_arguments)]
-    fn collect_sample<P: Policy, R: RewardFn>(
+    fn collect_sample<P, R, E>(
         &mut self,
         step: u64,
         beta: f64,
@@ -2153,7 +2397,13 @@ impl Trainer {
         tokenizer: &dyn TokenizerLike,
         selected: &SelectedSample<'_, R::Target>,
         gpu_mem: &mut StepGpuMemory,
-    ) -> Result<(PromptStat, Option<LiveItem>), TrainerError> {
+        exec: &E,
+    ) -> Result<(PromptStat, Option<LiveItem>), TrainerError>
+    where
+        P: Policy,
+        R: RewardFn,
+        E: PolicyExecution<P>,
+    {
         // Rollout with the adapter on, then score it.
         policy.set_adapter_enabled(true);
         let prompt_ids = tokenizer.encode(&selected.sample.prompt);
@@ -2174,7 +2424,8 @@ impl Trainer {
         // See `select_prompt`: prompt selection and rollout RNG row ranges differ
         // in distributed same-prompt mode.
         gpu_mem.record("rollout_start");
-        let rollout = policy.generate_at_instrumented(
+        let rollout = exec.generate_at_instrumented(
+            policy,
             &prompt_ids,
             &gen,
             selected.selection.rollout_global_row_base,
@@ -2282,7 +2533,7 @@ impl Trainer {
         // scoring path: same values, a fraction of the activation footprint
         // on policies that override it (no tape is built or captured).
         gpu_mem.record("logp_old_start");
-        let logp_old = policy.token_logprobs_detached(&rollout)?;
+        let logp_old = exec.token_logprobs_detached(policy, &rollout)?;
         gpu_mem.record("logp_old_end");
         // Train/rollout off-policy diagnostics + the optional TIS weight, both off
         // the captured behavior log-probs vs the logp_old scoring snapshot.
@@ -2297,7 +2548,7 @@ impl Trainer {
         let device = logp_old.device().clone();
         let mask = mask_rows_to_tensor(&mask_rows, &device)?;
         gpu_mem.record("logp_ref_start");
-        let logp_ref = self.reference_logprobs(policy, &rollout, beta)?;
+        let logp_ref = self.reference_logprobs(policy, &rollout, beta, exec)?;
         gpu_mem.record("logp_ref_end");
         let advantages = advantages_tensor(&advantages, &device)?;
         let item = LiveItem {
@@ -2341,7 +2592,8 @@ impl Trainer {
     /// kl/clip-mean divisor; `live.len()` at world 1). Under DP every rank runs
     /// these epochs — `live` may be empty on a rank whose shard was
     /// all-degenerate; it participates in the collectives with zeros.
-    fn update_window<P: Policy>(
+    #[allow(clippy::too_many_arguments)]
+    fn update_window<P, E>(
         &self,
         policy: &P,
         live: &[LiveItem],
@@ -2349,10 +2601,16 @@ impl Trainer {
         window_tokens: f64,
         n_live_global: f64,
         beta: f64,
-    ) -> Result<InnerAgg, TrainerError> {
+        exec: &E,
+    ) -> Result<InnerAgg, TrainerError>
+    where
+        P: Policy,
+        E: PolicyExecution<P>,
+    {
         let mut agg = InnerAgg::default();
         for _ in 0..self.config.mu {
-            agg = self.accumulate_step(policy, live, ctx, window_tokens, n_live_global, beta)?;
+            agg =
+                self.accumulate_step(policy, live, ctx, window_tokens, n_live_global, beta, exec)?;
         }
         Ok(agg)
     }
@@ -2369,7 +2627,8 @@ impl Trainer {
     /// rank **before** any early return, so every later decision (canary, the
     /// no-signal skip) is a pure function of global state and the ranks act in
     /// lockstep.
-    fn accumulate_step<P: Policy>(
+    #[allow(clippy::too_many_arguments)]
+    fn accumulate_step<P, E>(
         &self,
         policy: &P,
         live: &[LiveItem],
@@ -2377,7 +2636,12 @@ impl Trainer {
         window_tokens: f64,
         n_live_global: f64,
         beta: f64,
-    ) -> Result<InnerAgg, TrainerError> {
+        exec: &E,
+    ) -> Result<InnerAgg, TrainerError>
+    where
+        P: Policy,
+        E: PolicyExecution<P>,
+    {
         let vars = ctx.vars;
         let mut acc: Vec<Option<Tensor>> = vec![None; vars.len()];
         let mut covered = vec![true; vars.len()];
@@ -2386,7 +2650,7 @@ impl Trainer {
         for item in live {
             ctx.gpu_mem.record("item_backward_start");
             let (grads, kl, clip_frac) =
-                self.item_backward(policy, item, window_tokens, vars, beta)?;
+                self.item_backward_with_execution(policy, item, window_tokens, vars, beta, exec)?;
             ctx.gpu_mem.record("item_backward_end");
             sum_kl += kl;
             sum_clip += clip_frac;
@@ -2517,6 +2781,7 @@ impl Trainer {
     /// `num_items_in_batch` normalizer, all-reduced in `run_window`), so
     /// summing the items across ranks is the complete normalization and no
     /// extra scale applies.
+    #[cfg(test)]
     fn item_backward<P: Policy>(
         &self,
         policy: &P,
@@ -2525,15 +2790,42 @@ impl Trainer {
         vars: &[Var],
         beta: f64,
     ) -> Result<(GradStore, f32, f32), TrainerError> {
+        let exec = UnshardedPolicyExecution;
+        self.item_backward_with_execution(policy, item, window_tokens, vars, beta, &exec)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn item_backward_with_execution<P, E>(
+        &self,
+        policy: &P,
+        item: &LiveItem,
+        window_tokens: f64,
+        vars: &[Var],
+        beta: f64,
+        exec: &E,
+    ) -> Result<(GradStore, f32, f32), TrainerError>
+    where
+        P: Policy,
+        E: PolicyExecution<P>,
+    {
         let g = item.rollout.len();
         let mb = self.config.backward_microbatch_size;
         if mb > 0 && mb < g {
-            return self.item_backward_microbatched(policy, item, window_tokens, vars, mb, beta);
+            return self.item_backward_microbatched(
+                policy,
+                item,
+                window_tokens,
+                vars,
+                mb,
+                beta,
+                exec,
+            );
         }
-        self.item_backward_uncut(policy, item, window_tokens, vars, 1.0, beta)
+        self.item_backward_uncut(policy, item, window_tokens, vars, 1.0, beta, exec)
     }
 
-    fn item_backward_microbatched<P: Policy>(
+    #[allow(clippy::too_many_arguments)]
+    fn item_backward_microbatched<P, E>(
         &self,
         policy: &P,
         item: &LiveItem,
@@ -2541,8 +2833,13 @@ impl Trainer {
         vars: &[Var],
         microbatch_size: usize,
         beta: f64,
-    ) -> Result<(GradStore, f32, f32), TrainerError> {
-        let logp_diag = policy.token_logprobs_detached(&item.rollout)?;
+        exec: &E,
+    ) -> Result<(GradStore, f32, f32), TrainerError>
+    where
+        P: Policy,
+        E: PolicyExecution<P>,
+    {
+        let logp_diag = exec.token_logprobs_detached(policy, &item.rollout)?;
         let (kl, clip_frac) = self.item_diagnostics(&logp_diag, item)?;
 
         let mut acc: Vec<Option<Tensor>> = vec![None; vars.len()];
@@ -2555,8 +2852,15 @@ impl Trainer {
                 LossType::Dapo => 1.0,
                 LossType::Grpo | LossType::DrGrpo => len as f64 / total_rows as f64,
             };
-            let (grads, _, _) =
-                self.item_backward_uncut(policy, &slice, window_tokens, vars, loss_scale, beta)?;
+            let (grads, _, _) = self.item_backward_uncut(
+                policy,
+                &slice,
+                window_tokens,
+                vars,
+                loss_scale,
+                beta,
+                exec,
+            )?;
             fold_var_grads(vars, &grads, &mut acc, &mut covered)?;
         }
         let store = empty_grad_store(vars)?;
@@ -2564,7 +2868,8 @@ impl Trainer {
         Ok((store, kl, clip_frac))
     }
 
-    fn item_backward_uncut<P: Policy>(
+    #[allow(clippy::too_many_arguments)]
+    fn item_backward_uncut<P, E>(
         &self,
         policy: &P,
         item: &LiveItem,
@@ -2572,8 +2877,13 @@ impl Trainer {
         vars: &[Var],
         loss_scale: f64,
         beta: f64,
-    ) -> Result<(GradStore, f32, f32), TrainerError> {
-        let logp = policy.token_logprobs(&item.rollout)?;
+        exec: &E,
+    ) -> Result<(GradStore, f32, f32), TrainerError>
+    where
+        P: Policy,
+        E: PolicyExecution<P>,
+    {
+        let logp = exec.token_logprobs(policy, &item.rollout)?;
         let cfg = LossCfg {
             clip_eps_low: self.config.clip_eps,
             clip_eps_high: self.config.clip_eps_high_eff(),
@@ -2651,18 +2961,23 @@ impl Trainer {
 
     /// Reference (adapter-disabled) log-probs, restoring the adapter before any
     /// fallible op can early-return — only computed when `beta > 0`.
-    fn reference_logprobs<P: Policy>(
+    fn reference_logprobs<P, E>(
         &self,
         policy: &mut P,
         rollout: &Rollout,
         beta: f64,
-    ) -> Result<Option<Tensor>, TrainerError> {
+        exec: &E,
+    ) -> Result<Option<Tensor>, TrainerError>
+    where
+        P: Policy,
+        E: PolicyExecution<P>,
+    {
         if beta <= 0.0 {
             return Ok(None);
         }
         policy.set_adapter_enabled(false);
         // Value-only (the reference is never trained): the detached scoring path.
-        let logp = policy.token_logprobs_detached(rollout);
+        let logp = exec.token_logprobs_detached(policy, rollout);
         policy.set_adapter_enabled(true); // always restore.
         Ok(Some(logp?))
     }
@@ -5492,6 +5807,259 @@ mod tests {
     fn trainer_passes_model_telemetry_recorder_only_when_gpu_probe_enabled() {
         assert_eq!(telemetry_probe_seen(false), vec![false]);
         assert_eq!(telemetry_probe_seen(true), vec![true]);
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct ProbeTpComm {
+        rank: usize,
+        world_size: usize,
+    }
+
+    impl Comm for ProbeTpComm {
+        fn rank(&self) -> usize {
+            self.rank
+        }
+
+        fn world_size(&self) -> usize {
+            self.world_size
+        }
+
+        fn all_reduce_sum(&self, _tensors: &mut Vec<Tensor>) -> Result<(), crate::comm::CommError> {
+            panic!("ProbeTpComm should only be inspected by the trainer dispatch test")
+        }
+
+        fn all_reduce_scalar_sum(&self, _value: f64) -> Result<f64, crate::comm::CommError> {
+            panic!("ProbeTpComm should only be inspected by the trainer dispatch test")
+        }
+    }
+
+    #[derive(Default)]
+    struct TpProbeCalls {
+        generate: usize,
+        live_logp: usize,
+        detached_logp: usize,
+        telemetry_seen: Vec<bool>,
+        comms: Vec<(usize, usize)>,
+    }
+
+    struct TpProbePolicy {
+        logp: Var,
+        enabled: bool,
+        calls: std::sync::Arc<std::sync::Mutex<TpProbeCalls>>,
+    }
+
+    impl Policy for TpProbePolicy {
+        fn generate(&mut self, _prompt: &[u32], _cfg: &GenConfig) -> CandleResult<Rollout> {
+            panic!("train_tensor_parallel must not call Policy::generate")
+        }
+
+        fn token_logprobs(&self, _rollout: &Rollout) -> CandleResult<Tensor> {
+            panic!("train_tensor_parallel must not call Policy::token_logprobs")
+        }
+
+        fn token_logprobs_detached(&self, _rollout: &Rollout) -> CandleResult<Tensor> {
+            panic!("train_tensor_parallel must not call Policy::token_logprobs_detached")
+        }
+
+        fn set_adapter_enabled(&mut self, enabled: bool) {
+            self.enabled = enabled;
+        }
+
+        fn adapter_enabled(&self) -> bool {
+            self.enabled
+        }
+
+        fn trainable_vars(&self) -> Vec<Var> {
+            vec![self.logp.clone()]
+        }
+
+        fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+            Ok(Vec::new())
+        }
+
+        fn restore_sampler_state(&mut self, _state: &[u8]) -> CandleResult<()> {
+            Ok(())
+        }
+    }
+
+    impl TensorParallelPolicy for TpProbePolicy {
+        fn generate_at_tensor_parallel_instrumented(
+            &mut self,
+            prompt: &[u32],
+            _cfg: &GenConfig,
+            _global_row_base: u64,
+            comm: &dyn Comm,
+            telemetry: Option<&mut dyn ModelTelemetryRecorder>,
+        ) -> CandleResult<Rollout> {
+            let mut calls = self.calls.lock().unwrap();
+            calls.generate += 1;
+            calls.telemetry_seen.push(telemetry.is_some());
+            calls.comms.push((comm.rank(), comm.world_size()));
+            Ok(Rollout {
+                token_ids: vec![vec![prompt[0], 1], vec![prompt[0], 2]],
+                prompt_len: prompt.len(),
+                completion_lens: vec![1, 1],
+                rollout_logprobs: Some(vec![vec![-0.5], vec![-0.5]]),
+            })
+        }
+
+        fn token_logprobs_tensor_parallel(
+            &self,
+            _rollout: &Rollout,
+            comm: &dyn Comm,
+        ) -> CandleResult<Tensor> {
+            let mut calls = self.calls.lock().unwrap();
+            calls.live_logp += 1;
+            calls.comms.push((comm.rank(), comm.world_size()));
+            Ok(self.logp.as_tensor().clone())
+        }
+
+        fn token_logprobs_tensor_parallel_detached(
+            &self,
+            _rollout: &Rollout,
+            comm: &dyn Comm,
+        ) -> CandleResult<Tensor> {
+            let mut calls = self.calls.lock().unwrap();
+            calls.detached_logp += 1;
+            calls.comms.push((comm.rank(), comm.world_size()));
+            Ok(self.logp.as_tensor().detach())
+        }
+    }
+
+    struct TpProbeCodec;
+    impl TokenizerLike for TpProbeCodec {
+        fn encode(&self, _text: &str) -> Vec<u32> {
+            vec![42]
+        }
+
+        fn decode(&self, ids: &[u32]) -> String {
+            ids.iter().map(u32::to_string).collect::<Vec<_>>().join(",")
+        }
+    }
+
+    struct TpProbeReward;
+    impl RewardFn for TpProbeReward {
+        type Target = ();
+
+        fn reward(&self, _sample: &Sample<()>, completion: &str) -> Result<f32, RewardError> {
+            Ok(match completion {
+                "1" => 0.0,
+                "2" => 2.0,
+                other => panic!("unexpected completion {other}"),
+            })
+        }
+    }
+
+    fn tp_probe_policy() -> (
+        TpProbePolicy,
+        std::sync::Arc<std::sync::Mutex<TpProbeCalls>>,
+    ) {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(TpProbeCalls::default()));
+        let logp = Var::from_tensor(&mat(&[&[-0.4], &[-0.6]])).unwrap();
+        (
+            TpProbePolicy {
+                logp,
+                enabled: true,
+                calls: std::sync::Arc::clone(&calls),
+            },
+            calls,
+        )
+    }
+
+    #[test]
+    fn train_tensor_parallel_routes_rollout_and_scoring_through_explicit_comm() {
+        let tmp = WireTmp::new("tp-trainer-dispatch");
+        let run = RunDir::create(&tmp.0, "tp-trainer-dispatch").unwrap();
+        let cfg = TrainerConfig {
+            steps: 1,
+            group_size: 2,
+            max_new_tokens: 1,
+            lr: 0.0,
+            beta: 0.1,
+            gpu_memory_probe: true,
+            ..TrainerConfig::default()
+        };
+        let mut trainer = Trainer::new(cfg, &run).unwrap();
+        let (mut policy, calls) = tp_probe_policy();
+        trainer
+            .train_tensor_parallel(
+                &mut policy,
+                &TpProbeReward,
+                &TpProbeCodec,
+                &[Sample::new("prompt", ())],
+                &ProbeTpComm {
+                    rank: 0,
+                    world_size: 1,
+                },
+            )
+            .unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.generate, 1);
+        assert!(calls.live_logp >= 1, "live TP scoring was not used");
+        assert!(
+            calls.detached_logp >= 2,
+            "old/reference TP detached scoring was not used"
+        );
+        assert_eq!(calls.telemetry_seen, vec![true]);
+        assert!(
+            calls
+                .comms
+                .iter()
+                .all(|&(rank, world)| (rank, world) == (0, 1)),
+            "trainer did not pass the explicit TP communicator to every TP hook: {:?}",
+            calls.comms
+        );
+    }
+
+    #[test]
+    fn train_tensor_parallel_rejects_sharded_tp_before_gradient_sync_contract() {
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = crate::comm::LocalComm::world(2)
+                .into_iter()
+                .enumerate()
+                .map(|(rank, comm)| {
+                    scope.spawn(move || {
+                        let tmp = WireTmp::new(&format!("tp-trainer-sharded-guard-{rank}"));
+                        let run = RunDir::create(&tmp.0, format!("tp-trainer-sharded-rank-{rank}"))
+                            .unwrap();
+                        let cfg = TrainerConfig {
+                            steps: 1,
+                            group_size: 2,
+                            max_new_tokens: 1,
+                            lr: 0.0,
+                            ..TrainerConfig::default()
+                        };
+                        let mut trainer = Trainer::new(cfg, &run).unwrap();
+                        let (mut policy, calls) = tp_probe_policy();
+                        let err = trainer
+                            .train_tensor_parallel(
+                                &mut policy,
+                                &TpProbeReward,
+                                &TpProbeCodec,
+                                &[Sample::new("prompt", ())],
+                                &comm,
+                            )
+                            .unwrap_err();
+                        assert!(
+                            matches!(&err, TrainerError::Contract(msg)
+                                if msg.contains("sharded tensor-parallel trainer execution")),
+                            "unexpected error on rank {rank}: {err:?}"
+                        );
+                        let calls = calls.lock().unwrap();
+                        assert_eq!(calls.generate, 0, "rank {rank} reached TP rollout");
+                        assert_eq!(calls.live_logp, 0, "rank {rank} reached live TP scoring");
+                        assert_eq!(
+                            calls.detached_logp, 0,
+                            "rank {rank} reached detached TP scoring"
+                        );
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
     }
 
     #[test]

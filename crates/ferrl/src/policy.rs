@@ -15,6 +15,7 @@
 use candle_core::backprop::GradStore;
 use candle_core::{Result as CandleResult, Tensor, Var};
 
+use crate::comm::Comm;
 use crate::telemetry::ModelTelemetryRecorder;
 
 /// A batch of sampled completions: token ids plus the prompt length that
@@ -407,6 +408,59 @@ pub trait Policy {
     fn lora_recipe(&self) -> Option<String> {
         None
     }
+}
+
+/// Explicit tensor-parallel execution hooks for policies that can route GRPO
+/// rollout and scoring through a caller-supplied communicator.
+///
+/// This is intentionally separate from [`Policy`]: normal trainer, loader, and
+/// CLI paths remain fail-closed for sharded tensor parallelism. Explicit
+/// trainer tensor-parallel entry points require callers to provide a
+/// tensor-parallel [`Comm`], and currently reject sharded communicators until
+/// TP gradient/optimizer/checkpoint semantics are wired.
+pub trait TensorParallelPolicy: Policy {
+    /// Generate a rollout through the policy's tensor-parallel rollout path,
+    /// using `comm` as the tensor-parallel communicator.
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if the tensor-parallel plan is unsupported,
+    /// rollout generation fails, or telemetry recording touches a failing model
+    /// path.
+    fn generate_at_tensor_parallel_instrumented(
+        &mut self,
+        prompt: &[u32],
+        cfg: &GenConfig,
+        global_row_base: u64,
+        comm: &dyn Comm,
+        telemetry: Option<&mut dyn ModelTelemetryRecorder>,
+    ) -> CandleResult<Rollout>;
+
+    /// Per-token log-probabilities through the policy's tensor-parallel scoring
+    /// path, as a differentiable tensor.
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if the tensor-parallel plan is unsupported or the
+    /// scoring forward fails.
+    fn token_logprobs_tensor_parallel(
+        &self,
+        rollout: &Rollout,
+        comm: &dyn Comm,
+    ) -> CandleResult<Tensor>;
+
+    /// Detached/value-only variant of
+    /// [`token_logprobs_tensor_parallel`](Self::token_logprobs_tensor_parallel).
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if the tensor-parallel plan is unsupported or the
+    /// scoring forward fails.
+    fn token_logprobs_tensor_parallel_detached(
+        &self,
+        rollout: &Rollout,
+        comm: &dyn Comm,
+    ) -> CandleResult<Tensor>;
 }
 
 #[cfg(test)]
