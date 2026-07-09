@@ -25,7 +25,7 @@ use crate::gemma4::{
 };
 use crate::lm_policy::{Gemma4Policy, Qwen3_5Policy, QwenPolicy};
 use crate::lora::{BaseQuantization, DenseLoraTargets};
-use crate::policy::{GenConfig, Policy, Rollout};
+use crate::policy::{GenConfig, Policy, Rollout, TensorParallelPolicy};
 use crate::qwen::QwenGradModel;
 use crate::qwen35::{
     varbuilder_from_pretrained, LoraTargets as Qwen35LoraTargets, Qwen3_5Config, Qwen3_5GradModel,
@@ -168,6 +168,16 @@ impl AutoPolicy {
             Self::Gemma4(policy) => policy.model().activation_checkpointing(),
         }
     }
+
+    /// Whether the loaded model family has real tensor-parallel model execution
+    /// wired behind [`TensorParallelPolicy`].
+    #[must_use]
+    pub fn supports_tensor_parallel(&self) -> bool {
+        match self {
+            Self::Qwen(_) | Self::Gemma4(_) => true,
+            Self::Qwen3_5(_) => false,
+        }
+    }
 }
 
 impl Policy for AutoPolicy {
@@ -281,6 +291,65 @@ impl Policy for AutoPolicy {
             Self::Qwen(policy) => policy.lora_recipe(),
             Self::Qwen3_5(policy) => policy.lora_recipe(),
             Self::Gemma4(policy) => policy.lora_recipe(),
+        }
+    }
+}
+
+impl TensorParallelPolicy for AutoPolicy {
+    fn generate_at_tensor_parallel_instrumented(
+        &mut self,
+        prompt: &[u32],
+        cfg: &GenConfig,
+        global_row_base: u64,
+        comm: &dyn crate::Comm,
+        telemetry: Option<&mut dyn ModelTelemetryRecorder>,
+    ) -> CandleResult<Rollout> {
+        match self {
+            Self::Qwen(policy) => policy.generate_at_tensor_parallel_instrumented(
+                prompt,
+                cfg,
+                global_row_base,
+                comm,
+                telemetry,
+            ),
+            Self::Qwen3_5(policy) => policy.generate_at_tensor_parallel_instrumented(
+                prompt,
+                cfg,
+                global_row_base,
+                comm,
+                telemetry,
+            ),
+            Self::Gemma4(policy) => policy.generate_at_tensor_parallel_instrumented(
+                prompt,
+                cfg,
+                global_row_base,
+                comm,
+                telemetry,
+            ),
+        }
+    }
+
+    fn token_logprobs_tensor_parallel(
+        &self,
+        rollout: &Rollout,
+        comm: &dyn crate::Comm,
+    ) -> CandleResult<Tensor> {
+        match self {
+            Self::Qwen(policy) => policy.token_logprobs_tensor_parallel(rollout, comm),
+            Self::Qwen3_5(policy) => policy.token_logprobs_tensor_parallel(rollout, comm),
+            Self::Gemma4(policy) => policy.token_logprobs_tensor_parallel(rollout, comm),
+        }
+    }
+
+    fn token_logprobs_tensor_parallel_detached(
+        &self,
+        rollout: &Rollout,
+        comm: &dyn crate::Comm,
+    ) -> CandleResult<Tensor> {
+        match self {
+            Self::Qwen(policy) => policy.token_logprobs_tensor_parallel_detached(rollout, comm),
+            Self::Qwen3_5(policy) => policy.token_logprobs_tensor_parallel_detached(rollout, comm),
+            Self::Gemma4(policy) => policy.token_logprobs_tensor_parallel_detached(rollout, comm),
         }
     }
 }
@@ -848,6 +917,7 @@ mod tests {
             },
         )
         .unwrap();
+        assert!(!policy.supports_tensor_parallel());
         let AutoPolicy::Qwen3_5(policy) = policy else {
             panic!("expected Qwen3.5 auto-loader branch");
         };

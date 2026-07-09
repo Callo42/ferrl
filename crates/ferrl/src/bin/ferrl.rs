@@ -56,13 +56,13 @@ use sha2::{Digest, Sha256};
 use tracing::info;
 
 use ferrl::countdown::{build_prompt, generate_dataset, CountdownConfig, CountdownProblem};
-use ferrl::policy::GenConfig;
+use ferrl::policy::{GenConfig, Policy, TensorParallelPolicy};
 use ferrl::telemetry::{CandidateRecord, RegressionFailure};
 use ferrl::{
     compare_distributed_metrics, compare_metrics, evaluate, load_auto_policy, read_jsonl,
     summarize, train_eval_split, BaseQuantization, CountdownReward, LoaderOpts, MathProblem,
-    MathReward, RegressionBudget, RegressionReport, RewardFn, RunDir, Sample, TensorParallelPlan,
-    Trainer, TrainerConfig, TrimulReward,
+    MathReward, RegressionBudget, RegressionReport, RewardFn, RunDir, RunStop, Sample,
+    TensorParallelPlan, TokenizerLike, Trainer, TrainerConfig, TrimulReward,
 };
 
 /// A task's train/eval split: `(train, eval)` samples of the task's target type.
@@ -1049,8 +1049,9 @@ struct DistributedCfg {
 #[serde(default, deny_unknown_fields)]
 struct TensorParallelCfg {
     /// When true, validate this process as one rank of a tensor-parallel model
-    /// world. Multi-rank execution is intentionally rejected until model loaders
-    /// use the public tensor-parallel plan instead of silently falling back.
+    /// world. This slice opens execution through the explicit trainer TP hooks,
+    /// while loaders still full-load weights on every rank until sharded
+    /// safetensors loading lands.
     enabled: bool,
     /// Tensor-parallel rank in `0..world_size`.
     rank: usize,
@@ -1082,15 +1083,8 @@ impl TensorParallelCfg {
             .map_err(|e| CliError::msg(e.to_string()))
     }
 
-    fn validate_current_support(self) -> Result<(), CliError> {
-        let plan = self.plan()?;
-        if plan.is_sharded() {
-            return Err(CliError::msg(
-                "tensor_parallel.enabled is parsed and rank/world validated, but \
-                 tensor-parallel model execution is not wired yet",
-            ));
-        }
-        Ok(())
+    fn validate_current_support(self) -> Result<TensorParallelPlan, CliError> {
+        self.plan()
     }
 }
 
@@ -1141,10 +1135,10 @@ fn default_out_dir() -> PathBuf {
 
 impl RunConfig {
     fn open_device(&self) -> Result<Device, CliError> {
-        if self.distributed.enabled {
+        if self.distributed.enabled || self.tensor_parallel.plan()?.is_sharded() {
             if self.device != DeviceSel::Cuda {
                 return Err(CliError::msg(
-                    "distributed.enabled requires device = \"cuda\"",
+                    "distributed.enabled or sharded tensor_parallel requires device = \"cuda\"",
                 ));
             }
             open_distributed_device()
@@ -1170,11 +1164,47 @@ impl RunConfig {
     fn validate_current_config_support(&self) -> Result<(), CliError> {
         self.trimul.reward.validate().map_err(CliError::msg)?;
         self.run_health.validate_current_support(&self.trainer)?;
-        self.tensor_parallel.validate_current_support()
+        let plan = self.tensor_parallel.validate_current_support()?;
+        if plan.is_sharded() {
+            if self.distributed.enabled {
+                return Err(CliError::msg(
+                    "simultaneous sharded distributed data parallelism and tensor_parallel \
+                     execution is not wired yet",
+                ));
+            }
+            if self.device != DeviceSel::Cuda {
+                return Err(CliError::msg(
+                    "sharded tensor_parallel execution requires device = \"cuda\"",
+                ));
+            }
+            if self.policy.activation_checkpointing {
+                return Err(CliError::msg(
+                    "sharded tensor_parallel execution does not support \
+                     policy.activation_checkpointing yet",
+                ));
+            }
+            if self.data.eval_n > 0 {
+                return Err(CliError::msg(
+                    "sharded tensor_parallel execution does not support held-out eval yet; \
+                     set data.eval_n = 0",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn tensor_parallel_plan(&self) -> TensorParallelPlan {
+        self.tensor_parallel
+            .plan()
+            .expect("RunConfig validation must validate tensor_parallel")
     }
 
     /// The loader options for this run (rollout temperature mirrors the trainer's).
     fn loader_opts(&self) -> LoaderOpts {
+        // This PR opens public *execution* through the explicit TP trainer hooks,
+        // but does not claim sharded safetensors loading yet. Keep loaders in the
+        // full-weight path so their existing sharded LoaderOpts rejection remains
+        // a library-level fail-closed guard for direct callers.
         LoaderOpts {
             lora_rank: self.policy.lora_rank,
             lora_alpha: self.policy.lora_alpha,
@@ -1184,10 +1214,7 @@ impl RunConfig {
             temperature: self.trainer.temperature,
             memory_efficient_cached_gqa: self.policy.memory_efficient_cached_gqa,
             base_quantization: self.policy.base_quantization.as_base_quantization(),
-            tensor_parallel: self
-                .tensor_parallel
-                .plan()
-                .expect("RunConfig validation must validate tensor_parallel"),
+            tensor_parallel: TensorParallelPlan::single(),
         }
     }
 
@@ -1197,9 +1224,12 @@ impl RunConfig {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
         let base = format!("{}-{stamp}", self.task);
+        let tp = self.tensor_parallel_plan();
         if self.distributed.enabled {
             let rank = std::env::var("SLURM_PROCID").unwrap_or_else(|_| "unknown".to_owned());
             format!("{base}-rank{rank}")
+        } else if tp.is_sharded() {
+            format!("{base}-rank{}", tp.rank())
         } else {
             base
         }
@@ -1391,6 +1421,12 @@ fn run_training<R: RewardFn>(
 ) -> Result<(), CliError> {
     let (mut policy, tok) = load_auto_policy(&cfg.model_dir, device, &cfg.loader_opts())?;
     policy.set_activation_checkpointing(cfg.policy.activation_checkpointing);
+    let tensor_parallel_plan = cfg.tensor_parallel_plan();
+    if tensor_parallel_plan.is_sharded() && !policy.supports_tensor_parallel() {
+        return Err(CliError::msg(
+            "loaded checkpoint family does not support tensor_parallel execution yet",
+        ));
+    }
     let tcfg = cfg.trainer.clone();
     let gen = GenConfig::from(&tcfg);
     info!(
@@ -1400,6 +1436,8 @@ fn run_training<R: RewardFn>(
         activation_checkpointing = policy.activation_checkpointing(),
         train = train.len(),
         eval = eval.len(),
+        tensor_parallel_rank = tensor_parallel_plan.rank(),
+        tensor_parallel_world = tensor_parallel_plan.world_size(),
         "ferrl train: starting"
     );
 
@@ -1412,7 +1450,15 @@ fn run_training<R: RewardFn>(
         )?;
     }
     let mut trainer = open_trainer(tcfg, &run, cfg.distributed.enabled)?;
-    let (history, _stop) = trainer.train(&mut policy, reward, &tok, train)?;
+    let tensor_parallel_comm = open_tensor_parallel_comm(cfg)?;
+    let (history, _stop) = train_with_optional_tensor_parallel(
+        &mut trainer,
+        &mut policy,
+        reward,
+        &tok,
+        train,
+        tensor_parallel_comm.as_deref(),
+    )?;
     if let Some(summary) = summarize(&history) {
         info!(steps = summary.steps, "ferrl train: complete");
         apply_train_run_health_policy(cfg, &history, &summary, &run)?;
@@ -1434,6 +1480,24 @@ fn run_training<R: RewardFn>(
         run.root().display()
     );
     Ok(())
+}
+
+fn train_with_optional_tensor_parallel<P, R>(
+    trainer: &mut Trainer,
+    policy: &mut P,
+    reward: &R,
+    tokenizer: &dyn TokenizerLike,
+    train: &[Sample<R::Target>],
+    tensor_parallel_comm: Option<&dyn ferrl::Comm>,
+) -> Result<(Vec<ferrl::Metrics>, RunStop), CliError>
+where
+    P: Policy + TensorParallelPolicy,
+    R: RewardFn,
+{
+    match tensor_parallel_comm {
+        Some(comm) => Ok(trainer.train_tensor_parallel(policy, reward, tokenizer, train, comm)?),
+        None => Ok(trainer.train(policy, reward, tokenizer, train)?),
+    }
 }
 
 fn apply_train_run_health_policy(
@@ -1470,6 +1534,25 @@ fn open_trainer(
     }
 }
 
+fn open_tensor_parallel_comm(cfg: &RunConfig) -> Result<Option<Box<dyn ferrl::Comm>>, CliError> {
+    if !cfg.tensor_parallel_plan().is_sharded() {
+        return Ok(None);
+    }
+    open_sharded_tensor_parallel_comm().map(Some)
+}
+
+#[cfg(feature = "nccl")]
+fn open_sharded_tensor_parallel_comm() -> Result<Box<dyn ferrl::Comm>, CliError> {
+    Ok(Box::new(ferrl::NcclComm::from_slurm_env()?))
+}
+
+#[cfg(not(feature = "nccl"))]
+fn open_sharded_tensor_parallel_comm() -> Result<Box<dyn ferrl::Comm>, CliError> {
+    Err(CliError::msg(
+        "sharded tensor_parallel execution requires building ferrl with --features nccl",
+    ))
+}
+
 #[cfg(feature = "nccl")]
 fn open_distributed_device() -> Result<Device, CliError> {
     let nccl = ferrl::NcclConfig::from_env()?;
@@ -1484,7 +1567,8 @@ fn open_distributed_device() -> Result<Device, CliError> {
 #[cfg(not(feature = "nccl"))]
 fn open_distributed_device() -> Result<Device, CliError> {
     Err(CliError::msg(
-        "distributed.enabled requires building ferrl with --features nccl",
+        "distributed.enabled or sharded tensor_parallel execution requires building ferrl \
+         with --features nccl",
     ))
 }
 
@@ -3606,6 +3690,8 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_core::{Result as CandleResult, Tensor, Var};
+    use std::sync::{Arc, Mutex};
 
     struct TestDir(PathBuf);
 
@@ -3630,6 +3716,32 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn countdown_train_config(extra_fields: &str) -> String {
+        let extra = if extra_fields.trim().is_empty() {
+            String::new()
+        } else {
+            format!("{extra_fields},")
+        };
+        format!(
+            r#"{{
+                "task": "countdown",
+                "model_dir": "/models/qwen3-0.6b",
+                {extra}
+                "trainer": {{ "steps": 1, "group_size": 2, "max_new_tokens": 8,
+                    "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
+                    "lr": 1e-5, "weight_decay": 0.0,
+                    "loss_type": "grpo", "scale_rewards": "group" }}
+            }}"#
+        )
+    }
+
+    fn write_countdown_train_config(tag: &str, extra_fields: &str) -> (TestDir, PathBuf) {
+        let tmp = TestDir::new(tag);
+        let path = tmp.path().join("run.json");
+        std::fs::write(&path, countdown_train_config(extra_fields)).unwrap();
+        (tmp, path)
     }
 
     fn trimul_score_test_config(secret_seed: u64) -> String {
@@ -4004,23 +4116,266 @@ mod tests {
     }
 
     #[test]
-    fn tensor_parallel_multi_rank_execution_is_not_silent_fallback() {
-        let tmp = TestDir::new("tensor-parallel-not-silent-fallback");
-        let config = r#"{
-            "task": "countdown",
-            "model_dir": "/models/qwen3-0.6b",
-            "tensor_parallel": { "enabled": true, "rank": 0, "world_size": 2 },
-            "trainer": { "steps": 1, "group_size": 2, "max_new_tokens": 8,
-                         "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
-                         "lr": 1e-5, "weight_decay": 0.0,
-                         "loss_type": "grpo", "scale_rewards": "group" }
-        }"#;
-        let path = tmp.path().join("run.json");
-        std::fs::write(&path, config).unwrap();
+    fn tensor_parallel_multi_rank_config_uses_public_execution_plan_without_sharded_loader_opts() {
+        let (_tmp, path) = write_countdown_train_config(
+            "tensor-parallel-public-execution-plan",
+            r#""device": "cuda",
+               "tensor_parallel": { "enabled": true, "rank": 0, "world_size": 2 }"#,
+        );
+
+        let cfg = RunConfig::load(&path).unwrap();
+
+        assert_eq!(
+            cfg.tensor_parallel_plan(),
+            TensorParallelPlan::new(0, 2).unwrap()
+        );
+        assert_eq!(
+            cfg.loader_opts().tensor_parallel,
+            TensorParallelPlan::single()
+        );
+        let run_id = cfg.run_id();
+        assert!(run_id.starts_with("countdown-"), "{run_id}");
+        assert!(run_id.ends_with("-rank0"), "{run_id}");
+    }
+
+    #[test]
+    fn tensor_parallel_multi_rank_requires_cuda_device() {
+        let (_tmp, path) = write_countdown_train_config(
+            "tensor-parallel-requires-cuda",
+            r#""tensor_parallel": { "enabled": true, "rank": 0, "world_size": 2 }"#,
+        );
 
         let err = RunConfig::load(&path).unwrap_err().to_string();
 
-        assert!(err.contains("tensor-parallel model execution is not wired yet"));
+        assert!(err.contains("requires device = \"cuda\""));
+    }
+
+    #[test]
+    fn tensor_parallel_multi_rank_rejects_sharded_dp_combo() {
+        let (_tmp, path) = write_countdown_train_config(
+            "tensor-parallel-rejects-sharded-dp",
+            r#""device": "cuda",
+               "distributed": { "enabled": true },
+               "tensor_parallel": { "enabled": true, "rank": 0, "world_size": 2 }"#,
+        );
+
+        let err = RunConfig::load(&path).unwrap_err().to_string();
+
+        assert!(err.contains("simultaneous sharded distributed data parallelism"));
+    }
+
+    #[test]
+    fn tensor_parallel_multi_rank_rejects_activation_checkpointing() {
+        let (_tmp, path) = write_countdown_train_config(
+            "tensor-parallel-rejects-activation-checkpointing",
+            r#""device": "cuda",
+               "policy": { "activation_checkpointing": true },
+               "tensor_parallel": { "enabled": true, "rank": 0, "world_size": 2 }"#,
+        );
+
+        let err = RunConfig::load(&path).unwrap_err().to_string();
+
+        assert!(err.contains("policy.activation_checkpointing"));
+    }
+
+    #[test]
+    fn tensor_parallel_multi_rank_rejects_held_out_eval() {
+        let (_tmp, path) = write_countdown_train_config(
+            "tensor-parallel-rejects-held-out-eval",
+            r#""device": "cuda",
+               "data": { "eval_n": 1 },
+               "tensor_parallel": { "enabled": true, "rank": 0, "world_size": 2 }"#,
+        );
+
+        let err = RunConfig::load(&path).unwrap_err().to_string();
+
+        assert!(err.contains("held-out eval"));
+    }
+
+    #[derive(Clone, Default)]
+    struct CliTpCalls {
+        generate: usize,
+        live_logp: usize,
+        detached_logp: usize,
+        comms: Vec<(usize, usize)>,
+    }
+
+    struct CliTpPolicy {
+        logp: Var,
+        enabled: bool,
+        calls: Arc<Mutex<CliTpCalls>>,
+    }
+
+    impl Policy for CliTpPolicy {
+        fn generate(
+            &mut self,
+            _prompt: &[u32],
+            _cfg: &GenConfig,
+        ) -> CandleResult<ferrl::policy::Rollout> {
+            panic!("CLI tensor_parallel helper must not call Policy::generate")
+        }
+
+        fn token_logprobs(&self, _rollout: &ferrl::policy::Rollout) -> CandleResult<Tensor> {
+            panic!("CLI tensor_parallel helper must not call Policy::token_logprobs")
+        }
+
+        fn token_logprobs_detached(
+            &self,
+            _rollout: &ferrl::policy::Rollout,
+        ) -> CandleResult<Tensor> {
+            panic!("CLI tensor_parallel helper must not call Policy::token_logprobs_detached")
+        }
+
+        fn set_adapter_enabled(&mut self, enabled: bool) {
+            self.enabled = enabled;
+        }
+
+        fn adapter_enabled(&self) -> bool {
+            self.enabled
+        }
+
+        fn trainable_vars(&self) -> Vec<Var> {
+            vec![self.logp.clone()]
+        }
+
+        fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+            Ok(Vec::new())
+        }
+
+        fn restore_sampler_state(&mut self, _state: &[u8]) -> CandleResult<()> {
+            Ok(())
+        }
+    }
+
+    impl TensorParallelPolicy for CliTpPolicy {
+        fn generate_at_tensor_parallel_instrumented(
+            &mut self,
+            prompt: &[u32],
+            _cfg: &GenConfig,
+            _global_row_base: u64,
+            comm: &dyn ferrl::Comm,
+            _telemetry: Option<&mut dyn ferrl::ModelTelemetryRecorder>,
+        ) -> CandleResult<ferrl::policy::Rollout> {
+            let mut calls = self.calls.lock().unwrap();
+            calls.generate += 1;
+            calls.comms.push((comm.rank(), comm.world_size()));
+            Ok(ferrl::policy::Rollout {
+                token_ids: vec![vec![prompt[0], 1], vec![prompt[0], 2]],
+                prompt_len: prompt.len(),
+                completion_lens: vec![1, 1],
+                rollout_logprobs: Some(vec![vec![-0.5], vec![-0.5]]),
+            })
+        }
+
+        fn token_logprobs_tensor_parallel(
+            &self,
+            _rollout: &ferrl::policy::Rollout,
+            comm: &dyn ferrl::Comm,
+        ) -> CandleResult<Tensor> {
+            let mut calls = self.calls.lock().unwrap();
+            calls.live_logp += 1;
+            calls.comms.push((comm.rank(), comm.world_size()));
+            Ok(self.logp.as_tensor().clone())
+        }
+
+        fn token_logprobs_tensor_parallel_detached(
+            &self,
+            _rollout: &ferrl::policy::Rollout,
+            comm: &dyn ferrl::Comm,
+        ) -> CandleResult<Tensor> {
+            let mut calls = self.calls.lock().unwrap();
+            calls.detached_logp += 1;
+            calls.comms.push((comm.rank(), comm.world_size()));
+            Ok(self.logp.as_tensor().detach())
+        }
+    }
+
+    struct CliTpCodec;
+
+    impl TokenizerLike for CliTpCodec {
+        fn encode(&self, _text: &str) -> Vec<u32> {
+            vec![42]
+        }
+
+        fn decode(&self, ids: &[u32]) -> String {
+            ids.iter().map(u32::to_string).collect::<Vec<_>>().join(",")
+        }
+    }
+
+    struct CliTpReward;
+
+    impl RewardFn for CliTpReward {
+        type Target = ();
+
+        fn reward(
+            &self,
+            _sample: &Sample<()>,
+            completion: &str,
+        ) -> Result<f32, ferrl::RewardError> {
+            Ok(match completion {
+                "1" => 0.0,
+                "2" => 2.0,
+                other => panic!("unexpected completion {other}"),
+            })
+        }
+    }
+
+    fn cli_tp_policy() -> (CliTpPolicy, Arc<Mutex<CliTpCalls>>) {
+        let calls = Arc::new(Mutex::new(CliTpCalls::default()));
+        let logp =
+            Var::from_tensor(&Tensor::from_vec(vec![-0.4f32, -0.6], (2, 1), &Device::Cpu).unwrap())
+                .unwrap();
+        (
+            CliTpPolicy {
+                logp,
+                enabled: true,
+                calls: Arc::clone(&calls),
+            },
+            calls,
+        )
+    }
+
+    #[test]
+    fn train_helper_routes_tensor_parallel_comm_through_public_trainer_hook() {
+        let tmp = TestDir::new("tensor-parallel-train-helper-dispatch");
+        let run = RunDir::create(tmp.path(), "tp-train-helper-dispatch").unwrap();
+        let cfg = TrainerConfig {
+            steps: 1,
+            group_size: 2,
+            max_new_tokens: 1,
+            lr: 0.0,
+            beta: 0.1,
+            ..TrainerConfig::default()
+        };
+        let mut trainer = Trainer::new(cfg, &run).unwrap();
+        let (mut policy, calls) = cli_tp_policy();
+        let comm = ferrl::LocalComm::world(1).pop().unwrap();
+
+        train_with_optional_tensor_parallel(
+            &mut trainer,
+            &mut policy,
+            &CliTpReward,
+            &CliTpCodec,
+            &[Sample::new("prompt", ())],
+            Some(&comm),
+        )
+        .unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.generate, 1);
+        assert!(calls.live_logp >= 1, "live TP scoring was not used");
+        assert!(
+            calls.detached_logp >= 2,
+            "old/reference TP detached scoring was not used"
+        );
+        assert!(
+            calls
+                .comms
+                .iter()
+                .all(|&(rank, world)| (rank, world) == (0, 1)),
+            "trainer did not pass the explicit TP communicator: {:?}",
+            calls.comms
+        );
     }
 
     #[test]
