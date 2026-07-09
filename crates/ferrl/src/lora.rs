@@ -506,6 +506,7 @@ impl Proj {
 
     /// Input-axis partial from a full input tensor. The caller must sum every
     /// rank's partial to recover the full projection output.
+    #[cfg(test)]
     pub(crate) fn row_parallel_forward_partial(
         &self,
         x: &Tensor,
@@ -535,6 +536,7 @@ impl Proj {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn dims2(&self) -> CandleResult<(usize, usize)> {
         match self {
             Self::Frozen(w) => w.dims2(),

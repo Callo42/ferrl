@@ -8,11 +8,16 @@
 //! and N contiguous shards must reassemble the same projection/log-prob values
 //! as the unsharded path.
 
-use candle_core::{Result as CandleResult, Tensor};
+use candle_core::{DType, Result as CandleResult, Tensor};
 
 use crate::blocks::frozen_linear;
+use crate::comm::Comm;
 
 fn plan_to_candle<T>(result: Result<T, TensorParallelError>) -> CandleResult<T> {
+    result.map_err(|e| candle_core::Error::Msg(e.to_string()))
+}
+
+fn comm_to_candle<T>(result: Result<T, crate::comm::CommError>) -> CandleResult<T> {
     result.map_err(|e| candle_core::Error::Msg(e.to_string()))
 }
 
@@ -128,6 +133,34 @@ impl TensorParallelPlan {
         self.shard_axis("num_key_value_heads", dims.num_key_value_heads)?;
         Ok(())
     }
+}
+
+/// Build a [`TensorParallelPlan`] from a communicator's rank identity.
+///
+/// # Errors
+///
+/// Returns a candle error if the communicator reports an invalid rank/world
+/// coordinate.
+pub fn plan_from_comm(comm: &dyn Comm) -> CandleResult<TensorParallelPlan> {
+    plan_to_candle(TensorParallelPlan::new(comm.rank(), comm.world_size()))
+}
+
+/// Fail loud if `comm` and `plan` disagree about rank identity.
+///
+/// # Errors
+///
+/// Returns a candle error if either the rank or world size differs.
+pub fn validate_comm_plan(plan: TensorParallelPlan, comm: &dyn Comm) -> CandleResult<()> {
+    if plan.rank() != comm.rank() || plan.world_size() != comm.world_size() {
+        candle_core::bail!(
+            "tensor_parallel plan rank/world ({}, {}) does not match communicator ({}, {})",
+            plan.rank(),
+            plan.world_size(),
+            comm.rank(),
+            comm.world_size()
+        );
+    }
+    Ok(())
 }
 
 /// A contiguous rank-local slice of a full axis.
@@ -305,9 +338,57 @@ pub fn sum_row_parallel_partials(partials: &[Tensor]) -> CandleResult<Tensor> {
     Ok(out)
 }
 
+/// Row-parallel activation all-reduce with a local straight-through gradient.
+///
+/// A tensor-parallel row projection computes a rank-local partial `p_r` and the
+/// forward value must be `sum_r p_r` on every rank. The existing [`Comm`] seam
+/// moves values and does not define a distributed autograd op, so this helper
+/// rebuilds the returned tensor as:
+///
+/// `p_r + detach(all_reduce_sum(p_r) - p_r)`
+///
+/// The forward value is exactly the reduced sum, while the local backward
+/// derivative is the identity into `p_r`, which is the adjoint needed for the
+/// row-parallel partial on a rank that computes the same downstream loss.
+///
+/// Half-precision activations are staged through F32 for the collective because
+/// ferrl's current NCCL bridge only supports F32/F64 reductions.
+///
+/// # Errors
+///
+/// Returns a candle error if the plan and communicator disagree, if the
+/// communicator fails, or if any tensor op fails.
+pub fn all_reduce_sum_straight_through(
+    partial: &Tensor,
+    plan: TensorParallelPlan,
+    comm: &dyn Comm,
+) -> CandleResult<Tensor> {
+    validate_comm_plan(plan, comm)?;
+    if !plan.is_sharded() {
+        return Ok(partial.clone());
+    }
+
+    let original_dtype = partial.dtype();
+    let staged = match original_dtype {
+        DType::F32 | DType::F64 => partial.contiguous()?,
+        _ => partial.to_dtype(DType::F32)?.contiguous()?,
+    };
+    let mut reduced = vec![staged];
+    comm_to_candle(comm.all_reduce_sum(&mut reduced))?;
+    let Some(mut reduced) = reduced.pop() else {
+        candle_core::bail!("tensor_parallel all-reduce returned no tensors");
+    };
+    if reduced.dtype() != original_dtype {
+        reduced = reduced.to_dtype(original_dtype)?;
+    }
+    let correction = reduced.broadcast_sub(partial)?.detach();
+    partial.broadcast_add(&correction)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::comm::{Comm, LocalComm};
     use candle_core::{Device, Var, D};
     use candle_nn::ops::log_softmax;
 
@@ -489,6 +570,54 @@ mod tests {
 
         assert_close(&sharded_logits, &full_logits, 1e-6);
         assert_close(&sharded_logp, &full_logp, 1e-6);
+    }
+
+    #[test]
+    fn activation_all_reduce_uses_reduced_value_but_local_gradient() {
+        let comms = LocalComm::world(2);
+        let results: Vec<(Vec<f32>, Vec<f32>, Vec<f32>)> = std::thread::scope(|s| {
+            let handles: Vec<_> = comms
+                .into_iter()
+                .map(|comm| {
+                    s.spawn(move || {
+                        let plan = plan_from_comm(&comm).unwrap();
+                        let rank = comm.rank();
+                        let base = match rank {
+                            0 => 1.0f32,
+                            1 => 2.0f32,
+                            other => panic!("unexpected test rank {other}"),
+                        };
+                        let scale = match rank {
+                            0 => 1.0,
+                            1 => 2.0,
+                            other => panic!("unexpected test rank {other}"),
+                        };
+                        let v = Var::from_tensor(
+                            &Tensor::from_vec(vec![base, base + 1.0], 2, &Device::Cpu).unwrap(),
+                        )
+                        .unwrap();
+                        let partial = (v.as_tensor() * scale).unwrap();
+                        let reduced =
+                            all_reduce_sum_straight_through(&partial, plan, &comm).unwrap();
+                        let grads = reduced.sum_all().unwrap().backward().unwrap();
+                        let grad = grads.get(v.as_tensor()).unwrap();
+                        (
+                            partial.to_vec1::<f32>().unwrap(),
+                            reduced.to_vec1::<f32>().unwrap(),
+                            grad.to_vec1::<f32>().unwrap(),
+                        )
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        assert_eq!(results[0].0, vec![1.0, 2.0]);
+        assert_eq!(results[1].0, vec![4.0, 6.0]);
+        assert_eq!(results[0].1, vec![5.0, 8.0]);
+        assert_eq!(results[1].1, vec![5.0, 8.0]);
+        assert_eq!(results[0].2, vec![1.0, 1.0]);
+        assert_eq!(results[1].2, vec![2.0, 2.0]);
     }
 
     #[test]

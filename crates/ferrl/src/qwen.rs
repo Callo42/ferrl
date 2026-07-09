@@ -136,6 +136,7 @@ pub type MergedDecoder = DenseCachedDecoder;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::comm::LocalComm;
     use crate::dense::DenseLayer;
     use crate::lora::{DenseLoraTargets, Proj};
     use crate::model::GradModel;
@@ -759,10 +760,61 @@ mod tests {
         }
     }
 
+    fn arm_adapter_deterministic(model: &QwenGradModel) {
+        for (i, v) in model.trainable_vars().iter().enumerate() {
+            let dims = v.as_tensor().dims().to_vec();
+            let n = dims.iter().product::<usize>();
+            let data: Vec<f32> = (0..n)
+                .map(|j| 0.03 + i as f32 * 0.004 + j as f32 * 0.002)
+                .collect();
+            v.set(&Tensor::from_vec(data, dims, &dev()).unwrap())
+                .unwrap();
+        }
+    }
+
     fn all_tp_plans(world_size: usize) -> Vec<TensorParallelPlan> {
         (0..world_size)
             .map(|rank| TensorParallelPlan::new(rank, world_size).unwrap())
             .collect()
+    }
+
+    fn tiny_tp_gqa_cfg() -> Config {
+        let mut cfg = tiny_cfg();
+        cfg.hidden_size = 16;
+        cfg.num_attention_heads = 4;
+        cfg.num_key_value_heads = 2;
+        cfg.head_dim = 4;
+        cfg.intermediate_size = 16;
+        assert_eq!(cfg.num_attention_heads / cfg.num_key_value_heads, 2);
+        cfg
+    }
+
+    fn assert_rank_tp_projection_grads_live(
+        rank: usize,
+        vars: &[Var],
+        grads: &GradStore,
+        cfg: &Config,
+    ) {
+        let names = [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ];
+        for layer in 0..cfg.num_hidden_layers {
+            for (pair_idx, name) in names.iter().enumerate() {
+                let a_idx = layer * 14 + pair_idx * 2;
+                let b_idx = a_idx + 1;
+                let c = grad_coverage(&vars[a_idx..=b_idx], grads).unwrap();
+                assert!(
+                    c.is_covered() && c.nonzero == c.total && c.nonfinite == 0,
+                    "rank {rank} layer {layer} {name} TP backward grads not fully live: {c:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -888,6 +940,165 @@ mod tests {
             worst <= 1e-5,
             "o_proj row partials diverged from full projection: {worst}"
         );
+    }
+
+    #[test]
+    fn dense_tensor_parallel_collective_forward_matches_unsharded_logits() {
+        let mut cfg = tiny_cfg();
+        cfg.num_key_value_heads = 2;
+        let vb = tiny_vb(&cfg);
+        let input = ids(5);
+        let reference_model = QwenGradModel::load_with_targets(
+            &cfg,
+            &vb,
+            2,
+            4.0,
+            DType::F32,
+            DenseLoraTargets::industrial(),
+        )
+        .unwrap();
+        arm_adapter_deterministic(&reference_model);
+        let reference = reference_model.forward(&input).unwrap();
+        let reference_flat = reference.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+        let comms = LocalComm::world(2);
+        let outputs: Vec<Vec<f32>> = std::thread::scope(|s| {
+            let handles: Vec<_> = comms
+                .into_iter()
+                .map(|comm| {
+                    let cfg = cfg.clone();
+                    let vb = vb.clone();
+                    let input = input.clone();
+                    s.spawn(move || {
+                        let model = QwenGradModel::load_with_targets(
+                            &cfg,
+                            &vb,
+                            2,
+                            4.0,
+                            DType::F32,
+                            DenseLoraTargets::industrial(),
+                        )
+                        .unwrap();
+                        arm_adapter_deterministic(&model);
+                        let logits = model.forward_tensor_parallel(&input, &comm).unwrap();
+                        assert_eq!(logits.dims(), &[1, 5, cfg.vocab_size]);
+                        logits.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        for (rank, got) in outputs.iter().enumerate() {
+            let worst = got
+                .iter()
+                .zip(&reference_flat)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                worst <= 1e-5,
+                "rank {rank} TP collective logits diverged from unsharded logits: {worst}"
+            );
+        }
+    }
+
+    #[test]
+    fn dense_tensor_parallel_collective_gqa_forward_matches_unsharded_logits() {
+        let cfg = tiny_tp_gqa_cfg();
+        let vb = tiny_vb(&cfg);
+        let input = ids(5);
+        let reference_model = QwenGradModel::load_with_targets(
+            &cfg,
+            &vb,
+            2,
+            4.0,
+            DType::F32,
+            DenseLoraTargets::industrial(),
+        )
+        .unwrap();
+        arm_adapter_deterministic(&reference_model);
+        let reference = reference_model.forward(&input).unwrap();
+        let reference_flat = reference.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+        let comms = LocalComm::world(2);
+        let outputs: Vec<Vec<f32>> = std::thread::scope(|s| {
+            let handles: Vec<_> = comms
+                .into_iter()
+                .map(|comm| {
+                    let cfg = cfg.clone();
+                    let vb = vb.clone();
+                    let input = input.clone();
+                    s.spawn(move || {
+                        let model = QwenGradModel::load_with_targets(
+                            &cfg,
+                            &vb,
+                            2,
+                            4.0,
+                            DType::F32,
+                            DenseLoraTargets::industrial(),
+                        )
+                        .unwrap();
+                        arm_adapter_deterministic(&model);
+                        let logits = model.forward_tensor_parallel(&input, &comm).unwrap();
+                        assert_eq!(logits.dims(), &[1, 5, cfg.vocab_size]);
+                        logits.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        for (rank, got) in outputs.iter().enumerate() {
+            let worst = got
+                .iter()
+                .zip(&reference_flat)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                worst <= 1e-5,
+                "rank {rank} GQA TP collective logits diverged from unsharded logits: {worst}"
+            );
+        }
+    }
+
+    #[test]
+    fn dense_tensor_parallel_collective_backward_keeps_adapter_grads_live() {
+        let cfg = tiny_tp_gqa_cfg();
+        let vb = tiny_vb(&cfg);
+        let input = ids(5);
+
+        let comms = LocalComm::world(2);
+        std::thread::scope(|s| {
+            let handles: Vec<_> = comms
+                .into_iter()
+                .enumerate()
+                .map(|(rank, comm)| {
+                    let cfg = cfg.clone();
+                    let vb = vb.clone();
+                    let input = input.clone();
+                    s.spawn(move || {
+                        let model = QwenGradModel::load_with_targets(
+                            &cfg,
+                            &vb,
+                            2,
+                            4.0,
+                            DType::F32,
+                            DenseLoraTargets::industrial(),
+                        )
+                        .unwrap();
+                        arm_adapter_deterministic(&model);
+                        let vars = model.trainable_vars();
+                        let logits = model.forward_tensor_parallel(&input, &comm).unwrap();
+                        let loss = probe_loss(&logits);
+                        let grads = model.backward(&loss).unwrap();
+                        assert_rank_tp_projection_grads_live(rank, &vars, &grads, &cfg);
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
     }
 
     /// Uncached base-only logits over the same weights `vb`, for the non-vacuity
