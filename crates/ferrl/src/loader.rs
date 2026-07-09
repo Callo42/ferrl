@@ -31,6 +31,7 @@ use crate::qwen35::{
     varbuilder_from_pretrained, LoraTargets as Qwen35LoraTargets, Qwen3_5Config, Qwen3_5GradModel,
 };
 use crate::telemetry::ModelTelemetryRecorder;
+use crate::tensor_parallel::TensorParallelPlan;
 use crate::tokenizer::{HfTokenizer, TokenizerError};
 
 /// Knobs for [`load_qwen_policy`]: the `LoRA` shape, the load dtypes, and the
@@ -63,6 +64,8 @@ pub struct LoaderOpts {
     pub memory_efficient_cached_gqa: bool,
     /// Optional quantization mode for frozen base projection weights.
     pub base_quantization: BaseQuantization,
+    /// Tensor-parallel rank/world planning contract.
+    pub tensor_parallel: TensorParallelPlan,
 }
 
 impl Default for LoaderOpts {
@@ -76,6 +79,7 @@ impl Default for LoaderOpts {
             temperature: 1.0,
             memory_efficient_cached_gqa: false,
             base_quantization: BaseQuantization::None,
+            tensor_parallel: TensorParallelPlan::single(),
         }
     }
 }

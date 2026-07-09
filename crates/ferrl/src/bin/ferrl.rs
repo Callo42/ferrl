@@ -61,8 +61,8 @@ use ferrl::telemetry::{CandidateRecord, RegressionFailure};
 use ferrl::{
     compare_distributed_metrics, compare_metrics, evaluate, load_auto_policy, read_jsonl,
     summarize, train_eval_split, BaseQuantization, CountdownReward, LoaderOpts, MathProblem,
-    MathReward, RegressionBudget, RegressionReport, RewardFn, RunDir, Sample, Trainer,
-    TrainerConfig, TrimulReward,
+    MathReward, RegressionBudget, RegressionReport, RewardFn, RunDir, Sample, TensorParallelPlan,
+    Trainer, TrainerConfig, TrimulReward,
 };
 
 /// A task's train/eval split: `(train, eval)` samples of the task's target type.
@@ -1044,6 +1044,56 @@ struct DistributedCfg {
     enabled: bool,
 }
 
+/// Tensor-parallel launch knobs for model sharding.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct TensorParallelCfg {
+    /// When true, validate this process as one rank of a tensor-parallel model
+    /// world. Multi-rank execution is intentionally rejected until model loaders
+    /// use the public tensor-parallel plan instead of silently falling back.
+    enabled: bool,
+    /// Tensor-parallel rank in `0..world_size`.
+    rank: usize,
+    /// Tensor-parallel world size. The identity/default is `1`.
+    world_size: usize,
+}
+
+impl Default for TensorParallelCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            rank: 0,
+            world_size: 1,
+        }
+    }
+}
+
+impl TensorParallelCfg {
+    fn plan(self) -> Result<TensorParallelPlan, CliError> {
+        if !self.enabled {
+            if self.rank != 0 || self.world_size != 1 {
+                return Err(CliError::msg(
+                    "tensor_parallel disabled requires rank = 0 and world_size = 1",
+                ));
+            }
+            return Ok(TensorParallelPlan::single());
+        }
+        TensorParallelPlan::new(self.rank, self.world_size)
+            .map_err(|e| CliError::msg(e.to_string()))
+    }
+
+    fn validate_current_support(self) -> Result<(), CliError> {
+        let plan = self.plan()?;
+        if plan.is_sharded() {
+            return Err(CliError::msg(
+                "tensor_parallel.enabled is parsed and rank/world validated, but \
+                 tensor-parallel model execution is not wired yet",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// A `ferrl train` run, deserialized from JSON.
 ///
 /// The wire shape is a flat object: a `task` selector, the `model_dir` checkpoint,
@@ -1071,6 +1121,9 @@ struct RunConfig {
     /// Data-parallel launch knobs.
     #[serde(default)]
     distributed: DistributedCfg,
+    /// Tensor-parallel launch knobs.
+    #[serde(default)]
+    tensor_parallel: TensorParallelCfg,
     /// TriMul task knobs (only read when `task == "trimul"`).
     #[serde(default)]
     trimul: TrimulCfg,
@@ -1116,7 +1169,8 @@ impl RunConfig {
 
     fn validate_current_config_support(&self) -> Result<(), CliError> {
         self.trimul.reward.validate().map_err(CliError::msg)?;
-        self.run_health.validate_current_support(&self.trainer)
+        self.run_health.validate_current_support(&self.trainer)?;
+        self.tensor_parallel.validate_current_support()
     }
 
     /// The loader options for this run (rollout temperature mirrors the trainer's).
@@ -1130,6 +1184,10 @@ impl RunConfig {
             temperature: self.trainer.temperature,
             memory_efficient_cached_gqa: self.policy.memory_efficient_cached_gqa,
             base_quantization: self.policy.base_quantization.as_base_quantization(),
+            tensor_parallel: self
+                .tensor_parallel
+                .plan()
+                .expect("RunConfig validation must validate tensor_parallel"),
         }
     }
 
@@ -3891,10 +3949,78 @@ mod tests {
             cfg.policy.base_quantization.as_base_quantization(),
             BaseQuantization::None
         );
+        assert_eq!(
+            cfg.tensor_parallel.plan().unwrap(),
+            TensorParallelPlan::single()
+        );
         assert_eq!(cfg.data.train_n, 64);
         // The loader temperature mirrors the trainer's (cannot drift).
         assert!((cfg.loader_opts().temperature - cfg.trainer.temperature).abs() < f64::EPSILON);
         assert_eq!(cfg.loader_opts().base_quantization, BaseQuantization::None);
+        assert_eq!(
+            cfg.loader_opts().tensor_parallel,
+            TensorParallelPlan::single()
+        );
+    }
+
+    #[test]
+    fn tensor_parallel_config_fails_closed_on_rank_world_shape() {
+        let tmp = TestDir::new("tensor-parallel-rank-world");
+        let config = r#"{
+            "task": "countdown",
+            "model_dir": "/models/qwen3-0.6b",
+            "tensor_parallel": { "enabled": true, "rank": 2, "world_size": 2 },
+            "trainer": { "steps": 1, "group_size": 2, "max_new_tokens": 8,
+                         "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
+                         "lr": 1e-5, "weight_decay": 0.0,
+                         "loss_type": "grpo", "scale_rewards": "group" }
+        }"#;
+        let path = tmp.path().join("run.json");
+        std::fs::write(&path, config).unwrap();
+
+        let err = RunConfig::load(&path).unwrap_err().to_string();
+
+        assert!(err.contains("tensor_parallel.rank 2 outside world_size 2"));
+    }
+
+    #[test]
+    fn tensor_parallel_disabled_rejects_stale_rank_world_fields() {
+        let tmp = TestDir::new("tensor-parallel-disabled-stale-fields");
+        let config = r#"{
+            "task": "countdown",
+            "model_dir": "/models/qwen3-0.6b",
+            "tensor_parallel": { "rank": 1, "world_size": 2 },
+            "trainer": { "steps": 1, "group_size": 2, "max_new_tokens": 8,
+                         "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
+                         "lr": 1e-5, "weight_decay": 0.0,
+                         "loss_type": "grpo", "scale_rewards": "group" }
+        }"#;
+        let path = tmp.path().join("run.json");
+        std::fs::write(&path, config).unwrap();
+
+        let err = RunConfig::load(&path).unwrap_err().to_string();
+
+        assert!(err.contains("tensor_parallel disabled requires rank = 0"));
+    }
+
+    #[test]
+    fn tensor_parallel_multi_rank_execution_is_not_silent_fallback() {
+        let tmp = TestDir::new("tensor-parallel-not-silent-fallback");
+        let config = r#"{
+            "task": "countdown",
+            "model_dir": "/models/qwen3-0.6b",
+            "tensor_parallel": { "enabled": true, "rank": 0, "world_size": 2 },
+            "trainer": { "steps": 1, "group_size": 2, "max_new_tokens": 8,
+                         "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
+                         "lr": 1e-5, "weight_decay": 0.0,
+                         "loss_type": "grpo", "scale_rewards": "group" }
+        }"#;
+        let path = tmp.path().join("run.json");
+        std::fs::write(&path, config).unwrap();
+
+        let err = RunConfig::load(&path).unwrap_err().to_string();
+
+        assert!(err.contains("tensor-parallel model execution is not wired yet"));
     }
 
     #[test]
