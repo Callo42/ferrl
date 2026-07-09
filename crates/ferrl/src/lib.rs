@@ -216,7 +216,7 @@ pub use nn::{grad_coverage, GradCoverage, RmsNorm, RmsNormGated, RmsNormZeroCent
 #[doc(inline)]
 pub use optim::{FerrlAdamW, OptimizerState};
 #[doc(inline)]
-pub use policy::{EvalSampling, Policy};
+pub use policy::{EvalSampling, Policy, TensorParallelPolicy};
 #[doc(inline)]
 pub use qwen::{MergedDecoder, QwenGradModel};
 #[doc(inline)]
