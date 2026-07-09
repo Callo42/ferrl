@@ -51,13 +51,16 @@ use candle_nn::{Activation, VarBuilder};
 use crate::blocks::{
     causal_mask, causal_mask_at, frozen_linear, repeat_kv, windowed, RotaryTables,
 };
+use crate::comm::Comm;
 use crate::lora::{
     BaseQuantization, DenseLoraTargets, FrozenLinearSnapshot, Proj, ProjLoadOptions,
 };
 use crate::model::{CachedDecoder, GradModel};
 use crate::nn::RmsNorm;
 use crate::remat::{stitched_backward, RematTape};
-use crate::tensor_parallel::TensorParallelPlan;
+use crate::tensor_parallel::{
+    all_reduce_sum_straight_through, plan_from_comm, ShardRange, TensorParallelPlan,
+};
 
 /// The per-architecture seam of the shared dense backbone.
 ///
@@ -88,6 +91,30 @@ pub trait DenseArch {
     /// Returns a candle error if `cfg` requests an unsupported option or carries
     /// a degenerate head configuration, or if a `RoPE` table cannot be built.
     fn spec(cfg: &Self::Config, dtype: DType, device: &Device) -> CandleResult<DenseSpec>;
+}
+
+fn tp_shard(
+    plan: TensorParallelPlan,
+    label: &'static str,
+    axis_len: usize,
+) -> CandleResult<ShardRange> {
+    plan.shard_axis(label, axis_len)
+        .map_err(|e| candle_core::Error::Msg(e.to_string()))
+}
+
+fn reduce_row_parallel_output(
+    partial: &Tensor,
+    plan: TensorParallelPlan,
+    comm: Option<&dyn Comm>,
+) -> CandleResult<Tensor> {
+    match (plan.is_sharded(), comm) {
+        (false, _) => Ok(partial.clone()),
+        (true, Some(comm)) => all_reduce_sum_straight_through(partial, plan, comm),
+        (true, None) => candle_core::bail!(
+            "tensor_parallel row-parallel output for world_size {} needs a communicator",
+            plan.world_size()
+        ),
+    }
 }
 
 /// The architecture-neutral distillation of a dense model's `Config`: the dims
@@ -189,36 +216,38 @@ impl DenseAttention {
         })
     }
 
-    fn forward(
+    fn forward_tensor_parallel(
         &self,
         x: &Tensor,
         mask: Option<&Tensor>,
         rot: &RotaryTables,
+        plan: TensorParallelPlan,
+        comm: Option<&dyn Comm>,
     ) -> CandleResult<Tensor> {
         let (b, l, _) = x.dims3()?;
         let in_dtype = x.dtype();
-        let tp = TensorParallelPlan::single();
+        let heads = tp_shard(plan, "num_attention_heads", self.num_heads)?.len;
+        let kv_heads = tp_shard(plan, "num_key_value_heads", self.num_kv_heads)?.len;
+        let attn_hidden = heads * self.head_dim;
 
         // 1. Projections, each adapted or frozen per the recipe.
         let q = self
             .q_proj
-            .column_parallel_forward(x, tp, "attention_q_out")?;
+            .column_parallel_forward(x, plan, "attention_q_out")?;
         let k = self
             .k_proj
-            .column_parallel_forward(x, tp, "attention_k_out")?;
+            .column_parallel_forward(x, plan, "attention_k_out")?;
         let v = self
             .v_proj
-            .column_parallel_forward(x, tp, "attention_v_out")?;
+            .column_parallel_forward(x, plan, "attention_v_out")?;
 
         // 2. (B, L, H, D) -> (B, H, L, D).
-        let q = q
-            .reshape((b, l, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
+        let q = q.reshape((b, l, heads, self.head_dim))?.transpose(1, 2)?;
         let k = k
-            .reshape((b, l, self.num_kv_heads, self.head_dim))?
+            .reshape((b, l, kv_heads, self.head_dim))?
             .transpose(1, 2)?;
         let v = v
-            .reshape((b, l, self.num_kv_heads, self.head_dim))?
+            .reshape((b, l, kv_heads, self.head_dim))?
             .transpose(1, 2)?;
 
         // 3. Per-head QK-Norm (grad-safe rms_norm_slow) BEFORE RoPE — Qwen only.
@@ -266,9 +295,11 @@ impl DenseAttention {
         let ctx = ctx
             .transpose(1, 2)?
             .contiguous()?
-            .reshape((b, l, self.attn_hidden))?;
-        self.o_proj
-            .row_parallel_forward_partial(&ctx, tp, "attention_hidden")
+            .reshape((b, l, attn_hidden))?;
+        let partial =
+            self.o_proj
+                .row_parallel_forward_partial_from_shard(&ctx, plan, "attention_hidden")?;
+        reduce_row_parallel_output(&partial, plan, comm)
     }
 
     fn set_adapter_enabled(&mut self, enabled: bool) {
@@ -332,20 +363,26 @@ impl DenseMlp {
         })
     }
 
-    fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
-        let tp = TensorParallelPlan::single();
+    fn forward_tensor_parallel(
+        &self,
+        x: &Tensor,
+        plan: TensorParallelPlan,
+        comm: Option<&dyn Comm>,
+    ) -> CandleResult<Tensor> {
         let lhs = self
             .gate_proj
-            .column_parallel_forward(x, tp, "intermediate_size")?
+            .column_parallel_forward(x, plan, "intermediate_size")?
             .apply(&self.act)?;
         let rhs = self
             .up_proj
-            .column_parallel_forward(x, tp, "intermediate_size")?;
-        self.down_proj.row_parallel_forward_partial(
-            &lhs.broadcast_mul(&rhs)?,
-            tp,
+            .column_parallel_forward(x, plan, "intermediate_size")?;
+        let hidden = lhs.broadcast_mul(&rhs)?;
+        let partial = self.down_proj.row_parallel_forward_partial_from_shard(
+            &hidden,
+            plan,
             "intermediate_size",
-        )
+        )?;
+        reduce_row_parallel_output(&partial, plan, comm)
     }
 
     fn set_adapter_enabled(&mut self, enabled: bool) {
@@ -413,11 +450,24 @@ impl DenseLayer {
         mask: Option<&Tensor>,
         rot: &RotaryTables,
     ) -> CandleResult<Tensor> {
+        self.forward_tensor_parallel(x, mask, rot, TensorParallelPlan::single(), None)
+    }
+
+    fn forward_tensor_parallel(
+        &self,
+        x: &Tensor,
+        mask: Option<&Tensor>,
+        rot: &RotaryTables,
+        plan: TensorParallelPlan,
+        comm: Option<&dyn Comm>,
+    ) -> CandleResult<Tensor> {
         let h = self.ln1.forward(x)?;
-        let h = self.attn.forward(&h, mask, rot)?;
+        let h = self
+            .attn
+            .forward_tensor_parallel(&h, mask, rot, plan, comm)?;
         let x = x.broadcast_add(&h)?;
         let h2 = self.ln2.forward(&x)?;
-        let h2 = self.mlp.forward(&h2)?;
+        let h2 = self.mlp.forward_tensor_parallel(&h2, plan, comm)?;
         x.broadcast_add(&h2)
     }
 
@@ -668,6 +718,47 @@ impl<A: DenseArch> DenseGradModel<A> {
         self.norm_and_head(&h, window)
     }
 
+    /// Full-sequence logits through the tensor-parallel projection/collective
+    /// path, using `comm`'s rank/world as the plan.
+    ///
+    /// This wires real row-output activation reductions for the dense blocks,
+    /// but public loaders still reject multi-rank TP until rollout and weight
+    /// loading are sharded too.
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if rank/world validation, a collective, or any
+    /// tensor op fails. Activation checkpointing on this path is not wired yet
+    /// and fails loud.
+    pub fn forward_tensor_parallel(
+        &self,
+        input_ids: &Tensor,
+        comm: &dyn Comm,
+    ) -> CandleResult<Tensor> {
+        self.forward_tensor_parallel_window(input_ids, None, comm)
+    }
+
+    fn forward_tensor_parallel_window(
+        &self,
+        input_ids: &Tensor,
+        window: Option<(usize, usize)>,
+        comm: &dyn Comm,
+    ) -> CandleResult<Tensor> {
+        if self.remat {
+            candle_core::bail!(
+                "{}::forward_tensor_parallel: activation checkpointing is not wired for \
+                 tensor-parallel execution yet",
+                A::LABEL
+            );
+        }
+        let plan = plan_from_comm(comm)?;
+        let (mut h, mask) = self.embed_and_mask(input_ids)?;
+        for layer in &self.layers {
+            h = layer.forward_tensor_parallel(&h, mask.as_ref(), &self.rot, plan, Some(comm))?;
+        }
+        self.norm_and_head(&h, window)
+    }
+
     /// Shared prologue of every full-sequence walk: the token embedding plus the
     /// full causal mask (`None` at seq-len 1). The mask dtype is `self.mask_dtype`
     /// — F32 when the attention scores are F32 (Llama), the model dtype otherwise.
@@ -757,6 +848,35 @@ impl<A: DenseArch> DenseGradModel<A> {
             h = layer.forward(&h, mask.as_ref(), &self.rot)?.detach();
         }
         Ok(self.norm_and_head(&h, window)?.detach())
+    }
+
+    /// Detached full-sequence logits through the tensor-parallel
+    /// projection/collective path.
+    ///
+    /// # Errors
+    ///
+    /// As [`forward_tensor_parallel`](Self::forward_tensor_parallel).
+    pub fn forward_tensor_parallel_detached(
+        &self,
+        input_ids: &Tensor,
+        comm: &dyn Comm,
+    ) -> CandleResult<Tensor> {
+        if self.remat {
+            candle_core::bail!(
+                "{}::forward_tensor_parallel_detached: activation checkpointing is not wired for \
+                 tensor-parallel execution yet",
+                A::LABEL
+            );
+        }
+        let plan = plan_from_comm(comm)?;
+        let (mut h, mask) = self.embed_and_mask(input_ids)?;
+        h = h.detach();
+        for layer in &self.layers {
+            h = layer
+                .forward_tensor_parallel(&h, mask.as_ref(), &self.rot, plan, Some(comm))?
+                .detach();
+        }
+        Ok(self.norm_and_head(&h, None)?.detach())
     }
 
     /// Back-propagate a loss built from this model's logits: plain

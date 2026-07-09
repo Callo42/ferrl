@@ -13,13 +13,13 @@ use std::path::{Path, PathBuf};
 
 use candle_core::backprop::GradStore;
 use candle_core::{bail, DType, Device, Result as CandleResult, Tensor, Var, D};
-use candle_nn::kv_cache::ConcatKvCache;
 use candle_nn::ops::softmax;
 use candle_nn::rotary_emb::rope_slow;
 use candle_nn::{Activation, Module, VarBuilder};
 use serde::Deserialize;
 
 use crate::blocks::{frozen_linear, repeat_kv, rope_partial, windowed, RotaryTables};
+use crate::comm::Comm;
 use crate::lora::{
     BaseQuantization, DenseLoraTargets, FrozenLinearSnapshot, Proj, ProjLoadOptions,
 };
@@ -27,11 +27,37 @@ use crate::model::{CachedDecoder, GradModel};
 use crate::nn::RmsNorm;
 use crate::remat::{stitched_backward, RematTape};
 use crate::telemetry::DecoderCacheSnapshot;
-use crate::tensor_parallel::TensorParallelPlan;
+use crate::tensor_parallel::{
+    all_reduce_sum_straight_through, plan_from_comm, ShardRange, TensorParallelPlan,
+};
 
 /// The checkpoint prefix used by public Gemma 4 conditional-generation
 /// checkpoints for the text decoder.
 pub const CKPT_PREFIX: &str = "model.language_model";
+
+fn tp_shard(
+    plan: TensorParallelPlan,
+    label: &'static str,
+    axis_len: usize,
+) -> CandleResult<ShardRange> {
+    plan.shard_axis(label, axis_len)
+        .map_err(|e| candle_core::Error::Msg(e.to_string()))
+}
+
+fn reduce_row_parallel_output(
+    partial: &Tensor,
+    plan: TensorParallelPlan,
+    comm: Option<&dyn Comm>,
+) -> CandleResult<Tensor> {
+    match (plan.is_sharded(), comm) {
+        (false, _) => Ok(partial.clone()),
+        (true, Some(comm)) => all_reduce_sum_straight_through(partial, plan, comm),
+        (true, None) => candle_core::bail!(
+            "tensor_parallel row-parallel output for world_size {} needs a communicator",
+            plan.world_size()
+        ),
+    }
+}
 
 /// A Gemma 4 decoder layer's attention kind (`text_config.layer_types[i]`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -806,40 +832,34 @@ impl Gemma4Attention {
         })
     }
 
-    fn forward(
+    fn forward_at_tensor_parallel(
         &self,
         x: &Tensor,
         mask: Option<&Tensor>,
         rot: &Gemma4Rotary,
-    ) -> CandleResult<Tensor> {
-        self.forward_at(x, 0, mask, rot, None)
-    }
-
-    fn forward_at(
-        &self,
-        x: &Tensor,
-        offset: usize,
-        mask: Option<&Tensor>,
-        rot: &Gemma4Rotary,
-        cache: Option<&mut ConcatKvCache>,
+        plan: TensorParallelPlan,
+        comm: Option<&dyn Comm>,
     ) -> CandleResult<Tensor> {
         let (b, l, _) = x.dims3()?;
         let in_dtype = x.dtype();
-        let tp = TensorParallelPlan::single();
+        let offset = 0;
+        let heads = tp_shard(plan, "num_attention_heads", self.num_heads)?.len;
+        let kv_heads = tp_shard(plan, "num_key_value_heads", self.num_kv_heads)?.len;
+        let attn_hidden = heads * self.head_dim;
         let q = self
             .q_proj
-            .column_parallel_forward(x, tp, "attention_q_out")?;
+            .column_parallel_forward(x, plan, "attention_q_out")?;
         let k_raw = self
             .k_proj
-            .column_parallel_forward(x, tp, "attention_k_out")?;
+            .column_parallel_forward(x, plan, "attention_k_out")?;
         let v_raw = match &self.v_proj {
-            Some(v) => v.column_parallel_forward(x, tp, "attention_v_out")?,
+            Some(v) => v.column_parallel_forward(x, plan, "attention_v_out")?,
             None => k_raw.clone(),
         };
 
-        let q = q.reshape((b, l, self.num_heads, self.head_dim))?;
-        let k = k_raw.reshape((b, l, self.num_kv_heads, self.head_dim))?;
-        let v = v_raw.reshape((b, l, self.num_kv_heads, self.head_dim))?;
+        let q = q.reshape((b, l, heads, self.head_dim))?;
+        let k = k_raw.reshape((b, l, kv_heads, self.head_dim))?;
+        let v = v_raw.reshape((b, l, kv_heads, self.head_dim))?;
 
         let q = self.q_norm.forward(&q)?.transpose(1, 2)?;
         let k = self.k_norm.forward(&k)?;
@@ -847,10 +867,7 @@ impl Gemma4Attention {
         let k = rot.apply(self.kind, &k.transpose(1, 2)?, offset, l)?;
         let q = rot.apply(self.kind, &q, offset, l)?;
 
-        let (k, v) = match cache {
-            Some(c) => c.append(&k.contiguous()?, &v.contiguous()?)?,
-            None => (k, v.contiguous()?),
-        };
+        let v = v.contiguous()?;
         let k = repeat_kv(&k, self.num_kv_groups)?.contiguous()?;
         let v = repeat_kv(&v, self.num_kv_groups)?.contiguous()?;
 
@@ -863,9 +880,11 @@ impl Gemma4Attention {
         let ctx = ctx
             .transpose(1, 2)?
             .contiguous()?
-            .reshape((b, l, self.attn_hidden))?;
-        self.o_proj
-            .row_parallel_forward_partial(&ctx, tp, "attention_hidden")
+            .reshape((b, l, attn_hidden))?;
+        let partial =
+            self.o_proj
+                .row_parallel_forward_partial_from_shard(&ctx, plan, "attention_hidden")?;
+        reduce_row_parallel_output(&partial, plan, comm)
     }
 
     fn set_adapter_enabled(&mut self, enabled: bool) {
@@ -925,17 +944,25 @@ impl Gemma4Mlp {
         })
     }
 
-    fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
-        let tp = TensorParallelPlan::single();
+    fn forward_tensor_parallel(
+        &self,
+        x: &Tensor,
+        plan: TensorParallelPlan,
+        comm: Option<&dyn Comm>,
+    ) -> CandleResult<Tensor> {
         let g = self
             .gate_proj
-            .column_parallel_forward(x, tp, "intermediate_size")?;
+            .column_parallel_forward(x, plan, "intermediate_size")?;
         let u = self
             .up_proj
-            .column_parallel_forward(x, tp, "intermediate_size")?;
+            .column_parallel_forward(x, plan, "intermediate_size")?;
         let h = self.act.forward(&g)?.broadcast_mul(&u)?;
-        self.down_proj
-            .row_parallel_forward_partial(&h, tp, "intermediate_size")
+        let partial = self.down_proj.row_parallel_forward_partial_from_shard(
+            &h,
+            plan,
+            "intermediate_size",
+        )?;
+        reduce_row_parallel_output(&partial, plan, comm)
     }
 
     fn set_adapter_enabled(&mut self, enabled: bool) {
@@ -995,12 +1022,25 @@ impl Gemma4Layer {
     }
 
     fn forward(&self, x: &Tensor, masks: &Gemma4Masks, rot: &Gemma4Rotary) -> CandleResult<Tensor> {
+        self.forward_tensor_parallel(x, masks, rot, TensorParallelPlan::single(), None)
+    }
+
+    fn forward_tensor_parallel(
+        &self,
+        x: &Tensor,
+        masks: &Gemma4Masks,
+        rot: &Gemma4Rotary,
+        plan: TensorParallelPlan,
+        comm: Option<&dyn Comm>,
+    ) -> CandleResult<Tensor> {
         let h = self.input_layernorm.forward(x)?;
-        let h = self.attn.forward(&h, masks.get(self.kind), rot)?;
+        let h = self
+            .attn
+            .forward_at_tensor_parallel(&h, masks.get(self.kind), rot, plan, comm)?;
         let h = self.post_attention_layernorm.forward(&h)?;
         let x = x.broadcast_add(&h)?;
         let h2 = self.pre_feedforward_layernorm.forward(&x)?;
-        let h2 = self.mlp.forward(&h2)?;
+        let h2 = self.mlp.forward_tensor_parallel(&h2, plan, comm)?;
         let h2 = self.post_feedforward_layernorm.forward(&h2)?;
         let x = x.broadcast_add(&h2)?;
         x.broadcast_mul(&self.layer_scalar)
@@ -1198,6 +1238,45 @@ impl Gemma4GradModel {
         self.norm_head_softcap(&h, window)
     }
 
+    /// Full-sequence logits through the tensor-parallel projection/collective
+    /// path, using `comm`'s rank/world as the plan.
+    ///
+    /// Public loaders still reject multi-rank TP until rollout and weight
+    /// loading are sharded too.
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if rank/world validation, a collective, or any
+    /// tensor op fails. Activation checkpointing on this path is not wired yet
+    /// and fails loud.
+    pub fn forward_tensor_parallel(
+        &self,
+        input_ids: &Tensor,
+        comm: &dyn Comm,
+    ) -> CandleResult<Tensor> {
+        self.forward_tensor_parallel_window(input_ids, None, comm)
+    }
+
+    fn forward_tensor_parallel_window(
+        &self,
+        input_ids: &Tensor,
+        window: Option<(usize, usize)>,
+        comm: &dyn Comm,
+    ) -> CandleResult<Tensor> {
+        if self.remat {
+            bail!(
+                "Gemma4GradModel::forward_tensor_parallel: activation checkpointing is not wired \
+                 for tensor-parallel execution yet"
+            );
+        }
+        let plan = plan_from_comm(comm)?;
+        let (mut h, masks) = self.embed_and_masks(input_ids)?;
+        for layer in &self.layers {
+            h = layer.forward_tensor_parallel(&h, &masks, &self.rot, plan, Some(comm))?;
+        }
+        self.norm_head_softcap(&h, window)
+    }
+
     fn embed_and_masks(&self, input_ids: &Tensor) -> CandleResult<(Tensor, Gemma4Masks)> {
         let (b, l) = input_ids.dims2()?;
         let ids = input_ids.flatten_all()?;
@@ -1252,6 +1331,34 @@ impl Gemma4GradModel {
             h = layer.forward(&h, &masks, &self.rot)?.detach();
         }
         self.norm_head_softcap(&h, Some((start, len)))
+    }
+
+    /// Detached full-sequence logits through the tensor-parallel
+    /// projection/collective path.
+    ///
+    /// # Errors
+    ///
+    /// As [`forward_tensor_parallel`](Self::forward_tensor_parallel).
+    pub fn forward_tensor_parallel_detached(
+        &self,
+        input_ids: &Tensor,
+        comm: &dyn Comm,
+    ) -> CandleResult<Tensor> {
+        if self.remat {
+            bail!(
+                "Gemma4GradModel::forward_tensor_parallel_detached: activation checkpointing is \
+                 not wired for tensor-parallel execution yet"
+            );
+        }
+        let plan = plan_from_comm(comm)?;
+        let (mut h, masks) = self.embed_and_masks(input_ids)?;
+        h = h.detach();
+        for layer in &self.layers {
+            h = layer
+                .forward_tensor_parallel(&h, &masks, &self.rot, plan, Some(comm))?
+                .detach();
+        }
+        self.norm_head_softcap(&h, None)
     }
 
     fn forward_remat(
@@ -1763,6 +1870,7 @@ fn softcap(logits: &Tensor, cap: f64) -> CandleResult<Tensor> {
 mod tests {
     use super::*;
 
+    use crate::comm::LocalComm;
     use crate::nn::grad_coverage;
     use crate::tensor_parallel::{
         concat_column_shards, sum_row_parallel_partials, TensorParallelPlan,
@@ -2162,6 +2270,18 @@ mod tests {
         }
     }
 
+    fn arm_adapter_deterministic(model: &Gemma4GradModel) {
+        for (i, v) in model.trainable_vars().iter().enumerate() {
+            let dims = v.as_tensor().dims().to_vec();
+            let n = dims.iter().product::<usize>();
+            let data: Vec<f32> = (0..n)
+                .map(|j| 0.02 + i as f32 * 0.003 + j as f32 * 0.001)
+                .collect();
+            v.set(&Tensor::from_vec(data, dims, &dev()).unwrap())
+                .unwrap();
+        }
+    }
+
     fn all_tp_plans(world_size: usize) -> Vec<TensorParallelPlan> {
         (0..world_size)
             .map(|rank| TensorParallelPlan::new(rank, world_size).unwrap())
@@ -2180,7 +2300,9 @@ mod tests {
         )
         .unwrap();
 
-        let full = mlp.forward(&x).unwrap();
+        let full = mlp
+            .forward_tensor_parallel(&x, TensorParallelPlan::single(), None)
+            .unwrap();
         let partials = all_tp_plans(2)
             .into_iter()
             .map(|plan| {
@@ -2274,6 +2396,68 @@ mod tests {
             worst <= 1e-5,
             "o_proj row partials diverged from full Gemma 4 projection: {worst}"
         );
+    }
+
+    #[test]
+    fn gemma4_tensor_parallel_collective_forward_matches_unsharded_logits() {
+        let mut cfg = tiny_cfg();
+        cfg.text_config.num_key_value_heads = 2;
+        cfg.text_config.num_global_key_value_heads = 2;
+        cfg.validate().unwrap();
+        let vb = tiny_vb(&cfg);
+        let input = ids(5);
+        let reference_model = Gemma4GradModel::load_with_targets(
+            &cfg,
+            &vb,
+            2,
+            4.0,
+            DType::F32,
+            DenseLoraTargets::industrial(),
+        )
+        .unwrap();
+        arm_adapter_deterministic(&reference_model);
+        let reference = reference_model.forward(&input).unwrap();
+        let reference_flat = reference.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+        let comms = LocalComm::world(2);
+        let outputs: Vec<Vec<f32>> = std::thread::scope(|s| {
+            let handles: Vec<_> = comms
+                .into_iter()
+                .map(|comm| {
+                    let cfg = cfg.clone();
+                    let vb = vb.clone();
+                    let input = input.clone();
+                    s.spawn(move || {
+                        let model = Gemma4GradModel::load_with_targets(
+                            &cfg,
+                            &vb,
+                            2,
+                            4.0,
+                            DType::F32,
+                            DenseLoraTargets::industrial(),
+                        )
+                        .unwrap();
+                        arm_adapter_deterministic(&model);
+                        let logits = model.forward_tensor_parallel(&input, &comm).unwrap();
+                        assert_eq!(logits.dims(), &[1, 5, cfg.text_config.vocab_size]);
+                        logits.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        for (rank, got) in outputs.iter().enumerate() {
+            let worst = got
+                .iter()
+                .zip(&reference_flat)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                worst <= 1e-5,
+                "rank {rank} TP collective logits diverged from unsharded logits: {worst}"
+            );
+        }
     }
 
     fn overwrite_adapter(model: &Gemma4GradModel) {

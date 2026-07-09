@@ -247,9 +247,9 @@ pub use telemetry::{
 };
 #[doc(inline)]
 pub use tensor_parallel::{
-    column_parallel_linear, concat_column_shards, row_parallel_linear_partial,
-    row_parallel_linear_partial_from_shard, sum_row_parallel_partials, ShardRange,
-    TensorParallelDims, TensorParallelError, TensorParallelPlan,
+    all_reduce_sum_straight_through, column_parallel_linear, concat_column_shards, plan_from_comm,
+    row_parallel_linear_partial, row_parallel_linear_partial_from_shard, sum_row_parallel_partials,
+    validate_comm_plan, ShardRange, TensorParallelDims, TensorParallelError, TensorParallelPlan,
 };
 #[doc(inline)]
 pub use tokenizer::{HfTokenizer, TokenizerError};
