@@ -199,10 +199,10 @@ impl<M: GradModel> LmPolicy<M> {
     ///
     /// This is deliberately an inherent helper rather than part of
     /// [`Policy`]: callers must supply the communicator at the scoring site,
-    /// while the ordinary trainer/loader/CLI paths continue to reject sharded
-    /// TP; the explicit trainer TP entry points also reject sharded
-    /// communicators until gradient/optimizer/checkpoint semantics are wired
-    /// end to end.
+    /// while non-TP trainer, loader, and CLI paths continue to reject sharded
+    /// TP. Explicit trainer TP entry points can use sharded TP when the trainer
+    /// DP communicator is world-1; adapter gradients are reduced over the TP
+    /// communicator before the optimizer step.
     ///
     /// # Errors
     ///
@@ -254,8 +254,10 @@ impl<M: GradModel> LmPolicy<M> {
     ///
     /// This is deliberately an inherent helper rather than part of
     /// [`Policy`]: callers must supply the communicator at the generation site,
-    /// while public trainer, loader, and CLI entry points continue to reject
-    /// sharded TP until the end-to-end execution contract is opened.
+    /// while loader and CLI entry points continue to reject sharded TP until the
+    /// end-to-end public execution contract is opened. Explicit trainer TP
+    /// entry points can use sharded TP when the trainer DP communicator is
+    /// world-1.
     ///
     /// # Errors
     ///
@@ -2116,7 +2118,7 @@ mod tests {
     use crate::reward::{RewardError, RewardFn};
     use crate::sample::Sample;
     use crate::telemetry::RunDir;
-    use crate::trainer::{TokenizerLike, Trainer, TrainerConfig};
+    use crate::trainer::{RunStop, TokenizerLike, Trainer, TrainerConfig};
 
     /// Trivial char codec over the tiny vocab (id `i` <-> `'a' + i`); the tiny
     /// model's vocab is 16, so generated ids land in `'a'..'p'`.
@@ -2731,6 +2733,14 @@ mod tests {
         Gemma4Config::from_json_str(GEMMA4_TINY_TEXT_CONFIG).unwrap()
     }
 
+    fn gemma4_tp_tiny_cfg() -> Gemma4Config {
+        let mut cfg = gemma4_tiny_cfg();
+        cfg.text_config.num_key_value_heads = 2;
+        cfg.text_config.num_global_key_value_heads = 2;
+        cfg.validate().unwrap();
+        cfg
+    }
+
     fn gemma4_put_rand(t: &mut HashMap<String, Tensor>, name: &str, dims: &[usize]) {
         t.insert(
             name.to_string(),
@@ -2818,6 +2828,41 @@ mod tests {
         let model =
             Gemma4GradModel::load_with_adapter_dtype(&cfg, &vb, 2, 4.0, DType::F32).unwrap();
         Gemma4Policy::new(model, 7, 1.0)
+    }
+
+    fn gemma4_tiny_policy_from_weights(
+        cfg: &Gemma4Config,
+        weights: HashMap<String, Tensor>,
+    ) -> Gemma4Policy {
+        let vb = VarBuilder::from_tensors(weights, DType::F32, &Device::Cpu);
+        let model = Gemma4GradModel::load_with_adapter_dtype(cfg, &vb, 2, 4.0, DType::F32).unwrap();
+        Gemma4Policy::new(model, 7, 1.0)
+    }
+
+    fn arm_gemma4_adapter_deterministic(policy: &Gemma4Policy) {
+        for (i, v) in policy.trainable_vars().iter().enumerate() {
+            let dims = v.as_tensor().dims().to_vec();
+            let n = dims.iter().product::<usize>();
+            let data: Vec<f32> = (0..n)
+                .map(|j| 0.01 + i as f32 * 0.002 + j as f32 * 0.0005)
+                .collect();
+            v.set(&Tensor::from_vec(data, dims, &Device::Cpu).unwrap())
+                .unwrap();
+        }
+    }
+
+    fn trainable_snapshot(policy: &impl Policy) -> Vec<Vec<f32>> {
+        policy
+            .trainable_vars()
+            .iter()
+            .map(|v| {
+                v.as_tensor()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+            })
+            .collect()
     }
 
     #[derive(Default)]
@@ -2958,6 +3003,86 @@ mod tests {
             }),
         };
         assert_cached_matches_uncached(&mut policy, &[1u32, 2, 3, 4, 5], &cfg);
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn gemma4_tensor_parallel_trainer_runs_model_backed_step() {
+        let tmp = TempDir::new();
+        let cfg = gemma4_tp_tiny_cfg();
+        let weights = gemma4_weight_map(&cfg);
+        let results = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = LocalComm::world(2)
+                .into_iter()
+                .enumerate()
+                .map(|(rank, comm)| {
+                    let root = tmp.0.clone();
+                    let cfg = cfg.clone();
+                    let weights = weights.clone();
+                    let results = std::sync::Arc::clone(&results);
+                    scope.spawn(move || {
+                        let run = RunDir::create(&root, format!("gemma4-tp-trainer-rank-{rank}"))
+                            .unwrap();
+                        let trainer_cfg = TrainerConfig {
+                            steps: 1,
+                            group_size: 2,
+                            max_new_tokens: 2,
+                            beta: 0.03,
+                            lr: 1e-3,
+                            max_grad_norm: None,
+                            ..TrainerConfig::default()
+                        };
+                        let mut trainer = Trainer::new(trainer_cfg, &run).unwrap();
+                        let mut policy = gemma4_tiny_policy_from_weights(&cfg, weights);
+                        arm_gemma4_adapter_deterministic(&policy);
+                        let before = trainable_snapshot(&policy);
+                        let (history, stop) = trainer
+                            .train_tensor_parallel(
+                                &mut policy,
+                                &SpreadReward,
+                                &CharCodec,
+                                &[Sample::new("abc", ())],
+                                &comm,
+                            )
+                            .unwrap();
+                        assert_eq!(stop, RunStop::Completed);
+                        assert_eq!(history.len(), 1);
+                        assert!(
+                            history.iter().any(|m| m.grad_norm > 0.0),
+                            "rank {rank} Gemma 4 TP trainer step produced no live gradient"
+                        );
+                        let after = trainable_snapshot(&policy);
+                        assert!(
+                            before
+                                .iter()
+                                .zip(&after)
+                                .any(|(a, b)| max_abs_diff_vec(a, b) > 1e-7),
+                            "rank {rank} Gemma 4 TP trainer step did not update adapter vars"
+                        );
+                        results.lock().unwrap().push((rank, after));
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
+
+        let mut results = std::sync::Arc::try_unwrap(results)
+            .unwrap()
+            .into_inner()
+            .unwrap();
+        results.sort_by_key(|(rank, _)| *rank);
+        assert_eq!(results.len(), 2);
+        for (var_idx, (a, b)) in results[0].1.iter().zip(&results[1].1).enumerate() {
+            let worst = max_abs_diff_vec(a, b);
+            assert!(
+                worst <= 1e-5,
+                "Gemma 4 TP trainer var {var_idx} diverged across ranks: {worst}"
+            );
+        }
     }
 
     // ---- detached scoring + checkpointed backward (P7) ----------------------

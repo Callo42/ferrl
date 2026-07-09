@@ -1067,11 +1067,12 @@ fn resume_latest_under_dp_with_no_checkpoint_starts_fresh_in_lockstep() {
 /// start fresh, run every step while rank 0 (resuming the final step) runs none, and
 /// **deadlock** on the first mismatched collective (surfacing as a `Comm` timeout). The
 /// coordinated implementation instead makes rank 1 fail at the checkpoint load
-/// (`TrainerError::Checkpoint`), which this test asserts — and a `Comm` error would fail
-/// it. `steps == the checkpoint step` so rank 0 runs zero further steps and neither rank
-/// hangs on the happy path.
+/// (`TrainerError::Checkpoint`) and makes rank 0 abort on the peer's load failure
+/// (`TrainerError::Contract`) before it can proceed alone. A `Comm` error would fail
+/// this test.
 #[test]
-fn resume_latest_under_dp_without_a_shared_dir_resumes_rank0s_step_loudly_not_fresh() {
+#[allow(clippy::cognitive_complexity)]
+fn resume_latest_under_dp_without_a_shared_dir_aborts_load_in_lockstep_not_fresh() {
     let base = TrainerConfig {
         checkpoint_every: Some(1),
         grad_accum_steps: 2,
@@ -1127,11 +1128,14 @@ fn resume_latest_under_dp_without_a_shared_dir_resumes_rank0s_step_loudly_not_fr
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    // rank 0 resumed its own step-2 checkpoint; steps == 2 so zero further steps → Ok.
+    // rank 0 can load its local step-2 checkpoint, but rank 1 cannot load the
+    // broadcast step from its empty per-rank checkpoint dir. The load failure is
+    // coordinated, so rank 0 must abort in lockstep instead of proceeding alone.
+    let err0 = outcomes[0].as_ref().unwrap_err();
     assert!(
-        outcomes[0].is_ok(),
-        "rank 0 resumes its own checkpoint cleanly: {:?}",
-        outcomes[0]
+        matches!(err0, TrainerError::Contract(msg)
+            if msg.contains("checkpoint load/restore failed on a peer rank")),
+        "rank 0 must abort when a peer cannot load the broadcast checkpoint: got {err0:?}"
     );
     // rank 1 received rank 0's broadcast step and tried to resume from its OWN (empty)
     // dir → a loud checkpoint-load error. NOT a silent fresh start, NOT a Comm timeout
