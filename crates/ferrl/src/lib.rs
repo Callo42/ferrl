@@ -153,6 +153,7 @@ pub mod sample;
 pub mod sampler;
 pub mod sandbox;
 pub mod telemetry;
+pub mod tensor_parallel;
 pub mod tokenizer;
 pub mod trainer;
 pub mod trimul;
@@ -243,6 +244,12 @@ pub use telemetry::{
     run_span, summarize, Anomaly, DecoderCacheSnapshot, GpuMemoryProbeEvent, GpuMemorySnapshot,
     Metrics, MetricsWriter, ModelTelemetryRecorder, RegressionBudget, RegressionFailure,
     RegressionReport, RunDir, RunSummary,
+};
+#[doc(inline)]
+pub use tensor_parallel::{
+    column_parallel_linear, concat_column_shards, row_parallel_linear_partial,
+    row_parallel_linear_partial_from_shard, sum_row_parallel_partials, ShardRange,
+    TensorParallelDims, TensorParallelError, TensorParallelPlan,
 };
 #[doc(inline)]
 pub use tokenizer::{HfTokenizer, TokenizerError};

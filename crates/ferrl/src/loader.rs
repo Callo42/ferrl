@@ -31,6 +31,7 @@ use crate::qwen35::{
     varbuilder_from_pretrained, LoraTargets as Qwen35LoraTargets, Qwen3_5Config, Qwen3_5GradModel,
 };
 use crate::telemetry::ModelTelemetryRecorder;
+use crate::tensor_parallel::TensorParallelPlan;
 use crate::tokenizer::{HfTokenizer, TokenizerError};
 
 /// Knobs for [`load_qwen_policy`]: the `LoRA` shape, the load dtypes, and the
@@ -63,6 +64,8 @@ pub struct LoaderOpts {
     pub memory_efficient_cached_gqa: bool,
     /// Optional quantization mode for frozen base projection weights.
     pub base_quantization: BaseQuantization,
+    /// Tensor-parallel rank/world planning contract.
+    pub tensor_parallel: TensorParallelPlan,
 }
 
 impl Default for LoaderOpts {
@@ -76,6 +79,7 @@ impl Default for LoaderOpts {
             temperature: 1.0,
             memory_efficient_cached_gqa: false,
             base_quantization: BaseQuantization::None,
+            tensor_parallel: TensorParallelPlan::single(),
         }
     }
 }
@@ -318,6 +322,7 @@ pub fn load_qwen_policy(
             model_type: "qwen3".to_string(),
         });
     }
+    reject_sharded_tensor_parallel(opts, "qwen3")?;
 
     let weights_path = dir.join("model.safetensors");
     let weights = std::fs::read(&weights_path).map_err(|source| LoaderError::Io {
@@ -420,6 +425,7 @@ fn load_qwen35_policy(
             model_type: "qwen3_5".to_string(),
         });
     }
+    reject_sharded_tensor_parallel(opts, "qwen3_5")?;
     let cfg = Qwen3_5Config::from_json_file(dir.join("config.json"))?;
     let vb = varbuilder_from_pretrained(dir, opts.base_dtype, device)?;
     let mut model = Qwen3_5GradModel::load_with_targets(
@@ -451,6 +457,19 @@ fn read_gemma4_config(dir: &Path) -> Result<Gemma4Config, LoaderError> {
     Ok(cfg)
 }
 
+fn reject_sharded_tensor_parallel(opts: &LoaderOpts, model_type: &str) -> Result<(), LoaderError> {
+    if opts.tensor_parallel.is_sharded() {
+        return Err(LoaderError::UnsupportedLoaderOption {
+            option: "tensor_parallel".to_string(),
+            supported:
+                "tensor_parallel.world_size = 1 until tensor-parallel model execution is wired"
+                    .to_string(),
+            model_type: model_type.to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Load a dense Gemma 4 text policy and its tokenizer from a checkpoint `dir`.
 ///
 /// The public Gemma 4 checkpoints are conditional-generation wrappers whose
@@ -479,6 +498,7 @@ pub fn load_gemma4_policy(
                 .unwrap_or_else(|| "gemma4".to_string()),
         });
     }
+    reject_sharded_tensor_parallel(opts, cfg.model_type.as_deref().unwrap_or("gemma4"))?;
 
     let vb = gemma4_varbuilder_from_pretrained(dir, opts.base_dtype, device)?;
     let model = Gemma4GradModel::load_with_targets_and_base_quantization(
@@ -538,6 +558,77 @@ mod tests {
         assert_eq!(o.adapter_dtype, DType::F32);
         assert!(!o.memory_efficient_cached_gqa);
         assert_eq!(o.base_quantization, BaseQuantization::None);
+        assert_eq!(o.tensor_parallel, TensorParallelPlan::single());
+    }
+
+    fn sharded_tensor_parallel_opts() -> LoaderOpts {
+        LoaderOpts {
+            tensor_parallel: TensorParallelPlan::new(0, 2).unwrap(),
+            ..LoaderOpts::default()
+        }
+    }
+
+    fn assert_tensor_parallel_rejected(err: LoaderError, expected_model_type: &str) {
+        match err {
+            LoaderError::UnsupportedLoaderOption {
+                option,
+                supported,
+                model_type,
+            } => {
+                assert_eq!(option, "tensor_parallel");
+                assert!(supported.contains("world_size = 1"));
+                assert_eq!(model_type, expected_model_type);
+            }
+            other => panic!("expected UnsupportedLoaderOption, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn qwen_loader_rejects_sharded_tensor_parallel_before_weight_load() {
+        let tmp = TempDir::new("loader-qwen3-tensor-parallel-option");
+        std::fs::write(
+            tmp.path().join("config.json"),
+            r#"{ "model_type": "qwen3", "vocab_size": 16, "hidden_size": 8,
+                "intermediate_size": 16, "num_hidden_layers": 2,
+                "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 4,
+                "attention_bias": false, "max_position_embeddings": 32,
+                "sliding_window": null, "max_window_layers": 0,
+                "tie_word_embeddings": true, "rope_theta": 10000.0,
+                "rms_norm_eps": 1e-6, "use_sliding_window": false,
+                "hidden_act": "silu" }"#,
+        )
+        .unwrap();
+
+        let err = load_qwen_policy(tmp.path(), &Device::Cpu, &sharded_tensor_parallel_opts())
+            .unwrap_err();
+
+        assert_tensor_parallel_rejected(err, "qwen3");
+    }
+
+    #[test]
+    fn auto_qwen35_loader_rejects_sharded_tensor_parallel_before_weight_load() {
+        let tmp = TempDir::new("loader-qwen35-tensor-parallel-option");
+        std::fs::write(
+            tmp.path().join("config.json"),
+            r#"{ "model_type": "qwen3_5" }"#,
+        )
+        .unwrap();
+
+        match load_auto_policy(tmp.path(), &Device::Cpu, &sharded_tensor_parallel_opts()) {
+            Err(err) => assert_tensor_parallel_rejected(err, "qwen3_5"),
+            Ok(_) => panic!("expected UnsupportedLoaderOption, got loaded policy"),
+        }
+    }
+
+    #[test]
+    fn gemma4_loader_rejects_sharded_tensor_parallel_before_weight_load() {
+        let tmp = TempDir::new("loader-gemma4-tensor-parallel-option");
+        std::fs::write(tmp.path().join("config.json"), gemma4_config_json()).unwrap();
+
+        let err = load_gemma4_policy(tmp.path(), &Device::Cpu, &sharded_tensor_parallel_opts())
+            .unwrap_err();
+
+        assert_tensor_parallel_rejected(err, "gemma4");
     }
 
     #[test]
