@@ -272,6 +272,14 @@ pub(crate) enum FrozenLinearSnapshot {
 }
 
 impl FrozenLinearSnapshot {
+    pub(crate) fn dims2(&self) -> CandleResult<(usize, usize)> {
+        match self {
+            Self::Dense(w) => w.dims2(),
+            Self::Base(w) => w.dims2(),
+            Self::Lora { base, .. } => base.dims2(),
+        }
+    }
+
     pub(crate) fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
         match self {
             Self::Dense(w) => frozen_linear(x, w),
@@ -298,6 +306,102 @@ impl FrozenLinearSnapshot {
                 let xa = x.broadcast_matmul(&a.t()?)?;
                 let xab = xa.broadcast_matmul(&b.t()?)?;
                 base.broadcast_add(&(xab * *scale)?)
+            }
+        }
+    }
+
+    fn narrow_bias(bias: &Tensor, shard: ShardRange, label: &'static str) -> CandleResult<Tensor> {
+        let dims = bias.dims();
+        if dims != [shard.full_len] {
+            candle_core::bail!(
+                "snapshot LoRA column-parallel bias for {label} must have shape [{}], got {:?}",
+                shard.full_len,
+                dims
+            );
+        }
+        bias.narrow(0, shard.start, shard.len)
+    }
+
+    pub(crate) fn column_parallel_forward(
+        &self,
+        x: &Tensor,
+        plan: TensorParallelPlan,
+        label: &'static str,
+    ) -> CandleResult<Tensor> {
+        match self {
+            Self::Dense(w) => {
+                let (out, _in) = w.dims2()?;
+                let shard = tp_shard(plan, label, out)?;
+                frozen_linear(x, &w.narrow(0, shard.start, shard.len)?)
+            }
+            Self::Base(w) => w.column_parallel_forward(x, plan, label),
+            Self::Lora {
+                base,
+                base_bias,
+                a,
+                b,
+                scale,
+                enabled,
+            } => {
+                let (out, _in) = base.dims2()?;
+                let shard = tp_shard(plan, label, out)?;
+                let base_y = base.column_parallel_forward(x, plan, label)?;
+                let base_y = match base_bias {
+                    Some(bias) => base_y.broadcast_add(&Self::narrow_bias(bias, shard, label)?)?,
+                    None => base_y,
+                };
+                if !enabled {
+                    return Ok(base_y);
+                }
+                let dtype = base.dtype();
+                let a = a.to_dtype(dtype)?;
+                let b = b.to_dtype(dtype)?.narrow(0, shard.start, shard.len)?;
+                let xa = x.broadcast_matmul(&a.t()?)?;
+                let xab = xa.broadcast_matmul(&b.t()?)?;
+                base_y.broadcast_add(&(xab * *scale)?)
+            }
+        }
+    }
+
+    pub(crate) fn row_parallel_forward_partial_from_shard(
+        &self,
+        x_shard: &Tensor,
+        plan: TensorParallelPlan,
+        label: &'static str,
+    ) -> CandleResult<Tensor> {
+        match self {
+            Self::Dense(w) => {
+                let (_out, in_) = w.dims2()?;
+                let shard = tp_shard(plan, label, in_)?;
+                frozen_linear(x_shard, &w.narrow(1, shard.start, shard.len)?)
+            }
+            Self::Base(w) => w.row_parallel_forward_partial_from_shard(x_shard, plan, label),
+            Self::Lora {
+                base,
+                base_bias,
+                a,
+                b,
+                scale,
+                enabled,
+            } => {
+                if base_bias.is_some() {
+                    candle_core::bail!(
+                        "snapshot LoRA row-parallel partial for {label} cannot apply base_bias \
+                         per rank; sum all row-parallel partials first, then apply the bias once"
+                    );
+                }
+                let (_out, in_) = base.dims2()?;
+                let shard = tp_shard(plan, label, in_)?;
+                let base_y = base.row_parallel_forward_partial_from_shard(x_shard, plan, label)?;
+                if !enabled {
+                    return Ok(base_y);
+                }
+                let dtype = base.dtype();
+                let a = a.to_dtype(dtype)?.narrow(1, shard.start, shard.len)?;
+                let b = b.to_dtype(dtype)?;
+                let xa = x_shard.broadcast_matmul(&a.t()?)?;
+                let xab = xa.broadcast_matmul(&b.t()?)?;
+                base_y.broadcast_add(&(xab * *scale)?)
             }
         }
     }

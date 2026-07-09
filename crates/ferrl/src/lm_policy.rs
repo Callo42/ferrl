@@ -247,6 +247,43 @@ impl<M: GradModel> LmPolicy<M> {
         )
     }
 
+    /// Generate a rollout through the model's explicit tensor-parallel cached
+    /// decoder path.
+    ///
+    /// This is deliberately an inherent helper rather than part of
+    /// [`Policy`]: callers must supply the communicator at the generation site,
+    /// while public loaders and the CLI continue to reject sharded TP until the
+    /// end-to-end execution contract is opened.
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if communicator/model validation, cached decode,
+    /// sampling, or rollout construction fails.
+    pub fn generate_tensor_parallel(
+        &mut self,
+        prompt: &[u32],
+        cfg: &GenConfig,
+        comm: &dyn Comm,
+    ) -> CandleResult<Rollout> {
+        self.generate_tensor_parallel_at(prompt, cfg, 0, comm)
+    }
+
+    /// As [`generate_tensor_parallel`](Self::generate_tensor_parallel), but
+    /// forks per-row sampler streams from an explicit global row base.
+    ///
+    /// # Errors
+    ///
+    /// As [`generate_tensor_parallel`](Self::generate_tensor_parallel).
+    pub fn generate_tensor_parallel_at(
+        &mut self,
+        prompt: &[u32],
+        cfg: &GenConfig,
+        global_row_base: u64,
+        comm: &dyn Comm,
+    ) -> CandleResult<Rollout> {
+        self.generate_at_instrumented_inner(prompt, cfg, global_row_base, Some(comm), None)
+    }
+
     /// The teacher-forcing scoring input: all but the last token of every
     /// sequence, as one `[group, seq_len - 1]` tensor on the model's device.
     ///
@@ -438,6 +475,64 @@ impl<M: GradModel> LmPolicy<M> {
             }
         }
     }
+
+    fn generate_at_instrumented_inner(
+        &mut self,
+        prompt: &[u32],
+        cfg: &GenConfig,
+        global_row_base: u64,
+        tp_comm: Option<&dyn Comm>,
+        mut telemetry: Option<&mut dyn ModelTelemetryRecorder>,
+    ) -> CandleResult<Rollout> {
+        let (temperature, top_p) = self.resolve_sampling(cfg)?;
+        let device = self.model.device().clone();
+        let prompt_len = prompt.len();
+        // One KV-cached decoder snapshots the CURRENT merged weights (adapter folded
+        // in, toggle respected); the batch dimension carries all group members at
+        // once. The first GPU kernel JIT happens building the merged weights / in the
+        // first forward, so translate a driver-too-old PTX mismatch
+        // (`CUDA_ERROR_UNSUPPORTED_PTX_VERSION`) into an actionable rebuild/upgrade
+        // message — a no-op off the `cuda` build and on the success path.
+        if let Some(recorder) = telemetry.as_deref_mut() {
+            recorder.record_phase("merged_decoder_build_start");
+        }
+        let mut decoder = self
+            .model
+            .merged_decoder()
+            .map_err(crate::cuda_compat::translate_ptx_error)?;
+        if let Some(recorder) = telemetry.as_deref_mut() {
+            recorder.record_phase("merged_decoder_build_end");
+            recorder
+                .record_decoder_cache(decoder.decoder_cache_snapshots("merged_decoder_build_end"));
+        }
+        // Per-row independent RNG substreams seeded by GLOBAL row index
+        // (`global_row_base + row`): each row draws ONLY from its own substream, so
+        // the sampled stream is invariant both to decode order (this batched decode
+        // and the sequential `generate_uncached` oracle produce bit-identical groups)
+        // AND to data-parallel shard layout (a world-W run reproduces the
+        // single-process draws). See `GrpoSampler::fork_substreams_at`.
+        let mut substreams = self
+            .sampler
+            .fork_substreams_at(global_row_base, cfg.group_size);
+        let (token_ids, completion_lens, rollout_logprobs) = batched_group_decode(
+            &mut decoder,
+            &mut substreams,
+            prompt,
+            cfg,
+            (temperature, top_p),
+            (&device, tp_comm),
+            &mut telemetry,
+        )?;
+        // Built directly (not via `Rollout::rectangular`) so `completion_lens` carries
+        // the true per-sequence lengths; under `eos_token_id == None` every entry is
+        // `max_new_tokens` and this equals the rectangular construction exactly.
+        Ok(Rollout {
+            token_ids,
+            prompt_len,
+            completion_lens,
+            rollout_logprobs: Some(rollout_logprobs),
+        })
+    }
 }
 
 /// The raw rollout of [`batched_group_decode`]: per-row token ids (rectangular),
@@ -445,6 +540,18 @@ impl<M: GradModel> LmPolicy<M> {
 /// alias so the trait method and helper share one signature (and clippy's
 /// `type_complexity` stays quiet).
 type GroupDecode = (Vec<Vec<u32>>, Vec<usize>, Vec<Vec<f32>>);
+
+fn cached_decoder_forward<D: CachedDecoder>(
+    decoder: &mut D,
+    input_ids: &Tensor,
+    offset: usize,
+    tp_comm: Option<&dyn Comm>,
+) -> CandleResult<Tensor> {
+    match tp_comm {
+        Some(comm) => decoder.forward_tensor_parallel(input_ids, offset, comm),
+        None => decoder.forward(input_ids, offset),
+    }
+}
 
 /// Decode an entire GRPO group as one batch over the shared cached decoder.
 ///
@@ -467,7 +574,7 @@ fn batched_group_decode<D: CachedDecoder>(
     prompt: &[u32],
     cfg: &GenConfig,
     (temperature, top_p): (f64, Option<f64>),
-    device: &candle_core::Device,
+    (device, tp_comm): (&candle_core::Device, Option<&dyn Comm>),
     telemetry: &mut Option<&mut dyn ModelTelemetryRecorder>,
 ) -> CandleResult<GroupDecode> {
     let g = cfg.group_size;
@@ -491,8 +598,7 @@ fn batched_group_decode<D: CachedDecoder>(
     if let Some(recorder) = telemetry.as_mut() {
         recorder.record_phase("rollout_prefill_start");
     }
-    let logits = decoder
-        .forward(&prompt_input, 0)
+    let logits = cached_decoder_forward(decoder, &prompt_input, 0, tp_comm)
         .map_err(crate::cuda_compat::translate_ptx_error)?;
     if let Some(recorder) = telemetry.as_mut() {
         recorder.record_phase("rollout_prefill_end");
@@ -548,8 +654,7 @@ fn batched_group_decode<D: CachedDecoder>(
         // each substream's draw count exactly completion_lens[r].
         if step + 1 < cfg.max_new_tokens {
             let tok = Tensor::from_vec(feed, (g, 1), device)?;
-            let logits = decoder
-                .forward(&tok, offset)
+            let logits = cached_decoder_forward(decoder, &tok, offset, tp_comm)
                 .map_err(crate::cuda_compat::translate_ptx_error)?;
             last = logits.i((.., 0))?; // [g, vocab]
             offset += 1;
@@ -589,56 +694,9 @@ impl<M: GradModel> Policy for LmPolicy<M> {
         prompt: &[u32],
         cfg: &GenConfig,
         global_row_base: u64,
-        mut telemetry: Option<&mut dyn ModelTelemetryRecorder>,
+        telemetry: Option<&mut dyn ModelTelemetryRecorder>,
     ) -> CandleResult<Rollout> {
-        let (temperature, top_p) = self.resolve_sampling(cfg)?;
-        let device = self.model.device().clone();
-        let prompt_len = prompt.len();
-        // One KV-cached decoder snapshots the CURRENT merged weights (adapter folded
-        // in, toggle respected); the batch dimension carries all group members at
-        // once. The first GPU kernel JIT happens building the merged weights / in the
-        // first forward, so translate a driver-too-old PTX mismatch
-        // (`CUDA_ERROR_UNSUPPORTED_PTX_VERSION`) into an actionable rebuild/upgrade
-        // message — a no-op off the `cuda` build and on the success path.
-        if let Some(recorder) = telemetry.as_deref_mut() {
-            recorder.record_phase("merged_decoder_build_start");
-        }
-        let mut decoder = self
-            .model
-            .merged_decoder()
-            .map_err(crate::cuda_compat::translate_ptx_error)?;
-        if let Some(recorder) = telemetry.as_deref_mut() {
-            recorder.record_phase("merged_decoder_build_end");
-            recorder
-                .record_decoder_cache(decoder.decoder_cache_snapshots("merged_decoder_build_end"));
-        }
-        // Per-row independent RNG substreams seeded by GLOBAL row index
-        // (`global_row_base + row`): each row draws ONLY from its own substream, so
-        // the sampled stream is invariant both to decode order (this batched decode
-        // and the sequential `generate_uncached` oracle produce bit-identical groups)
-        // AND to data-parallel shard layout (a world-W run reproduces the
-        // single-process draws). See `GrpoSampler::fork_substreams_at`.
-        let mut substreams = self
-            .sampler
-            .fork_substreams_at(global_row_base, cfg.group_size);
-        let (token_ids, completion_lens, rollout_logprobs) = batched_group_decode(
-            &mut decoder,
-            &mut substreams,
-            prompt,
-            cfg,
-            (temperature, top_p),
-            &device,
-            &mut telemetry,
-        )?;
-        // Built directly (not via `Rollout::rectangular`) so `completion_lens` carries
-        // the true per-sequence lengths; under `eos_token_id == None` every entry is
-        // `max_new_tokens` and this equals the rectangular construction exactly.
-        Ok(Rollout {
-            token_ids,
-            prompt_len,
-            completion_lens,
-            rollout_logprobs: Some(rollout_logprobs),
-        })
+        self.generate_at_instrumented_inner(prompt, cfg, global_row_base, None, telemetry)
     }
 
     fn token_logprobs(&self, rollout: &Rollout) -> CandleResult<Tensor> {
@@ -837,6 +895,12 @@ mod tests {
         cfg
     }
 
+    fn tiny_tp_gqa_uneven_mlp_cfg() -> Config {
+        let mut cfg = tiny_tp_gqa_cfg();
+        cfg.intermediate_size = 15;
+        cfg
+    }
+
     fn tiny_tp_policy_from_weights(cfg: &Config, weights: HashMap<String, Tensor>) -> QwenPolicy {
         let vb = VarBuilder::from_tensors(weights, DType::F32, &Device::Cpu);
         let model = QwenGradModel::load_with_targets(
@@ -1008,6 +1072,125 @@ mod tests {
                 handle.join().unwrap();
             }
         });
+    }
+
+    #[test]
+    fn tensor_parallel_cached_generate_matches_unsharded_generate() {
+        let cfg = tiny_tp_gqa_cfg();
+        let weights = weight_map(&cfg);
+        let prompt = [1u32, 2, 3];
+        let gen_cfg = GenConfig {
+            group_size: 3,
+            max_new_tokens: 4,
+            temperature: 1.0,
+            eos_token_id: None,
+            eval_sampling: None,
+        };
+        let global_row_base = 17;
+
+        let mut reference_policy = tiny_tp_policy_from_weights(&cfg, weights.clone());
+        arm_adapter_deterministic(reference_policy.model());
+        let reference = reference_policy
+            .generate_at(&prompt, &gen_cfg, global_row_base)
+            .unwrap();
+        let reference_logprobs = reference.rollout_logprobs.clone().unwrap();
+
+        let comms = LocalComm::world(2);
+        let outputs: Vec<Rollout> = std::thread::scope(|s| {
+            let handles: Vec<_> = comms
+                .into_iter()
+                .map(|comm| {
+                    let cfg = cfg.clone();
+                    let weights = weights.clone();
+                    let prompt = prompt.to_vec();
+                    let rank_gen_cfg = gen_cfg;
+                    s.spawn(move || {
+                        let mut policy = tiny_tp_policy_from_weights(&cfg, weights);
+                        arm_adapter_deterministic(policy.model());
+                        policy
+                            .generate_tensor_parallel_at(
+                                &prompt,
+                                &rank_gen_cfg,
+                                global_row_base,
+                                &comm,
+                            )
+                            .unwrap()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        for (rank, got) in outputs.iter().enumerate() {
+            assert_eq!(
+                got.token_ids, reference.token_ids,
+                "rank {rank} TP cached generation changed sampled tokens"
+            );
+            assert_eq!(
+                got.completion_lens, reference.completion_lens,
+                "rank {rank} TP cached generation changed completion lengths"
+            );
+            let got_logprobs = got.rollout_logprobs.as_ref().unwrap();
+            assert_eq!(got_logprobs.len(), reference_logprobs.len());
+            for (row, (got_row, want_row)) in
+                got_logprobs.iter().zip(&reference_logprobs).enumerate()
+            {
+                let worst = max_abs_diff_vec(got_row, want_row);
+                assert!(
+                    worst <= 1e-5,
+                    "rank {rank} row {row} TP cached generation logprobs diverged: {worst}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tensor_parallel_cached_decoder_preflights_layout_before_mutating_cache() {
+        let cfg = tiny_tp_gqa_uneven_mlp_cfg();
+        let weights = weight_map(&cfg);
+        let input = Tensor::from_vec(vec![1u32, 2, 3], (1, 3), &Device::Cpu).unwrap();
+
+        let reference_policy = tiny_tp_policy_from_weights(&cfg, weights.clone());
+        arm_adapter_deterministic(reference_policy.model());
+        let mut reference_decoder = reference_policy.model().merged_decoder().unwrap();
+        let reference = reference_decoder.forward(&input, 0).unwrap();
+        let reference_flat = reference.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+        let comms = LocalComm::world(2);
+        let outputs: Vec<Vec<f32>> = std::thread::scope(|s| {
+            let handles: Vec<_> = comms
+                .into_iter()
+                .map(|comm| {
+                    let cfg = cfg.clone();
+                    let weights = weights.clone();
+                    let input = input.clone();
+                    s.spawn(move || {
+                        let policy = tiny_tp_policy_from_weights(&cfg, weights);
+                        arm_adapter_deterministic(policy.model());
+                        let mut decoder = policy.model().merged_decoder().unwrap();
+                        let err = decoder
+                            .forward_tensor_parallel(&input, 0, &comm)
+                            .unwrap_err()
+                            .to_string();
+                        assert!(
+                            err.contains("intermediate_size"),
+                            "expected MLP intermediate preflight failure, got {err}"
+                        );
+                        let got = decoder.forward(&input, 0).unwrap();
+                        got.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        for (rank, got) in outputs.iter().enumerate() {
+            let worst = max_abs_diff_vec(got, &reference_flat);
+            assert!(
+                worst <= 1e-5,
+                "rank {rank} decoder cache mutated before unsupported TP layout failed: {worst}"
+            );
+        }
     }
 
     /// Two policies sharing the SAME base weights and sampler seed, so they draw an

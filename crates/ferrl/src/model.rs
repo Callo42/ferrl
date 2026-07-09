@@ -28,6 +28,7 @@ use candle_nn::ops::log_softmax;
 
 use crate::comm::Comm;
 use crate::telemetry::DecoderCacheSnapshot;
+use crate::tensor_parallel::plan_from_comm;
 
 /// A stateful, grad-free incremental decoder over a snapshot of a
 /// [`GradModel`]'s effective weights.
@@ -59,6 +60,36 @@ pub trait CachedDecoder {
     /// already consumed, if any tensor op fails, or if `offset + chunk_len`
     /// exceeds the model's maximum position.
     fn forward(&mut self, input_ids: &Tensor, offset: usize) -> CandleResult<Tensor>;
+
+    /// Tensor-parallel variant of [`forward`](Self::forward), driven by an
+    /// explicitly supplied communicator.
+    ///
+    /// This is an opt-in rollout helper, not the public trainer/loader
+    /// contract. The default preserves fail-closed behavior: single-rank
+    /// communicators reuse the ordinary cached decode, while sharded worlds fail
+    /// loud unless a concrete decoder overrides this method.
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if a sharded communicator is supplied to a decoder
+    /// that has not overridden this method, or if the concrete decode fails.
+    fn forward_tensor_parallel(
+        &mut self,
+        input_ids: &Tensor,
+        offset: usize,
+        comm: &dyn Comm,
+    ) -> CandleResult<Tensor> {
+        let plan = plan_from_comm(comm)?;
+        if !plan.is_sharded() {
+            self.forward(input_ids, offset)
+        } else {
+            candle_core::bail!(
+                "{} does not implement tensor-parallel cached decode for world_size {}",
+                std::any::type_name::<Self>(),
+                plan.world_size()
+            )
+        }
+    }
 
     /// Clear the decoder state so the decoder can start a fresh sequence.
     ///
