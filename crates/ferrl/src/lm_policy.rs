@@ -91,9 +91,8 @@
 
 use candle_core::{IndexOp, Result as CandleResult, Tensor, Var};
 
-#[cfg(test)]
-use crate::model::chunked_logprobs_from_logits;
-use crate::model::{CachedDecoder, GradModel};
+use crate::comm::Comm;
+use crate::model::{chunked_logprobs_from_logits, CachedDecoder, GradModel};
 use crate::policy::{GenConfig, Policy, Rollout};
 use crate::qwen::QwenGradModel;
 use crate::sampler::GrpoSampler;
@@ -193,6 +192,59 @@ impl<M: GradModel> LmPolicy<M> {
     #[must_use]
     pub fn model_mut(&mut self) -> &mut M {
         &mut self.model
+    }
+
+    /// Score a rollout through the model's explicit tensor-parallel forward
+    /// path.
+    ///
+    /// This is deliberately an inherent helper rather than part of
+    /// [`Policy`]: callers must supply the communicator at the scoring site,
+    /// while the public trainer/loader/CLI paths continue to reject sharded TP
+    /// until their execution semantics are wired end to end.
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if the communicator/model plan is unsupported,
+    /// the rollout scoring window is malformed, or any tensor op fails.
+    pub fn token_logprobs_tensor_parallel(
+        &self,
+        rollout: &Rollout,
+        comm: &dyn Comm,
+    ) -> CandleResult<Tensor> {
+        let input = self.scoring_input(rollout)?;
+        let (start, len) = Self::scoring_window(rollout);
+        let targets = self.scoring_targets(rollout)?;
+        let logits = self
+            .model
+            .forward_tensor_parallel_narrowed(&input, start, len, comm)
+            .map_err(crate::cuda_compat::translate_ptx_error)?;
+        chunked_logprobs_from_logits(&logits, &targets, self.temperature, SCORING_CHUNK)
+            .map_err(crate::cuda_compat::translate_ptx_error)
+    }
+
+    /// Detached/value-only variant of
+    /// [`token_logprobs_tensor_parallel`](Self::token_logprobs_tensor_parallel).
+    ///
+    /// # Errors
+    ///
+    /// As [`token_logprobs_tensor_parallel`](Self::token_logprobs_tensor_parallel).
+    pub fn token_logprobs_tensor_parallel_detached(
+        &self,
+        rollout: &Rollout,
+        comm: &dyn Comm,
+    ) -> CandleResult<Tensor> {
+        let input = self.scoring_input(rollout)?;
+        let (start, len) = Self::scoring_window(rollout);
+        let targets = self.scoring_targets(rollout)?;
+        let logits = self
+            .model
+            .forward_tensor_parallel_detached_narrowed(&input, start, len, comm)
+            .map_err(crate::cuda_compat::translate_ptx_error)?;
+        Ok(
+            chunked_logprobs_from_logits(&logits, &targets, self.temperature, SCORING_CHUNK)
+                .map_err(crate::cuda_compat::translate_ptx_error)?
+                .detach(),
+        )
     }
 
     /// The teacher-forcing scoring input: all but the last token of every
@@ -692,7 +744,9 @@ impl<M: GradModel> Policy for LmPolicy<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::comm::LocalComm;
     use crate::gemma4::{Gemma4Config, Gemma4GradModel, Gemma4LayerType, CKPT_PREFIX};
+    use crate::lora::DenseLoraTargets;
     use crate::nn::grad_coverage;
     use crate::telemetry::DecoderCacheSnapshot;
     use candle_core::backprop::GradStore;
@@ -770,6 +824,190 @@ mod tests {
         let vb = VarBuilder::from_tensors(weight_map(&cfg), DType::F32, &Device::Cpu);
         let model = QwenGradModel::load(&cfg, &vb, 2, 4.0).unwrap();
         QwenPolicy::new(model, 7, temperature)
+    }
+
+    fn tiny_tp_gqa_cfg() -> Config {
+        let mut cfg = tiny_cfg();
+        cfg.hidden_size = 16;
+        cfg.num_attention_heads = 4;
+        cfg.num_key_value_heads = 2;
+        cfg.head_dim = 4;
+        cfg.intermediate_size = 16;
+        assert_eq!(cfg.num_attention_heads / cfg.num_key_value_heads, 2);
+        cfg
+    }
+
+    fn tiny_tp_policy_from_weights(cfg: &Config, weights: HashMap<String, Tensor>) -> QwenPolicy {
+        let vb = VarBuilder::from_tensors(weights, DType::F32, &Device::Cpu);
+        let model = QwenGradModel::load_with_targets(
+            cfg,
+            &vb,
+            2,
+            4.0,
+            DType::F32,
+            DenseLoraTargets::industrial(),
+        )
+        .unwrap();
+        QwenPolicy::new(model, 7, 1.0)
+    }
+
+    fn arm_adapter_deterministic(model: &QwenGradModel) {
+        for (i, v) in model.trainable_vars().iter().enumerate() {
+            let dims = v.as_tensor().dims().to_vec();
+            let n = dims.iter().product::<usize>();
+            let data: Vec<f32> = (0..n)
+                .map(|j| 0.03 + i as f32 * 0.004 + j as f32 * 0.002)
+                .collect();
+            v.set(&Tensor::from_vec(data, dims, &Device::Cpu).unwrap())
+                .unwrap();
+        }
+    }
+
+    fn tp_policy_rollout() -> Rollout {
+        Rollout::rectangular(vec![vec![1u32, 2, 3, 4, 5, 6], vec![3, 1, 2, 6, 4, 5]], 3)
+    }
+
+    fn max_abs_diff_vec(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len());
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    fn nonuniform_logprob_loss(logp: &Tensor) -> Tensor {
+        let n = logp.elem_count();
+        let weights: Vec<f32> = (0..n).map(|i| ((i % 7) as f32 + 1.0) * 0.125).collect();
+        let weights = Tensor::from_vec(weights, logp.dims().to_vec(), &Device::Cpu).unwrap();
+        logp.mul(&weights).unwrap().sum_all().unwrap()
+    }
+
+    fn assert_policy_tp_projection_grads_live(
+        rank: usize,
+        vars: &[Var],
+        grads: &GradStore,
+        cfg: &Config,
+    ) {
+        let names = [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ];
+        assert_eq!(vars.len(), cfg.num_hidden_layers * names.len() * 2);
+        for layer in 0..cfg.num_hidden_layers {
+            for (pair_idx, name) in names.iter().enumerate() {
+                let a_idx = layer * names.len() * 2 + pair_idx * 2;
+                let b_idx = a_idx + 1;
+                let c = grad_coverage(&vars[a_idx..=b_idx], grads).unwrap();
+                assert!(
+                    c.is_covered() && c.nonzero == c.total && c.nonfinite == 0,
+                    "rank {rank} layer {layer} {name} policy TP grads not fully live: {c:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tensor_parallel_policy_logprobs_match_unsharded_and_detached_is_tape_free() {
+        let cfg = tiny_tp_gqa_cfg();
+        let weights = weight_map(&cfg);
+        let rollout = tp_policy_rollout();
+
+        let reference_policy = tiny_tp_policy_from_weights(&cfg, weights.clone());
+        arm_adapter_deterministic(reference_policy.model());
+        let reference = reference_policy.token_logprobs(&rollout).unwrap();
+        let reference_flat = reference.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+        let comms = LocalComm::world(2);
+        let outputs: Vec<(Vec<f32>, Vec<f32>)> = std::thread::scope(|s| {
+            let handles: Vec<_> = comms
+                .into_iter()
+                .map(|comm| {
+                    let cfg = cfg.clone();
+                    let weights = weights.clone();
+                    let rollout = rollout.clone();
+                    s.spawn(move || {
+                        let policy = tiny_tp_policy_from_weights(&cfg, weights);
+                        arm_adapter_deterministic(policy.model());
+                        let live = policy
+                            .token_logprobs_tensor_parallel(&rollout, &comm)
+                            .unwrap();
+                        let det = policy
+                            .token_logprobs_tensor_parallel_detached(&rollout, &comm)
+                            .unwrap();
+                        assert_eq!(live.dims(), &[2, 3]);
+                        assert_eq!(det.dims(), live.dims());
+                        let det_store = det.sum_all().unwrap().backward().unwrap();
+                        assert!(policy
+                            .trainable_vars()
+                            .iter()
+                            .all(|v| det_store.get(v).is_none()));
+                        let live_flat = live.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                        let det_flat = det.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                        let detached_worst = max_abs_diff_vec(&live_flat, &det_flat);
+                        assert!(
+                            detached_worst <= 1e-6,
+                            "detached TP policy logprobs diverged from live TP values: \
+                             {detached_worst}"
+                        );
+                        (live_flat, det_flat)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        for (rank, (live, det)) in outputs.iter().enumerate() {
+            let live_worst = max_abs_diff_vec(live, &reference_flat);
+            assert!(
+                live_worst <= 1e-5,
+                "rank {rank} TP policy logprobs diverged from unsharded scoring: {live_worst}"
+            );
+            let det_worst = max_abs_diff_vec(det, &reference_flat);
+            assert!(
+                det_worst <= 1e-5,
+                "rank {rank} detached TP policy logprobs diverged from unsharded scoring: \
+                 {det_worst}"
+            );
+        }
+    }
+
+    #[test]
+    fn tensor_parallel_policy_backward_keeps_industrial_adapter_grads_live() {
+        let cfg = tiny_tp_gqa_cfg();
+        let weights = weight_map(&cfg);
+        let rollout = tp_policy_rollout();
+
+        let comms = LocalComm::world(2);
+        std::thread::scope(|s| {
+            let handles: Vec<_> = comms
+                .into_iter()
+                .enumerate()
+                .map(|(rank, comm)| {
+                    let cfg = cfg.clone();
+                    let weights = weights.clone();
+                    let rollout = rollout.clone();
+                    s.spawn(move || {
+                        let policy = tiny_tp_policy_from_weights(&cfg, weights);
+                        arm_adapter_deterministic(policy.model());
+                        let vars = policy.trainable_vars();
+                        let logp = policy
+                            .token_logprobs_tensor_parallel(&rollout, &comm)
+                            .unwrap();
+                        let loss = nonuniform_logprob_loss(&logp);
+                        let grads = policy.backward(&loss).unwrap();
+                        assert_policy_tp_projection_grads_live(rank, &vars, &grads, &cfg);
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
     }
 
     /// Two policies sharing the SAME base weights and sampler seed, so they draw an

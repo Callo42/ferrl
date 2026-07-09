@@ -1257,6 +1257,22 @@ impl Gemma4GradModel {
         self.forward_tensor_parallel_window(input_ids, None, comm)
     }
 
+    /// Windowed logits through the tensor-parallel projection/collective path.
+    ///
+    /// # Errors
+    ///
+    /// As [`forward_tensor_parallel`](Self::forward_tensor_parallel), plus any
+    /// windowing error.
+    pub fn forward_tensor_parallel_narrowed(
+        &self,
+        input_ids: &Tensor,
+        start: usize,
+        len: usize,
+        comm: &dyn Comm,
+    ) -> CandleResult<Tensor> {
+        self.forward_tensor_parallel_window(input_ids, Some((start, len)), comm)
+    }
+
     fn forward_tensor_parallel_window(
         &self,
         input_ids: &Tensor,
@@ -1344,6 +1360,31 @@ impl Gemma4GradModel {
         input_ids: &Tensor,
         comm: &dyn Comm,
     ) -> CandleResult<Tensor> {
+        self.forward_tensor_parallel_detached_window(input_ids, None, comm)
+    }
+
+    /// Detached windowed logits through the tensor-parallel path.
+    ///
+    /// # Errors
+    ///
+    /// As [`forward_tensor_parallel`](Self::forward_tensor_parallel), plus any
+    /// windowing error.
+    pub fn forward_tensor_parallel_detached_narrowed(
+        &self,
+        input_ids: &Tensor,
+        start: usize,
+        len: usize,
+        comm: &dyn Comm,
+    ) -> CandleResult<Tensor> {
+        self.forward_tensor_parallel_detached_window(input_ids, Some((start, len)), comm)
+    }
+
+    fn forward_tensor_parallel_detached_window(
+        &self,
+        input_ids: &Tensor,
+        window: Option<(usize, usize)>,
+        comm: &dyn Comm,
+    ) -> CandleResult<Tensor> {
         if self.remat {
             bail!(
                 "Gemma4GradModel::forward_tensor_parallel_detached: activation checkpointing is \
@@ -1358,7 +1399,7 @@ impl Gemma4GradModel {
                 .forward_tensor_parallel(&h, &masks, &self.rot, plan, Some(comm))?
                 .detach();
         }
-        self.norm_head_softcap(&h, None)
+        Ok(self.norm_head_softcap(&h, window)?.detach())
     }
 
     fn forward_remat(
@@ -1486,6 +1527,40 @@ impl GradModel for Gemma4GradModel {
         len: usize,
     ) -> CandleResult<Tensor> {
         Gemma4GradModel::forward_detached_narrowed(self, input_ids, start, len)
+    }
+
+    fn forward_tensor_parallel(&self, input_ids: &Tensor, comm: &dyn Comm) -> CandleResult<Tensor> {
+        Gemma4GradModel::forward_tensor_parallel(self, input_ids, comm)
+    }
+
+    fn forward_tensor_parallel_narrowed(
+        &self,
+        input_ids: &Tensor,
+        start: usize,
+        len: usize,
+        comm: &dyn Comm,
+    ) -> CandleResult<Tensor> {
+        Gemma4GradModel::forward_tensor_parallel_narrowed(self, input_ids, start, len, comm)
+    }
+
+    fn forward_tensor_parallel_detached(
+        &self,
+        input_ids: &Tensor,
+        comm: &dyn Comm,
+    ) -> CandleResult<Tensor> {
+        Gemma4GradModel::forward_tensor_parallel_detached(self, input_ids, comm)
+    }
+
+    fn forward_tensor_parallel_detached_narrowed(
+        &self,
+        input_ids: &Tensor,
+        start: usize,
+        len: usize,
+        comm: &dyn Comm,
+    ) -> CandleResult<Tensor> {
+        Gemma4GradModel::forward_tensor_parallel_detached_narrowed(
+            self, input_ids, start, len, comm,
+        )
     }
 
     fn backward(&self, loss: &Tensor) -> CandleResult<GradStore> {

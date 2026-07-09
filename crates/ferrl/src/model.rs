@@ -26,6 +26,7 @@ use candle_core::backprop::GradStore;
 use candle_core::{DType, Device, Result as CandleResult, Tensor, Var, D};
 use candle_nn::ops::log_softmax;
 
+use crate::comm::Comm;
 use crate::telemetry::DecoderCacheSnapshot;
 
 /// A stateful, grad-free incremental decoder over a snapshot of a
@@ -233,6 +234,96 @@ pub trait GradModel {
         len: usize,
     ) -> CandleResult<Tensor> {
         self.forward_detached(input_ids)?.narrow(1, start, len)
+    }
+
+    /// Full-sequence logits through an explicitly supplied tensor-parallel
+    /// communicator.
+    ///
+    /// This is an opt-in execution seam for model/policy helpers, not the
+    /// public loader/trainer contract. The default preserves fail-closed
+    /// behavior for models that have not wired tensor parallelism: single-rank
+    /// communicators reuse [`forward`](Self::forward), while sharded worlds fail
+    /// loud instead of silently running an unsharded forward.
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if a sharded communicator is supplied to a model
+    /// that has not overridden this method, or if the concrete forward fails.
+    fn forward_tensor_parallel(&self, input_ids: &Tensor, comm: &dyn Comm) -> CandleResult<Tensor> {
+        if comm.world_size() == 1 {
+            self.forward(input_ids)
+        } else {
+            candle_core::bail!(
+                "{} does not implement tensor-parallel forward for world_size {}",
+                std::any::type_name::<Self>(),
+                comm.world_size()
+            )
+        }
+    }
+
+    /// Windowed variant of
+    /// [`forward_tensor_parallel`](Self::forward_tensor_parallel).
+    ///
+    /// The default narrows the TP full-sequence logits, so overriding models can
+    /// provide the same memory win as [`forward_narrowed`](Self::forward_narrowed)
+    /// by applying the head to the scoring window alone.
+    ///
+    /// # Errors
+    ///
+    /// As [`forward_tensor_parallel`](Self::forward_tensor_parallel), plus any
+    /// windowing error.
+    fn forward_tensor_parallel_narrowed(
+        &self,
+        input_ids: &Tensor,
+        start: usize,
+        len: usize,
+        comm: &dyn Comm,
+    ) -> CandleResult<Tensor> {
+        self.forward_tensor_parallel(input_ids, comm)?
+            .narrow(1, start, len)
+    }
+
+    /// Detached/value-only tensor-parallel logits.
+    ///
+    /// The default is fail-closed for sharded communicators and reuses
+    /// [`forward_detached`](Self::forward_detached) only for a single-rank
+    /// communicator.
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if a sharded communicator is supplied to a model
+    /// that has not overridden this method, or if the concrete forward fails.
+    fn forward_tensor_parallel_detached(
+        &self,
+        input_ids: &Tensor,
+        comm: &dyn Comm,
+    ) -> CandleResult<Tensor> {
+        if comm.world_size() == 1 {
+            self.forward_detached(input_ids)
+        } else {
+            candle_core::bail!(
+                "{} does not implement detached tensor-parallel forward for world_size {}",
+                std::any::type_name::<Self>(),
+                comm.world_size()
+            )
+        }
+    }
+
+    /// Detached/value-only windowed TP logits.
+    ///
+    /// # Errors
+    ///
+    /// As [`forward_tensor_parallel_detached`](Self::forward_tensor_parallel_detached),
+    /// plus any windowing error.
+    fn forward_tensor_parallel_detached_narrowed(
+        &self,
+        input_ids: &Tensor,
+        start: usize,
+        len: usize,
+        comm: &dyn Comm,
+    ) -> CandleResult<Tensor> {
+        self.forward_tensor_parallel_detached(input_ids, comm)?
+            .narrow(1, start, len)
     }
 
     /// Gather temperature-scaled log-probabilities for `targets`
