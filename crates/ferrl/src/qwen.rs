@@ -140,6 +140,9 @@ mod tests {
     use crate::lora::{DenseLoraTargets, Proj};
     use crate::model::GradModel;
     use crate::nn::{grad_coverage, RmsNorm};
+    use crate::tensor_parallel::{
+        concat_column_shards, sum_row_parallel_partials, TensorParallelPlan,
+    };
     use candle_core::backprop::GradStore;
     use candle_core::safetensors;
     use candle_core::{Tensor, Var, D};
@@ -754,6 +757,137 @@ mod tests {
                     .unwrap();
             }
         }
+    }
+
+    fn all_tp_plans(world_size: usize) -> Vec<TensorParallelPlan> {
+        (0..world_size)
+            .map(|rank| TensorParallelPlan::new(rank, world_size).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn dense_mlp_tensor_parallel_projection_shards_reassemble() {
+        let cfg = tiny_cfg();
+        let vb = tiny_vb(&cfg);
+        let model = QwenGradModel::load_with_targets(
+            &cfg,
+            &vb,
+            2,
+            4.0,
+            DType::F32,
+            DenseLoraTargets::industrial(),
+        )
+        .unwrap();
+        arm_adapter(&model);
+        let mlp = &model.layers[0].mlp;
+        let x = Tensor::from_vec(
+            (0..16).map(|i| i as f32 * 0.04 - 0.3).collect::<Vec<_>>(),
+            (1, 2, cfg.hidden_size),
+            &dev(),
+        )
+        .unwrap();
+
+        let full_hidden = mlp
+            .gate_proj
+            .forward(&x)
+            .unwrap()
+            .apply(&Activation::Silu)
+            .unwrap()
+            .broadcast_mul(&mlp.up_proj.forward(&x).unwrap())
+            .unwrap();
+        let full = mlp.down_proj.forward(&full_hidden).unwrap();
+        let partials = all_tp_plans(2)
+            .into_iter()
+            .map(|plan| {
+                let gate = mlp
+                    .gate_proj
+                    .column_parallel_forward(&x, plan, "intermediate_size")?
+                    .apply(&Activation::Silu)?;
+                let up = mlp
+                    .up_proj
+                    .column_parallel_forward(&x, plan, "intermediate_size")?;
+                let hidden = gate.broadcast_mul(&up)?;
+                mlp.down_proj.row_parallel_forward_partial_from_shard(
+                    &hidden,
+                    plan,
+                    "intermediate_size",
+                )
+            })
+            .collect::<candle_core::Result<Vec<_>>>()
+            .unwrap();
+        let sharded = sum_row_parallel_partials(&partials).unwrap();
+
+        assert_eq!(sharded.dims(), full.dims());
+        let worst = max_abs_diff(&sharded, &full);
+        assert!(
+            worst <= 1e-5,
+            "tensor-parallel dense MLP reassembly diverged: {worst}"
+        );
+    }
+
+    #[test]
+    fn dense_attention_tensor_parallel_projection_shards_reassemble() {
+        let mut cfg = tiny_cfg();
+        cfg.num_key_value_heads = 2;
+        let vb = tiny_vb(&cfg);
+        let model = QwenGradModel::load_with_targets(
+            &cfg,
+            &vb,
+            2,
+            4.0,
+            DType::F32,
+            DenseLoraTargets::industrial(),
+        )
+        .unwrap();
+        arm_adapter(&model);
+        let attn = &model.layers[0].attn;
+        let x = Tensor::from_vec(
+            (0..16).map(|i| i as f32 * 0.025 - 0.2).collect::<Vec<_>>(),
+            (1, 2, cfg.hidden_size),
+            &dev(),
+        )
+        .unwrap();
+
+        for (name, proj) in [
+            ("q_proj", &attn.q_proj),
+            ("k_proj", &attn.k_proj),
+            ("v_proj", &attn.v_proj),
+        ] {
+            let full = proj.forward(&x).unwrap();
+            let shards = all_tp_plans(2)
+                .into_iter()
+                .map(|plan| proj.column_parallel_forward(&x, plan, "attention_out"))
+                .collect::<candle_core::Result<Vec<_>>>()
+                .unwrap();
+            let sharded = concat_column_shards(&shards).unwrap();
+            let worst = max_abs_diff(&sharded, &full);
+            assert!(
+                worst <= 1e-5,
+                "{name} column shards diverged from full projection: {worst}"
+            );
+        }
+
+        let ctx = Tensor::from_vec(
+            (0..16).map(|i| i as f32 * -0.03 + 0.4).collect::<Vec<_>>(),
+            (1, 2, cfg.num_attention_heads * cfg.head_dim),
+            &dev(),
+        )
+        .unwrap();
+        let full = attn.o_proj.forward(&ctx).unwrap();
+        let partials = all_tp_plans(2)
+            .into_iter()
+            .map(|plan| {
+                attn.o_proj
+                    .row_parallel_forward_partial(&ctx, plan, "attention_hidden")
+            })
+            .collect::<candle_core::Result<Vec<_>>>()
+            .unwrap();
+        let sharded = sum_row_parallel_partials(&partials).unwrap();
+        let worst = max_abs_diff(&sharded, &full);
+        assert!(
+            worst <= 1e-5,
+            "o_proj row partials diverged from full projection: {worst}"
+        );
     }
 
     /// Uncached base-only logits over the same weights `vb`, for the non-vacuity

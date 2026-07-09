@@ -57,6 +57,7 @@ use crate::lora::{
 use crate::model::{CachedDecoder, GradModel};
 use crate::nn::RmsNorm;
 use crate::remat::{stitched_backward, RematTape};
+use crate::tensor_parallel::TensorParallelPlan;
 
 /// The per-architecture seam of the shared dense backbone.
 ///
@@ -196,11 +197,18 @@ impl DenseAttention {
     ) -> CandleResult<Tensor> {
         let (b, l, _) = x.dims3()?;
         let in_dtype = x.dtype();
+        let tp = TensorParallelPlan::single();
 
         // 1. Projections, each adapted or frozen per the recipe.
-        let q = self.q_proj.forward(x)?;
-        let k = self.k_proj.forward(x)?;
-        let v = self.v_proj.forward(x)?;
+        let q = self
+            .q_proj
+            .column_parallel_forward(x, tp, "attention_q_out")?;
+        let k = self
+            .k_proj
+            .column_parallel_forward(x, tp, "attention_k_out")?;
+        let v = self
+            .v_proj
+            .column_parallel_forward(x, tp, "attention_v_out")?;
 
         // 2. (B, L, H, D) -> (B, H, L, D).
         let q = q
@@ -259,7 +267,8 @@ impl DenseAttention {
             .transpose(1, 2)?
             .contiguous()?
             .reshape((b, l, self.attn_hidden))?;
-        self.o_proj.forward(&ctx)
+        self.o_proj
+            .row_parallel_forward_partial(&ctx, tp, "attention_hidden")
     }
 
     fn set_adapter_enabled(&mut self, enabled: bool) {
@@ -324,9 +333,19 @@ impl DenseMlp {
     }
 
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
-        let lhs = self.gate_proj.forward(x)?.apply(&self.act)?;
-        let rhs = self.up_proj.forward(x)?;
-        self.down_proj.forward(&lhs.broadcast_mul(&rhs)?)
+        let tp = TensorParallelPlan::single();
+        let lhs = self
+            .gate_proj
+            .column_parallel_forward(x, tp, "intermediate_size")?
+            .apply(&self.act)?;
+        let rhs = self
+            .up_proj
+            .column_parallel_forward(x, tp, "intermediate_size")?;
+        self.down_proj.row_parallel_forward_partial(
+            &lhs.broadcast_mul(&rhs)?,
+            tp,
+            "intermediate_size",
+        )
     }
 
     fn set_adapter_enabled(&mut self, enabled: bool) {

@@ -40,6 +40,16 @@ use candle_core::{DType, Device, Result as CandleResult, Tensor, Var};
 use candle_nn::VarBuilder;
 
 use crate::blocks::frozen_linear;
+use crate::tensor_parallel::{ShardRange, TensorParallelPlan};
+
+fn tp_shard(
+    plan: TensorParallelPlan,
+    label: &'static str,
+    axis_len: usize,
+) -> CandleResult<ShardRange> {
+    plan.shard_axis(label, axis_len)
+        .map_err(|e| candle_core::Error::Msg(e.to_string()))
+}
 
 /// Optional quantization for frozen base projection weights.
 ///
@@ -183,6 +193,42 @@ impl FrozenLinearWeight {
                 frozen_linear(x, &w)
             }
         }
+    }
+
+    pub(crate) fn column_parallel_forward(
+        &self,
+        x: &Tensor,
+        plan: TensorParallelPlan,
+        label: &'static str,
+    ) -> CandleResult<Tensor> {
+        let (out, _in) = self.dims2()?;
+        let shard = tp_shard(plan, label, out)?;
+        let weight = match self {
+            Self::Dense(w) => w.narrow(0, shard.start, shard.len)?,
+            Self::Quantized { .. } => {
+                self.dequantized_to(x.dtype())?
+                    .narrow(0, shard.start, shard.len)?
+            }
+        };
+        frozen_linear(x, &weight)
+    }
+
+    pub(crate) fn row_parallel_forward_partial_from_shard(
+        &self,
+        x_shard: &Tensor,
+        plan: TensorParallelPlan,
+        label: &'static str,
+    ) -> CandleResult<Tensor> {
+        let (_out, in_) = self.dims2()?;
+        let shard = tp_shard(plan, label, in_)?;
+        let weight = match self {
+            Self::Dense(w) => w.narrow(1, shard.start, shard.len)?,
+            Self::Quantized { .. } => {
+                self.dequantized_to(x_shard.dtype())?
+                    .narrow(1, shard.start, shard.len)?
+            }
+        };
+        frozen_linear(x_shard, &weight)
     }
 
     /// Tape-free rollout linear. Quantized weights use candle's quantized matmul.
@@ -444,6 +490,58 @@ impl Proj {
         }
     }
 
+    /// Output-axis shard of this projection: `y_r = x @ W_r^T`, including the
+    /// rank-local `LoRA` B rows when adapted and enabled.
+    pub(crate) fn column_parallel_forward(
+        &self,
+        x: &Tensor,
+        plan: TensorParallelPlan,
+        label: &'static str,
+    ) -> CandleResult<Tensor> {
+        match self {
+            Self::Frozen(w) => w.column_parallel_forward(x, plan, label),
+            Self::Lora(l) => l.column_parallel_forward(x, plan, label),
+        }
+    }
+
+    /// Input-axis partial from a full input tensor. The caller must sum every
+    /// rank's partial to recover the full projection output.
+    pub(crate) fn row_parallel_forward_partial(
+        &self,
+        x: &Tensor,
+        plan: TensorParallelPlan,
+        label: &'static str,
+    ) -> CandleResult<Tensor> {
+        let (_out, in_) = self.dims2()?;
+        let shard = tp_shard(plan, label, in_)?;
+        let dim = x.rank().checked_sub(1).ok_or_else(|| {
+            candle_core::Error::Msg("row-parallel input must have rank >= 1".into())
+        })?;
+        let x_shard = x.narrow(dim, shard.start, shard.len)?;
+        self.row_parallel_forward_partial_from_shard(&x_shard, plan, label)
+    }
+
+    /// Input-axis partial from an already-sharded input tensor. The caller must
+    /// sum every rank's partial to recover the full projection output.
+    pub(crate) fn row_parallel_forward_partial_from_shard(
+        &self,
+        x_shard: &Tensor,
+        plan: TensorParallelPlan,
+        label: &'static str,
+    ) -> CandleResult<Tensor> {
+        match self {
+            Self::Frozen(w) => w.row_parallel_forward_partial_from_shard(x_shard, plan, label),
+            Self::Lora(l) => l.row_parallel_forward_partial_from_shard(x_shard, plan, label),
+        }
+    }
+
+    pub(crate) fn dims2(&self) -> CandleResult<(usize, usize)> {
+        match self {
+            Self::Frozen(w) => w.dims2(),
+            Self::Lora(l) => l.dims2(),
+        }
+    }
+
     /// The single effective weight of the current forward (see
     /// [`LoraLinear::merged_weight`]); a frozen projection is its own merge.
     ///
@@ -663,6 +761,82 @@ impl LoraLinear {
         self.base_bias.as_ref()
     }
 
+    fn dims2(&self) -> CandleResult<(usize, usize)> {
+        self.base_weight.dims2()
+    }
+
+    fn narrow_bias(bias: &Tensor, shard: ShardRange, label: &'static str) -> CandleResult<Tensor> {
+        let dims = bias.dims();
+        if dims != [shard.full_len] {
+            candle_core::bail!(
+                "LoRA column-parallel bias for {label} must have shape [{}], got {:?}",
+                shard.full_len,
+                dims
+            );
+        }
+        bias.narrow(0, shard.start, shard.len)
+    }
+
+    pub(crate) fn column_parallel_forward(
+        &self,
+        x: &Tensor,
+        plan: TensorParallelPlan,
+        label: &'static str,
+    ) -> CandleResult<Tensor> {
+        let (out, _in) = self.dims2()?;
+        let shard = tp_shard(plan, label, out)?;
+        let base = self.base_weight.column_parallel_forward(x, plan, label)?;
+        let base = match &self.base_bias {
+            Some(bias) => base.broadcast_add(&Self::narrow_bias(bias, shard, label)?)?,
+            None => base,
+        };
+        if !self.enabled {
+            return Ok(base);
+        }
+        let dtype = self.base_weight.dtype();
+        let a = self.a.as_tensor().to_dtype(dtype)?;
+        let b = self
+            .b
+            .as_tensor()
+            .to_dtype(dtype)?
+            .narrow(0, shard.start, shard.len)?;
+        let xa = x.broadcast_matmul(&a.t()?)?;
+        let xab = xa.broadcast_matmul(&b.t()?)?;
+        base.broadcast_add(&(xab * self.scale)?)
+    }
+
+    pub(crate) fn row_parallel_forward_partial_from_shard(
+        &self,
+        x_shard: &Tensor,
+        plan: TensorParallelPlan,
+        label: &'static str,
+    ) -> CandleResult<Tensor> {
+        if self.base_bias.is_some() {
+            candle_core::bail!(
+                "LoRA row-parallel partial for {label} cannot apply base_bias per rank; \
+                 sum all row-parallel partials first, then apply the bias once"
+            );
+        }
+        let (_out, in_) = self.dims2()?;
+        let shard = tp_shard(plan, label, in_)?;
+        let base = self
+            .base_weight
+            .row_parallel_forward_partial_from_shard(x_shard, plan, label)?;
+        if !self.enabled {
+            return Ok(base);
+        }
+        let dtype = self.base_weight.dtype();
+        let a = self
+            .a
+            .as_tensor()
+            .to_dtype(dtype)?
+            .narrow(1, shard.start, shard.len)?;
+        let b = self.b.as_tensor().to_dtype(dtype)?;
+        let xa = x_shard.broadcast_matmul(&a.t()?)?;
+        let xab = xa.broadcast_matmul(&b.t()?)?;
+        base.broadcast_add(&(xab * self.scale)?)
+    }
+
     /// The single effective weight the **current** forward applies: `W` when the
     /// adapter is disabled, `W + scale · (B @ A)` when enabled — so
     /// `x @ merged_weight()ᵀ (+ bias)` reproduces [`forward`](Self::forward)`(x)`
@@ -766,6 +940,9 @@ impl LoraLinear {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tensor_parallel::{
+        concat_column_shards, sum_row_parallel_partials, TensorParallelPlan,
+    };
     use candle_core::{DType, Device};
 
     fn base(out: usize, in_: usize) -> Tensor {
@@ -1152,6 +1329,145 @@ mod tests {
         l.b.set(&Tensor::from_vec(b_data, (out, rank), &Device::Cpu).unwrap())
             .unwrap();
         l
+    }
+
+    fn all_plans(world_size: usize) -> Vec<TensorParallelPlan> {
+        (0..world_size)
+            .map(|rank| TensorParallelPlan::new(rank, world_size).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn lora_column_parallel_shards_reassemble_full_forward() {
+        let p = Proj::Lora(nonzero_lora(6, 4, 2, 4.0));
+        let x = Tensor::from_vec(
+            (0..24).map(|i| i as f32 * 0.03 - 0.35).collect::<Vec<_>>(),
+            (2, 3, 4),
+            &Device::Cpu,
+        )
+        .unwrap();
+
+        let full = p.forward(&x).unwrap();
+        let shards = all_plans(3)
+            .into_iter()
+            .map(|plan| p.column_parallel_forward(&x, plan, "projection_out"))
+            .collect::<CandleResult<Vec<_>>>()
+            .unwrap();
+        let reassembled = concat_column_shards(&shards).unwrap();
+
+        assert_eq!(reassembled.dims(), full.dims());
+        let md = max_abs_diff(&reassembled, &full);
+        assert!(
+            md <= 1e-5,
+            "column-parallel LoRA shards diverged from full forward: {md}"
+        );
+    }
+
+    #[test]
+    fn lora_row_parallel_partials_reassemble_full_forward_and_keep_gradients() {
+        let p = Proj::Lora(nonzero_lora(5, 6, 2, 4.0));
+        let x = Tensor::from_vec(
+            (0..24).map(|i| i as f32 * 0.04 - 0.45).collect::<Vec<_>>(),
+            (2, 2, 6),
+            &Device::Cpu,
+        )
+        .unwrap();
+
+        let full = p.forward(&x).unwrap();
+        let partials = all_plans(3)
+            .into_iter()
+            .map(|plan| p.row_parallel_forward_partial(&x, plan, "projection_in"))
+            .collect::<CandleResult<Vec<_>>>()
+            .unwrap();
+        let reassembled = sum_row_parallel_partials(&partials).unwrap();
+
+        assert_eq!(reassembled.dims(), full.dims());
+        let md = max_abs_diff(&reassembled, &full);
+        assert!(
+            md <= 1e-5,
+            "row-parallel LoRA partials diverged from full forward: {md}"
+        );
+
+        let vars = match &p {
+            Proj::Lora(l) => l.trainable_vars(),
+            Proj::Frozen(_) => unreachable!(),
+        };
+        let grads = reassembled
+            .sqr()
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .backward()
+            .unwrap();
+        for (idx, var) in vars.iter().enumerate() {
+            let grad = grads
+                .get(var.as_tensor())
+                .unwrap_or_else(|| panic!("LoRA var {idx} missing from row-partial grad store"));
+            let mag: f32 = grad.abs().unwrap().sum_all().unwrap().to_scalar().unwrap();
+            assert!(mag > 0.0, "LoRA var {idx} row-partial gradient is zero");
+        }
+    }
+
+    #[test]
+    fn quantized_lora_tensor_parallel_shards_reassemble_full_forward() {
+        let l = LoraLinear::with_adapter_dtype_and_base_quantization(
+            base(6, 32),
+            None,
+            2,
+            4.0,
+            DType::F32,
+            BaseQuantization::Q8_0,
+        )
+        .unwrap();
+        l.a.set(
+            &Tensor::from_vec(
+                (0..64).map(|i| i as f32 * 0.004 - 0.12).collect::<Vec<_>>(),
+                (2, 32),
+                &Device::Cpu,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        l.b.set(
+            &Tensor::from_vec(
+                (0..12).map(|i| 0.08 - i as f32 * 0.01).collect::<Vec<_>>(),
+                (6, 2),
+                &Device::Cpu,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let p = Proj::Lora(l);
+        let x = Tensor::from_vec(
+            (0..128).map(|i| i as f32 * 0.01 - 0.4).collect::<Vec<_>>(),
+            (2, 2, 32),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let full = p.forward(&x).unwrap();
+
+        let columns = all_plans(2)
+            .into_iter()
+            .map(|plan| p.column_parallel_forward(&x, plan, "projection_out"))
+            .collect::<CandleResult<Vec<_>>>()
+            .unwrap();
+        let column_reassembled = concat_column_shards(&columns).unwrap();
+        assert!(
+            max_abs_diff(&column_reassembled, &full) <= 1e-5,
+            "quantized column-parallel LoRA shards diverged from full forward"
+        );
+
+        let partials = all_plans(2)
+            .into_iter()
+            .map(|plan| p.row_parallel_forward_partial(&x, plan, "projection_in"))
+            .collect::<CandleResult<Vec<_>>>()
+            .unwrap();
+        let row_reassembled = sum_row_parallel_partials(&partials).unwrap();
+        let row_md = max_abs_diff(&row_reassembled, &full);
+        assert!(
+            row_md <= 1e-4,
+            "quantized row-parallel LoRA partials diverged from full forward: {row_md}"
+        );
     }
 
     #[test]

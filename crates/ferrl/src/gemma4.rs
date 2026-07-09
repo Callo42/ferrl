@@ -27,6 +27,7 @@ use crate::model::{CachedDecoder, GradModel};
 use crate::nn::RmsNorm;
 use crate::remat::{stitched_backward, RematTape};
 use crate::telemetry::DecoderCacheSnapshot;
+use crate::tensor_parallel::TensorParallelPlan;
 
 /// The checkpoint prefix used by public Gemma 4 conditional-generation
 /// checkpoints for the text decoder.
@@ -824,10 +825,15 @@ impl Gemma4Attention {
     ) -> CandleResult<Tensor> {
         let (b, l, _) = x.dims3()?;
         let in_dtype = x.dtype();
-        let q = self.q_proj.forward(x)?;
-        let k_raw = self.k_proj.forward(x)?;
+        let tp = TensorParallelPlan::single();
+        let q = self
+            .q_proj
+            .column_parallel_forward(x, tp, "attention_q_out")?;
+        let k_raw = self
+            .k_proj
+            .column_parallel_forward(x, tp, "attention_k_out")?;
         let v_raw = match &self.v_proj {
-            Some(v) => v.forward(x)?,
+            Some(v) => v.column_parallel_forward(x, tp, "attention_v_out")?,
             None => k_raw.clone(),
         };
 
@@ -858,7 +864,8 @@ impl Gemma4Attention {
             .transpose(1, 2)?
             .contiguous()?
             .reshape((b, l, self.attn_hidden))?;
-        self.o_proj.forward(&ctx)
+        self.o_proj
+            .row_parallel_forward_partial(&ctx, tp, "attention_hidden")
     }
 
     fn set_adapter_enabled(&mut self, enabled: bool) {
@@ -919,10 +926,16 @@ impl Gemma4Mlp {
     }
 
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
-        let g = self.gate_proj.forward(x)?;
-        let u = self.up_proj.forward(x)?;
+        let tp = TensorParallelPlan::single();
+        let g = self
+            .gate_proj
+            .column_parallel_forward(x, tp, "intermediate_size")?;
+        let u = self
+            .up_proj
+            .column_parallel_forward(x, tp, "intermediate_size")?;
         let h = self.act.forward(&g)?.broadcast_mul(&u)?;
-        self.down_proj.forward(&h)
+        self.down_proj
+            .row_parallel_forward_partial(&h, tp, "intermediate_size")
     }
 
     fn set_adapter_enabled(&mut self, enabled: bool) {
@@ -1751,6 +1764,9 @@ mod tests {
     use super::*;
 
     use crate::nn::grad_coverage;
+    use crate::tensor_parallel::{
+        concat_column_shards, sum_row_parallel_partials, TensorParallelPlan,
+    };
 
     const GEMMA4_31B_TEXT_CONFIG: &str = r#"{
         "model_type": "gemma4",
@@ -2144,6 +2160,120 @@ mod tests {
                     .unwrap();
             }
         }
+    }
+
+    fn all_tp_plans(world_size: usize) -> Vec<TensorParallelPlan> {
+        (0..world_size)
+            .map(|rank| TensorParallelPlan::new(rank, world_size).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn gemma4_mlp_tensor_parallel_projection_shards_reassemble() {
+        let model = tiny_model();
+        arm_adapter(&model);
+        let mlp = &model.layers[0].mlp;
+        let x = Tensor::from_vec(
+            (0..16).map(|i| i as f32 * 0.035 - 0.25).collect::<Vec<_>>(),
+            (1, 2, model.hidden),
+            &dev(),
+        )
+        .unwrap();
+
+        let full = mlp.forward(&x).unwrap();
+        let partials = all_tp_plans(2)
+            .into_iter()
+            .map(|plan| {
+                let gate = mlp
+                    .gate_proj
+                    .column_parallel_forward(&x, plan, "intermediate_size")?;
+                let up = mlp
+                    .up_proj
+                    .column_parallel_forward(&x, plan, "intermediate_size")?;
+                let hidden = mlp.act.forward(&gate)?.broadcast_mul(&up)?;
+                mlp.down_proj.row_parallel_forward_partial_from_shard(
+                    &hidden,
+                    plan,
+                    "intermediate_size",
+                )
+            })
+            .collect::<CandleResult<Vec<_>>>()
+            .unwrap();
+        let sharded = sum_row_parallel_partials(&partials).unwrap();
+
+        assert_eq!(sharded.dims(), full.dims());
+        let worst = max_abs_diff(&sharded, &full);
+        assert!(
+            worst <= 1e-5,
+            "tensor-parallel Gemma 4 MLP reassembly diverged: {worst}"
+        );
+    }
+
+    #[test]
+    fn gemma4_attention_tensor_parallel_projection_shards_reassemble() {
+        let mut cfg = tiny_cfg();
+        cfg.text_config.num_key_value_heads = 2;
+        cfg.text_config.num_global_key_value_heads = 2;
+        cfg.validate().unwrap();
+        let vb = tiny_vb(&cfg);
+        let model = Gemma4GradModel::load_with_targets(
+            &cfg,
+            &vb,
+            2,
+            4.0,
+            DType::F32,
+            DenseLoraTargets::industrial(),
+        )
+        .unwrap();
+        arm_adapter(&model);
+        let attn = &model.layers[0].attn;
+        let x = Tensor::from_vec(
+            (0..16).map(|i| i as f32 * 0.02 - 0.15).collect::<Vec<_>>(),
+            (1, 2, model.hidden),
+            &dev(),
+        )
+        .unwrap();
+
+        for (name, proj) in [
+            ("q_proj", &attn.q_proj),
+            ("k_proj", &attn.k_proj),
+            ("v_proj", attn.v_proj.as_ref().unwrap()),
+        ] {
+            let full = proj.forward(&x).unwrap();
+            let shards = all_tp_plans(2)
+                .into_iter()
+                .map(|plan| proj.column_parallel_forward(&x, plan, "attention_out"))
+                .collect::<CandleResult<Vec<_>>>()
+                .unwrap();
+            let sharded = concat_column_shards(&shards).unwrap();
+            let worst = max_abs_diff(&sharded, &full);
+            assert!(
+                worst <= 1e-5,
+                "{name} column shards diverged from full Gemma 4 projection: {worst}"
+            );
+        }
+
+        let ctx = Tensor::from_vec(
+            (0..16).map(|i| i as f32 * -0.025 + 0.3).collect::<Vec<_>>(),
+            (1, 2, attn.attn_hidden),
+            &dev(),
+        )
+        .unwrap();
+        let full = attn.o_proj.forward(&ctx).unwrap();
+        let partials = all_tp_plans(2)
+            .into_iter()
+            .map(|plan| {
+                attn.o_proj
+                    .row_parallel_forward_partial(&ctx, plan, "attention_hidden")
+            })
+            .collect::<CandleResult<Vec<_>>>()
+            .unwrap();
+        let sharded = sum_row_parallel_partials(&partials).unwrap();
+        let worst = max_abs_diff(&sharded, &full);
+        assert!(
+            worst <= 1e-5,
+            "o_proj row partials diverged from full Gemma 4 projection: {worst}"
+        );
     }
 
     fn overwrite_adapter(model: &Gemma4GradModel) {
