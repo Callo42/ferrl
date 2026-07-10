@@ -2669,7 +2669,13 @@ impl Trainer {
         }
         let completions = decode_completions(&rollout, tokenizer);
         gpu_mem.record("reward_start");
-        let reward_outcomes = reward_fn.reward_group_detailed(selected.sample, &completions)?;
+        let reward_outcomes = self.coordinate_reward_group(
+            reward_fn,
+            selected.sample,
+            &completions,
+            rollout.len(),
+            exec,
+        )?;
         gpu_mem.record("reward_end");
         let rewards: Vec<f32> = reward_outcomes
             .iter()
@@ -2775,6 +2781,89 @@ impl Trainer {
             tis_w,
         };
         Ok((stat, Some(item)))
+    }
+
+    /// Score one TP group's rewards on execution rank 0, then broadcast those
+    /// canonical scalars before any rank computes advantages or branches on a
+    /// degenerate group. DP ranks still score their own prompt shards locally.
+    fn coordinate_reward_group<P, R, E>(
+        &self,
+        reward_fn: &R,
+        sample: &Sample<R::Target>,
+        completions: &[String],
+        expected_len: usize,
+        exec: &E,
+    ) -> Result<Vec<RewardOutcome>, TrainerError>
+    where
+        P: Policy,
+        R: RewardFn,
+        E: PolicyExecution<P>,
+    {
+        let score_local = || {
+            let outcomes = reward_fn.reward_group_detailed(sample, completions)?;
+            if outcomes.len() != expected_len {
+                return Err(TrainerError::Contract(format!(
+                    "reward_group_detailed returned {} rewards for {expected_len} completions",
+                    outcomes.len()
+                )));
+            }
+            Ok(outcomes)
+        };
+
+        if exec.model_parallel_world_size() <= 1 {
+            return score_local();
+        }
+
+        let is_primary = exec.is_execution_primary(self.comm.as_ref());
+        let local = if is_primary {
+            score_local()
+        } else {
+            Ok(Vec::new())
+        };
+        let failed_local = if local.is_err() { 1.0 } else { 0.0 };
+        let failed_global = exec.execution_all_reduce_scalar_sum(self.comm.as_ref(), failed_local);
+        let local = match (local, failed_global) {
+            (Err(err), _) | (Ok(_), Err(err)) => return Err(err),
+            (Ok(_), Ok(failed)) if failed > 0.0 => {
+                return Err(TrainerError::Contract(
+                    "reward evaluation failed on tensor-parallel execution rank 0; aborting in \
+                     lockstep"
+                        .into(),
+                ));
+            }
+            (Ok(outcomes), Ok(_)) => outcomes,
+        };
+
+        let local_reward_bits: Vec<f64> = if is_primary {
+            local
+                .iter()
+                .map(|outcome| f64::from(outcome.reward.to_bits()))
+                .collect()
+        } else {
+            vec![0.0; expected_len]
+        };
+        let mut canonical_rewards = Vec::with_capacity(expected_len);
+        for local_bits in local_reward_bits {
+            let canonical_bits =
+                exec.execution_all_reduce_scalar_sum(self.comm.as_ref(), local_bits)? as u32;
+            canonical_rewards.push(f32::from_bits(canonical_bits));
+        }
+
+        if is_primary {
+            Ok(local
+                .into_iter()
+                .zip(canonical_rewards)
+                .map(|(mut outcome, canonical)| {
+                    outcome.reward = canonical;
+                    outcome
+                })
+                .collect())
+        } else {
+            Ok(canonical_rewards
+                .into_iter()
+                .map(RewardOutcome::reward)
+                .collect())
+        }
     }
 
     fn reward_group_advantages(&self, rewards: &[f64]) -> Result<Vec<f64>, TrainerError> {
@@ -6179,6 +6268,123 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum CoordinatedTpRewardMode {
+        Scores([f32; 2]),
+        Error,
+        CountMismatch,
+    }
+
+    struct CoordinatedTpReward {
+        rank: usize,
+        mode: CoordinatedTpRewardMode,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl RewardFn for CoordinatedTpReward {
+        type Target = ();
+
+        fn reward(&self, _sample: &Sample<()>, _completion: &str) -> Result<f32, RewardError> {
+            panic!("coordinated TP reward test uses the detailed group seam")
+        }
+
+        fn reward_group_detailed(
+            &self,
+            _sample: &Sample<()>,
+            completions: &[String],
+        ) -> Result<Vec<RewardOutcome>, RewardError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            match self.mode {
+                CoordinatedTpRewardMode::Scores(scores) => Ok(scores
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, reward)| RewardOutcome {
+                        reward,
+                        diagnostic: Some(format!("rank{}:{index}", self.rank)),
+                        metadata: Some(serde_json::json!({
+                            "scoring_rank": self.rank,
+                            "completion": completions[index],
+                        })),
+                    })
+                    .collect()),
+                CoordinatedTpRewardMode::Error => {
+                    Err(RewardError::msg("execution-primary reward failure"))
+                }
+                CoordinatedTpRewardMode::CountMismatch => Ok(vec![RewardOutcome::reward(1.0)]),
+            }
+        }
+    }
+
+    struct CoordinatedTpRunResult {
+        rank: usize,
+        result: Result<(Vec<Metrics>, RunStop), TrainerError>,
+        reward_calls: usize,
+        policy_calls: TpProbeCalls,
+        candidates: String,
+    }
+
+    fn run_coordinated_tp_reward_case(
+        modes: [CoordinatedTpRewardMode; 2],
+        candidate_log_top_k: usize,
+    ) -> Vec<CoordinatedTpRunResult> {
+        let tmp = WireTmp::new("tp-coordinated-reward");
+        let results = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = crate::comm::LocalComm::world(2)
+                .into_iter()
+                .zip(modes)
+                .enumerate()
+                .map(|(rank, (tp_comm, mode))| {
+                    let root = tmp.0.clone();
+                    let results = std::sync::Arc::clone(&results);
+                    scope.spawn(move || {
+                        let run = RunDir::create(&root, format!("tp-reward-rank-{rank}")).unwrap();
+                        let cfg = TrainerConfig {
+                            steps: 1,
+                            group_size: 2,
+                            max_new_tokens: 1,
+                            lr: 0.0,
+                            candidate_log_top_k,
+                            ..TrainerConfig::default()
+                        };
+                        let mut trainer = Trainer::new(cfg, &run).unwrap();
+                        let (mut policy, policy_calls) = tp_probe_policy();
+                        let reward_calls =
+                            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                        let reward = CoordinatedTpReward {
+                            rank,
+                            mode,
+                            calls: std::sync::Arc::clone(&reward_calls),
+                        };
+                        let result = trainer.train_tensor_parallel(
+                            &mut policy,
+                            &reward,
+                            &TpProbeCodec,
+                            &[Sample::new("prompt", ())],
+                            &tp_comm,
+                        );
+                        let policy_calls = policy_calls.lock().unwrap().clone();
+                        let candidates =
+                            std::fs::read_to_string(run.candidates_path()).unwrap_or_default();
+                        results.lock().unwrap().push(CoordinatedTpRunResult {
+                            rank,
+                            result,
+                            reward_calls: reward_calls.load(Ordering::Relaxed),
+                            policy_calls,
+                            candidates,
+                        });
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
+        let mut results = std::mem::take(&mut *results.lock().unwrap());
+        results.sort_by_key(|result| result.rank);
+        results
+    }
+
     fn tp_probe_policy() -> (
         TpProbePolicy,
         std::sync::Arc<std::sync::Mutex<TpProbeCalls>>,
@@ -6380,6 +6586,106 @@ mod tests {
             "trainer did not pass the explicit TP communicator to every TP hook: {:?}",
             calls.comms
         );
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // assertion-heavy two-rank reward/ledger contract
+    fn train_tensor_parallel_broadcasts_primary_rewards_and_diagnostics() {
+        let results = run_coordinated_tp_reward_case(
+            [
+                CoordinatedTpRewardMode::Scores([0.0, 2.0]),
+                CoordinatedTpRewardMode::Scores([2.0, 0.0]),
+            ],
+            2,
+        );
+
+        assert_eq!(results[0].reward_calls, 1);
+        assert_eq!(
+            results[1].reward_calls, 0,
+            "non-primary TP rank must not invoke RewardFn"
+        );
+        let root_history = results[0].result.as_ref().unwrap().0.as_slice();
+        let peer_history = results[1].result.as_ref().unwrap().0.as_slice();
+        assert_eq!(root_history.len(), 1);
+        assert_eq!(peer_history.len(), 1);
+        assert_eq!(root_history[0].reward_mean, 1.0);
+        assert_eq!(root_history[0].reward_std, peer_history[0].reward_std);
+        assert_eq!(root_history[0].frac_reward_zero_std, 0.0);
+        assert_eq!(peer_history[0].frac_reward_zero_std, 0.0);
+        assert!(results[0].policy_calls.live_logp > 0);
+        assert!(results[1].policy_calls.live_logp > 0);
+        assert!(results[0].candidates.contains("rank0:0"));
+        assert!(results[0].candidates.contains("\"scoring_rank\":0"));
+        assert!(
+            results[1].candidates.is_empty(),
+            "non-primary TP rank wrote candidate diagnostics"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // two coordinated failure variants, same assertions
+    fn train_tensor_parallel_coordinates_reward_error_and_count_mismatch() {
+        for mode in [
+            CoordinatedTpRewardMode::Error,
+            CoordinatedTpRewardMode::CountMismatch,
+        ] {
+            let results = run_coordinated_tp_reward_case(
+                [mode, CoordinatedTpRewardMode::Scores([0.0, 2.0])],
+                0,
+            );
+            assert_eq!(results[0].reward_calls, 1);
+            assert_eq!(results[1].reward_calls, 0);
+            match (mode, results[0].result.as_ref().unwrap_err()) {
+                (CoordinatedTpRewardMode::Error, TrainerError::Reward(err)) => {
+                    assert!(err.to_string().contains("execution-primary reward failure"));
+                }
+                (CoordinatedTpRewardMode::CountMismatch, TrainerError::Contract(msg)) => {
+                    assert!(msg.contains("returned 1 rewards for 2 completions"));
+                }
+                (_, err) => panic!("unexpected primary reward error: {err:?}"),
+            }
+            assert!(matches!(
+                results[1].result.as_ref().unwrap_err(),
+                TrainerError::Contract(msg)
+                    if msg.contains("reward evaluation failed on tensor-parallel execution rank 0")
+            ));
+            for result in &results {
+                assert_eq!(result.policy_calls.live_logp, 0);
+                assert_eq!(result.policy_calls.detached_logp, 0);
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // paired branch-direction regression
+    fn train_tensor_parallel_uses_primary_reward_for_degenerate_live_branch() {
+        let degenerate = run_coordinated_tp_reward_case(
+            [
+                CoordinatedTpRewardMode::Scores([1.0, 1.0]),
+                CoordinatedTpRewardMode::Scores([0.0, 2.0]),
+            ],
+            0,
+        );
+        for result in &degenerate {
+            let history = &result.result.as_ref().unwrap().0;
+            assert_eq!(history[0].frac_reward_zero_std, 1.0);
+            assert_eq!(result.policy_calls.live_logp, 0);
+            assert_eq!(result.policy_calls.detached_logp, 0);
+        }
+
+        let live = run_coordinated_tp_reward_case(
+            [
+                CoordinatedTpRewardMode::Scores([0.0, 2.0]),
+                CoordinatedTpRewardMode::Scores([1.0, 1.0]),
+            ],
+            0,
+        );
+        for result in &live {
+            let history = &result.result.as_ref().unwrap().0;
+            assert_eq!(history[0].frac_reward_zero_std, 0.0);
+            assert!(result.policy_calls.live_logp > 0);
+            assert!(result.policy_calls.detached_logp > 0);
+        }
     }
 
     #[test]

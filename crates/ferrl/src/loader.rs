@@ -64,7 +64,9 @@ pub struct LoaderOpts {
     pub memory_efficient_cached_gqa: bool,
     /// Optional quantization mode for frozen base projection weights.
     pub base_quantization: BaseQuantization,
-    /// Tensor-parallel rank/world planning contract.
+    /// Direct-loader tensor-parallel loading plan. Sharded plans are rejected
+    /// until safetensors loading itself is sharded; `ferrl train` separately
+    /// carries its execution plan while loading full weights on each rank.
     pub tensor_parallel: TensorParallelPlan,
 }
 
@@ -131,10 +133,10 @@ pub enum LoaderError {
     },
 }
 
-/// A concrete policy loaded from any qwen-family checkpoint the CLI supports.
+/// A concrete policy loaded from any model-family checkpoint the CLI supports.
 ///
 /// The enum keeps `load_qwen_policy` backward-compatible while giving `ferrl train`
-/// one model-agnostic return type for Qwen3 and Qwen3.5/3.6 checkpoints.
+/// one model-agnostic return type for Qwen3, Qwen3.5/3.6, and dense Gemma 4 checkpoints.
 pub enum AutoPolicy {
     /// A classic dense-attention Qwen3 policy.
     Qwen(Box<QwenPolicy>),
@@ -530,9 +532,10 @@ fn reject_sharded_tensor_parallel(opts: &LoaderOpts, model_type: &str) -> Result
     if opts.tensor_parallel.is_sharded() {
         return Err(LoaderError::UnsupportedLoaderOption {
             option: "tensor_parallel".to_string(),
-            supported:
-                "tensor_parallel.world_size = 1 until tensor-parallel model execution is wired"
-                    .to_string(),
+            supported: "tensor_parallel.world_size = 1 for direct loaders until sharded \
+                        safetensors loading lands; ferrl train carries its TP execution plan \
+                        separately while full-loading weights on every rank"
+                .to_string(),
             model_type: model_type.to_string(),
         });
     }

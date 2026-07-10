@@ -31,11 +31,11 @@ candle's.
 > crate's only `unsafe`, developed CPU-mock-first), DP-coordinated checkpoint resume +
 > restart-on-preemption, and run observability (per-step timing, a `summarize` health
 > view, the `runreport` tool, and rank/world/step-stamped `tracing` logs); verified
-> bit-identical across ranks on multi-A100. **Multi-node rendezvous and tensor
-> parallelism are parked by choice** — the capability goal (correct GRPO+LoRA at the
-> ~27B single-card scale) is met, and both remaining pieces buy throughput, not
-> capability, so the supported scope is single-node DP over models that fit one card
-> with rematerialization (~27–32B). They stay documented and revivable.
+> bit-identical across ranks on multi-A100. **Single-node tensor-parallel execution is
+> also available through `ferrl train`** for Qwen3 and dense Gemma 4 policies: model
+> projections, rollout/scoring, adapter-gradient reduction, and trainer control flow use
+> an NCCL TP communicator. Checkpoint weights are still loaded in full on every rank;
+> sharded safetensors loading and combined sharded DP x TP remain future work.
 
 ---
 
@@ -73,7 +73,7 @@ ferrl/
     │   ├── blocks.rs  gdn.rs  remat.rs      # shared blocks, GatedDeltaNet math, activation ckpt
     │   ├── moe.rs                           # qwen3.5/3.6 sparse-MoE kernels (router/experts, M3′)
     │   ├── lm_policy.rs                     # Policy over any GradModel (Qwen/Llama/Qwen3_5/Gemma4)
-    │   ├── comm.rs  comm/                   # data-parallel Comm seam (Solo/Local + NCCL bridge)
+    │   ├── comm.rs  comm/                   # distributed Comm seam (Solo/Local + NCCL bridge)
     │   ├── full_ft.rs                       # opt-in full fine-tune (vs LoRA)
     │   └── {lib,policy,reward,nn,tokenizer,countdown,telemetry,cuda_compat}.rs
     └── tests/fixtures/grpo_golden.json      # committed oracle output
@@ -175,7 +175,7 @@ ferrl runreport runs/<run-id> --config run.json
                                 # one-glance health summary + configured post-run policy
 ```
 
-A `run.json` selects a task, points at a Qwen checkpoint, and carries the trainer
+A `run.json` selects a task, points at a supported model checkpoint, and carries the trainer
 config (only `task`, `model_dir`, and `trainer` are required; everything else has a
 default):
 
@@ -213,6 +213,34 @@ For deterministic trainer-owned scalar control, `trainer.beta_schedule` and
 Schedules start at step `0`, have strictly increasing in-range steps, interpolate
 linearly between points, and hold the last value. `lr_schedule` replaces both `lr`
 and `warmup_steps`; encode warmup directly as points.
+
+### Tensor-parallel `ferrl train`
+
+Sharded tensor-parallel execution supports Qwen3 (`model_type: "qwen3"`, including
+legacy configs without `model_type`) and dense Gemma 4 (`"gemma4"` or
+`"gemma4_unified"`). Qwen3.5/3.6 (`"qwen3_5"` / `"qwen3_5_moe"`) are not supported.
+Build with `--features nccl`, set `device` to `"cuda"`, and launch one Slurm task per
+TP rank. Each task's JSON `tensor_parallel.rank` must equal `SLURM_PROCID`, its
+`world_size` must equal `SLURM_NTASKS`, and every task must use the same launch-unique
+`FERRL_NCCL_RENDEZVOUS`. Generate or template one JSON file per rank; a shared file
+hard-coded to rank 0 is not a valid multi-rank launch. Configs must otherwise be
+identical. ferrl bootstraps NCCL first and validates the JSON plan against the live
+communicator before device/model setup.
+
+```jsonc
+{
+  "device": "cuda",
+  "tensor_parallel": { "enabled": true, "rank": 0, "world_size": 2 }
+}
+```
+
+Sharded TP cannot currently be combined with `distributed.enabled`, activation
+checkpointing, or held-out eval. `intermediate_size`, `num_attention_heads`, and every
+layer's effective KV-head count must divide evenly by `world_size` (both sliding and
+global KV-head counts matter for Gemma 4). Frozen checkpoint weights and trainable LoRA
+adapters remain fully replicated on every rank until sharded safetensors loading lands.
+TP rank 0 is authoritative for reward evaluation, metrics, candidate ledgers,
+checkpoints, post-run health, and the advertised output directory.
 
 `countdown` generates its data procedurally; `math` is file-backed — set `data.path`
 to a JSONL dataset of `{"prompt": ..., "target": {"answer": ...}}` lines (see
@@ -424,6 +452,8 @@ decoder cache snapshots, such as Gemma 4 per-layer seen/retained token counts. T
 run's `metrics.jsonl` and prints a health summary — reward trend, throughput, and grad-norm
 anomalies (human, `--json`, or `--strict`). Pass the original top-level run config with
 `--config run.json` to also apply its `run_health` post-run policy.
+Under sharded TP, rank-suffixed directories are created for process-local trainer state,
+but only TP rank 0 contains authoritative telemetry and is a valid `runreport` target.
 
 For manual GPU resource gates, run the same smoke or training command on a baseline
 commit and a candidate commit, then compare their per-rank metrics with `perf-gate`:

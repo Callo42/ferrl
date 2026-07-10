@@ -35,7 +35,7 @@ pub struct RealNccl {
     world_size: usize,
 }
 
-// SAFETY: a data-parallel launch runs exactly one process per rank, and that
+// SAFETY: a distributed launch runs exactly one process per rank, and that
 // process drives its single `RealNccl` from one thread (the trainer loop). The
 // cudarc `Comm` wraps a raw `ncclComm_t` that is therefore never shared across
 // threads; the `Send` bound exists only so the handle can move into the rank's

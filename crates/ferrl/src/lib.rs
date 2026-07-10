@@ -73,12 +73,13 @@
 //!   sigmoid-gated shared expert), grad-bearing and oracle-pinned, wired into
 //!   [`qwen35`]'s feed-forward layer menu so the same `Qwen3_5GradModel`
 //!   loads both the dense and the `MoE` family members (M3′);
-//! - the data-parallel communication seam ([`comm`]) — the [`Comm`] trait
-//!   (rank identity + sum-reductions) the trainer all-reduces its accumulated
-//!   gradients through, keeping every rank's weights in bitwise lockstep;
+//! - the distributed communication seam ([`comm`]) — the [`Comm`] trait
+//!   (rank identity + sum-reductions) drives data-parallel accumulated-gradient
+//!   reduction and tensor-parallel activations, rewards, control, and adapter
+//!   gradients while keeping every rank in lockstep;
 //!   [`SoloComm`] is the world-1 default (the single-rank path stays
 //!   bit-identical to the pre-DP trainer), [`LocalComm`] runs an N-thread
-//!   single-process world for the CPU-testable DP equivalence oracle, and
+//!   single-process world for CPU-testable DP/TP equivalence oracles, and
 //!   [`NcclComm`] is the real multi-GPU implementation whose `unsafe` cudarc
 //!   collective is quarantined behind `--features nccl`;
 //! - a CUDA driver-compatibility preflight ([`cuda_compat`]) — translates the cryptic

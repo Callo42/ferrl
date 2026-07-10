@@ -413,13 +413,12 @@ pub trait Policy {
 /// Explicit tensor-parallel execution hooks for policies that can route GRPO
 /// rollout and scoring through a caller-supplied communicator.
 ///
-/// This is intentionally separate from [`Policy`]: loader and CLI paths remain
-/// fail-closed for sharded tensor parallelism. Explicit trainer
-/// tensor-parallel entry points require callers to provide a tensor-parallel
-/// [`Comm`] and support sharded TP only without simultaneous sharded data
-/// parallelism: trainable adapter vars are fully replicated, gradients are
-/// sum-reduced over the TP communicator before the optimizer step, and TP rank
-/// 0 owns shared checkpoints.
+/// This is intentionally separate from [`Policy`]: explicit trainer entry points
+/// and supported `ferrl train` model families provide the tensor-parallel
+/// [`Comm`] at each execution site. Sharded TP is supported only without
+/// simultaneous sharded data parallelism: trainable adapter vars are fully
+/// replicated, gradients are sum-reduced before the optimizer step, and TP rank
+/// 0 owns rewards, metrics, candidates, checkpoints, and post-run health.
 pub trait TensorParallelPolicy: Policy {
     /// Generate a rollout through the policy's tensor-parallel rollout path,
     /// using `comm` as the tensor-parallel communicator.

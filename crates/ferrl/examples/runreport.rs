@@ -14,6 +14,8 @@
 //! learning signals (reward, kl, `grad_norm`) are bitwise-identical across ranks by
 //! the DP lockstep invariant, while `tokens_per_sec` is **per-rank** — the world
 //! throughput is `world_size ×` the reported figure.
+//! **Tensor-parallel runs** write authoritative metrics on TP rank 0 only; point
+//! this tool at rank 0's run directory, not an empty non-primary directory.
 
 // A standalone report binary whose interface *is* its stdout/stderr output.
 #![allow(clippy::print_stdout, clippy::print_stderr)]

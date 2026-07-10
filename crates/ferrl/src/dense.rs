@@ -721,9 +721,9 @@ impl<A: DenseArch> DenseGradModel<A> {
     /// Full-sequence logits through the tensor-parallel projection/collective
     /// path, using `comm`'s rank/world as the plan.
     ///
-    /// This wires real row-output activation reductions for the dense blocks,
-    /// but public loaders still reject multi-rank TP until rollout and weight
-    /// loading are sharded too.
+    /// This wires real row-output activation reductions for the dense blocks.
+    /// Public `ferrl train` uses this path for supported families while weights
+    /// remain fully loaded on every rank.
     ///
     /// # Errors
     ///

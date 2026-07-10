@@ -1241,8 +1241,8 @@ impl Gemma4GradModel {
     /// Full-sequence logits through the tensor-parallel projection/collective
     /// path, using `comm`'s rank/world as the plan.
     ///
-    /// Public loaders still reject multi-rank TP until rollout and weight
-    /// loading are sharded too.
+    /// Public `ferrl train` uses this path while weights remain fully loaded on
+    /// every rank; direct sharded loader plans remain fail-closed.
     ///
     /// # Errors
     ///

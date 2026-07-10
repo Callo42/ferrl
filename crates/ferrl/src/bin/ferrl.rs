@@ -12,7 +12,7 @@
 //! ```
 //!
 //! `train` reads a `RunConfig` (a serialized [`TrainerConfig`](ferrl::TrainerConfig)
-//! plus a model directory, a device, and a task selector), loads a Qwen-family policy via
+//! plus a model directory, a device, and a task selector), loads a supported policy via
 //! [`ferrl::load_auto_policy`], builds the named task's train/eval splits, and runs
 //! the GRPO [`Trainer`](ferrl::Trainer). The task registry is closed (the worked
 //! examples `countdown` and `math`, plus the `trimul` kernel-discovery task — which
@@ -604,7 +604,7 @@ struct PolicyCfg {
     /// Enable layer-boundary activation checkpointing for the update forward.
     ///
     /// This trades extra recompute for a lower activation peak and is the main
-    /// CLI-accessible memory lever for long Qwen-family GPU training runs.
+    /// CLI-accessible memory lever for long supported-model GPU training runs.
     activation_checkpointing: bool,
     /// Enable the experimental grouped cached-GQA rollout memory path for Qwen3.5.
     memory_efficient_cached_gqa: bool,
@@ -1044,14 +1044,13 @@ struct DistributedCfg {
     enabled: bool,
 }
 
-/// Tensor-parallel launch knobs for model sharding.
+/// Tensor-parallel launch knobs for sharded model execution.
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct TensorParallelCfg {
-    /// When true, validate this process as one rank of a tensor-parallel model
-    /// world. This slice opens execution through the explicit trainer TP hooks,
-    /// while loaders still full-load weights on every rank until sharded
-    /// safetensors loading lands.
+    /// When true, bind this process to one rank of a live tensor-parallel world.
+    /// Model projections execute in shards, while checkpoint weights still load
+    /// in full on every rank until sharded safetensors loading lands.
     enabled: bool,
     /// Tensor-parallel rank in `0..world_size`.
     rank: usize,
@@ -1201,10 +1200,9 @@ impl RunConfig {
 
     /// The loader options for this run (rollout temperature mirrors the trainer's).
     fn loader_opts(&self) -> LoaderOpts {
-        // This PR opens public *execution* through the explicit TP trainer hooks,
-        // but does not claim sharded safetensors loading yet. Keep loaders in the
-        // full-weight path so their existing sharded LoaderOpts rejection remains
-        // a library-level fail-closed guard for direct callers.
+        // The CLI carries the sharded execution plan separately. Keep loaders in
+        // the full-weight path until sharded safetensors loading lands, preserving
+        // the direct-loader fail-closed guard.
         LoaderOpts {
             lora_rank: self.policy.lora_rank,
             lora_alpha: self.policy.lora_alpha,
@@ -1218,7 +1216,7 @@ impl RunConfig {
         }
     }
 
-    /// A unique run id for this invocation: `<task>-<unix-seconds>` plus rank suffix under DP.
+    /// A unique run id: `<task>-<unix-seconds>`, rank-suffixed under DP or sharded TP.
     fn run_id(&self) -> String {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1370,7 +1368,16 @@ impl RunConfig {
 fn train(args: &TrainArgs) -> Result<(), CliError> {
     let _ = ferrl::init_tracing();
     let cfg = RunConfig::load(&args.config)?;
-    let device = cfg.open_device()?;
+    let tensor_parallel_runtime = open_tensor_parallel_runtime(&cfg)?;
+    let tensor_parallel_comm = tensor_parallel_runtime
+        .as_ref()
+        .map(|runtime| runtime.comm.as_ref());
+    let local_device = tensor_parallel_runtime.as_ref().map_or_else(
+        || cfg.open_device(),
+        |runtime| prepare_tensor_parallel_device(&runtime.device),
+    );
+    let device =
+        coordinate_tensor_parallel_result(tensor_parallel_comm, "device setup", local_device)?;
     match cfg.task.as_str() {
         "countdown" => {
             let (train, eval) = cfg.countdown_splits();
@@ -1381,17 +1388,37 @@ fn train(args: &TrainArgs) -> Result<(), CliError> {
                 &train,
                 &eval,
                 None,
+                tensor_parallel_comm,
             )
         }
         "math" => {
-            let (train, eval) = cfg.math_splits()?;
-            run_training(&cfg, &device, &MathReward::default(), &train, &eval, None)
+            let (train, eval) = coordinate_tensor_parallel_result(
+                tensor_parallel_comm,
+                "math dataset setup",
+                cfg.math_splits(),
+            )?;
+            run_training(
+                &cfg,
+                &device,
+                &MathReward::default(),
+                &train,
+                &eval,
+                None,
+                tensor_parallel_comm,
+            )
         }
         "trimul" => {
-            let prompt_file_bytes = cfg.trimul_prompt_file_bytes()?;
-            let prompt = cfg.trimul_prompt_text(&prompt_file_bytes)?;
-            let (train, eval) = cfg.trimul_splits_from_prompt(&prompt);
-            let reward = cfg.build_trimul_reward()?;
+            let (prompt_file_bytes, train, eval, reward) = coordinate_tensor_parallel_result(
+                tensor_parallel_comm,
+                "TriMul reward and dataset setup",
+                (|| {
+                    let prompt_file_bytes = cfg.trimul_prompt_file_bytes()?;
+                    let prompt = cfg.trimul_prompt_text(&prompt_file_bytes)?;
+                    let (train, eval) = cfg.trimul_splits_from_prompt(&prompt);
+                    let reward = cfg.build_trimul_reward()?;
+                    Ok((prompt_file_bytes, train, eval, reward))
+                })(),
+            )?;
             run_training(
                 &cfg,
                 &device,
@@ -1399,6 +1426,7 @@ fn train(args: &TrainArgs) -> Result<(), CliError> {
                 &train,
                 &eval,
                 Some(&prompt_file_bytes),
+                tensor_parallel_comm,
             )
         }
         other => Err(CliError::msg(format!(
@@ -1418,22 +1446,16 @@ fn run_training<R: RewardFn>(
     train: &[Sample<R::Target>],
     eval: &[Sample<R::Target>],
     rendered_prompt_bytes: Option<&[u8]>,
+    tensor_parallel_comm: Option<&dyn ferrl::Comm>,
 ) -> Result<(), CliError> {
-    let (mut policy, tok) = load_auto_policy(&cfg.model_dir, device, &cfg.loader_opts())?;
-    policy.set_activation_checkpointing(cfg.policy.activation_checkpointing);
     let tensor_parallel_plan = cfg.tensor_parallel_plan();
-    if tensor_parallel_plan.is_sharded() && !policy.supports_tensor_parallel() {
-        return Err(CliError::msg(
-            "loaded checkpoint family does not support tensor_parallel execution yet",
-        ));
-    }
     let tcfg = cfg.trainer.clone();
     let gen = GenConfig::from(&tcfg);
     info!(
         task = %cfg.task,
         steps = tcfg.steps,
         group_size = tcfg.group_size,
-        activation_checkpointing = policy.activation_checkpointing(),
+        activation_checkpointing = cfg.policy.activation_checkpointing,
         train = train.len(),
         eval = eval.len(),
         tensor_parallel_rank = tensor_parallel_plan.rank(),
@@ -1441,28 +1463,44 @@ fn run_training<R: RewardFn>(
         "ferrl train: starting"
     );
 
-    let run = RunDir::create(&cfg.out_dir, cfg.run_id())?;
-    if let Some(prompt_bytes) = rendered_prompt_bytes {
-        write_bytes(&run.root().join("prompt.txt"), prompt_bytes)?;
-        write_text(
-            &run.root().join("prompt.sha256"),
-            &format!("{}\n", sha256_hex(prompt_bytes)),
-        )?;
-    }
-    let mut trainer = open_trainer(tcfg, &run, cfg.distributed.enabled)?;
-    let tensor_parallel_comm = open_tensor_parallel_comm(cfg)?;
+    let setup = (|| {
+        let (mut policy, tok) = load_auto_policy(&cfg.model_dir, device, &cfg.loader_opts())?;
+        policy.set_activation_checkpointing(cfg.policy.activation_checkpointing);
+        if tensor_parallel_plan.is_sharded() && !policy.supports_tensor_parallel() {
+            return Err(CliError::msg(
+                "loaded checkpoint family does not support tensor_parallel execution; supported \
+                 families are qwen3 (including legacy configs without model_type) and dense \
+                 gemma4/gemma4_unified; qwen3_5/qwen3_5_moe (Qwen3.5/3.6) are unsupported",
+            ));
+        }
+        let run = RunDir::create(&cfg.out_dir, cfg.run_id())?;
+        if let Some(prompt_bytes) = rendered_prompt_bytes {
+            write_bytes(&run.root().join("prompt.txt"), prompt_bytes)?;
+            write_text(
+                &run.root().join("prompt.sha256"),
+                &format!("{}\n", sha256_hex(prompt_bytes)),
+            )?;
+        }
+        let trainer = open_trainer(tcfg, &run, cfg.distributed.enabled)?;
+        Ok((policy, tok, run, trainer))
+    })();
+    let (mut policy, tok, run, mut trainer) =
+        coordinate_tensor_parallel_result(tensor_parallel_comm, "model and trainer setup", setup)?;
     let (history, _stop) = train_with_optional_tensor_parallel(
         &mut trainer,
         &mut policy,
         reward,
         &tok,
         train,
-        tensor_parallel_comm.as_deref(),
+        tensor_parallel_comm,
     )?;
-    if let Some(summary) = summarize(&history) {
-        info!(steps = summary.steps, "ferrl train: complete");
-        apply_train_run_health_policy(cfg, &history, &summary, &run)?;
-    }
+    run_on_tensor_parallel_primary(tensor_parallel_comm, "post-run health", || {
+        if let Some(summary) = summarize(&history) {
+            info!(steps = summary.steps, "ferrl train: complete");
+            apply_train_run_health_policy(cfg, &history, &summary, &run)?;
+        }
+        Ok(())
+    })?;
 
     if !eval.is_empty() {
         let report = evaluate(&mut policy, reward, &tok, eval, &gen)?;
@@ -1474,12 +1512,14 @@ fn run_training<R: RewardFn>(
         );
     }
 
-    println!("ferrl: run complete -> {}", run.root().display());
-    println!(
-        "ferrl: inspect with `ferrl runreport {}`",
-        run.root().display()
-    );
-    Ok(())
+    run_on_tensor_parallel_primary(tensor_parallel_comm, "run completion output", || {
+        println!("ferrl: run complete -> {}", run.root().display());
+        println!(
+            "ferrl: inspect with `ferrl runreport {}`",
+            run.root().display()
+        );
+        Ok(())
+    })
 }
 
 fn train_with_optional_tensor_parallel<P, R>(
@@ -1534,20 +1574,96 @@ fn open_trainer(
     }
 }
 
-fn open_tensor_parallel_comm(cfg: &RunConfig) -> Result<Option<Box<dyn ferrl::Comm>>, CliError> {
-    if !cfg.tensor_parallel_plan().is_sharded() {
+struct TensorParallelRuntime {
+    device: Device,
+    comm: Box<dyn ferrl::Comm>,
+}
+
+fn open_tensor_parallel_runtime(
+    cfg: &RunConfig,
+) -> Result<Option<TensorParallelRuntime>, CliError> {
+    let plan = cfg.tensor_parallel_plan();
+    if !plan.is_sharded() {
         return Ok(None);
     }
-    open_sharded_tensor_parallel_comm().map(Some)
+    let runtime = open_sharded_tensor_parallel_runtime()?;
+    validate_tensor_parallel_runtime(plan, runtime.comm.as_ref())?;
+    Ok(Some(runtime))
+}
+
+fn validate_tensor_parallel_runtime(
+    plan: TensorParallelPlan,
+    comm: &dyn ferrl::Comm,
+) -> Result<(), CliError> {
+    let local = ferrl::validate_comm_plan(plan, comm).map_err(|err| {
+        CliError::msg(format!(
+            "tensor_parallel config does not match the live communicator: {err}"
+        ))
+    });
+    coordinate_tensor_parallel_result(Some(comm), "tensor_parallel config validation", local)
+}
+
+fn coordinate_tensor_parallel_result<T>(
+    comm: Option<&dyn ferrl::Comm>,
+    label: &'static str,
+    local: Result<T, CliError>,
+) -> Result<T, CliError> {
+    let Some(comm) = comm.filter(|comm| comm.world_size() > 1) else {
+        return local;
+    };
+    let failed_local = if local.is_err() { 1.0 } else { 0.0 };
+    let failed_global = comm.all_reduce_scalar_sum(failed_local);
+    match (local, failed_global) {
+        (Err(err), _) => Err(err),
+        (Ok(_), Err(err)) => Err(err.into()),
+        (Ok(_), Ok(failed)) if failed > 0.0 => Err(CliError::msg(format!(
+            "{label} failed on a peer tensor-parallel rank; aborting in lockstep"
+        ))),
+        (Ok(value), Ok(_)) => Ok(value),
+    }
+}
+
+fn run_on_tensor_parallel_primary(
+    comm: Option<&dyn ferrl::Comm>,
+    label: &'static str,
+    op: impl FnOnce() -> Result<(), CliError>,
+) -> Result<(), CliError> {
+    let local = if comm.is_none_or(|comm| comm.world_size() <= 1 || comm.rank() == 0) {
+        op()
+    } else {
+        Ok(())
+    };
+    coordinate_tensor_parallel_result(comm, label, local)
 }
 
 #[cfg(feature = "nccl")]
-fn open_sharded_tensor_parallel_comm() -> Result<Box<dyn ferrl::Comm>, CliError> {
-    Ok(Box::new(ferrl::NcclComm::from_slurm_env()?))
+fn open_sharded_tensor_parallel_runtime() -> Result<TensorParallelRuntime, CliError> {
+    let comm = ferrl::NcclComm::from_slurm_env()?;
+    let device = comm.device().clone();
+    Ok(TensorParallelRuntime {
+        device,
+        comm: Box::new(comm),
+    })
 }
 
 #[cfg(not(feature = "nccl"))]
-fn open_sharded_tensor_parallel_comm() -> Result<Box<dyn ferrl::Comm>, CliError> {
+fn open_sharded_tensor_parallel_runtime() -> Result<TensorParallelRuntime, CliError> {
+    Err(CliError::msg(
+        "sharded tensor_parallel execution requires building ferrl with --features nccl",
+    ))
+}
+
+#[cfg(feature = "nccl")]
+fn prepare_tensor_parallel_device(device: &Device) -> Result<Device, CliError> {
+    if let Some(w) = ferrl::check_driver_compat(device).warning() {
+        tracing::warn!("{w}");
+    }
+    ferrl::guard_first_kernel(device)?;
+    Ok(device.clone())
+}
+
+#[cfg(not(feature = "nccl"))]
+fn prepare_tensor_parallel_device(_device: &Device) -> Result<Device, CliError> {
     Err(CliError::msg(
         "sharded tensor_parallel execution requires building ferrl with --features nccl",
     ))
@@ -3691,6 +3807,7 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use candle_core::{Result as CandleResult, Tensor, Var};
+    use ferrl::Comm as _;
     use std::sync::{Arc, Mutex};
 
     struct TestDir(PathBuf);
@@ -3716,6 +3833,122 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn fixture_path(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name)
+    }
+
+    fn write_tiny_tokenizer(model_dir: &Path) {
+        std::fs::copy(
+            fixture_path("tiny_tokenizer.json"),
+            model_dir.join("tokenizer.json"),
+        )
+        .unwrap();
+    }
+
+    fn deterministic_tensor(dims: &[usize], offset: &mut usize) -> Tensor {
+        let len = dims.iter().product();
+        let values: Vec<f32> = (0..len)
+            .map(|index| {
+                let value = ((*offset + index) % 97) as f32;
+                (value - 48.0) * 0.002
+            })
+            .collect();
+        *offset += len;
+        Tensor::from_vec(values, dims.to_vec(), &Device::Cpu).unwrap()
+    }
+
+    fn write_tp2_qwen3_fixture(model_dir: &Path) {
+        std::fs::create_dir_all(model_dir).unwrap();
+        let config = serde_json::json!({
+            "model_type": "qwen3",
+            "vocab_size": 16,
+            "hidden_size": 16,
+            "intermediate_size": 16,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "head_dim": 4,
+            "attention_bias": false,
+            "num_key_value_heads": 2,
+            "max_position_embeddings": 32,
+            "sliding_window": null,
+            "max_window_layers": 0,
+            "tie_word_embeddings": true,
+            "rope_theta": 10000.0,
+            "rms_norm_eps": 1e-6,
+            "use_sliding_window": false,
+            "hidden_act": "silu"
+        });
+        std::fs::write(
+            model_dir.join("config.json"),
+            serde_json::to_vec_pretty(&config).unwrap(),
+        )
+        .unwrap();
+
+        let mut offset = 0;
+        let mut weights = std::collections::HashMap::new();
+        let mut put = |name: &str, dims: &[usize]| {
+            weights.insert(name.to_string(), deterministic_tensor(dims, &mut offset));
+        };
+        put("model.embed_tokens.weight", &[16, 16]);
+        put("model.norm.weight", &[16]);
+        put("model.layers.0.input_layernorm.weight", &[16]);
+        put("model.layers.0.post_attention_layernorm.weight", &[16]);
+        put("model.layers.0.self_attn.q_proj.weight", &[16, 16]);
+        put("model.layers.0.self_attn.k_proj.weight", &[8, 16]);
+        put("model.layers.0.self_attn.v_proj.weight", &[8, 16]);
+        put("model.layers.0.self_attn.o_proj.weight", &[16, 16]);
+        put("model.layers.0.self_attn.q_norm.weight", &[4]);
+        put("model.layers.0.self_attn.k_norm.weight", &[4]);
+        put("model.layers.0.mlp.gate_proj.weight", &[16, 16]);
+        put("model.layers.0.mlp.up_proj.weight", &[16, 16]);
+        put("model.layers.0.mlp.down_proj.weight", &[16, 16]);
+        candle_core::safetensors::save(&weights, model_dir.join("model.safetensors")).unwrap();
+        write_tiny_tokenizer(model_dir);
+    }
+
+    fn write_tp2_gemma4_fixture(model_dir: &Path) {
+        std::fs::create_dir_all(model_dir).unwrap();
+        let source = fixture_path("tiny_gemma4");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(source.join("config.json")).unwrap()).unwrap();
+        config["text_config"]["num_key_value_heads"] = serde_json::json!(2);
+        config["text_config"]["num_global_key_value_heads"] = serde_json::json!(2);
+        std::fs::write(
+            model_dir.join("config.json"),
+            serde_json::to_vec_pretty(&config).unwrap(),
+        )
+        .unwrap();
+
+        let source_weights =
+            candle_core::safetensors::load(source.join("model.safetensors"), &Device::Cpu).unwrap();
+        let weights: std::collections::HashMap<_, _> = source_weights
+            .into_iter()
+            .map(|(name, tensor)| {
+                if name.ends_with(".k_proj.weight") || name.ends_with(".v_proj.weight") {
+                    let doubled = Tensor::cat(&[&tensor, &tensor], 0).unwrap();
+                    (name, doubled)
+                } else {
+                    (name, tensor)
+                }
+            })
+            .collect();
+        candle_core::safetensors::save(&weights, model_dir.join("model.safetensors")).unwrap();
+        write_tiny_tokenizer(model_dir);
+    }
+
+    fn copy_fixture_dir(source_name: &str, model_dir: &Path) {
+        std::fs::create_dir_all(model_dir).unwrap();
+        for entry in std::fs::read_dir(fixture_path(source_name)).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                std::fs::copy(entry.path(), model_dir.join(entry.file_name())).unwrap();
+            }
+        }
+        write_tiny_tokenizer(model_dir);
     }
 
     fn countdown_train_config(extra_fields: &str) -> String {
@@ -4138,6 +4371,179 @@ mod tests {
         assert!(run_id.ends_with("-rank0"), "{run_id}");
     }
 
+    fn validate_local_tp_plans(plans: [TensorParallelPlan; 2]) -> Vec<Result<(), String>> {
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = ferrl::LocalComm::world(2)
+                .into_iter()
+                .zip(plans)
+                .map(|(comm, plan)| {
+                    scope.spawn(move || {
+                        validate_tensor_parallel_runtime(plan, &comm).map_err(|err| err.to_string())
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        })
+    }
+
+    #[test]
+    fn tensor_parallel_comm_plan_accepts_live_world_two() {
+        let results = validate_local_tp_plans([
+            TensorParallelPlan::new(0, 2).unwrap(),
+            TensorParallelPlan::new(1, 2).unwrap(),
+        ]);
+        assert!(results.into_iter().all(|result| result.is_ok()));
+    }
+
+    #[test]
+    fn tensor_parallel_comm_plan_mismatch_aborts_world_in_lockstep() {
+        let rank_mismatch = validate_local_tp_plans([
+            TensorParallelPlan::new(0, 2).unwrap(),
+            TensorParallelPlan::new(0, 2).unwrap(),
+        ]);
+        assert!(rank_mismatch[0]
+            .as_ref()
+            .unwrap_err()
+            .contains("failed on a peer tensor-parallel rank"));
+        assert!(rank_mismatch[1]
+            .as_ref()
+            .unwrap_err()
+            .contains("plan rank/world (0, 2) does not match communicator (1, 2)"));
+
+        let world_mismatch = validate_local_tp_plans([
+            TensorParallelPlan::new(0, 3).unwrap(),
+            TensorParallelPlan::new(1, 3).unwrap(),
+        ]);
+        for result in world_mismatch {
+            assert!(result.unwrap_err().contains("does not match communicator"));
+        }
+    }
+
+    #[test]
+    fn tensor_parallel_rank_setup_failure_aborts_world_in_lockstep() {
+        let results = std::thread::scope(|scope| {
+            let handles: Vec<_> = ferrl::LocalComm::world(2)
+                .into_iter()
+                .map(|comm| {
+                    scope.spawn(move || {
+                        let local = if comm.rank() == 1 {
+                            Err(CliError::msg("rank-local model setup failed"))
+                        } else {
+                            Ok(())
+                        };
+                        coordinate_tensor_parallel_result(Some(&comm), "model setup", local)
+                            .map_err(|err| err.to_string())
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(results[0]
+            .as_ref()
+            .unwrap_err()
+            .contains("model setup failed on a peer tensor-parallel rank"));
+        assert_eq!(
+            results[1].as_ref().unwrap_err(),
+            "rank-local model setup failed"
+        );
+    }
+
+    fn candidate_health_run_config() -> RunConfig {
+        let mut cfg: RunConfig = serde_json::from_str(&countdown_train_config("")).unwrap();
+        cfg.trainer.candidate_log_top_k = 2;
+        cfg.run_health = correctness_collapse_policy();
+        cfg
+    }
+
+    fn healthy_candidate_history() -> Vec<ferrl::Metrics> {
+        vec![
+            run_health_test_metric(0, 2.0, 1.0),
+            run_health_test_metric(1, 2.0, 1.0),
+        ]
+    }
+
+    fn write_healthy_candidate_ledger(run: &RunDir) {
+        write_candidate_jsonl(
+            &run.candidates_path(),
+            [
+                (0, 0, true, "source-0-0".to_string()),
+                (0, 1, true, "source-0-1".to_string()),
+                (1, 0, true, "source-1-0".to_string()),
+                (1, 1, true, "source-1-1".to_string()),
+            ],
+        );
+    }
+
+    fn run_coordinated_candidate_health(with_primary_ledger: bool) -> Vec<(usize, usize, String)> {
+        let tmp = TestDir::new("tp-primary-candidate-health");
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = ferrl::LocalComm::world(2)
+                .into_iter()
+                .enumerate()
+                .map(|(rank, comm)| {
+                    let root = tmp.path().to_path_buf();
+                    scope.spawn(move || {
+                        let cfg = candidate_health_run_config();
+                        let history = healthy_candidate_history();
+                        let summary = summarize(&history).unwrap();
+                        let run =
+                            RunDir::create(&root, format!("candidate-health-rank-{rank}")).unwrap();
+                        if rank == 0 && with_primary_ledger {
+                            write_healthy_candidate_ledger(&run);
+                        }
+                        let mut calls = 0;
+                        let result =
+                            run_on_tensor_parallel_primary(Some(&comm), "post-run health", || {
+                                calls += 1;
+                                apply_train_run_health_policy(&cfg, &history, &summary, &run)
+                            })
+                            .map_or_else(|err| err.to_string(), |()| String::new());
+                        (rank, calls, result)
+                    })
+                })
+                .collect();
+            let mut results: Vec<_> = handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect();
+            results.sort_by_key(|(rank, _, _)| *rank);
+            results
+        })
+    }
+
+    #[test]
+    fn tensor_parallel_postprocess_uses_primary_candidate_ledger_only() {
+        let tmp = TestDir::new("tp-empty-peer-health");
+        let cfg = candidate_health_run_config();
+        let history = healthy_candidate_history();
+        let summary = summarize(&history).unwrap();
+        let empty_peer = RunDir::create(tmp.path(), "empty-peer").unwrap();
+        assert!(apply_train_run_health_policy(&cfg, &history, &summary, &empty_peer).is_err());
+
+        let results = run_coordinated_candidate_health(true);
+        assert_eq!(results[0], (0, 1, String::new()));
+        assert_eq!(results[1], (1, 0, String::new()));
+    }
+
+    #[test]
+    fn tensor_parallel_postprocess_primary_health_failure_reaches_all_ranks() {
+        let results = run_coordinated_candidate_health(false);
+        assert_eq!(results[0].0, 0);
+        assert_eq!(results[0].1, 1);
+        assert_eq!(results[0].2, "run_health policy failed");
+        assert_eq!(results[1].0, 1);
+        assert_eq!(results[1].1, 0);
+        assert!(results[1]
+            .2
+            .contains("post-run health failed on a peer tensor-parallel rank"));
+    }
+
     #[test]
     fn tensor_parallel_multi_rank_requires_cuda_device() {
         let (_tmp, path) = write_countdown_train_config(
@@ -4376,6 +4782,175 @@ mod tests {
             "trainer did not pass the explicit TP communicator: {:?}",
             calls.comms
         );
+    }
+
+    #[test]
+    fn train_helper_routes_live_world_two_through_public_tp_hooks() {
+        let tmp = TestDir::new("tensor-parallel-train-helper-world-two");
+        let results = std::thread::scope(|scope| {
+            let handles: Vec<_> = ferrl::LocalComm::world(2)
+                .into_iter()
+                .enumerate()
+                .map(|(rank, comm)| {
+                    let root = tmp.path().to_path_buf();
+                    scope.spawn(move || {
+                        let run = RunDir::create(&root, format!("tp-helper-rank-{rank}")).unwrap();
+                        let cfg = TrainerConfig {
+                            steps: 1,
+                            group_size: 2,
+                            max_new_tokens: 1,
+                            lr: 0.0,
+                            beta: 0.1,
+                            ..TrainerConfig::default()
+                        };
+                        let mut trainer = Trainer::new(cfg, &run).unwrap();
+                        let (mut policy, calls) = cli_tp_policy();
+                        train_with_optional_tensor_parallel(
+                            &mut trainer,
+                            &mut policy,
+                            &CliTpReward,
+                            &CliTpCodec,
+                            &[Sample::new("prompt", ())],
+                            Some(&comm),
+                        )
+                        .unwrap();
+                        let calls = calls.lock().unwrap().clone();
+                        (rank, calls)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        for (rank, calls) in results {
+            assert_eq!(calls.generate, 1, "rank {rank} skipped TP rollout");
+            assert!(calls.live_logp > 0, "rank {rank} skipped TP scoring");
+            assert!(calls
+                .comms
+                .iter()
+                .all(|&(seen_rank, world)| (seen_rank, world) == (rank, 2)));
+        }
+    }
+
+    struct IndexedGroupReward;
+
+    impl RewardFn for IndexedGroupReward {
+        type Target = ();
+
+        fn reward(
+            &self,
+            _sample: &Sample<()>,
+            _completion: &str,
+        ) -> Result<f32, ferrl::RewardError> {
+            panic!("AutoPolicy composition test uses reward_group_detailed")
+        }
+
+        fn reward_group_detailed(
+            &self,
+            _sample: &Sample<()>,
+            completions: &[String],
+        ) -> Result<Vec<ferrl::RewardOutcome>, ferrl::RewardError> {
+            Ok(completions
+                .iter()
+                .enumerate()
+                .map(|(index, _)| ferrl::RewardOutcome::reward(index as f32))
+                .collect())
+        }
+    }
+
+    fn tp_auto_policy_config(model_dir: &Path, out_dir: &Path, rank: usize) -> RunConfig {
+        let cfg: RunConfig = serde_json::from_value(serde_json::json!({
+            "task": "countdown",
+            "model_dir": model_dir,
+            "device": "cuda",
+            "out_dir": out_dir,
+            "policy": { "lora_rank": 2, "lora_alpha": 4.0, "seed": 7 },
+            "data": { "train_n": 1, "eval_n": 0, "seed": 11 },
+            "tensor_parallel": { "enabled": true, "rank": rank, "world_size": 2 },
+            "trainer": {
+                "steps": 1,
+                "group_size": 2,
+                "max_new_tokens": 1,
+                "temperature": 1.0,
+                "mu": 1,
+                "beta": 0.0,
+                "clip_eps": 0.2,
+                "lr": 0.0,
+                "weight_decay": 0.0,
+                "loss_type": "grpo",
+                "scale_rewards": "group"
+            }
+        }))
+        .unwrap();
+        cfg.validate_current_config_support().unwrap();
+        cfg
+    }
+
+    fn run_auto_policy_world_two(model_dir: &Path) -> Vec<Result<(), String>> {
+        let output = TestDir::new("tp-auto-policy-output");
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = ferrl::LocalComm::world(2)
+                .into_iter()
+                .enumerate()
+                .map(|(rank, comm)| {
+                    let model_dir = model_dir.to_path_buf();
+                    let out_dir = output.path().to_path_buf();
+                    scope.spawn(move || {
+                        let cfg = tp_auto_policy_config(&model_dir, &out_dir, rank);
+                        run_training(
+                            &cfg,
+                            &Device::Cpu,
+                            &IndexedGroupReward,
+                            &[Sample::new("hello", ())],
+                            &[],
+                            None,
+                            Some(&comm),
+                        )
+                        .map_err(|err| err.to_string())
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        })
+    }
+
+    #[test]
+    fn public_tp_auto_policy_runs_qwen3_and_gemma4_on_world_two() {
+        let fixtures = TestDir::new("tp-auto-policy-fixtures");
+        let qwen = fixtures.path().join("qwen3");
+        write_tp2_qwen3_fixture(&qwen);
+        let qwen_results = run_auto_policy_world_two(&qwen);
+        assert!(
+            qwen_results.iter().all(Result::is_ok),
+            "Qwen3 AutoPolicy TP composition failed: {qwen_results:?}"
+        );
+
+        let gemma = fixtures.path().join("gemma4");
+        write_tp2_gemma4_fixture(&gemma);
+        let gemma_results = run_auto_policy_world_two(&gemma);
+        assert!(
+            gemma_results.iter().all(Result::is_ok),
+            "Gemma 4 AutoPolicy TP composition failed: {gemma_results:?}"
+        );
+    }
+
+    #[test]
+    fn public_tp_auto_policy_rejects_qwen35_on_world_two() {
+        let fixtures = TestDir::new("tp-qwen35-unsupported");
+        let qwen35 = fixtures.path().join("qwen35");
+        copy_fixture_dir("tiny_qwen35", &qwen35);
+        let results = run_auto_policy_world_two(&qwen35);
+        for result in results {
+            let err = result.unwrap_err();
+            assert!(err.contains("qwen3_5/qwen3_5_moe"), "{err}");
+            assert!(err.contains("qwen3"), "{err}");
+            assert!(err.contains("gemma4"), "{err}");
+        }
     }
 
     #[test]
