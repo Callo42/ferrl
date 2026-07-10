@@ -30,7 +30,9 @@ autograd, GPU, and the base model forward to [candle](https://github.com/hugging
   DP-coordinated resume. The same communicator seam drives single-node tensor-parallel
   Qwen3 and dense Gemma 4 execution through `ferrl train`; weights and LoRA adapters
   remain fully replicated, combined sharded DP x TP is rejected, and TP rank 0 owns
-  rewards, telemetry, checkpoints, post-run health, and advertised output.
+  rewards, telemetry, checkpoints, post-run health, and advertised output. Slurm/NCCL
+  launches must set a launch-unique `FERRL_NCCL_RENDEZVOUS`; ferrl uses it to bootstrap
+  before loading rank-local configs, then validates every enabled TP rank/world plan.
 - Telemetry: `tracing` (every event stamped with `rank`/`world`/`step`); each run writes
   `runs/<run_id>/` (config + metrics.jsonl + checkpoints), summarized by the `runreport`
   example. `runs/` and `target/` are git-ignored.

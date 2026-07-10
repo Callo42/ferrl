@@ -224,8 +224,10 @@ TP rank. Each task's JSON `tensor_parallel.rank` must equal `SLURM_PROCID`, its
 `world_size` must equal `SLURM_NTASKS`, and every task must use the same launch-unique
 `FERRL_NCCL_RENDEZVOUS`. Generate or template one JSON file per rank; a shared file
 hard-coded to rank 0 is not a valid multi-rank launch. Configs must otherwise be
-identical. ferrl bootstraps NCCL first and validates the JSON plan against the live
-communicator before device/model setup.
+identical. The presence of `FERRL_NCCL_RENDEZVOUS` tells ferrl to bootstrap the Slurm/NCCL
+runtime before reading any rank's JSON, so a rank-local config failure is coordinated before
+later collectives. It then validates every enabled JSON plan, including world 1, against the
+live communicator before device/model setup.
 
 ```jsonc
 {
@@ -234,11 +236,11 @@ communicator before device/model setup.
 }
 ```
 
-Sharded TP cannot currently be combined with `distributed.enabled`, activation
-checkpointing, or held-out eval. `intermediate_size`, `num_attention_heads`, and every
-layer's effective KV-head count must divide evenly by `world_size` (both sliding and
-global KV-head counts matter for Gemma 4). Frozen checkpoint weights and trainable LoRA
-adapters remain fully replicated on every rank until sharded safetensors loading lands.
+TP cannot currently be combined with `distributed.enabled`; sharded TP also rejects
+activation checkpointing and held-out eval. `intermediate_size`, `num_attention_heads`,
+and every layer's effective KV-head count must divide evenly by `world_size` (both sliding
+and global KV-head counts matter for Gemma 4). Frozen checkpoint weights and trainable
+LoRA adapters remain fully replicated on every rank until sharded safetensors loading lands.
 TP rank 0 is authoritative for reward evaluation, metrics, candidate ledgers,
 checkpoints, post-run health, and the advertised output directory.
 
