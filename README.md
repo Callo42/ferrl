@@ -238,11 +238,12 @@ other difference aborts the launch in lockstep before task, device, or model dis
 }
 ```
 
-TP cannot currently be combined with `distributed.enabled`; sharded TP also rejects
-activation checkpointing, held-out eval, and `policy.base_quantization = "q8_0"`. Q8_0
-remains supported for world-one execution; sharded TP will reopen it only after projection
-weights are constructed as persistent rank-local quantized shards rather than repeatedly
-dequantizing full projections. `intermediate_size`, `num_attention_heads`, and every layer's
+TP cannot currently be combined with `distributed.enabled`; any enabled TP execution rejects
+`policy.base_quantization = "q8_0"`, including `world_size = 1`, while sharded TP also rejects
+activation checkpointing and held-out eval. Ordinary world-one execution with TP disabled keeps
+Q8_0 quantized matmul support; explicit TP will reopen it only after projection weights are
+constructed as persistent rank-local quantized shards rather than repeatedly dequantizing full
+projections. `intermediate_size`, `num_attention_heads`, and every layer's
 effective KV-head count must divide evenly by `world_size` (both sliding and global KV-head
 counts matter for Gemma 4). Frozen checkpoint weights and trainable LoRA adapters remain fully
 replicated on every rank until sharded safetensors loading lands.

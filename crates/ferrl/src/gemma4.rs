@@ -1070,6 +1070,7 @@ pub struct Gemma4GradModel {
     final_logit_softcap: f64,
     device: Device,
     dtype: DType,
+    base_quantization: BaseQuantization,
     targets: DenseLoraTargets,
     adapter_enabled: bool,
     remat: bool,
@@ -1192,6 +1193,7 @@ impl Gemma4GradModel {
             final_logit_softcap: t.final_logit_softcapping,
             device: vb.device().clone(),
             dtype: vb.dtype(),
+            base_quantization,
             targets,
             adapter_enabled: true,
             remat: false,
@@ -1286,11 +1288,23 @@ impl Gemma4GradModel {
             );
         }
         let plan = plan_from_comm(comm)?;
+        self.validate_tensor_parallel_execution_support()?;
         let (mut h, masks) = self.embed_and_masks(input_ids)?;
         for layer in &self.layers {
             h = layer.forward_tensor_parallel(&h, &masks, &self.rot, plan, Some(comm))?;
         }
         self.norm_head_softcap(&h, window)
+    }
+
+    fn validate_tensor_parallel_execution_support(&self) -> CandleResult<()> {
+        if self.base_quantization == BaseQuantization::Q8_0 {
+            bail!(
+                "Gemma4GradModel tensor_parallel execution does not support q8_0 base \
+                 projections; disable tensor_parallel for world-one Q8_0 until rank-local \
+                 quantized shards are implemented"
+            );
+        }
+        Ok(())
     }
 
     fn embed_and_masks(&self, input_ids: &Tensor) -> CandleResult<(Tensor, Gemma4Masks)> {
@@ -1392,6 +1406,7 @@ impl Gemma4GradModel {
             );
         }
         let plan = plan_from_comm(comm)?;
+        self.validate_tensor_parallel_execution_support()?;
         let (mut h, masks) = self.embed_and_masks(input_ids)?;
         h = h.detach();
         for layer in &self.layers {
@@ -1998,6 +2013,7 @@ pub struct Gemma4MergedDecoder {
     final_logit_softcap: f64,
     device: Device,
     dtype: DType,
+    base_quantization: BaseQuantization,
 }
 
 impl Gemma4MergedDecoder {
@@ -2016,6 +2032,7 @@ impl Gemma4MergedDecoder {
             final_logit_softcap: model.final_logit_softcap,
             device: model.device.clone(),
             dtype: model.dtype,
+            base_quantization: model.base_quantization,
         })
     }
 
@@ -2065,6 +2082,7 @@ impl Gemma4MergedDecoder {
         comm: &dyn Comm,
     ) -> CandleResult<Tensor> {
         let plan = plan_from_comm(comm)?;
+        self.validate_tensor_parallel_execution_support()?;
         let (b, l) = input_ids.dims2()?;
         let cached = self
             .layers
@@ -2095,6 +2113,17 @@ impl Gemma4MergedDecoder {
     fn validate_tensor_parallel_plan(&self, plan: TensorParallelPlan) -> CandleResult<()> {
         for layer in &self.layers {
             layer.validate_tensor_parallel_plan(plan)?;
+        }
+        Ok(())
+    }
+
+    fn validate_tensor_parallel_execution_support(&self) -> CandleResult<()> {
+        if self.base_quantization == BaseQuantization::Q8_0 {
+            bail!(
+                "Gemma4MergedDecoder tensor_parallel execution does not support q8_0 base \
+                 projections; disable tensor_parallel for world-one Q8_0 until rank-local \
+                 quantized shards are implemented"
+            );
         }
         Ok(())
     }
@@ -2929,7 +2958,7 @@ mod tests {
     }
 
     #[test]
-    fn gemma4_quantized_tensor_parallel_rejects_before_cached_state_mutation() {
+    fn gemma4_quantized_multi_rank_tensor_parallel_rejects_before_cached_state_mutation() {
         let input = ids(3);
         let results = std::thread::scope(|scope| {
             let handles: Vec<_> = LocalComm::world(2)
@@ -2957,7 +2986,7 @@ mod tests {
                             .unwrap_err()
                             .to_string();
                         assert!(
-                            live_error.contains("does not support q8_0 projection"),
+                            live_error.contains("does not support q8_0 base projections"),
                             "unexpected live TP rejection: {live_error}"
                         );
 
@@ -2967,7 +2996,7 @@ mod tests {
                             .unwrap_err()
                             .to_string();
                         assert!(
-                            cached_error.contains("does not support q8_0 projection"),
+                            cached_error.contains("does not support q8_0 base projections"),
                             "unexpected cached TP rejection: {cached_error}"
                         );
 
@@ -2984,6 +3013,56 @@ mod tests {
         for dims in results {
             assert_eq!(dims, [1, 3, quantized_tiny_cfg().text_config.vocab_size]);
         }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // assertion-heavy live/detached/cache path contract
+    fn gemma4_quantized_world_one_tensor_parallel_rejects_but_ordinary_paths_work() {
+        let input = ids(3);
+        let model = quantized_tiny_model();
+        let comm = LocalComm::world(1).pop().unwrap();
+
+        let ordinary = model.forward(&input).unwrap();
+        assert_eq!(
+            ordinary.dims(),
+            &[1, 3, quantized_tiny_cfg().text_config.vocab_size]
+        );
+
+        let live_error = model
+            .forward_tensor_parallel(&input, &comm)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            live_error.contains("does not support q8_0 base projections"),
+            "unexpected live world-one TP rejection: {live_error}"
+        );
+        assert!(live_error.contains("disable tensor_parallel for world-one Q8_0"));
+
+        let detached_error = model
+            .forward_tensor_parallel_detached(&input, &comm)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            detached_error.contains("does not support q8_0 base projections"),
+            "unexpected detached world-one TP rejection: {detached_error}"
+        );
+
+        let mut decoder = model.merged_decoder().unwrap();
+        let cached_error = decoder
+            .forward_tensor_parallel(&input, 0, &comm)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            cached_error.contains("does not support q8_0 base projections"),
+            "unexpected cached world-one TP rejection: {cached_error}"
+        );
+        assert!(cached_error.contains("disable tensor_parallel for world-one Q8_0"));
+
+        let ordinary_cached = decoder.forward(&input, 0).unwrap();
+        assert_eq!(
+            ordinary_cached.dims(),
+            &[1, 3, quantized_tiny_cfg().text_config.vocab_size]
+        );
     }
 
     fn overwrite_adapter(model: &Gemma4GradModel) {

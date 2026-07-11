@@ -507,6 +507,7 @@ pub struct DenseGradModel<A: DenseArch> {
     /// The dtype of the additive causal mask: F32 when the attention force-casts
     /// to F32 (Llama), the model dtype otherwise (Qwen).
     mask_dtype: DType,
+    base_quantization: BaseQuantization,
     targets: DenseLoraTargets,
     adapter_enabled: bool,
     remat: bool,
@@ -658,6 +659,7 @@ impl<A: DenseArch> DenseGradModel<A> {
             hidden: h,
             device: vb.device().clone(),
             mask_dtype,
+            base_quantization,
             targets,
             adapter_enabled: true,
             remat: false,
@@ -768,11 +770,24 @@ impl<A: DenseArch> DenseGradModel<A> {
             );
         }
         let plan = plan_from_comm(comm)?;
+        self.validate_tensor_parallel_execution_support()?;
         let (mut h, mask) = self.embed_and_mask(input_ids)?;
         for layer in &self.layers {
             h = layer.forward_tensor_parallel(&h, mask.as_ref(), &self.rot, plan, Some(comm))?;
         }
         self.norm_and_head(&h, window)
+    }
+
+    fn validate_tensor_parallel_execution_support(&self) -> CandleResult<()> {
+        if self.base_quantization == BaseQuantization::Q8_0 {
+            candle_core::bail!(
+                "{} tensor_parallel execution does not support q8_0 base projections; disable \
+                 tensor_parallel for world-one Q8_0 until rank-local quantized shards are \
+                 implemented",
+                A::LABEL
+            );
+        }
+        Ok(())
     }
 
     /// Shared prologue of every full-sequence walk: the token embedding plus the
@@ -910,6 +925,7 @@ impl<A: DenseArch> DenseGradModel<A> {
             );
         }
         let plan = plan_from_comm(comm)?;
+        self.validate_tensor_parallel_execution_support()?;
         let (mut h, mask) = self.embed_and_mask(input_ids)?;
         h = h.detach();
         for layer in &self.layers {
@@ -1451,6 +1467,7 @@ pub struct DenseCachedDecoder {
     hidden: usize,
     device: Device,
     mask_dtype: DType,
+    base_quantization: BaseQuantization,
 }
 
 impl DenseCachedDecoder {
@@ -1489,6 +1506,7 @@ impl DenseCachedDecoder {
             hidden: model.hidden,
             device: model.device.clone(),
             mask_dtype: model.mask_dtype,
+            base_quantization: model.base_quantization,
         })
     }
 
@@ -1560,6 +1578,7 @@ impl DenseCachedDecoder {
         comm: &dyn Comm,
     ) -> CandleResult<Tensor> {
         let plan = plan_from_comm(comm)?;
+        self.validate_tensor_parallel_execution_support()?;
         let (b, l) = input_ids.dims2()?;
         let cached = self
             .layers
@@ -1595,6 +1614,17 @@ impl DenseCachedDecoder {
     fn validate_tensor_parallel_plan(&self, plan: TensorParallelPlan) -> CandleResult<()> {
         for layer in &self.layers {
             layer.validate_tensor_parallel_plan(plan)?;
+        }
+        Ok(())
+    }
+
+    fn validate_tensor_parallel_execution_support(&self) -> CandleResult<()> {
+        if self.base_quantization == BaseQuantization::Q8_0 {
+            candle_core::bail!(
+                "DenseCachedDecoder tensor_parallel execution does not support q8_0 base \
+                 projections; disable tensor_parallel for world-one Q8_0 until rank-local \
+                 quantized shards are implemented"
+            );
         }
         Ok(())
     }
