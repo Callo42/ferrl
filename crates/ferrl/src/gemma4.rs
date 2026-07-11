@@ -3009,7 +3009,7 @@ mod tests {
     #[test]
     fn quantized_merged_decoder_matches_uncached_with_armed_adapters() {
         let model = quantized_tiny_model();
-        arm_adapter(&model);
+        arm_adapter_deterministic(&model);
         let input = ids(5);
         let reference = model.forward(&input).unwrap();
         let mut dec = model.merged_decoder().unwrap();

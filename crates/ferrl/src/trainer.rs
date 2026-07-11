@@ -2816,7 +2816,13 @@ impl Trainer {
 
         let is_primary = exec.is_execution_primary(self.comm.as_ref());
         let local = if is_primary {
-            score_local()
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(score_local)) {
+                Ok(result) => result,
+                Err(payload) => Err(TrainerError::Contract(format!(
+                    "reward evaluation panicked: {}",
+                    panic_payload_message(payload.as_ref())
+                ))),
+            }
         } else {
             Ok(Vec::new())
         };
@@ -3327,6 +3333,14 @@ impl Trainer {
         m.beta = beta as f32;
         m
     }
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&'static str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload")
 }
 
 /// Per-rank rollout throughput for a step: this rank's real completion tokens over
@@ -6273,6 +6287,7 @@ mod tests {
         Scores([f32; 2]),
         Error,
         CountMismatch,
+        Panic,
     }
 
     struct CoordinatedTpReward {
@@ -6311,6 +6326,9 @@ mod tests {
                     Err(RewardError::msg("execution-primary reward failure"))
                 }
                 CoordinatedTpRewardMode::CountMismatch => Ok(vec![RewardOutcome::reward(1.0)]),
+                CoordinatedTpRewardMode::Panic => {
+                    panic!("execution-primary reward panic")
+                }
             }
         }
     }
@@ -6653,6 +6671,34 @@ mod tests {
                 assert_eq!(result.policy_calls.live_logp, 0);
                 assert_eq!(result.policy_calls.detached_logp, 0);
             }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // paired rank-specific panic assertions
+    fn train_tensor_parallel_coordinates_primary_reward_panic() {
+        let results = run_coordinated_tp_reward_case(
+            [
+                CoordinatedTpRewardMode::Panic,
+                CoordinatedTpRewardMode::Scores([0.0, 2.0]),
+            ],
+            0,
+        );
+        assert_eq!(results[0].reward_calls, 1);
+        assert_eq!(results[1].reward_calls, 0);
+        assert!(matches!(
+            results[0].result.as_ref().unwrap_err(),
+            TrainerError::Contract(msg)
+                if msg.contains("reward evaluation panicked: execution-primary reward panic")
+        ));
+        assert!(matches!(
+            results[1].result.as_ref().unwrap_err(),
+            TrainerError::Contract(msg)
+                if msg.contains("reward evaluation failed on tensor-parallel execution rank 0")
+        ));
+        for result in &results {
+            assert_eq!(result.policy_calls.live_logp, 0);
+            assert_eq!(result.policy_calls.detached_logp, 0);
         }
     }
 

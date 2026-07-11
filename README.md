@@ -227,7 +227,9 @@ hard-coded to rank 0 is not a valid multi-rank launch. Configs must otherwise be
 identical. The presence of `FERRL_NCCL_RENDEZVOUS` tells ferrl to bootstrap the Slurm/NCCL
 runtime before reading any rank's JSON, so a rank-local config failure is coordinated before
 later collectives. It then validates every enabled JSON plan, including world 1, against the
-live communicator before device/model setup.
+live communicator before device/model setup. The parsed, default-expanded configs are also
+canonicalized and compared across ranks after normalizing only `tensor_parallel.rank`; any
+other difference aborts the launch in lockstep before task, device, or model dispatch.
 
 ```jsonc
 {

@@ -397,7 +397,10 @@ impl FrozenLinearSnapshot {
                     return Ok(base_y);
                 }
                 let dtype = base.dtype();
-                let a = a.to_dtype(dtype)?.narrow(1, shard.start, shard.len)?;
+                let a = a
+                    .to_dtype(dtype)?
+                    .narrow(1, shard.start, shard.len)?
+                    .contiguous()?;
                 let b = b.to_dtype(dtype)?;
                 let xa = x_shard.broadcast_matmul(&a.t()?)?;
                 let xab = xa.broadcast_matmul(&b.t()?)?;
@@ -936,7 +939,8 @@ impl LoraLinear {
             .a
             .as_tensor()
             .to_dtype(dtype)?
-            .narrow(1, shard.start, shard.len)?;
+            .narrow(1, shard.start, shard.len)?
+            .contiguous()?;
         let b = self.b.as_tensor().to_dtype(dtype)?;
         let xa = x_shard.broadcast_matmul(&a.t()?)?;
         let xab = xa.broadcast_matmul(&b.t()?)?;
