@@ -184,6 +184,20 @@ impl FrozenLinearWeight {
         self.dequantized_to(self.dtype())
     }
 
+    fn validate_tensor_parallel_support(
+        &self,
+        plan: TensorParallelPlan,
+        label: &'static str,
+    ) -> CandleResult<()> {
+        if plan.is_sharded() && matches!(self, Self::Quantized { .. }) {
+            candle_core::bail!(
+                "sharded tensor_parallel execution does not support q8_0 projection {label}; \
+                 rank-local quantized shards are not implemented"
+            );
+        }
+        Ok(())
+    }
+
     /// Tape-bearing frozen linear: gradients still flow to `x`.
     pub(crate) fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
         match self {
@@ -201,6 +215,7 @@ impl FrozenLinearWeight {
         plan: TensorParallelPlan,
         label: &'static str,
     ) -> CandleResult<Tensor> {
+        self.validate_tensor_parallel_support(plan, label)?;
         let (out, _in) = self.dims2()?;
         let shard = tp_shard(plan, label, out)?;
         let weight = match self {
@@ -219,6 +234,7 @@ impl FrozenLinearWeight {
         plan: TensorParallelPlan,
         label: &'static str,
     ) -> CandleResult<Tensor> {
+        self.validate_tensor_parallel_support(plan, label)?;
         let (_out, in_) = self.dims2()?;
         let shard = tp_shard(plan, label, in_)?;
         let weight = match self {
@@ -280,6 +296,19 @@ impl FrozenLinearSnapshot {
         }
     }
 
+    pub(crate) fn validate_tensor_parallel_support(
+        &self,
+        plan: TensorParallelPlan,
+        label: &'static str,
+    ) -> CandleResult<()> {
+        match self {
+            Self::Dense(_) => Ok(()),
+            Self::Base(weight) | Self::Lora { base: weight, .. } => {
+                weight.validate_tensor_parallel_support(plan, label)
+            }
+        }
+    }
+
     pub(crate) fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
         match self {
             Self::Dense(w) => frozen_linear(x, w),
@@ -328,6 +357,7 @@ impl FrozenLinearSnapshot {
         plan: TensorParallelPlan,
         label: &'static str,
     ) -> CandleResult<Tensor> {
+        self.validate_tensor_parallel_support(plan, label)?;
         match self {
             Self::Dense(w) => {
                 let (out, _in) = w.dims2()?;
@@ -369,6 +399,7 @@ impl FrozenLinearSnapshot {
         plan: TensorParallelPlan,
         label: &'static str,
     ) -> CandleResult<Tensor> {
+        self.validate_tensor_parallel_support(plan, label)?;
         match self {
             Self::Dense(w) => {
                 let (_out, in_) = w.dims2()?;
@@ -1519,7 +1550,7 @@ mod tests {
     }
 
     #[test]
-    fn quantized_lora_tensor_parallel_shards_reassemble_full_forward() {
+    fn quantized_lora_rejects_sharded_tensor_parallel_before_projection() {
         let l = LoraLinear::with_adapter_dtype_and_base_quantization(
             base(6, 32),
             None,
@@ -1556,28 +1587,23 @@ mod tests {
         .unwrap();
         let full = p.forward(&x).unwrap();
 
-        let columns = all_plans(2)
-            .into_iter()
-            .map(|plan| p.column_parallel_forward(&x, plan, "projection_out"))
-            .collect::<CandleResult<Vec<_>>>()
+        let world_one = p
+            .column_parallel_forward(&x, TensorParallelPlan::single(), "projection_out")
             .unwrap();
-        let column_reassembled = concat_column_shards(&columns).unwrap();
-        assert!(
-            max_abs_diff(&column_reassembled, &full) <= 1e-5,
-            "quantized column-parallel LoRA shards diverged from full forward"
-        );
+        assert!(max_abs_diff(&world_one, &full) <= 1e-5);
 
-        let partials = all_plans(2)
-            .into_iter()
-            .map(|plan| p.row_parallel_forward_partial(&x, plan, "projection_in"))
-            .collect::<CandleResult<Vec<_>>>()
-            .unwrap();
-        let row_reassembled = sum_row_parallel_partials(&partials).unwrap();
-        let row_md = max_abs_diff(&row_reassembled, &full);
-        assert!(
-            row_md <= 1e-4,
-            "quantized row-parallel LoRA partials diverged from full forward: {row_md}"
-        );
+        for plan in all_plans(2) {
+            let column = p
+                .column_parallel_forward(&x, plan, "projection_out")
+                .unwrap_err()
+                .to_string();
+            assert!(column.contains("does not support q8_0 projection projection_out"));
+            let row = p
+                .row_parallel_forward_partial(&x, plan, "projection_in")
+                .unwrap_err()
+                .to_string();
+            assert!(row.contains("does not support q8_0 projection projection_in"));
+        }
     }
 
     #[test]

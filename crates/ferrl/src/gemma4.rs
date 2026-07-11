@@ -1698,6 +1698,15 @@ impl Gemma4MergedAttention {
     }
 
     fn validate_tensor_parallel_plan(&self, plan: TensorParallelPlan) -> CandleResult<()> {
+        self.q_weight
+            .validate_tensor_parallel_support(plan, "attention_q_out")?;
+        self.k_weight
+            .validate_tensor_parallel_support(plan, "attention_k_out")?;
+        if let Some(weight) = &self.v_weight {
+            weight.validate_tensor_parallel_support(plan, "attention_v_out")?;
+        }
+        self.o_weight
+            .validate_tensor_parallel_support(plan, "attention_hidden")?;
         tp_shard(plan, "num_attention_heads", self.num_heads)?;
         tp_shard(plan, "num_key_value_heads", self.num_kv_heads)?;
         tp_shard(plan, "attention_q_out", self.q_weight.dims2()?.0)?;
@@ -1867,6 +1876,12 @@ impl Gemma4MergedMlp {
     }
 
     fn validate_tensor_parallel_plan(&self, plan: TensorParallelPlan) -> CandleResult<()> {
+        self.gate_weight
+            .validate_tensor_parallel_support(plan, "intermediate_size")?;
+        self.up_weight
+            .validate_tensor_parallel_support(plan, "intermediate_size")?;
+        self.down_weight
+            .validate_tensor_parallel_support(plan, "intermediate_size")?;
         tp_shard(plan, "intermediate_size", self.gate_weight.dims2()?.0)?;
         tp_shard(plan, "intermediate_size", self.up_weight.dims2()?.0)?;
         tp_shard(plan, "intermediate_size", self.down_weight.dims2()?.1)?;
@@ -2910,6 +2925,64 @@ mod tests {
                 "rank {rank} Gemma 4 decoder cache mutated before unsupported TP layout failed: \
                  {worst}"
             );
+        }
+    }
+
+    #[test]
+    fn gemma4_quantized_tensor_parallel_rejects_before_cached_state_mutation() {
+        let input = ids(3);
+        let results = std::thread::scope(|scope| {
+            let handles: Vec<_> = LocalComm::world(2)
+                .into_iter()
+                .map(|comm| {
+                    let input = input.clone();
+                    scope.spawn(move || {
+                        let mut cfg = quantized_tiny_cfg();
+                        cfg.text_config.num_key_value_heads = 2;
+                        cfg.text_config.num_global_key_value_heads = 2;
+                        cfg.validate().unwrap();
+                        let vb = tiny_vb(&cfg);
+                        let model = Gemma4GradModel::load_with_targets_and_base_quantization(
+                            &cfg,
+                            &vb,
+                            2,
+                            4.0,
+                            DType::F32,
+                            DenseLoraTargets::industrial(),
+                            BaseQuantization::Q8_0,
+                        )
+                        .unwrap();
+                        let live_error = model
+                            .forward_tensor_parallel(&input, &comm)
+                            .unwrap_err()
+                            .to_string();
+                        assert!(
+                            live_error.contains("does not support q8_0 projection"),
+                            "unexpected live TP rejection: {live_error}"
+                        );
+
+                        let mut decoder = model.merged_decoder().unwrap();
+                        let cached_error = decoder
+                            .forward_tensor_parallel(&input, 0, &comm)
+                            .unwrap_err()
+                            .to_string();
+                        assert!(
+                            cached_error.contains("does not support q8_0 projection"),
+                            "unexpected cached TP rejection: {cached_error}"
+                        );
+
+                        decoder.forward(&input, 0).unwrap().dims().to_vec()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        for dims in results {
+            assert_eq!(dims, [1, 3, quantized_tiny_cfg().text_config.vocab_size]);
         }
     }
 

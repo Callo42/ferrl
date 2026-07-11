@@ -1186,6 +1186,13 @@ impl RunConfig {
             ));
         }
         if plan.is_sharded() {
+            if matches!(self.policy.base_quantization, BaseQuantizationSel::Q8_0) {
+                return Err(CliError::msg(
+                    "sharded tensor_parallel execution does not support \
+                     policy.base_quantization = \"q8_0\" until rank-local quantized shards \
+                     are implemented",
+                ));
+            }
             if self.policy.activation_checkpointing {
                 return Err(CliError::msg(
                     "sharded tensor_parallel execution does not support \
@@ -4529,6 +4536,20 @@ mod tests {
         let run_id = cfg.run_id();
         assert!(run_id.starts_with("countdown-"), "{run_id}");
         assert!(run_id.ends_with("-rank0"), "{run_id}");
+    }
+
+    #[test]
+    fn tensor_parallel_multi_rank_rejects_q8_0_before_dispatch() {
+        let (_tmp, path) = write_countdown_train_config(
+            "tensor-parallel-q8-rejected",
+            r#""device": "cuda",
+               "policy": { "base_quantization": "q8_0" },
+               "tensor_parallel": { "enabled": true, "rank": 0, "world_size": 2 }"#,
+        );
+
+        let err = RunConfig::load(&path).unwrap_err().to_string();
+
+        assert!(err.contains("does not support policy.base_quantization = \"q8_0\""));
     }
 
     fn validate_local_tp_plans(plans: [TensorParallelPlan; 2]) -> Vec<Result<(), String>> {

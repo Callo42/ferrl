@@ -1140,6 +1140,14 @@ struct DenseMergedAttention {
 
 impl DenseMergedAttention {
     fn validate_tensor_parallel_plan(&self, plan: TensorParallelPlan) -> CandleResult<()> {
+        self.q_weight
+            .validate_tensor_parallel_support(plan, "attention_q_out")?;
+        self.k_weight
+            .validate_tensor_parallel_support(plan, "attention_k_out")?;
+        self.v_weight
+            .validate_tensor_parallel_support(plan, "attention_v_out")?;
+        self.o_weight
+            .validate_tensor_parallel_support(plan, "attention_hidden")?;
         tp_shard(plan, "num_attention_heads", self.num_heads)?;
         tp_shard(plan, "num_key_value_heads", self.num_kv_heads)?;
         tp_shard(plan, "attention_q_out", self.q_weight.dims2()?.0)?;
@@ -1331,6 +1339,12 @@ impl DenseMergedMlp {
     }
 
     fn validate_tensor_parallel_plan(&self, plan: TensorParallelPlan) -> CandleResult<()> {
+        self.gate_weight
+            .validate_tensor_parallel_support(plan, "intermediate_size")?;
+        self.up_weight
+            .validate_tensor_parallel_support(plan, "intermediate_size")?;
+        self.down_weight
+            .validate_tensor_parallel_support(plan, "intermediate_size")?;
         tp_shard(plan, "intermediate_size", self.gate_weight.dims2()?.0)?;
         tp_shard(plan, "intermediate_size", self.up_weight.dims2()?.0)?;
         tp_shard(plan, "intermediate_size", self.down_weight.dims2()?.1)?;
