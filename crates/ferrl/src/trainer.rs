@@ -6625,6 +6625,14 @@ mod tests {
         ) -> CandleResult<Tensor> {
             self.logps(comm, true)
         }
+
+        fn backward_tensor_parallel(
+            &self,
+            loss: &Tensor,
+            _comm: &dyn Comm,
+        ) -> CandleResult<GradStore> {
+            loss.backward()
+        }
     }
 
     #[test]

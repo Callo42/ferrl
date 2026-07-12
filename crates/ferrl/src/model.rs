@@ -442,9 +442,18 @@ pub trait GradModel {
     ///
     /// # Errors
     ///
-    /// Returns a candle error if backward fails or the concrete model rejects
-    /// the communicator/tape pairing.
-    fn backward_tensor_parallel(&self, loss: &Tensor, _comm: &dyn Comm) -> CandleResult<GradStore> {
+    /// Returns a candle error if the communicator is sharded and the concrete
+    /// model has not overridden this hook, backward fails, or the concrete
+    /// model rejects the communicator/tape pairing.
+    fn backward_tensor_parallel(&self, loss: &Tensor, comm: &dyn Comm) -> CandleResult<GradStore> {
+        let plan = plan_from_comm(comm)?;
+        if plan.is_sharded() {
+            candle_core::bail!(
+                "{} does not implement tensor-parallel backward for world_size {}",
+                std::any::type_name::<Self>(),
+                plan.world_size()
+            )
+        }
         self.backward(loss)
     }
 
@@ -529,6 +538,8 @@ mod tests {
     use super::*;
     use candle_core::{DType, Device};
 
+    use crate::comm::LocalComm;
+
     /// A minimal [`GradModel`] that relies on every provided default — the
     /// witness that an external implementor gets working behavior for free:
     /// `forward_detached` is a value-identical detach and `backward` is
@@ -592,6 +603,29 @@ mod tests {
             "default backward lost the var grad"
         );
         assert!(m.lora_recipe().is_none());
+    }
+
+    #[test]
+    fn the_provided_tensor_parallel_backward_rejects_a_sharded_communicator() {
+        let device = Device::Cpu;
+        let w = Var::from_tensor(&Tensor::from_vec(vec![2.0f32], (1,), &device).unwrap()).unwrap();
+        let m = OneVarModel { w, device };
+        let loss = m
+            .forward(&Tensor::from_vec(vec![1u32], (1, 1), m.device()).unwrap())
+            .unwrap()
+            .sum_all()
+            .unwrap();
+        let comm = LocalComm::world(2).remove(0);
+
+        let error = m
+            .backward_tensor_parallel(&loss, &comm)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("does not implement tensor-parallel backward"),
+            "{error}"
+        );
+        assert!(error.contains("world_size 2"), "{error}");
     }
 
     #[test]

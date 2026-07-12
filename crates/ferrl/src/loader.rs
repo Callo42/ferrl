@@ -185,8 +185,13 @@ impl AutoPolicy {
 
     /// Whether this model family can replay activation-checkpointed update
     /// layers through the explicit tensor-parallel communicator.
+    ///
+    /// This is a family-static loader capability, not the live policy
+    /// instance's current checkpointing setting. Use
+    /// [`activation_checkpointing`](Self::activation_checkpointing) for the
+    /// latter.
     #[must_use]
-    pub fn supports_tensor_parallel_activation_checkpointing(&self) -> bool {
+    pub fn model_family_supports_tensor_parallel_activation_checkpointing(&self) -> bool {
         matches!(self, Self::Gemma4(_))
     }
 }
@@ -771,7 +776,7 @@ mod tests {
         )
         .unwrap();
         assert!(policy.supports_tensor_parallel());
-        assert!(policy.supports_tensor_parallel_activation_checkpointing());
+        assert!(policy.model_family_supports_tensor_parallel_activation_checkpointing());
     }
 
     #[test]

@@ -4962,6 +4962,14 @@ mod tests {
             calls.comms.push((comm.rank(), comm.world_size()));
             Ok(self.logp.as_tensor().detach())
         }
+
+        fn backward_tensor_parallel(
+            &self,
+            loss: &Tensor,
+            _comm: &dyn ferrl::Comm,
+        ) -> CandleResult<candle_core::backprop::GradStore> {
+            loss.backward()
+        }
     }
 
     struct CliTpCodec;
