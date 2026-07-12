@@ -1049,8 +1049,8 @@ struct DistributedCfg {
 #[serde(default, deny_unknown_fields)]
 struct TensorParallelCfg {
     /// When true, bind this process to one rank of a live tensor-parallel world.
-    /// Model projections execute in shards, while checkpoint weights still load
-    /// in full on every rank until sharded safetensors loading lands.
+    /// Model projections execute in shards. Gemma 4 also streams rank-local
+    /// projection weights; Qwen3 currently keeps replicated checkpoint weights.
     enabled: bool,
     /// Tensor-parallel rank in `0..world_size`.
     rank: usize,
@@ -1219,9 +1219,6 @@ impl RunConfig {
 
     /// The loader options for this run (rollout temperature mirrors the trainer's).
     fn loader_opts(&self) -> LoaderOpts {
-        // The CLI carries the sharded execution plan separately. Keep loaders in
-        // the full-weight path until sharded safetensors loading lands, preserving
-        // the direct-loader fail-closed guard.
         LoaderOpts {
             lora_rank: self.policy.lora_rank,
             lora_alpha: self.policy.lora_alpha,
@@ -1231,7 +1228,7 @@ impl RunConfig {
             temperature: self.trainer.temperature,
             memory_efficient_cached_gqa: self.policy.memory_efficient_cached_gqa,
             base_quantization: self.policy.base_quantization.as_base_quantization(),
-            tensor_parallel: TensorParallelPlan::single(),
+            tensor_parallel: self.tensor_parallel_plan(),
         }
     }
 
@@ -4518,7 +4515,7 @@ mod tests {
     }
 
     #[test]
-    fn tensor_parallel_multi_rank_config_uses_public_execution_plan_without_sharded_loader_opts() {
+    fn tensor_parallel_multi_rank_config_passes_plan_to_loader_and_execution() {
         let (_tmp, path) = write_countdown_train_config(
             "tensor-parallel-public-execution-plan",
             r#""device": "cuda",
@@ -4533,7 +4530,7 @@ mod tests {
         );
         assert_eq!(
             cfg.loader_opts().tensor_parallel,
-            TensorParallelPlan::single()
+            TensorParallelPlan::new(0, 2).unwrap()
         );
         let run_id = cfg.run_id();
         assert!(run_id.starts_with("countdown-"), "{run_id}");
@@ -5249,9 +5246,9 @@ mod tests {
         let results = run_auto_policy_world_two(&qwen35);
         for result in results {
             let err = result.unwrap_err();
-            assert!(err.contains("qwen3_5/qwen3_5_moe"), "{err}");
-            assert!(err.contains("qwen3"), "{err}");
-            assert!(err.contains("gemma4"), "{err}");
+            assert!(err.contains("not supported for qwen3_5"), "{err}");
+            assert!(err.contains("Qwen3"), "{err}");
+            assert!(err.contains("Gemma 4"), "{err}");
         }
     }
 
