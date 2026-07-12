@@ -153,6 +153,7 @@ pub mod reward;
 pub mod sample;
 pub mod sampler;
 pub mod sandbox;
+mod sharded_safetensors;
 pub mod telemetry;
 pub mod tensor_parallel;
 pub mod tokenizer;

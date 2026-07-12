@@ -774,6 +774,7 @@ dependencies = [
  "hf-hub",
  "proptest",
  "rand 0.10.1",
+ "safetensors 0.7.0",
  "serde",
  "serde_json",
  "sha2",

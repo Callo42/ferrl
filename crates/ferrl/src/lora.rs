@@ -112,6 +112,12 @@ impl ProjLoadOptions {
 #[derive(Debug, Clone)]
 pub(crate) enum FrozenLinearWeight {
     Dense(Tensor),
+    DenseShard {
+        weight: Tensor,
+        global_shape: (usize, usize),
+        plan: TensorParallelPlan,
+        axis: ProjectionShardAxis,
+    },
     Quantized {
         q: Arc<QTensor>,
         qmatmul: QMatMul,
@@ -119,6 +125,12 @@ pub(crate) enum FrozenLinearWeight {
         device: Device,
         shape: (usize, usize),
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProjectionShardAxis {
+    Column,
+    Row,
 }
 
 impl FrozenLinearWeight {
@@ -152,9 +164,62 @@ impl FrozenLinearWeight {
         })
     }
 
+    pub(crate) fn from_tensor_parallel_shard(
+        weight: Tensor,
+        quantization: BaseQuantization,
+        global_shape: (usize, usize),
+        plan: TensorParallelPlan,
+        axis: ProjectionShardAxis,
+    ) -> CandleResult<Self> {
+        if quantization != BaseQuantization::None {
+            candle_core::bail!(
+                "rank-local tensor_parallel base weights do not support {} quantization",
+                quantization.as_str()
+            );
+        }
+        if !plan.is_sharded() {
+            candle_core::bail!("rank-local tensor_parallel base weight requires world_size > 1");
+        }
+        let expected = match axis {
+            ProjectionShardAxis::Column => (
+                tp_shard(plan, "projection_out", global_shape.0)?.len,
+                global_shape.1,
+            ),
+            ProjectionShardAxis::Row => (
+                global_shape.0,
+                tp_shard(plan, "projection_in", global_shape.1)?.len,
+            ),
+        };
+        let got = weight.dims2()?;
+        if got != expected {
+            candle_core::bail!(
+                "rank-local tensor_parallel {:?} weight has shape {got:?}, expected {expected:?} \
+                 from global shape {global_shape:?} and plan rank {}/world {}",
+                axis,
+                plan.rank(),
+                plan.world_size()
+            );
+        }
+        Ok(Self::DenseShard {
+            weight,
+            global_shape,
+            plan,
+            axis,
+        })
+    }
+
     pub(crate) fn dims2(&self) -> CandleResult<(usize, usize)> {
         match self {
             Self::Dense(w) => w.dims2(),
+            Self::DenseShard { global_shape, .. } => Ok(*global_shape),
+            Self::Quantized { shape, .. } => Ok(*shape),
+        }
+    }
+
+    #[cfg(test)]
+    fn stored_dims2(&self) -> CandleResult<(usize, usize)> {
+        match self {
+            Self::Dense(weight) | Self::DenseShard { weight, .. } => weight.dims2(),
             Self::Quantized { shape, .. } => Ok(*shape),
         }
     }
@@ -162,6 +227,7 @@ impl FrozenLinearWeight {
     pub(crate) fn dtype(&self) -> DType {
         match self {
             Self::Dense(w) => w.dtype(),
+            Self::DenseShard { weight, .. } => weight.dtype(),
             Self::Quantized { dtype, .. } => *dtype,
         }
     }
@@ -169,6 +235,7 @@ impl FrozenLinearWeight {
     pub(crate) fn device(&self) -> &Device {
         match self {
             Self::Dense(w) => w.device(),
+            Self::DenseShard { weight, .. } => weight.device(),
             Self::Quantized { device, .. } => device,
         }
     }
@@ -176,6 +243,7 @@ impl FrozenLinearWeight {
     fn dequantized_to(&self, dtype: DType) -> CandleResult<Tensor> {
         match self {
             Self::Dense(w) => w.to_dtype(dtype),
+            Self::DenseShard { weight, .. } => weight.to_dtype(dtype),
             Self::Quantized { q, device, .. } => q.dequantize(device)?.to_dtype(dtype),
         }
     }
@@ -198,10 +266,42 @@ impl FrozenLinearWeight {
         Ok(())
     }
 
+    fn validate_tensor_parallel_layout(
+        &self,
+        plan: TensorParallelPlan,
+        axis: ProjectionShardAxis,
+        label: &'static str,
+    ) -> CandleResult<()> {
+        self.validate_tensor_parallel_support(plan, label)?;
+        if let Self::DenseShard {
+            plan: stored_plan,
+            axis: stored_axis,
+            ..
+        } = self
+        {
+            if *stored_plan != plan || *stored_axis != axis {
+                candle_core::bail!(
+                    "tensor_parallel projection {label} requested {:?} rank {}/world {}, but base \
+                     weight stores {:?} rank {}/world {}",
+                    axis,
+                    plan.rank(),
+                    plan.world_size(),
+                    stored_axis,
+                    stored_plan.rank(),
+                    stored_plan.world_size()
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Tape-bearing frozen linear: gradients still flow to `x`.
     pub(crate) fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
         match self {
             Self::Dense(w) => frozen_linear(x, w),
+            Self::DenseShard { .. } => candle_core::bail!(
+                "ordinary linear forward cannot use a rank-local tensor_parallel base weight"
+            ),
             Self::Quantized { .. } => {
                 let w = self.dequantized_to(x.dtype())?;
                 frozen_linear(x, &w)
@@ -215,11 +315,30 @@ impl FrozenLinearWeight {
         plan: TensorParallelPlan,
         label: &'static str,
     ) -> CandleResult<Tensor> {
-        self.validate_tensor_parallel_support(plan, label)?;
+        self.validate_tensor_parallel_layout(plan, ProjectionShardAxis::Column, label)?;
         let (out, _in) = self.dims2()?;
         let shard = tp_shard(plan, label, out)?;
         let weight = match self {
             Self::Dense(w) => w.narrow(0, shard.start, shard.len)?,
+            Self::DenseShard {
+                weight,
+                plan: stored_plan,
+                axis: ProjectionShardAxis::Column,
+                ..
+            } if *stored_plan == plan => weight.clone(),
+            Self::DenseShard {
+                plan: stored_plan,
+                axis,
+                ..
+            } => candle_core::bail!(
+                "column-parallel projection {label} requested rank {}/world {}, but base weight \
+                 stores a {:?} shard for rank {}/world {}",
+                plan.rank(),
+                plan.world_size(),
+                axis,
+                stored_plan.rank(),
+                stored_plan.world_size()
+            ),
             Self::Quantized { .. } => {
                 self.dequantized_to(x.dtype())?
                     .narrow(0, shard.start, shard.len)?
@@ -234,11 +353,30 @@ impl FrozenLinearWeight {
         plan: TensorParallelPlan,
         label: &'static str,
     ) -> CandleResult<Tensor> {
-        self.validate_tensor_parallel_support(plan, label)?;
+        self.validate_tensor_parallel_layout(plan, ProjectionShardAxis::Row, label)?;
         let (_out, in_) = self.dims2()?;
         let shard = tp_shard(plan, label, in_)?;
         let weight = match self {
             Self::Dense(w) => w.narrow(1, shard.start, shard.len)?,
+            Self::DenseShard {
+                weight,
+                plan: stored_plan,
+                axis: ProjectionShardAxis::Row,
+                ..
+            } if *stored_plan == plan => weight.clone(),
+            Self::DenseShard {
+                plan: stored_plan,
+                axis,
+                ..
+            } => candle_core::bail!(
+                "row-parallel projection {label} requested rank {}/world {}, but base weight \
+                 stores a {:?} shard for rank {}/world {}",
+                plan.rank(),
+                plan.world_size(),
+                axis,
+                stored_plan.rank(),
+                stored_plan.world_size()
+            ),
             Self::Quantized { .. } => {
                 self.dequantized_to(x_shard.dtype())?
                     .narrow(1, shard.start, shard.len)?
@@ -251,6 +389,9 @@ impl FrozenLinearWeight {
     pub(crate) fn forward_tape_free(&self, x: &Tensor) -> CandleResult<Tensor> {
         match self {
             Self::Dense(w) => frozen_linear(x, w),
+            Self::DenseShard { .. } => candle_core::bail!(
+                "ordinary tape-free forward cannot use a rank-local tensor_parallel base weight"
+            ),
             Self::Quantized { qmatmul, .. } => {
                 let input_dtype = x.dtype();
                 let compute_dtype = match input_dtype {
@@ -309,6 +450,32 @@ impl FrozenLinearSnapshot {
         }
     }
 
+    pub(crate) fn validate_column_parallel_support(
+        &self,
+        plan: TensorParallelPlan,
+        label: &'static str,
+    ) -> CandleResult<()> {
+        match self {
+            Self::Dense(_) => Ok(()),
+            Self::Base(weight) | Self::Lora { base: weight, .. } => {
+                weight.validate_tensor_parallel_layout(plan, ProjectionShardAxis::Column, label)
+            }
+        }
+    }
+
+    pub(crate) fn validate_row_parallel_support(
+        &self,
+        plan: TensorParallelPlan,
+        label: &'static str,
+    ) -> CandleResult<()> {
+        match self {
+            Self::Dense(_) => Ok(()),
+            Self::Base(weight) | Self::Lora { base: weight, .. } => {
+                weight.validate_tensor_parallel_layout(plan, ProjectionShardAxis::Row, label)
+            }
+        }
+    }
+
     pub(crate) fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
         match self {
             Self::Dense(w) => frozen_linear(x, w),
@@ -357,7 +524,7 @@ impl FrozenLinearSnapshot {
         plan: TensorParallelPlan,
         label: &'static str,
     ) -> CandleResult<Tensor> {
-        self.validate_tensor_parallel_support(plan, label)?;
+        self.validate_column_parallel_support(plan, label)?;
         match self {
             Self::Dense(w) => {
                 let (out, _in) = w.dims2()?;
@@ -399,7 +566,7 @@ impl FrozenLinearSnapshot {
         plan: TensorParallelPlan,
         label: &'static str,
     ) -> CandleResult<Tensor> {
-        self.validate_tensor_parallel_support(plan, label)?;
+        self.validate_row_parallel_support(plan, label)?;
         match self {
             Self::Dense(w) => {
                 let (_out, in_) = w.dims2()?;
@@ -620,6 +787,84 @@ impl Proj {
         }
     }
 
+    pub(crate) fn load_column_parallel_with_options(
+        vb: &VarBuilder,
+        name: &str,
+        global_shape: (usize, usize),
+        adapted: bool,
+        opts: ProjLoadOptions,
+        plan: TensorParallelPlan,
+    ) -> CandleResult<Self> {
+        Self::load_tensor_parallel_shard_with_options(
+            vb,
+            name,
+            global_shape,
+            adapted,
+            opts,
+            plan,
+            ProjectionShardAxis::Column,
+        )
+    }
+
+    pub(crate) fn load_row_parallel_with_options(
+        vb: &VarBuilder,
+        name: &str,
+        global_shape: (usize, usize),
+        adapted: bool,
+        opts: ProjLoadOptions,
+        plan: TensorParallelPlan,
+    ) -> CandleResult<Self> {
+        Self::load_tensor_parallel_shard_with_options(
+            vb,
+            name,
+            global_shape,
+            adapted,
+            opts,
+            plan,
+            ProjectionShardAxis::Row,
+        )
+    }
+
+    fn load_tensor_parallel_shard_with_options(
+        vb: &VarBuilder,
+        name: &str,
+        global_shape: (usize, usize),
+        adapted: bool,
+        opts: ProjLoadOptions,
+        plan: TensorParallelPlan,
+        axis: ProjectionShardAxis,
+    ) -> CandleResult<Self> {
+        let stored_shape = match axis {
+            ProjectionShardAxis::Column => (
+                tp_shard(plan, "projection_out", global_shape.0)?.len,
+                global_shape.1,
+            ),
+            ProjectionShardAxis::Row => (
+                global_shape.0,
+                tp_shard(plan, "projection_in", global_shape.1)?.len,
+            ),
+        };
+        let weight = vb.pp(name).get(stored_shape, "weight")?;
+        let weight = FrozenLinearWeight::from_tensor_parallel_shard(
+            weight,
+            opts.base_quantization,
+            global_shape,
+            plan,
+            axis,
+        )?;
+        if adapted {
+            Ok(Self::Lora(LoraLinear::from_frozen_base(
+                weight,
+                None,
+                opts.rank,
+                opts.alpha,
+                opts.adapter_dtype,
+            )?))
+        } else {
+            Ok(Self::Frozen(weight))
+        }
+    }
+
     /// `y = x Wᵀ` (plus the adapter side-path when adapted and enabled).
     pub(crate) fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
         match self {
@@ -679,6 +924,14 @@ impl Proj {
         match self {
             Self::Frozen(w) => w.dims2(),
             Self::Lora(l) => l.dims2(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stored_dims2(&self) -> CandleResult<(usize, usize)> {
+        match self {
+            Self::Frozen(weight) => weight.stored_dims2(),
+            Self::Lora(layer) => layer.base_weight.stored_dims2(),
         }
     }
 
@@ -1027,14 +1280,16 @@ impl LoraLinear {
     pub(crate) fn snapshot(&self) -> CandleResult<FrozenLinearSnapshot> {
         match &self.base_weight {
             FrozenLinearWeight::Dense(_) => Ok(FrozenLinearSnapshot::Dense(self.merged_weight()?)),
-            FrozenLinearWeight::Quantized { .. } => Ok(FrozenLinearSnapshot::Lora {
-                base: self.base_weight.clone(),
-                base_bias: self.base_bias.clone(),
-                a: self.a.as_tensor().copy()?.detach(),
-                b: self.b.as_tensor().copy()?.detach(),
-                scale: self.scale,
-                enabled: self.enabled,
-            }),
+            FrozenLinearWeight::DenseShard { .. } | FrozenLinearWeight::Quantized { .. } => {
+                Ok(FrozenLinearSnapshot::Lora {
+                    base: self.base_weight.clone(),
+                    base_bias: self.base_bias.clone(),
+                    a: self.a.as_tensor().copy()?.detach(),
+                    b: self.b.as_tensor().copy()?.detach(),
+                    scale: self.scale,
+                    enabled: self.enabled,
+                })
+            }
         }
     }
 
@@ -1174,7 +1429,9 @@ mod tests {
             FrozenLinearWeight::Quantized { qmatmul, .. } => {
                 assert!(matches!(qmatmul, QMatMul::QTensor(_)));
             }
-            FrozenLinearWeight::Dense(_) => panic!("expected quantized frozen weight"),
+            FrozenLinearWeight::Dense(_) | FrozenLinearWeight::DenseShard { .. } => {
+                panic!("expected quantized frozen weight")
+            }
         }
 
         let x2 = Tensor::from_vec(

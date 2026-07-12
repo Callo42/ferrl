@@ -34,8 +34,10 @@ candle's.
 > bit-identical across ranks on multi-A100. **Single-node tensor-parallel execution is
 > also available through `ferrl train`** for Qwen3 and dense Gemma 4 policies: model
 > projections, rollout/scoring, adapter-gradient reduction, and trainer control flow use
-> an NCCL TP communicator. Checkpoint weights are still loaded in full on every rank;
-> sharded safetensors loading and combined sharded DP x TP remain future work.
+> an NCCL TP communicator. Dense Gemma 4 streams each rank's frozen projection shards
+> directly from single-file or indexed safetensors; shared weights and LoRA adapters stay
+> replicated. Qwen3 currently retains a fully replicated frozen-base fallback. Combined
+> sharded DP x TP remains future work.
 
 ---
 
@@ -243,10 +245,13 @@ TP cannot currently be combined with `distributed.enabled`; any enabled TP execu
 activation checkpointing and held-out eval. Ordinary world-one execution with TP disabled keeps
 Q8_0 quantized matmul support; explicit TP will reopen it only after projection weights are
 constructed as persistent rank-local quantized shards rather than repeatedly dequantizing full
-projections. `intermediate_size`, `num_attention_heads`, and every layer's
+projections. For dense Gemma 4, frozen attention and MLP projections are read directly as
+rank-local shards from either `model.safetensors` or an indexed safetensors checkpoint;
+embeddings, norms, and trainable LoRA A/B factors remain replicated. Qwen3 keeps a
+fully replicated frozen-base fallback while using the same sharded execution and adapter
+gradient contract. `intermediate_size`, `num_attention_heads`, and every layer's
 effective KV-head count must divide evenly by `world_size` (both sliding and global KV-head
-counts matter for Gemma 4). Frozen checkpoint weights and trainable LoRA adapters remain fully
-replicated on every rank until sharded safetensors loading lands.
+counts matter for Gemma 4).
 TP rank 0 is authoritative for reward evaluation, metrics, candidate ledgers,
 checkpoints, post-run health, and the advertised output directory.
 

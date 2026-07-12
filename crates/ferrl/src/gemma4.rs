@@ -782,6 +782,7 @@ impl Gemma4Attention {
         vb: &VarBuilder,
         targets: DenseLoraTargets,
         proj_opts: ProjLoadOptions,
+        weight_plan: TensorParallelPlan,
     ) -> CandleResult<Self> {
         let kind = cfg.layer_types[layer_idx];
         let full = kind == Gemma4LayerType::FullAttention;
@@ -798,23 +799,43 @@ impl Gemma4Attention {
         let h = cfg.hidden_size;
         let q_out = cfg.num_attention_heads * head_dim;
         let kv_out = num_kv_heads * head_dim;
+        let load_column = |name: &str, shape: (usize, usize), adapted: bool| {
+            if weight_plan.is_sharded() {
+                Proj::load_column_parallel_with_options(
+                    vb,
+                    name,
+                    shape,
+                    adapted,
+                    proj_opts,
+                    weight_plan,
+                )
+            } else {
+                Proj::load_with_options(vb, name, shape, adapted, proj_opts)
+            }
+        };
         let v_proj = if full {
             None
         } else {
-            Some(Proj::load_with_options(
+            Some(load_column("v_proj", (kv_out, h), targets.attn_v)?)
+        };
+        let o_proj = if weight_plan.is_sharded() {
+            Proj::load_row_parallel_with_options(
                 vb,
-                "v_proj",
-                (kv_out, h),
-                targets.attn_v,
+                "o_proj",
+                (h, q_out),
+                targets.attn_o,
                 proj_opts,
-            )?)
+                weight_plan,
+            )?
+        } else {
+            Proj::load_with_options(vb, "o_proj", (h, q_out), targets.attn_o, proj_opts)?
         };
         Ok(Self {
             kind,
-            q_proj: Proj::load_with_options(vb, "q_proj", (q_out, h), targets.attn_q, proj_opts)?,
-            k_proj: Proj::load_with_options(vb, "k_proj", (kv_out, h), targets.attn_k, proj_opts)?,
+            q_proj: load_column("q_proj", (q_out, h), targets.attn_q)?,
+            k_proj: load_column("k_proj", (kv_out, h), targets.attn_k)?,
             v_proj,
-            o_proj: Proj::load_with_options(vb, "o_proj", (h, q_out), targets.attn_o, proj_opts)?,
+            o_proj,
             q_norm: RmsNorm::new(
                 vb.pp("q_norm").get(head_dim, "weight")?,
                 cfg.rms_norm_eps as f32,
@@ -921,25 +942,40 @@ impl Gemma4Mlp {
         vb: &VarBuilder,
         targets: DenseLoraTargets,
         proj_opts: ProjLoadOptions,
+        weight_plan: TensorParallelPlan,
     ) -> CandleResult<Self> {
         let h = cfg.hidden_size;
         let i = cfg.intermediate_size;
-        Ok(Self {
-            gate_proj: Proj::load_with_options(
-                vb,
-                "gate_proj",
-                (i, h),
-                targets.mlp_gate,
-                proj_opts,
-            )?,
-            up_proj: Proj::load_with_options(vb, "up_proj", (i, h), targets.mlp_up, proj_opts)?,
-            down_proj: Proj::load_with_options(
+        let load_column = |name: &str, adapted: bool| {
+            if weight_plan.is_sharded() {
+                Proj::load_column_parallel_with_options(
+                    vb,
+                    name,
+                    (i, h),
+                    adapted,
+                    proj_opts,
+                    weight_plan,
+                )
+            } else {
+                Proj::load_with_options(vb, name, (i, h), adapted, proj_opts)
+            }
+        };
+        let down_proj = if weight_plan.is_sharded() {
+            Proj::load_row_parallel_with_options(
                 vb,
                 "down_proj",
                 (h, i),
                 targets.mlp_down,
                 proj_opts,
-            )?,
+                weight_plan,
+            )?
+        } else {
+            Proj::load_with_options(vb, "down_proj", (h, i), targets.mlp_down, proj_opts)?
+        };
+        Ok(Self {
+            gate_proj: load_column("gate_proj", targets.mlp_gate)?,
+            up_proj: load_column("up_proj", targets.mlp_up)?,
+            down_proj,
             act: Activation::GeluPytorchTanh,
         })
     }
@@ -997,13 +1033,21 @@ impl Gemma4Layer {
         vb: &VarBuilder,
         targets: DenseLoraTargets,
         proj_opts: ProjLoadOptions,
+        weight_plan: TensorParallelPlan,
     ) -> CandleResult<Self> {
         let h = cfg.hidden_size;
         let eps = cfg.rms_norm_eps as f32;
         Ok(Self {
             kind: cfg.layer_types[layer_idx],
             input_layernorm: RmsNorm::new(vb.pp("input_layernorm").get(h, "weight")?, eps),
-            attn: Gemma4Attention::load(cfg, layer_idx, &vb.pp("self_attn"), targets, proj_opts)?,
+            attn: Gemma4Attention::load(
+                cfg,
+                layer_idx,
+                &vb.pp("self_attn"),
+                targets,
+                proj_opts,
+                weight_plan,
+            )?,
             post_attention_layernorm: RmsNorm::new(
                 vb.pp("post_attention_layernorm").get(h, "weight")?,
                 eps,
@@ -1012,7 +1056,7 @@ impl Gemma4Layer {
                 vb.pp("pre_feedforward_layernorm").get(h, "weight")?,
                 eps,
             ),
-            mlp: Gemma4Mlp::load(cfg, &vb.pp("mlp"), targets, proj_opts)?,
+            mlp: Gemma4Mlp::load(cfg, &vb.pp("mlp"), targets, proj_opts, weight_plan)?,
             post_feedforward_layernorm: RmsNorm::new(
                 vb.pp("post_feedforward_layernorm").get(h, "weight")?,
                 eps,
@@ -1071,6 +1115,7 @@ pub struct Gemma4GradModel {
     device: Device,
     dtype: DType,
     base_quantization: BaseQuantization,
+    weight_plan: TensorParallelPlan,
     targets: DenseLoraTargets,
     adapter_enabled: bool,
     remat: bool,
@@ -1158,9 +1203,39 @@ impl Gemma4GradModel {
         targets: DenseLoraTargets,
         base_quantization: BaseQuantization,
     ) -> CandleResult<Self> {
+        Self::load_with_targets_base_quantization_and_tensor_parallel(
+            cfg,
+            vb,
+            rank,
+            alpha,
+            adapter_dtype,
+            targets,
+            base_quantization,
+            TensorParallelPlan::single(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn load_with_targets_base_quantization_and_tensor_parallel(
+        cfg: &Gemma4Config,
+        vb: &VarBuilder,
+        rank: usize,
+        alpha: f64,
+        adapter_dtype: DType,
+        targets: DenseLoraTargets,
+        base_quantization: BaseQuantization,
+        weight_plan: TensorParallelPlan,
+    ) -> CandleResult<Self> {
         cfg.validate()?;
         if !targets.any() {
             bail!("Gemma4GradModel: DenseLoraTargets selects no projection");
+        }
+        if weight_plan.is_sharded() && base_quantization != BaseQuantization::None {
+            bail!(
+                "Gemma4GradModel rank-local tensor_parallel loading does not support {} base \
+                 quantization",
+                base_quantization.as_str()
+            );
         }
         let t = &cfg.text_config;
         let root = vb.pp(CKPT_PREFIX);
@@ -1177,6 +1252,7 @@ impl Gemma4GradModel {
                 &layers_vb.pp(i),
                 targets,
                 proj_opts,
+                weight_plan,
             )?);
         }
         Ok(Self {
@@ -1194,6 +1270,7 @@ impl Gemma4GradModel {
             device: vb.device().clone(),
             dtype: vb.dtype(),
             base_quantization,
+            weight_plan,
             targets,
             adapter_enabled: true,
             remat: false,
@@ -1230,6 +1307,7 @@ impl Gemma4GradModel {
         input_ids: &Tensor,
         window: Option<(usize, usize)>,
     ) -> CandleResult<Tensor> {
+        self.validate_ordinary_execution_support()?;
         if self.remat {
             return self.forward_remat(input_ids, window);
         }
@@ -1243,8 +1321,8 @@ impl Gemma4GradModel {
     /// Full-sequence logits through the tensor-parallel projection/collective
     /// path, using `comm`'s rank/world as the plan.
     ///
-    /// Public `ferrl train` uses this path while weights remain fully loaded on
-    /// every rank; direct sharded loader plans remain fail-closed.
+    /// Public `ferrl train` uses this path with either replicated weights or
+    /// persistent rank-local projection weights loaded for the matching plan.
     ///
     /// # Errors
     ///
@@ -1288,7 +1366,7 @@ impl Gemma4GradModel {
             );
         }
         let plan = plan_from_comm(comm)?;
-        self.validate_tensor_parallel_execution_support()?;
+        self.validate_tensor_parallel_execution_support(plan)?;
         let (mut h, masks) = self.embed_and_masks(input_ids)?;
         for layer in &self.layers {
             h = layer.forward_tensor_parallel(&h, &masks, &self.rot, plan, Some(comm))?;
@@ -1296,12 +1374,35 @@ impl Gemma4GradModel {
         self.norm_head_softcap(&h, window)
     }
 
-    fn validate_tensor_parallel_execution_support(&self) -> CandleResult<()> {
+    fn validate_tensor_parallel_execution_support(
+        &self,
+        execution_plan: TensorParallelPlan,
+    ) -> CandleResult<()> {
         if self.base_quantization == BaseQuantization::Q8_0 {
             bail!(
                 "Gemma4GradModel tensor_parallel execution does not support q8_0 base \
                  projections; disable tensor_parallel for world-one Q8_0 until rank-local \
                  quantized shards are implemented"
+            );
+        }
+        if self.weight_plan.is_sharded() && self.weight_plan != execution_plan {
+            bail!(
+                "Gemma4GradModel rank-local weight plan rank {}/world {} does not match \
+                 execution plan rank {}/world {}",
+                self.weight_plan.rank(),
+                self.weight_plan.world_size(),
+                execution_plan.rank(),
+                execution_plan.world_size()
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_ordinary_execution_support(&self) -> CandleResult<()> {
+        if self.weight_plan.is_sharded() {
+            bail!(
+                "ordinary Gemma4GradModel forward cannot use rank-local tensor_parallel base \
+                 weights; call a tensor_parallel forward method with the matching communicator"
             );
         }
         Ok(())
@@ -1335,6 +1436,7 @@ impl Gemma4GradModel {
     ///
     /// Returns a candle error if any tensor op fails.
     pub fn forward_detached(&self, input_ids: &Tensor) -> CandleResult<Tensor> {
+        self.validate_ordinary_execution_support()?;
         let (mut h, masks) = self.embed_and_masks(input_ids)?;
         h = h.detach();
         for layer in &self.layers {
@@ -1355,6 +1457,7 @@ impl Gemma4GradModel {
         start: usize,
         len: usize,
     ) -> CandleResult<Tensor> {
+        self.validate_ordinary_execution_support()?;
         let (mut h, masks) = self.embed_and_masks(input_ids)?;
         h = h.detach();
         for layer in &self.layers {
@@ -1406,7 +1509,7 @@ impl Gemma4GradModel {
             );
         }
         let plan = plan_from_comm(comm)?;
-        self.validate_tensor_parallel_execution_support()?;
+        self.validate_tensor_parallel_execution_support(plan)?;
         let (mut h, masks) = self.embed_and_masks(input_ids)?;
         h = h.detach();
         for layer in &self.layers {
@@ -1714,14 +1817,14 @@ impl Gemma4MergedAttention {
 
     fn validate_tensor_parallel_plan(&self, plan: TensorParallelPlan) -> CandleResult<()> {
         self.q_weight
-            .validate_tensor_parallel_support(plan, "attention_q_out")?;
+            .validate_column_parallel_support(plan, "attention_q_out")?;
         self.k_weight
-            .validate_tensor_parallel_support(plan, "attention_k_out")?;
+            .validate_column_parallel_support(plan, "attention_k_out")?;
         if let Some(weight) = &self.v_weight {
-            weight.validate_tensor_parallel_support(plan, "attention_v_out")?;
+            weight.validate_column_parallel_support(plan, "attention_v_out")?;
         }
         self.o_weight
-            .validate_tensor_parallel_support(plan, "attention_hidden")?;
+            .validate_row_parallel_support(plan, "attention_hidden")?;
         tp_shard(plan, "num_attention_heads", self.num_heads)?;
         tp_shard(plan, "num_key_value_heads", self.num_kv_heads)?;
         tp_shard(plan, "attention_q_out", self.q_weight.dims2()?.0)?;
@@ -1892,11 +1995,11 @@ impl Gemma4MergedMlp {
 
     fn validate_tensor_parallel_plan(&self, plan: TensorParallelPlan) -> CandleResult<()> {
         self.gate_weight
-            .validate_tensor_parallel_support(plan, "intermediate_size")?;
+            .validate_column_parallel_support(plan, "intermediate_size")?;
         self.up_weight
-            .validate_tensor_parallel_support(plan, "intermediate_size")?;
+            .validate_column_parallel_support(plan, "intermediate_size")?;
         self.down_weight
-            .validate_tensor_parallel_support(plan, "intermediate_size")?;
+            .validate_row_parallel_support(plan, "intermediate_size")?;
         tp_shard(plan, "intermediate_size", self.gate_weight.dims2()?.0)?;
         tp_shard(plan, "intermediate_size", self.up_weight.dims2()?.0)?;
         tp_shard(plan, "intermediate_size", self.down_weight.dims2()?.1)?;
@@ -2014,6 +2117,7 @@ pub struct Gemma4MergedDecoder {
     device: Device,
     dtype: DType,
     base_quantization: BaseQuantization,
+    weight_plan: TensorParallelPlan,
 }
 
 impl Gemma4MergedDecoder {
@@ -2033,6 +2137,7 @@ impl Gemma4MergedDecoder {
             device: model.device.clone(),
             dtype: model.dtype,
             base_quantization: model.base_quantization,
+            weight_plan: model.weight_plan,
         })
     }
 
@@ -2043,6 +2148,7 @@ impl Gemma4MergedDecoder {
     /// Returns a candle error if `offset` disagrees with the cache length or any
     /// tensor op fails.
     pub fn forward(&mut self, input_ids: &Tensor, offset: usize) -> CandleResult<Tensor> {
+        self.validate_ordinary_execution_support()?;
         let (b, l) = input_ids.dims2()?;
         let cached = self
             .layers
@@ -2082,7 +2188,7 @@ impl Gemma4MergedDecoder {
         comm: &dyn Comm,
     ) -> CandleResult<Tensor> {
         let plan = plan_from_comm(comm)?;
-        self.validate_tensor_parallel_execution_support()?;
+        self.validate_tensor_parallel_execution_support(plan)?;
         let (b, l) = input_ids.dims2()?;
         let cached = self
             .layers
@@ -2117,12 +2223,35 @@ impl Gemma4MergedDecoder {
         Ok(())
     }
 
-    fn validate_tensor_parallel_execution_support(&self) -> CandleResult<()> {
+    fn validate_tensor_parallel_execution_support(
+        &self,
+        execution_plan: TensorParallelPlan,
+    ) -> CandleResult<()> {
         if self.base_quantization == BaseQuantization::Q8_0 {
             bail!(
                 "Gemma4MergedDecoder tensor_parallel execution does not support q8_0 base \
                  projections; disable tensor_parallel for world-one Q8_0 until rank-local \
                  quantized shards are implemented"
+            );
+        }
+        if self.weight_plan.is_sharded() && self.weight_plan != execution_plan {
+            bail!(
+                "Gemma4MergedDecoder rank-local weight plan rank {}/world {} does not match \
+                 execution plan rank {}/world {}",
+                self.weight_plan.rank(),
+                self.weight_plan.world_size(),
+                execution_plan.rank(),
+                execution_plan.world_size()
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_ordinary_execution_support(&self) -> CandleResult<()> {
+        if self.weight_plan.is_sharded() {
+            bail!(
+                "ordinary Gemma4MergedDecoder forward cannot use rank-local tensor_parallel \
+                 base weights; call forward_tensor_parallel with the matching communicator"
             );
         }
         Ok(())
@@ -2184,6 +2313,7 @@ mod tests {
 
     use crate::comm::LocalComm;
     use crate::nn::grad_coverage;
+    use crate::sharded_safetensors::varbuilder_from_rank_local_safetensors;
     use crate::tensor_parallel::{
         concat_column_shards, sum_row_parallel_partials, TensorParallelPlan,
     };
@@ -2768,6 +2898,153 @@ mod tests {
             assert!(
                 worst <= 1e-5,
                 "rank {rank} TP collective logits diverged from unsharded logits: {worst}"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // storage, adapter, live, and cached oracle
+    fn gemma4_rank_local_tensor_parallel_load_matches_unsharded_live_and_cached() {
+        let mut cfg = tiny_cfg();
+        cfg.text_config.num_key_value_heads = 2;
+        cfg.text_config.num_global_key_value_heads = 2;
+        cfg.validate().unwrap();
+        let weights = weight_map(&cfg);
+        let dir = unique_tmp("rank-local-tp-load");
+        std::fs::create_dir_all(&dir).unwrap();
+        candle_core::safetensors::save(&weights, dir.join("model.safetensors")).unwrap();
+
+        let reference_vb = VarBuilder::from_tensors(weights, DType::F32, &dev());
+        let reference_model = Gemma4GradModel::load_with_targets(
+            &cfg,
+            &reference_vb,
+            2,
+            4.0,
+            DType::F32,
+            DenseLoraTargets::industrial(),
+        )
+        .unwrap();
+        arm_adapter_deterministic(&reference_model);
+        let input = ids(5);
+        let reference_live = reference_model.forward(&input).unwrap();
+        let reference_live = reference_live
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let reference_var_shapes: Vec<_> = reference_model
+            .trainable_vars()
+            .iter()
+            .map(|var| var.as_tensor().dims().to_vec())
+            .collect();
+        let mut reference_decoder = reference_model.merged_decoder().unwrap();
+        let reference_cached = reference_decoder.forward(&input, 0).unwrap();
+        let reference_cached = reference_cached
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+
+        let outputs = std::thread::scope(|scope| {
+            let handles: Vec<_> = LocalComm::world(2)
+                .into_iter()
+                .map(|comm| {
+                    let cfg = cfg.clone();
+                    let input = input.clone();
+                    let dir = dir.clone();
+                    let reference_var_shapes = reference_var_shapes.clone();
+                    scope.spawn(move || {
+                        let plan = TensorParallelPlan::new(comm.rank(), comm.world_size()).unwrap();
+                        let vb = varbuilder_from_rank_local_safetensors(
+                            &dir,
+                            DType::F32,
+                            &dev(),
+                            plan,
+                        )
+                        .unwrap();
+                        let model = Gemma4GradModel::load_with_targets_base_quantization_and_tensor_parallel(
+                            &cfg,
+                            &vb,
+                            2,
+                            4.0,
+                            DType::F32,
+                            DenseLoraTargets::industrial(),
+                            BaseQuantization::None,
+                            plan,
+                        )
+                        .unwrap();
+                        arm_adapter_deterministic(&model);
+
+                        let layer = &model.layers[0];
+                        assert_eq!(layer.attn.q_proj.stored_dims2().unwrap(), (4, 8));
+                        assert_eq!(layer.attn.k_proj.stored_dims2().unwrap(), (4, 8));
+                        assert_eq!(layer.attn.v_proj.as_ref().unwrap().stored_dims2().unwrap(), (4, 8));
+                        assert_eq!(layer.attn.o_proj.stored_dims2().unwrap(), (8, 4));
+                        assert_eq!(layer.mlp.gate_proj.stored_dims2().unwrap(), (8, 8));
+                        assert_eq!(layer.mlp.up_proj.stored_dims2().unwrap(), (8, 8));
+                        assert_eq!(layer.mlp.down_proj.stored_dims2().unwrap(), (8, 8));
+                        let var_shapes: Vec<_> = model
+                            .trainable_vars()
+                            .iter()
+                            .map(|var| var.as_tensor().dims().to_vec())
+                            .collect();
+                        assert_eq!(var_shapes, reference_var_shapes);
+                        assert!(model
+                            .forward(&input)
+                            .unwrap_err()
+                            .to_string()
+                            .contains("ordinary Gemma4GradModel forward cannot use rank-local"));
+
+                        let live = model.forward_tensor_parallel(&input, &comm).unwrap();
+                        let grads = live.sqr().unwrap().sum_all().unwrap().backward().unwrap();
+                        for (pair_index, pair) in model.trainable_vars().chunks(2).enumerate() {
+                            let coverage = grad_coverage(pair, &grads).unwrap();
+                            assert!(
+                                coverage.is_ok(),
+                                "rank {} projection pair {pair_index} has dead/missing grads: \
+                                 {coverage:?}",
+                                comm.rank()
+                            );
+                        }
+                        let mut decoder = model.merged_decoder().unwrap();
+                        assert!(decoder
+                            .forward(&input, 0)
+                            .unwrap_err()
+                            .to_string()
+                            .contains("ordinary Gemma4MergedDecoder forward cannot use rank-local"));
+                        let cached = decoder.forward_tensor_parallel(&input, 0, &comm).unwrap();
+                        (
+                            live.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+                            cached.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+                        )
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        std::fs::remove_dir_all(&dir).ok();
+
+        for (rank, (live, cached)) in outputs.iter().enumerate() {
+            let live_worst = live
+                .iter()
+                .zip(&reference_live)
+                .map(|(got, want)| (got - want).abs())
+                .fold(0.0_f32, f32::max);
+            let cached_worst = cached
+                .iter()
+                .zip(&reference_cached)
+                .map(|(got, want)| (got - want).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(
+                live_worst <= 1e-5,
+                "rank {rank} live mismatch: {live_worst}"
+            );
+            assert!(
+                cached_worst <= 1e-5,
+                "rank {rank} cached mismatch: {cached_worst}"
             );
         }
     }

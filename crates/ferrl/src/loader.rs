@@ -30,6 +30,7 @@ use crate::qwen::QwenGradModel;
 use crate::qwen35::{
     varbuilder_from_pretrained, LoraTargets as Qwen35LoraTargets, Qwen3_5Config, Qwen3_5GradModel,
 };
+use crate::sharded_safetensors::varbuilder_from_rank_local_safetensors;
 use crate::telemetry::ModelTelemetryRecorder;
 use crate::tensor_parallel::TensorParallelPlan;
 use crate::tokenizer::{HfTokenizer, TokenizerError};
@@ -64,9 +65,9 @@ pub struct LoaderOpts {
     pub memory_efficient_cached_gqa: bool,
     /// Optional quantization mode for frozen base projection weights.
     pub base_quantization: BaseQuantization,
-    /// Direct-loader tensor-parallel loading plan. Sharded plans are rejected
-    /// until safetensors loading itself is sharded; `ferrl train` separately
-    /// carries its execution plan while loading full weights on each rank.
+    /// Tensor-parallel loading/execution plan. Dense Gemma 4 uses it to stream
+    /// rank-local projection shards; Qwen3 keeps replicated frozen weights,
+    /// while Qwen3.5 rejects sharded plans.
     pub tensor_parallel: TensorParallelPlan,
 }
 
@@ -393,8 +394,6 @@ pub fn load_qwen_policy(
             model_type: "qwen3".to_string(),
         });
     }
-    reject_sharded_tensor_parallel(opts, "qwen3")?;
-
     let weights_path = dir.join("model.safetensors");
     let weights = std::fs::read(&weights_path).map_err(|source| LoaderError::Io {
         path: weights_path,
@@ -496,7 +495,7 @@ fn load_qwen35_policy(
             model_type: "qwen3_5".to_string(),
         });
     }
-    reject_sharded_tensor_parallel(opts, "qwen3_5")?;
+    reject_unsupported_sharded_tensor_parallel(opts, "qwen3_5")?;
     let cfg = Qwen3_5Config::from_json_file(dir.join("config.json"))?;
     let vb = varbuilder_from_pretrained(dir, opts.base_dtype, device)?;
     let mut model = Qwen3_5GradModel::load_with_targets(
@@ -528,14 +527,17 @@ fn read_gemma4_config(dir: &Path) -> Result<Gemma4Config, LoaderError> {
     Ok(cfg)
 }
 
-fn reject_sharded_tensor_parallel(opts: &LoaderOpts, model_type: &str) -> Result<(), LoaderError> {
+fn reject_unsupported_sharded_tensor_parallel(
+    opts: &LoaderOpts,
+    model_type: &str,
+) -> Result<(), LoaderError> {
     if opts.tensor_parallel.is_sharded() {
         return Err(LoaderError::UnsupportedLoaderOption {
             option: "tensor_parallel".to_string(),
-            supported: "tensor_parallel.world_size = 1 for direct loaders until sharded \
-                        safetensors loading lands; ferrl train carries its TP execution plan \
-                        separately while full-loading weights on every rank"
-                .to_string(),
+            supported: format!(
+                "sharded tensor_parallel execution is not supported for {model_type}; use \
+                 Qwen3 or dense Gemma 4, or set tensor_parallel.world_size = 1"
+            ),
             model_type: model_type.to_string(),
         });
     }
@@ -570,10 +572,12 @@ pub fn load_gemma4_policy(
                 .unwrap_or_else(|| "gemma4".to_string()),
         });
     }
-    reject_sharded_tensor_parallel(opts, cfg.model_type.as_deref().unwrap_or("gemma4"))?;
-
-    let vb = gemma4_varbuilder_from_pretrained(dir, opts.base_dtype, device)?;
-    let model = Gemma4GradModel::load_with_targets_and_base_quantization(
+    let vb = if opts.tensor_parallel.is_sharded() {
+        varbuilder_from_rank_local_safetensors(dir, opts.base_dtype, device, opts.tensor_parallel)?
+    } else {
+        gemma4_varbuilder_from_pretrained(dir, opts.base_dtype, device)?
+    };
+    let model = Gemma4GradModel::load_with_targets_base_quantization_and_tensor_parallel(
         &cfg,
         &vb,
         opts.lora_rank,
@@ -581,6 +585,7 @@ pub fn load_gemma4_policy(
         opts.adapter_dtype,
         DenseLoraTargets::industrial(),
         opts.base_quantization,
+        opts.tensor_parallel,
     )?;
     let policy = Gemma4Policy::new(model, opts.seed, opts.temperature);
     let tok = HfTokenizer::from_file(dir.join("tokenizer.json"))?;
@@ -648,7 +653,7 @@ mod tests {
                 model_type,
             } => {
                 assert_eq!(option, "tensor_parallel");
-                assert!(supported.contains("world_size = 1"));
+                assert!(supported.contains("not supported"));
                 assert_eq!(model_type, expected_model_type);
             }
             other => panic!("expected UnsupportedLoaderOption, got {other:?}"),
@@ -656,7 +661,7 @@ mod tests {
     }
 
     #[test]
-    fn qwen_loader_rejects_sharded_tensor_parallel_before_weight_load() {
+    fn qwen_loader_keeps_replicated_weight_fallback_under_sharded_execution_plan() {
         let tmp = TempDir::new("loader-qwen3-tensor-parallel-option");
         std::fs::write(
             tmp.path().join("config.json"),
@@ -674,7 +679,10 @@ mod tests {
         let err = load_qwen_policy(tmp.path(), &Device::Cpu, &sharded_tensor_parallel_opts())
             .unwrap_err();
 
-        assert_tensor_parallel_rejected(err, "qwen3");
+        match err {
+            LoaderError::Io { path, .. } => assert!(path.ends_with("model.safetensors")),
+            other => panic!("expected replicated Qwen weight read, got {other:?}"),
+        }
     }
 
     #[test]
@@ -693,14 +701,20 @@ mod tests {
     }
 
     #[test]
-    fn gemma4_loader_rejects_sharded_tensor_parallel_before_weight_load() {
+    fn gemma4_loader_enters_rank_local_safetensors_path() {
         let tmp = TempDir::new("loader-gemma4-tensor-parallel-option");
         std::fs::write(tmp.path().join("config.json"), gemma4_config_json()).unwrap();
 
         let err = load_gemma4_policy(tmp.path(), &Device::Cpu, &sharded_tensor_parallel_opts())
             .unwrap_err();
 
-        assert_tensor_parallel_rejected(err, "gemma4");
+        match err {
+            LoaderError::Model(error) => assert!(
+                error.to_string().contains("neither model.safetensors"),
+                "unexpected rank-local loader error: {error}"
+            ),
+            other => panic!("expected rank-local Gemma safetensors read, got {other:?}"),
+        }
     }
 
     #[test]

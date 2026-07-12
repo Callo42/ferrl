@@ -25,6 +25,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+safetensors = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 rand = { workspace = true }
