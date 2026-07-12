@@ -160,6 +160,26 @@ pub fn stitched_backward<F>(
 where
     F: Fn(usize, &Tensor) -> CandleResult<Tensor>,
 {
+    stitched_backward_with_cotangent(loss, tape, trainable, run_segment, |_, cot| Ok(cot.clone()))
+}
+
+/// As [`stitched_backward`], applying `transform_cotangent` to each internal
+/// boundary cotangent before it is fed to the preceding segment.
+///
+/// Tensor-parallel rematerialization uses this seam to sum replicated-boundary
+/// cotangents across ranks. The transform is not called for segment zero,
+/// because no earlier segment consumes its input cotangent.
+pub(crate) fn stitched_backward_with_cotangent<F, C>(
+    loss: &Tensor,
+    tape: &RematTape,
+    trainable: &[Var],
+    run_segment: F,
+    transform_cotangent: C,
+) -> CandleResult<GradStore>
+where
+    F: Fn(usize, &Tensor) -> CandleResult<Tensor>,
+    C: Fn(usize, &Tensor) -> CandleResult<Tensor>,
+{
     let Some(segments) = tape.inputs.len().checked_sub(1) else {
         candle_core::bail!("stitched_backward: the tape is empty (no boundaries were captured)")
     };
@@ -180,6 +200,9 @@ where
             &run_segment,
             i,
         )?;
+        if i > 0 {
+            cot = transform_cotangent(i, &cot)?;
+        }
     }
     Ok(store)
 }

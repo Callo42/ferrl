@@ -462,6 +462,32 @@ pub trait TensorParallelPolicy: Policy {
         rollout: &Rollout,
         comm: &dyn Comm,
     ) -> CandleResult<Tensor>;
+
+    /// Back-propagate a loss produced by
+    /// [`token_logprobs_tensor_parallel`](Self::token_logprobs_tensor_parallel).
+    ///
+    /// The default preserves world-one and forward-only TP policies by
+    /// delegating to [`Policy::backward`], but does not advertise sharded
+    /// training support. Checkpointed TP policies override it so reverse
+    /// rematerialization can replay collectives and reduce boundary cotangents
+    /// through `comm`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if backward fails or the policy rejects the
+    /// communicator/tape pairing.
+    fn backward_tensor_parallel(&self, loss: &Tensor, _comm: &dyn Comm) -> CandleResult<GradStore> {
+        self.backward(loss)
+    }
+
+    /// Whether this policy instance has a mathematically complete backward for
+    /// a tensor-parallel communicator whose world size is greater than one.
+    ///
+    /// Defaults to false so a value-only TP implementation cannot silently be
+    /// used for training.
+    fn supports_sharded_tensor_parallel_backward(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

@@ -25,10 +25,11 @@ use crate::lora::{
 };
 use crate::model::{CachedDecoder, GradModel};
 use crate::nn::RmsNorm;
-use crate::remat::{stitched_backward, RematTape};
+use crate::remat::{stitched_backward, stitched_backward_with_cotangent, RematTape};
 use crate::telemetry::DecoderCacheSnapshot;
 use crate::tensor_parallel::{
-    all_reduce_sum_straight_through, plan_from_comm, ShardRange, TensorParallelPlan,
+    all_reduce_sum_straight_through, all_reduce_sum_value, plan_from_comm, ShardRange,
+    TensorParallelPlan,
 };
 
 /// The checkpoint prefix used by public Gemma 4 conditional-generation
@@ -1077,16 +1078,57 @@ impl Gemma4Layer {
         plan: TensorParallelPlan,
         comm: Option<&dyn Comm>,
     ) -> CandleResult<Tensor> {
+        let x = self.forward_attention_tensor_parallel(x, masks, rot, plan, comm, false)?;
+        self.forward_mlp_tensor_parallel(&x, plan, comm, false)
+    }
+
+    fn reduced_backward_residual(x: &Tensor, plan: TensorParallelPlan) -> CandleResult<Tensor> {
+        if !plan.is_sharded() {
+            return Ok(x.clone());
+        }
+        let scaled = (x * (1.0 / plan.world_size() as f64))?;
+        let correction = x.broadcast_sub(&scaled)?.detach();
+        scaled.broadcast_add(&correction)
+    }
+
+    fn forward_attention_tensor_parallel(
+        &self,
+        x: &Tensor,
+        masks: &Gemma4Masks,
+        rot: &Gemma4Rotary,
+        plan: TensorParallelPlan,
+        comm: Option<&dyn Comm>,
+        reduce_boundary_backward: bool,
+    ) -> CandleResult<Tensor> {
+        let residual = if reduce_boundary_backward {
+            Self::reduced_backward_residual(x, plan)?
+        } else {
+            x.clone()
+        };
         let h = self.input_layernorm.forward(x)?;
         let h = self
             .attn
             .forward_at_tensor_parallel(&h, masks.get(self.kind), rot, plan, comm)?;
         let h = self.post_attention_layernorm.forward(&h)?;
-        let x = x.broadcast_add(&h)?;
-        let h2 = self.pre_feedforward_layernorm.forward(&x)?;
+        residual.broadcast_add(&h)
+    }
+
+    fn forward_mlp_tensor_parallel(
+        &self,
+        x: &Tensor,
+        plan: TensorParallelPlan,
+        comm: Option<&dyn Comm>,
+        reduce_boundary_backward: bool,
+    ) -> CandleResult<Tensor> {
+        let residual = if reduce_boundary_backward {
+            Self::reduced_backward_residual(x, plan)?
+        } else {
+            x.clone()
+        };
+        let h2 = self.pre_feedforward_layernorm.forward(x)?;
         let h2 = self.mlp.forward_tensor_parallel(&h2, plan, comm)?;
         let h2 = self.post_feedforward_layernorm.forward(&h2)?;
-        let x = x.broadcast_add(&h2)?;
+        let x = residual.broadcast_add(&h2)?;
         x.broadcast_mul(&self.layer_scalar)
     }
 
@@ -1099,6 +1141,18 @@ impl Gemma4Layer {
         self.attn.push_vars(out);
         self.mlp.push_vars(out);
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gemma4RematExecution {
+    Ordinary,
+    TensorParallel(TensorParallelPlan),
+}
+
+#[derive(Debug)]
+struct Gemma4RematTape {
+    tape: RematTape,
+    execution: Gemma4RematExecution,
 }
 
 /// A grad-bearing, uncached dense Gemma 4 text forward with `LoRA`.
@@ -1119,7 +1173,7 @@ pub struct Gemma4GradModel {
     targets: DenseLoraTargets,
     adapter_enabled: bool,
     remat: bool,
-    tape: RefCell<Option<RematTape>>,
+    tape: RefCell<Option<Gemma4RematTape>>,
 }
 
 impl Gemma4GradModel {
@@ -1329,9 +1383,7 @@ impl Gemma4GradModel {
     /// # Errors
     ///
     /// Returns a candle error if rank/world validation fails, `comm` does not
-    /// match the stored rank-local weight plan, a collective or tensor op fails,
-    /// or activation checkpointing is enabled (that combination is not wired
-    /// yet).
+    /// match the stored rank-local weight plan, or a collective/tensor op fails.
     pub fn forward_tensor_parallel(
         &self,
         input_ids: &Tensor,
@@ -1362,14 +1414,11 @@ impl Gemma4GradModel {
         window: Option<(usize, usize)>,
         comm: &dyn Comm,
     ) -> CandleResult<Tensor> {
-        if self.remat {
-            bail!(
-                "Gemma4GradModel::forward_tensor_parallel: activation checkpointing is not wired \
-                 for tensor-parallel execution yet"
-            );
-        }
         let plan = plan_from_comm(comm)?;
         self.validate_tensor_parallel_execution_support(plan)?;
+        if self.remat {
+            return self.forward_tensor_parallel_remat(input_ids, window, plan, comm);
+        }
         let (mut h, masks) = self.embed_and_masks(input_ids)?;
         for layer in &self.layers {
             h = layer.forward_tensor_parallel(&h, &masks, &self.rot, plan, Some(comm))?;
@@ -1508,12 +1557,6 @@ impl Gemma4GradModel {
         window: Option<(usize, usize)>,
         comm: &dyn Comm,
     ) -> CandleResult<Tensor> {
-        if self.remat {
-            bail!(
-                "Gemma4GradModel::forward_tensor_parallel_detached: activation checkpointing is \
-                 not wired for tensor-parallel execution yet"
-            );
-        }
         let plan = plan_from_comm(comm)?;
         self.validate_tensor_parallel_execution_support(plan)?;
         let (mut h, masks) = self.embed_and_masks(input_ids)?;
@@ -1531,6 +1574,7 @@ impl Gemma4GradModel {
         input_ids: &Tensor,
         window: Option<(usize, usize)>,
     ) -> CandleResult<Tensor> {
+        self.tape.borrow_mut().take();
         let (mut h, masks) = self.embed_and_masks(input_ids)?;
         let mut tape = RematTape::new(self.adapter_enabled);
         for layer in &self.layers {
@@ -1538,8 +1582,44 @@ impl Gemma4GradModel {
             h = layer.forward(&x, &masks, &self.rot)?;
         }
         let x = tape.capture(&h)?;
-        *self.tape.borrow_mut() = Some(tape);
-        self.norm_head_softcap(&x, window)
+        let logits = self.norm_head_softcap(&x, window)?;
+        *self.tape.borrow_mut() = Some(Gemma4RematTape {
+            tape,
+            execution: Gemma4RematExecution::Ordinary,
+        });
+        Ok(logits)
+    }
+
+    fn forward_tensor_parallel_remat(
+        &self,
+        input_ids: &Tensor,
+        window: Option<(usize, usize)>,
+        plan: TensorParallelPlan,
+        comm: &dyn Comm,
+    ) -> CandleResult<Tensor> {
+        self.tape.borrow_mut().take();
+        let (mut h, masks) = self.embed_and_masks(input_ids)?;
+        let mut tape = RematTape::new(self.adapter_enabled);
+        for layer in &self.layers {
+            let x = tape.capture(&h)?;
+            h = layer.forward_attention_tensor_parallel(
+                &x,
+                &masks,
+                &self.rot,
+                plan,
+                Some(comm),
+                true,
+            )?;
+            let x = tape.capture(&h)?;
+            h = layer.forward_mlp_tensor_parallel(&x, plan, Some(comm), true)?;
+        }
+        let x = tape.capture(&h)?;
+        let logits = self.norm_head_softcap(&x, window)?;
+        *self.tape.borrow_mut() = Some(Gemma4RematTape {
+            tape,
+            execution: Gemma4RematExecution::TensorParallel(plan),
+        });
+        Ok(logits)
     }
 
     /// Backward through the most recent loss.
@@ -1552,9 +1632,17 @@ impl Gemma4GradModel {
         if !self.remat {
             return loss.backward();
         }
-        let Some(tape) = self.tape.borrow_mut().take() else {
+        let Some(captured) = self.tape.borrow_mut().take() else {
             bail!("Gemma4GradModel::backward: activation checkpointing is on but no tape exists")
         };
+        if captured.execution != Gemma4RematExecution::Ordinary {
+            bail!(
+                "Gemma4GradModel::backward: the pending activation-checkpoint tape was captured \
+                 by tensor-parallel execution; call backward_tensor_parallel with the matching \
+                 communicator"
+            )
+        }
+        let tape = captured.tape;
         if tape.segments() != self.layers.len() {
             bail!(
                 "Gemma4GradModel::backward: tape has {} layer segments for {} layers",
@@ -1570,6 +1658,88 @@ impl Gemma4GradModel {
         stitched_backward(loss, &tape, &self.trainable_vars(), |i, x| {
             self.layers[i].forward(x, &masks, &self.rot)
         })
+    }
+
+    /// Backward through the most recent tensor-parallel loss, replaying each
+    /// checkpointed layer with the same communicator when rematerialization is
+    /// enabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if the live communicator does not match the
+    /// stored rank-local plan or captured tape, the tape/loss pairing is stale,
+    /// a collective fails, or candle backward fails.
+    pub fn backward_tensor_parallel(
+        &self,
+        loss: &Tensor,
+        comm: &dyn Comm,
+    ) -> CandleResult<GradStore> {
+        let plan = plan_from_comm(comm)?;
+        self.validate_tensor_parallel_execution_support(plan)?;
+        if !self.remat {
+            if plan.is_sharded() {
+                bail!(
+                    "Gemma4GradModel sharded tensor-parallel backward requires activation \
+                     checkpointing so replicated-boundary cotangents can be reduced correctly"
+                )
+            }
+            return loss.backward();
+        }
+        let Some(captured) = self.tape.borrow_mut().take() else {
+            bail!(
+                "Gemma4GradModel::backward_tensor_parallel: activation checkpointing is on but \
+                 no tape exists"
+            )
+        };
+        if captured.execution != Gemma4RematExecution::TensorParallel(plan) {
+            bail!(
+                "Gemma4GradModel::backward_tensor_parallel: pending tape execution {:?} does not \
+                 match live tensor-parallel rank {}/world {}",
+                captured.execution,
+                plan.rank(),
+                plan.world_size()
+            )
+        }
+        let tape = captured.tape;
+        let expected_segments = self.layers.len() * 2;
+        if tape.segments() != expected_segments {
+            bail!(
+                "Gemma4GradModel::backward_tensor_parallel: tape has {} sublayer segments, \
+                 expected {} for {} layers",
+                tape.segments(),
+                expected_segments,
+                self.layers.len()
+            )
+        }
+        if tape.adapter_enabled() != self.adapter_enabled {
+            bail!(
+                "Gemma4GradModel::backward_tensor_parallel: adapter toggle changed between \
+                 forward and backward"
+            )
+        }
+        let l = tape.first_boundary_dims().map(|d| d[1]).unwrap_or_default();
+        let masks = masks_at(0, l, self.sliding_window, self.dtype, &self.device)?;
+        stitched_backward_with_cotangent(
+            loss,
+            &tape,
+            &self.trainable_vars(),
+            |i, x| {
+                let layer = &self.layers[i / 2];
+                if i % 2 == 0 {
+                    layer.forward_attention_tensor_parallel(
+                        x,
+                        &masks,
+                        &self.rot,
+                        plan,
+                        Some(comm),
+                        true,
+                    )
+                } else {
+                    layer.forward_mlp_tensor_parallel(x, plan, Some(comm), true)
+                }
+            },
+            |_, cot| all_reduce_sum_value(cot, plan, comm),
+        )
     }
 
     /// Turn layer-boundary activation checkpointing on or off.
@@ -1689,6 +1859,14 @@ impl GradModel for Gemma4GradModel {
 
     fn backward(&self, loss: &Tensor) -> CandleResult<GradStore> {
         Gemma4GradModel::backward(self, loss)
+    }
+
+    fn backward_tensor_parallel(&self, loss: &Tensor, comm: &dyn Comm) -> CandleResult<GradStore> {
+        Gemma4GradModel::backward_tensor_parallel(self, loss, comm)
+    }
+
+    fn supports_sharded_tensor_parallel_backward(&self) -> bool {
+        self.remat
     }
 
     fn trainable_vars(&self) -> Vec<Var> {
@@ -2910,6 +3088,180 @@ mod tests {
                 "rank {rank} TP collective logits diverged from unsharded logits: {worst}"
             );
         }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // two-rank value + local/global gradient oracle
+    fn gemma4_tensor_parallel_checkpointed_backward_matches_unsharded_and_rejects_uncut() {
+        let mut cfg = tiny_cfg();
+        cfg.text_config.num_key_value_heads = 2;
+        cfg.text_config.num_global_key_value_heads = 2;
+        cfg.validate().unwrap();
+        let weights = weight_map(&cfg);
+        let input = ids(5);
+
+        let reference = Gemma4GradModel::load_with_targets(
+            &cfg,
+            &VarBuilder::from_tensors(weights.clone(), DType::F32, &dev()),
+            2,
+            4.0,
+            DType::F32,
+            DenseLoraTargets::industrial(),
+        )
+        .unwrap();
+        arm_adapter_deterministic(&reference);
+        let reference_logits = reference.forward(&input).unwrap();
+        let reference_loss = reference_logits.sqr().unwrap().sum_all().unwrap();
+        let reference_store = reference.backward(&reference_loss).unwrap();
+        let reference_grads: Vec<Vec<f32>> = reference
+            .trainable_vars()
+            .iter()
+            .map(|var| {
+                reference_store
+                    .get(var)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+            })
+            .collect();
+
+        let rank_results = std::thread::scope(|scope| {
+            let handles: Vec<_> = LocalComm::world(2)
+                .into_iter()
+                .map(|comm| {
+                    let cfg = cfg.clone();
+                    let weights = weights.clone();
+                    let input = input.clone();
+                    scope.spawn(move || {
+                        let load = || {
+                            Gemma4GradModel::load_with_targets(
+                                &cfg,
+                                &VarBuilder::from_tensors(weights.clone(), DType::F32, &dev()),
+                                2,
+                                4.0,
+                                DType::F32,
+                                DenseLoraTargets::industrial(),
+                            )
+                            .unwrap()
+                        };
+
+                        let uncut = load();
+                        arm_adapter_deterministic(&uncut);
+                        let uncut_logits = uncut.forward_tensor_parallel(&input, &comm).unwrap();
+                        let uncut_loss = uncut_logits.sqr().unwrap().sum_all().unwrap();
+                        let uncut_error = uncut
+                            .backward_tensor_parallel(&uncut_loss, &comm)
+                            .unwrap_err()
+                            .to_string();
+
+                        let mut checkpointed = load();
+                        arm_adapter_deterministic(&checkpointed);
+                        checkpointed.set_activation_checkpointing(true);
+                        let detached = checkpointed
+                            .forward_tensor_parallel_detached(&input, &comm)
+                            .unwrap();
+                        let checkpointed_logits =
+                            checkpointed.forward_tensor_parallel(&input, &comm).unwrap();
+                        let checkpointed_loss =
+                            checkpointed_logits.sqr().unwrap().sum_all().unwrap();
+                        let checkpointed_store = checkpointed
+                            .backward_tensor_parallel(&checkpointed_loss, &comm)
+                            .unwrap();
+
+                        let vars = checkpointed.trainable_vars();
+                        let checkpointed_grads: Vec<Vec<f32>> = vars
+                            .iter()
+                            .map(|var| {
+                                checkpointed_store
+                                    .get(var)
+                                    .unwrap()
+                                    .flatten_all()
+                                    .unwrap()
+                                    .to_vec1::<f32>()
+                                    .unwrap()
+                            })
+                            .collect();
+                        (
+                            comm.rank(),
+                            uncut_error,
+                            detached,
+                            checkpointed_logits,
+                            checkpointed_grads,
+                        )
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        let mut summed_checkpointed = reference_grads
+            .iter()
+            .map(|grad| vec![0.0_f32; grad.len()])
+            .collect::<Vec<_>>();
+        for (rank, uncut_error, detached, checkpointed_logits, checkpointed_grads) in rank_results {
+            assert!(
+                uncut_error.contains("requires activation checkpointing"),
+                "rank {rank} did not fail closed for uncut TP backward: {uncut_error}"
+            );
+            assert!(
+                max_abs_diff(&detached, &reference_logits) <= 1e-5,
+                "rank {rank} detached TP logits diverged under checkpointing"
+            );
+            assert!(
+                max_abs_diff(&checkpointed_logits, &reference_logits) <= 1e-5,
+                "rank {rank} checkpointed TP logits diverged"
+            );
+            for (sum, rank_grad) in summed_checkpointed.iter_mut().zip(checkpointed_grads) {
+                for (total, value) in sum.iter_mut().zip(rank_grad) {
+                    *total += value;
+                }
+            }
+        }
+        for (var_index, (summed, reference)) in
+            summed_checkpointed.iter().zip(&reference_grads).enumerate()
+        {
+            let (worst_index, worst) = summed
+                .iter()
+                .zip(reference)
+                .enumerate()
+                .map(|(index, (a, b))| (index, (a - b).abs()))
+                .max_by(|(_, a), (_, b)| a.total_cmp(b))
+                .unwrap();
+            assert!(
+                worst <= 1e-4,
+                "TP-reduced var {var_index} gradient diverged from unsharded at element \
+                 {worst_index}: {worst}; summed={}, reference={}",
+                summed[worst_index],
+                reference[worst_index]
+            );
+        }
+    }
+
+    #[test]
+    fn gemma4_tensor_parallel_checkpoint_tape_requires_matching_backward_hook() {
+        let comm = LocalComm::world(1).pop().unwrap();
+        let mut model = tiny_model();
+        arm_adapter_deterministic(&model);
+        model.set_activation_checkpointing(true);
+        let loss = model
+            .forward_tensor_parallel(&ids(3), &comm)
+            .unwrap()
+            .sqr()
+            .unwrap()
+            .sum_all()
+            .unwrap();
+
+        let error = model.backward(&loss).unwrap_err().to_string();
+        assert!(
+            error.contains("captured by tensor-parallel execution"),
+            "{error}"
+        );
+        assert!(error.contains("backward_tensor_parallel"), "{error}");
     }
 
     #[test]

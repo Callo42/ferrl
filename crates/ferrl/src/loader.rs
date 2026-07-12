@@ -182,6 +182,13 @@ impl AutoPolicy {
             Self::Qwen3_5(_) => false,
         }
     }
+
+    /// Whether this model family can replay activation-checkpointed update
+    /// layers through the explicit tensor-parallel communicator.
+    #[must_use]
+    pub fn supports_tensor_parallel_activation_checkpointing(&self) -> bool {
+        matches!(self, Self::Gemma4(_))
+    }
 }
 
 impl Policy for AutoPolicy {
@@ -354,6 +361,26 @@ impl TensorParallelPolicy for AutoPolicy {
             Self::Qwen(policy) => policy.token_logprobs_tensor_parallel_detached(rollout, comm),
             Self::Qwen3_5(policy) => policy.token_logprobs_tensor_parallel_detached(rollout, comm),
             Self::Gemma4(policy) => policy.token_logprobs_tensor_parallel_detached(rollout, comm),
+        }
+    }
+
+    fn backward_tensor_parallel(
+        &self,
+        loss: &Tensor,
+        comm: &dyn crate::Comm,
+    ) -> CandleResult<GradStore> {
+        match self {
+            Self::Qwen(policy) => policy.backward_tensor_parallel(loss, comm),
+            Self::Qwen3_5(policy) => policy.backward_tensor_parallel(loss, comm),
+            Self::Gemma4(policy) => policy.backward_tensor_parallel(loss, comm),
+        }
+    }
+
+    fn supports_sharded_tensor_parallel_backward(&self) -> bool {
+        match self {
+            Self::Qwen(policy) => policy.supports_sharded_tensor_parallel_backward(),
+            Self::Qwen3_5(policy) => policy.supports_sharded_tensor_parallel_backward(),
+            Self::Gemma4(policy) => policy.supports_sharded_tensor_parallel_backward(),
         }
     }
 }
@@ -720,6 +747,31 @@ mod tests {
             ),
             other => panic!("expected rank-local Gemma safetensors read, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn gemma4_policy_advertises_tensor_parallel_activation_checkpointing() {
+        let tmp = TempDir::new("loader-gemma4-tp-remat-capability");
+        let fixture_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        copy_dir_contents(&fixture_root.join("tiny_gemma4"), tmp.path());
+        std::fs::copy(
+            fixture_root.join("tiny_tokenizer.json"),
+            tmp.path().join("tokenizer.json"),
+        )
+        .unwrap();
+
+        let (policy, _tok) = load_auto_policy(
+            tmp.path(),
+            &Device::Cpu,
+            &LoaderOpts {
+                lora_rank: 2,
+                lora_alpha: 4.0,
+                ..LoaderOpts::default()
+            },
+        )
+        .unwrap();
+        assert!(policy.supports_tensor_parallel());
+        assert!(policy.supports_tensor_parallel_activation_checkpointing());
     }
 
     #[test]

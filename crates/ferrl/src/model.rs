@@ -430,6 +430,34 @@ pub trait GradModel {
         loss.backward()
     }
 
+    /// Back-propagate a loss built from
+    /// [`forward_tensor_parallel`](Self::forward_tensor_parallel).
+    ///
+    /// The default delegates to [`backward`](Self::backward) for world-one and
+    /// forward-only compatibility. It does **not** advertise sharded-training
+    /// support: an uncut local tensor graph cannot express the backward
+    /// all-reduces required at replicated TP activation boundaries. A model
+    /// that implements those semantics must override this hook and
+    /// [`supports_sharded_tensor_parallel_backward`](Self::supports_sharded_tensor_parallel_backward).
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if backward fails or the concrete model rejects
+    /// the communicator/tape pairing.
+    fn backward_tensor_parallel(&self, loss: &Tensor, _comm: &dyn Comm) -> CandleResult<GradStore> {
+        self.backward(loss)
+    }
+
+    /// Whether this instance implements the cross-rank backward semantics
+    /// required for sharded tensor-parallel training.
+    ///
+    /// The default is fail-closed. Forward-value equivalence alone is not
+    /// sufficient: replicated activation boundaries need rank-summed
+    /// cotangents during reverse execution.
+    fn supports_sharded_tensor_parallel_backward(&self) -> bool {
+        false
+    }
+
     /// The model's `LoRA` recipe as a stable canonical string (e.g.
     /// `attn:qkvo|mlp:gud|gdn:-`), recorded into checkpoint manifests so an
     /// adapter is self-describing about which projections its positional

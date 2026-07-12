@@ -32,9 +32,11 @@ candle's.
 > restart-on-preemption, and run observability (per-step timing, a `summarize` health
 > view, the `runreport` tool, and rank/world/step-stamped `tracing` logs); verified
 > bit-identical across ranks on multi-A100. **Single-node tensor-parallel execution is
-> also available through `ferrl train`** for Qwen3 and dense Gemma 4 policies: model
-> projections, rollout/scoring, adapter-gradient reduction, and trainer control flow use
-> an NCCL TP communicator. Dense Gemma 4 streams each rank's frozen projection shards
+> also available** for Qwen3 and dense Gemma 4 rollout/scoring. Sharded training through
+> `ferrl train` is currently fail-closed except for activation-checkpointed dense Gemma 4,
+> whose rematerialized backward reduces replicated-boundary cotangents and whose final
+> adapter gradients are reduced over the NCCL TP communicator. Dense Gemma 4 streams each
+> rank's frozen projection shards
 > directly from single-file or indexed safetensors on Unix; shared weights and LoRA adapters
 > stay replicated. Qwen3 currently retains a fully replicated frozen-base fallback. Combined
 > sharded DP x TP remains future work.
@@ -218,9 +220,11 @@ and `warmup_steps`; encode warmup directly as points.
 
 ### Tensor-parallel `ferrl train`
 
-Sharded tensor-parallel execution supports Qwen3 (`model_type: "qwen3"`, including
+Sharded tensor-parallel rollout/scoring supports Qwen3 (`model_type: "qwen3"`, including
 legacy configs without `model_type`) and dense Gemma 4 (`"gemma4"` or
 `"gemma4_unified"`). Qwen3.5/3.6 (`"qwen3_5"` / `"qwen3_5_moe"`) are not supported.
+Sharded training requires dense Gemma 4 with `policy.activation_checkpointing = true`;
+forward-only Qwen3 TP fails closed before the trainer enters rollout.
 Build with `--features nccl`, set `device` to `"cuda"`, and launch one Slurm task per
 TP rank. Each task's JSON `tensor_parallel.rank` must equal `SLURM_PROCID`, its
 `world_size` must equal `SLURM_NTASKS`, and every task must use the same launch-unique
@@ -236,13 +240,19 @@ other difference aborts the launch in lockstep before task, device, or model dis
 ```jsonc
 {
   "device": "cuda",
+  "policy": { "activation_checkpointing": true },
   "tensor_parallel": { "enabled": true, "rank": 0, "world_size": 2 }
 }
 ```
 
 TP cannot currently be combined with `distributed.enabled`; any enabled TP execution rejects
 `policy.base_quantization = "q8_0"`, including `world_size = 1`, while sharded TP also rejects
-activation checkpointing and held-out eval. Ordinary world-one execution with TP disabled keeps
+held-out eval. Dense Gemma 4 TP activation checkpointing captures attention and MLP
+sub-layer boundaries, replays their collectives during backward, and sum-reduces each
+replicated-boundary cotangent before continuing the reverse walk. This backward-aware
+rematerialization is mandatory for sharded training; an uncut TP graph and Qwen3's current
+forward-only TP path both fail closed rather than applying incomplete gradients. Ordinary
+world-one execution with TP disabled keeps
 Q8_0 quantized matmul support; explicit TP will reopen it only after projection weights are
 constructed as persistent rank-local quantized shards rather than repeatedly dequantizing full
 projections. For dense Gemma 4, frozen attention and MLP projections are read directly as
