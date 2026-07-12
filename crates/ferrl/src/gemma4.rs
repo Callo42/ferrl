@@ -1282,7 +1282,9 @@ impl Gemma4GradModel {
     ///
     /// # Errors
     ///
-    /// Returns a candle error if any tensor op fails.
+    /// Returns a candle error if the model stores rank-local tensor-parallel
+    /// weights (use [`forward_tensor_parallel`](Self::forward_tensor_parallel)
+    /// instead) or if any tensor op fails.
     pub fn forward(&self, input_ids: &Tensor) -> CandleResult<Tensor> {
         self.forward_window(input_ids, None)
     }
@@ -1291,8 +1293,8 @@ impl Gemma4GradModel {
     ///
     /// # Errors
     ///
-    /// Returns a candle error if the window exceeds the sequence or a tensor op
-    /// fails.
+    /// Returns a candle error if the model stores rank-local tensor-parallel
+    /// weights, the window exceeds the sequence, or a tensor op fails.
     pub fn forward_narrowed(
         &self,
         input_ids: &Tensor,
@@ -1326,9 +1328,10 @@ impl Gemma4GradModel {
     ///
     /// # Errors
     ///
-    /// Returns a candle error if rank/world validation, a collective, or any
-    /// tensor op fails. Activation checkpointing on this path is not wired yet
-    /// and fails loud.
+    /// Returns a candle error if rank/world validation fails, `comm` does not
+    /// match the stored rank-local weight plan, a collective or tensor op fails,
+    /// or activation checkpointing is enabled (that combination is not wired
+    /// yet).
     pub fn forward_tensor_parallel(
         &self,
         input_ids: &Tensor,
@@ -1434,7 +1437,10 @@ impl Gemma4GradModel {
     ///
     /// # Errors
     ///
-    /// Returns a candle error if any tensor op fails.
+    /// Returns a candle error if the model stores rank-local tensor-parallel
+    /// weights (use
+    /// [`forward_tensor_parallel_detached`](Self::forward_tensor_parallel_detached)
+    /// instead) or if any tensor op fails.
     pub fn forward_detached(&self, input_ids: &Tensor) -> CandleResult<Tensor> {
         self.validate_ordinary_execution_support()?;
         let (mut h, masks) = self.embed_and_masks(input_ids)?;
@@ -1449,8 +1455,8 @@ impl Gemma4GradModel {
     ///
     /// # Errors
     ///
-    /// Returns a candle error if the window exceeds the sequence or a tensor op
-    /// fails.
+    /// Returns a candle error if the model stores rank-local tensor-parallel
+    /// weights, the window exceeds the sequence, or a tensor op fails.
     pub fn forward_detached_narrowed(
         &self,
         input_ids: &Tensor,
@@ -2145,8 +2151,10 @@ impl Gemma4MergedDecoder {
     ///
     /// # Errors
     ///
-    /// Returns a candle error if `offset` disagrees with the cache length or any
-    /// tensor op fails.
+    /// Returns a candle error if the decoder stores rank-local tensor-parallel
+    /// weights (use
+    /// [`forward_tensor_parallel`](Self::forward_tensor_parallel) instead),
+    /// `offset` disagrees with the cache length, or any tensor op fails.
     pub fn forward(&mut self, input_ids: &Tensor, offset: usize) -> CandleResult<Tensor> {
         self.validate_ordinary_execution_support()?;
         let (b, l) = input_ids.dims2()?;
@@ -2179,8 +2187,10 @@ impl Gemma4MergedDecoder {
     ///
     /// # Errors
     ///
-    /// As [`forward`](Self::forward), plus any rank/world validation or
-    /// collective failure.
+    /// Returns a candle error if `comm` does not match the stored rank-local
+    /// weight plan, rank/world or projection-shape validation fails, `offset`
+    /// disagrees with the cache length, a collective fails, or any tensor op
+    /// fails.
     pub fn forward_tensor_parallel(
         &mut self,
         input_ids: &Tensor,
