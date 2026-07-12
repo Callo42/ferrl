@@ -64,10 +64,9 @@ pub trait CachedDecoder {
     /// Tensor-parallel variant of [`forward`](Self::forward), driven by an
     /// explicitly supplied communicator.
     ///
-    /// This is an opt-in rollout helper, not the public trainer/loader
-    /// contract. The default preserves fail-closed behavior: single-rank
-    /// communicators reuse the ordinary cached decode, while sharded worlds fail
-    /// loud unless a concrete decoder overrides this method.
+    /// The default preserves fail-closed behavior for unsupported decoders:
+    /// single-rank communicators reuse the ordinary cached decode, while
+    /// sharded worlds fail loud unless a concrete decoder overrides this method.
     ///
     /// # Errors
     ///
@@ -270,11 +269,10 @@ pub trait GradModel {
     /// Full-sequence logits through an explicitly supplied tensor-parallel
     /// communicator.
     ///
-    /// This is an opt-in execution seam for model/policy helpers, not the
-    /// public loader/trainer contract. The default preserves fail-closed
-    /// behavior for models that have not wired tensor parallelism: single-rank
-    /// communicators reuse [`forward`](Self::forward), while sharded worlds fail
-    /// loud instead of silently running an unsharded forward.
+    /// The default preserves fail-closed behavior for models that have not wired
+    /// tensor parallelism: single-rank communicators reuse
+    /// [`forward`](Self::forward), while sharded worlds fail loud instead of
+    /// silently running an unsharded forward.
     ///
     /// # Errors
     ///

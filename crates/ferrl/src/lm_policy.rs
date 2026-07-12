@@ -199,8 +199,8 @@ impl<M: GradModel> LmPolicy<M> {
     ///
     /// This is deliberately an inherent helper rather than part of
     /// [`Policy`]: callers must supply the communicator at the scoring site,
-    /// while non-TP trainer, loader, and CLI paths continue to reject sharded
-    /// TP. Explicit trainer TP entry points can use sharded TP when the trainer
+    /// while ordinary non-TP calls remain unchanged. Explicit trainer TP entry
+    /// points and supported `ferrl train` models use sharded TP when the trainer
     /// DP communicator is world-1; adapter gradients are reduced over the TP
     /// communicator before the optimizer step.
     ///
@@ -254,10 +254,9 @@ impl<M: GradModel> LmPolicy<M> {
     ///
     /// This is deliberately an inherent helper rather than part of
     /// [`Policy`]: callers must supply the communicator at the generation site,
-    /// while loader and CLI entry points continue to reject sharded TP until the
-    /// end-to-end public execution contract is opened. Explicit trainer TP
-    /// entry points can use sharded TP when the trainer DP communicator is
-    /// world-1.
+    /// while ordinary non-TP calls remain unchanged. Explicit trainer TP entry
+    /// points and supported `ferrl train` models use sharded TP when the trainer
+    /// DP communicator is world-1.
     ///
     /// # Errors
     ///

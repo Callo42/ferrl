@@ -1,13 +1,15 @@
-//! The data-parallel communication seam (P8).
+//! The distributed communication seam for data and tensor parallelism.
 //!
-//! GRPO data parallelism in ferrl is a single, exceptionally narrow seam: after
+//! GRPO data parallelism in ferrl uses one narrow part of this seam: after
 //! each rank folds its local shard's per-item gradients, the per-var sums are
 //! **all-reduce-summed** across ranks, and everything downstream of the reduce
 //! (the grad-coverage canary, the global norm, clipping, the `AdamW` step) runs
 //! on the identical reduced gradient on every rank. Ranks therefore stay in
 //! **bitwise lockstep** — same initial weights + same reduced gradients + same
 //! optimizer arithmetic — without ever broadcasting parameters. [`Comm`] is
-//! that seam's whole surface: rank identity plus two sum-reductions.
+//! that seam's whole surface: rank identity plus two sum-reductions. Tensor
+//! parallelism reuses the same surface for projection activations, replicated
+//! adapter gradients, canonical rewards, and lockstep control decisions.
 //!
 //! The surface is deliberately minimal. There is no average-reduce — a mean is
 //! a sum plus a global divisor, and the trainer keeps every normalizer in one
@@ -100,19 +102,18 @@ pub enum CommError {
     /// A tensor operation inside the reduction failed.
     #[error("candle error inside a collective: {0}")]
     Candle(#[from] candle_core::Error),
-    /// The data-parallel launch environment is malformed — a missing or
+    /// The distributed launch environment is malformed — a missing or
     /// unparseable rank/world variable, or an unusable rendezvous path. Raised
     /// during [`NcclComm`] bootstrap, before any collective runs.
-    #[error("data-parallel configuration error: {0}")]
+    #[error("distributed configuration error: {0}")]
     Config(String),
 }
 
-/// The data-parallel collective seam: rank identity plus sum-reductions.
+/// The distributed collective seam: rank identity plus sum-reductions.
 ///
 /// Implementations must be [`Send`] (each rank's handle moves into that rank's
 /// thread) and every rank must receive **rank-identical** reduced values — the
-/// lockstep invariant the trainer's DP correctness rests on (same reduced
-/// gradient on every rank ⇒ same optimizer step). The fold *order* is
+/// lockstep invariant distributed trainer execution rests on. The fold *order* is
 /// implementation-defined: [`LocalComm`] / [`SoloComm`] combine in rank order
 /// (bit-reproducible against a sequential reference), whereas [`NcclComm`]
 /// returns NCCL's rank-identical output, which need not equal a rank-order fold

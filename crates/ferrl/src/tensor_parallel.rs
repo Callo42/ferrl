@@ -1,9 +1,9 @@
 //! Tensor-parallel planning primitives.
 //!
-//! This module is deliberately a contract layer, not a distributed execution
-//! engine. It centralizes the rank/world validation and projection-axis slicing
-//! rules that model implementations must share when they add tensor-parallel
-//! execution. Keeping that policy separate from Dense/Gemma loader code gives
+//! This module is the contract layer beneath the distributed model execution
+//! paths. It centralizes the rank/world validation and projection-axis slicing
+//! rules shared by Dense/Qwen and Gemma 4 tensor-parallel implementations.
+//! Keeping that policy separate from Dense/Gemma loader code gives
 //! the CPU tests a small deterministic oracle: one shard must be the identity,
 //! and N contiguous shards must reassemble the same projection/log-prob values
 //! as the unsharded path.

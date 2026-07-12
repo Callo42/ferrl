@@ -60,7 +60,15 @@ pub(crate) fn windowed(h: &Tensor, window: Option<(usize, usize)>) -> CandleResu
 ///
 /// Returns a candle error if the matmul shapes are incompatible.
 pub fn frozen_linear(x: &Tensor, w: &Tensor) -> CandleResult<Tensor> {
-    let wt = w.t()?;
+    // CUDA matmul accepts a transpose of contiguous row-major storage, but not
+    // a transpose of a gapped view (for example a TP input-axis shard produced
+    // by `narrow(1, ..)`). Materialize only those gapped weights; ordinary full
+    // weights and output-axis shards keep their existing zero-copy transpose.
+    let wt = if w.is_contiguous() {
+        w.t()?
+    } else {
+        w.contiguous()?.t()?
+    };
     if x.rank() <= 2 {
         return x.matmul(&wt);
     }
@@ -308,6 +316,28 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn frozen_linear_materializes_a_gapped_input_axis_weight_view() {
+        let dev = Device::Cpu;
+        let full = Tensor::arange(0f32, 40f32, &dev)
+            .unwrap()
+            .reshape((5, 8))
+            .unwrap();
+        let shard = full.narrow(1, 2, 4).unwrap();
+        assert!(!shard.is_contiguous());
+        let x = Tensor::arange(0f32, 12f32, &dev)
+            .unwrap()
+            .reshape((3, 4))
+            .unwrap();
+
+        let got = frozen_linear(&x, &shard).unwrap();
+        let want = x.matmul(&shard.contiguous().unwrap().t().unwrap()).unwrap();
+        assert_eq!(
+            got.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            want.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
     }
 
     /// The gradient that flows back into `x` is also the same dot-products

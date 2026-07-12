@@ -1,4 +1,4 @@
-//! The NCCL data-parallel bridge (P8 GPU phase) — CPU-mock-first.
+//! The NCCL distributed bridge for data and tensor parallelism — CPU-mock-first.
 //!
 //! [`NcclComm`] is the [`Comm`] implementation that runs real multi-GPU /
 //! multi-process all-reduces. It is generic over a [`NcclPrimitives`] seam —
@@ -31,7 +31,7 @@
 //!
 //! NCCL guarantees **every rank receives the bit-identical all-reduce output** —
 //! which is exactly the lockstep invariant the trainer rests on (same reduced
-//! gradient on every rank ⇒ same optimizer step). It does **not** guarantee that
+//! reduced state on every rank. It does **not** guarantee that
 //! output equals a specific rank-order fold: NCCL's ring/tree reduction may sum
 //! in any order, and float addition is not associative. So the equivalence gate
 //! asserts cross-rank agreement plus correctness within an fp tolerance, not
@@ -54,9 +54,9 @@ pub(crate) const NCCL_UNIQUE_ID_LEN: usize = 128;
 // Bootstrap config
 // ===========================================================================
 
-/// The data-parallel launch parameters, parsed from the (Slurm) environment.
+/// Distributed launch parameters parsed from the Slurm environment.
 ///
-/// A DP launch runs one process per rank; each reads its identity from the
+/// A DP or TP launch runs one process per rank; each reads its identity from the
 /// environment Slurm sets (`SLURM_PROCID` / `SLURM_NTASKS` / `SLURM_LOCALID`)
 /// and a shared rendezvous-file path (`FERRL_NCCL_RENDEZVOUS`) over which rank 0
 /// publishes the NCCL unique id. This type is the pure, CPU-testable parse;
@@ -148,7 +148,7 @@ impl NcclConfig {
 /// bad value to a descriptive [`CommError::Config`].
 fn parse_usize_env(get: &impl Fn(&str) -> Option<String>, key: &str) -> Result<usize, CommError> {
     let raw = get(key)
-        .ok_or_else(|| CommError::Config(format!("{key} is unset (not a Slurm DP launch?)")))?;
+        .ok_or_else(|| CommError::Config(format!("{key} is unset (not a Slurm launch?)")))?;
     raw.parse::<usize>()
         .map_err(|e| CommError::Config(format!("{key}={raw:?} is not a non-negative integer: {e}")))
 }
@@ -219,22 +219,20 @@ fn read_id_file(
 /// `ncclDataType_t`; keeping the decision here (not in the `unsafe` layer) makes
 /// the supported-dtype contract CI-testable.
 ///
-/// Deliberately just the two ferrl's DP path ever reduces: **F32** (the `LoRA`
-/// gradients — the adapter is F32 by design, sidestepping the bf16-GRPO
-/// precision collapse) and **F64** (the scalar all-reduce packs one `f64`).
-/// Half precision (F16/BF16) is intentionally unmapped: ferrl never reduces it,
-/// and reducing in half would reintroduce the precision question F32 avoids — a
-/// deliberate future extension, not a gap.
+/// Deliberately just the two ferrl paths reduce: **F32** (`LoRA` gradients and
+/// F32-staged TP activations) and **F64** (scalar/control all-reduces). Half
+/// precision (F16/BF16) is staged through F32 by the TP helper rather than
+/// reduced directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NcclDataType {
-    /// 32-bit float — the `LoRA`-gradient and scalar-counter path.
+    /// 32-bit float — `LoRA` gradients and staged TP activations.
     F32,
     /// 64-bit float — the scalar all-reduce packs a single `f64`.
     F64,
 }
 
 /// Map a candle [`DType`] to its NCCL element type, rejecting every dtype the
-/// ferrl DP path never reduces.
+/// ferrl distributed paths never reduce directly.
 ///
 /// # Errors
 ///
@@ -245,7 +243,8 @@ pub(crate) fn nccl_dtype_tag(dtype: DType) -> Result<NcclDataType, CommError> {
         DType::F32 => Ok(NcclDataType::F32),
         DType::F64 => Ok(NcclDataType::F64),
         other => Err(CommError::Mismatch(format!(
-            "ferrl's NCCL all-reduce carries only f32 (gradients) and f64 (scalars); got {other:?}"
+            "ferrl's NCCL all-reduce carries only f32 (gradients/TP activations) and f64 \
+             (scalars); got {other:?}"
         ))),
     }
 }
