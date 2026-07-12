@@ -35,8 +35,8 @@ candle's.
 > also available through `ferrl train`** for Qwen3 and dense Gemma 4 policies: model
 > projections, rollout/scoring, adapter-gradient reduction, and trainer control flow use
 > an NCCL TP communicator. Dense Gemma 4 streams each rank's frozen projection shards
-> directly from single-file or indexed safetensors; shared weights and LoRA adapters stay
-> replicated. Qwen3 currently retains a fully replicated frozen-base fallback. Combined
+> directly from single-file or indexed safetensors on Unix; shared weights and LoRA adapters
+> stay replicated. Qwen3 currently retains a fully replicated frozen-base fallback. Combined
 > sharded DP x TP remains future work.
 
 ---
@@ -249,7 +249,11 @@ projections. For dense Gemma 4, frozen attention and MLP projections are read di
 rank-local shards from either `model.safetensors` or an indexed safetensors checkpoint;
 embeddings, norms, and trainable LoRA A/B factors remain replicated. Qwen3 keeps a
 fully replicated frozen-base fallback while using the same sharded execution and adapter
-gradient contract. `intermediate_size`, `num_attention_heads`, and every layer's
+gradient contract. Rank-local safetensors streaming is Unix-only so the loader can bind
+path validation to the opened file's identity. Each indexed `weight_map` value must be one
+flat `.safetensors` filename whose file in the checkpoint directory is regular and not a
+symlink; materialize or copy symlink-based cache snapshots into that layout before launch.
+`intermediate_size`, `num_attention_heads`, and every layer's
 effective KV-head count must divide evenly by `world_size` (both sliding and global KV-head
 counts matter for Gemma 4).
 TP rank 0 is authoritative for reward evaluation, metrics, candidate ledgers,

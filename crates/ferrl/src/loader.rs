@@ -65,8 +65,9 @@ pub struct LoaderOpts {
     pub memory_efficient_cached_gqa: bool,
     /// Optional quantization mode for frozen base projection weights.
     pub base_quantization: BaseQuantization,
-    /// Tensor-parallel loading/execution plan. Dense Gemma 4 uses it to stream
-    /// rank-local projection shards; Qwen3 keeps replicated frozen weights,
+    /// Tensor-parallel loading/execution plan. On Unix, dense Gemma 4 uses it to
+    /// stream rank-local projection shards; indexed shards must be flat, regular,
+    /// non-symlink `.safetensors` files. Qwen3 keeps replicated frozen weights,
     /// while Qwen3.5 rejects sharded plans.
     pub tensor_parallel: TensorParallelPlan,
 }
@@ -550,12 +551,16 @@ fn reject_unsupported_sharded_tensor_parallel(
 /// text decoder lives under `model.language_model.*`; the native loader validates
 /// the wrapper config, maps only those text tensors, attaches the dense
 /// industrial `LoRA` recipe, and returns a policy ready for the generic trainer.
+/// Sharded tensor-parallel loading is supported only on Unix. Indexed shard values
+/// must name flat, regular, non-symlink `.safetensors` files in `dir`; materialize
+/// symlink-based cache snapshots into that layout before loading.
 ///
 /// # Errors
 ///
 /// Returns [`LoaderError`] if the config is unsupported, the requested loader
-/// options are incompatible with Gemma 4, the model tensors cannot be mapped, or
-/// the tokenizer cannot be loaded.
+/// options are incompatible with Gemma 4 or the current platform, indexed shards
+/// violate the supported file layout, model tensors cannot be mapped, or the
+/// tokenizer cannot be loaded.
 pub fn load_gemma4_policy(
     dir: &Path,
     device: &Device,

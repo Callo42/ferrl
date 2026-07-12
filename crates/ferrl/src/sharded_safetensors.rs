@@ -13,6 +13,7 @@
 //! symlink shard files are rejected. Each accepted shard is opened once, its
 //! complete extent is validated, and all later reads use that stable handle.
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -23,7 +24,8 @@ use candle_core::{DType, Device, Error, Result as CandleResult, Shape, Tensor};
 use candle_nn::var_builder::SimpleBackend;
 use candle_nn::{Init, VarBuilder};
 use safetensors::tensor::{Metadata, TensorInfo};
-use serde::Deserialize;
+use serde::de::{Error as _, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 
 use crate::tensor_parallel::TensorParallelPlan;
 
@@ -65,6 +67,7 @@ struct ShardedSafetensorsBackend {
 
 impl ShardedSafetensorsBackend {
     fn from_dir(dir: &Path, plan: TensorParallelPlan) -> CandleResult<Self> {
+        ensure_supported_platform()?;
         let index_path = dir.join("model.safetensors.index.json");
         let single_path = dir.join("model.safetensors");
         let layout = if index_path.is_file() {
@@ -171,6 +174,18 @@ impl ShardedSafetensorsBackend {
     }
 }
 
+#[cfg(unix)]
+fn ensure_supported_platform() -> CandleResult<()> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_supported_platform() -> CandleResult<()> {
+    Err(msg(
+        "rank-local safetensors streaming requires Unix file-identity guarantees".into(),
+    ))
+}
+
 impl SimpleBackend for ShardedSafetensorsBackend {
     fn get(
         &self,
@@ -213,6 +228,7 @@ pub(crate) fn varbuilder_from_rank_local_safetensors(
 fn read_index(index_path: &Path) -> CandleResult<HashMap<String, PathBuf>> {
     #[derive(Deserialize)]
     struct Index {
+        #[serde(deserialize_with = "deserialize_unique_weight_map")]
         weight_map: HashMap<String, String>,
     }
 
@@ -236,6 +252,46 @@ fn read_index(index_path: &Path) -> CandleResult<HashMap<String, PathBuf>> {
             Ok((tensor, validate_shard_name(index_path, &shard)?))
         })
         .collect()
+}
+
+fn deserialize_unique_weight_map<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<String, String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct UniqueWeightMapVisitor;
+
+    impl<'de> Visitor<'de> for UniqueWeightMapVisitor {
+        type Value = HashMap<String, String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a weight_map with unique tensor keys")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut weight_map = HashMap::with_capacity(map.size_hint().unwrap_or(0));
+            while let Some((tensor, shard)) = map.next_entry::<String, String>()? {
+                match weight_map.entry(tensor) {
+                    Entry::Vacant(entry) => {
+                        entry.insert(shard);
+                    }
+                    Entry::Occupied(entry) => {
+                        return Err(A::Error::custom(format!(
+                            "duplicate tensor key {:?} in weight_map",
+                            entry.key()
+                        )));
+                    }
+                }
+            }
+            Ok(weight_map)
+        }
+    }
+
+    deserializer.deserialize_map(UniqueWeightMapVisitor)
 }
 
 fn validate_shard_name(index_path: &Path, shard: &str) -> CandleResult<PathBuf> {
@@ -724,6 +780,24 @@ mod tests {
             .to_string();
         assert!(error.contains("index declares tensor"), "{error}");
         assert!(error.contains("wrong.safetensors"), "{error}");
+    }
+
+    #[test]
+    fn indexed_backend_rejects_duplicate_tensor_assignments() {
+        let dir = TestDir::new("duplicate-index-key");
+        std::fs::write(
+            dir.0.join("model.safetensors.index.json"),
+            br#"{"weight_map":{"weight":"one.safetensors","weight":"two.safetensors"}}"#,
+        )
+        .unwrap();
+
+        let error = read_index(&dir.0.join("model.safetensors.index.json"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("duplicate tensor key \"weight\" in weight_map"),
+            "{error}"
+        );
     }
 
     #[test]
