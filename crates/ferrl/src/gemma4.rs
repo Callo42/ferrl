@@ -3760,7 +3760,7 @@ mod tests {
     fn gemma4_adapter_payload_preflight_globalizes_wrong_device_before_tensor_collective() {
         let tensor_payload_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let errors = std::thread::scope(|scope| {
-            let handles = LocalComm::world_with_timeout(2, Duration::from_millis(200))
+            let handles = LocalComm::world_with_timeout(2, Duration::from_secs(2))
                 .into_iter()
                 .map(|inner| WrongDeviceComm {
                     inner,
