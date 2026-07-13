@@ -2675,6 +2675,8 @@ fn softcap(logits: &Tensor, cap: f64) -> CandleResult<Tensor> {
 mod tests {
     use super::*;
 
+    use rand::rngs::Xoshiro256PlusPlus;
+    use rand::{RngExt, SeedableRng};
     use std::time::Duration;
 
     use crate::comm::{CommError, LocalComm};
@@ -2892,11 +2894,33 @@ mod tests {
         .to_string()
     }
 
-    fn put_rand(t: &mut HashMap<String, Tensor>, name: &str, dims: &[usize]) {
-        t.insert(
-            name.to_string(),
-            Tensor::randn(0f32, 0.05f32, dims.to_vec(), &dev()).unwrap(),
-        );
+    const WEIGHT_SEED: u64 = 0x4745_4D4D_4134; // "GEMMA4"
+
+    /// Deterministic `N(0, 0.05)` test weights. Candle's CPU device cannot be
+    /// seeded, and fresh random weights made quantized equivalence coverage
+    /// depend on parallel test scheduling.
+    fn seeded_randn(rng: &mut Xoshiro256PlusPlus, dims: &[usize]) -> Tensor {
+        let n: usize = dims.iter().product();
+        let mut values = Vec::with_capacity(n + 1);
+        while values.len() < n {
+            let u1: f32 = rng.random::<f32>().max(f32::MIN_POSITIVE);
+            let u2: f32 = rng.random();
+            let radius = (-2.0f32 * u1.ln()).sqrt();
+            let (sin, cos) = (2.0 * std::f32::consts::PI * u2).sin_cos();
+            values.push(0.05 * radius * cos);
+            values.push(0.05 * radius * sin);
+        }
+        values.truncate(n);
+        Tensor::from_vec(values, dims.to_vec(), &dev()).unwrap()
+    }
+
+    fn put_rand(
+        t: &mut HashMap<String, Tensor>,
+        rng: &mut Xoshiro256PlusPlus,
+        name: &str,
+        dims: &[usize],
+    ) {
+        t.insert(name.to_string(), seeded_randn(rng, dims));
     }
 
     fn put_ones(t: &mut HashMap<String, Tensor>, name: &str, dims: &[usize]) {
@@ -2908,12 +2932,14 @@ mod tests {
 
     fn weight_map(cfg: &Gemma4Config) -> HashMap<String, Tensor> {
         let tcfg = &cfg.text_config;
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(WEIGHT_SEED);
         let mut t: HashMap<String, Tensor> = HashMap::new();
         let h = tcfg.hidden_size;
         let i = tcfg.intermediate_size;
 
         put_rand(
             &mut t,
+            &mut rng,
             &format!("{CKPT_PREFIX}.embed_tokens.weight"),
             &[tcfg.vocab_size, h],
         );
@@ -2951,25 +2977,52 @@ mod tests {
                 &[h],
             );
             put_ones(&mut t, &format!("{p}.layer_scalar"), &[1]);
-            put_rand(&mut t, &format!("{p}.self_attn.q_proj.weight"), &[q_out, h]);
             put_rand(
                 &mut t,
+                &mut rng,
+                &format!("{p}.self_attn.q_proj.weight"),
+                &[q_out, h],
+            );
+            put_rand(
+                &mut t,
+                &mut rng,
                 &format!("{p}.self_attn.k_proj.weight"),
                 &[kv_out, h],
             );
             if !full {
                 put_rand(
                     &mut t,
+                    &mut rng,
                     &format!("{p}.self_attn.v_proj.weight"),
                     &[kv_out, h],
                 );
             }
-            put_rand(&mut t, &format!("{p}.self_attn.o_proj.weight"), &[h, q_out]);
+            put_rand(
+                &mut t,
+                &mut rng,
+                &format!("{p}.self_attn.o_proj.weight"),
+                &[h, q_out],
+            );
             put_ones(&mut t, &format!("{p}.self_attn.q_norm.weight"), &[head_dim]);
             put_ones(&mut t, &format!("{p}.self_attn.k_norm.weight"), &[head_dim]);
-            put_rand(&mut t, &format!("{p}.mlp.gate_proj.weight"), &[i, h]);
-            put_rand(&mut t, &format!("{p}.mlp.up_proj.weight"), &[i, h]);
-            put_rand(&mut t, &format!("{p}.mlp.down_proj.weight"), &[h, i]);
+            put_rand(
+                &mut t,
+                &mut rng,
+                &format!("{p}.mlp.gate_proj.weight"),
+                &[i, h],
+            );
+            put_rand(
+                &mut t,
+                &mut rng,
+                &format!("{p}.mlp.up_proj.weight"),
+                &[i, h],
+            );
+            put_rand(
+                &mut t,
+                &mut rng,
+                &format!("{p}.mlp.down_proj.weight"),
+                &[h, i],
+            );
         }
         t
     }
