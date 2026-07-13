@@ -26,10 +26,12 @@
 //! the trainer globalizes every decision that feeds a collective (the
 //! degenerate-window skip all-reduces the live count *first*, so all ranks
 //! skip together or participate together, a rank with no local items
-//! contributing zeros). [`LocalComm`] converts the failure modes this contract
-//! leaves open into loud errors: a shape/count mismatch fails the collective
-//! on every rank, and a peer that never arrives trips a timeout instead of a
-//! silent hang. Rounds carry no operation identity, though (NCCL's collectives
+//! contributing zeros). [`LocalComm`] converts tensor metadata disagreements
+//! into loud errors, while callers with rank-local/dynamic payloads use
+//! [`Comm::validate_all_reduce_sum`] and globalize its result before entering
+//! the payload reduction. `LocalComm` also turns a peer that never arrives into
+//! a timeout instead of a silent hang. Rounds carry no operation identity,
+//! though (NCCL's collectives
 //! are equally untagged): if ranks ever disagree on *which* collective a round
 //! is — same types, different call sites — the values are summed together and
 //! consumed until the eventual desync trips a timeout, so the same-sequence
@@ -87,8 +89,9 @@ pub const DEFAULT_COLLECTIVE_TIMEOUT: Duration = Duration::from_secs(300);
 #[derive(Debug, thiserror::Error)]
 pub enum CommError {
     /// The ranks' contributions to a collective disagree (tensor count,
-    /// shape, or dtype) — a programming error in the caller, surfaced on
-    /// every rank of the world.
+    /// shape, dtype, layout, or device) — a programming error in the caller.
+    /// Dynamic callers coordinate the non-collective preflight so this is
+    /// surfaced on every rank before payload reduction.
     #[error("collective contract violation: {0}")]
     Mismatch(String),
     /// A peer rank failed to arrive at a collective within the timeout —
@@ -128,15 +131,37 @@ pub trait Comm: std::fmt::Debug + Send {
     /// The number of ranks in the world.
     fn world_size(&self) -> usize;
 
-    /// Element-wise sum of each tensor across all ranks, in place: on return,
-    /// `tensors[i]` holds the sum of every rank's `tensors[i]`, **rank-identical
-    /// on every rank**. Every rank must pass the same tensor count, shapes, and
-    /// dtypes; a mismatch fails the collective on every rank.
+    /// Validate the part of an upcoming tensor sum-reduction contract this
+    /// rank can check without entering a collective.
+    ///
+    /// The default accepts every payload. Implementations with dtype, layout,
+    /// or device restrictions override it. A caller whose payload metadata or
+    /// validity can differ by rank must coordinate this result and tensor
+    /// count/shapes/dtypes through fixed-shape controls before calling
+    /// [`all_reduce_sum`](Self::all_reduce_sum).
     ///
     /// # Errors
     ///
-    /// Returns [`CommError`] on a contribution mismatch, a peer timeout, a
-    /// poisoned world, or a failed tensor op. On error the contents of
+    /// Returns [`CommError`] when this rank's payload cannot be reduced by the
+    /// implementation. This method itself performs no collective.
+    fn validate_all_reduce_sum(&self, _tensors: &[Tensor]) -> Result<(), CommError> {
+        Ok(())
+    }
+
+    /// Element-wise sum of each tensor across all ranks, in place: on return,
+    /// `tensors[i]` holds the sum of every rank's `tensors[i]`, **rank-identical
+    /// on every rank**. Every rank must pass the same tensor count, shapes, and
+    /// dtypes. This is a caller obligation: implementations such as NCCL cannot
+    /// safely discover incompatible payload metadata inside the payload
+    /// collective itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CommError`] on a contribution mismatch, unsupported local
+    /// payload, peer timeout, poisoned world, or failed tensor op. Callers must
+    /// not rely on this payload collective to coordinate rank-local validation
+    /// failures; use [`validate_all_reduce_sum`](Self::validate_all_reduce_sum)
+    /// first when the payload can differ by rank. On error the contents of
     /// `tensors` are unspecified (an implementation may have consumed them) —
     /// the world is dead at that point and the gradients in flight with it.
     fn all_reduce_sum(&self, tensors: &mut Vec<Tensor>) -> Result<(), CommError>;

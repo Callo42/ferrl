@@ -17,6 +17,7 @@ use candle_nn::ops::softmax;
 use candle_nn::rotary_emb::rope_slow;
 use candle_nn::{Activation, Module, VarBuilder};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::blocks::{frozen_linear, repeat_kv, rope_partial, windowed, RotaryTables};
 use crate::comm::Comm;
@@ -63,21 +64,82 @@ fn reduce_row_parallel_output(
     }
 }
 
-fn validate_replicated_adapter_values(
-    vars: &[Var],
+fn validate_activation_checkpointing_consensus(
+    remat: bool,
     plan: TensorParallelPlan,
     comm: &dyn Comm,
 ) -> CandleResult<()> {
-    if !plan.is_sharded() || vars.is_empty() {
+    if !plan.is_sharded() {
+        return Ok(());
+    }
+    let checkpointed_count = comm
+        .all_reduce_scalar_sum(if remat { 1.0 } else { 0.0 })
+        .map_err(|err| candle_core::Error::Msg(err.to_string()))?;
+    if checkpointed_count != 0.0 && checkpointed_count != plan.world_size() as f64 {
+        bail!(
+            "Gemma4GradModel::backward_tensor_parallel: activation-checkpointing state differs \
+             across tensor-parallel ranks"
+        )
+    }
+    Ok(())
+}
+
+fn validate_replicated_adapter_values(
+    vars: &[Var],
+    recipe: &str,
+    device: &Device,
+    plan: TensorParallelPlan,
+    comm: &dyn Comm,
+) -> CandleResult<()> {
+    if !plan.is_sharded() {
         return Ok(());
     }
     let mut summed = vars
         .iter()
         .map(|var| var.as_tensor().clone())
         .collect::<Vec<_>>();
+    let local_validity = comm.validate_all_reduce_sum(&summed);
+    let digest = adapter_manifest_digest(vars, recipe);
+    let world = plan.world_size() as f64;
+    let mut control = Vec::with_capacity(1 + digest.len());
+    control.push(if local_validity.is_err() { 1.0 } else { 0.0 });
+    control.extend(digest.map(f64::from));
+    let manifest = Tensor::from_vec(control, 1 + digest.len(), device)?;
+    let mut reduced_manifest = vec![manifest];
+    comm.all_reduce_sum(&mut reduced_manifest)
+        .map_err(|err| candle_core::Error::Msg(err.to_string()))?;
+    let sums = reduced_manifest[0].to_vec1::<f64>()?;
+    let invalid_global = sums[0];
+    let metadata_mismatch_local = digest
+        .iter()
+        .zip(&sums[1..])
+        .any(|(byte, sum)| *sum != world * f64::from(*byte));
+    let metadata_mismatch_global = comm
+        .all_reduce_scalar_sum(if metadata_mismatch_local { 1.0 } else { 0.0 })
+        .map_err(|err| candle_core::Error::Msg(err.to_string()))?;
+    if invalid_global > 0.0 {
+        return match local_validity {
+            Err(error) => Err(candle_core::Error::Msg(format!(
+                "Gemma4GradModel::backward_tensor_parallel: local adapter payload is invalid: \
+                 {error}; adapter values were not reduced"
+            ))),
+            Ok(()) => candle_core::bail!(
+                "Gemma4GradModel::backward_tensor_parallel: adapter payload validation failed \
+                 on a peer tensor-parallel rank; adapter values were not reduced"
+            ),
+        };
+    }
+    if metadata_mismatch_global > 0.0 {
+        bail!(
+            "Gemma4GradModel::backward_tensor_parallel: adapter recipe, tensor count, shapes, or \
+             dtypes differ across tensor-parallel ranks; adapter values were not reduced"
+        )
+    }
+    if vars.is_empty() {
+        return Ok(());
+    }
     comm.all_reduce_sum(&mut summed)
         .map_err(|err| candle_core::Error::Msg(err.to_string()))?;
-    let world = plan.world_size() as f64;
     for (index, (var, sum)) in vars.iter().zip(&summed).enumerate() {
         let expected = (var.as_tensor() * world)?;
         let worst = sum
@@ -104,6 +166,25 @@ fn validate_replicated_adapter_values(
         }
     }
     Ok(())
+}
+
+fn adapter_manifest_digest(vars: &[Var], recipe: &str) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"ferrl-gemma4-adapter-manifest-v1\0");
+    digest.update(recipe.len().to_le_bytes());
+    digest.update(recipe.as_bytes());
+    digest.update(vars.len().to_le_bytes());
+    for var in vars {
+        let tensor = var.as_tensor();
+        let dtype = format!("{:?}", tensor.dtype());
+        digest.update(dtype.len().to_le_bytes());
+        digest.update(dtype.as_bytes());
+        digest.update(tensor.dims().len().to_le_bytes());
+        for dim in tensor.dims() {
+            digest.update(dim.to_le_bytes());
+        }
+    }
+    digest.finalize().into()
 }
 
 /// A Gemma 4 decoder layer's attention kind (`text_config.layer_types[i]`).
@@ -1721,6 +1802,7 @@ impl Gemma4GradModel {
         comm: &dyn Comm,
     ) -> CandleResult<GradStore> {
         let plan = plan_from_comm(comm)?;
+        validate_activation_checkpointing_consensus(self.remat, plan, comm)?;
         if !self.remat {
             self.validate_tensor_parallel_execution_support(plan)?;
             if plan.is_sharded() {
@@ -1742,7 +1824,13 @@ impl Gemma4GradModel {
         let adapters_match =
             adapters_enabled == 0.0 || adapters_enabled == plan.world_size() as f64;
         let trainable = self.trainable_vars();
-        let adapter_values_match = validate_replicated_adapter_values(&trainable, plan, comm);
+        let adapter_values_match = validate_replicated_adapter_values(
+            &trainable,
+            &self.targets.canonical(),
+            &self.device,
+            plan,
+            comm,
+        );
         let local = (|| {
             self.validate_tensor_parallel_execution_support(plan)?;
             let Some(captured) = self.tape.borrow_mut().take() else {
@@ -2590,7 +2678,7 @@ mod tests {
 
     use std::time::Duration;
 
-    use crate::comm::LocalComm;
+    use crate::comm::{CommError, LocalComm};
     use crate::nn::grad_coverage;
     use crate::sharded_safetensors::varbuilder_from_rank_local_safetensors;
     use crate::tensor_parallel::{
@@ -3412,6 +3500,221 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn gemma4_tensor_parallel_backward_coordinates_asymmetric_checkpointing_state() {
+        let cfg = tiny_cfg();
+        let weights = weight_map(&cfg);
+
+        let errors = std::thread::scope(|scope| {
+            let handles = LocalComm::world_with_timeout(2, Duration::from_secs(2))
+                .into_iter()
+                .map(|comm| {
+                    let cfg = cfg.clone();
+                    let weights = weights.clone();
+                    scope.spawn(move || {
+                        let mut model = Gemma4GradModel::load_with_targets(
+                            &cfg,
+                            &VarBuilder::from_tensors(weights, DType::F32, &dev()),
+                            2,
+                            4.0,
+                            DType::F32,
+                            DenseLoraTargets::industrial(),
+                        )
+                        .unwrap();
+                        model.set_activation_checkpointing(comm.rank() == 0);
+                        model
+                            .backward_tensor_parallel(&Tensor::new(1.0_f32, &dev()).unwrap(), &comm)
+                            .unwrap_err()
+                            .to_string()
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        for error in errors {
+            assert!(
+                error.contains(
+                    "activation-checkpointing state differs across tensor-parallel ranks"
+                ),
+                "{error}"
+            );
+        }
+    }
+
+    fn two_rank_adapter_manifest_errors(
+        make: impl Fn(usize) -> (Vec<Var>, String) + Sync,
+    ) -> Vec<String> {
+        std::thread::scope(|scope| {
+            let make = &make;
+            let handles = LocalComm::world(2)
+                .into_iter()
+                .map(|comm| {
+                    scope.spawn(move || {
+                        let (vars, recipe) = make(comm.rank());
+                        let plan = TensorParallelPlan::new(comm.rank(), comm.world_size()).unwrap();
+                        validate_replicated_adapter_values(
+                            &vars,
+                            &recipe,
+                            &Device::Cpu,
+                            plan,
+                            &comm,
+                        )
+                        .unwrap_err()
+                        .to_string()
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        })
+    }
+
+    #[derive(Debug)]
+    struct F32F64OnlyComm(LocalComm);
+
+    impl Comm for F32F64OnlyComm {
+        fn rank(&self) -> usize {
+            self.0.rank()
+        }
+
+        fn world_size(&self) -> usize {
+            self.0.world_size()
+        }
+
+        fn validate_all_reduce_sum(&self, tensors: &[Tensor]) -> Result<(), CommError> {
+            if let Some((index, tensor)) = tensors
+                .iter()
+                .enumerate()
+                .find(|(_, tensor)| !matches!(tensor.dtype(), DType::F32 | DType::F64))
+            {
+                return Err(CommError::Mismatch(format!(
+                    "test communicator accepts only f32/f64; tensor {index} is {:?}",
+                    tensor.dtype()
+                )));
+            }
+            Ok(())
+        }
+
+        fn all_reduce_sum(&self, tensors: &mut Vec<Tensor>) -> Result<(), CommError> {
+            self.0.all_reduce_sum(tensors)
+        }
+
+        fn all_reduce_scalar_sum(&self, value: f64) -> Result<f64, CommError> {
+            self.0.all_reduce_scalar_sum(value)
+        }
+    }
+
+    #[test]
+    fn gemma4_adapter_manifest_preflight_rejects_recipe_count_shape_and_dtype_mismatches() {
+        let var = |tensor: Tensor| Var::from_tensor(&tensor).unwrap();
+        let recipe = two_rank_adapter_manifest_errors(|rank| {
+            (
+                vec![var(Tensor::zeros(2, DType::F32, &dev()).unwrap())],
+                if rank == 0 { "attn:q" } else { "attn:k" }.to_owned(),
+            )
+        });
+        let count = two_rank_adapter_manifest_errors(|rank| {
+            let mut vars = vec![var(Tensor::zeros(2, DType::F32, &dev()).unwrap())];
+            if rank == 1 {
+                vars.push(var(Tensor::zeros(1, DType::F32, &dev()).unwrap()));
+            }
+            (vars, "attn:q".to_owned())
+        });
+        let shape = two_rank_adapter_manifest_errors(|rank| {
+            (
+                vec![var(Tensor::zeros(
+                    if rank == 0 { 2 } else { 3 },
+                    DType::F32,
+                    &dev(),
+                )
+                .unwrap())],
+                "attn:q".to_owned(),
+            )
+        });
+        let dtype = two_rank_adapter_manifest_errors(|rank| {
+            (
+                vec![var(Tensor::zeros(
+                    2,
+                    if rank == 0 { DType::F32 } else { DType::BF16 },
+                    &dev(),
+                )
+                .unwrap())],
+                "attn:q".to_owned(),
+            )
+        });
+
+        for error in recipe.into_iter().chain(count).chain(shape).chain(dtype) {
+            assert!(
+                error.contains("adapter recipe, tensor count, shapes, or dtypes differ"),
+                "{error}"
+            );
+            assert!(error.contains("adapter values were not reduced"), "{error}");
+        }
+    }
+
+    #[test]
+    fn gemma4_adapter_manifest_preflight_globalizes_mixed_unsupported_dtype() {
+        let errors = std::thread::scope(|scope| {
+            let handles = LocalComm::world(2)
+                .into_iter()
+                .map(F32F64OnlyComm)
+                .map(|comm| {
+                    scope.spawn(move || {
+                        let dtype = if comm.rank() == 0 {
+                            DType::F32
+                        } else {
+                            DType::BF16
+                        };
+                        let vars =
+                            vec![
+                                Var::from_tensor(&Tensor::zeros(2, dtype, &Device::Cpu).unwrap())
+                                    .unwrap(),
+                            ];
+                        let plan = TensorParallelPlan::new(comm.rank(), comm.world_size()).unwrap();
+                        validate_replicated_adapter_values(
+                            &vars,
+                            "attn:q",
+                            &Device::Cpu,
+                            plan,
+                            &comm,
+                        )
+                        .unwrap_err()
+                        .to_string()
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("local adapter payload is invalid")),
+            "the unsupported rank should retain its local diagnostic: {errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("payload validation failed on a peer")),
+            "the valid rank should fail before adapter values are reduced: {errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .all(|error| error.contains("adapter values were not reduced")),
+            "{errors:?}"
+        );
     }
 
     #[test]

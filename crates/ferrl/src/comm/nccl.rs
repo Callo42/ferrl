@@ -3,8 +3,8 @@
 //! [`NcclComm`] is the [`Comm`] implementation that runs real multi-GPU /
 //! multi-process all-reduces. It is generic over a [`NcclPrimitives`] seam —
 //! the one collective primitive (init + element-wise sum-reduce) — so the
-//! **same orchestration** (dtype validation, the scalar→tensor packing NCCL's
-//! tensor-only API forces, the per-rank local contract checks) runs two ways:
+//! **same orchestration** (local payload validation and the scalar→tensor
+//! packing NCCL's tensor-only API forces) runs two ways:
 //!
 //! - against `MockNccl`, an in-memory CPU substrate, in plain CI — this is
 //!   the **mock gate**: it exercises the real `NcclComm` code path with no GPU
@@ -21,11 +21,11 @@
 //! [`LocalComm`](crate::comm::LocalComm) sees every rank's contribution in one
 //! process, so it validates the **cross-rank** contract (same count, shape,
 //! dtype) directly. A real NCCL rank is one process that sees only its own
-//! tensors, so `NcclComm` validates only what is **local** — each tensor has an
-//! NCCL-supported dtype and is contiguous — and leaves the cross-rank contract
-//! to NCCL itself (a shape/count disagreement deadlocks or errors the
-//! collective). The mock, being in-process, restores the cross-rank check, so
-//! the CI gate still covers mismatch detection.
+//! tensors. `NcclComm` therefore exposes its dtype/layout/device checks through
+//! [`Comm::validate_all_reduce_sum`]. Callers with rank-local or dynamic payloads
+//! must globalize that non-collective result and a fixed-shape metadata manifest
+//! before entering the payload collective; Gemma adapter validation is the
+//! production example.
 //!
 //! ## Determinism: cross-rank agreement, not a sequential fold
 //!
@@ -319,8 +319,12 @@ impl<P: NcclPrimitives> Comm for NcclComm<P> {
         self.primitive.world_size()
     }
 
+    fn validate_all_reduce_sum(&self, tensors: &[Tensor]) -> Result<(), CommError> {
+        validate_local(tensors, &self.device)
+    }
+
     fn all_reduce_sum(&self, tensors: &mut Vec<Tensor>) -> Result<(), CommError> {
-        validate_local(tensors)?;
+        self.validate_all_reduce_sum(tensors)?;
         self.primitive.all_reduce(tensors)
     }
 
@@ -336,15 +340,19 @@ impl<P: NcclPrimitives> Comm for NcclComm<P> {
 }
 
 /// Validate the part of the collective contract a single rank can see: every
-/// tensor must have an NCCL-supported dtype and be contiguous (NCCL reduces a
-/// flat device buffer). The cross-rank shape/count agreement is enforced by
-/// NCCL itself (or, under the mock, by the in-memory reducer).
-fn validate_local(tensors: &[Tensor]) -> Result<(), CommError> {
+/// tensor must have an NCCL-supported dtype, be contiguous, and live on this
+/// communicator's staging device.
+fn validate_local(tensors: &[Tensor], device: &Device) -> Result<(), CommError> {
     for (i, tensor) in tensors.iter().enumerate() {
         nccl_dtype_tag(tensor.dtype())?;
         if !tensor.is_contiguous() {
             return Err(CommError::Mismatch(format!(
                 "NCCL all-reduce requires contiguous tensors; tensor {i} is not contiguous"
+            )));
+        }
+        if !tensor.device().same_device(device) {
+            return Err(CommError::Mismatch(format!(
+                "NCCL all-reduce tensor {i} is not on this communicator's device"
             )));
         }
     }
@@ -576,17 +584,17 @@ mod tests {
             .unwrap();
         assert!(!noncontig.is_contiguous());
         assert!(matches!(
-            validate_local(&[noncontig]),
+            validate_local(&[noncontig], &Device::Cpu),
             Err(CommError::Mismatch(_))
         ));
 
         let int_tensor = Tensor::from_vec(vec![1u32, 2], 2, &Device::Cpu).unwrap();
         assert!(matches!(
-            validate_local(&[int_tensor]),
+            validate_local(&[int_tensor], &Device::Cpu),
             Err(CommError::Mismatch(_))
         ));
 
-        validate_local(&[t(&[1.0, 2.0])]).unwrap();
+        validate_local(&[t(&[1.0, 2.0])], &Device::Cpu).unwrap();
     }
 
     // ---- unique-id file rendezvous ----
@@ -689,10 +697,14 @@ mod tests {
 
     #[test]
     fn orchestration_validates_before_the_collective() {
-        // A bad-dtype tensor must be rejected by NcclComm BEFORE it reaches the
-        // primitive (so a real launch never hands NCCL an unmappable buffer).
+        // A bad-dtype payload must be exposed through the non-collective
+        // preflight and rejected before it reaches the NCCL primitive.
         let comm = MockNccl::world(1).pop().unwrap();
         let int_tensor = Tensor::from_vec(vec![1u32, 2], 2, &Device::Cpu).unwrap();
+        assert!(matches!(
+            comm.validate_all_reduce_sum(std::slice::from_ref(&int_tensor)),
+            Err(CommError::Mismatch(_))
+        ));
         assert!(matches!(
             comm.all_reduce_sum(&mut vec![int_tensor]),
             Err(CommError::Mismatch(_))
