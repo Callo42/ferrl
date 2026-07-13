@@ -99,23 +99,8 @@ fn validate_replicated_adapter_values(
         .map(|var| var.as_tensor().clone())
         .collect::<Vec<_>>();
     let local_validity = comm.validate_all_reduce_sum(&summed);
-    let digest = adapter_manifest_digest(vars, recipe);
-    let world = plan.world_size() as f64;
-    let mut control = Vec::with_capacity(1 + digest.len());
-    control.push(if local_validity.is_err() { 1.0 } else { 0.0 });
-    control.extend(digest.map(f64::from));
-    let manifest = Tensor::from_vec(control, 1 + digest.len(), device)?;
-    let mut reduced_manifest = vec![manifest];
-    comm.all_reduce_sum(&mut reduced_manifest)
-        .map_err(|err| candle_core::Error::Msg(err.to_string()))?;
-    let sums = reduced_manifest[0].to_vec1::<f64>()?;
-    let invalid_global = sums[0];
-    let metadata_mismatch_local = digest
-        .iter()
-        .zip(&sums[1..])
-        .any(|(byte, sum)| *sum != world * f64::from(*byte));
-    let metadata_mismatch_global = comm
-        .all_reduce_scalar_sum(if metadata_mismatch_local { 1.0 } else { 0.0 })
+    let invalid_global = comm
+        .all_reduce_scalar_sum(if local_validity.is_err() { 1.0 } else { 0.0 })
         .map_err(|err| candle_core::Error::Msg(err.to_string()))?;
     if invalid_global > 0.0 {
         return match local_validity {
@@ -129,6 +114,20 @@ fn validate_replicated_adapter_values(
             ),
         };
     }
+    let digest = adapter_manifest_digest(vars, recipe);
+    let world = plan.world_size() as f64;
+    let manifest = Tensor::from_vec(digest.map(f64::from).to_vec(), digest.len(), device)?;
+    let mut reduced_manifest = vec![manifest];
+    comm.all_reduce_sum(&mut reduced_manifest)
+        .map_err(|err| candle_core::Error::Msg(err.to_string()))?;
+    let sums = reduced_manifest[0].to_vec1::<f64>()?;
+    let metadata_mismatch_local = digest
+        .iter()
+        .zip(&sums)
+        .any(|(byte, sum)| *sum != world * f64::from(*byte));
+    let metadata_mismatch_global = comm
+        .all_reduce_scalar_sum(if metadata_mismatch_local { 1.0 } else { 0.0 })
+        .map_err(|err| candle_core::Error::Msg(err.to_string()))?;
     if metadata_mismatch_global > 0.0 {
         bail!(
             "Gemma4GradModel::backward_tensor_parallel: adapter recipe, tensor count, shapes, or \
@@ -3604,6 +3603,7 @@ mod tests {
         }
 
         fn all_reduce_sum(&self, tensors: &mut Vec<Tensor>) -> Result<(), CommError> {
+            self.validate_all_reduce_sum(tensors)?;
             self.0.all_reduce_sum(tensors)
         }
 
@@ -3714,6 +3714,100 @@ mod tests {
                 .iter()
                 .all(|error| error.contains("adapter values were not reduced")),
             "{errors:?}"
+        );
+    }
+
+    // Emulates the NcclComm contract when rank 1's model tensors live on a
+    // different device: scalar controls are communicator-staged, while any
+    // caller-supplied tensor collective re-runs the local device preflight.
+    #[derive(Debug)]
+    struct WrongDeviceComm {
+        inner: LocalComm,
+        tensor_payload_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Comm for WrongDeviceComm {
+        fn rank(&self) -> usize {
+            self.inner.rank()
+        }
+
+        fn world_size(&self) -> usize {
+            self.inner.world_size()
+        }
+
+        fn validate_all_reduce_sum(&self, _tensors: &[Tensor]) -> Result<(), CommError> {
+            if self.rank() == 1 {
+                return Err(CommError::Mismatch(
+                    "test adapter tensor is not on this communicator's device".to_owned(),
+                ));
+            }
+            Ok(())
+        }
+
+        fn all_reduce_sum(&self, tensors: &mut Vec<Tensor>) -> Result<(), CommError> {
+            self.tensor_payload_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.validate_all_reduce_sum(tensors)?;
+            self.inner.all_reduce_sum(tensors)
+        }
+
+        fn all_reduce_scalar_sum(&self, value: f64) -> Result<f64, CommError> {
+            self.inner.all_reduce_scalar_sum(value)
+        }
+    }
+
+    #[test]
+    fn gemma4_adapter_payload_preflight_globalizes_wrong_device_before_tensor_collective() {
+        let tensor_payload_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let errors = std::thread::scope(|scope| {
+            let handles = LocalComm::world_with_timeout(2, Duration::from_millis(200))
+                .into_iter()
+                .map(|inner| WrongDeviceComm {
+                    inner,
+                    tensor_payload_calls: std::sync::Arc::clone(&tensor_payload_calls),
+                })
+                .map(|comm| {
+                    scope.spawn(move || {
+                        let vars = vec![Var::from_tensor(
+                            &Tensor::zeros(2, DType::F32, &Device::Cpu).unwrap(),
+                        )
+                        .unwrap()];
+                        let plan = TensorParallelPlan::new(comm.rank(), comm.world_size()).unwrap();
+                        validate_replicated_adapter_values(
+                            &vars,
+                            "attn:q",
+                            &Device::Cpu,
+                            plan,
+                            &comm,
+                        )
+                        .unwrap_err()
+                        .to_string()
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("local adapter payload is invalid")),
+            "the wrong-device rank should retain its local diagnostic: {errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("payload validation failed on a peer")),
+            "the valid rank should fail through communicator-owned control traffic: {errors:?}"
+        );
+        assert_eq!(
+            tensor_payload_calls.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "no manifest or adapter-value tensor collective may start after an asymmetric \
+             wrong-device preflight failure"
         );
     }
 
