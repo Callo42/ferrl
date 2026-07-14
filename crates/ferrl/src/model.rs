@@ -430,6 +430,43 @@ pub trait GradModel {
         loss.backward()
     }
 
+    /// Back-propagate a loss built from
+    /// [`forward_tensor_parallel`](Self::forward_tensor_parallel).
+    ///
+    /// The default delegates to [`backward`](Self::backward) for world-one and
+    /// forward-only compatibility. It does **not** advertise sharded-training
+    /// support: an uncut local tensor graph cannot express the backward
+    /// all-reduces required at replicated TP activation boundaries. A model
+    /// that implements those semantics must override this hook and
+    /// [`supports_sharded_tensor_parallel_backward`](Self::supports_sharded_tensor_parallel_backward).
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if the communicator is sharded and the concrete
+    /// model has not overridden this hook, backward fails, or the concrete
+    /// model rejects the communicator/tape pairing.
+    fn backward_tensor_parallel(&self, loss: &Tensor, comm: &dyn Comm) -> CandleResult<GradStore> {
+        let plan = plan_from_comm(comm)?;
+        if plan.is_sharded() {
+            candle_core::bail!(
+                "{} does not implement tensor-parallel backward for world_size {}",
+                std::any::type_name::<Self>(),
+                plan.world_size()
+            )
+        }
+        self.backward(loss)
+    }
+
+    /// Whether this instance implements the cross-rank backward semantics
+    /// required for sharded tensor-parallel training.
+    ///
+    /// The default is fail-closed. Forward-value equivalence alone is not
+    /// sufficient: replicated activation boundaries need rank-summed
+    /// cotangents during reverse execution.
+    fn supports_sharded_tensor_parallel_backward(&self) -> bool {
+        false
+    }
+
     /// The model's `LoRA` recipe as a stable canonical string (e.g.
     /// `attn:qkvo|mlp:gud|gdn:-`), recorded into checkpoint manifests so an
     /// adapter is self-describing about which projections its positional
@@ -501,6 +538,8 @@ mod tests {
     use super::*;
     use candle_core::{DType, Device};
 
+    use crate::comm::LocalComm;
+
     /// A minimal [`GradModel`] that relies on every provided default — the
     /// witness that an external implementor gets working behavior for free:
     /// `forward_detached` is a value-identical detach and `backward` is
@@ -564,6 +603,29 @@ mod tests {
             "default backward lost the var grad"
         );
         assert!(m.lora_recipe().is_none());
+    }
+
+    #[test]
+    fn the_provided_tensor_parallel_backward_rejects_a_sharded_communicator() {
+        let device = Device::Cpu;
+        let w = Var::from_tensor(&Tensor::from_vec(vec![2.0f32], (1,), &device).unwrap()).unwrap();
+        let m = OneVarModel { w, device };
+        let loss = m
+            .forward(&Tensor::from_vec(vec![1u32], (1, 1), m.device()).unwrap())
+            .unwrap()
+            .sum_all()
+            .unwrap();
+        let comm = LocalComm::world(2).remove(0);
+
+        let error = m
+            .backward_tensor_parallel(&loss, &comm)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("does not implement tensor-parallel backward"),
+            "{error}"
+        );
+        assert!(error.contains("world_size 2"), "{error}");
     }
 
     #[test]

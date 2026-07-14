@@ -847,6 +847,18 @@ impl<M: GradModel> TensorParallelPolicy for LmPolicy<M> {
     ) -> CandleResult<Tensor> {
         LmPolicy::token_logprobs_tensor_parallel_detached(self, rollout, comm)
     }
+
+    fn backward_tensor_parallel(
+        &self,
+        loss: &Tensor,
+        comm: &dyn Comm,
+    ) -> CandleResult<candle_core::backprop::GradStore> {
+        self.model.backward_tensor_parallel(loss, comm)
+    }
+
+    fn supports_sharded_tensor_parallel_backward(&self) -> bool {
+        self.model.supports_sharded_tensor_parallel_backward()
+    }
 }
 
 #[cfg(test)]
@@ -3036,6 +3048,7 @@ mod tests {
                         let mut trainer = Trainer::new(trainer_cfg, &run).unwrap();
                         let mut policy = gemma4_tiny_policy_from_weights(&cfg, weights);
                         arm_gemma4_adapter_deterministic(&policy);
+                        policy.model_mut().set_activation_checkpointing(true);
                         let before = trainable_snapshot(&policy);
                         let (history, stop) = trainer
                             .train_tensor_parallel(

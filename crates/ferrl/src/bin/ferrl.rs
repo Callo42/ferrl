@@ -1195,16 +1195,17 @@ impl RunConfig {
             ));
         }
         if plan.is_sharded() {
-            if self.policy.activation_checkpointing {
-                return Err(CliError::msg(
-                    "sharded tensor_parallel execution does not support \
-                     policy.activation_checkpointing yet",
-                ));
-            }
             if self.data.eval_n > 0 {
                 return Err(CliError::msg(
                     "sharded tensor_parallel execution does not support held-out eval yet; \
-                     set data.eval_n = 0",
+                    set data.eval_n = 0",
+                ));
+            }
+            if !self.policy.activation_checkpointing {
+                return Err(CliError::msg(
+                    "sharded tensor_parallel training requires \
+                     policy.activation_checkpointing = true so replicated-boundary \
+                     cotangents are reduced during backward",
                 ));
             }
         }
@@ -1539,6 +1540,14 @@ fn run_training<R: RewardFn>(
                 "loaded checkpoint family does not support tensor_parallel execution; supported \
                  families are qwen3 (including legacy configs without model_type) and dense \
                  gemma4/gemma4_unified; qwen3_5/qwen3_5_moe (Qwen3.5/3.6) are unsupported",
+            ));
+        }
+        if tensor_parallel_plan.is_sharded() && !policy.supports_sharded_tensor_parallel_backward()
+        {
+            return Err(CliError::msg(
+                "sharded tensor_parallel training is supported only for dense \
+                 gemma4/gemma4_unified policies with activation checkpointing; the loaded \
+                 policy does not provide cross-rank backward semantics",
             ));
         }
         let run = RunDir::create(&cfg.out_dir, cfg.run_id())?;
@@ -4519,6 +4528,7 @@ mod tests {
         let (_tmp, path) = write_countdown_train_config(
             "tensor-parallel-public-execution-plan",
             r#""device": "cuda",
+               "policy": { "activation_checkpointing": true },
                "tensor_parallel": { "enabled": true, "rank": 0, "world_size": 2 }"#,
         );
 
@@ -4813,17 +4823,29 @@ mod tests {
     }
 
     #[test]
-    fn tensor_parallel_multi_rank_rejects_activation_checkpointing() {
+    fn tensor_parallel_multi_rank_defers_activation_checkpointing_to_model_capability() {
         let (_tmp, path) = write_countdown_train_config(
-            "tensor-parallel-rejects-activation-checkpointing",
+            "tensor-parallel-activation-checkpointing-capability",
             r#""device": "cuda",
                "policy": { "activation_checkpointing": true },
                "tensor_parallel": { "enabled": true, "rank": 0, "world_size": 2 }"#,
         );
 
-        let err = RunConfig::load(&path).unwrap_err().to_string();
+        let cfg = RunConfig::load(&path).unwrap();
+        assert!(cfg.policy.activation_checkpointing);
+        assert!(cfg.tensor_parallel_plan().is_sharded());
+    }
 
-        assert!(err.contains("policy.activation_checkpointing"));
+    #[test]
+    fn tensor_parallel_multi_rank_requires_activation_checkpointing() {
+        let (_tmp, path) = write_countdown_train_config(
+            "tensor-parallel-requires-activation-checkpointing",
+            r#""device": "cuda",
+               "tensor_parallel": { "enabled": true, "rank": 0, "world_size": 2 }"#,
+        );
+
+        let err = RunConfig::load(&path).unwrap_err().to_string();
+        assert!(err.contains("requires policy.activation_checkpointing = true"));
     }
 
     #[test]
@@ -4896,6 +4918,10 @@ mod tests {
     }
 
     impl TensorParallelPolicy for CliTpPolicy {
+        fn supports_sharded_tensor_parallel_backward(&self) -> bool {
+            true
+        }
+
         fn generate_at_tensor_parallel_instrumented(
             &mut self,
             prompt: &[u32],
@@ -4935,6 +4961,14 @@ mod tests {
             calls.detached_logp += 1;
             calls.comms.push((comm.rank(), comm.world_size()));
             Ok(self.logp.as_tensor().detach())
+        }
+
+        fn backward_tensor_parallel(
+            &self,
+            loss: &Tensor,
+            _comm: &dyn ferrl::Comm,
+        ) -> CandleResult<candle_core::backprop::GradStore> {
+            loss.backward()
         }
     }
 
@@ -5088,7 +5122,12 @@ mod tests {
             "model_dir": model_dir,
             "device": "cuda",
             "out_dir": out_dir,
-            "policy": { "lora_rank": 2, "lora_alpha": 4.0, "seed": 7 },
+            "policy": {
+                "lora_rank": 2,
+                "lora_alpha": 4.0,
+                "seed": 7,
+                "activation_checkpointing": true
+            },
             "data": { "train_n": 1, "eval_n": 0, "seed": 11 },
             "tensor_parallel": {
                 "enabled": true,
@@ -5219,15 +5258,16 @@ mod tests {
     }
 
     #[test]
-    fn public_tp_auto_policy_runs_qwen3_and_gemma4_on_world_two() {
+    fn public_tp_auto_policy_trains_gemma4_and_rejects_forward_only_qwen3() {
         let fixtures = TestDir::new("tp-auto-policy-fixtures");
         let qwen = fixtures.path().join("qwen3");
         write_tp2_qwen3_fixture(&qwen);
         let qwen_results = run_auto_policy_world_two(&qwen);
-        assert!(
-            qwen_results.iter().all(Result::is_ok),
-            "Qwen3 AutoPolicy TP composition failed: {qwen_results:?}"
-        );
+        for result in qwen_results {
+            assert!(result
+                .unwrap_err()
+                .contains("does not provide cross-rank backward semantics"));
+        }
 
         let gemma = fixtures.path().join("gemma4");
         write_tp2_gemma4_fixture(&gemma);

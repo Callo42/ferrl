@@ -1266,6 +1266,10 @@ trait PolicyExecution<P: Policy> {
 
     fn token_logprobs_detached(&self, policy: &P, rollout: &Rollout) -> CandleResult<Tensor>;
 
+    fn backward(&self, policy: &P, loss: &Tensor) -> CandleResult<GradStore> {
+        policy.backward(loss)
+    }
+
     fn execution_rank(&self, trainer_comm: &dyn Comm) -> usize {
         trainer_comm.rank()
     }
@@ -1357,6 +1361,10 @@ impl<P: TensorParallelPolicy> PolicyExecution<P> for TensorParallelPolicyExecuti
 
     fn token_logprobs_detached(&self, policy: &P, rollout: &Rollout) -> CandleResult<Tensor> {
         policy.token_logprobs_tensor_parallel_detached(rollout, self.comm)
+    }
+
+    fn backward(&self, policy: &P, loss: &Tensor) -> CandleResult<GradStore> {
+        policy.backward_tensor_parallel(loss, self.comm)
     }
 
     fn execution_rank(&self, trainer_comm: &dyn Comm) -> usize {
@@ -1656,7 +1664,8 @@ impl Trainer {
     /// `tensor_parallel_comm` is separate from the trainer's data-parallel
     /// communicator installed by [`with_comm`](Self::with_comm). A sharded TP
     /// communicator is supported only when the trainer's DP communicator is
-    /// world-1: `LoRA` trainable vars remain fully replicated, their accumulated
+    /// world-1 and the policy advertises a complete sharded backward: `LoRA`
+    /// trainable vars remain fully replicated, their accumulated
     /// gradients are sum-reduced over the TP communicator before coverage,
     /// clipping, optimizer step, and checkpointing, and TP rank 0 owns the shared
     /// checkpoint/candidate/metrics side effects.
@@ -1664,7 +1673,8 @@ impl Trainer {
     /// # Errors
     ///
     /// As [`train`](Self::train), plus a fail-closed contract error when both
-    /// data parallelism and tensor parallelism are sharded.
+    /// data parallelism and tensor parallelism are sharded or the policy has
+    /// only forward-value TP semantics.
     pub fn train_tensor_parallel<P: TensorParallelPolicy, R: RewardFn>(
         &mut self,
         policy: &mut P,
@@ -1674,6 +1684,7 @@ impl Trainer {
         tensor_parallel_comm: &dyn Comm,
     ) -> Result<(Vec<Metrics>, RunStop), TrainerError> {
         self.validate_tensor_parallel_comm(tensor_parallel_comm)?;
+        self.validate_tensor_parallel_backward(policy, tensor_parallel_comm)?;
         let exec = TensorParallelPolicyExecution {
             comm: tensor_parallel_comm,
         };
@@ -1740,6 +1751,7 @@ impl Trainer {
         tensor_parallel_comm: &dyn Comm,
     ) -> Result<(Vec<Metrics>, RunStop), TrainerError> {
         self.validate_tensor_parallel_comm(tensor_parallel_comm)?;
+        self.validate_tensor_parallel_backward(policy, tensor_parallel_comm)?;
         let exec = TensorParallelPolicyExecution {
             comm: tensor_parallel_comm,
         };
@@ -1819,6 +1831,7 @@ impl Trainer {
         tensor_parallel_comm: &dyn Comm,
     ) -> Result<(Vec<Metrics>, RunStop), TrainerError> {
         self.validate_tensor_parallel_comm(tensor_parallel_comm)?;
+        self.validate_tensor_parallel_backward(policy, tensor_parallel_comm)?;
         let exec = TensorParallelPolicyExecution {
             comm: tensor_parallel_comm,
         };
@@ -1945,6 +1958,7 @@ impl Trainer {
         tensor_parallel_comm: &dyn Comm,
     ) -> Result<(Vec<Metrics>, RunStop), TrainerError> {
         self.validate_tensor_parallel_comm(tensor_parallel_comm)?;
+        self.validate_tensor_parallel_backward(policy, tensor_parallel_comm)?;
         let exec = TensorParallelPolicyExecution {
             comm: tensor_parallel_comm,
         };
@@ -2004,6 +2018,31 @@ impl Trainer {
                 "simultaneous sharded data-parallel and tensor-parallel trainer execution is \
                  not wired yet; use a world-1 trainer communicator with sharded tensor \
                  parallelism until the combined DP×TP optimizer/checkpoint contract lands"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_tensor_parallel_backward<P: TensorParallelPolicy>(
+        &self,
+        policy: &P,
+        comm: &dyn Comm,
+    ) -> Result<(), TrainerError> {
+        if comm.world_size() <= 1 {
+            return Ok(());
+        }
+        let unsupported_local = if policy.supports_sharded_tensor_parallel_backward() {
+            0.0
+        } else {
+            1.0
+        };
+        let unsupported = comm.all_reduce_scalar_sum(unsupported_local)?;
+        if unsupported > 0.0 {
+            return Err(TrainerError::Contract(
+                "sharded tensor-parallel training requires a policy with cross-rank backward \
+                 semantics; forward-only TP policies are supported for rollout/scoring but \
+                 must fail closed before training"
                     .into(),
             ));
         }
@@ -3209,10 +3248,11 @@ impl Trainer {
             loss = loss.affine(1.0 / global_items as f64, 0.0)?;
         }
         let (kl, clip_frac) = self.item_diagnostics(&logp.detach(), item)?;
-        // Through the policy seam (default: exactly `loss.backward()`): under
-        // activation checkpointing the policy stitches the full gradient from
-        // its boundary tape — the canary downstream holds either way.
-        let raw = policy.backward(&loss)?;
+        // Through the active execution seam (default: exactly
+        // `Policy::backward`): TP checkpointing can replay layer collectives
+        // through its explicit communicator, while the canary downstream holds
+        // either way.
+        let raw = exec.backward(policy, &loss)?;
         let grads = compact_trainable_grad_store(vars, raw)?;
         Ok((grads, kl, clip_frac))
     }
@@ -6170,6 +6210,7 @@ mod tests {
         generate: usize,
         live_logp: usize,
         detached_logp: usize,
+        backward: usize,
         telemetry_seen: Vec<bool>,
         comms: Vec<(usize, usize)>,
     }
@@ -6177,6 +6218,7 @@ mod tests {
     struct TpProbePolicy {
         logp: Var,
         enabled: bool,
+        sharded_backward: bool,
         calls: std::sync::Arc<std::sync::Mutex<TpProbeCalls>>,
     }
 
@@ -6191,6 +6233,10 @@ mod tests {
 
         fn token_logprobs_detached(&self, _rollout: &Rollout) -> CandleResult<Tensor> {
             panic!("train_tensor_parallel must not call Policy::token_logprobs_detached")
+        }
+
+        fn backward(&self, _loss: &Tensor) -> CandleResult<GradStore> {
+            panic!("train_tensor_parallel must not call Policy::backward")
         }
 
         fn set_adapter_enabled(&mut self, enabled: bool) {
@@ -6215,6 +6261,10 @@ mod tests {
     }
 
     impl TensorParallelPolicy for TpProbePolicy {
+        fn supports_sharded_tensor_parallel_backward(&self) -> bool {
+            self.sharded_backward
+        }
+
         fn generate_at_tensor_parallel_instrumented(
             &mut self,
             prompt: &[u32],
@@ -6255,6 +6305,18 @@ mod tests {
             calls.detached_logp += 1;
             calls.comms.push((comm.rank(), comm.world_size()));
             Ok(self.logp.as_tensor().detach())
+        }
+
+        fn backward_tensor_parallel(
+            &self,
+            loss: &Tensor,
+            comm: &dyn Comm,
+        ) -> CandleResult<GradStore> {
+            let mut calls = self.calls.lock().unwrap();
+            calls.backward += 1;
+            calls.comms.push((comm.rank(), comm.world_size()));
+            drop(calls);
+            loss.backward()
         }
     }
 
@@ -6413,6 +6475,7 @@ mod tests {
             TpProbePolicy {
                 logp,
                 enabled: true,
+                sharded_backward: true,
                 calls: std::sync::Arc::clone(&calls),
             },
             calls,
@@ -6527,6 +6590,10 @@ mod tests {
     }
 
     impl TensorParallelPolicy for TpSyncPolicy {
+        fn supports_sharded_tensor_parallel_backward(&self) -> bool {
+            true
+        }
+
         fn generate_at_tensor_parallel_instrumented(
             &mut self,
             prompt: &[u32],
@@ -6557,6 +6624,14 @@ mod tests {
             comm: &dyn Comm,
         ) -> CandleResult<Tensor> {
             self.logps(comm, true)
+        }
+
+        fn backward_tensor_parallel(
+            &self,
+            loss: &Tensor,
+            _comm: &dyn Comm,
+        ) -> CandleResult<GradStore> {
+            loss.backward()
         }
     }
 
@@ -6595,6 +6670,7 @@ mod tests {
             calls.detached_logp >= 2,
             "old/reference TP detached scoring was not used"
         );
+        assert!(calls.backward >= 1, "TP backward hook was not used");
         assert_eq!(calls.telemetry_seen, vec![true]);
         assert!(
             calls
@@ -6604,6 +6680,56 @@ mod tests {
             "trainer did not pass the explicit TP communicator to every TP hook: {:?}",
             calls.comms
         );
+    }
+
+    #[test]
+    fn train_tensor_parallel_rejects_forward_only_sharded_policy_in_lockstep() {
+        let tmp = WireTmp::new("tp-trainer-forward-only-reject");
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = crate::comm::LocalComm::world(2)
+                .into_iter()
+                .enumerate()
+                .map(|(rank, comm)| {
+                    let root = tmp.0.clone();
+                    scope.spawn(move || {
+                        let run = RunDir::create(&root, format!("rank-{rank}")).unwrap();
+                        let mut trainer = Trainer::new(
+                            TrainerConfig {
+                                steps: 1,
+                                group_size: 2,
+                                max_new_tokens: 1,
+                                ..TrainerConfig::default()
+                            },
+                            &run,
+                        )
+                        .unwrap();
+                        let (mut policy, calls) = tp_probe_policy();
+                        policy.sharded_backward = false;
+                        let err = trainer
+                            .train_tensor_parallel(
+                                &mut policy,
+                                &TpProbeReward,
+                                &TpProbeCodec,
+                                &[Sample::new("prompt", ())],
+                                &comm,
+                            )
+                            .unwrap_err();
+                        assert!(
+                            matches!(&err, TrainerError::Contract(msg)
+                                if msg.contains("cross-rank backward semantics")),
+                            "unexpected rank {rank} error: {err:?}"
+                        );
+                        let calls = calls.lock().unwrap();
+                        assert_eq!(calls.generate, 0);
+                        assert_eq!(calls.live_logp, 0);
+                        assert_eq!(calls.detached_logp, 0);
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
     }
 
     #[test]

@@ -160,17 +160,81 @@ pub fn stitched_backward<F>(
 where
     F: Fn(usize, &Tensor) -> CandleResult<Tensor>,
 {
+    stitched_backward_with_cotangent(loss, tape, trainable, run_segment, |_, cot| Ok(cot.clone()))
+}
+
+/// As [`stitched_backward`], applying `transform_cotangent` to each internal
+/// boundary cotangent before it is fed to the preceding segment.
+///
+/// Tensor-parallel rematerialization uses this seam to sum replicated-boundary
+/// cotangents across ranks. The transform is not called for segment zero,
+/// because no earlier segment consumes its input cotangent.
+pub(crate) fn stitched_backward_with_cotangent<F, C>(
+    loss: &Tensor,
+    tape: &RematTape,
+    trainable: &[Var],
+    run_segment: F,
+    transform_cotangent: C,
+) -> CandleResult<GradStore>
+where
+    F: Fn(usize, &Tensor) -> CandleResult<Tensor>,
+    C: Fn(usize, &Tensor) -> CandleResult<Tensor>,
+{
+    let prepared = prepare_stitched_backward(loss, tape)?;
+    finish_stitched_backward_with_cotangent(
+        prepared,
+        tape,
+        trainable,
+        run_segment,
+        transform_cotangent,
+    )
+}
+
+/// The loss/tail portion of a stitched backward, completed before segment
+/// replay begins.
+///
+/// Tensor-parallel callers prepare this rank-local state first, coordinate that
+/// every rank succeeded, and only then enter replay collectives.
+pub(crate) struct PreparedStitchedBackward {
+    store: GradStore,
+    cot: Tensor,
+}
+
+/// Back-propagate through the uncheckpointed tail and extract the cotangent at
+/// the tape's final boundary without replaying any checkpointed segment.
+pub(crate) fn prepare_stitched_backward(
+    loss: &Tensor,
+    tape: &RematTape,
+) -> CandleResult<PreparedStitchedBackward> {
     let Some(segments) = tape.inputs.len().checked_sub(1) else {
         candle_core::bail!("stitched_backward: the tape is empty (no boundaries were captured)")
     };
     let mut store = loss.backward()?;
-    let mut cot = store.remove(&tape.inputs[segments]).ok_or_else(|| {
+    let cot = store.remove(&tape.inputs[segments]).ok_or_else(|| {
         candle_core::Error::Msg(
             "stitched_backward: the loss does not reach the tape's tail boundary; \
              the loss must be built from the same forward that captured this tape"
                 .to_string(),
         )
     })?;
+    Ok(PreparedStitchedBackward { store, cot })
+}
+
+/// Replay every checkpointed segment after all ranks have successfully
+/// prepared the loss-tail cotangent.
+pub(crate) fn finish_stitched_backward_with_cotangent<F, C>(
+    prepared: PreparedStitchedBackward,
+    tape: &RematTape,
+    trainable: &[Var],
+    run_segment: F,
+    transform_cotangent: C,
+) -> CandleResult<GradStore>
+where
+    F: Fn(usize, &Tensor) -> CandleResult<Tensor>,
+    C: Fn(usize, &Tensor) -> CandleResult<Tensor>,
+{
+    let segments = tape.inputs.len() - 1;
+    let PreparedStitchedBackward { mut store, mut cot } = prepared;
     for i in (0..segments).rev() {
         cot = stitch_segment(
             &mut store,
@@ -180,6 +244,9 @@ where
             &run_segment,
             i,
         )?;
+        if i > 0 {
+            cot = transform_cotangent(i, &cot)?;
+        }
     }
     Ok(store)
 }

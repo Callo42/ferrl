@@ -17,6 +17,7 @@ use candle_core::{Result as CandleResult, Tensor, Var};
 
 use crate::comm::Comm;
 use crate::telemetry::ModelTelemetryRecorder;
+use crate::tensor_parallel::plan_from_comm;
 
 /// A batch of sampled completions: token ids plus the prompt length that
 /// produced them, so callers can slice prompt from completion.
@@ -462,11 +463,107 @@ pub trait TensorParallelPolicy: Policy {
         rollout: &Rollout,
         comm: &dyn Comm,
     ) -> CandleResult<Tensor>;
+
+    /// Back-propagate a loss produced by
+    /// [`token_logprobs_tensor_parallel`](Self::token_logprobs_tensor_parallel).
+    ///
+    /// The default preserves world-one and forward-only TP policies by
+    /// delegating to [`Policy::backward`], but does not advertise sharded
+    /// training support. Checkpointed TP policies override it so reverse
+    /// rematerialization can replay collectives and reduce boundary cotangents
+    /// through `comm`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error if the communicator is sharded and the concrete
+    /// policy has not overridden this hook, backward fails, or the policy
+    /// rejects the communicator/tape pairing.
+    fn backward_tensor_parallel(&self, loss: &Tensor, comm: &dyn Comm) -> CandleResult<GradStore> {
+        let plan = plan_from_comm(comm)?;
+        if plan.is_sharded() {
+            candle_core::bail!(
+                "{} does not implement tensor-parallel policy backward for world_size {}",
+                std::any::type_name::<Self>(),
+                plan.world_size()
+            )
+        }
+        self.backward(loss)
+    }
+
+    /// Whether this policy instance has a mathematically complete backward for
+    /// a tensor-parallel communicator whose world size is greater than one.
+    ///
+    /// Defaults to false so a value-only TP implementation cannot silently be
+    /// used for training.
+    fn supports_sharded_tensor_parallel_backward(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::comm::LocalComm;
+
+    struct DefaultTensorParallelPolicy;
+
+    impl Policy for DefaultTensorParallelPolicy {
+        fn generate(&mut self, _prompt: &[u32], _cfg: &GenConfig) -> CandleResult<Rollout> {
+            candle_core::bail!("unused test policy generation")
+        }
+
+        fn token_logprobs(&self, _rollout: &Rollout) -> CandleResult<Tensor> {
+            candle_core::bail!("unused test policy scoring")
+        }
+
+        fn set_adapter_enabled(&mut self, _enabled: bool) {}
+
+        fn adapter_enabled(&self) -> bool {
+            true
+        }
+
+        fn trainable_vars(&self) -> Vec<Var> {
+            Vec::new()
+        }
+
+        fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+            Ok(Vec::new())
+        }
+
+        fn restore_sampler_state(&mut self, _state: &[u8]) -> CandleResult<()> {
+            Ok(())
+        }
+    }
+
+    impl TensorParallelPolicy for DefaultTensorParallelPolicy {
+        fn generate_at_tensor_parallel_instrumented(
+            &mut self,
+            _prompt: &[u32],
+            _cfg: &GenConfig,
+            _global_row_base: u64,
+            _comm: &dyn Comm,
+            _telemetry: Option<&mut dyn ModelTelemetryRecorder>,
+        ) -> CandleResult<Rollout> {
+            candle_core::bail!("unused test policy TP generation")
+        }
+
+        fn token_logprobs_tensor_parallel(
+            &self,
+            _rollout: &Rollout,
+            _comm: &dyn Comm,
+        ) -> CandleResult<Tensor> {
+            candle_core::bail!("unused test policy TP scoring")
+        }
+
+        fn token_logprobs_tensor_parallel_detached(
+            &self,
+            _rollout: &Rollout,
+            _comm: &dyn Comm,
+        ) -> CandleResult<Tensor> {
+            candle_core::bail!("unused test policy detached TP scoring")
+        }
+    }
 
     #[test]
     fn rollout_len_and_empty() {
@@ -477,6 +574,23 @@ mod tests {
         let e = Rollout::rectangular(vec![], 0);
         assert_eq!(e.len(), 0);
         assert!(e.is_empty());
+    }
+
+    #[test]
+    fn default_tensor_parallel_policy_backward_rejects_a_sharded_communicator() {
+        let policy = DefaultTensorParallelPolicy;
+        let loss = Tensor::new(1.0_f32, &candle_core::Device::Cpu).unwrap();
+        let comm = LocalComm::world(2).remove(0);
+
+        let error = policy
+            .backward_tensor_parallel(&loss, &comm)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("does not implement tensor-parallel policy backward"),
+            "{error}"
+        );
+        assert!(error.contains("world_size 2"), "{error}");
     }
 
     #[test]

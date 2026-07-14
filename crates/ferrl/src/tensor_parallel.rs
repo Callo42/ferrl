@@ -385,6 +385,37 @@ pub fn all_reduce_sum_straight_through(
     partial.broadcast_add(&correction)
 }
 
+/// Sum a detached tensor value across TP ranks.
+///
+/// Explicit rematerialized backward uses this for cotangents, which are values
+/// rather than graph edges and must be rank-identical before replaying the
+/// preceding segment.
+pub(crate) fn all_reduce_sum_value(
+    value: &Tensor,
+    plan: TensorParallelPlan,
+    comm: &dyn Comm,
+) -> CandleResult<Tensor> {
+    validate_comm_plan(plan, comm)?;
+    if !plan.is_sharded() {
+        return Ok(value.detach());
+    }
+
+    let original_dtype = value.dtype();
+    let staged = match original_dtype {
+        DType::F32 | DType::F64 => value.detach().contiguous()?,
+        _ => value.to_dtype(DType::F32)?.detach().contiguous()?,
+    };
+    let mut reduced = vec![staged];
+    comm_to_candle(comm.all_reduce_sum(&mut reduced))?;
+    let Some(mut reduced) = reduced.pop() else {
+        candle_core::bail!("tensor_parallel cotangent all-reduce returned no tensors");
+    };
+    if reduced.dtype() != original_dtype {
+        reduced = reduced.to_dtype(original_dtype)?;
+    }
+    Ok(reduced.detach())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
