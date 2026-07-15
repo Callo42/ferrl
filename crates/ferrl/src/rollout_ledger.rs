@@ -66,7 +66,9 @@ impl RolloutLedgerError {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RolloutLedgerIdentity {
-    /// Canonical learner-affecting trainer configuration digest.
+    /// Canonical learner-semantic `TrainerConfig` projection digest. Operational
+    /// run horizon, checkpoint cadence, candidate logging, and GPU probing are
+    /// excluded because they do not change one validated learner update.
     pub trainer_config_sha256: String,
     /// Frozen base-policy content/configuration digest.
     pub policy_sha256: String,

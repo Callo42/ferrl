@@ -505,6 +505,41 @@ pub struct TrainerConfig {
     pub eos_token_id: Option<u32>,
 }
 
+/// The stable, learner-semantic projection bound into a rollout-ledger identity.
+///
+/// Keeping this projection typed and exhaustive makes every future `TrainerConfig`
+/// field choose explicitly between learner semantics and operational orchestration.
+/// The four omitted fields (`steps`, checkpoint cadence, candidate logging, and GPU
+/// probing) do not change one validated learner update.
+#[derive(Serialize)]
+struct RolloutLedgerTrainerSemantics<'a> {
+    group_size: &'a usize,
+    max_new_tokens: &'a usize,
+    temperature: &'a f64,
+    mu: &'a usize,
+    beta: &'a f64,
+    beta_schedule: &'a Option<ScalarSchedule>,
+    clip_eps: &'a f64,
+    clip_eps_high: &'a Option<f64>,
+    importance_sampling_level: &'a ImportanceSamplingLevel,
+    lr: &'a f64,
+    lr_schedule: &'a Option<ScalarSchedule>,
+    weight_decay: &'a f64,
+    adam_beta1: &'a f64,
+    adam_beta2: &'a f64,
+    warmup_steps: &'a u64,
+    max_grad_norm: &'a Option<f64>,
+    truncation_masking: &'a bool,
+    tis: &'a bool,
+    tis_imp_ratio_cap: &'a f64,
+    loss_type: &'a LossType,
+    scale_rewards: &'a ScaleRewards,
+    reward_group_scope: &'a RewardGroupScope,
+    grad_accum_steps: &'a usize,
+    backward_microbatch_size: &'a usize,
+    eos_token_id: &'a Option<u32>,
+}
+
 /// `serde` default for [`TrainerConfig::grad_accum_steps`]: `1` (no accumulation).
 fn default_grad_accum_steps() -> usize {
     1
@@ -843,6 +878,67 @@ impl TrainerConfig {
     #[must_use]
     pub fn builder() -> TrainerConfigBuilder {
         TrainerConfigBuilder::new()
+    }
+
+    fn rollout_ledger_semantics(&self) -> RolloutLedgerTrainerSemantics<'_> {
+        let TrainerConfig {
+            steps: _,
+            group_size,
+            max_new_tokens,
+            temperature,
+            mu,
+            beta,
+            beta_schedule,
+            clip_eps,
+            clip_eps_high,
+            importance_sampling_level,
+            lr,
+            lr_schedule,
+            weight_decay,
+            adam_beta1,
+            adam_beta2,
+            warmup_steps,
+            max_grad_norm,
+            truncation_masking,
+            tis,
+            tis_imp_ratio_cap,
+            loss_type,
+            scale_rewards,
+            reward_group_scope,
+            grad_accum_steps,
+            backward_microbatch_size,
+            checkpoint_every: _,
+            candidate_log_top_k: _,
+            gpu_memory_probe: _,
+            eos_token_id,
+        } = self;
+        RolloutLedgerTrainerSemantics {
+            group_size,
+            max_new_tokens,
+            temperature,
+            mu,
+            beta,
+            beta_schedule,
+            clip_eps,
+            clip_eps_high,
+            importance_sampling_level,
+            lr,
+            lr_schedule,
+            weight_decay,
+            adam_beta1,
+            adam_beta2,
+            warmup_steps,
+            max_grad_norm,
+            truncation_masking,
+            tis,
+            tis_imp_ratio_cap,
+            loss_type,
+            scale_rewards,
+            reward_group_scope,
+            grad_accum_steps,
+            backward_microbatch_size,
+            eos_token_id,
+        }
     }
 
     /// Reject settings that would silently do nothing or crash mid-run.
@@ -1660,6 +1756,9 @@ impl Trainer {
     /// `policy_sha256` must be a verified lowercase SHA-256 digest binding the
     /// frozen model content and its execution recipe. It is the sole identity
     /// datum the generic [`Policy`] seam cannot derive from live state today.
+    /// Format v1 does not publish collector performance telemetry; a future
+    /// phase-specific schema can do so without mislabelling asynchronous work as
+    /// an ordinary whole trainer step.
     ///
     /// # Errors
     ///
@@ -1707,7 +1806,7 @@ impl Trainer {
         let writer = RolloutLedgerWriter::create(root.as_ref(), identity.clone())?;
 
         let exec = UnshardedPolicyExecution;
-        let mut gpu_mem = StepGpuMemory::new(self.config.gpu_memory_probe);
+        let mut gpu_mem = StepGpuMemory::new(false);
         let mut collected = Vec::with_capacity(self.config.grad_accum_steps);
         for j in 0..self.config.grad_accum_steps {
             let sel = self.select_prompt(step, j, samples.len());
@@ -1746,6 +1845,9 @@ impl Trainer {
     /// This separated learner API deliberately does not checkpoint: the learner's
     /// sampler has not advanced through the collector's rollouts, so persisting it
     /// would create an unfaithful resume. Sampler-state handoff is a later contract.
+    /// Rollout-ledger v1 carries no collector timing or device-memory telemetry, so
+    /// the returned/persisted whole-window performance fields remain explicitly
+    /// unmeasured rather than relabelling learner-only work as a complete step.
     ///
     /// `policy_sha256` has the same externally verified frozen-model/execution
     /// meaning as on [`collect_rollout_ledger_step`](Self::collect_rollout_ledger_step).
@@ -1785,92 +1887,110 @@ impl Trainer {
         let validated = reader.read_step(step)?;
         let validated_identity = validated.identity().clone();
         let payload = validated.into_step();
-        self.require_toggleable_reference_policy(policy, self.config.requires_reference_policy())?;
-        let post_toggle_vars = policy.trainable_vars();
-        self.require_same_rollout_ledger_vars(
-            &vars,
-            &post_toggle_vars,
-            "reference-policy preflight",
-        )?;
-        let post_toggle_identity =
-            self.rollout_ledger_identity(step, policy, policy_sha256, &post_toggle_vars, &opt)?;
-        if post_toggle_identity != validated_identity {
-            return Err(TrainerError::Contract(
-                "learner identity changed during reference-policy preflight".into(),
-            ));
-        }
-
-        let exec = UnshardedPolicyExecution;
-        let started = std::time::Instant::now();
-        let mut gpu_mem = StepGpuMemory::new(self.config.gpu_memory_probe);
-        gpu_mem.record("step_start");
-        gpu_mem.record("window_start");
-        let mut stats = Vec::with_capacity(payload.groups.len());
-        let mut live = Vec::with_capacity(payload.live_items as usize);
-        for group in &payload.groups {
-            let collected = self.collected_group_from_ledger(group)?;
-            let (stat, item) = self.materialize_collected_group(
+        let adapter_prestate = Self::snapshot_rollout_ledger_vars(&vars)?;
+        let optimizer_prestate = opt.state()?;
+        let adapter_enabled_prestate = policy.adapter_enabled();
+        let outcome: Result<(Metrics, OptimizerState), TrainerError> = (|| {
+            self.require_toggleable_reference_policy(
                 policy,
-                collected,
-                step_beta,
-                &mut gpu_mem,
-                &exec,
+                self.config.requires_reference_policy(),
             )?;
-            stats.push(stat);
-            if let Some(item) = item {
-                live.push(item);
+            let post_toggle_vars = policy.trainable_vars();
+            self.require_same_rollout_ledger_vars(
+                &vars,
+                &post_toggle_vars,
+                "reference-policy preflight",
+            )?;
+            let post_toggle_identity =
+                self.rollout_ledger_identity(step, policy, policy_sha256, &post_toggle_vars, &opt)?;
+            if post_toggle_identity != validated_identity {
+                return Err(TrainerError::Contract(
+                    "learner identity changed during reference-policy preflight".into(),
+                ));
+            }
+
+            let exec = UnshardedPolicyExecution;
+            // Ledger v1 has no composable collector/learner performance schema.
+            // Keep the existing update instrumentation sink disabled and leave the
+            // ordinary whole-window timing/memory fields at their neutral defaults.
+            let mut gpu_mem = StepGpuMemory::new(false);
+            let mut stats = Vec::with_capacity(payload.groups.len());
+            let mut live = Vec::with_capacity(payload.live_items as usize);
+            for group in &payload.groups {
+                let collected = self.collected_group_from_ledger(group)?;
+                let (stat, item) = self.materialize_collected_group(
+                    policy,
+                    collected,
+                    step_beta,
+                    &mut gpu_mem,
+                    &exec,
+                )?;
+                stats.push(stat);
+                if let Some(item) = item {
+                    live.push(item);
+                }
+            }
+            let post_scoring_vars = policy.trainable_vars();
+            self.require_same_rollout_ledger_vars(
+                &vars,
+                &post_scoring_vars,
+                "detached ledger scoring",
+            )?;
+            let post_scoring_identity = self.rollout_ledger_identity(
+                step,
+                policy,
+                policy_sha256,
+                &post_scoring_vars,
+                &opt,
+            )?;
+            if post_scoring_identity != validated_identity {
+                return Err(TrainerError::Contract(
+                    "learner identity changed during detached ledger scoring".into(),
+                ));
+            }
+            let agg = if live.is_empty() {
+                InnerAgg::default()
+            } else {
+                let mut ctx = UpdateCtx {
+                    vars: &vars,
+                    opt: &mut opt,
+                    gpu_mem: &mut gpu_mem,
+                };
+                self.update_window(
+                    policy,
+                    &live,
+                    &mut ctx,
+                    payload.window_tokens as f64,
+                    f64::from(payload.live_items),
+                    step_beta,
+                    &exec,
+                )?
+            };
+            let metrics = self.build_window_metrics(step, step_beta, &stats, &agg, &opt);
+            // Capture the faithful continuation before the final fallible side effect.
+            let optimizer_state = opt.state()?;
+            self.append_metrics::<P, _>(&metrics, &exec)?;
+            Ok((metrics, optimizer_state))
+        })();
+
+        match outcome {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                if let Err(rollback) = Self::restore_rollout_ledger_prestate(
+                    policy,
+                    &vars,
+                    &adapter_prestate,
+                    &mut opt,
+                    &optimizer_prestate,
+                    adapter_enabled_prestate,
+                ) {
+                    return Err(TrainerError::Contract(format!(
+                        "rollout-ledger learner failed ({error}); restoring its pre-state also failed: {rollback}"
+                    )));
+                }
+                Err(error)
             }
         }
-        let post_scoring_vars = policy.trainable_vars();
-        self.require_same_rollout_ledger_vars(
-            &vars,
-            &post_scoring_vars,
-            "detached ledger scoring",
-        )?;
-        let post_scoring_identity =
-            self.rollout_ledger_identity(step, policy, policy_sha256, &post_scoring_vars, &opt)?;
-        if post_scoring_identity != validated_identity {
-            return Err(TrainerError::Contract(
-                "learner identity changed during detached ledger scoring".into(),
-            ));
-        }
-        let agg = if live.is_empty() {
-            InnerAgg::default()
-        } else {
-            let mut ctx = UpdateCtx {
-                vars: &vars,
-                opt: &mut opt,
-                gpu_mem: &mut gpu_mem,
-            };
-            self.update_window(
-                policy,
-                &live,
-                &mut ctx,
-                payload.window_tokens as f64,
-                f64::from(payload.live_items),
-                step_beta,
-                &exec,
-            )?
-        };
-        gpu_mem.record("window_end");
-        gpu_mem.record("step_end");
-        let mut metrics = self.build_window_metrics(step, step_beta, &stats, &agg, &opt);
-        let secs = started.elapsed().as_secs_f64();
-        metrics.step_secs = secs as f32;
-        let local_tokens = payload.groups.iter().try_fold(0_usize, |total, group| {
-            group.completion_lens.iter().try_fold(total, |total, &len| {
-                let len = usize::try_from(len).map_err(|_| {
-                    TrainerError::Contract("ledger completion length overflows usize".into())
-                })?;
-                total.checked_add(len).ok_or_else(|| {
-                    TrainerError::Contract("ledger local token count overflows usize".into())
-                })
-            })
-        })?;
-        metrics.tokens_per_sec = step_throughput(local_tokens, secs);
-        gpu_mem.apply(&mut metrics);
-        self.append_metrics::<P, _>(&metrics, &exec)?;
-        Ok((metrics, opt.state()?))
     }
 
     fn require_world_one_rollout_ledger(&self) -> Result<(), TrainerError> {
@@ -1946,6 +2066,48 @@ impl Trainer {
         Ok(())
     }
 
+    fn snapshot_rollout_ledger_vars(vars: &[Var]) -> Result<Vec<Tensor>, TrainerError> {
+        vars.iter()
+            .map(|var| Ok(var.as_tensor().copy()?.contiguous()?))
+            .collect()
+    }
+
+    fn restore_rollout_ledger_prestate<P: Policy>(
+        policy: &mut P,
+        vars: &[Var],
+        adapter_prestate: &[Tensor],
+        opt: &mut FerrlAdamW,
+        optimizer_prestate: &OptimizerState,
+        adapter_enabled_prestate: bool,
+    ) -> Result<(), TrainerError> {
+        let mut failures = Vec::new();
+        if vars.len() != adapter_prestate.len() {
+            failures.push(format!(
+                "adapter snapshot has {} tensors for {} live variables",
+                adapter_prestate.len(),
+                vars.len()
+            ));
+        } else {
+            for (index, (var, snapshot)) in vars.iter().zip(adapter_prestate).enumerate() {
+                if let Err(error) = var.set(snapshot) {
+                    failures.push(format!("restore adapter tensor {index}: {error}"));
+                }
+            }
+        }
+        if let Err(error) = opt.load_state(optimizer_prestate) {
+            failures.push(format!("restore optimizer state: {error}"));
+        }
+        policy.set_adapter_enabled(adapter_enabled_prestate);
+        if policy.adapter_enabled() != adapter_enabled_prestate {
+            failures.push("restore adapter-enabled state".into());
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(TrainerError::Contract(failures.join("; ")))
+        }
+    }
+
     fn rollout_ledger_controls(
         &self,
         step: u64,
@@ -1990,11 +2152,12 @@ impl Trainer {
         vars: &[Var],
         opt: &FerrlAdamW,
     ) -> Result<RolloutLedgerIdentity, TrainerError> {
-        let config = serde_json::to_vec(&self.config).map_err(|error| {
-            TrainerError::Contract(format!(
-                "serialize trainer config for ledger identity: {error}"
-            ))
-        })?;
+        let config =
+            serde_json::to_vec(&self.config.rollout_ledger_semantics()).map_err(|error| {
+                TrainerError::Contract(format!(
+                    "serialize learner-semantic trainer config for ledger identity: {error}"
+                ))
+            })?;
         let schema: Vec<(String, Vec<usize>, String)> = vars
             .iter()
             .enumerate()

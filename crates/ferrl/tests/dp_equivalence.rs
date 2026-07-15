@@ -454,6 +454,31 @@ fn deterministic_metrics(metrics: &Metrics) -> Metrics {
     metrics
 }
 
+#[allow(clippy::cognitive_complexity)] // one assertion surface pins every ordinary sentinel
+fn assert_ledger_performance_unmeasured(metrics: &Metrics, context: &str) {
+    assert_eq!(metrics.step_secs, 0.0, "{context}: step_secs");
+    assert_eq!(metrics.tokens_per_sec, 0.0, "{context}: tokens_per_sec");
+    assert_eq!(
+        metrics.cuda_mem_start_used_bytes, 0,
+        "{context}: cuda start"
+    );
+    assert_eq!(metrics.cuda_mem_peak_used_bytes, 0, "{context}: cuda peak");
+    assert_eq!(metrics.cuda_mem_end_used_bytes, 0, "{context}: cuda end");
+    assert_eq!(metrics.cuda_mem_total_bytes, 0, "{context}: cuda total");
+    assert_eq!(
+        metrics.cuda_mem_peak_delta_bytes, 0,
+        "{context}: cuda delta"
+    );
+    assert!(
+        metrics.cuda_mem_probe_events.is_empty(),
+        "{context}: cuda probe events"
+    );
+    assert!(
+        metrics.decoder_cache_snapshots.is_empty(),
+        "{context}: decoder cache snapshots"
+    );
+}
+
 fn assert_ledger_identity_mismatch<T>(result: Result<T, TrainerError>, what: &str) {
     match result {
         Err(TrainerError::RolloutLedger(RolloutLedgerError::IdentityMismatch)) => {}
@@ -824,6 +849,10 @@ fn world_one_rollout_ledger_update_is_bit_identical_to_direct_training() {
         direct_metrics.kl > 0.0,
         "mu=2/beta>0 reference did not exercise the frozen reference snapshot"
     );
+    assert!(
+        direct_metrics.step_secs > 0.0 && direct_metrics.tokens_per_sec > 0.0,
+        "ordinary direct training did not publish measured whole-window performance"
+    );
     let direct_adapter = var_bits(&direct_policy);
     assert_ne!(
         direct_adapter, initial_adapter,
@@ -891,6 +920,47 @@ fn world_one_rollout_ledger_update_is_bit_identical_to_direct_training() {
             None,
         )
         .unwrap();
+
+    // Run orchestration and output controls do not change a single learner
+    // update. Each mutation must remain compatible with the collector's ledger
+    // while preserving the exact mathematical result.
+    let mut longer_run = cfg.clone();
+    longer_run.steps += 4;
+    let mut different_checkpoint_cadence = cfg.clone();
+    different_checkpoint_cadence.checkpoint_every = None;
+    let mut candidate_logging = cfg.clone();
+    candidate_logging.candidate_log_top_k = 1;
+    let mut gpu_probing = cfg.clone();
+    gpu_probing.gpu_memory_probe = true;
+    for (label, operational_cfg) in [
+        ("different run horizon", longer_run),
+        ("different checkpoint cadence", different_checkpoint_cadence),
+        ("different candidate logging", candidate_logging),
+        ("different GPU probing", gpu_probing),
+    ] {
+        let mut policy = ScriptedPolicy::new(SEED).unwrap();
+        let run = RunDir::create(tmp.path(), format!("operational-{label}")).unwrap();
+        let mut trainer = Trainer::new(operational_cfg, &run).unwrap();
+        let (metrics, optimizer) = trainer
+            .train_rollout_ledger_step(0, &mut policy, &ledger_root, &policy_sha256, None)
+            .unwrap_or_else(|error| panic!("{label} rejected: {error:?}"));
+        assert_eq!(
+            deterministic_metrics(&metrics),
+            deterministic_metrics(direct_metrics),
+            "{label}: mathematical metrics diverged"
+        );
+        assert_eq!(
+            var_bits(&policy),
+            direct_adapter,
+            "{label}: adapter diverged"
+        );
+        assert_eq!(
+            optimizer_bits(&optimizer),
+            optimizer_bits(&direct_optimizer),
+            "{label}: Adam state diverged"
+        );
+        assert_ledger_performance_unmeasured(&metrics, label);
+    }
 
     // Both public identity inputs and live adapter values are checked before
     // scoring or mutation. A rejected read must leave the learner untouched.
@@ -1013,6 +1083,58 @@ fn world_one_rollout_ledger_update_is_bit_identical_to_direct_training() {
         "tensor-schema rejection mutated the learner adapter"
     );
 
+    #[cfg(target_os = "linux")]
+    {
+        // `/dev/full` opens successfully but rejects the final metrics write. The
+        // same live mu=2 window has already performed real Adam updates when that
+        // error is reached, so the learner must restore its complete pre-call state
+        // and permit an exact retry from the caller's original optimizer prestate.
+        let mut late_failure_policy = ScriptedPolicy::new(SEED).unwrap();
+        let late_failure_before = var_bits(&late_failure_policy);
+        let late_failure_run = RunDir::create(tmp.path(), "late-metrics-failure").unwrap();
+        std::os::unix::fs::symlink("/dev/full", late_failure_run.metrics_path()).unwrap();
+        let mut late_failure_trainer = Trainer::new(cfg.clone(), &late_failure_run).unwrap();
+        match late_failure_trainer.train_rollout_ledger_step(
+            0,
+            &mut late_failure_policy,
+            &ledger_root,
+            &policy_sha256,
+            None,
+        ) {
+            Err(TrainerError::Telemetry(_)) => {}
+            Err(error) => panic!("expected forced late metrics failure, got {error:?}"),
+            Ok(_) => panic!("/dev/full unexpectedly accepted the learner metrics row"),
+        }
+        assert_eq!(
+            var_bits(&late_failure_policy),
+            late_failure_before,
+            "late failure left the adapter advanced"
+        );
+        assert!(
+            late_failure_policy.adapter_enabled(),
+            "late failure did not restore the adapter-enabled flag"
+        );
+
+        let retry_run = RunDir::create(tmp.path(), "late-metrics-retry").unwrap();
+        let mut retry_trainer = Trainer::new(cfg.clone(), &retry_run).unwrap();
+        let (retry_metrics, retry_optimizer) = retry_trainer
+            .train_rollout_ledger_step(
+                0,
+                &mut late_failure_policy,
+                &ledger_root,
+                &policy_sha256,
+                None,
+            )
+            .unwrap();
+        assert_eq!(var_bits(&late_failure_policy), direct_adapter);
+        assert_eq!(
+            optimizer_bits(&retry_optimizer),
+            optimizer_bits(&direct_optimizer),
+            "retry after rollback did not recover the exact Adam continuation"
+        );
+        assert_ledger_performance_unmeasured(&retry_metrics, "retry after rollback");
+    }
+
     let mut ledger_policy = ScriptedPolicy::new(SEED).unwrap();
     assert_eq!(var_bits(&ledger_policy), initial_adapter);
     let ledger_run = RunDir::create(tmp.path(), "learner").unwrap();
@@ -1020,6 +1142,11 @@ fn world_one_rollout_ledger_update_is_bit_identical_to_direct_training() {
     let (ledger_metrics, ledger_optimizer) = ledger_trainer
         .train_rollout_ledger_step(0, &mut ledger_policy, &ledger_root, &policy_sha256, None)
         .unwrap();
+
+    assert_ledger_performance_unmeasured(&ledger_metrics, "returned ledger metrics");
+    let persisted_ledger_metrics = ferrl::read_metrics(ledger_run.metrics_path()).unwrap();
+    assert_eq!(persisted_ledger_metrics.len(), 1);
+    assert_ledger_performance_unmeasured(&persisted_ledger_metrics[0], "persisted ledger metrics");
 
     assert_eq!(
         deterministic_metrics(&ledger_metrics),
