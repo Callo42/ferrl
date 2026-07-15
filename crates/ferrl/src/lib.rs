@@ -60,6 +60,10 @@
 //!   ([`save_adapter`]), and a **momentum-faithful** v2 checkpoint
 //!   ([`save_checkpoint`]) that also persists the optimizer moments and the rollout
 //!   sampler RNG, so [`Trainer::resume`] continues an interrupted run **bit-exactly**;
+//! - the separated rollout/learner artifact contract ([`rollout_ledger`]) — a
+//!   strict, checksummed, no-replace whole-window package whose reader validates
+//!   learner pre-state identity, mandatory structured controls, and every
+//!   rollout/reward/mask invariant before returning [`ValidatedRolloutLedgerStep`];
 //! - held-out evaluation ([`eval`]) — the base model vs. the trained adapter,
 //!   mean reward over a held-out set (the P4 gate's comparison);
 //! - activation checkpointing ([`remat`]) — candle ships no checkpoint
@@ -150,6 +154,7 @@ pub mod qwen;
 pub mod qwen35;
 pub mod remat;
 pub mod reward;
+pub mod rollout_ledger;
 pub mod sample;
 pub mod sampler;
 pub mod sandbox;
@@ -231,6 +236,12 @@ pub use qwen35::{
 pub use remat::{stitched_backward, RematTape};
 #[doc(inline)]
 pub use reward::{RewardError, RewardFn, RewardOutcome};
+#[doc(inline)]
+pub use rollout_ledger::{
+    LedgerScoreRequirement, RolloutLedgerControls, RolloutLedgerError, RolloutLedgerExpectations,
+    RolloutLedgerGroup, RolloutLedgerIdentity, RolloutLedgerReader, RolloutLedgerStep,
+    RolloutLedgerWriter, ValidatedRolloutLedgerStep, ROLLOUT_LEDGER_FORMAT_VERSION,
+};
 #[doc(inline)]
 pub use sample::Sample;
 #[doc(inline)]
