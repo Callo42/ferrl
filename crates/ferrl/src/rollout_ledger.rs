@@ -40,6 +40,9 @@ pub enum RolloutLedgerError {
     /// The manifest belongs to a different learner pre-state.
     #[error("rollout ledger identity mismatch")]
     IdentityMismatch,
+    /// The payload declares controls different from the learner's resolved values.
+    #[error("rollout ledger learner controls mismatch")]
+    LearnerControlsMismatch,
     /// The artifact is corrupt, unsupported, or semantically inconsistent.
     #[error("invalid rollout ledger: {0}")]
     Invalid(String),
@@ -79,6 +82,43 @@ pub struct RolloutLedgerIdentity {
     pub optimizer_step: u64,
 }
 
+/// Exact learner controls that must agree with a rollout window.
+///
+/// The opaque trainer-configuration digest binds controls not represented by the
+/// ledger. These structured values separately prevent a checksum-valid payload
+/// from declaring different rollout/update semantics under the same digest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RolloutLedgerControls {
+    /// Number of ordered prompt groups in the optimizer window.
+    pub grad_accum_steps: u32,
+    /// Number of completions in each prompt group.
+    pub group_size: u32,
+    /// Rectangular completion width in every group.
+    pub completion_width: u32,
+    /// Reward-to-advantage scaling rule.
+    pub scale_rewards: ScaleRewards,
+    /// EOS token used for completion and truncation semantics.
+    pub eos_token_id: Option<u32>,
+    /// Whether full-width non-EOS completions are wholly masked.
+    pub truncation_masking: bool,
+    /// Effective TIS cap, or `None` when TIS is disabled.
+    pub tis_imp_ratio_cap_bits: Option<u64>,
+    /// Resolved learning rate as exact f64 bits.
+    pub effective_lr_bits: u64,
+    /// Resolved KL coefficient as exact f64 bits.
+    pub effective_beta_bits: u64,
+}
+
+/// Mandatory learner pre-state and structured controls for reading a window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RolloutLedgerExpectations {
+    /// Exact learner/model/optimizer identity expected by the consumer.
+    pub identity: RolloutLedgerIdentity,
+    /// Exact structured rollout and update controls expected by the consumer.
+    pub controls: RolloutLedgerControls,
+}
+
 /// Detached scoring operation the learner must perform before its first update.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -101,7 +141,7 @@ pub enum LedgerScoreRequirement {
 pub struct RolloutLedgerGroup {
     /// Zero-based position inside the accumulation window.
     pub accum_index: u32,
-    /// Global prompt ordinal used for rollout seeding/provenance.
+    /// Global prompt ordinal: `step * grad_accum_steps + accum_index` in v1.
     pub prompt_index: u64,
     /// Rectangular rows: prompt tokens followed by padded completion tokens.
     pub token_ids: Vec<Vec<u32>>,
@@ -144,8 +184,8 @@ pub struct RolloutLedgerStep {
     pub eos_token_id: Option<u32>,
     /// Whether full-width non-EOS completions are wholly masked.
     pub truncation_masking: bool,
-    /// Whether learner-side TIS requires behavior log-probabilities.
-    pub tis_required: bool,
+    /// Effective TIS cap as exact finite f64 bits, or `None` when TIS is disabled.
+    pub tis_imp_ratio_cap_bits: Option<u64>,
     /// Resolved learning rate as exact finite f64 bits.
     pub effective_lr_bits: u64,
     /// Resolved KL coefficient as exact finite f64 bits.
@@ -229,8 +269,9 @@ impl RolloutLedgerWriter {
     /// Stage and atomically publish one complete optimizer window.
     ///
     /// The payload is synced first and the manifest is written/synced last inside
-    /// a sibling staging directory. Renaming that directory publishes the window;
-    /// readers never inspect staging directories.
+    /// a sibling staging directory. An atomic final-directory claim prevents
+    /// replacement; the complete staged manifest is then hard-linked last as the
+    /// reader-visible commit marker.
     ///
     /// # Errors
     ///
@@ -245,9 +286,6 @@ impl RolloutLedgerWriter {
             )));
         }
         let final_dir = self.root.join(step_dir_name(step.step));
-        if final_dir.exists() {
-            return Err(RolloutLedgerError::AlreadyExists(final_dir));
-        }
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
@@ -257,15 +295,10 @@ impl RolloutLedgerWriter {
             std::process::id()
         ));
         fs::create_dir(&staging).map_err(|e| RolloutLedgerError::io(&staging, e))?;
-        let result = self.write_staged(step, &staging).and_then(|()| {
-            if final_dir.exists() {
-                return Err(RolloutLedgerError::AlreadyExists(final_dir.clone()));
-            }
-            fs::rename(&staging, &final_dir).map_err(|e| RolloutLedgerError::io(&final_dir, e))?;
-            sync_dir(&self.root)?;
-            Ok(final_dir.clone())
-        });
-        if result.is_err() && staging.exists() {
+        let result = self
+            .write_staged(step, &staging)
+            .and_then(|()| self.publish_staged(&staging, &final_dir));
+        if staging.exists() {
             let _ = fs::remove_dir_all(&staging);
         }
         result
@@ -294,6 +327,37 @@ impl RolloutLedgerWriter {
         sync_dir(staging)
     }
 
+    fn publish_staged(
+        &self,
+        staging: &Path,
+        final_dir: &Path,
+    ) -> Result<PathBuf, RolloutLedgerError> {
+        match fs::create_dir(final_dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(RolloutLedgerError::AlreadyExists(final_dir.to_path_buf()));
+            }
+            Err(error) => return Err(RolloutLedgerError::io(final_dir, error)),
+        }
+        let result = (|| {
+            let payload = final_dir.join(PAYLOAD_FILE);
+            fs::hard_link(staging.join(PAYLOAD_FILE), &payload)
+                .map_err(|error| RolloutLedgerError::io(&payload, error))?;
+            sync_dir(final_dir)?;
+
+            let manifest = final_dir.join(MANIFEST_FILE);
+            fs::hard_link(staging.join(MANIFEST_FILE), &manifest)
+                .map_err(|error| RolloutLedgerError::io(&manifest, error))?;
+            sync_dir(final_dir)?;
+            sync_dir(&self.root)?;
+            Ok(final_dir.to_path_buf())
+        })();
+        if result.is_err() && !final_dir.join(MANIFEST_FILE).exists() {
+            let _ = fs::remove_dir_all(final_dir);
+        }
+        result
+    }
+
     /// The ledger root directory.
     #[must_use]
     pub fn root(&self) -> &Path {
@@ -305,23 +369,25 @@ impl RolloutLedgerWriter {
 #[derive(Debug, Clone)]
 pub struct RolloutLedgerReader {
     root: PathBuf,
-    expected_identity: RolloutLedgerIdentity,
+    expected: RolloutLedgerExpectations,
 }
 
 impl RolloutLedgerReader {
-    /// Open a reader bound to the identity the learner currently holds.
+    /// Open a reader bound to the identity and resolved controls the learner holds.
     ///
     /// # Errors
     ///
-    /// Returns [`RolloutLedgerError::Invalid`] if an expected digest is malformed.
+    /// Returns [`RolloutLedgerError::Invalid`] if an expected digest or control is
+    /// malformed.
     pub fn open(
         root: impl Into<PathBuf>,
-        expected_identity: RolloutLedgerIdentity,
+        expected: RolloutLedgerExpectations,
     ) -> Result<Self, RolloutLedgerError> {
-        validate_identity(&expected_identity)?;
+        validate_identity(&expected.identity)?;
+        validate_controls(&expected.controls)?;
         Ok(Self {
             root: root.into(),
-            expected_identity,
+            expected,
         })
     }
 
@@ -346,7 +412,7 @@ impl RolloutLedgerReader {
                 manifest.format_version, ROLLOUT_LEDGER_FORMAT_VERSION
             )));
         }
-        if manifest.identity != self.expected_identity {
+        if manifest.identity != self.expected.identity {
             return Err(RolloutLedgerError::IdentityMismatch);
         }
         if manifest.payload_file != PAYLOAD_FILE {
@@ -381,6 +447,10 @@ impl RolloutLedgerReader {
             )));
         }
         validate_step(&payload)?;
+        let actual_controls = controls_from_step(&payload);
+        if actual_controls != self.expected.controls {
+            return Err(RolloutLedgerError::LearnerControlsMismatch);
+        }
         Ok(ValidatedRolloutLedgerStep {
             identity: manifest.identity,
             step: payload,
@@ -415,6 +485,45 @@ fn validate_identity(identity: &RolloutLedgerIdentity) -> Result<(), RolloutLedg
     Ok(())
 }
 
+fn validate_controls(controls: &RolloutLedgerControls) -> Result<(), RolloutLedgerError> {
+    if controls.grad_accum_steps == 0 || controls.group_size == 0 || controls.completion_width == 0
+    {
+        return Err(RolloutLedgerError::Invalid(
+            "grad_accum_steps, group_size, and completion_width must be positive".into(),
+        ));
+    }
+    let lr = f64::from_bits(controls.effective_lr_bits);
+    let beta = f64::from_bits(controls.effective_beta_bits);
+    if !lr.is_finite() || lr < 0.0 || !beta.is_finite() || beta < 0.0 {
+        return Err(RolloutLedgerError::Invalid(
+            "effective learning rate and beta must be finite and nonnegative".into(),
+        ));
+    }
+    if let Some(bits) = controls.tis_imp_ratio_cap_bits {
+        let cap = f64::from_bits(bits);
+        if !cap.is_finite() || cap < 1.0 {
+            return Err(RolloutLedgerError::Invalid(
+                "enabled TIS requires a finite importance-ratio cap >= 1".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn controls_from_step(step: &RolloutLedgerStep) -> RolloutLedgerControls {
+    RolloutLedgerControls {
+        grad_accum_steps: step.grad_accum_steps,
+        group_size: step.group_size,
+        completion_width: step.completion_width,
+        scale_rewards: step.scale_rewards,
+        eos_token_id: step.eos_token_id,
+        truncation_masking: step.truncation_masking,
+        tis_imp_ratio_cap_bits: step.tis_imp_ratio_cap_bits,
+        effective_lr_bits: step.effective_lr_bits,
+        effective_beta_bits: step.effective_beta_bits,
+    }
+}
+
 #[allow(clippy::cognitive_complexity)] // ordered whole-window preflight is clearest in one pass
 fn validate_step(step: &RolloutLedgerStep) -> Result<(), RolloutLedgerError> {
     if step.world_size != 1 || step.rank != 0 {
@@ -423,13 +532,9 @@ fn validate_step(step: &RolloutLedgerStep) -> Result<(), RolloutLedgerError> {
             step.rank, step.world_size
         )));
     }
-    let lr = f64::from_bits(step.effective_lr_bits);
+    let controls = controls_from_step(step);
+    validate_controls(&controls)?;
     let beta = f64::from_bits(step.effective_beta_bits);
-    if !lr.is_finite() || lr < 0.0 || !beta.is_finite() || beta < 0.0 {
-        return Err(RolloutLedgerError::Invalid(
-            "effective learning rate and beta must be finite and nonnegative".into(),
-        ));
-    }
     let expected_ref = if beta > 0.0 {
         LedgerScoreRequirement::AdapterDisabledDetached
     } else {
@@ -446,17 +551,16 @@ fn validate_step(step: &RolloutLedgerStep) -> Result<(), RolloutLedgerError> {
         .map_err(|_| RolloutLedgerError::Invalid("group_size overflows usize".into()))?;
     let width = usize::try_from(step.completion_width)
         .map_err(|_| RolloutLedgerError::Invalid("completion_width overflows usize".into()))?;
-    if accum == 0 || group_size == 0 || width == 0 {
-        return Err(RolloutLedgerError::Invalid(
-            "grad_accum_steps, group_size, and completion_width must be positive".into(),
-        ));
-    }
     if step.groups.len() != accum {
         return Err(RolloutLedgerError::Invalid(format!(
             "expected {accum} groups, found {}",
             step.groups.len()
         )));
     }
+    let prompt_base = step
+        .step
+        .checked_mul(u64::from(step.grad_accum_steps))
+        .ok_or_else(|| RolloutLedgerError::Invalid("prompt ordinal overflow".into()))?;
     let mut token_total = 0_u64;
     let mut live = 0_u32;
     for (index, group) in step.groups.iter().enumerate() {
@@ -468,7 +572,16 @@ fn validate_step(step: &RolloutLedgerStep) -> Result<(), RolloutLedgerError> {
                 group.accum_index
             )));
         }
-        validate_group(step, group, group_size, width)?;
+        let expected_prompt = prompt_base
+            .checked_add(u64::from(group.accum_index))
+            .ok_or_else(|| RolloutLedgerError::Invalid("prompt ordinal overflow".into()))?;
+        if group.prompt_index != expected_prompt {
+            return Err(RolloutLedgerError::Invalid(format!(
+                "group {index} has prompt_index {}, expected {expected_prompt}",
+                group.prompt_index
+            )));
+        }
+        let surrogate_live = validate_group(step, group, group_size, width)?;
         token_total = group
             .completion_lens
             .iter()
@@ -477,12 +590,7 @@ fn validate_step(step: &RolloutLedgerStep) -> Result<(), RolloutLedgerError> {
                     RolloutLedgerError::Invalid("window token count overflow".into())
                 })
             })?;
-        if beta > 0.0
-            || group
-                .advantage_bits
-                .iter()
-                .any(|&bits| f32::from_bits(bits) != 0.0)
-        {
+        if beta > 0.0 || surrogate_live {
             live = live
                 .checked_add(1)
                 .ok_or_else(|| RolloutLedgerError::Invalid("live item count overflow".into()))?;
@@ -519,7 +627,7 @@ fn validate_group(
     group: &RolloutLedgerGroup,
     group_size: usize,
     width: usize,
-) -> Result<(), RolloutLedgerError> {
+) -> Result<bool, RolloutLedgerError> {
     let prompt_len = usize::try_from(group.prompt_len)
         .map_err(|_| RolloutLedgerError::Invalid("prompt_len overflows usize".into()))?;
     if prompt_len == 0 {
@@ -570,7 +678,9 @@ fn validate_group(
         )?;
     }
     validate_behavior_capture(step, group, group_size)?;
-    Ok(())
+    Ok(expected_advantages
+        .iter()
+        .any(|&advantage| advantage != 0.0))
 }
 
 #[allow(clippy::too_many_arguments)] // the row contract is clearer with named source fields
@@ -671,7 +781,7 @@ fn validate_behavior_capture(
     group_size: usize,
 ) -> Result<(), RolloutLedgerError> {
     match &group.behavior_logprob_bits {
-        None if step.tis_required => {
+        None if step.tis_imp_ratio_cap_bits.is_some() => {
             return Err(RolloutLedgerError::Invalid(
                 "TIS requires behavior logprobs for every group".into(),
             ));
@@ -789,6 +899,13 @@ mod tests {
         }
     }
 
+    fn expectations() -> RolloutLedgerExpectations {
+        RolloutLedgerExpectations {
+            identity: identity(),
+            controls: controls_from_step(&step()),
+        }
+    }
+
     fn group() -> RolloutLedgerGroup {
         let rewards = vec![1.0_f32, 3.0];
         let advantages = group_advantages(
@@ -797,7 +914,7 @@ mod tests {
         );
         RolloutLedgerGroup {
             accum_index: 0,
-            prompt_index: 11,
+            prompt_index: 7,
             token_ids: vec![vec![5, 6, 9, 9], vec![5, 7, 8, 3]],
             prompt_len: 1,
             completion_lens: vec![2, 3],
@@ -829,7 +946,7 @@ mod tests {
             scale_rewards: ScaleRewards::Group,
             eos_token_id: Some(9),
             truncation_masking: true,
-            tis_required: true,
+            tis_imp_ratio_cap_bits: Some(2.0_f64.to_bits()),
             effective_lr_bits: 1e-5_f64.to_bits(),
             effective_beta_bits: 0.1_f64.to_bits(),
             window_tokens: 5,
@@ -880,8 +997,40 @@ mod tests {
         let published = writer.write_step(&expected).unwrap();
         assert_eq!(published.file_name().unwrap(), step_dir_name(7).as_str());
         assert!(published.join(MANIFEST_FILE).is_file());
-        let reader = RolloutLedgerReader::open(&tmp.0, identity()).unwrap();
+        let reader = RolloutLedgerReader::open(&tmp.0, expectations()).unwrap();
         assert_eq!(reader.read_step(7).unwrap().as_step(), &expected);
+    }
+
+    #[test]
+    fn reader_rejects_self_consistent_controls_that_mismatch_the_learner() {
+        type ExpectationMutation = fn(&mut RolloutLedgerExpectations);
+        let cases: Vec<ExpectationMutation> = vec![
+            |expected| expected.controls.grad_accum_steps = 2,
+            |expected| expected.controls.group_size = 3,
+            |expected| expected.controls.completion_width = 4,
+            |expected| expected.controls.scale_rewards = ScaleRewards::None,
+            |expected| expected.controls.eos_token_id = None,
+            |expected| expected.controls.truncation_masking = false,
+            |expected| expected.controls.tis_imp_ratio_cap_bits = None,
+            |expected| expected.controls.tis_imp_ratio_cap_bits = Some(3.0_f64.to_bits()),
+            |expected| expected.controls.effective_lr_bits = 2e-5_f64.to_bits(),
+            |expected| expected.controls.effective_beta_bits = 0.2_f64.to_bits(),
+        ];
+        let tmp = TempDir::new("learner-controls");
+        RolloutLedgerWriter::create(&tmp.0, identity())
+            .unwrap()
+            .write_step(&step())
+            .unwrap();
+        for mutate in cases {
+            let mut expected = expectations();
+            mutate(&mut expected);
+            assert!(matches!(
+                RolloutLedgerReader::open(&tmp.0, expected)
+                    .unwrap()
+                    .read_step(7),
+                Err(RolloutLedgerError::LearnerControlsMismatch)
+            ));
+        }
     }
 
     #[test]
@@ -906,6 +1055,68 @@ mod tests {
     }
 
     #[test]
+    fn empty_destination_claim_is_never_replaced() {
+        let tmp = TempDir::new("empty-destination");
+        let destination = tmp.0.join(step_dir_name(7));
+        fs::create_dir(&destination).unwrap();
+        let writer = RolloutLedgerWriter::create(&tmp.0, identity()).unwrap();
+        assert!(matches!(
+            writer.write_step(&step()),
+            Err(RolloutLedgerError::AlreadyExists(path)) if path == destination
+        ));
+        assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
+        assert!(fs::read_dir(&tmp.0).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".tmp-")
+        }));
+    }
+
+    #[test]
+    fn empty_destination_race_never_replaces_the_winner() {
+        let tmp = TempDir::new("empty-destination-race");
+        let writer = RolloutLedgerWriter::create(&tmp.0, identity()).unwrap();
+        let staging = tmp.0.join(".manual-staging");
+        fs::create_dir(&staging).unwrap();
+        writer.write_staged(&step(), &staging).unwrap();
+        let destination = tmp.0.join(step_dir_name(7));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        let publish_barrier = barrier.clone();
+        let publish_writer = writer.clone();
+        let publish_staging = staging.clone();
+        let publish_destination = destination.clone();
+        let publisher = std::thread::spawn(move || {
+            publish_barrier.wait();
+            publish_writer.publish_staged(&publish_staging, &publish_destination)
+        });
+        let claim_barrier = barrier;
+        let claim_destination = destination.clone();
+        let claimer = std::thread::spawn(move || {
+            claim_barrier.wait();
+            fs::create_dir(claim_destination)
+        });
+
+        match (publisher.join().unwrap(), claimer.join().unwrap()) {
+            (Ok(path), Err(error)) => {
+                assert_eq!(path, destination);
+                assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+                RolloutLedgerReader::open(&tmp.0, expectations())
+                    .unwrap()
+                    .read_step(7)
+                    .unwrap();
+            }
+            (Err(RolloutLedgerError::AlreadyExists(path)), Ok(())) => {
+                assert_eq!(path, destination);
+                assert_eq!(fs::read_dir(destination).unwrap().count(), 0);
+            }
+            (publish, claim) => panic!("unexpected publish/claim race: {publish:?} / {claim:?}"),
+        }
+    }
+
+    #[test]
     fn same_length_payload_corruption_hits_the_checksum_gate() {
         let tmp = TempDir::new("checksum");
         let published = RolloutLedgerWriter::create(&tmp.0, identity())
@@ -917,7 +1128,7 @@ mod tests {
         payload[0] ^= 1;
         fs::write(payload_path, payload).unwrap();
         assert!(matches!(
-            RolloutLedgerReader::open(&tmp.0, identity())
+            RolloutLedgerReader::open(&tmp.0, expectations())
                 .unwrap()
                 .read_step(7),
             Err(RolloutLedgerError::Invalid(message)) if message.contains("checksum")
@@ -949,7 +1160,7 @@ mod tests {
         let b = std::thread::spawn(move || right.write_step(&right_step));
         let outcomes = [a.join().unwrap(), b.join().unwrap()];
         assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
-        RolloutLedgerReader::open(&tmp.0, identity())
+        RolloutLedgerReader::open(&tmp.0, expectations())
             .unwrap()
             .read_step(7)
             .unwrap();
@@ -983,6 +1194,61 @@ mod tests {
     }
 
     #[test]
+    fn f64_nonzero_advantage_keeps_group_live_after_f32_rounding() {
+        let mut value = step();
+        value.scale_rewards = ScaleRewards::None;
+        value.effective_beta_bits = 0.0_f64.to_bits();
+        value.reference_logprobs = LedgerScoreRequirement::NotRequired;
+        value.groups[0].reward_bits = vec![0.0_f32.to_bits(), f32::from_bits(1).to_bits()];
+        let rewards = [0.0, f64::from(f32::from_bits(1))];
+        let advantages = group_advantages(&rewards, ScaleRewards::None);
+        assert!(advantages.iter().any(|&advantage| advantage != 0.0));
+        value.groups[0].advantage_bits = advantages
+            .iter()
+            .map(|&advantage| (advantage as f32).to_bits())
+            .collect();
+        assert!(value.groups[0]
+            .advantage_bits
+            .iter()
+            .all(|&bits| f32::from_bits(bits) == 0.0));
+        value.live_items = 1;
+        value.old_logprobs = LedgerScoreRequirement::AdapterEnabledDetached;
+        validate_step(&value).unwrap();
+
+        value.live_items = 0;
+        value.old_logprobs = LedgerScoreRequirement::NotRequired;
+        assert!(matches!(
+            validate_step(&value),
+            Err(RolloutLedgerError::Invalid(message)) if message.contains("live_items")
+        ));
+    }
+
+    #[test]
+    fn prompt_ordinals_follow_world_one_window_order() {
+        let mut value = step();
+        value.grad_accum_steps = 2;
+        let mut second = value.groups[0].clone();
+        value.groups[0].accum_index = 0;
+        value.groups[0].prompt_index = 14;
+        second.accum_index = 1;
+        second.prompt_index = 15;
+        value.groups.push(second);
+        value.window_tokens = 10;
+        value.live_items = 2;
+        validate_step(&value).unwrap();
+
+        for ordinals in [[14, 14], [15, 14], [14, 16]] {
+            let mut invalid = value.clone();
+            invalid.groups[0].prompt_index = ordinals[0];
+            invalid.groups[1].prompt_index = ordinals[1];
+            assert!(matches!(
+                validate_step(&invalid),
+                Err(RolloutLedgerError::Invalid(message)) if message.contains("prompt_index")
+            ));
+        }
+    }
+
+    #[test]
     fn nonfinite_rewards_keep_the_trainer_zero_advantage_semantics() {
         for reward_bits in [
             vec![f32::NAN.to_bits(), 3.0_f32.to_bits()],
@@ -1009,8 +1275,8 @@ mod tests {
             .unwrap()
             .write_step(&step())
             .unwrap();
-        let mut wrong = identity();
-        wrong.adapter_sha256 = digest('f');
+        let mut wrong = expectations();
+        wrong.identity.adapter_sha256 = digest('f');
         assert!(matches!(
             RolloutLedgerReader::open(&tmp.0, wrong)
                 .unwrap()
@@ -1032,7 +1298,7 @@ mod tests {
         manifest.format_version = 2;
         fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
         assert!(matches!(
-            RolloutLedgerReader::open(&tmp.0, identity())
+            RolloutLedgerReader::open(&tmp.0, expectations())
                 .unwrap()
                 .read_step(7),
             Err(RolloutLedgerError::Invalid(message)) if message.contains("version")
@@ -1051,7 +1317,7 @@ mod tests {
         payload.truncate(payload.len() / 2);
         fs::write(payload_path, payload).unwrap();
         assert!(matches!(
-            RolloutLedgerReader::open(&tmp.0, identity())
+            RolloutLedgerReader::open(&tmp.0, expectations())
                 .unwrap()
                 .read_step(7),
             Err(RolloutLedgerError::Invalid(message)) if message.contains("length")
@@ -1091,7 +1357,7 @@ mod tests {
                 .unwrap();
             rewrite_payload(&tmp.0, mutate);
             assert!(matches!(
-                RolloutLedgerReader::open(&tmp.0, identity())
+                RolloutLedgerReader::open(&tmp.0, expectations())
                     .unwrap()
                     .read_step(7),
                 Err(RolloutLedgerError::Invalid(_))
@@ -1120,7 +1386,7 @@ mod tests {
         manifest.payload_sha256 = sha256_hex(&bytes);
         fs::write(manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
         assert!(matches!(
-            RolloutLedgerReader::open(&tmp.0, identity())
+            RolloutLedgerReader::open(&tmp.0, expectations())
                 .unwrap()
                 .read_step(7),
             Err(RolloutLedgerError::Json(_))

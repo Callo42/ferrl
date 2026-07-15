@@ -61,9 +61,9 @@
 //!   ([`save_checkpoint`]) that also persists the optimizer moments and the rollout
 //!   sampler RNG, so [`Trainer::resume`] continues an interrupted run **bit-exactly**;
 //! - the separated rollout/learner artifact contract ([`rollout_ledger`]) — a
-//!   strict, checksummed, atomically published whole-window package whose reader
-//!   validates learner pre-state identity and every rollout/reward/mask invariant
-//!   before returning [`ValidatedRolloutLedgerStep`];
+//!   strict, checksummed, no-replace whole-window package whose reader validates
+//!   learner pre-state identity, mandatory structured controls, and every
+//!   rollout/reward/mask invariant before returning [`ValidatedRolloutLedgerStep`];
 //! - held-out evaluation ([`eval`]) — the base model vs. the trained adapter,
 //!   mean reward over a held-out set (the P4 gate's comparison);
 //! - activation checkpointing ([`remat`]) — candle ships no checkpoint
@@ -238,9 +238,9 @@ pub use remat::{stitched_backward, RematTape};
 pub use reward::{RewardError, RewardFn, RewardOutcome};
 #[doc(inline)]
 pub use rollout_ledger::{
-    LedgerScoreRequirement, RolloutLedgerError, RolloutLedgerGroup, RolloutLedgerIdentity,
-    RolloutLedgerReader, RolloutLedgerStep, RolloutLedgerWriter, ValidatedRolloutLedgerStep,
-    ROLLOUT_LEDGER_FORMAT_VERSION,
+    LedgerScoreRequirement, RolloutLedgerControls, RolloutLedgerError, RolloutLedgerExpectations,
+    RolloutLedgerGroup, RolloutLedgerIdentity, RolloutLedgerReader, RolloutLedgerStep,
+    RolloutLedgerWriter, ValidatedRolloutLedgerStep, ROLLOUT_LEDGER_FORMAT_VERSION,
 };
 #[doc(inline)]
 pub use sample::Sample;
