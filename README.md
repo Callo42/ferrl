@@ -449,6 +449,30 @@ seq_log_ratio       = sum_t m·(logp-old) / max(sum_t m, 1)     # GSPO sequence-
 
 ---
 
+## Separated rollout/learner ledger
+
+`ferrl::rollout_ledger` defines the first Phase 1.5C boundary between rollout
+collection and learning. It is separate from `candidates.jsonl`: candidate rows
+are top-K decoded text for artifact triage, while a rollout ledger package holds
+every ordered prompt group required for one optimizer window.
+
+`RolloutLedgerWriter` stages and syncs `window.json`, writes a versioned manifest
+last, then atomically publishes the whole step directory. `RolloutLedgerReader`
+checks the manifest version, byte length, SHA-256, expected trainer/model/adapter/
+optimizer identity, and all token, behavior-logprob, reward, advantage, EOS-mask,
+and scoring-requirement invariants before returning a
+`ValidatedRolloutLedgerStep`. Identity digests are supplied by the collector and
+matched against values supplied by the learner; deriving them from live trainer,
+model, adapter, and optimizer state lands with learner integration. Non-finite
+logprobs, advantages, and resolved controls fail closed, while non-finite rewards
+retain the trainer's existing zero-advantage hardening. Unknown semantic fields
+are never defaulted.
+
+Format v1 is intentionally world-1 only. It rejects distributed payloads instead
+of treating rank-local rewards or token counts as a complete optimizer window.
+The trainer collection/consumption entry points and then DP/TP completeness are
+subsequent Phase 1.5C slices built on this artifact contract.
+
 ## Training run layout (`runs/`)
 
 Each training run writes to `runs/<run_id>/`:
