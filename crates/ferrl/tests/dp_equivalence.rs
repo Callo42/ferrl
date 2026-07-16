@@ -246,6 +246,56 @@ impl Policy for ReplacingGeneratePolicy {
     }
 }
 
+/// Replaces and perturbs its live trainable variables during the learner's
+/// adapter-toggle preflight. The rollback seam cannot reattach the original
+/// handles through `Policy`, so it must report that exact restoration failed.
+struct ReplacingTogglePolicy {
+    inner: ScriptedPolicy,
+    seed: u64,
+    replaced: bool,
+}
+
+impl Policy for ReplacingTogglePolicy {
+    fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
+        self.inner.generate(prompt, cfg)
+    }
+
+    fn token_logprobs(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+        self.inner.token_logprobs(rollout)
+    }
+
+    fn set_adapter_enabled(&mut self, enabled: bool) {
+        if !enabled && !self.replaced {
+            self.inner = ScriptedPolicy::new(self.seed).unwrap();
+            let live_var = self.inner.trainable_vars()[1].clone();
+            let (rows, cols) = live_var.as_tensor().dims2().unwrap();
+            let mut values = vec![0.0_f32; rows * cols];
+            values[0] = 0.125;
+            live_var
+                .set(&Tensor::from_vec(values, (rows, cols), &Device::Cpu).unwrap())
+                .unwrap();
+            self.replaced = true;
+        }
+        self.inner.set_adapter_enabled(enabled);
+    }
+
+    fn adapter_enabled(&self) -> bool {
+        self.inner.adapter_enabled()
+    }
+
+    fn trainable_vars(&self) -> Vec<Var> {
+        self.inner.trainable_vars()
+    }
+
+    fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+        self.inner.sampler_state()
+    }
+
+    fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
+        self.inner.restore_sampler_state(state)
+    }
+}
+
 /// `'a'..` to ids `0..` (the toy-echo codec).
 struct CharTokenizer;
 impl TokenizerLike for CharTokenizer {
@@ -920,6 +970,65 @@ fn world_one_rollout_ledger_update_is_bit_identical_to_direct_training() {
             None,
         )
         .unwrap();
+
+    // A learner-side replacement is detected after reference-toggle preflight,
+    // but rollback cannot falsely claim success by restoring only the now-stale
+    // original handles. The combined error makes the policy-discard requirement
+    // explicit, while still restoring its independently controlled enable flag.
+    let mut replacing_learner = ReplacingTogglePolicy {
+        inner: ScriptedPolicy::new(SEED).unwrap(),
+        seed: SEED,
+        replaced: false,
+    };
+    let replacing_before = var_bits(&replacing_learner);
+    let replacing_ids_before: Vec<_> = replacing_learner
+        .trainable_vars()
+        .iter()
+        .map(|var| var.as_tensor().id())
+        .collect();
+    let replacing_learner_run = RunDir::create(tmp.path(), "replacing-toggle-learner").unwrap();
+    let mut replacing_learner_trainer = Trainer::new(cfg.clone(), &replacing_learner_run).unwrap();
+    match replacing_learner_trainer.train_rollout_ledger_step(
+        0,
+        &mut replacing_learner,
+        &ledger_root,
+        &policy_sha256,
+        None,
+    ) {
+        Err(TrainerError::Contract(message)) => {
+            assert!(
+                message.contains(
+                    "policy trainable-variable set changed during reference-policy preflight"
+                ),
+                "missing primary replacement failure: {message}"
+            );
+            assert!(
+                message.contains("restoring its pre-state also failed")
+                    && message.contains("trainable-variable binding changed"),
+                "rollback falsely reported success after rebinding: {message}"
+            );
+        }
+        Err(error) => panic!("expected terminal learner rebinding error, got {error:?}"),
+        Ok(_) => panic!("learner trainable-variable replacement unexpectedly succeeded"),
+    }
+    let replacing_ids_after: Vec<_> = replacing_learner
+        .trainable_vars()
+        .iter()
+        .map(|var| var.as_tensor().id())
+        .collect();
+    assert_ne!(
+        replacing_ids_after, replacing_ids_before,
+        "replacement fixture did not change the live Var binding"
+    );
+    assert_ne!(
+        var_bits(&replacing_learner),
+        replacing_before,
+        "replacement fixture did not leave a distinguishable live adapter"
+    );
+    assert!(
+        replacing_learner.adapter_enabled(),
+        "rollback did not restore the independently controlled adapter flag"
+    );
 
     // Run orchestration and output controls do not change a single learner
     // update. Each mutation must remain compatible with the collector's ledger

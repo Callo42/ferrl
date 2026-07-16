@@ -1848,6 +1848,12 @@ impl Trainer {
     /// Rollout-ledger v1 carries no collector timing or device-memory telemetry, so
     /// the returned/persisted whole-window performance fields remain explicitly
     /// unmeasured rather than relabelling learner-only work as a complete step.
+    /// Exact rollback requires the policy to retain the same trainable [`Var`]
+    /// binding across adapter toggling and scoring. A policy that replaces those
+    /// bindings is rejected, and—because the generic [`Policy`] seam cannot
+    /// reattach the original variables—the returned contract error also reports
+    /// that rollback could not restore the exact pre-call state; callers must
+    /// discard that policy instance.
     ///
     /// `policy_sha256` has the same externally verified frozen-model/execution
     /// meaning as on [`collect_rollout_ledger_step`](Self::collect_rollout_ledger_step).
@@ -2053,17 +2059,20 @@ impl Trainer {
         actual: &[Var],
         phase: &str,
     ) -> Result<(), TrainerError> {
-        if expected.len() != actual.len()
-            || expected
-                .iter()
-                .zip(actual)
-                .any(|(expected, actual)| expected.as_tensor().id() != actual.as_tensor().id())
-        {
+        if !Self::same_rollout_ledger_vars(expected, actual) {
             return Err(TrainerError::Contract(format!(
                 "policy trainable-variable set changed during {phase}"
             )));
         }
         Ok(())
+    }
+
+    fn same_rollout_ledger_vars(expected: &[Var], actual: &[Var]) -> bool {
+        expected.len() == actual.len()
+            && expected
+                .iter()
+                .zip(actual)
+                .all(|(expected, actual)| expected.as_tensor().id() == actual.as_tensor().id())
     }
 
     fn snapshot_rollout_ledger_vars(vars: &[Var]) -> Result<Vec<Tensor>, TrainerError> {
@@ -2072,6 +2081,7 @@ impl Trainer {
             .collect()
     }
 
+    #[allow(clippy::cognitive_complexity)] // rollback must aggregate every independent failure
     fn restore_rollout_ledger_prestate<P: Policy>(
         policy: &mut P,
         vars: &[Var],
@@ -2081,6 +2091,17 @@ impl Trainer {
         adapter_enabled_prestate: bool,
     ) -> Result<(), TrainerError> {
         let mut failures = Vec::new();
+        // Restore the flag first: an adversarial policy may replace its live Vars
+        // from set_adapter_enabled itself. Only the binding observed after the
+        // final flag transition is eligible for a successful rollback.
+        policy.set_adapter_enabled(adapter_enabled_prestate);
+        let active_vars = policy.trainable_vars();
+        if !Self::same_rollout_ledger_vars(vars, &active_vars) {
+            failures.push(
+                "policy trainable-variable binding changed and cannot be restored through the Policy seam"
+                    .into(),
+            );
+        }
         if vars.len() != adapter_prestate.len() {
             failures.push(format!(
                 "adapter snapshot has {} tensors for {} live variables",
@@ -2097,7 +2118,6 @@ impl Trainer {
         if let Err(error) = opt.load_state(optimizer_prestate) {
             failures.push(format!("restore optimizer state: {error}"));
         }
-        policy.set_adapter_enabled(adapter_enabled_prestate);
         if policy.adapter_enabled() != adapter_enabled_prestate {
             failures.push("restore adapter-enabled state".into());
         }

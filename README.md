@@ -480,8 +480,12 @@ The separated learner returns its exact post-update Adam state and appends its
 metrics row, but deliberately does not write a checkpoint yet: its local sampler
 did not produce the collector's rollouts, so checkpointing that sampler would make
 resume provenance false. Any failure after validation restores the adapter, Adam
-state, and adapter-enabled flag to their exact pre-call state. Because format v1
-does not carry composable collector performance measurements, the ordinary
+state, and adapter-enabled flag to their exact pre-call state while the policy
+retains the same live trainable-variable binding. Replacing those variables during
+adapter toggling or scoring is a contract violation: the generic policy seam cannot
+reattach the original binding, so the learner reports rollback failure and the
+caller must discard that policy instance. Because format v1 does not carry
+composable collector performance measurements, the ordinary
 whole-window timing, throughput, GPU-memory, and decoder-cache fields are written
 as explicitly unmeasured rather than populated from learner-only work. Sampler-state
 handoff and multi-step orchestration follow in a later slice. Non-finite logprobs,
