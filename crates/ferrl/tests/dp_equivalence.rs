@@ -38,6 +38,7 @@
 
 use candle_core::{DType, Device, Result as CandleResult, Tensor, Var, D};
 use candle_nn::ops::log_softmax;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -293,6 +294,60 @@ impl Policy for ReplacingTogglePolicy {
 
     fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
         self.inner.restore_sampler_state(state)
+    }
+}
+
+/// Returns a live scoring graph over the original trainable variables, then
+/// replaces the policy's active variables before backward. Gradient coverage
+/// and Adam can still succeed on the orphaned originals, so the learner must
+/// recheck the binding after the complete update.
+struct ReplacingLiveScoringPolicy {
+    inner: RefCell<ScriptedPolicy>,
+    seed: u64,
+    replaced: Cell<bool>,
+}
+
+impl Policy for ReplacingLiveScoringPolicy {
+    fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
+        self.inner.get_mut().generate(prompt, cfg)
+    }
+
+    fn token_logprobs(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+        let logp = self.inner.borrow().token_logprobs(rollout)?;
+        if !self.replaced.replace(true) {
+            let replacement = ScriptedPolicy::new(self.seed)?;
+            let live_var = replacement.trainable_vars()[1].clone();
+            let (rows, cols) = live_var.as_tensor().dims2()?;
+            let mut values = vec![0.0_f32; rows * cols];
+            values[0] = 0.125;
+            live_var.set(&Tensor::from_vec(values, (rows, cols), &Device::Cpu)?)?;
+            *self.inner.borrow_mut() = replacement;
+        }
+        Ok(logp)
+    }
+
+    fn token_logprobs_detached(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+        Ok(self.inner.borrow().token_logprobs(rollout)?.detach())
+    }
+
+    fn set_adapter_enabled(&mut self, enabled: bool) {
+        self.inner.get_mut().set_adapter_enabled(enabled);
+    }
+
+    fn adapter_enabled(&self) -> bool {
+        self.inner.borrow().adapter_enabled()
+    }
+
+    fn trainable_vars(&self) -> Vec<Var> {
+        self.inner.borrow().trainable_vars()
+    }
+
+    fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+        self.inner.borrow().sampler_state()
+    }
+
+    fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
+        self.inner.get_mut().restore_sampler_state(state)
     }
 }
 
@@ -1028,6 +1083,94 @@ fn world_one_rollout_ledger_update_is_bit_identical_to_direct_training() {
     assert!(
         replacing_learner.adapter_enabled(),
         "rollback did not restore the independently controlled adapter flag"
+    );
+
+    // A one-group, one-epoch update lets live scoring return a graph over the
+    // original Vars and then replace the policy binding. Backward coverage and
+    // Adam both succeed on those orphaned handles; only the post-update binding
+    // barrier can prevent a false successful state and telemetry commit.
+    let live_replacement_cfg = TrainerConfig {
+        grad_accum_steps: 1,
+        mu: 1,
+        checkpoint_every: None,
+        ..cfg.clone()
+    };
+    let live_replacement_root = tmp.path().join("live-replacement-rollout-ledger");
+    let mut live_replacement_collector_policy = ScriptedPolicy::new(SEED).unwrap();
+    let live_replacement_collector_run =
+        RunDir::create(tmp.path(), "live-replacement-collector").unwrap();
+    let mut live_replacement_collector = Trainer::new(
+        live_replacement_cfg.clone(),
+        &live_replacement_collector_run,
+    )
+    .unwrap();
+    live_replacement_collector
+        .collect_rollout_ledger_step(
+            0,
+            &mut live_replacement_collector_policy,
+            &EchoOrFlatReward,
+            &CharTokenizer,
+            &samples,
+            &live_replacement_root,
+            &policy_sha256,
+            None,
+        )
+        .unwrap();
+
+    let mut live_replacement_learner = ReplacingLiveScoringPolicy {
+        inner: RefCell::new(ScriptedPolicy::new(SEED).unwrap()),
+        seed: SEED,
+        replaced: Cell::new(false),
+    };
+    let live_replacement_ids_before: Vec<_> = live_replacement_learner
+        .trainable_vars()
+        .iter()
+        .map(|var| var.as_tensor().id())
+        .collect();
+    let live_replacement_run = RunDir::create(tmp.path(), "live-replacement-learner").unwrap();
+    let mut live_replacement_trainer =
+        Trainer::new(live_replacement_cfg, &live_replacement_run).unwrap();
+    match live_replacement_trainer.train_rollout_ledger_step(
+        0,
+        &mut live_replacement_learner,
+        &live_replacement_root,
+        &policy_sha256,
+        None,
+    ) {
+        Err(TrainerError::Contract(message)) => {
+            assert!(
+                message.contains(
+                    "policy trainable-variable set changed during rollout-ledger learner update"
+                ),
+                "missing post-update replacement failure: {message}"
+            );
+            assert!(
+                message.contains("restoring its pre-state also failed")
+                    && message.contains("trainable-variable binding changed"),
+                "live-scoring rebinding did not reach terminal rollback failure: {message}"
+            );
+        }
+        Err(error) => panic!("expected terminal live-scoring rebinding error, got {error:?}"),
+        Ok(_) => panic!("live-scoring trainable-variable replacement unexpectedly succeeded"),
+    }
+    assert!(
+        live_replacement_learner.replaced.get(),
+        "replacement fixture never reached live scoring"
+    );
+    let live_replacement_ids_after: Vec<_> = live_replacement_learner
+        .trainable_vars()
+        .iter()
+        .map(|var| var.as_tensor().id())
+        .collect();
+    assert_ne!(
+        live_replacement_ids_after, live_replacement_ids_before,
+        "live-scoring fixture did not change the active Var binding"
+    );
+    assert!(
+        ferrl::read_metrics(live_replacement_run.metrics_path())
+            .unwrap()
+            .is_empty(),
+        "rejected live-scoring replacement committed a metrics row"
     );
 
     // Run orchestration and output controls do not change a single learner

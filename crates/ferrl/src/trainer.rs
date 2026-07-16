@@ -1972,6 +1972,12 @@ impl Trainer {
                     &exec,
                 )?
             };
+            let post_update_vars = policy.trainable_vars();
+            self.require_same_rollout_ledger_vars(
+                &vars,
+                &post_update_vars,
+                "rollout-ledger learner update",
+            )?;
             let metrics = self.build_window_metrics(step, step_beta, &stats, &agg, &opt);
             // Capture the faithful continuation before the final fallible side effect.
             let optimizer_state = opt.state()?;
