@@ -2760,7 +2760,7 @@ impl Trainer {
         let optimizer_step = u64::try_from(optimizer_state.step_t).map_err(|_| {
             TrainerError::Contract("optimizer step does not fit rollout ledger u64".into())
         })?;
-        let optimizer = canonical_tensor_bytes(
+        let optimizer_tensors = canonical_tensor_bytes(
             optimizer_state
                 .first_moments
                 .iter()
@@ -2785,7 +2785,10 @@ impl Trainer {
                 &[&schema],
             ),
             adapter_sha256: domain_sha256("ferrl.rollout-ledger.adapter.v1", &[&adapter]),
-            optimizer_sha256: domain_sha256("ferrl.rollout-ledger.optimizer.v1", &[&optimizer]),
+            optimizer_sha256: domain_sha256(
+                "ferrl.rollout-ledger.optimizer.v2",
+                &[&optimizer_step.to_le_bytes(), &optimizer_tensors],
+            ),
             sampler_sha256: domain_sha256("ferrl.rollout-ledger.sampler.v1", &[sampler_state]),
             lineage_sha256: lineage_sha256.to_owned(),
             source_step: step,
@@ -7602,6 +7605,48 @@ mod tests {
             .unwrap();
         assert!(published.join("manifest.json").is_file());
         assert_eq!(policy.sampler, 1, "collector rewound a visible L_0");
+    }
+
+    #[test]
+    fn collector_keeps_poststate_when_post_manifest_durability_is_ambiguous() {
+        let tmp = WireTmp::new("ledger-ambiguous-post-manifest-collector");
+        let run = RunDir::create(&tmp.0, "run").unwrap();
+        let config = TrainerConfig {
+            steps: 1,
+            group_size: 3,
+            grad_accum_steps: 1,
+            max_new_tokens: 2,
+            beta: 0.0,
+            checkpoint_every: None,
+            ..TrainerConfig::default()
+        };
+        let mut trainer = Trainer::new(config, &run).unwrap();
+        let logp =
+            Var::from_tensor(&Tensor::zeros((3, 2), DType::F32, &Device::Cpu).unwrap()).unwrap();
+        let mut policy = StatefulCandidatePolicy {
+            inner: CandidatePolicy { logp },
+            sampler: 0,
+        };
+        crate::rollout_ledger::inject_persistent_post_manifest_sync_failure_once();
+        assert!(matches!(
+            trainer.collect_rollout_ledger_step(
+                0,
+                &mut policy,
+                &CandidateReward,
+                &CandidateCodec,
+                &[Sample::new("p", ())],
+                tmp.0.join("ledger"),
+                &"a".repeat(64),
+                None,
+            ),
+            Err(TrainerError::RolloutLedger(
+                RolloutLedgerError::PublicationAmbiguous { .. }
+            ))
+        ));
+        assert_eq!(
+            policy.sampler, 1,
+            "collector rewound after crossing the manifest boundary"
+        );
     }
 
     struct TelemetryProbePolicy {

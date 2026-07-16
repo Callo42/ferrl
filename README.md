@@ -494,8 +494,10 @@ adapter toggling or scoring is a contract violation: the generic policy seam can
 reattach the original binding, so the learner reports rollback failure and the
 caller must discard that policy instance. Collection also restores and verifies its
 sampler prestate after any failure known to precede publication. Once a manifest may
-be visible, it never rewinds the sampler; an exact visible package is reconciled as
-success and an ambiguous visible package is reported for operator reconciliation.
+be visible, it never rewinds the sampler; the writer retries every required directory
+sync and reports success only after durability is established and the visible bytes
+still match. A persistent sync failure or post-link disappearance is reported as
+ambiguous for operator reconciliation.
 Because format v3 does not carry
 composable collector performance measurements, the ordinary
 whole-window timing, throughput, GPU-memory, and decoder-cache fields are written
@@ -506,7 +508,10 @@ fields are rejected.
 
 Format v3 is intentionally world-1 only. It rejects distributed payloads instead
 of treating rank-local rewards or token counts as a complete optimizer window.
-The durable multi-step protocol is `C_k → collect L_k → learn L_k → publish
+The continuation optimizer digest binds both Adam moments and its bias-correction
+counter. Newly absent checkpoint-parent chains are created one component at a time,
+with every new entry synced in its ancestor before publication can succeed. The durable
+multi-step protocol is `C_k → collect L_k → learn L_k → publish
 C_(k+1)`; outer checkpoint progress stays distinct from Adam's update counter.
 DP/TP completeness is a subsequent Phase 1.5C slice built on this contract.
 

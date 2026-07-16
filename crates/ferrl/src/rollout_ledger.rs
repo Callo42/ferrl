@@ -22,12 +22,22 @@ const MANIFEST_FILE: &str = "manifest.json";
 
 #[cfg(test)]
 thread_local! {
-    static FAIL_AFTER_MANIFEST_LINK_ONCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static POST_MANIFEST_TEST_FAULT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
 pub(crate) fn inject_post_manifest_failure_once() {
-    FAIL_AFTER_MANIFEST_LINK_ONCE.with(|flag| flag.set(true));
+    POST_MANIFEST_TEST_FAULT.with(|fault| fault.set(1));
+}
+
+#[cfg(test)]
+pub(crate) fn inject_persistent_post_manifest_sync_failure_once() {
+    POST_MANIFEST_TEST_FAULT.with(|fault| fault.set(2));
+}
+
+#[cfg(test)]
+pub(crate) fn inject_post_manifest_disappearance_once() {
+    POST_MANIFEST_TEST_FAULT.with(|fault| fault.set(3));
 }
 
 /// A rollout-ledger read, write, identity, or semantic validation failure.
@@ -311,7 +321,9 @@ impl RolloutLedgerWriter {
     /// The payload is synced first and the manifest is written/synced last inside
     /// a sibling staging directory. An atomic final-directory claim prevents
     /// replacement; the complete staged manifest is then hard-linked last as the
-    /// reader-visible commit marker.
+    /// reader-visible commit marker. Once that link succeeds, every required
+    /// directory sync is retried before success can be reported; a persistent
+    /// durability failure remains ambiguous and must not rewind collector state.
     ///
     /// # Errors
     ///
@@ -379,6 +391,7 @@ impl RolloutLedgerWriter {
             }
             Err(error) => return Err(RolloutLedgerError::io(final_dir, error)),
         }
+        let mut manifest_linked = false;
         let result = (|| {
             let payload = final_dir.join(PAYLOAD_FILE);
             fs::hard_link(staging.join(PAYLOAD_FILE), &payload)
@@ -388,24 +401,61 @@ impl RolloutLedgerWriter {
             let manifest = final_dir.join(MANIFEST_FILE);
             fs::hard_link(staging.join(MANIFEST_FILE), &manifest)
                 .map_err(|error| RolloutLedgerError::io(&manifest, error))?;
+            manifest_linked = true;
             #[cfg(test)]
-            if self.fail_after_manifest_link
-                || FAIL_AFTER_MANIFEST_LINK_ONCE.with(|flag| flag.replace(false))
-            {
+            if self.fail_after_manifest_link {
                 return Err(RolloutLedgerError::io(
                     final_dir,
                     std::io::Error::other("injected post-manifest publication failure"),
                 ));
             }
+            #[cfg(test)]
+            POST_MANIFEST_TEST_FAULT.with(|fault| match fault.get() {
+                0 => Ok(()),
+                1 => {
+                    fault.set(0);
+                    Err(RolloutLedgerError::io(
+                        final_dir,
+                        std::io::Error::other("injected transient post-manifest failure"),
+                    ))
+                }
+                2 => Err(RolloutLedgerError::io(
+                    final_dir,
+                    std::io::Error::other("injected persistent post-manifest sync failure"),
+                )),
+                3 => {
+                    fault.set(0);
+                    let _ = fs::remove_file(&manifest);
+                    Err(RolloutLedgerError::io(
+                        final_dir,
+                        std::io::Error::other("injected post-link manifest disappearance"),
+                    ))
+                }
+                other => panic!("unknown post-manifest test fault {other}"),
+            })?;
             sync_dir(final_dir)?;
             sync_dir(&self.root)?;
             Ok(final_dir.to_path_buf())
         })();
         if let Err(error) = result {
-            if !final_dir.join(MANIFEST_FILE).exists() {
+            if !manifest_linked {
                 let _ = fs::remove_dir_all(final_dir);
                 return Err(error);
             }
+            let durability = (|| {
+                #[cfg(test)]
+                POST_MANIFEST_TEST_FAULT.with(|fault| {
+                    if fault.replace(0) == 2 {
+                        return Err(RolloutLedgerError::io(
+                            final_dir,
+                            std::io::Error::other("injected persistent post-manifest sync failure"),
+                        ));
+                    }
+                    Ok(())
+                })?;
+                sync_dir(final_dir)?;
+                sync_dir(&self.root)
+            })();
             let exact_visible = [PAYLOAD_FILE, MANIFEST_FILE].into_iter().all(|name| {
                 fs::read(staging.join(name))
                     .and_then(|expected| {
@@ -413,15 +463,17 @@ impl RolloutLedgerWriter {
                     })
                     .unwrap_or(false)
             });
-            if exact_visible {
-                // The immutable package is already complete and reader-visible.
-                // Treat the operation as committed so the collector retains the
-                // matching post-rollout sampler state.
+            if durability.is_ok() && exact_visible {
+                // The manifest boundary was crossed, and all required directory
+                // syncs have now completed. Only this establishes success.
                 return Ok(final_dir.to_path_buf());
             }
             return Err(RolloutLedgerError::PublicationAmbiguous {
                 path: final_dir.to_path_buf(),
-                detail: error.to_string(),
+                detail: match durability {
+                    Ok(()) => format!("{error}; visible package no longer matches staged bytes"),
+                    Err(sync_error) => format!("{error}; durability retry failed: {sync_error}"),
+                },
             });
         }
         Ok(final_dir.to_path_buf())
@@ -1092,6 +1144,42 @@ mod tests {
                 .as_step(),
             &expected
         );
+    }
+
+    #[test]
+    fn persistent_post_manifest_sync_failure_is_ambiguous_not_success() {
+        let tmp = TempDir::new("persistent-post-manifest-sync");
+        let writer = RolloutLedgerWriter::create(&tmp.0, identity()).unwrap();
+        inject_persistent_post_manifest_sync_failure_once();
+
+        assert!(matches!(
+            writer.write_step(&step()),
+            Err(RolloutLedgerError::PublicationAmbiguous { path, detail })
+                if path == tmp.0.join(step_dir_name(7))
+                    && detail.contains("durability retry failed")
+        ));
+        // The complete package remains visible, so the caller must preserve its
+        // post-collection state despite the ambiguous durability outcome.
+        RolloutLedgerReader::open(&tmp.0, expectations())
+            .unwrap()
+            .read_step(7)
+            .unwrap();
+    }
+
+    #[test]
+    fn post_link_manifest_disappearance_remains_ambiguous() {
+        let tmp = TempDir::new("post-link-disappearance");
+        let writer = RolloutLedgerWriter::create(&tmp.0, identity()).unwrap();
+        inject_post_manifest_disappearance_once();
+
+        assert!(matches!(
+            writer.write_step(&step()),
+            Err(RolloutLedgerError::PublicationAmbiguous { path, detail })
+                if path == tmp.0.join(step_dir_name(7))
+                    && detail.contains("no longer matches")
+        ));
+        assert!(!tmp.0.join(step_dir_name(7)).join(MANIFEST_FILE).exists());
+        assert!(tmp.0.join(step_dir_name(7)).join(PAYLOAD_FILE).exists());
     }
 
     #[test]

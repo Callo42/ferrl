@@ -53,7 +53,9 @@
 //! an atomic destination-directory claim prevents forks, and a temporary
 //! manifest is renamed into place only after both payload files and the manifest
 //! have been synced. The checkpoint directory is then synced, followed by its
-//! parent so the directory claim itself is durable. Successful publication thus
+//! parent so the directory claim itself is durable. Any missing parent chain is
+//! created one component at a time, syncing each new directory entry in its
+//! already durable ancestor before proceeding. Successful publication thus
 //! requires a filesystem/platform that supports opening and syncing directories;
 //! unsupported directory-sync behavior returns an I/O error instead of claiming
 //! durability. A crash may strand an incomplete claim, but it cannot expose or
@@ -67,6 +69,11 @@ use candle_core::{Device, Tensor, Var};
 use serde::{Deserialize, Serialize};
 
 use crate::optim::OptimizerState;
+
+#[cfg(test)]
+thread_local! {
+    static SYNCED_DIRECTORIES: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+}
 
 /// Filename of the serialized adapter tensors within a checkpoint directory.
 const ADAPTER_FILE: &str = "adapter.safetensors";
@@ -531,11 +538,22 @@ pub(crate) fn save_checkpoint_no_replace(
     continuation: RolloutLedgerContinuationManifest,
 ) -> Result<(), CheckpointError> {
     let dir = dir.as_ref();
-    if let Some(parent) = dir.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| io(parent, error))?;
-    }
+    let parent = dir.parent().ok_or_else(|| {
+        io(
+            dir,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "checkpoint path has no parent directory",
+            ),
+        )
+    })?;
+    create_directory_all_durable(parent)?;
     std::fs::create_dir(dir).map_err(|error| io(dir, error))?;
-    let parent = dir.parent().map(Path::to_path_buf);
+    // Anchor the no-replace claim before writing behind it. A crash may retain
+    // an incomplete claim, but a successful return can never depend on an
+    // uncommitted directory entry.
+    sync_directory(parent)?;
+    let parent = parent.to_path_buf();
     let manifest_stage = dir.join(format!("{MANIFEST_FILE}.tmp-{}", std::process::id()));
     let mut manifest_committed = false;
     let written = write_checkpoint_contents(
@@ -553,9 +571,7 @@ pub(crate) fn save_checkpoint_no_replace(
         std::fs::rename(&manifest_stage, &manifest).map_err(|error| io(&manifest_stage, error))?;
         manifest_committed = true;
         sync_directory(dir)?;
-        if let Some(parent) = &parent {
-            sync_directory(parent)?;
-        }
+        sync_directory(&parent)?;
         Ok(())
     });
     if written.is_err() && !manifest_committed {
@@ -638,7 +654,44 @@ fn sync_file(path: &Path) -> Result<(), CheckpointError> {
 fn sync_directory(path: &Path) -> Result<(), CheckpointError> {
     std::fs::File::open(path)
         .and_then(|directory| directory.sync_all())
-        .map_err(|error| io(path, error))
+        .map_err(|error| io(path, error))?;
+    #[cfg(test)]
+    SYNCED_DIRECTORIES.with(|paths| paths.borrow_mut().push(path.to_path_buf()));
+    Ok(())
+}
+
+fn create_directory_all_durable(path: &Path) -> Result<(), CheckpointError> {
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => return Ok(()),
+        Ok(_) => {
+            return Err(io(
+                path,
+                std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "checkpoint parent exists but is not a directory",
+                ),
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io(path, error)),
+    }
+    let parent = path.parent().ok_or_else(|| {
+        io(
+            path,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "cannot durably create a directory without an ancestor",
+            ),
+        )
+    })?;
+    create_directory_all_durable(parent)?;
+    match std::fs::create_dir(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => {}
+        Err(error) => return Err(io(path, error)),
+    }
+    sync_directory(path)?;
+    sync_directory(parent)
 }
 
 /// Restore a checkpoint from `dir` into `vars`, returning the resume step and any
@@ -1219,6 +1272,41 @@ mod tests {
         let loaded = load_checkpoint(&destination, &vars).unwrap();
         assert_eq!(loaded.step, 1);
         assert!(matches!(loaded.sampler_state.as_deref(), Some([1 | 2])));
+    }
+
+    #[test]
+    fn no_replace_checkpoint_durably_anchors_new_parent_chain() {
+        let tmp = TempDir::new("no-replace-new-parent-chain");
+        let first_parent = tmp.path().join("new-run");
+        let checkpoints = first_parent.join("checkpoints");
+        let destination = checkpoints.join("step-1");
+        assert!(!first_parent.exists());
+        SYNCED_DIRECTORIES.with(|paths| paths.borrow_mut().clear());
+
+        save_checkpoint_no_replace(
+            &destination,
+            &make_vars(),
+            &make_opt_state(),
+            &[1],
+            None,
+            continuation_manifest(1),
+        )
+        .unwrap();
+
+        let synced = SYNCED_DIRECTORIES.with(|paths| paths.borrow().clone());
+        assert!(
+            synced.contains(&tmp.path().to_path_buf()),
+            "new-run entry was not anchored in its existing ancestor: {synced:?}"
+        );
+        assert!(
+            synced.contains(&first_parent),
+            "checkpoints entry was not anchored in new-run: {synced:?}"
+        );
+        assert!(
+            synced.contains(&checkpoints),
+            "step-1 claim was not anchored in checkpoints: {synced:?}"
+        );
+        load_checkpoint(&destination, &make_vars()).unwrap();
     }
 
     #[test]

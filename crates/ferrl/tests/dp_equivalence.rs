@@ -1724,6 +1724,36 @@ fn world_one_rollout_ledger_sampler_handoff_and_resume_are_bit_exact() {
     }
     assert_eq!(var_bits(&wrong_step_policy), wrong_step_before);
 
+    // Adam's bias-correction counter is part of optimizer provenance even when
+    // every moment tensor is byte-identical.
+    let wrong_adam_step = tmp.path().join("wrong-adam-step").join("step-1");
+    std::fs::create_dir_all(&wrong_adam_step).unwrap();
+    for entry in std::fs::read_dir(&first_continuation).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::copy(entry.path(), wrong_adam_step.join(entry.file_name())).unwrap();
+    }
+    let wrong_adam_manifest_path = wrong_adam_step.join("manifest.json");
+    let mut wrong_adam_manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&wrong_adam_manifest_path).unwrap()).unwrap();
+    let original_step_t = wrong_adam_manifest["optimizer_step_t"].as_u64().unwrap();
+    wrong_adam_manifest["optimizer_step_t"] = serde_json::json!(original_step_t + 1);
+    std::fs::write(
+        &wrong_adam_manifest_path,
+        serde_json::to_vec_pretty(&wrong_adam_manifest).unwrap(),
+    )
+    .unwrap();
+    let mut wrong_adam_policy = StatefulScriptedPolicy::new(SEED, 0).unwrap();
+    let wrong_adam_before = var_bits(&wrong_adam_policy);
+    match learner.restore_rollout_ledger_continuation(
+        &wrong_adam_step,
+        &mut wrong_adam_policy,
+        &policy_sha256,
+    ) {
+        Err(TrainerError::Contract(message)) => assert!(message.contains("payload"), "{message}"),
+        other => panic!("expected Adam step_t provenance rejection, got {other:?}"),
+    }
+    assert_eq!(var_bits(&wrong_adam_policy), wrong_adam_before);
+
     // Generic cadence checkpoints are not separated continuations and cannot
     // outrank C_1 during continuation-specific latest discovery.
     ferrl::save_checkpoint(
