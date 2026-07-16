@@ -460,7 +460,7 @@ every ordered prompt group required for one optimizer window.
 immutable step directory without replacement, and hard-links the complete
 versioned manifest last as the reader-visible commit marker.
 `RolloutLedgerReader` checks the manifest version, byte length, SHA-256, expected
-trainer/model/adapter/optimizer/sampler identity, mandatory structured learner controls,
+trainer/model/adapter/optimizer/sampler/lineage identity, mandatory structured learner controls,
 and all token, prompt-order, behavior-logprob, reward, advantage, EOS-mask, and
 scoring-requirement invariants before returning a `ValidatedRolloutLedgerStep`.
 `Trainer::collect_rollout_ledger_step` now publishes one complete world-1 window
@@ -476,21 +476,27 @@ recipe, which the generic `Policy` seam cannot enumerate today. Collection
 rechecks the live identity before publication so a policy that mutates trainable
 state during generation fails closed.
 
-Ledger format v2 carries the collector's checksummed opaque post-rollout sampler
+Ledger format v3 carries the collector's checksummed opaque post-rollout sampler
 blob. The learner installs and byte-verifies it before returning the exact
-post-update Adam state or appending its metrics row. The explicit
-`save_rollout_ledger_continuation` primitive then publishes `C_(k+1)`—updated
-adapter and Adam plus that collector sampler—without replacing an existing step;
+post-update chain-bound continuation receipt or appending its metrics row. The explicit
+`save_rollout_ledger_continuation` primitive accepts only that receipt and then publishes
+`C_(k+1)`—updated adapter and Adam plus that collector sampler—without replacing an existing step;
 both roles restore the same state through
 `restore_rollout_ledger_continuation` (or its latest-checkpoint variant) before
-producing or consuming the next ledger. Adapter-only legacy checkpoints fail
-closed on this separated path. Any failure after validation restores the adapter,
+producing or consuming the next ledger. Its versioned continuation manifest binds
+the frozen-policy digest, learner-semantic configuration, tensor schema, exact
+adapter/Adam/sampler payload, outer step, parent lineage, and resulting lineage.
+Continuation-specific latest discovery ignores ordinary checkpoints. Adapter-only
+legacy checkpoints fail closed on this separated path. Any failure after validation restores the adapter,
 Adam state, sampler state, and adapter-enabled flag to their exact pre-call state while the policy
 retains the same live trainable-variable binding. Replacing those variables during
 adapter toggling or scoring is a contract violation: the generic policy seam cannot
 reattach the original binding, so the learner reports rollback failure and the
 caller must discard that policy instance. Collection also restores and verifies its
-sampler prestate after any generation or publication failure. Because format v2 does not carry
+sampler prestate after any failure known to precede publication. Once a manifest may
+be visible, it never rewinds the sampler; an exact visible package is reconciled as
+success and an ambiguous visible package is reported for operator reconciliation.
+Because format v3 does not carry
 composable collector performance measurements, the ordinary
 whole-window timing, throughput, GPU-memory, and decoder-cache fields are written
 as explicitly unmeasured rather than populated from learner-only work. Non-finite logprobs,
@@ -498,7 +504,7 @@ advantages, and resolved controls fail closed, while non-finite rewards retain t
 trainer's existing zero-advantage hardening. Unknown ledger manifest and payload
 fields are rejected.
 
-Format v2 is intentionally world-1 only. It rejects distributed payloads instead
+Format v3 is intentionally world-1 only. It rejects distributed payloads instead
 of treating rank-local rewards or token counts as a complete optimizer window.
 The durable multi-step protocol is `C_k → collect L_k → learn L_k → publish
 C_(k+1)`; outer checkpoint progress stays distinct from Adam's update counter.

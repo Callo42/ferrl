@@ -51,11 +51,16 @@
 //! from crashed processes are swept by the next write to the same path.
 //! Separated rollout continuations use an internal no-replace variant instead:
 //! an atomic destination-directory claim prevents forks, and a temporary
-//! manifest is renamed into place only after every tensor file is complete. A
-//! crash may strand an incomplete claim, but it cannot expose or overwrite a
-//! completed continuation.
+//! manifest is renamed into place only after both payload files and the manifest
+//! have been synced. The checkpoint directory is then synced, followed by its
+//! parent so the directory claim itself is durable. Successful publication thus
+//! requires a filesystem/platform that supports opening and syncing directories;
+//! unsupported directory-sync behavior returns an I/O error instead of claiming
+//! durability. A crash may strand an incomplete claim, but it cannot expose or
+//! overwrite a completed continuation.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use candle_core::{Device, Tensor, Var};
@@ -82,6 +87,28 @@ const FORMAT_VERSION: u32 = 3;
 /// Lowest on-disk format version this build can read. Older (v1, adapter-only)
 /// checkpoints still load — a resume then falls back to fresh momentum.
 const MIN_FORMAT_VERSION: u32 = 1;
+/// On-disk schema version for separated rollout-ledger continuations.
+pub(crate) const ROLLOUT_LEDGER_CONTINUATION_FORMAT_VERSION: u32 = 1;
+pub(crate) const ROLLOUT_LEDGER_CONTINUATION_KIND: &str = "rollout_ledger";
+
+/// Provenance that distinguishes a separated rollout-ledger continuation from
+/// an ordinary trainer checkpoint and binds it to one exact ledger chain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RolloutLedgerContinuationManifest {
+    pub(crate) format_version: u32,
+    pub(crate) kind: String,
+    pub(crate) completed_step: u64,
+    pub(crate) policy_sha256: String,
+    pub(crate) trainer_config_sha256: String,
+    pub(crate) tensor_schema_sha256: String,
+    pub(crate) adapter_sha256: String,
+    pub(crate) optimizer_sha256: String,
+    pub(crate) sampler_sha256: String,
+    pub(crate) parent_lineage_sha256: String,
+    pub(crate) consumed_ledger_sha256: String,
+    pub(crate) lineage_sha256: String,
+}
 
 /// Errors raised while saving or loading an adapter checkpoint.
 #[derive(Debug, thiserror::Error)]
@@ -148,6 +175,11 @@ pub struct CheckpointManifest {
     /// `#[serde(default)]` for back-compat.
     #[serde(default)]
     pub lora_recipe: Option<String>,
+    /// Present only for a versioned separated rollout-ledger continuation.
+    /// Ordinary cadence/eval checkpoints omit it and are never eligible for
+    /// separated-continuation discovery.
+    #[serde(default)]
+    pub(crate) rollout_ledger_continuation: Option<RolloutLedgerContinuationManifest>,
 }
 
 /// Tensor key for the `i`-th trainable var, zero-padded so lexical order matches
@@ -302,6 +334,7 @@ pub fn save_adapter(
             optimizer_num_vars: None,
             sampler_state: None,
             lora_recipe: recipe,
+            rollout_ledger_continuation: None,
         };
         let manifest_path = stage.join(MANIFEST_FILE);
         let json = serde_json::to_string_pretty(&manifest)?;
@@ -475,6 +508,7 @@ pub fn save_checkpoint(
             sampler_state,
             step,
             recipe,
+            None,
         )
     })
 }
@@ -493,34 +527,44 @@ pub(crate) fn save_checkpoint_no_replace(
     vars: &[Var],
     opt_state: &OptimizerState,
     sampler_state: &[u8],
-    step: u64,
     lora_recipe: Option<&str>,
+    continuation: RolloutLedgerContinuationManifest,
 ) -> Result<(), CheckpointError> {
     let dir = dir.as_ref();
     if let Some(parent) = dir.parent() {
         std::fs::create_dir_all(parent).map_err(|error| io(parent, error))?;
     }
     std::fs::create_dir(dir).map_err(|error| io(dir, error))?;
+    let parent = dir.parent().map(Path::to_path_buf);
     let manifest_stage = dir.join(format!("{MANIFEST_FILE}.tmp-{}", std::process::id()));
+    let mut manifest_committed = false;
     let written = write_checkpoint_contents(
         dir,
         &manifest_stage,
         vars,
         opt_state,
         sampler_state,
-        step,
+        continuation.completed_step,
         lora_recipe.map(str::to_owned),
+        Some(continuation),
     )
     .and_then(|()| {
         let manifest = dir.join(MANIFEST_FILE);
-        std::fs::rename(&manifest_stage, &manifest).map_err(|error| io(&manifest_stage, error))
+        std::fs::rename(&manifest_stage, &manifest).map_err(|error| io(&manifest_stage, error))?;
+        manifest_committed = true;
+        sync_directory(dir)?;
+        if let Some(parent) = &parent {
+            sync_directory(parent)?;
+        }
+        Ok(())
     });
-    if written.is_err() {
+    if written.is_err() && !manifest_committed {
         let _ = std::fs::remove_dir_all(dir);
     }
     written
 }
 
+#[allow(clippy::too_many_arguments)] // one explicit durable checkpoint payload + provenance tuple
 fn write_checkpoint_contents(
     dir: &Path,
     manifest_path: &Path,
@@ -529,6 +573,7 @@ fn write_checkpoint_contents(
     sampler_state: &[u8],
     step: u64,
     lora_recipe: Option<String>,
+    rollout_ledger_continuation: Option<RolloutLedgerContinuationManifest>,
 ) -> Result<(), CheckpointError> {
     // Adapter weights (identical to the v1 layout).
     let mut adapter: HashMap<String, Tensor> = HashMap::with_capacity(vars.len());
@@ -536,7 +581,9 @@ fn write_checkpoint_contents(
         let t = v.as_tensor().to_device(&Device::Cpu)?.contiguous()?;
         adapter.insert(var_key(i), t);
     }
-    candle_core::safetensors::save(&adapter, dir.join(ADAPTER_FILE))?;
+    let adapter_path = dir.join(ADAPTER_FILE);
+    candle_core::safetensors::save(&adapter, &adapter_path)?;
+    sync_file(&adapter_path)?;
 
     // Optimizer moments: `m.<i>` / `v.<i>`, CPU + contiguous.
     let n = opt_state.first_moments.len();
@@ -551,7 +598,9 @@ fn write_checkpoint_contents(
         moments.insert(moment_key("m", i), m);
         moments.insert(moment_key("v", i), v);
     }
-    candle_core::safetensors::save(&moments, dir.join(OPTIMIZER_FILE))?;
+    let optimizer_path = dir.join(OPTIMIZER_FILE);
+    candle_core::safetensors::save(&moments, &optimizer_path)?;
+    sync_file(&optimizer_path)?;
 
     // Manifest LAST — either inside a hidden staging directory or under a
     // temporary name that the no-replace publisher atomically commits.
@@ -563,10 +612,33 @@ fn write_checkpoint_contents(
         optimizer_num_vars: Some(n),
         sampler_state: Some(sampler_state.to_vec()),
         lora_recipe,
+        rollout_ledger_continuation,
     };
     let json = serde_json::to_string_pretty(&manifest)?;
-    std::fs::write(manifest_path, json).map_err(|error| io(manifest_path, error))?;
+    let mut manifest_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(manifest_path)
+        .map_err(|error| io(manifest_path, error))?;
+    manifest_file
+        .write_all(json.as_bytes())
+        .map_err(|error| io(manifest_path, error))?;
+    manifest_file
+        .sync_all()
+        .map_err(|error| io(manifest_path, error))?;
     Ok(())
+}
+
+fn sync_file(path: &Path) -> Result<(), CheckpointError> {
+    std::fs::File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| io(path, error))
+}
+
+fn sync_directory(path: &Path) -> Result<(), CheckpointError> {
+    std::fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| io(path, error))
 }
 
 /// Restore a checkpoint from `dir` into `vars`, returning the resume step and any
@@ -713,6 +785,64 @@ pub fn latest_checkpoint(
             step: manifest.step,
         };
         if best.as_ref().is_none_or(|b| candidate.step > b.step) {
+            best = Some(candidate);
+        }
+    }
+    Ok(best)
+}
+
+/// Find the newest complete *separated rollout-ledger continuation*.
+///
+/// Ordinary cadence/eval checkpoints and incomplete or unsupported continuation
+/// claims are ignored. This prevents the separated roles from treating a generic
+/// checkpoint with coincidentally present Adam/sampler fields as chain state.
+pub(crate) fn latest_rollout_ledger_continuation(
+    checkpoints_dir: impl AsRef<Path>,
+) -> Result<Option<LatestCheckpoint>, CheckpointError> {
+    let dir = checkpoints_dir.as_ref();
+    if !dir.exists() {
+        return Ok(None);
+    }
+    let mut best: Option<LatestCheckpoint> = None;
+    for entry in std::fs::read_dir(dir).map_err(|error| io(dir, error))? {
+        let entry = entry.map_err(|error| io(dir, error))?;
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        let Some(directory_step) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("step-"))
+            .filter(|rest| !rest.is_empty() && rest.bytes().all(|byte| byte.is_ascii_digit()))
+            .and_then(|rest| rest.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        let Ok(manifest) = read_manifest(&path) else {
+            continue;
+        };
+        let Some(continuation) = manifest.rollout_ledger_continuation else {
+            continue;
+        };
+        if continuation.format_version != ROLLOUT_LEDGER_CONTINUATION_FORMAT_VERSION
+            || continuation.kind != ROLLOUT_LEDGER_CONTINUATION_KIND
+            || continuation.completed_step != manifest.step
+            || directory_step != manifest.step
+        {
+            continue;
+        }
+        let candidate = LatestCheckpoint {
+            dir: path,
+            step: manifest.step,
+        };
+        if best
+            .as_ref()
+            .is_none_or(|current| candidate.step > current.step)
+        {
             best = Some(candidate);
         }
     }
@@ -911,6 +1041,7 @@ mod tests {
             optimizer_num_vars: None,
             sampler_state: None,
             lora_recipe: None,
+            rollout_ledger_continuation: None,
         };
         std::fs::write(
             tmp.path().join(MANIFEST_FILE),
@@ -942,6 +1073,7 @@ mod tests {
             optimizer_num_vars: Some(8),
             sampler_state: Some(vec![1, 2, 3, 4]),
             lora_recipe: Some("attn:qv|mlp:-".to_string()),
+            rollout_ledger_continuation: None,
         };
         let j = serde_json::to_string(&m).unwrap();
         let back: CheckpointManifest = serde_json::from_str(&j).unwrap();
@@ -1000,6 +1132,23 @@ mod tests {
         t.flatten_all().unwrap().to_vec1::<f32>().unwrap()
     }
 
+    fn continuation_manifest(step: u64) -> RolloutLedgerContinuationManifest {
+        RolloutLedgerContinuationManifest {
+            format_version: ROLLOUT_LEDGER_CONTINUATION_FORMAT_VERSION,
+            kind: ROLLOUT_LEDGER_CONTINUATION_KIND.to_owned(),
+            completed_step: step,
+            policy_sha256: "a".repeat(64),
+            trainer_config_sha256: "b".repeat(64),
+            tensor_schema_sha256: "c".repeat(64),
+            adapter_sha256: "d".repeat(64),
+            optimizer_sha256: "e".repeat(64),
+            sampler_sha256: "f".repeat(64),
+            parent_lineage_sha256: "1".repeat(64),
+            consumed_ledger_sha256: "3".repeat(64),
+            lineage_sha256: "2".repeat(64),
+        }
+    }
+
     /// Zero every var (so a subsequent load has something to overwrite).
     fn clobber(vars: &[Var]) {
         for v in vars {
@@ -1042,8 +1191,8 @@ mod tests {
                     &vars,
                     &make_opt_state(),
                     &[1],
-                    1,
                     None,
+                    continuation_manifest(1),
                 )
             });
             let second = scope.spawn(move || {
@@ -1054,8 +1203,8 @@ mod tests {
                     &vars,
                     &make_opt_state(),
                     &[2],
-                    1,
                     None,
+                    continuation_manifest(1),
                 )
             });
             (first.join().unwrap(), second.join().unwrap())

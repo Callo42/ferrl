@@ -1270,7 +1270,7 @@ fn world_one_rollout_ledger_update_is_bit_identical_to_direct_training() {
         let mut policy = ScriptedPolicy::new(SEED).unwrap();
         let run = RunDir::create(tmp.path(), format!("operational-{label}")).unwrap();
         let mut trainer = Trainer::new(operational_cfg, &run).unwrap();
-        let (metrics, optimizer) = trainer
+        let (metrics, continuation) = trainer
             .train_rollout_ledger_step(0, &mut policy, &ledger_root, &policy_sha256, None)
             .unwrap_or_else(|error| panic!("{label} rejected: {error:?}"));
         assert_eq!(
@@ -1284,7 +1284,7 @@ fn world_one_rollout_ledger_update_is_bit_identical_to_direct_training() {
             "{label}: adapter diverged"
         );
         assert_eq!(
-            optimizer_bits(&optimizer),
+            optimizer_bits(continuation.optimizer_state()),
             optimizer_bits(&direct_optimizer),
             "{label}: Adam state diverged"
         );
@@ -1365,26 +1365,6 @@ fn world_one_rollout_ledger_update_is_bit_identical_to_direct_training() {
         "trainer-config rejection mutated the learner adapter"
     );
 
-    let mut wrong_optimizer_policy = ScriptedPolicy::new(SEED).unwrap();
-    let wrong_optimizer_before = var_bits(&wrong_optimizer_policy);
-    let wrong_optimizer_run = RunDir::create(tmp.path(), "wrong-optimizer").unwrap();
-    let mut wrong_optimizer_trainer = Trainer::new(cfg.clone(), &wrong_optimizer_run).unwrap();
-    assert_ledger_identity_mismatch(
-        wrong_optimizer_trainer.train_rollout_ledger_step(
-            0,
-            &mut wrong_optimizer_policy,
-            &ledger_root,
-            &policy_sha256,
-            Some(&direct_optimizer),
-        ),
-        "different Adam moments/step counter",
-    );
-    assert_eq!(
-        var_bits(&wrong_optimizer_policy),
-        wrong_optimizer_before,
-        "optimizer-identity rejection mutated the learner adapter"
-    );
-
     let mut wrong_recipe_policy = RecipeScriptedPolicy {
         inner: ScriptedPolicy::new(SEED).unwrap(),
     };
@@ -1446,7 +1426,7 @@ fn world_one_rollout_ledger_update_is_bit_identical_to_direct_training() {
 
         let retry_run = RunDir::create(tmp.path(), "late-metrics-retry").unwrap();
         let mut retry_trainer = Trainer::new(cfg.clone(), &retry_run).unwrap();
-        let (retry_metrics, retry_optimizer) = retry_trainer
+        let (retry_metrics, retry_continuation) = retry_trainer
             .train_rollout_ledger_step(
                 0,
                 &mut late_failure_policy,
@@ -1457,7 +1437,7 @@ fn world_one_rollout_ledger_update_is_bit_identical_to_direct_training() {
             .unwrap();
         assert_eq!(var_bits(&late_failure_policy), direct_adapter);
         assert_eq!(
-            optimizer_bits(&retry_optimizer),
+            optimizer_bits(retry_continuation.optimizer_state()),
             optimizer_bits(&direct_optimizer),
             "retry after rollback did not recover the exact Adam continuation"
         );
@@ -1468,7 +1448,7 @@ fn world_one_rollout_ledger_update_is_bit_identical_to_direct_training() {
     assert_eq!(var_bits(&ledger_policy), initial_adapter);
     let ledger_run = RunDir::create(tmp.path(), "learner").unwrap();
     let mut ledger_trainer = Trainer::new(cfg.clone(), &ledger_run).unwrap();
-    let (ledger_metrics, ledger_optimizer) = ledger_trainer
+    let (ledger_metrics, ledger_continuation) = ledger_trainer
         .train_rollout_ledger_step(0, &mut ledger_policy, &ledger_root, &policy_sha256, None)
         .unwrap();
 
@@ -1488,12 +1468,12 @@ fn world_one_rollout_ledger_update_is_bit_identical_to_direct_training() {
         "ledger learner adapter diverged from direct training"
     );
     assert_eq!(
-        optimizer_bits(&ledger_optimizer),
+        optimizer_bits(ledger_continuation.optimizer_state()),
         optimizer_bits(&direct_optimizer),
         "ledger learner Adam state diverged from direct training"
     );
 
-    let (_, first_moments, second_moments) = optimizer_bits(&ledger_optimizer);
+    let (_, first_moments, second_moments) = optimizer_bits(ledger_continuation.optimizer_state());
     assert!(
         first_moments
             .iter()
@@ -1510,7 +1490,7 @@ fn world_one_rollout_ledger_update_is_bit_identical_to_direct_training() {
     );
 }
 
-/// Ledger v2 must carry a load-bearing sampler transition across independent
+/// Ledger v3 must carry a load-bearing sampler transition and lineage across independent
 /// collector and learner policies, then persist the combined adapter + Adam +
 /// sampler continuation so fresh roles resume the same multi-step trajectory.
 #[test]
@@ -1639,7 +1619,7 @@ fn world_one_rollout_ledger_sampler_handoff_and_resume_are_bit_exact() {
         "sampler-prestate rejection wrote telemetry"
     );
 
-    let (first_metrics, first_optimizer) = learner
+    let (first_metrics, first_continuation_state) = learner
         .train_rollout_ledger_step(0, &mut learner_policy, &ledger_root, &policy_sha256, None)
         .unwrap();
     assert_eq!(
@@ -1648,12 +1628,22 @@ fn world_one_rollout_ledger_sampler_handoff_and_resume_are_bit_exact() {
         "ledger did not install the collector's exact post-rollout sampler"
     );
     separated_metrics.push(first_metrics);
+
+    // Only the learner-produced receipt may publish C_1. A same-shaped policy
+    // carrying the wrong adapter/sampler state cannot be mixed with its Adam
+    // payload, and rejection happens before the destination is claimed.
+    let mixed_policy = StatefulScriptedPolicy::new(SEED, 0).unwrap();
+    assert!(learner
+        .save_rollout_ledger_continuation(&mixed_policy, &first_continuation_state)
+        .is_err());
+    assert!(!learner_run.checkpoints_dir().join("step-1").exists());
+
     let first_continuation = learner
-        .save_rollout_ledger_continuation(1, &learner_policy, &first_optimizer)
+        .save_rollout_ledger_continuation(&learner_policy, &first_continuation_state)
         .unwrap();
     assert!(
         learner
-            .save_rollout_ledger_continuation(1, &learner_policy, &first_optimizer)
+            .save_rollout_ledger_continuation(&learner_policy, &first_continuation_state)
             .is_err(),
         "separated continuation silently replaced an existing step"
     );
@@ -1662,9 +1652,11 @@ fn world_one_rollout_ledger_sampler_handoff_and_resume_are_bit_exact() {
         inner: ScriptedPolicy::new(SEED).unwrap(),
     };
     let unverifiable_recipe_before = var_bits(&unverifiable_recipe_policy);
-    match learner
-        .restore_rollout_ledger_continuation(&first_continuation, &mut unverifiable_recipe_policy)
-    {
+    match learner.restore_rollout_ledger_continuation(
+        &first_continuation,
+        &mut unverifiable_recipe_policy,
+        &policy_sha256,
+    ) {
         Err(TrainerError::Contract(message)) => {
             assert!(message.contains("adapter recipe"), "{message}");
         }
@@ -1677,25 +1669,102 @@ fn world_one_rollout_ledger_sampler_handoff_and_resume_are_bit_exact() {
         "recipe-preflight rejection mutated the policy"
     );
 
+    // Frozen-policy identity is external to Policy and must be supplied and
+    // matched before checkpoint tensors mutate the live model.
+    let mut wrong_model_policy = StatefulScriptedPolicy::new(SEED, 0).unwrap();
+    let wrong_model_before = var_bits(&wrong_model_policy);
+    let wrong_model_sha256 = format!("{:064x}", 8);
+    match learner.restore_rollout_ledger_continuation(
+        &first_continuation,
+        &mut wrong_model_policy,
+        &wrong_model_sha256,
+    ) {
+        Err(TrainerError::Contract(message)) => assert!(message.contains("frozen-policy")),
+        other => panic!("expected frozen-policy continuation rejection, got {other:?}"),
+    }
+    assert_eq!(var_bits(&wrong_model_policy), wrong_model_before);
+
+    // Learner-semantic configuration is part of continuation provenance even
+    // when tensor shapes and the external policy digest are unchanged.
+    let swapped_cfg = TrainerConfig {
+        clip_eps: cfg.clip_eps + 0.01,
+        ..cfg.clone()
+    };
+    let swapped_run = RunDir::create(tmp.path(), "swapped-config-continuation").unwrap();
+    let swapped_trainer = Trainer::new(swapped_cfg, &swapped_run).unwrap();
+    let mut swapped_policy = StatefulScriptedPolicy::new(SEED, 0).unwrap();
+    let swapped_before = var_bits(&swapped_policy);
+    match swapped_trainer.restore_rollout_ledger_continuation(
+        &first_continuation,
+        &mut swapped_policy,
+        &policy_sha256,
+    ) {
+        Err(TrainerError::Contract(message)) => assert!(message.contains("configuration")),
+        other => panic!("expected config-bound continuation rejection, got {other:?}"),
+    }
+    assert_eq!(var_bits(&swapped_policy), swapped_before);
+
+    // The outer step is bound redundantly by directory, generic manifest, and
+    // separated manifest. A renamed/cross-wired package fails before mutation.
+    let wrong_step = tmp.path().join("wrong-step").join("step-2");
+    std::fs::create_dir_all(&wrong_step).unwrap();
+    for entry in std::fs::read_dir(&first_continuation).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::copy(entry.path(), wrong_step.join(entry.file_name())).unwrap();
+    }
+    let mut wrong_step_policy = StatefulScriptedPolicy::new(SEED, 0).unwrap();
+    let wrong_step_before = var_bits(&wrong_step_policy);
+    match learner.restore_rollout_ledger_continuation(
+        &wrong_step,
+        &mut wrong_step_policy,
+        &policy_sha256,
+    ) {
+        Err(TrainerError::Contract(message)) => assert!(message.contains("outer step")),
+        other => panic!("expected wrong-step continuation rejection, got {other:?}"),
+    }
+    assert_eq!(var_bits(&wrong_step_policy), wrong_step_before);
+
+    // Generic cadence checkpoints are not separated continuations and cannot
+    // outrank C_1 during continuation-specific latest discovery.
+    ferrl::save_checkpoint(
+        learner_run.checkpoints_dir().join("step-999"),
+        &learner_policy.trainable_vars(),
+        first_continuation_state.optimizer_state(),
+        &learner_policy.sampler_state().unwrap(),
+        999,
+        learner_policy.lora_recipe().as_deref(),
+    )
+    .unwrap();
+    let mut ordinary_discovery_probe = StatefulScriptedPolicy::new(SEED, 0).unwrap();
+    let discovered = learner
+        .restore_latest_rollout_ledger_continuation(&mut ordinary_discovery_probe, &policy_sha256)
+        .unwrap()
+        .unwrap();
+    assert_eq!(discovered.completed_step(), 1);
+
     // Restart both roles from deliberately wrong policies. The one shared
     // continuation—not process-local memory—must restore adapter, Adam, sampler,
     // and the next outer step.
     collector_policy = StatefulScriptedPolicy::new(SEED.wrapping_add(5), 777).unwrap();
     learner_policy = StatefulScriptedPolicy::new(SEED.wrapping_add(9), 888).unwrap();
-    let (collector_next, collector_optimizer) = collector
-        .restore_rollout_ledger_continuation(&first_continuation, &mut collector_policy)
+    let collector_continuation = collector
+        .restore_rollout_ledger_continuation(
+            &first_continuation,
+            &mut collector_policy,
+            &policy_sha256,
+        )
         .unwrap();
-    let (learner_next, learner_optimizer) = learner
-        .restore_latest_rollout_ledger_continuation(&mut learner_policy)
+    let learner_continuation = learner
+        .restore_latest_rollout_ledger_continuation(&mut learner_policy, &policy_sha256)
         .unwrap()
         .unwrap();
-    assert_eq!(collector_next, 1);
-    assert_eq!(learner_next, 1);
+    assert_eq!(collector_continuation.completed_step(), 1);
+    assert_eq!(learner_continuation.completed_step(), 1);
     assert_eq!(
-        optimizer_bits(&collector_optimizer),
-        optimizer_bits(&learner_optimizer)
+        optimizer_bits(collector_continuation.optimizer_state()),
+        optimizer_bits(learner_continuation.optimizer_state())
     );
-    let mut optimizer = Some(learner_optimizer);
+    let mut continuation = Some(learner_continuation);
 
     for step in 1..cfg.steps {
         collector
@@ -1707,17 +1776,17 @@ fn world_one_rollout_ledger_sampler_handoff_and_resume_are_bit_exact() {
                 &samples,
                 &ledger_root,
                 &policy_sha256,
-                optimizer.as_ref(),
+                continuation.as_ref(),
             )
             .unwrap();
         let collector_sampler = collector_policy.sampler_state().unwrap();
-        let (metrics, next_optimizer) = learner
+        let (metrics, next_continuation) = learner
             .train_rollout_ledger_step(
                 step,
                 &mut learner_policy,
                 &ledger_root,
                 &policy_sha256,
-                optimizer.as_ref(),
+                continuation.as_ref(),
             )
             .unwrap();
         assert_eq!(
@@ -1726,19 +1795,23 @@ fn world_one_rollout_ledger_sampler_handoff_and_resume_are_bit_exact() {
             "step {step} sampler handoff diverged"
         );
         separated_metrics.push(metrics);
-        let continuation = learner
-            .save_rollout_ledger_continuation(step + 1, &learner_policy, &next_optimizer)
+        let continuation_path = learner
+            .save_rollout_ledger_continuation(&learner_policy, &next_continuation)
             .unwrap();
-        optimizer = Some(next_optimizer);
+        continuation = Some(next_continuation);
         if step + 1 < cfg.steps {
             collector_policy = StatefulScriptedPolicy::new(SEED, 1234).unwrap();
-            let (next, restored_optimizer) = collector
-                .restore_rollout_ledger_continuation(&continuation, &mut collector_policy)
+            let restored = collector
+                .restore_rollout_ledger_continuation(
+                    &continuation_path,
+                    &mut collector_policy,
+                    &policy_sha256,
+                )
                 .unwrap();
-            assert_eq!(next, step + 1);
+            assert_eq!(restored.completed_step(), step + 1);
             assert_eq!(
-                optimizer_bits(&restored_optimizer),
-                optimizer_bits(optimizer.as_ref().unwrap())
+                optimizer_bits(restored.optimizer_state()),
+                optimizer_bits(continuation.as_ref().unwrap().optimizer_state())
             );
         }
     }
@@ -1754,11 +1827,11 @@ fn world_one_rollout_ledger_sampler_handoff_and_resume_are_bit_exact() {
     assert_eq!(var_bits(&learner_policy), direct_adapter);
     assert_eq!(learner_policy.sampler_state().unwrap(), direct_sampler);
     assert_eq!(
-        optimizer_bits(optimizer.as_ref().unwrap()),
+        optimizer_bits(continuation.as_ref().unwrap().optimizer_state()),
         optimizer_bits(&direct_optimizer)
     );
     assert!(
-        optimizer_bits(optimizer.as_ref().unwrap())
+        optimizer_bits(continuation.as_ref().unwrap().optimizer_state())
             .1
             .iter()
             .flatten()
@@ -1773,15 +1846,15 @@ fn world_one_rollout_ledger_sampler_handoff_and_resume_are_bit_exact() {
     );
 
     let mut final_probe = StatefulScriptedPolicy::new(SEED.wrapping_add(17), 4321).unwrap();
-    let (final_step, final_optimizer) = learner
-        .restore_latest_rollout_ledger_continuation(&mut final_probe)
+    let final_continuation = learner
+        .restore_latest_rollout_ledger_continuation(&mut final_probe, &policy_sha256)
         .unwrap()
         .unwrap();
-    assert_eq!(final_step, cfg.steps);
+    assert_eq!(final_continuation.completed_step(), cfg.steps);
     assert_eq!(var_bits(&final_probe), direct_adapter);
     assert_eq!(final_probe.sampler_state().unwrap(), direct_sampler);
     assert_eq!(
-        optimizer_bits(&final_optimizer),
+        optimizer_bits(final_continuation.optimizer_state()),
         optimizer_bits(&direct_optimizer)
     );
 }

@@ -15,10 +15,20 @@ use sha2::{Digest, Sha256};
 use crate::grpo::{group_advantages, ScaleRewards};
 
 /// The only rollout-ledger format this release accepts.
-pub const ROLLOUT_LEDGER_FORMAT_VERSION: u32 = 2;
+pub const ROLLOUT_LEDGER_FORMAT_VERSION: u32 = 3;
 
 const PAYLOAD_FILE: &str = "window.json";
 const MANIFEST_FILE: &str = "manifest.json";
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_AFTER_MANIFEST_LINK_ONCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn inject_post_manifest_failure_once() {
+    FAIL_AFTER_MANIFEST_LINK_ONCE.with(|flag| flag.set(true));
+}
 
 /// A rollout-ledger read, write, identity, or semantic validation failure.
 #[derive(Debug, thiserror::Error)]
@@ -37,6 +47,15 @@ pub enum RolloutLedgerError {
     /// The artifact exists already; rollout windows are immutable.
     #[error("rollout ledger window already exists: {0}")]
     AlreadyExists(PathBuf),
+    /// Publication crossed the reader-visible manifest boundary, but the exact
+    /// visible bytes could not be reconciled after a later durability failure.
+    #[error("rollout ledger publication is visible but ambiguous at {path}: {detail}")]
+    PublicationAmbiguous {
+        /// Reader-visible destination that must not be treated as uncommitted.
+        path: PathBuf,
+        /// Original publication/reconciliation failure.
+        detail: String,
+    },
     /// The manifest belongs to a different learner pre-state.
     #[error("rollout ledger identity mismatch")]
     IdentityMismatch,
@@ -54,6 +73,12 @@ impl RolloutLedgerError {
             path: path.into(),
             source,
         }
+    }
+
+    /// Whether the manifest commit marker may already be reader-visible.
+    #[must_use]
+    pub fn may_be_visible(&self) -> bool {
+        matches!(self, Self::PublicationAmbiguous { .. })
     }
 }
 
@@ -80,6 +105,8 @@ pub struct RolloutLedgerIdentity {
     pub optimizer_sha256: String,
     /// Exact pre-collection opaque sampler-state digest.
     pub sampler_sha256: String,
+    /// Exact chain lineage represented by the pre-step continuation.
+    pub lineage_sha256: String,
     /// Outer trainer step that produced this window.
     pub source_step: u64,
     /// Adam update counter before consuming this window.
@@ -253,6 +280,8 @@ struct RolloutLedgerManifest {
 pub struct RolloutLedgerWriter {
     root: PathBuf,
     identity: RolloutLedgerIdentity,
+    #[cfg(test)]
+    fail_after_manifest_link: bool,
 }
 
 impl RolloutLedgerWriter {
@@ -269,7 +298,12 @@ impl RolloutLedgerWriter {
         validate_identity(&identity)?;
         let root = root.into();
         fs::create_dir_all(&root).map_err(|e| RolloutLedgerError::io(&root, e))?;
-        Ok(Self { root, identity })
+        Ok(Self {
+            root,
+            identity,
+            #[cfg(test)]
+            fail_after_manifest_link: false,
+        })
     }
 
     /// Stage and atomically publish one complete optimizer window.
@@ -354,14 +388,43 @@ impl RolloutLedgerWriter {
             let manifest = final_dir.join(MANIFEST_FILE);
             fs::hard_link(staging.join(MANIFEST_FILE), &manifest)
                 .map_err(|error| RolloutLedgerError::io(&manifest, error))?;
+            #[cfg(test)]
+            if self.fail_after_manifest_link
+                || FAIL_AFTER_MANIFEST_LINK_ONCE.with(|flag| flag.replace(false))
+            {
+                return Err(RolloutLedgerError::io(
+                    final_dir,
+                    std::io::Error::other("injected post-manifest publication failure"),
+                ));
+            }
             sync_dir(final_dir)?;
             sync_dir(&self.root)?;
             Ok(final_dir.to_path_buf())
         })();
-        if result.is_err() && !final_dir.join(MANIFEST_FILE).exists() {
-            let _ = fs::remove_dir_all(final_dir);
+        if let Err(error) = result {
+            if !final_dir.join(MANIFEST_FILE).exists() {
+                let _ = fs::remove_dir_all(final_dir);
+                return Err(error);
+            }
+            let exact_visible = [PAYLOAD_FILE, MANIFEST_FILE].into_iter().all(|name| {
+                fs::read(staging.join(name))
+                    .and_then(|expected| {
+                        fs::read(final_dir.join(name)).map(|actual| actual == expected)
+                    })
+                    .unwrap_or(false)
+            });
+            if exact_visible {
+                // The immutable package is already complete and reader-visible.
+                // Treat the operation as committed so the collector retains the
+                // matching post-rollout sampler state.
+                return Ok(final_dir.to_path_buf());
+            }
+            return Err(RolloutLedgerError::PublicationAmbiguous {
+                path: final_dir.to_path_buf(),
+                detail: error.to_string(),
+            });
         }
-        result
+        Ok(final_dir.to_path_buf())
     }
 
     /// The ledger root directory.
@@ -478,6 +541,7 @@ fn validate_identity(identity: &RolloutLedgerIdentity) -> Result<(), RolloutLedg
         ("adapter_sha256", &identity.adapter_sha256),
         ("optimizer_sha256", &identity.optimizer_sha256),
         ("sampler_sha256", &identity.sampler_sha256),
+        ("lineage_sha256", &identity.lineage_sha256),
     ] {
         if digest.len() != 64
             || !digest
@@ -535,7 +599,7 @@ fn controls_from_step(step: &RolloutLedgerStep) -> RolloutLedgerControls {
 fn validate_step(step: &RolloutLedgerStep) -> Result<(), RolloutLedgerError> {
     if step.world_size != 1 || step.rank != 0 {
         return Err(RolloutLedgerError::Invalid(format!(
-            "format v2 is world-1 only (got rank {}/world {})",
+            "format v3 is world-1 only (got rank {}/world {})",
             step.rank, step.world_size
         )));
     }
@@ -902,6 +966,7 @@ mod tests {
             adapter_sha256: digest('d'),
             optimizer_sha256: digest('e'),
             sampler_sha256: digest('f'),
+            lineage_sha256: digest('1'),
             source_step: 7,
             optimizer_step: 3,
         }
@@ -1008,6 +1073,25 @@ mod tests {
         assert!(published.join(MANIFEST_FILE).is_file());
         let reader = RolloutLedgerReader::open(&tmp.0, expectations()).unwrap();
         assert_eq!(reader.read_step(7).unwrap().as_step(), &expected);
+    }
+
+    #[test]
+    fn post_manifest_failure_reconciles_the_visible_exact_window_as_committed() {
+        let tmp = TempDir::new("post-manifest-reconcile");
+        let expected = step();
+        let mut writer = RolloutLedgerWriter::create(&tmp.0, identity()).unwrap();
+        writer.fail_after_manifest_link = true;
+
+        let published = writer.write_step(&expected).unwrap();
+        assert!(published.join(MANIFEST_FILE).is_file());
+        assert_eq!(
+            RolloutLedgerReader::open(&tmp.0, expectations())
+                .unwrap()
+                .read_step(7)
+                .unwrap()
+                .as_step(),
+            &expected
+        );
     }
 
     #[test]
