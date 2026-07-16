@@ -162,6 +162,83 @@ impl Policy for ScriptedPolicy {
     }
 }
 
+/// A deterministic but genuinely stateful rollout stream over the same real
+/// LoRA/autograd scoring path as [`ScriptedPolicy`]. Each prompt group advances
+/// an opaque epoch and changes how many rows echo the prompt, so sampler handoff
+/// affects rewards, advantages, gradients, and the final Adam trajectory.
+struct StatefulScriptedPolicy {
+    inner: ScriptedPolicy,
+    sampler_epoch: u64,
+}
+
+impl StatefulScriptedPolicy {
+    const STATE_MAGIC: [u8; 4] = *b"FSP1";
+
+    fn new(seed: u64, sampler_epoch: u64) -> CandleResult<Self> {
+        Ok(Self {
+            inner: ScriptedPolicy::new(seed)?,
+            sampler_epoch,
+        })
+    }
+}
+
+impl Policy for StatefulScriptedPolicy {
+    fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
+        let first = prompt[0];
+        let echo_count = if cfg.group_size <= 1 {
+            cfg.group_size
+        } else {
+            1 + usize::try_from(self.sampler_epoch % (cfg.group_size - 1) as u64).unwrap()
+        };
+        let token_ids = (0..cfg.group_size)
+            .map(|row| {
+                let symbol = if row < echo_count {
+                    first
+                } else {
+                    (first + 1) % VOCAB as u32
+                };
+                let mut ids = prompt.to_vec();
+                ids.extend(std::iter::repeat_n(symbol, cfg.max_new_tokens));
+                ids
+            })
+            .collect();
+        self.sampler_epoch = self.sampler_epoch.wrapping_add(1);
+        Ok(Rollout::rectangular(token_ids, prompt.len()))
+    }
+
+    fn token_logprobs(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+        self.inner.token_logprobs(rollout)
+    }
+
+    fn set_adapter_enabled(&mut self, enabled: bool) {
+        self.inner.set_adapter_enabled(enabled);
+    }
+
+    fn adapter_enabled(&self) -> bool {
+        self.inner.adapter_enabled()
+    }
+
+    fn trainable_vars(&self) -> Vec<Var> {
+        self.inner.trainable_vars()
+    }
+
+    fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+        let mut state = Self::STATE_MAGIC.to_vec();
+        state.extend_from_slice(&self.sampler_epoch.to_le_bytes());
+        Ok(state)
+    }
+
+    fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
+        if state.len() != 12 || state[..4] != Self::STATE_MAGIC {
+            candle_core::bail!("invalid stateful scripted sampler state")
+        }
+        let mut epoch = [0_u8; 8];
+        epoch.copy_from_slice(&state[4..]);
+        self.sampler_epoch = u64::from_le_bytes(epoch);
+        Ok(())
+    }
+}
+
 /// A forwarding policy with the exact same live trainable tensors as
 /// [`ScriptedPolicy`] but a different declared adapter recipe. Ledger identity
 /// must bind this semantic schema, not only tensor values and shapes.
@@ -1430,6 +1507,282 @@ fn world_one_rollout_ledger_update_is_bit_identical_to_direct_training() {
             .flatten()
             .any(|&bits| bits != 0.0_f32.to_bits()),
         "second moments stayed zero — optimizer-state equivalence is vacuous"
+    );
+}
+
+/// Ledger v2 must carry a load-bearing sampler transition across independent
+/// collector and learner policies, then persist the combined adapter + Adam +
+/// sampler continuation so fresh roles resume the same multi-step trajectory.
+#[test]
+#[allow(clippy::cognitive_complexity)]
+fn world_one_rollout_ledger_sampler_handoff_and_resume_are_bit_exact() {
+    let tmp = TempDir::new("world1-ledger-sampler-resume");
+    let samples = live_samples();
+    let cfg = TrainerConfig {
+        steps: 3,
+        grad_accum_steps: 2,
+        checkpoint_every: Some(1),
+        ..scripted_cfg()
+    };
+    let policy_sha256 = format!("{:064x}", 7);
+
+    let mut direct_policy = StatefulScriptedPolicy::new(SEED, 0).unwrap();
+    let direct_run = RunDir::create(tmp.path(), "stateful-direct").unwrap();
+    let mut direct_trainer = Trainer::new(cfg.clone(), &direct_run).unwrap();
+    let (direct_metrics, direct_stop) = direct_trainer
+        .train(
+            &mut direct_policy,
+            &EchoOrFlatReward,
+            &CharTokenizer,
+            &samples,
+        )
+        .unwrap();
+    assert_eq!(direct_stop, ferrl::RunStop::Completed);
+    assert_eq!(direct_metrics.len(), cfg.steps as usize);
+    let direct_adapter = var_bits(&direct_policy);
+    let direct_sampler = direct_policy.sampler_state().unwrap();
+    assert_ne!(
+        direct_sampler,
+        StatefulScriptedPolicy::new(SEED, 0)
+            .unwrap()
+            .sampler_state()
+            .unwrap(),
+        "stateful direct fixture did not advance its sampler"
+    );
+    let direct_probe = StatefulScriptedPolicy::new(SEED.wrapping_add(1), 999).unwrap();
+    let direct_checkpoint = ferrl::load_checkpoint(
+        direct_run.checkpoints_dir().join("step-3"),
+        &direct_probe.trainable_vars(),
+    )
+    .unwrap();
+    let direct_optimizer = direct_checkpoint.optimizer_state.unwrap();
+    assert_eq!(
+        direct_checkpoint.sampler_state.as_deref(),
+        Some(direct_sampler.as_slice())
+    );
+
+    let ledger_root = tmp.path().join("stateful-rollout-ledger");
+    let mut collector_policy = StatefulScriptedPolicy::new(SEED, 0).unwrap();
+    let collector_run = RunDir::create(tmp.path(), "stateful-collector").unwrap();
+    let mut collector = Trainer::new(cfg.clone(), &collector_run).unwrap();
+    let learner_run = RunDir::create(tmp.path(), "stateful-learner").unwrap();
+    let mut learner = Trainer::new(cfg.clone(), &learner_run).unwrap();
+    let mut learner_policy = StatefulScriptedPolicy::new(SEED, 0).unwrap();
+    let mut separated_metrics = Vec::new();
+
+    let first_path = collector
+        .collect_rollout_ledger_step(
+            0,
+            &mut collector_policy,
+            &EchoOrFlatReward,
+            &CharTokenizer,
+            &samples,
+            &ledger_root,
+            &policy_sha256,
+            None,
+        )
+        .unwrap();
+    let collector_after_first = collector_policy.sampler_state().unwrap();
+
+    // Publication is discovered after generation. A duplicate destination must
+    // nevertheless restore the collector's sampler exactly for a safe retry.
+    let collision_root = tmp.path().join("stateful-collision-ledger");
+    std::fs::create_dir_all(collision_root.join(first_path.file_name().unwrap())).unwrap();
+    let mut collision_policy = StatefulScriptedPolicy::new(SEED, 0).unwrap();
+    let collision_before = collision_policy.sampler_state().unwrap();
+    let collision_run = RunDir::create(tmp.path(), "stateful-collision-collector").unwrap();
+    let mut collision_collector = Trainer::new(cfg.clone(), &collision_run).unwrap();
+    assert!(matches!(
+        collision_collector.collect_rollout_ledger_step(
+            0,
+            &mut collision_policy,
+            &EchoOrFlatReward,
+            &CharTokenizer,
+            &samples,
+            &collision_root,
+            &policy_sha256,
+            None,
+        ),
+        Err(TrainerError::RolloutLedger(
+            RolloutLedgerError::AlreadyExists(_)
+        ))
+    ));
+    assert_eq!(
+        collision_policy.sampler_state().unwrap(),
+        collision_before,
+        "failed collector publication advanced the sampler"
+    );
+
+    // Adapter/Adam/config equality is insufficient: the learner must begin at
+    // the collector's exact sampler prestate before it can consume this window.
+    let wrong_sampler_run = RunDir::create(tmp.path(), "wrong-sampler-learner").unwrap();
+    let mut wrong_sampler_trainer = Trainer::new(cfg.clone(), &wrong_sampler_run).unwrap();
+    let mut wrong_sampler_policy = StatefulScriptedPolicy::new(SEED, 99).unwrap();
+    let wrong_sampler_before = var_bits(&wrong_sampler_policy);
+    assert!(matches!(
+        wrong_sampler_trainer.train_rollout_ledger_step(
+            0,
+            &mut wrong_sampler_policy,
+            &ledger_root,
+            &policy_sha256,
+            None,
+        ),
+        Err(TrainerError::RolloutLedger(
+            RolloutLedgerError::IdentityMismatch
+        ))
+    ));
+    assert_eq!(var_bits(&wrong_sampler_policy), wrong_sampler_before);
+    assert!(
+        ferrl::read_metrics(wrong_sampler_run.metrics_path())
+            .unwrap()
+            .is_empty(),
+        "sampler-prestate rejection wrote telemetry"
+    );
+
+    let (first_metrics, first_optimizer) = learner
+        .train_rollout_ledger_step(0, &mut learner_policy, &ledger_root, &policy_sha256, None)
+        .unwrap();
+    assert_eq!(
+        learner_policy.sampler_state().unwrap(),
+        collector_after_first,
+        "ledger did not install the collector's exact post-rollout sampler"
+    );
+    separated_metrics.push(first_metrics);
+    let first_continuation = learner
+        .save_rollout_ledger_continuation(1, &learner_policy, &first_optimizer)
+        .unwrap();
+    assert!(
+        learner
+            .save_rollout_ledger_continuation(1, &learner_policy, &first_optimizer)
+            .is_err(),
+        "separated continuation silently replaced an existing step"
+    );
+
+    let mut unverifiable_recipe_policy = RecipeScriptedPolicy {
+        inner: ScriptedPolicy::new(SEED).unwrap(),
+    };
+    let unverifiable_recipe_before = var_bits(&unverifiable_recipe_policy);
+    match learner
+        .restore_rollout_ledger_continuation(&first_continuation, &mut unverifiable_recipe_policy)
+    {
+        Err(TrainerError::Contract(message)) => {
+            assert!(message.contains("adapter recipe"), "{message}");
+        }
+        Err(error) => panic!("expected strict continuation recipe error, got {error:?}"),
+        Ok(_) => panic!("continuation accepted unverifiable adapter provenance"),
+    }
+    assert_eq!(
+        var_bits(&unverifiable_recipe_policy),
+        unverifiable_recipe_before,
+        "recipe-preflight rejection mutated the policy"
+    );
+
+    // Restart both roles from deliberately wrong policies. The one shared
+    // continuation—not process-local memory—must restore adapter, Adam, sampler,
+    // and the next outer step.
+    collector_policy = StatefulScriptedPolicy::new(SEED.wrapping_add(5), 777).unwrap();
+    learner_policy = StatefulScriptedPolicy::new(SEED.wrapping_add(9), 888).unwrap();
+    let (collector_next, collector_optimizer) = collector
+        .restore_rollout_ledger_continuation(&first_continuation, &mut collector_policy)
+        .unwrap();
+    let (learner_next, learner_optimizer) = learner
+        .restore_latest_rollout_ledger_continuation(&mut learner_policy)
+        .unwrap()
+        .unwrap();
+    assert_eq!(collector_next, 1);
+    assert_eq!(learner_next, 1);
+    assert_eq!(
+        optimizer_bits(&collector_optimizer),
+        optimizer_bits(&learner_optimizer)
+    );
+    let mut optimizer = Some(learner_optimizer);
+
+    for step in 1..cfg.steps {
+        collector
+            .collect_rollout_ledger_step(
+                step,
+                &mut collector_policy,
+                &EchoOrFlatReward,
+                &CharTokenizer,
+                &samples,
+                &ledger_root,
+                &policy_sha256,
+                optimizer.as_ref(),
+            )
+            .unwrap();
+        let collector_sampler = collector_policy.sampler_state().unwrap();
+        let (metrics, next_optimizer) = learner
+            .train_rollout_ledger_step(
+                step,
+                &mut learner_policy,
+                &ledger_root,
+                &policy_sha256,
+                optimizer.as_ref(),
+            )
+            .unwrap();
+        assert_eq!(
+            learner_policy.sampler_state().unwrap(),
+            collector_sampler,
+            "step {step} sampler handoff diverged"
+        );
+        separated_metrics.push(metrics);
+        let continuation = learner
+            .save_rollout_ledger_continuation(step + 1, &learner_policy, &next_optimizer)
+            .unwrap();
+        optimizer = Some(next_optimizer);
+        if step + 1 < cfg.steps {
+            collector_policy = StatefulScriptedPolicy::new(SEED, 1234).unwrap();
+            let (next, restored_optimizer) = collector
+                .restore_rollout_ledger_continuation(&continuation, &mut collector_policy)
+                .unwrap();
+            assert_eq!(next, step + 1);
+            assert_eq!(
+                optimizer_bits(&restored_optimizer),
+                optimizer_bits(optimizer.as_ref().unwrap())
+            );
+        }
+    }
+
+    for (step, (direct, separated)) in direct_metrics.iter().zip(&separated_metrics).enumerate() {
+        assert_eq!(
+            deterministic_metrics(direct),
+            deterministic_metrics(separated),
+            "step {step} direct/separated mathematical metrics diverged"
+        );
+        assert_ledger_performance_unmeasured(separated, "stateful separated step");
+    }
+    assert_eq!(var_bits(&learner_policy), direct_adapter);
+    assert_eq!(learner_policy.sampler_state().unwrap(), direct_sampler);
+    assert_eq!(
+        optimizer_bits(optimizer.as_ref().unwrap()),
+        optimizer_bits(&direct_optimizer)
+    );
+    assert!(
+        optimizer_bits(optimizer.as_ref().unwrap())
+            .1
+            .iter()
+            .flatten()
+            .any(|&bits| bits != 0.0_f32.to_bits()),
+        "stateful continuation kept vacuous first moments"
+    );
+    assert_eq!(
+        ferrl::read_metrics(learner_run.metrics_path())
+            .unwrap()
+            .len(),
+        cfg.steps as usize
+    );
+
+    let mut final_probe = StatefulScriptedPolicy::new(SEED.wrapping_add(17), 4321).unwrap();
+    let (final_step, final_optimizer) = learner
+        .restore_latest_rollout_ledger_continuation(&mut final_probe)
+        .unwrap()
+        .unwrap();
+    assert_eq!(final_step, cfg.steps);
+    assert_eq!(var_bits(&final_probe), direct_adapter);
+    assert_eq!(final_probe.sampler_state().unwrap(), direct_sampler);
+    assert_eq!(
+        optimizer_bits(&final_optimizer),
+        optimizer_bits(&direct_optimizer)
     );
 }
 

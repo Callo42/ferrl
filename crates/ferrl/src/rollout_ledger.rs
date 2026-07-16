@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use crate::grpo::{group_advantages, ScaleRewards};
 
 /// The only rollout-ledger format this release accepts.
-pub const ROLLOUT_LEDGER_FORMAT_VERSION: u32 = 1;
+pub const ROLLOUT_LEDGER_FORMAT_VERSION: u32 = 2;
 
 const PAYLOAD_FILE: &str = "window.json";
 const MANIFEST_FILE: &str = "manifest.json";
@@ -78,6 +78,8 @@ pub struct RolloutLedgerIdentity {
     pub adapter_sha256: String,
     /// Exact pre-update optimizer-state digest.
     pub optimizer_sha256: String,
+    /// Exact pre-collection opaque sampler-state digest.
+    pub sampler_sha256: String,
     /// Outer trainer step that produced this window.
     pub source_step: u64,
     /// Adam update counter before consuming this window.
@@ -143,7 +145,7 @@ pub enum LedgerScoreRequirement {
 pub struct RolloutLedgerGroup {
     /// Zero-based position inside the accumulation window.
     pub accum_index: u32,
-    /// Global prompt ordinal: `step * grad_accum_steps + accum_index` in v1.
+    /// Global prompt ordinal: `step * grad_accum_steps + accum_index` in v2.
     pub prompt_index: u64,
     /// Rectangular rows: prompt tokens followed by padded completion tokens.
     pub token_ids: Vec<Vec<u32>>,
@@ -170,9 +172,9 @@ pub struct RolloutLedgerGroup {
 pub struct RolloutLedgerStep {
     /// Outer trainer step represented by this artifact.
     pub step: u64,
-    /// Execution rank; v1 requires `0`.
+    /// Execution rank; v2 requires `0`.
     pub rank: u32,
-    /// Execution world size; v1 requires `1`.
+    /// Execution world size; v2 requires `1`.
     pub world_size: u32,
     /// Expected number of ordered prompt groups.
     pub grad_accum_steps: u32,
@@ -200,6 +202,8 @@ pub struct RolloutLedgerStep {
     pub old_logprobs: LedgerScoreRequirement,
     /// Required detached reference-policy scoring contract.
     pub reference_logprobs: LedgerScoreRequirement,
+    /// Exact opaque sampler state after the collector produced this window.
+    pub post_rollout_sampler_state: Vec<u8>,
     /// Every prompt group in accumulation order.
     pub groups: Vec<RolloutLedgerGroup>,
 }
@@ -473,6 +477,7 @@ fn validate_identity(identity: &RolloutLedgerIdentity) -> Result<(), RolloutLedg
         ("tensor_schema_sha256", &identity.tensor_schema_sha256),
         ("adapter_sha256", &identity.adapter_sha256),
         ("optimizer_sha256", &identity.optimizer_sha256),
+        ("sampler_sha256", &identity.sampler_sha256),
     ] {
         if digest.len() != 64
             || !digest
@@ -530,7 +535,7 @@ fn controls_from_step(step: &RolloutLedgerStep) -> RolloutLedgerControls {
 fn validate_step(step: &RolloutLedgerStep) -> Result<(), RolloutLedgerError> {
     if step.world_size != 1 || step.rank != 0 {
         return Err(RolloutLedgerError::Invalid(format!(
-            "format v1 is world-1 only (got rank {}/world {})",
+            "format v2 is world-1 only (got rank {}/world {})",
             step.rank, step.world_size
         )));
     }
@@ -896,6 +901,7 @@ mod tests {
             tensor_schema_sha256: digest('c'),
             adapter_sha256: digest('d'),
             optimizer_sha256: digest('e'),
+            sampler_sha256: digest('f'),
             source_step: 7,
             optimizer_step: 3,
         }
@@ -955,6 +961,7 @@ mod tests {
             live_items: 1,
             old_logprobs: LedgerScoreRequirement::AdapterEnabledDetached,
             reference_logprobs: LedgerScoreRequirement::AdapterDisabledDetached,
+            post_rollout_sampler_state: vec![1, 2, 3, 4],
             groups: vec![group()],
         }
     }
@@ -1278,7 +1285,7 @@ mod tests {
             .write_step(&step())
             .unwrap();
         let mut wrong = expectations();
-        wrong.identity.adapter_sha256 = digest('f');
+        wrong.identity.sampler_sha256 = digest('0');
         assert!(matches!(
             RolloutLedgerReader::open(&tmp.0, wrong)
                 .unwrap()
@@ -1297,7 +1304,7 @@ mod tests {
         let manifest_path = tmp.0.join(step_dir_name(7)).join(MANIFEST_FILE);
         let mut manifest: RolloutLedgerManifest =
             serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
-        manifest.format_version = 2;
+        manifest.format_version = 1;
         fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
         assert!(matches!(
             RolloutLedgerReader::open(&tmp.0, expectations())

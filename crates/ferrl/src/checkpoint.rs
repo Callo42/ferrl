@@ -49,6 +49,11 @@
 //! checkpoint exists on disk (a crash can at worst leave the prior one under
 //! `<dir>.old-<pid>`, recoverable by hand). Stale `.tmp-*`/`.old-*` siblings
 //! from crashed processes are swept by the next write to the same path.
+//! Separated rollout continuations use an internal no-replace variant instead:
+//! an atomic destination-directory claim prevents forks, and a temporary
+//! manifest is renamed into place only after every tensor file is complete. A
+//! crash may strand an incomplete claim, but it cannot expose or overwrite a
+//! completed continuation.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -462,45 +467,106 @@ pub fn save_checkpoint(
 ) -> Result<(), CheckpointError> {
     let recipe = lora_recipe.map(str::to_owned);
     write_staged(dir.as_ref(), |stage| {
-        // Adapter weights (identical to the v1 layout).
-        let mut adapter: HashMap<String, Tensor> = HashMap::with_capacity(vars.len());
-        for (i, v) in vars.iter().enumerate() {
-            let t = v.as_tensor().to_device(&Device::Cpu)?.contiguous()?;
-            adapter.insert(var_key(i), t);
-        }
-        candle_core::safetensors::save(&adapter, stage.join(ADAPTER_FILE))?;
-
-        // Optimizer moments: `m.<i>` / `v.<i>`, CPU + contiguous.
-        let n = opt_state.first_moments.len();
-        let mut moments: HashMap<String, Tensor> = HashMap::with_capacity(n * 2);
-        for i in 0..n {
-            let m = opt_state.first_moments[i]
-                .to_device(&Device::Cpu)?
-                .contiguous()?;
-            let v = opt_state.second_moments[i]
-                .to_device(&Device::Cpu)?
-                .contiguous()?;
-            moments.insert(moment_key("m", i), m);
-            moments.insert(moment_key("v", i), v);
-        }
-        candle_core::safetensors::save(&moments, stage.join(OPTIMIZER_FILE))?;
-
-        // Manifest LAST — the commit marker (a crash before it leaves the load failing
-        // cleanly rather than reading partial state).
-        let manifest = CheckpointManifest {
-            format_version: FORMAT_VERSION,
+        write_checkpoint_contents(
+            stage,
+            &stage.join(MANIFEST_FILE),
+            vars,
+            opt_state,
+            sampler_state,
             step,
-            num_vars: vars.len(),
-            optimizer_step_t: Some(opt_state.step_t),
-            optimizer_num_vars: Some(n),
-            sampler_state: Some(sampler_state.to_vec()),
-            lora_recipe: recipe,
-        };
-        let manifest_path = stage.join(MANIFEST_FILE);
-        let json = serde_json::to_string_pretty(&manifest)?;
-        std::fs::write(&manifest_path, json).map_err(|e| io(&manifest_path, e))?;
-        Ok(())
+            recipe,
+        )
     })
+}
+
+/// Persist a momentum-faithful checkpoint while atomically claiming a previously
+/// absent destination directory.
+///
+/// Unlike [`save_checkpoint`], this never renames an existing destination aside.
+/// `create_dir` is the no-replace claim, the tensor files are written behind that
+/// claim, and an atomically renamed manifest is the reader-visible commit marker.
+/// A process crash can leave an incomplete claimed directory, which discovery
+/// skips and a later writer refuses to replace; recovery must explicitly inspect
+/// and remove that abandoned claim.
+pub(crate) fn save_checkpoint_no_replace(
+    dir: impl AsRef<Path>,
+    vars: &[Var],
+    opt_state: &OptimizerState,
+    sampler_state: &[u8],
+    step: u64,
+    lora_recipe: Option<&str>,
+) -> Result<(), CheckpointError> {
+    let dir = dir.as_ref();
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| io(parent, error))?;
+    }
+    std::fs::create_dir(dir).map_err(|error| io(dir, error))?;
+    let manifest_stage = dir.join(format!("{MANIFEST_FILE}.tmp-{}", std::process::id()));
+    let written = write_checkpoint_contents(
+        dir,
+        &manifest_stage,
+        vars,
+        opt_state,
+        sampler_state,
+        step,
+        lora_recipe.map(str::to_owned),
+    )
+    .and_then(|()| {
+        let manifest = dir.join(MANIFEST_FILE);
+        std::fs::rename(&manifest_stage, &manifest).map_err(|error| io(&manifest_stage, error))
+    });
+    if written.is_err() {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    written
+}
+
+fn write_checkpoint_contents(
+    dir: &Path,
+    manifest_path: &Path,
+    vars: &[Var],
+    opt_state: &OptimizerState,
+    sampler_state: &[u8],
+    step: u64,
+    lora_recipe: Option<String>,
+) -> Result<(), CheckpointError> {
+    // Adapter weights (identical to the v1 layout).
+    let mut adapter: HashMap<String, Tensor> = HashMap::with_capacity(vars.len());
+    for (i, v) in vars.iter().enumerate() {
+        let t = v.as_tensor().to_device(&Device::Cpu)?.contiguous()?;
+        adapter.insert(var_key(i), t);
+    }
+    candle_core::safetensors::save(&adapter, dir.join(ADAPTER_FILE))?;
+
+    // Optimizer moments: `m.<i>` / `v.<i>`, CPU + contiguous.
+    let n = opt_state.first_moments.len();
+    let mut moments: HashMap<String, Tensor> = HashMap::with_capacity(n * 2);
+    for i in 0..n {
+        let m = opt_state.first_moments[i]
+            .to_device(&Device::Cpu)?
+            .contiguous()?;
+        let v = opt_state.second_moments[i]
+            .to_device(&Device::Cpu)?
+            .contiguous()?;
+        moments.insert(moment_key("m", i), m);
+        moments.insert(moment_key("v", i), v);
+    }
+    candle_core::safetensors::save(&moments, dir.join(OPTIMIZER_FILE))?;
+
+    // Manifest LAST — either inside a hidden staging directory or under a
+    // temporary name that the no-replace publisher atomically commits.
+    let manifest = CheckpointManifest {
+        format_version: FORMAT_VERSION,
+        step,
+        num_vars: vars.len(),
+        optimizer_step_t: Some(opt_state.step_t),
+        optimizer_num_vars: Some(n),
+        sampler_state: Some(sampler_state.to_vec()),
+        lora_recipe,
+    };
+    let json = serde_json::to_string_pretty(&manifest)?;
+    std::fs::write(manifest_path, json).map_err(|error| io(manifest_path, error))?;
+    Ok(())
 }
 
 /// Restore a checkpoint from `dir` into `vars`, returning the resume step and any
@@ -592,11 +658,12 @@ pub struct LatestCheckpoint {
 ///
 /// A subdirectory whose manifest is missing, unreadable, or an unsupported
 /// format version is **skipped, not an error**: the writer publishes a checkpoint
-/// only once its manifest is committed by the final atomic rename (see the module
-/// docs), so a `step-<n>` directory without a readable manifest is an interrupted
-/// or foreign write, never a usable checkpoint — and a present, readable manifest
-/// is therefore a sufficient completeness marker (every sibling file landed in the
-/// same rename). Crash-leftover `.tmp-*` / `.old-*` siblings do not match the
+/// only once its manifest is committed by an atomic rename (see the module docs),
+/// so a `step-<n>` directory without a readable manifest is an interrupted or
+/// foreign write, never a usable checkpoint. A present, readable manifest is a
+/// sufficient completeness marker: either every sibling landed in the same
+/// directory rename, or the no-replace writer committed the manifest only after
+/// every sibling. Crash-leftover `.tmp-*` / `.old-*` siblings do not match the
 /// `step-<n>` shape and are ignored, as is any unrelated entry.
 ///
 /// # Errors
@@ -955,6 +1022,54 @@ mod tests {
             adapter,
             "adapter must round-trip bit-for-bit"
         );
+    }
+
+    #[test]
+    fn no_replace_checkpoint_has_exactly_one_race_winner() {
+        let tmp = TempDir::new("no-replace-race");
+        let destination = tmp.path().join("step-1");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let first_destination = destination.clone();
+        let first_barrier = barrier.clone();
+        let second_destination = destination.clone();
+        let second_barrier = barrier.clone();
+        let (first, second) = std::thread::scope(|scope| {
+            let first = scope.spawn(move || {
+                let vars = make_vars();
+                first_barrier.wait();
+                save_checkpoint_no_replace(
+                    &first_destination,
+                    &vars,
+                    &make_opt_state(),
+                    &[1],
+                    1,
+                    None,
+                )
+            });
+            let second = scope.spawn(move || {
+                let vars = make_vars();
+                second_barrier.wait();
+                save_checkpoint_no_replace(
+                    &second_destination,
+                    &vars,
+                    &make_opt_state(),
+                    &[2],
+                    1,
+                    None,
+                )
+            });
+            (first.join().unwrap(), second.join().unwrap())
+        });
+        assert_ne!(
+            first.is_ok(),
+            second.is_ok(),
+            "results: {first:?}, {second:?}"
+        );
+
+        let vars = make_vars();
+        let loaded = load_checkpoint(&destination, &vars).unwrap();
+        assert_eq!(loaded.step, 1);
+        assert!(matches!(loaded.sampler_state.as_deref(), Some([1 | 2])));
     }
 
     #[test]

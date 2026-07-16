@@ -63,7 +63,10 @@
 //! - the separated rollout/learner artifact contract ([`rollout_ledger`]) — a
 //!   strict, checksummed, no-replace whole-window package whose reader validates
 //!   learner pre-state identity, mandatory structured controls, and every
-//!   rollout/reward/mask invariant before returning [`ValidatedRolloutLedgerStep`];
+//!   rollout/reward/mask invariant before returning [`ValidatedRolloutLedgerStep`].
+//!   Format v2 also binds the sampler prestate and transfers the collector's exact
+//!   post-rollout sampler blob, so the learner can publish a truthful adapter +
+//!   Adam + sampler continuation for the next separated step;
 //! - held-out evaluation ([`eval`]) — the base model vs. the trained adapter,
 //!   mean reward over a held-out set (the P4 gate's comparison);
 //! - activation checkpointing ([`remat`]) — candle ships no checkpoint

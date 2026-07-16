@@ -460,7 +460,7 @@ every ordered prompt group required for one optimizer window.
 immutable step directory without replacement, and hard-links the complete
 versioned manifest last as the reader-visible commit marker.
 `RolloutLedgerReader` checks the manifest version, byte length, SHA-256, expected
-trainer/model/adapter/optimizer identity, mandatory structured learner controls,
+trainer/model/adapter/optimizer/sampler identity, mandatory structured learner controls,
 and all token, prompt-order, behavior-logprob, reward, advantage, EOS-mask, and
 scoring-requirement invariants before returning a `ValidatedRolloutLedgerStep`.
 `Trainer::collect_rollout_ledger_step` now publishes one complete world-1 window
@@ -470,33 +470,39 @@ the immutable package, performs the required detached scoring, and feeds the
 existing update path. The trainer derives the learner-semantic configuration
 projection (excluding run horizon and output/telemetry controls), structured
 controls, positional tensor schema plus LoRA recipe, adapter values, optimizer
-moments, source step, and optimizer counter from live state. The one explicit
+moments, sampler prestate, source step, and optimizer counter from live state. The one explicit
 input is a verified SHA-256 digest binding the frozen model content and execution
 recipe, which the generic `Policy` seam cannot enumerate today. Collection
 rechecks the live identity before publication so a policy that mutates trainable
 state during generation fails closed.
 
-The separated learner returns its exact post-update Adam state and appends its
-metrics row, but deliberately does not write a checkpoint yet: its local sampler
-did not produce the collector's rollouts, so checkpointing that sampler would make
-resume provenance false. Any failure after validation restores the adapter, Adam
-state, and adapter-enabled flag to their exact pre-call state while the policy
+Ledger format v2 carries the collector's checksummed opaque post-rollout sampler
+blob. The learner installs and byte-verifies it before returning the exact
+post-update Adam state or appending its metrics row. The explicit
+`save_rollout_ledger_continuation` primitive then publishes `C_(k+1)`—updated
+adapter and Adam plus that collector sampler—without replacing an existing step;
+both roles restore the same state through
+`restore_rollout_ledger_continuation` (or its latest-checkpoint variant) before
+producing or consuming the next ledger. Adapter-only legacy checkpoints fail
+closed on this separated path. Any failure after validation restores the adapter,
+Adam state, sampler state, and adapter-enabled flag to their exact pre-call state while the policy
 retains the same live trainable-variable binding. Replacing those variables during
 adapter toggling or scoring is a contract violation: the generic policy seam cannot
 reattach the original binding, so the learner reports rollback failure and the
-caller must discard that policy instance. Because format v1 does not carry
+caller must discard that policy instance. Collection also restores and verifies its
+sampler prestate after any generation or publication failure. Because format v2 does not carry
 composable collector performance measurements, the ordinary
 whole-window timing, throughput, GPU-memory, and decoder-cache fields are written
-as explicitly unmeasured rather than populated from learner-only work. Sampler-state
-handoff and multi-step orchestration follow in a later slice. Non-finite logprobs,
+as explicitly unmeasured rather than populated from learner-only work. Non-finite logprobs,
 advantages, and resolved controls fail closed, while non-finite rewards retain the
 trainer's existing zero-advantage hardening. Unknown ledger manifest and payload
 fields are rejected.
 
-Format v1 is intentionally world-1 only. It rejects distributed payloads instead
+Format v2 is intentionally world-1 only. It rejects distributed payloads instead
 of treating rank-local rewards or token counts as a complete optimizer window.
-Multi-step durable orchestration, sampler-state handoff, and DP/TP completeness
-are subsequent Phase 1.5C slices built on this artifact contract.
+The durable multi-step protocol is `C_k → collect L_k → learn L_k → publish
+C_(k+1)`; outer checkpoint progress stays distinct from Adam's update counter.
+DP/TP completeness is a subsequent Phase 1.5C slice built on this contract.
 
 ## Training run layout (`runs/`)
 
