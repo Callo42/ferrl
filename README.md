@@ -463,16 +463,40 @@ versioned manifest last as the reader-visible commit marker.
 trainer/model/adapter/optimizer identity, mandatory structured learner controls,
 and all token, prompt-order, behavior-logprob, reward, advantage, EOS-mask, and
 scoring-requirement invariants before returning a `ValidatedRolloutLedgerStep`.
-Identity digests and the learner's resolved controls are supplied independently;
-deriving them from live trainer, model, adapter, and optimizer state lands with
-learner integration. Non-finite logprobs, advantages, and resolved controls fail
-closed, while non-finite rewards retain the trainer's existing zero-advantage
-hardening. Unknown semantic fields are never defaulted.
+`Trainer::collect_rollout_ledger_step` now publishes one complete world-1 window
+without old/reference scoring or an optimizer mutation, and
+`Trainer::train_rollout_ledger_step` recomputes the learner pre-state, validates
+the immutable package, performs the required detached scoring, and feeds the
+existing update path. The trainer derives the learner-semantic configuration
+projection (excluding run horizon and output/telemetry controls), structured
+controls, positional tensor schema plus LoRA recipe, adapter values, optimizer
+moments, source step, and optimizer counter from live state. The one explicit
+input is a verified SHA-256 digest binding the frozen model content and execution
+recipe, which the generic `Policy` seam cannot enumerate today. Collection
+rechecks the live identity before publication so a policy that mutates trainable
+state during generation fails closed.
+
+The separated learner returns its exact post-update Adam state and appends its
+metrics row, but deliberately does not write a checkpoint yet: its local sampler
+did not produce the collector's rollouts, so checkpointing that sampler would make
+resume provenance false. Any failure after validation restores the adapter, Adam
+state, and adapter-enabled flag to their exact pre-call state while the policy
+retains the same live trainable-variable binding. Replacing those variables during
+adapter toggling or scoring is a contract violation: the generic policy seam cannot
+reattach the original binding, so the learner reports rollback failure and the
+caller must discard that policy instance. Because format v1 does not carry
+composable collector performance measurements, the ordinary
+whole-window timing, throughput, GPU-memory, and decoder-cache fields are written
+as explicitly unmeasured rather than populated from learner-only work. Sampler-state
+handoff and multi-step orchestration follow in a later slice. Non-finite logprobs,
+advantages, and resolved controls fail closed, while non-finite rewards retain the
+trainer's existing zero-advantage hardening. Unknown ledger manifest and payload
+fields are rejected.
 
 Format v1 is intentionally world-1 only. It rejects distributed payloads instead
 of treating rank-local rewards or token counts as a complete optimizer window.
-The trainer collection/consumption entry points and then DP/TP completeness are
-subsequent Phase 1.5C slices built on this artifact contract.
+Multi-step durable orchestration, sampler-state handoff, and DP/TP completeness
+are subsequent Phase 1.5C slices built on this artifact contract.
 
 ## Training run layout (`runs/`)
 

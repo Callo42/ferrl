@@ -63,6 +63,7 @@
 //! accumulated gradients over the TP communicator before coverage, clipping, and
 //! optimizer step, and TP rank 0 owns shared side effects such as checkpoints.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -72,6 +73,7 @@ use candle_core::{DType, Device, Result as CandleResult, Tensor, Var, D};
 use candle_nn::optim::ParamsAdamW;
 use candle_nn::Optimizer;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::comm::{Comm, SoloComm};
 use crate::grpo::{
@@ -82,6 +84,11 @@ use crate::nn::grad_coverage;
 use crate::optim::{FerrlAdamW, OptimizerState};
 use crate::policy::{GenConfig, Policy, Rollout, TensorParallelPolicy};
 use crate::reward::{RewardError, RewardFn, RewardOutcome};
+use crate::rollout_ledger::{
+    LedgerScoreRequirement, RolloutLedgerControls, RolloutLedgerError, RolloutLedgerExpectations,
+    RolloutLedgerGroup, RolloutLedgerIdentity, RolloutLedgerReader, RolloutLedgerStep,
+    RolloutLedgerWriter,
+};
 use crate::sample::Sample;
 use crate::telemetry::{
     cuda_memory_snapshot, CandidateRecord, CandidateWriter, DecoderCacheSnapshot,
@@ -119,6 +126,9 @@ pub enum TrainerError {
     /// timing out, or a poisoned world) — see [`crate::comm`].
     #[error(transparent)]
     Comm(#[from] crate::comm::CommError),
+    /// A separated rollout/learner ledger could not be published or validated.
+    #[error(transparent)]
+    RolloutLedger(#[from] RolloutLedgerError),
 }
 
 /// Bridges prompt / completion text and token ids for the trainer.
@@ -495,6 +505,41 @@ pub struct TrainerConfig {
     pub eos_token_id: Option<u32>,
 }
 
+/// The stable, learner-semantic projection bound into a rollout-ledger identity.
+///
+/// Keeping this projection typed and exhaustive makes every future `TrainerConfig`
+/// field choose explicitly between learner semantics and operational orchestration.
+/// The four omitted fields (`steps`, checkpoint cadence, candidate logging, and GPU
+/// probing) do not change one validated learner update.
+#[derive(Serialize)]
+struct RolloutLedgerTrainerSemantics<'a> {
+    group_size: &'a usize,
+    max_new_tokens: &'a usize,
+    temperature: &'a f64,
+    mu: &'a usize,
+    beta: &'a f64,
+    beta_schedule: &'a Option<ScalarSchedule>,
+    clip_eps: &'a f64,
+    clip_eps_high: &'a Option<f64>,
+    importance_sampling_level: &'a ImportanceSamplingLevel,
+    lr: &'a f64,
+    lr_schedule: &'a Option<ScalarSchedule>,
+    weight_decay: &'a f64,
+    adam_beta1: &'a f64,
+    adam_beta2: &'a f64,
+    warmup_steps: &'a u64,
+    max_grad_norm: &'a Option<f64>,
+    truncation_masking: &'a bool,
+    tis: &'a bool,
+    tis_imp_ratio_cap: &'a f64,
+    loss_type: &'a LossType,
+    scale_rewards: &'a ScaleRewards,
+    reward_group_scope: &'a RewardGroupScope,
+    grad_accum_steps: &'a usize,
+    backward_microbatch_size: &'a usize,
+    eos_token_id: &'a Option<u32>,
+}
+
 /// `serde` default for [`TrainerConfig::grad_accum_steps`]: `1` (no accumulation).
 fn default_grad_accum_steps() -> usize {
     1
@@ -835,6 +880,67 @@ impl TrainerConfig {
         TrainerConfigBuilder::new()
     }
 
+    fn rollout_ledger_semantics(&self) -> RolloutLedgerTrainerSemantics<'_> {
+        let TrainerConfig {
+            steps: _,
+            group_size,
+            max_new_tokens,
+            temperature,
+            mu,
+            beta,
+            beta_schedule,
+            clip_eps,
+            clip_eps_high,
+            importance_sampling_level,
+            lr,
+            lr_schedule,
+            weight_decay,
+            adam_beta1,
+            adam_beta2,
+            warmup_steps,
+            max_grad_norm,
+            truncation_masking,
+            tis,
+            tis_imp_ratio_cap,
+            loss_type,
+            scale_rewards,
+            reward_group_scope,
+            grad_accum_steps,
+            backward_microbatch_size,
+            checkpoint_every: _,
+            candidate_log_top_k: _,
+            gpu_memory_probe: _,
+            eos_token_id,
+        } = self;
+        RolloutLedgerTrainerSemantics {
+            group_size,
+            max_new_tokens,
+            temperature,
+            mu,
+            beta,
+            beta_schedule,
+            clip_eps,
+            clip_eps_high,
+            importance_sampling_level,
+            lr,
+            lr_schedule,
+            weight_decay,
+            adam_beta1,
+            adam_beta2,
+            warmup_steps,
+            max_grad_norm,
+            truncation_masking,
+            tis,
+            tis_imp_ratio_cap,
+            loss_type,
+            scale_rewards,
+            reward_group_scope,
+            grad_accum_steps,
+            backward_microbatch_size,
+            eos_token_id,
+        }
+    }
+
     /// Reject settings that would silently do nothing or crash mid-run.
     ///
     /// In particular `mu = 0` would run **no** inner update — no backward, no
@@ -1031,6 +1137,19 @@ struct LiveItem {
     tis_w: Option<Tensor>,
 }
 
+/// Host-side collector output for one prompt group. This is the exact boundary
+/// between rollout/reward work and learner-owned detached scoring/tensorization.
+struct CollectedGroup {
+    accum_index: u32,
+    prompt_index: u64,
+    rollout: Rollout,
+    rewards: Vec<f32>,
+    advantages: Vec<f64>,
+    mask_rows: Vec<Vec<f64>>,
+    stat: PromptStat,
+    surrogate_live: bool,
+}
+
 fn slice_live_item(item: &LiveItem, start: usize, len: usize) -> CandleResult<LiveItem> {
     let end = start + len;
     let rollout = Rollout::new(
@@ -1106,6 +1225,7 @@ struct CandidateWriteCtx {
 struct SelectedSample<'a, T> {
     sample: &'a Sample<T>,
     selection: &'a PromptSelection,
+    accum_index: usize,
 }
 
 #[derive(Debug, Default)]
@@ -1628,6 +1748,665 @@ impl Trainer {
     pub fn with_checkpoints_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.checkpoints_dir = dir.into();
         self
+    }
+
+    /// Collect and atomically publish one world-1 rollout window without scoring
+    /// old/reference log-probabilities or mutating learner parameters.
+    ///
+    /// `policy_sha256` must be a verified lowercase SHA-256 digest binding the
+    /// frozen model content and its execution recipe. It is the sole identity
+    /// datum the generic [`Policy`] seam cannot derive from live state today.
+    /// Format v1 does not publish collector performance telemetry; a future
+    /// phase-specific schema can do so without mislabelling asynchronous work as
+    /// an ordinary whole trainer step.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrainerError`] for a non-world-1 trainer, an out-of-range step,
+    /// malformed identity/state, collection failure, or publication failure.
+    #[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
+    pub fn collect_rollout_ledger_step<P, R>(
+        &mut self,
+        step: u64,
+        policy: &mut P,
+        reward_fn: &R,
+        tokenizer: &dyn TokenizerLike,
+        samples: &[Sample<R::Target>],
+        root: impl AsRef<Path>,
+        policy_sha256: &str,
+        optimizer_state: Option<&OptimizerState>,
+    ) -> Result<PathBuf, TrainerError>
+    where
+        P: Policy,
+        R: RewardFn,
+    {
+        self.require_world_one_rollout_ledger()?;
+        self.require_rollout_ledger_step_in_range(step)?;
+        validate_external_policy_sha256(policy_sha256)?;
+        if samples.is_empty() {
+            return Err(TrainerError::Contract(
+                "collect_rollout_ledger_step: no samples".into(),
+            ));
+        }
+
+        let vars = policy.trainable_vars();
+        let mut opt = self.new_optimizer(vars.clone())?;
+        if let Some(state) = optimizer_state {
+            opt.load_state(state)?;
+        }
+        let step_lr = self.config.lr_at(step);
+        let step_beta = self.config.beta_at(step);
+        self.require_toggleable_reference_policy(policy, self.config.requires_reference_policy())?;
+        opt.set_learning_rate(step_lr);
+        let installed_lr = opt.learning_rate();
+        let controls = self.rollout_ledger_controls(step, installed_lr, step_beta)?;
+        let identity = self.rollout_ledger_identity(step, policy, policy_sha256, &vars, &opt)?;
+        // Validate the complete live identity before generation changes policy-local
+        // rollout state, and claim/create only the caller-provided ledger root.
+        let writer = RolloutLedgerWriter::create(root.as_ref(), identity.clone())?;
+
+        let exec = UnshardedPolicyExecution;
+        let mut gpu_mem = StepGpuMemory::new(false);
+        let mut collected = Vec::with_capacity(self.config.grad_accum_steps);
+        for j in 0..self.config.grad_accum_steps {
+            let sel = self.select_prompt(step, j, samples.len());
+            self.record_prompt_selection(&sel);
+            let selected = SelectedSample {
+                sample: &samples[sel.sample_idx],
+                selection: &sel,
+                accum_index: j,
+            };
+            collected.push(self.collect_group(
+                step,
+                step_beta,
+                policy,
+                reward_fn,
+                tokenizer,
+                &selected,
+                &mut gpu_mem,
+                &exec,
+            )?);
+        }
+        let post_collection_vars = policy.trainable_vars();
+        self.require_same_rollout_ledger_vars(&vars, &post_collection_vars, "rollout collection")?;
+        let post_collection_identity =
+            self.rollout_ledger_identity(step, policy, policy_sha256, &post_collection_vars, &opt)?;
+        if post_collection_identity != identity {
+            return Err(TrainerError::Contract(
+                "learner identity changed during rollout collection".into(),
+            ));
+        }
+        let payload = self.rollout_ledger_payload(step, &controls, &collected)?;
+        writer.write_step(&payload).map_err(TrainerError::from)
+    }
+
+    /// Validate and consume one world-1 rollout ledger window as one learner
+    /// optimizer step, returning the metrics row and exact post-update Adam state.
+    /// This separated learner API deliberately does not checkpoint: the learner's
+    /// sampler has not advanced through the collector's rollouts, so persisting it
+    /// would create an unfaithful resume. Sampler-state handoff is a later contract.
+    /// Rollout-ledger v1 carries no collector timing or device-memory telemetry, so
+    /// the returned/persisted whole-window performance fields remain explicitly
+    /// unmeasured rather than relabelling learner-only work as a complete step.
+    /// Exact rollback requires the policy to retain the same trainable [`Var`]
+    /// binding across adapter toggling and scoring. A policy that replaces those
+    /// bindings is rejected, and—because the generic [`Policy`] seam cannot
+    /// reattach the original variables—the returned contract error also reports
+    /// that rollback could not restore the exact pre-call state; callers must
+    /// discard that policy instance.
+    ///
+    /// `policy_sha256` has the same externally verified frozen-model/execution
+    /// meaning as on [`collect_rollout_ledger_step`](Self::collect_rollout_ledger_step).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrainerError`] for a non-world-1 trainer, an out-of-range step,
+    /// malformed/mismatched learner state, invalid ledger data, scoring/backward
+    /// failure, a grad-canary failure, or a metrics write failure.
+    #[allow(clippy::cognitive_complexity)]
+    pub fn train_rollout_ledger_step<P: Policy>(
+        &mut self,
+        step: u64,
+        policy: &mut P,
+        root: impl AsRef<Path>,
+        policy_sha256: &str,
+        optimizer_state: Option<&OptimizerState>,
+    ) -> Result<(Metrics, OptimizerState), TrainerError> {
+        self.require_world_one_rollout_ledger()?;
+        self.require_rollout_ledger_step_in_range(step)?;
+        validate_external_policy_sha256(policy_sha256)?;
+        let vars = policy.trainable_vars();
+        let mut opt = self.new_optimizer(vars.clone())?;
+        if let Some(state) = optimizer_state {
+            opt.load_state(state)?;
+        }
+        let step_lr = self.config.lr_at(step);
+        let step_beta = self.config.beta_at(step);
+        opt.set_learning_rate(step_lr);
+        let controls = self.rollout_ledger_controls(step, opt.learning_rate(), step_beta)?;
+        let identity = self.rollout_ledger_identity(step, policy, policy_sha256, &vars, &opt)?;
+        let reader = RolloutLedgerReader::open(
+            root.as_ref(),
+            RolloutLedgerExpectations { identity, controls },
+        )?;
+        // No policy mutation occurs until the complete artifact is validated.
+        let validated = reader.read_step(step)?;
+        let validated_identity = validated.identity().clone();
+        let payload = validated.into_step();
+        let adapter_prestate = Self::snapshot_rollout_ledger_vars(&vars)?;
+        let optimizer_prestate = opt.state()?;
+        let adapter_enabled_prestate = policy.adapter_enabled();
+        let outcome: Result<(Metrics, OptimizerState), TrainerError> = (|| {
+            self.require_toggleable_reference_policy(
+                policy,
+                self.config.requires_reference_policy(),
+            )?;
+            let post_toggle_vars = policy.trainable_vars();
+            self.require_same_rollout_ledger_vars(
+                &vars,
+                &post_toggle_vars,
+                "reference-policy preflight",
+            )?;
+            let post_toggle_identity =
+                self.rollout_ledger_identity(step, policy, policy_sha256, &post_toggle_vars, &opt)?;
+            if post_toggle_identity != validated_identity {
+                return Err(TrainerError::Contract(
+                    "learner identity changed during reference-policy preflight".into(),
+                ));
+            }
+
+            let exec = UnshardedPolicyExecution;
+            // Ledger v1 has no composable collector/learner performance schema.
+            // Keep the existing update instrumentation sink disabled and leave the
+            // ordinary whole-window timing/memory fields at their neutral defaults.
+            let mut gpu_mem = StepGpuMemory::new(false);
+            let mut stats = Vec::with_capacity(payload.groups.len());
+            let mut live = Vec::with_capacity(payload.live_items as usize);
+            for group in &payload.groups {
+                let collected = self.collected_group_from_ledger(group)?;
+                let (stat, item) = self.materialize_collected_group(
+                    policy,
+                    collected,
+                    step_beta,
+                    &mut gpu_mem,
+                    &exec,
+                )?;
+                stats.push(stat);
+                if let Some(item) = item {
+                    live.push(item);
+                }
+            }
+            let post_scoring_vars = policy.trainable_vars();
+            self.require_same_rollout_ledger_vars(
+                &vars,
+                &post_scoring_vars,
+                "detached ledger scoring",
+            )?;
+            let post_scoring_identity = self.rollout_ledger_identity(
+                step,
+                policy,
+                policy_sha256,
+                &post_scoring_vars,
+                &opt,
+            )?;
+            if post_scoring_identity != validated_identity {
+                return Err(TrainerError::Contract(
+                    "learner identity changed during detached ledger scoring".into(),
+                ));
+            }
+            let agg = if live.is_empty() {
+                InnerAgg::default()
+            } else {
+                let mut ctx = UpdateCtx {
+                    vars: &vars,
+                    opt: &mut opt,
+                    gpu_mem: &mut gpu_mem,
+                };
+                self.update_window(
+                    policy,
+                    &live,
+                    &mut ctx,
+                    payload.window_tokens as f64,
+                    f64::from(payload.live_items),
+                    step_beta,
+                    &exec,
+                )?
+            };
+            let post_update_vars = policy.trainable_vars();
+            self.require_same_rollout_ledger_vars(
+                &vars,
+                &post_update_vars,
+                "rollout-ledger learner update",
+            )?;
+            let metrics = self.build_window_metrics(step, step_beta, &stats, &agg, &opt);
+            // Capture the faithful continuation before the final fallible side effect.
+            let optimizer_state = opt.state()?;
+            self.append_metrics::<P, _>(&metrics, &exec)?;
+            Ok((metrics, optimizer_state))
+        })();
+
+        match outcome {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                if let Err(rollback) = Self::restore_rollout_ledger_prestate(
+                    policy,
+                    &vars,
+                    &adapter_prestate,
+                    &mut opt,
+                    &optimizer_prestate,
+                    adapter_enabled_prestate,
+                ) {
+                    return Err(TrainerError::Contract(format!(
+                        "rollout-ledger learner failed ({error}); restoring its pre-state also failed: {rollback}"
+                    )));
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn require_world_one_rollout_ledger(&self) -> Result<(), TrainerError> {
+        if self.comm.rank() != 0 || self.comm.world_size() != 1 {
+            return Err(TrainerError::Contract(format!(
+                "rollout ledger trainer integration is world-1 only (got rank {}/world {})",
+                self.comm.rank(),
+                self.comm.world_size()
+            )));
+        }
+        Ok(())
+    }
+
+    fn require_rollout_ledger_step_in_range(&self, step: u64) -> Result<(), TrainerError> {
+        if step >= self.config.steps {
+            return Err(TrainerError::Contract(format!(
+                "rollout ledger step {step} is outside configured steps 0..{}",
+                self.config.steps
+            )));
+        }
+        Ok(())
+    }
+
+    fn require_toggleable_reference_policy<P: Policy>(
+        &self,
+        policy: &mut P,
+        required: bool,
+    ) -> Result<(), TrainerError> {
+        if !required {
+            return Ok(());
+        }
+        policy.set_adapter_enabled(false);
+        let toggleable = !policy.adapter_enabled();
+        policy.set_adapter_enabled(true);
+        if !toggleable {
+            return Err(TrainerError::Contract(
+                "beta > 0 needs the adapter-disabled reference policy, but this policy cannot \
+                 disable its adapter (full fine-tuning mode?) — train with beta = 0, or use a \
+                 LoRA recipe for KL-regularized runs"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn new_optimizer(&self, vars: Vec<Var>) -> Result<FerrlAdamW, TrainerError> {
+        let params = ParamsAdamW {
+            lr: self.config.lr,
+            weight_decay: self.config.weight_decay,
+            beta1: self.config.adam_beta1,
+            beta2: self.config.adam_beta2,
+            ..Default::default()
+        };
+        Ok(FerrlAdamW::new(vars, params)?)
+    }
+
+    fn require_same_rollout_ledger_vars(
+        &self,
+        expected: &[Var],
+        actual: &[Var],
+        phase: &str,
+    ) -> Result<(), TrainerError> {
+        if !Self::same_rollout_ledger_vars(expected, actual) {
+            return Err(TrainerError::Contract(format!(
+                "policy trainable-variable set changed during {phase}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn same_rollout_ledger_vars(expected: &[Var], actual: &[Var]) -> bool {
+        expected.len() == actual.len()
+            && expected
+                .iter()
+                .zip(actual)
+                .all(|(expected, actual)| expected.as_tensor().id() == actual.as_tensor().id())
+    }
+
+    fn snapshot_rollout_ledger_vars(vars: &[Var]) -> Result<Vec<Tensor>, TrainerError> {
+        vars.iter()
+            .map(|var| Ok(var.as_tensor().copy()?.contiguous()?))
+            .collect()
+    }
+
+    #[allow(clippy::cognitive_complexity)] // rollback must aggregate every independent failure
+    fn restore_rollout_ledger_prestate<P: Policy>(
+        policy: &mut P,
+        vars: &[Var],
+        adapter_prestate: &[Tensor],
+        opt: &mut FerrlAdamW,
+        optimizer_prestate: &OptimizerState,
+        adapter_enabled_prestate: bool,
+    ) -> Result<(), TrainerError> {
+        let mut failures = Vec::new();
+        // Restore the flag first: an adversarial policy may replace its live Vars
+        // from set_adapter_enabled itself. Only the binding observed after the
+        // final flag transition is eligible for a successful rollback.
+        policy.set_adapter_enabled(adapter_enabled_prestate);
+        let active_vars = policy.trainable_vars();
+        if !Self::same_rollout_ledger_vars(vars, &active_vars) {
+            failures.push(
+                "policy trainable-variable binding changed and cannot be restored through the Policy seam"
+                    .into(),
+            );
+        }
+        if vars.len() != adapter_prestate.len() {
+            failures.push(format!(
+                "adapter snapshot has {} tensors for {} live variables",
+                adapter_prestate.len(),
+                vars.len()
+            ));
+        } else {
+            for (index, (var, snapshot)) in vars.iter().zip(adapter_prestate).enumerate() {
+                if let Err(error) = var.set(snapshot) {
+                    failures.push(format!("restore adapter tensor {index}: {error}"));
+                }
+            }
+        }
+        if let Err(error) = opt.load_state(optimizer_prestate) {
+            failures.push(format!("restore optimizer state: {error}"));
+        }
+        if policy.adapter_enabled() != adapter_enabled_prestate {
+            failures.push("restore adapter-enabled state".into());
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(TrainerError::Contract(failures.join("; ")))
+        }
+    }
+
+    fn rollout_ledger_controls(
+        &self,
+        step: u64,
+        effective_lr: f64,
+        effective_beta: f64,
+    ) -> Result<RolloutLedgerControls, TrainerError> {
+        let grad_accum_steps = u32::try_from(self.config.grad_accum_steps).map_err(|_| {
+            TrainerError::Contract("grad_accum_steps does not fit rollout ledger u32".into())
+        })?;
+        let group_size = u32::try_from(self.config.group_size).map_err(|_| {
+            TrainerError::Contract("group_size does not fit rollout ledger u32".into())
+        })?;
+        let completion_width = u32::try_from(self.config.max_new_tokens).map_err(|_| {
+            TrainerError::Contract("max_new_tokens does not fit rollout ledger u32".into())
+        })?;
+        debug_assert_eq!(effective_lr.to_bits(), self.config.lr_at(step).to_bits());
+        debug_assert_eq!(
+            effective_beta.to_bits(),
+            self.config.beta_at(step).to_bits()
+        );
+        Ok(RolloutLedgerControls {
+            grad_accum_steps,
+            group_size,
+            completion_width,
+            scale_rewards: self.config.scale_rewards,
+            eos_token_id: self.config.eos_token_id,
+            truncation_masking: self.config.truncation_masking,
+            tis_imp_ratio_cap_bits: self
+                .config
+                .tis
+                .then_some(self.config.tis_imp_ratio_cap.to_bits()),
+            effective_lr_bits: effective_lr.to_bits(),
+            effective_beta_bits: effective_beta.to_bits(),
+        })
+    }
+
+    fn rollout_ledger_identity<P: Policy>(
+        &self,
+        step: u64,
+        policy: &P,
+        policy_sha256: &str,
+        vars: &[Var],
+        opt: &FerrlAdamW,
+    ) -> Result<RolloutLedgerIdentity, TrainerError> {
+        let config =
+            serde_json::to_vec(&self.config.rollout_ledger_semantics()).map_err(|error| {
+                TrainerError::Contract(format!(
+                    "serialize learner-semantic trainer config for ledger identity: {error}"
+                ))
+            })?;
+        let schema: Vec<(String, Vec<usize>, String)> = vars
+            .iter()
+            .enumerate()
+            .map(|(index, var)| {
+                (
+                    format!("lora.{index:05}"),
+                    var.as_tensor().dims().to_vec(),
+                    var.as_tensor().dtype().as_str().to_owned(),
+                )
+            })
+            .collect();
+        let schema = serde_json::to_vec(&(policy.lora_recipe(), schema)).map_err(|error| {
+            TrainerError::Contract(format!(
+                "serialize tensor schema for ledger identity: {error}"
+            ))
+        })?;
+        let adapter = canonical_tensor_bytes(
+            vars.iter()
+                .enumerate()
+                .map(|(index, var)| (format!("lora.{index:05}"), var.as_tensor())),
+        )?;
+        let optimizer_state = opt.state()?;
+        let optimizer_step = u64::try_from(optimizer_state.step_t).map_err(|_| {
+            TrainerError::Contract("optimizer step does not fit rollout ledger u64".into())
+        })?;
+        let optimizer = canonical_tensor_bytes(
+            optimizer_state
+                .first_moments
+                .iter()
+                .enumerate()
+                .map(|(index, tensor)| (format!("m.{index:05}"), tensor))
+                .chain(
+                    optimizer_state
+                        .second_moments
+                        .iter()
+                        .enumerate()
+                        .map(|(index, tensor)| (format!("v.{index:05}"), tensor)),
+                ),
+        )?;
+        Ok(RolloutLedgerIdentity {
+            trainer_config_sha256: domain_sha256(
+                "ferrl.rollout-ledger.trainer-config.v1",
+                &[&config],
+            ),
+            policy_sha256: policy_sha256.to_owned(),
+            tensor_schema_sha256: domain_sha256(
+                "ferrl.rollout-ledger.tensor-schema.v1",
+                &[&schema],
+            ),
+            adapter_sha256: domain_sha256("ferrl.rollout-ledger.adapter.v1", &[&adapter]),
+            optimizer_sha256: domain_sha256("ferrl.rollout-ledger.optimizer.v1", &[&optimizer]),
+            source_step: step,
+            optimizer_step,
+        })
+    }
+
+    #[allow(clippy::cognitive_complexity)]
+    fn rollout_ledger_payload(
+        &self,
+        step: u64,
+        controls: &RolloutLedgerControls,
+        collected: &[CollectedGroup],
+    ) -> Result<RolloutLedgerStep, TrainerError> {
+        let mut groups = Vec::with_capacity(collected.len());
+        let mut window_tokens = 0_u64;
+        let mut live_items = 0_u32;
+        let beta = f64::from_bits(controls.effective_beta_bits);
+        for item in collected {
+            let completion_lens: Vec<u32> = item
+                .rollout
+                .completion_lens
+                .iter()
+                .map(|&len| {
+                    u32::try_from(len).map_err(|_| {
+                        TrainerError::Contract(
+                            "completion length does not fit rollout ledger u32".into(),
+                        )
+                    })
+                })
+                .collect::<Result<_, _>>()?;
+            for &len in &completion_lens {
+                window_tokens = window_tokens.checked_add(u64::from(len)).ok_or_else(|| {
+                    TrainerError::Contract("rollout ledger window token count overflow".into())
+                })?;
+            }
+            if beta > 0.0 || item.surrogate_live {
+                live_items = live_items.checked_add(1).ok_or_else(|| {
+                    TrainerError::Contract("rollout ledger live item count overflow".into())
+                })?;
+            }
+            groups.push(RolloutLedgerGroup {
+                accum_index: item.accum_index,
+                prompt_index: item.prompt_index,
+                token_ids: item.rollout.token_ids.clone(),
+                prompt_len: u32::try_from(item.rollout.prompt_len).map_err(|_| {
+                    TrainerError::Contract("prompt length does not fit rollout ledger u32".into())
+                })?,
+                completion_lens,
+                behavior_logprob_bits: item.rollout.rollout_logprobs.as_ref().map(|rows| {
+                    rows.iter()
+                        .map(|row| row.iter().map(|value| value.to_bits()).collect())
+                        .collect()
+                }),
+                reward_bits: item.rewards.iter().map(|value| value.to_bits()).collect(),
+                advantage_bits: item
+                    .advantages
+                    .iter()
+                    .map(|&value| (value as f32).to_bits())
+                    .collect(),
+                loss_mask: item
+                    .mask_rows
+                    .iter()
+                    .map(|row| row.iter().map(|&value| u8::from(value > 0.0)).collect())
+                    .collect(),
+            });
+        }
+        Ok(RolloutLedgerStep {
+            step,
+            rank: 0,
+            world_size: 1,
+            grad_accum_steps: controls.grad_accum_steps,
+            group_size: controls.group_size,
+            completion_width: controls.completion_width,
+            scale_rewards: controls.scale_rewards,
+            eos_token_id: controls.eos_token_id,
+            truncation_masking: controls.truncation_masking,
+            tis_imp_ratio_cap_bits: controls.tis_imp_ratio_cap_bits,
+            effective_lr_bits: controls.effective_lr_bits,
+            effective_beta_bits: controls.effective_beta_bits,
+            window_tokens: window_tokens.max(1),
+            live_items,
+            old_logprobs: if live_items > 0 {
+                LedgerScoreRequirement::AdapterEnabledDetached
+            } else {
+                LedgerScoreRequirement::NotRequired
+            },
+            reference_logprobs: if beta > 0.0 {
+                LedgerScoreRequirement::AdapterDisabledDetached
+            } else {
+                LedgerScoreRequirement::NotRequired
+            },
+            groups,
+        })
+    }
+
+    #[allow(clippy::cognitive_complexity)]
+    fn collected_group_from_ledger(
+        &self,
+        group: &RolloutLedgerGroup,
+    ) -> Result<CollectedGroup, TrainerError> {
+        let completion_lens: Vec<usize> = group
+            .completion_lens
+            .iter()
+            .map(|&len| usize::try_from(len))
+            .collect::<Result<_, _>>()
+            .map_err(|_| {
+                TrainerError::Contract("ledger completion length overflows usize".into())
+            })?;
+        let rollout_logprobs = group.behavior_logprob_bits.as_ref().map(|rows| {
+            rows.iter()
+                .map(|row| row.iter().map(|&bits| f32::from_bits(bits)).collect())
+                .collect()
+        });
+        let rollout = Rollout::new(
+            group.token_ids.clone(),
+            usize::try_from(group.prompt_len).map_err(|_| {
+                TrainerError::Contract("ledger prompt length overflows usize".into())
+            })?,
+            completion_lens,
+            rollout_logprobs,
+        );
+        let rewards: Vec<f32> = group
+            .reward_bits
+            .iter()
+            .map(|&bits| f32::from_bits(bits))
+            .collect();
+        let rewards_f64: Vec<f64> = rewards.iter().map(|&value| f64::from(value)).collect();
+        let production_advantages = group_advantages(&rewards_f64, self.config.scale_rewards);
+        let surrogate_live = production_advantages.iter().any(|&value| value != 0.0);
+        let advantages = group
+            .advantage_bits
+            .iter()
+            .map(|&bits| f64::from(f32::from_bits(bits)))
+            .collect();
+        let mask_rows: Vec<Vec<f64>> = group
+            .loss_mask
+            .iter()
+            .map(|row| row.iter().map(|&value| f64::from(value)).collect())
+            .collect();
+        let comp_len = self.config.max_new_tokens;
+        let truncated = if self.config.truncation_masking {
+            self.config.eos_token_id.map_or(0, |eos| {
+                rollout
+                    .completion_lens
+                    .iter()
+                    .zip(&rollout.token_ids)
+                    .filter(|(len, ids)| {
+                        **len == comp_len && ids[rollout.prompt_len + **len - 1] != eos
+                    })
+                    .count()
+            })
+        } else {
+            0
+        };
+        let stat = PromptStat {
+            rewards: rewards.clone(),
+            completion_len: mean_completion_len(&rollout),
+            completion_tokens: rollout.completion_lens.iter().sum(),
+            dropped: zero_mask_rows(&mask_rows),
+            truncated,
+            degenerate: !surrogate_live,
+            ratio_stats: None,
+        };
+        Ok(CollectedGroup {
+            accum_index: group.accum_index,
+            prompt_index: group.prompt_index,
+            rollout,
+            rewards,
+            advantages,
+            mask_rows,
+            stat,
+            surrogate_live,
+        })
     }
 
     /// Run `config.steps` optimizer steps — each over a window of
@@ -2185,19 +2964,7 @@ impl Trainer {
         // full-FT runs take `beta = 0` (no frozen reference exists to pull
         // toward; a base-anchored KL needs a separately loaded base policy,
         // which this trainer does not model).
-        if self.config.requires_reference_policy() {
-            policy.set_adapter_enabled(false);
-            let toggleable = !policy.adapter_enabled();
-            policy.set_adapter_enabled(true);
-            if !toggleable {
-                return Err(TrainerError::Contract(
-                    "beta > 0 needs the adapter-disabled reference policy, but this policy \
-                     cannot disable its adapter (full fine-tuning mode?) — train with \
-                     beta = 0, or use a LoRA recipe for KL-regularized runs"
-                        .into(),
-                ));
-            }
-        }
+        self.require_toggleable_reference_policy(policy, self.config.requires_reference_policy())?;
         let vars = policy.trainable_vars();
         let params = ParamsAdamW {
             lr: self.config.lr,
@@ -2334,6 +3101,7 @@ impl Trainer {
             let selected = SelectedSample {
                 sample: &samples[sel.sample_idx],
                 selection: &sel,
+                accum_index: j,
             };
             let (stat, item) = self.collect_sample(
                 step, beta, policy, reward_fn, tokenizer, &selected, gpu_mem, exec,
@@ -2629,12 +3397,6 @@ impl Trainer {
         }
     }
 
-    /// Collect one sample's group for the current window: rollout (adapter on) →
-    /// reward → group advantages, validating the `Policy` / `RewardFn` contract. A
-    /// degenerate (all-zero-advantage) group returns `(stat, None)` — a GRPO no-op
-    /// with no snapshot and no update; a live group also snapshots the old / reference
-    /// log-probs (taken now, at the window's start) into a [`LiveItem`] for the inner
-    /// epochs.
     #[allow(clippy::too_many_arguments)]
     fn collect_sample<P, R, E>(
         &mut self,
@@ -2647,6 +3409,31 @@ impl Trainer {
         gpu_mem: &mut StepGpuMemory,
         exec: &E,
     ) -> Result<(PromptStat, Option<LiveItem>), TrainerError>
+    where
+        P: Policy,
+        R: RewardFn,
+        E: PolicyExecution<P>,
+    {
+        let collected = self.collect_group(
+            step, beta, policy, reward_fn, tokenizer, selected, gpu_mem, exec,
+        )?;
+        self.materialize_collected_group(policy, collected, beta, gpu_mem, exec)
+    }
+
+    /// Collector half of one prompt group: rollout → reward → host-side mask and
+    /// F64 advantages. It deliberately performs no old/reference learner scoring.
+    #[allow(clippy::too_many_arguments)]
+    fn collect_group<P, R, E>(
+        &mut self,
+        step: u64,
+        _beta: f64,
+        policy: &mut P,
+        reward_fn: &R,
+        tokenizer: &dyn TokenizerLike,
+        selected: &SelectedSample<'_, R::Target>,
+        gpu_mem: &mut StepGpuMemory,
+        exec: &E,
+    ) -> Result<CollectedGroup, TrainerError>
     where
         P: Policy,
         R: RewardFn,
@@ -2685,6 +3472,12 @@ impl Trainer {
         // behavior-log-prob capture), so the decode slice `ids[prompt_len..]`
         // cannot panic on malformed Policy output.
         let (_, comp_len) = completion_dims(&rollout)?;
+        if comp_len != self.config.max_new_tokens {
+            return Err(TrainerError::Contract(format!(
+                "Policy::generate returned completion width {comp_len}, expected max_new_tokens {}",
+                self.config.max_new_tokens
+            )));
+        }
         // The TIS weight is undefined without the behavior policy's probabilities;
         // fail loud on the FIRST prompt rather than silently training uncorrected.
         if self.config.tis && rollout.rollout_logprobs.is_none() {
@@ -2775,19 +3568,55 @@ impl Trainer {
         let rewards_f64: Vec<f64> = rewards.iter().map(|&r| f64::from(r)).collect();
         let advantages = self.reward_group_advantages(&rewards_f64)?;
         let degenerate = advantages.iter().all(|a| *a == 0.0);
-        let mut stat = PromptStat {
+        let stat = PromptStat {
             completion_len: mean_completion_len(&rollout),
             completion_tokens: rollout.completion_lens.iter().sum(),
             dropped,
             truncated,
             degenerate,
             ratio_stats: None,
-            rewards,
+            rewards: rewards.clone(),
         };
-        if degenerate && beta <= 0.0 {
+        Ok(CollectedGroup {
+            accum_index: u32::try_from(selected.accum_index).map_err(|_| {
+                TrainerError::Contract("accumulation index does not fit rollout ledger u32".into())
+            })?,
+            prompt_index: selected.selection.prompt_index,
+            rollout,
+            rewards,
+            advantages,
+            mask_rows,
+            stat,
+            surrogate_live: !degenerate,
+        })
+    }
+
+    /// Learner half of one collected group: enforce the production F64 liveness
+    /// branch, take detached old/reference scores, and tensorize constants.
+    fn materialize_collected_group<P, E>(
+        &self,
+        policy: &mut P,
+        collected: CollectedGroup,
+        beta: f64,
+        gpu_mem: &mut StepGpuMemory,
+        exec: &E,
+    ) -> Result<(PromptStat, Option<LiveItem>), TrainerError>
+    where
+        P: Policy,
+        E: PolicyExecution<P>,
+    {
+        let CollectedGroup {
+            rollout,
+            advantages,
+            mask_rows,
+            mut stat,
+            surrogate_live,
+            ..
+        } = collected;
+        if !surrogate_live && beta <= 0.0 {
             return Ok((stat, None));
         }
-
+        policy.set_adapter_enabled(true);
         // Snapshot the old / reference log-probs once (the window's "old" policy),
         // reused across the mu inner epochs. Value-only, so the detached
         // scoring path: same values, a fraction of the activation footprint
@@ -3392,6 +4221,50 @@ fn step_throughput(tokens: usize, secs: f64) -> f32 {
     } else {
         0.0
     }
+}
+
+fn validate_external_policy_sha256(digest: &str) -> Result<(), TrainerError> {
+    if digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Ok(());
+    }
+    Err(TrainerError::Contract(
+        "policy_sha256 must be 64 lowercase hexadecimal characters".into(),
+    ))
+}
+
+fn domain_sha256(domain: &str, fields: &[&[u8]]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update((domain.len() as u64).to_le_bytes());
+    hasher.update(domain.as_bytes());
+    for field in fields {
+        hasher.update((field.len() as u64).to_le_bytes());
+        hasher.update(field);
+    }
+    let digest = hasher.finalize();
+    format!("{digest:x}")
+}
+
+fn canonical_tensor_bytes<'a>(
+    tensors: impl IntoIterator<Item = (String, &'a Tensor)>,
+) -> Result<Vec<u8>, TrainerError> {
+    let mut ordered = BTreeMap::new();
+    for (name, tensor) in tensors {
+        let canonical = tensor.to_device(&Device::Cpu)?.contiguous()?;
+        ordered.insert(name, canonical);
+    }
+    safetensors::tensor::serialize(
+        ordered.iter().map(|(name, tensor)| (name.as_str(), tensor)),
+        None,
+    )
+    .map_err(|error| {
+        TrainerError::Contract(format!(
+            "serialize exact tensors for rollout ledger identity: {error}"
+        ))
+    })
 }
 
 /// Candidate ledger ordering: higher finite reward first; non-finite rewards sort

@@ -38,6 +38,7 @@
 
 use candle_core::{DType, Device, Result as CandleResult, Tensor, Var, D};
 use candle_nn::ops::log_softmax;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -49,8 +50,8 @@ use ferrl::telemetry::RunDir;
 use ferrl::trainer::{TokenizerLike, Trainer, TrainerConfig, TrainerError};
 use ferrl::{
     tensors_from_pretrained, varbuilder_from_pretrained, Comm, CommError, LocalComm, LossType,
-    Metrics, Qwen3_5Config, Qwen3_5GradModel, Qwen3_5Policy, RewardError, RewardFn, Sample,
-    SoloComm,
+    Metrics, OptimizerState, Qwen3_5Config, Qwen3_5GradModel, Qwen3_5Policy, RewardError, RewardFn,
+    RolloutLedgerError, Sample, SoloComm,
 };
 
 const VOCAB: usize = 5;
@@ -158,6 +159,195 @@ impl Policy for ScriptedPolicy {
 
     fn restore_sampler_state(&mut self, _state: &[u8]) -> CandleResult<()> {
         Ok(())
+    }
+}
+
+/// A forwarding policy with the exact same live trainable tensors as
+/// [`ScriptedPolicy`] but a different declared adapter recipe. Ledger identity
+/// must bind this semantic schema, not only tensor values and shapes.
+struct RecipeScriptedPolicy {
+    inner: ScriptedPolicy,
+}
+
+impl Policy for RecipeScriptedPolicy {
+    fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
+        self.inner.generate(prompt, cfg)
+    }
+
+    fn token_logprobs(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+        self.inner.token_logprobs(rollout)
+    }
+
+    fn set_adapter_enabled(&mut self, enabled: bool) {
+        self.inner.set_adapter_enabled(enabled);
+    }
+
+    fn adapter_enabled(&self) -> bool {
+        self.inner.adapter_enabled()
+    }
+
+    fn trainable_vars(&self) -> Vec<Var> {
+        self.inner.trainable_vars()
+    }
+
+    fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+        self.inner.sampler_state()
+    }
+
+    fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
+        self.inner.restore_sampler_state(state)
+    }
+
+    fn lora_recipe(&self) -> Option<String> {
+        Some("test:alternate-scripted-recipe".to_string())
+    }
+}
+
+/// Replaces its trainable variables with byte-identical fresh variables after
+/// the first rollout. A post-collection check that only rehashes previously
+/// captured `Var` handles cannot observe this policy-state replacement.
+struct ReplacingGeneratePolicy {
+    inner: ScriptedPolicy,
+    seed: u64,
+    replaced: bool,
+}
+
+impl Policy for ReplacingGeneratePolicy {
+    fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
+        let rollout = self.inner.generate(prompt, cfg)?;
+        if !self.replaced {
+            self.inner = ScriptedPolicy::new(self.seed)?;
+            self.replaced = true;
+        }
+        Ok(rollout)
+    }
+
+    fn token_logprobs(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+        self.inner.token_logprobs(rollout)
+    }
+
+    fn set_adapter_enabled(&mut self, enabled: bool) {
+        self.inner.set_adapter_enabled(enabled);
+    }
+
+    fn adapter_enabled(&self) -> bool {
+        self.inner.adapter_enabled()
+    }
+
+    fn trainable_vars(&self) -> Vec<Var> {
+        self.inner.trainable_vars()
+    }
+
+    fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+        self.inner.sampler_state()
+    }
+
+    fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
+        self.inner.restore_sampler_state(state)
+    }
+}
+
+/// Replaces and perturbs its live trainable variables during the learner's
+/// adapter-toggle preflight. The rollback seam cannot reattach the original
+/// handles through `Policy`, so it must report that exact restoration failed.
+struct ReplacingTogglePolicy {
+    inner: ScriptedPolicy,
+    seed: u64,
+    replaced: bool,
+}
+
+impl Policy for ReplacingTogglePolicy {
+    fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
+        self.inner.generate(prompt, cfg)
+    }
+
+    fn token_logprobs(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+        self.inner.token_logprobs(rollout)
+    }
+
+    fn set_adapter_enabled(&mut self, enabled: bool) {
+        if !enabled && !self.replaced {
+            self.inner = ScriptedPolicy::new(self.seed).unwrap();
+            let live_var = self.inner.trainable_vars()[1].clone();
+            let (rows, cols) = live_var.as_tensor().dims2().unwrap();
+            let mut values = vec![0.0_f32; rows * cols];
+            values[0] = 0.125;
+            live_var
+                .set(&Tensor::from_vec(values, (rows, cols), &Device::Cpu).unwrap())
+                .unwrap();
+            self.replaced = true;
+        }
+        self.inner.set_adapter_enabled(enabled);
+    }
+
+    fn adapter_enabled(&self) -> bool {
+        self.inner.adapter_enabled()
+    }
+
+    fn trainable_vars(&self) -> Vec<Var> {
+        self.inner.trainable_vars()
+    }
+
+    fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+        self.inner.sampler_state()
+    }
+
+    fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
+        self.inner.restore_sampler_state(state)
+    }
+}
+
+/// Returns a live scoring graph over the original trainable variables, then
+/// replaces the policy's active variables before backward. Gradient coverage
+/// and Adam can still succeed on the orphaned originals, so the learner must
+/// recheck the binding after the complete update.
+struct ReplacingLiveScoringPolicy {
+    inner: RefCell<ScriptedPolicy>,
+    seed: u64,
+    replaced: Cell<bool>,
+}
+
+impl Policy for ReplacingLiveScoringPolicy {
+    fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
+        self.inner.get_mut().generate(prompt, cfg)
+    }
+
+    fn token_logprobs(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+        let logp = self.inner.borrow().token_logprobs(rollout)?;
+        if !self.replaced.replace(true) {
+            let replacement = ScriptedPolicy::new(self.seed)?;
+            let live_var = replacement.trainable_vars()[1].clone();
+            let (rows, cols) = live_var.as_tensor().dims2()?;
+            let mut values = vec![0.0_f32; rows * cols];
+            values[0] = 0.125;
+            live_var.set(&Tensor::from_vec(values, (rows, cols), &Device::Cpu)?)?;
+            *self.inner.borrow_mut() = replacement;
+        }
+        Ok(logp)
+    }
+
+    fn token_logprobs_detached(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+        Ok(self.inner.borrow().token_logprobs(rollout)?.detach())
+    }
+
+    fn set_adapter_enabled(&mut self, enabled: bool) {
+        self.inner.get_mut().set_adapter_enabled(enabled);
+    }
+
+    fn adapter_enabled(&self) -> bool {
+        self.inner.borrow().adapter_enabled()
+    }
+
+    fn trainable_vars(&self) -> Vec<Var> {
+        self.inner.borrow().trainable_vars()
+    }
+
+    fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+        self.inner.borrow().sampler_state()
+    }
+
+    fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
+        self.inner.get_mut().restore_sampler_state(state)
     }
 }
 
@@ -323,6 +513,83 @@ fn var_bits<P: Policy>(policy: &P) -> Vec<Vec<u32>> {
                 .collect()
         })
         .collect()
+}
+
+/// Raw `f32` bits for every tensor in an optimizer-moment list.
+fn tensor_bits(tensors: &[Tensor]) -> Vec<Vec<u32>> {
+    tensors
+        .iter()
+        .map(|tensor| {
+            tensor
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect()
+        })
+        .collect()
+}
+
+/// Adam state as a bitwise-comparable value. The moments matter independently
+/// of the adapter: Adam can cancel a uniform gradient-scale error in the weight
+/// update while retaining the wrong first and second moments.
+fn optimizer_bits(state: &OptimizerState) -> (usize, Vec<Vec<u32>>, Vec<Vec<u32>>) {
+    (
+        state.step_t,
+        tensor_bits(&state.first_moments),
+        tensor_bits(&state.second_moments),
+    )
+}
+
+/// Strip fields that describe wall time or device-memory sampling rather than
+/// the mathematical result of a trainer window.
+fn deterministic_metrics(metrics: &Metrics) -> Metrics {
+    let mut metrics = metrics.clone();
+    metrics.step_secs = 0.0;
+    metrics.tokens_per_sec = 0.0;
+    metrics.cuda_mem_start_used_bytes = 0;
+    metrics.cuda_mem_peak_used_bytes = 0;
+    metrics.cuda_mem_end_used_bytes = 0;
+    metrics.cuda_mem_total_bytes = 0;
+    metrics.cuda_mem_peak_delta_bytes = 0;
+    metrics.cuda_mem_probe_events.clear();
+    metrics.decoder_cache_snapshots.clear();
+    metrics
+}
+
+#[allow(clippy::cognitive_complexity)] // one assertion surface pins every ordinary sentinel
+fn assert_ledger_performance_unmeasured(metrics: &Metrics, context: &str) {
+    assert_eq!(metrics.step_secs, 0.0, "{context}: step_secs");
+    assert_eq!(metrics.tokens_per_sec, 0.0, "{context}: tokens_per_sec");
+    assert_eq!(
+        metrics.cuda_mem_start_used_bytes, 0,
+        "{context}: cuda start"
+    );
+    assert_eq!(metrics.cuda_mem_peak_used_bytes, 0, "{context}: cuda peak");
+    assert_eq!(metrics.cuda_mem_end_used_bytes, 0, "{context}: cuda end");
+    assert_eq!(metrics.cuda_mem_total_bytes, 0, "{context}: cuda total");
+    assert_eq!(
+        metrics.cuda_mem_peak_delta_bytes, 0,
+        "{context}: cuda delta"
+    );
+    assert!(
+        metrics.cuda_mem_probe_events.is_empty(),
+        "{context}: cuda probe events"
+    );
+    assert!(
+        metrics.decoder_cache_snapshots.is_empty(),
+        "{context}: decoder cache snapshots"
+    );
+}
+
+fn assert_ledger_identity_mismatch<T>(result: Result<T, TrainerError>, what: &str) {
+    match result {
+        Err(TrainerError::RolloutLedger(RolloutLedgerError::IdentityMismatch)) => {}
+        Err(error) => panic!("{what}: expected ledger identity mismatch, got {error:?}"),
+        Ok(_) => panic!("{what}: mismatched learner identity was accepted"),
+    }
 }
 
 /// Largest |a - b| across two var-bit snapshots (for the measured envelope).
@@ -639,6 +906,531 @@ fn world_one_localcomm_solocomm_and_legacy_are_bit_identical() {
             "world-1 LocalComm diverged from the legacy constructor at accum {accum}"
         );
     }
+}
+
+/// One separated world-1 ledger window must produce the exact update the
+/// ordinary in-process trainer produces from the same learner pre-state.
+///
+/// The scripted fixture keeps rollouts deterministic while retaining a real
+/// LoRA/autograd/Adam path. Two live prompt groups exercise whole-window
+/// accumulation, and `mu = 2` makes the frozen old/reference snapshots
+/// load-bearing on the second inner update. Comparing optimizer moments as well
+/// as adapter values closes Adam's uniform-gradient-scale blind spot.
+#[test]
+#[allow(clippy::cognitive_complexity)] // one end-to-end oracle keeps every prestate rejection visible
+fn world_one_rollout_ledger_update_is_bit_identical_to_direct_training() {
+    let tmp = TempDir::new("world1-ledger-equivalence");
+    let samples = live_samples();
+    let cfg = TrainerConfig {
+        steps: 1,
+        grad_accum_steps: 2,
+        checkpoint_every: Some(1),
+        ..scripted_cfg()
+    };
+    let policy_sha256 = format!("{:064x}", 1);
+
+    // Direct reference: one ordinary trainer window, including a
+    // momentum-faithful checkpoint so its otherwise-private Adam state is
+    // observable through the existing public checkpoint API.
+    let mut direct_policy = ScriptedPolicy::new(SEED).unwrap();
+    let initial_adapter = var_bits(&direct_policy);
+    let direct_run = RunDir::create(tmp.path(), "direct").unwrap();
+    let mut direct_trainer = Trainer::new(cfg.clone(), &direct_run).unwrap();
+    let (direct_history, _) = direct_trainer
+        .train(
+            &mut direct_policy,
+            &EchoOrFlatReward,
+            &CharTokenizer,
+            &samples,
+        )
+        .unwrap();
+    assert_eq!(direct_history.len(), 1);
+    let direct_metrics = &direct_history[0];
+    assert!(
+        direct_metrics.grad_norm > 0.0,
+        "direct reference performed no real optimizer update"
+    );
+    assert!(
+        direct_metrics.kl > 0.0,
+        "mu=2/beta>0 reference did not exercise the frozen reference snapshot"
+    );
+    assert!(
+        direct_metrics.step_secs > 0.0 && direct_metrics.tokens_per_sec > 0.0,
+        "ordinary direct training did not publish measured whole-window performance"
+    );
+    let direct_adapter = var_bits(&direct_policy);
+    assert_ne!(
+        direct_adapter, initial_adapter,
+        "direct reference left the adapter at initialization"
+    );
+    let direct_probe = ScriptedPolicy::new(SEED.wrapping_add(1)).unwrap();
+    let direct_checkpoint = ferrl::checkpoint::load_checkpoint(
+        direct_run.checkpoints_dir().join("step-1"),
+        &direct_probe.trainable_vars(),
+    )
+    .unwrap();
+    let direct_optimizer = direct_checkpoint
+        .optimizer_state
+        .expect("direct checkpoint must contain Adam state");
+    assert_eq!(direct_optimizer.step_t, cfg.mu);
+
+    // Fresh, byte-identical Vars are still a different live optimizer binding.
+    // The collector must re-read the policy's current variable set and reject
+    // the replacement before publishing a ledger step.
+    let replacing_root = tmp.path().join("replacing-rollout-ledger");
+    let mut replacing_policy = ReplacingGeneratePolicy {
+        inner: ScriptedPolicy::new(SEED).unwrap(),
+        seed: SEED,
+        replaced: false,
+    };
+    let replacing_run = RunDir::create(tmp.path(), "replacing-collector").unwrap();
+    let mut replacing_collector = Trainer::new(cfg.clone(), &replacing_run).unwrap();
+    match replacing_collector.collect_rollout_ledger_step(
+        0,
+        &mut replacing_policy,
+        &EchoOrFlatReward,
+        &CharTokenizer,
+        &samples,
+        &replacing_root,
+        &policy_sha256,
+        None,
+    ) {
+        Err(TrainerError::Contract(message)) => assert!(
+            message.contains("trainable-variable set changed during rollout collection"),
+            "unexpected replacement rejection: {message}"
+        ),
+        Err(error) => panic!("expected trainable-variable replacement rejection, got {error:?}"),
+        Ok(path) => panic!("trainable-variable replacement published {path:?}"),
+    }
+    assert!(
+        std::fs::read_dir(&replacing_root).unwrap().next().is_none(),
+        "rejected collection left a reader-visible package"
+    );
+
+    // Separated path: collect with one policy instance and consume with an
+    // independent instance holding the same learner pre-state.
+    let ledger_root = tmp.path().join("rollout-ledger");
+    let mut collector_policy = ScriptedPolicy::new(SEED).unwrap();
+    let collector_run = RunDir::create(tmp.path(), "collector").unwrap();
+    let mut collector = Trainer::new(cfg.clone(), &collector_run).unwrap();
+    collector
+        .collect_rollout_ledger_step(
+            0,
+            &mut collector_policy,
+            &EchoOrFlatReward,
+            &CharTokenizer,
+            &samples,
+            &ledger_root,
+            &policy_sha256,
+            None,
+        )
+        .unwrap();
+
+    // A learner-side replacement is detected after reference-toggle preflight,
+    // but rollback cannot falsely claim success by restoring only the now-stale
+    // original handles. The combined error makes the policy-discard requirement
+    // explicit, while still restoring its independently controlled enable flag.
+    let mut replacing_learner = ReplacingTogglePolicy {
+        inner: ScriptedPolicy::new(SEED).unwrap(),
+        seed: SEED,
+        replaced: false,
+    };
+    let replacing_before = var_bits(&replacing_learner);
+    let replacing_ids_before: Vec<_> = replacing_learner
+        .trainable_vars()
+        .iter()
+        .map(|var| var.as_tensor().id())
+        .collect();
+    let replacing_learner_run = RunDir::create(tmp.path(), "replacing-toggle-learner").unwrap();
+    let mut replacing_learner_trainer = Trainer::new(cfg.clone(), &replacing_learner_run).unwrap();
+    match replacing_learner_trainer.train_rollout_ledger_step(
+        0,
+        &mut replacing_learner,
+        &ledger_root,
+        &policy_sha256,
+        None,
+    ) {
+        Err(TrainerError::Contract(message)) => {
+            assert!(
+                message.contains(
+                    "policy trainable-variable set changed during reference-policy preflight"
+                ),
+                "missing primary replacement failure: {message}"
+            );
+            assert!(
+                message.contains("restoring its pre-state also failed")
+                    && message.contains("trainable-variable binding changed"),
+                "rollback falsely reported success after rebinding: {message}"
+            );
+        }
+        Err(error) => panic!("expected terminal learner rebinding error, got {error:?}"),
+        Ok(_) => panic!("learner trainable-variable replacement unexpectedly succeeded"),
+    }
+    let replacing_ids_after: Vec<_> = replacing_learner
+        .trainable_vars()
+        .iter()
+        .map(|var| var.as_tensor().id())
+        .collect();
+    assert_ne!(
+        replacing_ids_after, replacing_ids_before,
+        "replacement fixture did not change the live Var binding"
+    );
+    assert_ne!(
+        var_bits(&replacing_learner),
+        replacing_before,
+        "replacement fixture did not leave a distinguishable live adapter"
+    );
+    assert!(
+        replacing_learner.adapter_enabled(),
+        "rollback did not restore the independently controlled adapter flag"
+    );
+
+    // A one-group, one-epoch update lets live scoring return a graph over the
+    // original Vars and then replace the policy binding. Backward coverage and
+    // Adam both succeed on those orphaned handles; only the post-update binding
+    // barrier can prevent a false successful state and telemetry commit.
+    let live_replacement_cfg = TrainerConfig {
+        grad_accum_steps: 1,
+        mu: 1,
+        checkpoint_every: None,
+        ..cfg.clone()
+    };
+    let live_replacement_root = tmp.path().join("live-replacement-rollout-ledger");
+    let mut live_replacement_collector_policy = ScriptedPolicy::new(SEED).unwrap();
+    let live_replacement_collector_run =
+        RunDir::create(tmp.path(), "live-replacement-collector").unwrap();
+    let mut live_replacement_collector = Trainer::new(
+        live_replacement_cfg.clone(),
+        &live_replacement_collector_run,
+    )
+    .unwrap();
+    live_replacement_collector
+        .collect_rollout_ledger_step(
+            0,
+            &mut live_replacement_collector_policy,
+            &EchoOrFlatReward,
+            &CharTokenizer,
+            &samples,
+            &live_replacement_root,
+            &policy_sha256,
+            None,
+        )
+        .unwrap();
+
+    let mut live_replacement_learner = ReplacingLiveScoringPolicy {
+        inner: RefCell::new(ScriptedPolicy::new(SEED).unwrap()),
+        seed: SEED,
+        replaced: Cell::new(false),
+    };
+    let live_replacement_ids_before: Vec<_> = live_replacement_learner
+        .trainable_vars()
+        .iter()
+        .map(|var| var.as_tensor().id())
+        .collect();
+    let live_replacement_run = RunDir::create(tmp.path(), "live-replacement-learner").unwrap();
+    let mut live_replacement_trainer =
+        Trainer::new(live_replacement_cfg, &live_replacement_run).unwrap();
+    match live_replacement_trainer.train_rollout_ledger_step(
+        0,
+        &mut live_replacement_learner,
+        &live_replacement_root,
+        &policy_sha256,
+        None,
+    ) {
+        Err(TrainerError::Contract(message)) => {
+            assert!(
+                message.contains(
+                    "policy trainable-variable set changed during rollout-ledger learner update"
+                ),
+                "missing post-update replacement failure: {message}"
+            );
+            assert!(
+                message.contains("restoring its pre-state also failed")
+                    && message.contains("trainable-variable binding changed"),
+                "live-scoring rebinding did not reach terminal rollback failure: {message}"
+            );
+        }
+        Err(error) => panic!("expected terminal live-scoring rebinding error, got {error:?}"),
+        Ok(_) => panic!("live-scoring trainable-variable replacement unexpectedly succeeded"),
+    }
+    assert!(
+        live_replacement_learner.replaced.get(),
+        "replacement fixture never reached live scoring"
+    );
+    let live_replacement_ids_after: Vec<_> = live_replacement_learner
+        .trainable_vars()
+        .iter()
+        .map(|var| var.as_tensor().id())
+        .collect();
+    assert_ne!(
+        live_replacement_ids_after, live_replacement_ids_before,
+        "live-scoring fixture did not change the active Var binding"
+    );
+    assert!(
+        ferrl::read_metrics(live_replacement_run.metrics_path())
+            .unwrap()
+            .is_empty(),
+        "rejected live-scoring replacement committed a metrics row"
+    );
+
+    // Run orchestration and output controls do not change a single learner
+    // update. Each mutation must remain compatible with the collector's ledger
+    // while preserving the exact mathematical result.
+    let mut longer_run = cfg.clone();
+    longer_run.steps += 4;
+    let mut different_checkpoint_cadence = cfg.clone();
+    different_checkpoint_cadence.checkpoint_every = None;
+    let mut candidate_logging = cfg.clone();
+    candidate_logging.candidate_log_top_k = 1;
+    let mut gpu_probing = cfg.clone();
+    gpu_probing.gpu_memory_probe = true;
+    for (label, operational_cfg) in [
+        ("different run horizon", longer_run),
+        ("different checkpoint cadence", different_checkpoint_cadence),
+        ("different candidate logging", candidate_logging),
+        ("different GPU probing", gpu_probing),
+    ] {
+        let mut policy = ScriptedPolicy::new(SEED).unwrap();
+        let run = RunDir::create(tmp.path(), format!("operational-{label}")).unwrap();
+        let mut trainer = Trainer::new(operational_cfg, &run).unwrap();
+        let (metrics, optimizer) = trainer
+            .train_rollout_ledger_step(0, &mut policy, &ledger_root, &policy_sha256, None)
+            .unwrap_or_else(|error| panic!("{label} rejected: {error:?}"));
+        assert_eq!(
+            deterministic_metrics(&metrics),
+            deterministic_metrics(direct_metrics),
+            "{label}: mathematical metrics diverged"
+        );
+        assert_eq!(
+            var_bits(&policy),
+            direct_adapter,
+            "{label}: adapter diverged"
+        );
+        assert_eq!(
+            optimizer_bits(&optimizer),
+            optimizer_bits(&direct_optimizer),
+            "{label}: Adam state diverged"
+        );
+        assert_ledger_performance_unmeasured(&metrics, label);
+    }
+
+    // Both public identity inputs and live adapter values are checked before
+    // scoring or mutation. A rejected read must leave the learner untouched.
+    let mut wrong_policy = ScriptedPolicy::new(SEED).unwrap();
+    let wrong_before = var_bits(&wrong_policy);
+    let wrong_run = RunDir::create(tmp.path(), "wrong-policy").unwrap();
+    let mut wrong_trainer = Trainer::new(cfg.clone(), &wrong_run).unwrap();
+    let wrong_digest = format!("{:064x}", 2);
+    assert_ledger_identity_mismatch(
+        wrong_trainer.train_rollout_ledger_step(
+            0,
+            &mut wrong_policy,
+            &ledger_root,
+            &wrong_digest,
+            None,
+        ),
+        "different policy digest",
+    );
+    assert_eq!(
+        var_bits(&wrong_policy),
+        wrong_before,
+        "policy-digest rejection mutated the learner adapter"
+    );
+
+    let mut stale_adapter_policy = ScriptedPolicy::new(SEED).unwrap();
+    let stale_var = stale_adapter_policy.trainable_vars()[1].clone();
+    let (rows, cols) = stale_var.as_tensor().dims2().unwrap();
+    let mut stale_values = vec![0.0_f32; rows * cols];
+    stale_values[0] = 0.125;
+    stale_var
+        .set(&Tensor::from_vec(stale_values, (rows, cols), &Device::Cpu).unwrap())
+        .unwrap();
+    let stale_before = var_bits(&stale_adapter_policy);
+    let stale_run = RunDir::create(tmp.path(), "stale-adapter").unwrap();
+    let mut stale_trainer = Trainer::new(cfg.clone(), &stale_run).unwrap();
+    assert_ledger_identity_mismatch(
+        stale_trainer.train_rollout_ledger_step(
+            0,
+            &mut stale_adapter_policy,
+            &ledger_root,
+            &policy_sha256,
+            None,
+        ),
+        "different live adapter pre-state",
+    );
+    assert_eq!(
+        var_bits(&stale_adapter_policy),
+        stale_before,
+        "adapter-identity rejection mutated the learner adapter"
+    );
+
+    let drift_cfg = TrainerConfig {
+        clip_eps: cfg.clip_eps + 0.01,
+        ..cfg.clone()
+    };
+    let mut drift_policy = ScriptedPolicy::new(SEED).unwrap();
+    let drift_before = var_bits(&drift_policy);
+    let drift_run = RunDir::create(tmp.path(), "config-drift").unwrap();
+    let mut drift_trainer = Trainer::new(drift_cfg, &drift_run).unwrap();
+    assert_ledger_identity_mismatch(
+        drift_trainer.train_rollout_ledger_step(
+            0,
+            &mut drift_policy,
+            &ledger_root,
+            &policy_sha256,
+            None,
+        ),
+        "different clip_eps",
+    );
+    assert_eq!(
+        var_bits(&drift_policy),
+        drift_before,
+        "trainer-config rejection mutated the learner adapter"
+    );
+
+    let mut wrong_optimizer_policy = ScriptedPolicy::new(SEED).unwrap();
+    let wrong_optimizer_before = var_bits(&wrong_optimizer_policy);
+    let wrong_optimizer_run = RunDir::create(tmp.path(), "wrong-optimizer").unwrap();
+    let mut wrong_optimizer_trainer = Trainer::new(cfg.clone(), &wrong_optimizer_run).unwrap();
+    assert_ledger_identity_mismatch(
+        wrong_optimizer_trainer.train_rollout_ledger_step(
+            0,
+            &mut wrong_optimizer_policy,
+            &ledger_root,
+            &policy_sha256,
+            Some(&direct_optimizer),
+        ),
+        "different Adam moments/step counter",
+    );
+    assert_eq!(
+        var_bits(&wrong_optimizer_policy),
+        wrong_optimizer_before,
+        "optimizer-identity rejection mutated the learner adapter"
+    );
+
+    let mut wrong_recipe_policy = RecipeScriptedPolicy {
+        inner: ScriptedPolicy::new(SEED).unwrap(),
+    };
+    assert_eq!(
+        var_bits(&wrong_recipe_policy),
+        initial_adapter,
+        "recipe-drift premise changed the live adapter values"
+    );
+    let wrong_recipe_before = var_bits(&wrong_recipe_policy);
+    let wrong_recipe_run = RunDir::create(tmp.path(), "wrong-recipe").unwrap();
+    let mut wrong_recipe_trainer = Trainer::new(cfg.clone(), &wrong_recipe_run).unwrap();
+    assert_ledger_identity_mismatch(
+        wrong_recipe_trainer.train_rollout_ledger_step(
+            0,
+            &mut wrong_recipe_policy,
+            &ledger_root,
+            &policy_sha256,
+            None,
+        ),
+        "different tensor recipe/schema",
+    );
+    assert_eq!(
+        var_bits(&wrong_recipe_policy),
+        wrong_recipe_before,
+        "tensor-schema rejection mutated the learner adapter"
+    );
+
+    #[cfg(target_os = "linux")]
+    {
+        // `/dev/full` opens successfully but rejects the final metrics write. The
+        // same live mu=2 window has already performed real Adam updates when that
+        // error is reached, so the learner must restore its complete pre-call state
+        // and permit an exact retry from the caller's original optimizer prestate.
+        let mut late_failure_policy = ScriptedPolicy::new(SEED).unwrap();
+        let late_failure_before = var_bits(&late_failure_policy);
+        let late_failure_run = RunDir::create(tmp.path(), "late-metrics-failure").unwrap();
+        std::os::unix::fs::symlink("/dev/full", late_failure_run.metrics_path()).unwrap();
+        let mut late_failure_trainer = Trainer::new(cfg.clone(), &late_failure_run).unwrap();
+        match late_failure_trainer.train_rollout_ledger_step(
+            0,
+            &mut late_failure_policy,
+            &ledger_root,
+            &policy_sha256,
+            None,
+        ) {
+            Err(TrainerError::Telemetry(_)) => {}
+            Err(error) => panic!("expected forced late metrics failure, got {error:?}"),
+            Ok(_) => panic!("/dev/full unexpectedly accepted the learner metrics row"),
+        }
+        assert_eq!(
+            var_bits(&late_failure_policy),
+            late_failure_before,
+            "late failure left the adapter advanced"
+        );
+        assert!(
+            late_failure_policy.adapter_enabled(),
+            "late failure did not restore the adapter-enabled flag"
+        );
+
+        let retry_run = RunDir::create(tmp.path(), "late-metrics-retry").unwrap();
+        let mut retry_trainer = Trainer::new(cfg.clone(), &retry_run).unwrap();
+        let (retry_metrics, retry_optimizer) = retry_trainer
+            .train_rollout_ledger_step(
+                0,
+                &mut late_failure_policy,
+                &ledger_root,
+                &policy_sha256,
+                None,
+            )
+            .unwrap();
+        assert_eq!(var_bits(&late_failure_policy), direct_adapter);
+        assert_eq!(
+            optimizer_bits(&retry_optimizer),
+            optimizer_bits(&direct_optimizer),
+            "retry after rollback did not recover the exact Adam continuation"
+        );
+        assert_ledger_performance_unmeasured(&retry_metrics, "retry after rollback");
+    }
+
+    let mut ledger_policy = ScriptedPolicy::new(SEED).unwrap();
+    assert_eq!(var_bits(&ledger_policy), initial_adapter);
+    let ledger_run = RunDir::create(tmp.path(), "learner").unwrap();
+    let mut ledger_trainer = Trainer::new(cfg.clone(), &ledger_run).unwrap();
+    let (ledger_metrics, ledger_optimizer) = ledger_trainer
+        .train_rollout_ledger_step(0, &mut ledger_policy, &ledger_root, &policy_sha256, None)
+        .unwrap();
+
+    assert_ledger_performance_unmeasured(&ledger_metrics, "returned ledger metrics");
+    let persisted_ledger_metrics = ferrl::read_metrics(ledger_run.metrics_path()).unwrap();
+    assert_eq!(persisted_ledger_metrics.len(), 1);
+    assert_ledger_performance_unmeasured(&persisted_ledger_metrics[0], "persisted ledger metrics");
+
+    assert_eq!(
+        deterministic_metrics(&ledger_metrics),
+        deterministic_metrics(direct_metrics),
+        "ledger learner metrics diverged from direct training"
+    );
+    assert_eq!(
+        var_bits(&ledger_policy),
+        direct_adapter,
+        "ledger learner adapter diverged from direct training"
+    );
+    assert_eq!(
+        optimizer_bits(&ledger_optimizer),
+        optimizer_bits(&direct_optimizer),
+        "ledger learner Adam state diverged from direct training"
+    );
+
+    let (_, first_moments, second_moments) = optimizer_bits(&ledger_optimizer);
+    assert!(
+        first_moments
+            .iter()
+            .flatten()
+            .any(|&bits| bits != 0.0_f32.to_bits()),
+        "first moments stayed zero — optimizer-state equivalence is vacuous"
+    );
+    assert!(
+        second_moments
+            .iter()
+            .flatten()
+            .any(|&bits| bits != 0.0_f32.to_bits()),
+        "second moments stayed zero — optimizer-state equivalence is vacuous"
+    );
 }
 
 // ---- gate 4: degenerate shards ------------------------------------------------
