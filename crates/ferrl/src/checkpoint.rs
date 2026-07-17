@@ -73,6 +73,7 @@ use crate::optim::OptimizerState;
 #[cfg(test)]
 thread_local! {
     static SYNCED_DIRECTORIES: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+    static FAIL_SYNC_DIRECTORY_ONCE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Filename of the serialized adapter tensors within a checkpoint directory.
@@ -652,6 +653,17 @@ fn sync_file(path: &Path) -> Result<(), CheckpointError> {
 }
 
 fn sync_directory(path: &Path) -> Result<(), CheckpointError> {
+    #[cfg(test)]
+    FAIL_SYNC_DIRECTORY_ONCE.with(|failure| {
+        if failure.borrow().as_deref() == Some(path) {
+            failure.borrow_mut().take();
+            return Err(io(
+                path,
+                std::io::Error::other("injected directory sync failure"),
+            ));
+        }
+        Ok(())
+    })?;
     std::fs::File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| io(path, error))?;
@@ -661,8 +673,23 @@ fn sync_directory(path: &Path) -> Result<(), CheckpointError> {
 }
 
 fn create_directory_all_durable(path: &Path) -> Result<(), CheckpointError> {
+    let Some(parent) = path.parent() else {
+        return match std::fs::metadata(path) {
+            Ok(metadata) if metadata.is_dir() => sync_directory(path),
+            Ok(_) => Err(io(
+                path,
+                std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "checkpoint parent exists but is not a directory",
+                ),
+            )),
+            Err(error) => Err(io(path, error)),
+        };
+    };
+    create_directory_all_durable(parent)?;
+    let mut missing = false;
     match std::fs::metadata(path) {
-        Ok(metadata) if metadata.is_dir() => return Ok(()),
+        Ok(metadata) if metadata.is_dir() => {}
         Ok(_) => {
             return Err(io(
                 path,
@@ -672,23 +699,15 @@ fn create_directory_all_durable(path: &Path) -> Result<(), CheckpointError> {
                 ),
             ));
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => missing = true,
         Err(error) => return Err(io(path, error)),
     }
-    let parent = path.parent().ok_or_else(|| {
-        io(
-            path,
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "cannot durably create a directory without an ancestor",
-            ),
-        )
-    })?;
-    create_directory_all_durable(parent)?;
-    match std::fs::create_dir(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => {}
-        Err(error) => return Err(io(path, error)),
+    if missing {
+        match std::fs::create_dir(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => {}
+            Err(error) => return Err(io(path, error)),
+        }
     }
     sync_directory(path)?;
     sync_directory(parent)
@@ -905,6 +924,7 @@ pub(crate) fn latest_rollout_ledger_continuation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::telemetry::RunDir;
     use candle_core::{DType, Tensor};
 
     /// A unique temp directory, removed on drop.
@@ -1306,6 +1326,73 @@ mod tests {
             synced.contains(&checkpoints),
             "step-1 claim was not anchored in checkpoints: {synced:?}"
         );
+        load_checkpoint(&destination, &make_vars()).unwrap();
+    }
+
+    #[test]
+    fn no_replace_checkpoint_durably_anchors_fresh_run_dir_chain() {
+        let tmp = TempDir::new("no-replace-fresh-run-dir");
+        let runs_root = tmp.path().join("runs");
+        let run = RunDir::create(&runs_root, "fresh").unwrap();
+        let checkpoints = run.checkpoints_dir();
+        let destination = checkpoints.join("step-1");
+        SYNCED_DIRECTORIES.with(|paths| paths.borrow_mut().clear());
+
+        save_checkpoint_no_replace(
+            &destination,
+            &make_vars(),
+            &make_opt_state(),
+            &[1],
+            None,
+            continuation_manifest(1),
+        )
+        .unwrap();
+
+        let synced = SYNCED_DIRECTORIES.with(|paths| paths.borrow().clone());
+        for expected in [
+            tmp.path(),
+            runs_root.as_path(),
+            run.root(),
+            checkpoints.as_path(),
+        ] {
+            assert!(
+                synced.iter().any(|path| path == expected),
+                "fresh RunDir ancestor was not durably re-established: {expected:?}; synced={synced:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_replace_checkpoint_retries_sync_for_existing_ancestor_chain() {
+        let tmp = TempDir::new("no-replace-existing-retry");
+        let run = RunDir::create(tmp.path().join("runs"), "fresh").unwrap();
+        let destination = run.checkpoints_dir().join("step-1");
+        FAIL_SYNC_DIRECTORY_ONCE.with(|failure| {
+            *failure.borrow_mut() = Some(run.root().to_path_buf());
+        });
+
+        assert!(matches!(
+            save_checkpoint_no_replace(
+                &destination,
+                &make_vars(),
+                &make_opt_state(),
+                &[1],
+                None,
+                continuation_manifest(1),
+            ),
+            Err(CheckpointError::Io { .. })
+        ));
+        assert!(!destination.exists());
+
+        save_checkpoint_no_replace(
+            &destination,
+            &make_vars(),
+            &make_opt_state(),
+            &[1],
+            None,
+            continuation_manifest(1),
+        )
+        .unwrap();
         load_checkpoint(&destination, &make_vars()).unwrap();
     }
 

@@ -509,8 +509,9 @@ fields are rejected.
 Format v3 is intentionally world-1 only. It rejects distributed payloads instead
 of treating rank-local rewards or token counts as a complete optimizer window.
 The continuation optimizer digest binds both Adam moments and its bias-correction
-counter. Newly absent checkpoint-parent chains are created one component at a time,
-with every new entry synced in its ancestor before publication can succeed. The durable
+counter. Checkpoint-parent and ledger-root chains are established one component at a time,
+with every entry synced in its ancestor before publication can succeed; retries re-sync
+pre-existing components so a prior failed ancestor sync cannot be skipped. The durable
 multi-step protocol is `C_k → collect L_k → learn L_k → publish
 C_(k+1)`; outer checkpoint progress stays distinct from Adam's update counter.
 DP/TP completeness is a subsequent Phase 1.5C slice built on this contract.
