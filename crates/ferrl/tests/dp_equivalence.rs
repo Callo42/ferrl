@@ -573,6 +573,32 @@ impl Drop for TempDir {
     }
 }
 
+struct RelativeTempRoot(PathBuf);
+impl RelativeTempRoot {
+    fn new(tag: &str) -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = PathBuf::from(format!(
+            ".ferrl-dp-relative-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        assert!(path.is_relative());
+        assert!(!path.exists());
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+impl Drop for RelativeTempRoot {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).ok();
+    }
+}
+
 /// The policy's trainable vars as raw `f32` bit patterns (bitwise comparison —
 /// `==` on floats would also pass for `-0.0` vs `0.0`).
 fn var_bits<P: Policy>(policy: &P) -> Vec<Vec<u32>> {
@@ -1887,6 +1913,59 @@ fn world_one_rollout_ledger_sampler_handoff_and_resume_are_bit_exact() {
         optimizer_bits(final_continuation.optimizer_state()),
         optimizer_bits(&direct_optimizer)
     );
+}
+
+#[test]
+fn relative_run_dir_continuation_saves_and_restores() {
+    let root = RelativeTempRoot::new("continuation");
+    let runs_root = root.path().join("runs");
+    let ledger_root = root.path().join("ledger");
+    let samples = live_samples();
+    let cfg = TrainerConfig {
+        steps: 1,
+        grad_accum_steps: 1,
+        ..scripted_cfg()
+    };
+    let policy_sha256 = format!("{:064x}", 17);
+
+    let collector_run = RunDir::create(&runs_root, "collector").unwrap();
+    let mut collector = Trainer::new(cfg.clone(), &collector_run).unwrap();
+    let mut collector_policy = StatefulScriptedPolicy::new(SEED, 0).unwrap();
+    collector
+        .collect_rollout_ledger_step(
+            0,
+            &mut collector_policy,
+            &EchoOrFlatReward,
+            &CharTokenizer,
+            &samples,
+            &ledger_root,
+            &policy_sha256,
+            None,
+        )
+        .unwrap();
+
+    let learner_run = RunDir::create(&runs_root, "learner").unwrap();
+    let mut learner = Trainer::new(cfg.clone(), &learner_run).unwrap();
+    let mut learner_policy = StatefulScriptedPolicy::new(SEED, 0).unwrap();
+    let (_, continuation) = learner
+        .train_rollout_ledger_step(0, &mut learner_policy, &ledger_root, &policy_sha256, None)
+        .unwrap();
+    let expected_adapter = var_bits(&learner_policy);
+    let expected_sampler = learner_policy.sampler_state().unwrap();
+    let checkpoint = learner
+        .save_rollout_ledger_continuation(&learner_policy, &continuation)
+        .unwrap();
+    assert!(checkpoint.is_relative(), "checkpoint={checkpoint:?}");
+
+    let reopened_run = RunDir::open(&runs_root, "learner").unwrap();
+    let reopened = Trainer::new(cfg, &reopened_run).unwrap();
+    let mut restored_policy = StatefulScriptedPolicy::new(SEED.wrapping_add(1), 99).unwrap();
+    let restored = reopened
+        .restore_rollout_ledger_continuation(&checkpoint, &mut restored_policy, &policy_sha256)
+        .unwrap();
+    assert_eq!(restored.completed_step(), 1);
+    assert_eq!(var_bits(&restored_policy), expected_adapter);
+    assert_eq!(restored_policy.sampler_state().unwrap(), expected_sampler);
 }
 
 // ---- gate 4: degenerate shards ------------------------------------------------

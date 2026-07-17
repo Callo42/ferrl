@@ -997,6 +997,14 @@ fn write_new_synced(path: &Path, bytes: &[u8]) -> Result<(), RolloutLedgerError>
 }
 
 fn sync_dir(path: &Path) -> Result<(), RolloutLedgerError> {
+    // `Path::parent()` represents the ancestor of a one-component relative
+    // path as `""`. Opening that path is not portable; its durable ancestor is
+    // the current directory.
+    let path = if path.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        path
+    };
     #[cfg(test)]
     FAIL_SYNC_DIRECTORY_ONCE.with(|failure| {
         if failure.borrow().as_deref() == Some(path) {
@@ -1017,6 +1025,9 @@ fn sync_dir(path: &Path) -> Result<(), RolloutLedgerError> {
 }
 
 fn create_dir_all_durable(path: &Path) -> Result<(), RolloutLedgerError> {
+    if path.as_os_str().is_empty() {
+        return sync_dir(Path::new("."));
+    }
     let Some(parent) = path.parent() else {
         return match fs::metadata(path) {
             Ok(metadata) if metadata.is_dir() => sync_dir(path),
@@ -1075,6 +1086,23 @@ mod tests {
                 std::process::id()
             ));
             fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn relative(tag: &str, create: bool) -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = PathBuf::from(format!(
+                ".ferrl-rollout-ledger-{tag}-{}-{nonce}",
+                std::process::id()
+            ));
+            assert!(path.is_relative());
+            assert!(!path.exists());
+            if create {
+                fs::create_dir(&path).unwrap();
+            }
             Self(path)
         }
     }
@@ -1223,6 +1251,40 @@ mod tests {
             synced.contains(&tmp.0),
             "ledger-root entry was not synced in its parent: {synced:?}"
         );
+    }
+
+    #[test]
+    fn absent_relative_ledger_root_uses_current_directory_as_durable_base() {
+        let root = TempDir::relative("absent-relative-root", false);
+        SYNCED_DIRECTORIES.with(|paths| paths.borrow_mut().clear());
+
+        let writer = RolloutLedgerWriter::create(&root.0, identity()).unwrap();
+        writer.write_step(&step()).unwrap();
+
+        let synced = SYNCED_DIRECTORIES.with(|paths| paths.borrow().clone());
+        assert!(synced.contains(&PathBuf::from(".")), "synced={synced:?}");
+        assert!(synced.contains(&root.0), "synced={synced:?}");
+        RolloutLedgerReader::open(&root.0, expectations())
+            .unwrap()
+            .read_step(7)
+            .unwrap();
+    }
+
+    #[test]
+    fn existing_relative_ledger_root_uses_current_directory_as_durable_base() {
+        let root = TempDir::relative("existing-relative-root", true);
+        SYNCED_DIRECTORIES.with(|paths| paths.borrow_mut().clear());
+
+        let writer = RolloutLedgerWriter::create(&root.0, identity()).unwrap();
+        writer.write_step(&step()).unwrap();
+
+        let synced = SYNCED_DIRECTORIES.with(|paths| paths.borrow().clone());
+        assert!(synced.contains(&PathBuf::from(".")), "synced={synced:?}");
+        assert!(synced.contains(&root.0), "synced={synced:?}");
+        RolloutLedgerReader::open(&root.0, expectations())
+            .unwrap()
+            .read_step(7)
+            .unwrap();
     }
 
     #[test]
