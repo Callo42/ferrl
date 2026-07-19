@@ -60,17 +60,20 @@
 //! unsupported directory-sync behavior returns an I/O error instead of claiming
 //! durability. A failed claim sync is rolled back and the removal synced before
 //! returning; a failure after the manifest rename retries the complete directory
-//! durability fence. If cleanup or that retry cannot be confirmed, the writer
-//! returns [`CheckpointError::PublicationAmbiguous`] for explicit operator
-//! reconciliation. A crash may still strand an incomplete claim, but it cannot
-//! expose or overwrite a completed continuation.
+//! durability fence and verifies that all three visible files still match their
+//! pre-publication fingerprints before accepting recovery as success. If cleanup,
+//! that retry, or the exact-package check cannot be confirmed, the writer returns
+//! [`CheckpointError::PublicationAmbiguous`] for explicit operator reconciliation.
+//! A crash may still strand an incomplete claim, but it cannot expose or overwrite
+//! a completed continuation.
 
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use candle_core::{Device, Tensor, Var};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::optim::OptimizerState;
 
@@ -82,10 +85,27 @@ enum NoReplaceSyncPoint {
 }
 
 #[cfg(test)]
+type NoReplaceRecoveryHook = Box<dyn FnOnce(&Path)>;
+
+#[cfg(test)]
 thread_local! {
     static SYNCED_DIRECTORIES: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
     static FAIL_SYNC_DIRECTORY_ONCE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
     static FAIL_NO_REPLACE_SYNCS: std::cell::RefCell<Vec<NoReplaceSyncPoint>> = const { std::cell::RefCell::new(Vec::new()) };
+    static NO_REPLACE_RECOVERY_HOOK: std::cell::RefCell<Option<NoReplaceRecoveryHook>> = const { std::cell::RefCell::new(None) };
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileFingerprint {
+    length: u64,
+    sha256: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CheckpointPackageFingerprint {
+    adapter: FileFingerprint,
+    optimizer: FileFingerprint,
+    manifest: FileFingerprint,
 }
 
 /// Filename of the serialized adapter tensors within a checkpoint directory.
@@ -141,8 +161,9 @@ pub enum CheckpointError {
         /// Underlying I/O error.
         source: std::io::Error,
     },
-    /// A no-replace continuation may hold an incomplete claim or a complete,
-    /// reader-visible manifest, but cleanup/durability could not be confirmed.
+    /// A no-replace continuation may hold an incomplete claim or a reader-visible
+    /// package, but cleanup, durability, or exact package identity could not be
+    /// confirmed.
     #[error("checkpoint publication requires reconciliation at {path}: {detail}")]
     PublicationAmbiguous {
         /// Claimed checkpoint destination that must be inspected before repair.
@@ -552,7 +573,9 @@ pub fn save_checkpoint(
 /// skips and a later writer refuses to replace; recovery must explicitly inspect
 /// and remove that abandoned claim. Ordinary operation cleans and durably removes
 /// a failed pre-manifest claim before returning. Once the manifest is visible,
-/// directory-sync failures are retried; an unreconciled failure is returned as
+/// directory-sync failures are retried. Recovery is success only when the visible
+/// adapter, optimizer, and manifest still match the exact package fingerprinted
+/// before publication; an unreconciled failure or mismatch is returned as
 /// [`CheckpointError::PublicationAmbiguous`] and must not be blindly overwritten.
 pub(crate) fn save_checkpoint_no_replace(
     dir: impl AsRef<Path>,
@@ -593,6 +616,10 @@ pub(crate) fn save_checkpoint_no_replace(
     ) {
         return Err(cleanup_uncommitted_claim(dir, parent, error));
     }
+    let expected_package = match checkpoint_package_fingerprint(dir, &manifest_stage) {
+        Ok(fingerprint) => fingerprint,
+        Err(error) => return Err(cleanup_uncommitted_claim(dir, parent, error)),
+    };
     let manifest = dir.join(MANIFEST_FILE);
     if let Err(error) =
         std::fs::rename(&manifest_stage, &manifest).map_err(|error| io(&manifest_stage, error))
@@ -601,13 +628,74 @@ pub(crate) fn save_checkpoint_no_replace(
     }
     match sync_no_replace_publication(dir, parent) {
         Ok(()) => Ok(()),
-        Err(error) => match sync_no_replace_publication(dir, parent) {
-            Ok(()) => Ok(()),
-            Err(retry_error) => Err(CheckpointError::PublicationAmbiguous {
-                path: dir.to_path_buf(),
-                detail: format!("{error}; durability retry failed: {retry_error}"),
-            }),
-        },
+        Err(error) => {
+            #[cfg(test)]
+            run_no_replace_recovery_hook(dir);
+            match sync_no_replace_publication(dir, parent) {
+                Ok(()) => match checkpoint_package_fingerprint(dir, &manifest) {
+                    Ok(visible_package) if visible_package == expected_package => Ok(()),
+                    Ok(_) => Err(CheckpointError::PublicationAmbiguous {
+                        path: dir.to_path_buf(),
+                        detail: format!(
+                            "{error}; durability retry completed but the visible package no longer matches the intended checkpoint"
+                        ),
+                    }),
+                    Err(verification_error) => Err(CheckpointError::PublicationAmbiguous {
+                        path: dir.to_path_buf(),
+                        detail: format!(
+                            "{error}; durability retry completed but visible package verification failed: {verification_error}"
+                        ),
+                    }),
+                },
+                Err(retry_error) => Err(CheckpointError::PublicationAmbiguous {
+                    path: dir.to_path_buf(),
+                    detail: format!("{error}; durability retry failed: {retry_error}"),
+                }),
+            }
+        }
+    }
+}
+
+fn checkpoint_package_fingerprint(
+    dir: &Path,
+    manifest_path: &Path,
+) -> Result<CheckpointPackageFingerprint, CheckpointError> {
+    Ok(CheckpointPackageFingerprint {
+        adapter: fingerprint_file(&dir.join(ADAPTER_FILE))?,
+        optimizer: fingerprint_file(&dir.join(OPTIMIZER_FILE))?,
+        manifest: fingerprint_file(manifest_path)?,
+    })
+}
+
+fn fingerprint_file(path: &Path) -> Result<FileFingerprint, CheckpointError> {
+    let mut file = std::fs::File::open(path).map_err(|error| io(path, error))?;
+    let mut hasher = Sha256::new();
+    let mut length = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| io(path, error))?;
+        if read == 0 {
+            break;
+        }
+        length = length.checked_add(read as u64).ok_or_else(|| {
+            io(
+                path,
+                std::io::Error::other("checkpoint file length overflow while fingerprinting"),
+            )
+        })?;
+        hasher.update(&buffer[..read]);
+    }
+    Ok(FileFingerprint {
+        length,
+        sha256: hasher.finalize().into(),
+    })
+}
+
+#[cfg(test)]
+fn run_no_replace_recovery_hook(dir: &Path) {
+    let hook = NO_REPLACE_RECOVERY_HOOK.with(|hook| hook.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook(dir);
     }
 }
 
@@ -1584,6 +1672,115 @@ mod tests {
                     if source.kind() == std::io::ErrorKind::AlreadyExists
             ));
         }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // pins publication, discovery, and restore outcomes
+    fn no_replace_checkpoint_recovery_rejects_ordinary_replacement() {
+        let tmp = TempDir::new("no-replace-recovery-replacement");
+        let checkpoints = tmp.path().join("checkpoints");
+        let destination = checkpoints.join("step-1");
+        FAIL_NO_REPLACE_SYNCS.with(|failures| {
+            *failures.borrow_mut() = vec![NoReplaceSyncPoint::ManifestDirectory];
+        });
+        NO_REPLACE_RECOVERY_HOOK.with(|hook| {
+            let replacement_vars = make_vars();
+            let replacement_opt = make_opt_state();
+            *hook.borrow_mut() = Some(Box::new(move |dir| {
+                save_checkpoint(
+                    dir,
+                    &replacement_vars,
+                    &replacement_opt,
+                    &[9, 8, 7],
+                    99,
+                    Some("ordinary-replacement"),
+                )
+                .unwrap();
+            }));
+        });
+
+        assert!(matches!(
+            save_checkpoint_no_replace(
+                &destination,
+                &make_vars(),
+                &make_opt_state(),
+                &[1],
+                None,
+                continuation_manifest(1),
+            ),
+            Err(CheckpointError::PublicationAmbiguous { path, detail })
+                if path == destination && detail.contains("visible package no longer matches")
+        ));
+        assert_eq!(
+            latest_rollout_ledger_continuation(&checkpoints).unwrap(),
+            None,
+            "ordinary replacement must not remain discoverable as a continuation"
+        );
+        assert_eq!(
+            latest_checkpoint(&checkpoints).unwrap().unwrap(),
+            LatestCheckpoint {
+                dir: destination.clone(),
+                step: 99,
+            }
+        );
+        let loaded = load_checkpoint(&destination, &make_vars()).unwrap();
+        assert_eq!(loaded.step, 99);
+        assert_eq!(loaded.sampler_state.as_deref(), Some([9, 8, 7].as_slice()));
+        assert_eq!(loaded.lora_recipe.as_deref(), Some("ordinary-replacement"));
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // pins ambiguous discovery, restore, and retry behavior
+    fn no_replace_checkpoint_recovery_marks_manifest_disappearance_ambiguous() {
+        let tmp = TempDir::new("no-replace-recovery-missing-manifest");
+        let checkpoints = tmp.path().join("checkpoints");
+        let destination = checkpoints.join("step-1");
+        FAIL_NO_REPLACE_SYNCS.with(|failures| {
+            *failures.borrow_mut() = vec![NoReplaceSyncPoint::ManifestDirectory];
+        });
+        NO_REPLACE_RECOVERY_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|dir| {
+                std::fs::rename(
+                    dir.join(MANIFEST_FILE),
+                    dir.join("manifest.json.disappeared"),
+                )
+                .unwrap();
+            }));
+        });
+
+        assert!(matches!(
+            save_checkpoint_no_replace(
+                &destination,
+                &make_vars(),
+                &make_opt_state(),
+                &[1],
+                None,
+                continuation_manifest(1),
+            ),
+            Err(CheckpointError::PublicationAmbiguous { path, detail })
+                if path == destination && detail.contains("visible package verification failed")
+        ));
+        assert_eq!(latest_checkpoint(&checkpoints).unwrap(), None);
+        assert_eq!(
+            latest_rollout_ledger_continuation(&checkpoints).unwrap(),
+            None
+        );
+        assert!(matches!(
+            load_checkpoint(&destination, &make_vars()),
+            Err(CheckpointError::Io { .. })
+        ));
+        assert!(matches!(
+            save_checkpoint_no_replace(
+                &destination,
+                &make_vars(),
+                &make_opt_state(),
+                &[1],
+                None,
+                continuation_manifest(1),
+            ),
+            Err(CheckpointError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::AlreadyExists
+        ));
     }
 
     #[test]
