@@ -2444,49 +2444,48 @@ impl Trainer {
     ) -> Result<PathBuf, TrainerError> {
         self.require_rollout_ledger_topology()?;
         let checkpoints_dir = checkpoints_dir.as_ref();
-        let preflight = (|| {
-            let completed_step = continuation.completed_step;
-            if completed_step == 0 || completed_step > self.config.steps {
-                return Err(TrainerError::Contract(format!(
-                    "rollout-ledger continuation step {completed_step} is outside 1..={}",
-                    self.config.steps
-                )));
-            }
-            let vars = policy.trainable_vars();
-            let mut opt = self.new_optimizer(vars.clone())?;
-            opt.load_state(continuation.optimizer_state())?;
-            let sampler_state = policy.sampler_state()?;
-            self.require_rollout_ledger_continuation_state(
-                completed_step,
-                policy,
-                &continuation.policy_sha256,
-                &vars,
-                &opt,
-                &sampler_state,
-                Some(continuation),
-            )?;
-            let dir = checkpoints_dir.join(format!("step-{completed_step}"));
-            let recipe = policy.lora_recipe();
-            let manifest = crate::checkpoint::RolloutLedgerContinuationManifest {
-                format_version: crate::checkpoint::ROLLOUT_LEDGER_CONTINUATION_FORMAT_VERSION,
-                kind: crate::checkpoint::ROLLOUT_LEDGER_CONTINUATION_KIND.to_owned(),
-                world_size: Some(continuation.world_size),
-                completed_step,
-                policy_sha256: continuation.policy_sha256.clone(),
-                trainer_config_sha256: continuation.trainer_config_sha256.clone(),
-                tensor_schema_sha256: continuation.tensor_schema_sha256.clone(),
-                adapter_sha256: continuation.adapter_sha256.clone(),
-                optimizer_sha256: continuation.optimizer_sha256.clone(),
-                sampler_sha256: continuation.sampler_sha256.clone(),
-                parent_lineage_sha256: continuation.parent_lineage_sha256.clone(),
-                consumed_ledger_sha256: continuation.consumed_ledger_sha256.clone(),
-                lineage_sha256: continuation.lineage_sha256.clone(),
-            };
-            Ok((vars, sampler_state, dir, recipe, manifest))
-        })();
-        let (vars, sampler_state, dir, recipe, manifest) = self.coordinate_data_parallel_result(
+        let (vars, sampler_state, dir, recipe, manifest) = self.coordinate_data_parallel_call(
             "rollout-ledger continuation save preflight",
-            preflight,
+            || {
+                let completed_step = continuation.completed_step;
+                if completed_step == 0 || completed_step > self.config.steps {
+                    return Err(TrainerError::Contract(format!(
+                        "rollout-ledger continuation step {completed_step} is outside 1..={}",
+                        self.config.steps
+                    )));
+                }
+                let vars = policy.trainable_vars();
+                let mut opt = self.new_optimizer(vars.clone())?;
+                opt.load_state(continuation.optimizer_state())?;
+                let sampler_state = policy.sampler_state()?;
+                self.require_rollout_ledger_continuation_state(
+                    completed_step,
+                    policy,
+                    &continuation.policy_sha256,
+                    &vars,
+                    &opt,
+                    &sampler_state,
+                    Some(continuation),
+                )?;
+                let dir = checkpoints_dir.join(format!("step-{completed_step}"));
+                let recipe = policy.lora_recipe();
+                let manifest = crate::checkpoint::RolloutLedgerContinuationManifest {
+                    format_version: crate::checkpoint::ROLLOUT_LEDGER_CONTINUATION_FORMAT_VERSION,
+                    kind: crate::checkpoint::ROLLOUT_LEDGER_CONTINUATION_KIND.to_owned(),
+                    world_size: Some(continuation.world_size),
+                    completed_step,
+                    policy_sha256: continuation.policy_sha256.clone(),
+                    trainer_config_sha256: continuation.trainer_config_sha256.clone(),
+                    tensor_schema_sha256: continuation.tensor_schema_sha256.clone(),
+                    adapter_sha256: continuation.adapter_sha256.clone(),
+                    optimizer_sha256: continuation.optimizer_sha256.clone(),
+                    sampler_sha256: continuation.sampler_sha256.clone(),
+                    parent_lineage_sha256: continuation.parent_lineage_sha256.clone(),
+                    consumed_ledger_sha256: continuation.consumed_ledger_sha256.clone(),
+                    lineage_sha256: continuation.lineage_sha256.clone(),
+                };
+                Ok((vars, sampler_state, dir, recipe, manifest))
+            },
         )?;
         let consensus = self.coordinate_data_parallel_result(
             "rollout-ledger continuation save serialization",
@@ -2611,16 +2610,15 @@ impl Trainer {
             "rollout-ledger continuation restore path/policy",
             &restore_input,
         )?;
-        let prestate = (|| {
-            validate_external_policy_sha256(policy_sha256)?;
-            let vars = policy.trainable_vars();
-            let adapter_prestate = Self::snapshot_rollout_ledger_vars(&vars)?;
-            let sampler_prestate = policy.sampler_state()?;
-            Ok((vars, adapter_prestate, sampler_prestate))
-        })();
-        let (vars, adapter_prestate, sampler_prestate) = self.coordinate_data_parallel_result(
+        let (vars, adapter_prestate, sampler_prestate) = self.coordinate_data_parallel_call(
             "rollout-ledger continuation restore snapshot",
-            prestate,
+            || {
+                validate_external_policy_sha256(policy_sha256)?;
+                let vars = policy.trainable_vars();
+                let adapter_prestate = Self::snapshot_rollout_ledger_vars(&vars)?;
+                let sampler_prestate = policy.sampler_state()?;
+                Ok((vars, adapter_prestate, sampler_prestate))
+            },
         )?;
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let manifest = crate::checkpoint::read_manifest(checkpoint_dir)?;
@@ -2804,11 +2802,16 @@ impl Trainer {
         let failed_global = match failed_global {
             Ok(failed) => failed,
             Err(comm_error) => {
-                let rollback = Self::restore_rollout_ledger_checkpoint_prestate(
-                    policy,
-                    &vars,
-                    &adapter_prestate,
-                    &sampler_prestate,
+                let rollback = self.coordinate_data_parallel_call(
+                    "rollout-ledger continuation restore rollback after status failure",
+                    || {
+                        Self::restore_rollout_ledger_checkpoint_prestate(
+                            policy,
+                            &vars,
+                            &adapter_prestate,
+                            &sampler_prestate,
+                        )
+                    },
                 );
                 return match (outcome, rollback) {
                     (Err(local_error), Ok(())) => Err(TrainerError::Contract(format!(
@@ -2816,26 +2819,27 @@ impl Trainer {
                     ))),
                     (Ok(_), Ok(())) => Err(comm_error.into()),
                     (_, Err(rollback_error)) => Err(TrainerError::Contract(format!(
-                        "rollout-ledger continuation restore lost its status collective ({comm_error}); local rollback also failed: {rollback_error}"
+                        "rollout-ledger continuation restore lost its status collective ({comm_error}); coordinated rollback also failed ({rollback_error}); discard the policy state on every rank in this data-parallel world"
                     ))),
                 };
             }
         };
         if failed_global > 0.0 {
             let local_error = outcome.err();
-            let rollback_local = Self::restore_rollout_ledger_checkpoint_prestate(
-                policy,
-                &vars,
-                &adapter_prestate,
-                &sampler_prestate,
-            );
-            let rollback = self.coordinate_data_parallel_result(
+            let rollback = self.coordinate_data_parallel_call(
                 "rollout-ledger continuation restore rollback",
-                rollback_local,
+                || {
+                    Self::restore_rollout_ledger_checkpoint_prestate(
+                        policy,
+                        &vars,
+                        &adapter_prestate,
+                        &sampler_prestate,
+                    )
+                },
             );
             return match (local_error, rollback) {
                 (_, Err(rollback_error)) => Err(TrainerError::Contract(format!(
-                    "rollout-ledger continuation restore failed on at least one rank; coordinated rollback failed: {rollback_error}"
+                    "rollout-ledger continuation restore failed on at least one rank; coordinated rollback failed ({rollback_error}); discard the policy state on every rank in this data-parallel world"
                 ))),
                 (Some(error), Ok(())) => Err(error),
                 (None, Ok(())) => Err(TrainerError::Contract(
@@ -2873,20 +2877,21 @@ impl Trainer {
             )
         })();
         if let Err(error) = consensus {
-            let rollback_local = Self::restore_rollout_ledger_checkpoint_prestate(
-                policy,
-                &vars,
-                &adapter_prestate,
-                &sampler_prestate,
-            );
-            let rollback = self.coordinate_data_parallel_result(
+            let rollback = self.coordinate_data_parallel_call(
                 "rollout-ledger continuation consensus rollback",
-                rollback_local,
+                || {
+                    Self::restore_rollout_ledger_checkpoint_prestate(
+                        policy,
+                        &vars,
+                        &adapter_prestate,
+                        &sampler_prestate,
+                    )
+                },
             );
             return match rollback {
                 Ok(()) => Err(error),
                 Err(rollback_error) => Err(TrainerError::Contract(format!(
-                    "restored continuation consensus failed ({error}); coordinated rollback also failed: {rollback_error}"
+                    "restored continuation consensus failed ({error}); coordinated rollback also failed ({rollback_error}); discard the policy state on every rank in this data-parallel world"
                 ))),
             };
         }
@@ -8882,13 +8887,15 @@ mod tests {
                         &"d".repeat(64),
                         None,
                     );
-                    (rank, outcome, retry.sampler)
+                    let cleanup_faults_consumed =
+                        crate::rollout_ledger::distributed_stage_cleanup_faults_consumed();
+                    (rank, outcome, retry.sampler, cleanup_faults_consumed)
                 })
             })
             .collect();
 
             for handle in handles {
-                let (rank, outcome, sampler) = handle.join().unwrap();
+                let (rank, outcome, sampler, cleanup_faults_consumed) = handle.join().unwrap();
                 match fault {
                     "sync" => assert!(
                         matches!(
@@ -8903,11 +8910,126 @@ mod tests {
                     _ => unreachable!(),
                 }
                 assert_eq!(
+                    cleanup_faults_consumed,
+                    u32::from(fault == "cleanup" && rank == 0),
+                    "{fault}: rank {rank} cleanup injector consumption"
+                );
+                assert_eq!(
                     sampler, 1,
                     "{fault}: rank {rank} rewound after exact visibility"
                 );
             }
             assert!(final_dir.join("manifest.json").is_file());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // three marker-exact payload uncertainty modes
+    fn distributed_exact_marker_payload_uncertainty_preserves_every_sampler() {
+        for fault in ["mutated", "missing", "read-failure"] {
+            let tmp = WireTmp::new(&format!("distributed-exact-marker-{fault}"));
+            let ledger_root = tmp.0.join("ledger");
+            let final_dir = ledger_root.join("step-00000000000000000000");
+            let payload_path = final_dir.join("rank-00000.window.json");
+            let handles: Vec<_> = crate::comm::LocalComm::world_with_timeout(
+                2,
+                std::time::Duration::from_secs(10),
+            )
+            .into_iter()
+            .map(|comm| {
+                let base = tmp.0.clone();
+                let ledger_root = ledger_root.clone();
+                let payload_path = payload_path.clone();
+                std::thread::spawn(move || {
+                    let rank = comm.rank();
+                    let run = RunDir::create(&base, format!("{fault}-rank-{rank}")).unwrap();
+                    let config = TrainerConfig {
+                        steps: 1,
+                        group_size: 3,
+                        grad_accum_steps: 1,
+                        max_new_tokens: 2,
+                        beta: 0.0,
+                        checkpoint_every: None,
+                        ..TrainerConfig::default()
+                    };
+                    let mut trainer = Trainer::with_comm(config, &run, comm).unwrap();
+                    let make_policy = || {
+                        let logp = Var::from_tensor(
+                            &Tensor::zeros((3, 2), DType::F32, &Device::Cpu).unwrap(),
+                        )
+                        .unwrap();
+                        StatefulCandidatePolicy {
+                            inner: CandidatePolicy { logp },
+                            sampler: 0,
+                        }
+                    };
+                    let mut first = make_policy();
+                    trainer
+                        .collect_rollout_ledger_step(
+                            0,
+                            &mut first,
+                            &CandidateReward,
+                            &CandidateCodec,
+                            &[Sample::new("p", ()), Sample::new("q", ())],
+                            &ledger_root,
+                            &"e".repeat(64),
+                            None,
+                        )
+                        .unwrap();
+                    assert_eq!(first.sampler, 1);
+                    let manifest_path = ledger_root
+                        .join("step-00000000000000000000")
+                        .join("manifest.json");
+                    let exact_manifest = std::fs::read(&manifest_path).unwrap();
+
+                    if rank == 0 {
+                        match fault {
+                            "mutated" => std::fs::write(&payload_path, b"corrupt").unwrap(),
+                            "missing" => std::fs::remove_file(&payload_path).unwrap(),
+                            "read-failure" => crate::rollout_ledger::inject_distributed_reconciliation_read_failure_once(&payload_path),
+                            _ => unreachable!(),
+                        }
+                    }
+                    let mut retry = make_policy();
+                    let outcome = trainer.collect_rollout_ledger_step(
+                        0,
+                        &mut retry,
+                        &CandidateReward,
+                        &CandidateCodec,
+                        &[Sample::new("p", ()), Sample::new("q", ())],
+                        &ledger_root,
+                        &"e".repeat(64),
+                        None,
+                    );
+                    assert_eq!(std::fs::read(manifest_path).unwrap(), exact_manifest);
+                    (rank, outcome, retry.sampler)
+                })
+            })
+            .collect();
+
+            for handle in handles {
+                let (rank, outcome, sampler) = handle.join().unwrap();
+                assert!(
+                    matches!(
+                        outcome,
+                        Err(TrainerError::RolloutLedger(
+                            RolloutLedgerError::PublicationAmbiguous { .. }
+                        ))
+                    ),
+                    "{fault}: rank {rank}: {outcome:?}"
+                );
+                assert_eq!(
+                    sampler, 1,
+                    "{fault}: rank {rank} rewound after the exact manifest became visible"
+                );
+            }
+            assert!(final_dir.join("manifest.json").is_file());
+            match fault {
+                "mutated" => assert_eq!(std::fs::read(&payload_path).unwrap(), b"corrupt"),
+                "missing" => assert!(!payload_path.exists()),
+                "read-failure" => assert!(payload_path.is_file()),
+                _ => unreachable!(),
+            }
         }
     }
 

@@ -884,6 +884,65 @@ impl Policy for PersistentRollbackFailurePolicy {
     }
 }
 
+struct ContinuationFaultPolicy {
+    inner: StatefulScriptedPolicy,
+    panic_next_trainable_vars: Cell<bool>,
+    fail_restore_call: Option<usize>,
+    panic_restore_call: Option<usize>,
+    restore_calls: usize,
+}
+
+impl Policy for ContinuationFaultPolicy {
+    fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
+        self.inner.generate(prompt, cfg)
+    }
+
+    fn generate_at(
+        &mut self,
+        prompt: &[u32],
+        cfg: &GenConfig,
+        global_row_base: u64,
+    ) -> CandleResult<Rollout> {
+        self.inner.generate_at(prompt, cfg, global_row_base)
+    }
+
+    fn token_logprobs(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+        self.inner.token_logprobs(rollout)
+    }
+
+    fn set_adapter_enabled(&mut self, enabled: bool) {
+        self.inner.set_adapter_enabled(enabled);
+    }
+
+    fn adapter_enabled(&self) -> bool {
+        self.inner.adapter_enabled()
+    }
+
+    fn trainable_vars(&self) -> Vec<Var> {
+        assert!(
+            !self.panic_next_trainable_vars.replace(false),
+            "injected continuation trainable-vars panic"
+        );
+        self.inner.trainable_vars()
+    }
+
+    fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+        self.inner.sampler_state()
+    }
+
+    fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
+        self.restore_calls += 1;
+        if self.fail_restore_call == Some(self.restore_calls) {
+            candle_core::bail!("injected continuation restore failure")
+        }
+        assert!(
+            self.panic_restore_call != Some(self.restore_calls),
+            "injected continuation rollback panic"
+        );
+        self.inner.restore_sampler_state(state)
+    }
+}
+
 /// A world-1 spy counting collective invocations — the oracle for the
 /// "world-1 issues no collectives" guard discipline.
 #[derive(Debug)]
@@ -2785,6 +2844,307 @@ fn distributed_continuation_restore_rolls_back_after_asymmetric_sampler_failure(
         }
         assert_eq!(adapter_after, adapter_before, "rank {rank} adapter");
         assert_eq!(sampler_after, sampler_before, "rank {rank} sampler");
+    }
+}
+
+#[test]
+#[allow(clippy::cognitive_complexity)] // asymmetric save-preflight panic oracle
+fn distributed_continuation_save_preflight_panic_aborts_every_rank() {
+    let tmp = TempDir::new("distributed-continuation-save-panic");
+    let cfg = TrainerConfig {
+        steps: 1,
+        grad_accum_steps: 1,
+        group_size: 2,
+        beta: 0.0,
+        mu: 1,
+        ..scripted_cfg()
+    };
+    let samples = live_samples();
+    let policy_sha256 = format!("{:064x}", 89);
+    let ledger_root = tmp.path().join("ledger");
+    let checkpoint_root = tmp.path().join("continuations");
+    let comms = LocalComm::world_with_timeout(2, std::time::Duration::from_secs(10));
+    let outcomes: Vec<_> = std::thread::scope(|scope| {
+        let handles: Vec<_> = comms
+            .into_iter()
+            .map(|comm| {
+                let rank = comm.rank();
+                let cfg = cfg.clone();
+                let samples = samples.clone();
+                let base = tmp.path().to_path_buf();
+                let ledger_root = ledger_root.clone();
+                let checkpoint_root = checkpoint_root.clone();
+                let policy_sha256 = policy_sha256.clone();
+                scope.spawn(move || {
+                    let run = RunDir::create(&base, format!("save-panic-rank{rank}")).unwrap();
+                    let mut trainer = Trainer::with_comm(cfg, &run, comm).unwrap();
+                    let mut collector = StatefulScriptedPolicy::new(SEED, 0).unwrap();
+                    let mut learner = StatefulScriptedPolicy::new(SEED, 0).unwrap();
+                    trainer
+                        .collect_rollout_ledger_step(
+                            0,
+                            &mut collector,
+                            &EchoOrFlatReward,
+                            &CharTokenizer,
+                            &samples,
+                            &ledger_root,
+                            &policy_sha256,
+                            None,
+                        )
+                        .unwrap();
+                    let (_, continuation) = trainer
+                        .train_rollout_ledger_step(
+                            0,
+                            &mut learner,
+                            &ledger_root,
+                            &policy_sha256,
+                            None,
+                        )
+                        .unwrap();
+                    let adapter_before = var_bits(&learner);
+                    let sampler_before = learner.sampler_state().unwrap();
+                    let policy = ContinuationFaultPolicy {
+                        inner: learner,
+                        panic_next_trainable_vars: Cell::new(rank == 1),
+                        fail_restore_call: None,
+                        panic_restore_call: None,
+                        restore_calls: 0,
+                    };
+                    let error = trainer
+                        .save_rollout_ledger_continuation_to(
+                            &checkpoint_root,
+                            &policy,
+                            &continuation,
+                        )
+                        .unwrap_err();
+                    (
+                        rank,
+                        error.to_string(),
+                        adapter_before,
+                        var_bits(&policy),
+                        sampler_before,
+                        policy.sampler_state().unwrap(),
+                    )
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect()
+    });
+    for (rank, error, adapter_before, adapter_after, sampler_before, sampler_after) in outcomes {
+        assert!(!error.contains("timeout"), "rank {rank}: {error}");
+        if rank == 1 {
+            assert!(
+                error.contains(
+                    "continuation save preflight panicked: injected continuation trainable-vars panic"
+                ),
+                "rank {rank}: {error}"
+            );
+        } else {
+            assert!(error.contains("peer rank"), "rank {rank}: {error}");
+        }
+        assert_eq!(adapter_after, adapter_before, "rank {rank} adapter");
+        assert_eq!(sampler_after, sampler_before, "rank {rank} sampler");
+    }
+    assert!(!checkpoint_root.join("step-1").exists());
+}
+
+#[test]
+#[allow(clippy::cognitive_complexity)] // asymmetric restore-snapshot panic oracle
+fn distributed_continuation_restore_snapshot_panic_aborts_every_rank() {
+    let tmp = TempDir::new("distributed-continuation-snapshot-panic");
+    let cfg = TrainerConfig {
+        steps: 1,
+        grad_accum_steps: 1,
+        group_size: 2,
+        beta: 0.0,
+        mu: 1,
+        ..scripted_cfg()
+    };
+    let samples = live_samples();
+    let policy_sha256 = format!("{:064x}", 97);
+    let _seeded = run_stateful_separated_dp(
+        tmp.path(),
+        "snapshot-source",
+        &cfg,
+        &samples,
+        &policy_sha256,
+    );
+    let checkpoint = tmp.path().join("snapshot-source-continuations/step-1");
+    let comms = LocalComm::world_with_timeout(2, std::time::Duration::from_secs(10));
+    let outcomes: Vec<_> = std::thread::scope(|scope| {
+        let handles: Vec<_> = comms
+            .into_iter()
+            .map(|comm| {
+                let rank = comm.rank();
+                let cfg = cfg.clone();
+                let base = tmp.path().to_path_buf();
+                let checkpoint = checkpoint.clone();
+                let policy_sha256 = policy_sha256.clone();
+                scope.spawn(move || {
+                    let run = RunDir::create(&base, format!("snapshot-panic-rank{rank}")).unwrap();
+                    let trainer = Trainer::with_comm(cfg, &run, comm).unwrap();
+                    let inner = StatefulScriptedPolicy::new(
+                        SEED.wrapping_add(600 + rank as u64),
+                        700 + rank as u64,
+                    )
+                    .unwrap();
+                    let adapter_before = var_bits(&inner);
+                    let sampler_before = inner.sampler_state().unwrap();
+                    let mut policy = ContinuationFaultPolicy {
+                        inner,
+                        panic_next_trainable_vars: Cell::new(rank == 0),
+                        fail_restore_call: None,
+                        panic_restore_call: None,
+                        restore_calls: 0,
+                    };
+                    let error = trainer
+                        .restore_rollout_ledger_continuation(
+                            &checkpoint,
+                            &mut policy,
+                            &policy_sha256,
+                        )
+                        .unwrap_err();
+                    (
+                        rank,
+                        error.to_string(),
+                        adapter_before,
+                        var_bits(&policy),
+                        sampler_before,
+                        policy.sampler_state().unwrap(),
+                    )
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect()
+    });
+    for (rank, error, adapter_before, adapter_after, sampler_before, sampler_after) in outcomes {
+        assert!(!error.contains("timeout"), "rank {rank}: {error}");
+        if rank == 0 {
+            assert!(
+                error.contains(
+                    "continuation restore snapshot panicked: injected continuation trainable-vars panic"
+                ),
+                "rank {rank}: {error}"
+            );
+        } else {
+            assert!(error.contains("peer rank"), "rank {rank}: {error}");
+        }
+        assert_eq!(adapter_after, adapter_before, "rank {rank} adapter");
+        assert_eq!(sampler_after, sampler_before, "rank {rank} sampler");
+    }
+}
+
+#[test]
+#[allow(clippy::cognitive_complexity)] // asymmetric primary failure plus rollback panic
+fn distributed_continuation_rollback_panic_requires_discarding_every_rank() {
+    let tmp = TempDir::new("distributed-continuation-rollback-panic");
+    let cfg = TrainerConfig {
+        steps: 1,
+        grad_accum_steps: 1,
+        group_size: 2,
+        beta: 0.0,
+        mu: 1,
+        ..scripted_cfg()
+    };
+    let samples = live_samples();
+    let policy_sha256 = format!("{:064x}", 101);
+    let _seeded = run_stateful_separated_dp(
+        tmp.path(),
+        "rollback-panic-source",
+        &cfg,
+        &samples,
+        &policy_sha256,
+    );
+    let checkpoint = tmp
+        .path()
+        .join("rollback-panic-source-continuations/step-1");
+    let comms = LocalComm::world_with_timeout(2, std::time::Duration::from_secs(10));
+    let outcomes: Vec<_> = std::thread::scope(|scope| {
+        let handles: Vec<_> = comms
+            .into_iter()
+            .map(|comm| {
+                let rank = comm.rank();
+                let cfg = cfg.clone();
+                let base = tmp.path().to_path_buf();
+                let checkpoint = checkpoint.clone();
+                let policy_sha256 = policy_sha256.clone();
+                scope.spawn(move || {
+                    let run = RunDir::create(&base, format!("rollback-panic-rank{rank}")).unwrap();
+                    let trainer = Trainer::with_comm(cfg, &run, comm).unwrap();
+                    let inner = StatefulScriptedPolicy::new(
+                        SEED.wrapping_add(800 + rank as u64),
+                        900 + rank as u64,
+                    )
+                    .unwrap();
+                    let adapter_before = var_bits(&inner);
+                    let sampler_before = inner.sampler_state().unwrap();
+                    let mut policy = ContinuationFaultPolicy {
+                        inner,
+                        panic_next_trainable_vars: Cell::new(false),
+                        fail_restore_call: (rank == 0).then_some(1),
+                        panic_restore_call: (rank == 1).then_some(2),
+                        restore_calls: 0,
+                    };
+                    let error = trainer
+                        .restore_rollout_ledger_continuation(
+                            &checkpoint,
+                            &mut policy,
+                            &policy_sha256,
+                        )
+                        .unwrap_err();
+                    (
+                        rank,
+                        error.to_string(),
+                        adapter_before,
+                        var_bits(&policy),
+                        sampler_before,
+                        policy.sampler_state().unwrap(),
+                        policy.restore_calls,
+                    )
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect()
+    });
+    for (
+        rank,
+        error,
+        adapter_before,
+        adapter_after,
+        sampler_before,
+        sampler_after,
+        restore_calls,
+    ) in outcomes
+    {
+        assert!(!error.contains("timeout"), "rank {rank}: {error}");
+        assert!(
+            error.contains("discard the policy state on every rank"),
+            "rank {rank}: {error}"
+        );
+        if rank == 0 {
+            assert!(error.contains("peer rank"), "rank {rank}: {error}");
+            assert_eq!(sampler_after, sampler_before, "rank {rank} sampler");
+        } else {
+            assert!(
+                error.contains("injected continuation rollback panic"),
+                "rank {rank}: {error}"
+            );
+            assert_ne!(
+                sampler_after, sampler_before,
+                "rank {rank} fixture did not leave partially restored state"
+            );
+        }
+        assert_eq!(adapter_after, adapter_before, "rank {rank} adapter");
+        assert_eq!(restore_calls, 2, "rank {rank} restore calls");
     }
 }
 

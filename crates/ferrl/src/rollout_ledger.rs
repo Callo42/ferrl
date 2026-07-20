@@ -28,6 +28,8 @@ thread_local! {
     static SYNCED_DIRECTORIES: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
     static FAIL_SYNC_DIRECTORY_ONCE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
     static FAIL_DISTRIBUTED_STAGE_CLEANUP_ONCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static DISTRIBUTED_STAGE_CLEANUP_FAULTS_CONSUMED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static FAIL_DISTRIBUTED_RECONCILIATION_READ_ONCE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -59,7 +61,20 @@ pub(crate) fn inject_directory_sync_failure_once(path: impl Into<PathBuf>) {
 
 #[cfg(test)]
 pub(crate) fn inject_distributed_stage_cleanup_failure_once() {
+    DISTRIBUTED_STAGE_CLEANUP_FAULTS_CONSUMED.with(|count| count.set(0));
     FAIL_DISTRIBUTED_STAGE_CLEANUP_ONCE.with(|failure| failure.set(true));
+}
+
+#[cfg(test)]
+pub(crate) fn distributed_stage_cleanup_faults_consumed() -> u32 {
+    DISTRIBUTED_STAGE_CLEANUP_FAULTS_CONSUMED.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn inject_distributed_reconciliation_read_failure_once(path: impl Into<PathBuf>) {
+    FAIL_DISTRIBUTED_RECONCILIATION_READ_ONCE.with(|failure| {
+        *failure.borrow_mut() = Some(path.into());
+    });
 }
 
 /// A rollout-ledger read, write, identity, or semantic validation failure.
@@ -736,6 +751,8 @@ impl RolloutLedgerWriter {
         #[cfg(test)]
         FAIL_DISTRIBUTED_STAGE_CLEANUP_ONCE.with(|failure| {
             if failure.replace(false) {
+                DISTRIBUTED_STAGE_CLEANUP_FAULTS_CONSUMED
+                    .with(|count| count.set(count.get().saturating_add(1)));
                 return Err(RolloutLedgerError::io(
                     &stage.path,
                     std::io::Error::other("injected distributed hidden-stage cleanup failure"),
@@ -749,39 +766,56 @@ impl RolloutLedgerWriter {
         sync_dir(&self.root)
     }
 
-    /// Reconcile a destination that already contains the exact intended global
-    /// package. Once the manifest-bearing bytes have been observed, hidden-stage
-    /// cleanup can no longer downgrade a durably verified publication, while any
-    /// unresolved fence or post-fence identity result is reader-visible
-    /// ambiguity regardless of cleanup outcome.
-    fn reconcile_exact_existing_distributed_package(
+    /// Classify an existing destination marker-first and reconcile it when the
+    /// intended commit marker may be reader-visible. Hidden-stage cleanup cannot
+    /// downgrade a durably verified publication, while payload uncertainty or an
+    /// unresolved fence is publication ambiguity regardless of cleanup outcome.
+    fn reconcile_existing_distributed_package(
         &self,
         stage: &DistributedRolloutLedgerStage,
         expected_files: &[(String, Vec<u8>)],
     ) -> Option<Result<PathBuf, RolloutLedgerError>> {
-        if !exact_owned_distributed_package(&stage.final_dir, expected_files, None) {
-            return None;
+        match probe_existing_distributed_package(&stage.final_dir, expected_files) {
+            ExistingDistributedPackageProbe::RetryableMarker => return None,
+            ExistingDistributedPackageProbe::Exact => {}
+            ExistingDistributedPackageProbe::Ambiguous(mut detail) => {
+                if let Err(cleanup_error) = self.abort_distributed_stage(stage) {
+                    detail.push_str(&format!(
+                        "; hidden-stage cleanup also failed: {cleanup_error}"
+                    ));
+                }
+                return Some(Err(RolloutLedgerError::PublicationAmbiguous {
+                    path: stage.final_dir.clone(),
+                    detail,
+                }));
+            }
         }
 
         let fences = sync_dir(&stage.final_dir).and_then(|()| sync_dir(&self.root));
-        let exact_after_fences =
-            exact_owned_distributed_package(&stage.final_dir, expected_files, None);
+        let post_fence = probe_existing_distributed_package(&stage.final_dir, expected_files);
         let cleanup = self.abort_distributed_stage(stage);
-        if fences.is_ok() && exact_after_fences {
+        if fences.is_ok() && matches!(&post_fence, ExistingDistributedPackageProbe::Exact) {
             return Some(Ok(stage.final_dir.clone()));
         }
 
-        let mut detail = match (fences, exact_after_fences) {
-            (Ok(()), false) => {
-                "exact distributed package changed during post-fence byte verification".into()
+        let mut detail = match (fences, post_fence) {
+            (Ok(()), ExistingDistributedPackageProbe::RetryableMarker) => {
+                "the exact distributed manifest changed or disappeared during post-fence verification"
+                    .into()
             }
-            (Err(error), true) => format!(
+            (Ok(()), ExistingDistributedPackageProbe::Ambiguous(detail)) => detail,
+            (Err(error), ExistingDistributedPackageProbe::Exact) => format!(
                 "exact distributed package was already visible, but durability reconciliation failed: {error}"
             ),
-            (Err(error), false) => format!(
-                "exact distributed package was already visible, but durability reconciliation failed: {error}; post-fence byte verification also failed"
+            (Err(error), ExistingDistributedPackageProbe::RetryableMarker) => format!(
+                "exact distributed package was already visible, but durability reconciliation failed: {error}; its manifest also changed or disappeared during post-fence verification"
             ),
-            (Ok(()), true) => unreachable!("successful reconciliation returned above"),
+            (Err(error), ExistingDistributedPackageProbe::Ambiguous(detail)) => format!(
+                "exact distributed package was already visible, but durability reconciliation failed: {error}; post-fence verification was also ambiguous: {detail}"
+            ),
+            (Ok(()), ExistingDistributedPackageProbe::Exact) => {
+                unreachable!("successful reconciliation returned above")
+            }
         };
         if let Err(cleanup_error) = cleanup {
             detail.push_str(&format!(
@@ -888,7 +922,7 @@ impl RolloutLedgerWriter {
         };
         if stage.final_dir.exists() {
             if let Some(reconciled) =
-                self.reconcile_exact_existing_distributed_package(stage, &expected_files)
+                self.reconcile_existing_distributed_package(stage, &expected_files)
             {
                 return reconciled;
             }
@@ -901,24 +935,21 @@ impl RolloutLedgerWriter {
         }
 
         if let Err(source) = fs::create_dir(&stage.final_dir) {
-            if source.kind() == std::io::ErrorKind::AlreadyExists {
-                if let Some(reconciled) =
-                    self.reconcile_exact_existing_distributed_package(stage, &expected_files)
-                {
-                    return reconciled;
-                }
-                return Err(cleanup_unpublished_stage(
-                    &self.root,
-                    &stage.path,
-                    &stage.owner,
-                    RolloutLedgerError::AlreadyExists(stage.final_dir.clone()),
-                ));
+            if let Some(reconciled) =
+                self.reconcile_existing_distributed_package(stage, &expected_files)
+            {
+                return reconciled;
             }
+            let error = if source.kind() == std::io::ErrorKind::AlreadyExists {
+                RolloutLedgerError::AlreadyExists(stage.final_dir.clone())
+            } else {
+                RolloutLedgerError::io(&stage.final_dir, source)
+            };
             return Err(cleanup_unpublished_stage(
                 &self.root,
                 &stage.path,
                 &stage.owner,
-                RolloutLedgerError::io(&stage.final_dir, source),
+                error,
             ));
         }
         if let Err(error) =
@@ -1984,6 +2015,93 @@ fn exact_files_visible(dir: &Path, expected: &[(&str, &[u8])]) -> bool {
     expected.iter().all(|(name, bytes)| {
         fs::read(dir.join(name)).is_ok_and(|actual| actual.as_slice() == *bytes)
     })
+}
+
+enum ExistingDistributedPackageProbe {
+    /// The marker is definitely absent or contains different readable bytes, so
+    /// the destination cannot be the intended reader-visible publication.
+    RetryableMarker,
+    /// The intended marker and every named payload are exactly readable.
+    Exact,
+    /// The intended marker may be visible, or is exact while a payload is not
+    /// exactly readable. Sampler rollback would split state from publication.
+    Ambiguous(String),
+}
+
+fn read_distributed_reconciliation_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    #[cfg(test)]
+    {
+        let injected = FAIL_DISTRIBUTED_RECONCILIATION_READ_ONCE.with(|failure| {
+            let matches = failure.borrow().as_deref() == Some(path);
+            if matches {
+                failure.borrow_mut().take();
+            }
+            matches
+        });
+        if injected {
+            return Err(std::io::Error::other(
+                "injected distributed reconciliation read failure",
+            ));
+        }
+    }
+    fs::read(path)
+}
+
+/// Probe the commit marker before any payload. Only a definitely absent or
+/// different readable marker is retryable; once the exact intended marker is
+/// visible, every payload mismatch, absence, or read error is publication
+/// ambiguity rather than evidence that nothing was committed.
+fn probe_existing_distributed_package(
+    dir: &Path,
+    expected: &[(String, Vec<u8>)],
+) -> ExistingDistributedPackageProbe {
+    let Some((_, expected_manifest)) = expected.iter().find(|(name, _)| name == MANIFEST_FILE)
+    else {
+        return ExistingDistributedPackageProbe::Ambiguous(
+            "staged distributed package has no expected manifest bytes".into(),
+        );
+    };
+    let manifest_path = dir.join(MANIFEST_FILE);
+    match read_distributed_reconciliation_file(&manifest_path) {
+        Ok(actual) if actual.as_slice() != expected_manifest.as_slice() => {
+            return ExistingDistributedPackageProbe::RetryableMarker;
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return ExistingDistributedPackageProbe::RetryableMarker;
+        }
+        Err(error) => {
+            return ExistingDistributedPackageProbe::Ambiguous(format!(
+                "distributed manifest could not be classified as absent or different: {error}"
+            ));
+        }
+    }
+
+    for (name, expected_bytes) in expected {
+        if name == MANIFEST_FILE {
+            continue;
+        }
+        let path = dir.join(name);
+        match read_distributed_reconciliation_file(&path) {
+            Ok(actual) if actual.as_slice() == expected_bytes.as_slice() => {}
+            Ok(_) => {
+                return ExistingDistributedPackageProbe::Ambiguous(format!(
+                    "the exact distributed manifest is visible, but payload {name} differs from the intended bytes"
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return ExistingDistributedPackageProbe::Ambiguous(format!(
+                    "the exact distributed manifest is visible, but payload {name} is missing"
+                ));
+            }
+            Err(error) => {
+                return ExistingDistributedPackageProbe::Ambiguous(format!(
+                    "the exact distributed manifest is visible, but payload {name} could not be read: {error}"
+                ));
+            }
+        }
+    }
+    ExistingDistributedPackageProbe::Exact
 }
 
 fn exact_owned_distributed_package(
