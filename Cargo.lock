@@ -771,6 +771,7 @@ dependencies = [
  "candle-transformers",
  "clap",
  "cudarc 0.19.7",
+ "fs2",
  "hf-hub",
  "proptest",
  "rand 0.10.1",

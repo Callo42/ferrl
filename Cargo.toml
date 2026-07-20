@@ -63,6 +63,9 @@ serde_json = "1"
 safetensors = "0.7"
 # SHA-256 for artifact/provenance manifests.
 sha2 = "0.10"
+# Cross-process advisory locks coordinate every checkpoint writer flavor for one
+# destination. The lock file persists; the OS releases ownership on process exit.
+fs2 = "0.4"
 # Errors. `thiserror` for the library's typed error enum; `anyhow` for binaries,
 # examples, and oracle/glue paths where a boxed error is fine.
 thiserror = "2"

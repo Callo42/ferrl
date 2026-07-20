@@ -40,7 +40,9 @@
 //!
 //! ## Crash atomicity
 //!
-//! Both writers stage the whole checkpoint into a sibling temp directory
+//! Both writers coordinate through one persistent per-destination advisory lock,
+//! so an ordinary replacement cannot overlap continuation publication. Ordinary
+//! writers then stage the whole checkpoint into a sibling temp directory
 //! (`<dir>.tmp-<pid>`) and publish it with a single `rename` — so the published
 //! path never holds a *partial* checkpoint (the manifest-last ordering inside
 //! the stage is belt-and-braces on top). Replacing an existing checkpoint
@@ -50,28 +52,31 @@
 //! `<dir>.old-<pid>`, recoverable by hand). Stale `.tmp-*`/`.old-*` siblings
 //! from crashed processes are swept by the next write to the same path.
 //! Separated rollout continuations use an internal no-replace variant instead:
-//! an atomic destination-directory claim prevents forks, and a temporary
-//! manifest is renamed into place only after both payload files and the manifest
-//! have been synced. The checkpoint directory is then synced, followed by its
-//! parent so the directory claim itself is durable. Any missing parent chain is
-//! created one component at a time, syncing each new directory entry in its
-//! already durable ancestor before proceeding. Successful publication thus
-//! requires a filesystem/platform that supports opening and syncing directories;
-//! unsupported directory-sync behavior returns an I/O error instead of claiming
-//! durability. A failed claim sync is rolled back and the removal synced before
-//! returning; a failure after the manifest rename retries the complete directory
-//! durability fence and verifies that all three visible files still match their
-//! pre-publication fingerprints before accepting recovery as success. If cleanup,
-//! that retry, or the exact-package check cannot be confirmed, the writer returns
-//! [`CheckpointError::PublicationAmbiguous`] for explicit operator reconciliation.
-//! A crash may still strand an incomplete claim, but it cannot expose or overwrite
-//! a completed continuation.
+//! an atomic destination-directory claim prevents forks, a synced private owner
+//! marker binds cleanup to that exact claim, and a temporary manifest is renamed
+//! into place only after both payload files and the manifest have been synced. The
+//! checkpoint directory is then synced, followed by its parent so the directory
+//! claim itself is durable. Any missing parent chain is created one component at a
+//! time, syncing each new directory entry in its already durable ancestor before
+//! proceeding. Successful publication thus requires a filesystem/platform that
+//! supports advisory file locks plus opening and syncing directories; unsupported
+//! behavior returns an I/O error instead of claiming durability. A failed claim
+//! sync is removed only while the marker proves ownership, and the removal is
+//! synced before returning. Every post-manifest success path verifies that the
+//! owner marker and all three visible files still match the intended package; a
+//! failed fence retries the complete durability boundary before the same check. If
+//! ownership, cleanup, durability, or the exact-package check cannot be confirmed,
+//! the writer returns [`CheckpointError::PublicationAmbiguous`] for explicit
+//! operator reconciliation. A crash may still strand an incomplete claim, but it
+//! cannot expose or overwrite a completed continuation.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use candle_core::{Device, Tensor, Var};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -85,14 +90,34 @@ enum NoReplaceSyncPoint {
 }
 
 #[cfg(test)]
-type NoReplaceRecoveryHook = Box<dyn FnOnce(&Path)>;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoReplaceHookPoint {
+    BeforeFingerprint,
+    BeforeManifestRename,
+    BeforeFirstFence,
+    AfterFirstFenceFailure,
+}
+
+#[cfg(test)]
+type NoReplaceHook = Box<dyn FnOnce(&Path)>;
 
 #[cfg(test)]
 thread_local! {
     static SYNCED_DIRECTORIES: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
     static FAIL_SYNC_DIRECTORY_ONCE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
     static FAIL_NO_REPLACE_SYNCS: std::cell::RefCell<Vec<NoReplaceSyncPoint>> = const { std::cell::RefCell::new(Vec::new()) };
-    static NO_REPLACE_RECOVERY_HOOK: std::cell::RefCell<Option<NoReplaceRecoveryHook>> = const { std::cell::RefCell::new(None) };
+    static NO_REPLACE_HOOK: std::cell::RefCell<Option<(NoReplaceHookPoint, NoReplaceHook)>> = const { std::cell::RefCell::new(None) };
+}
+
+static CLAIM_TOKEN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+struct CheckpointWriterLock {
+    _file: std::fs::File,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClaimOwnership {
+    token: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +139,10 @@ const ADAPTER_FILE: &str = "adapter.safetensors";
 const OPTIMIZER_FILE: &str = "optimizer.safetensors";
 /// Filename of the checkpoint manifest within a checkpoint directory.
 const MANIFEST_FILE: &str = "manifest.json";
+/// Persistent sibling file used for the shared advisory destination lock.
+const WRITER_LOCK_SUFFIX: &str = ".writer-lock";
+/// Private file binding no-replace cleanup and publication to one exact claim.
+const CLAIM_OWNER_FILE: &str = ".ferrl-continuation-owner";
 /// On-disk checkpoint layout version; bumped on an incompatible format change. v1 =
 /// adapter only; v2 = adapter + optimizer moments + sampler RNG (momentum-faithful);
 /// v3 = v2 with the sampler blob now carrying the run `base_seed` (global-index
@@ -252,13 +281,81 @@ fn io(path: impl Into<PathBuf>, source: std::io::Error) -> CheckpointError {
     }
 }
 
+fn sibling_path_with_suffix(dir: &Path, suffix: &str) -> PathBuf {
+    let mut name = dir.file_name().unwrap_or_default().to_os_string();
+    name.push(suffix);
+    dir.with_file_name(name)
+}
+
+fn acquire_checkpoint_writer_lock(dir: &Path) -> Result<CheckpointWriterLock, CheckpointError> {
+    let parent = dir.parent().ok_or_else(|| {
+        io(
+            dir,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "checkpoint path has no parent directory",
+            ),
+        )
+    })?;
+    if !parent.as_os_str().is_empty() {
+        std::fs::create_dir_all(parent).map_err(|error| io(parent, error))?;
+    }
+    let lock_path = sibling_path_with_suffix(dir, WRITER_LOCK_SUFFIX);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|error| io(&lock_path, error))?;
+    FileExt::try_lock_exclusive(&file).map_err(|error| {
+        let error = if error.kind() == std::io::ErrorKind::WouldBlock {
+            std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "another checkpoint writer owns this destination",
+            )
+        } else {
+            error
+        };
+        io(&lock_path, error)
+    })?;
+    Ok(CheckpointWriterLock { _file: file })
+}
+
+impl ClaimOwnership {
+    fn create(dir: &Path) -> Result<Self, CheckpointError> {
+        let sequence = CLAIM_TOKEN_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let token = format!(
+            "{}:{:?}:{now}:{sequence}",
+            std::process::id(),
+            std::thread::current().id()
+        )
+        .into_bytes();
+        let path = dir.join(CLAIM_OWNER_FILE);
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|error| io(&path, error))?;
+        file.write_all(&token).map_err(|error| io(&path, error))?;
+        file.sync_all().map_err(|error| io(&path, error))?;
+        Ok(Self { token })
+    }
+
+    fn matches(&self, dir: &Path) -> std::io::Result<bool> {
+        std::fs::read(dir.join(CLAIM_OWNER_FILE)).map(|actual| actual == self.token)
+    }
+}
+
 /// The sibling staging directory for an atomic checkpoint write:
 /// `<dir>.tmp-<pid>` (pid-suffixed so a stale stage from a dead process can
 /// never be confused with this one's).
 fn stage_path(dir: &Path) -> PathBuf {
-    let mut name = dir.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".tmp-{}", std::process::id()));
-    dir.with_file_name(name)
+    sibling_path_with_suffix(dir, &format!(".tmp-{}", std::process::id()))
 }
 
 /// Prepare an empty staging directory for `dir`, sweeping any stale `.tmp-*` /
@@ -330,6 +427,9 @@ fn write_staged(
     dir: &Path,
     write: impl FnOnce(&Path) -> Result<(), CheckpointError>,
 ) -> Result<(), CheckpointError> {
+    // Every public writer for this destination takes the same OS-released lock.
+    // Keep the guard alive through stale-stage cleanup, commit, and rollback.
+    let _writer_lock = acquire_checkpoint_writer_lock(dir)?;
     let stage = prepare_stage(dir)?;
     match write(&stage) {
         Ok(()) => commit_stage(&stage, dir),
@@ -567,15 +667,17 @@ pub fn save_checkpoint(
 /// absent destination directory.
 ///
 /// Unlike [`save_checkpoint`], this never renames an existing destination aside.
-/// `create_dir` is the no-replace claim, the tensor files are written behind that
-/// claim, and an atomically renamed manifest is the reader-visible commit marker.
-/// A process crash can leave an incomplete claimed directory, which discovery
-/// skips and a later writer refuses to replace; recovery must explicitly inspect
-/// and remove that abandoned claim. Ordinary operation cleans and durably removes
-/// a failed pre-manifest claim before returning. Once the manifest is visible,
-/// directory-sync failures are retried. Recovery is success only when the visible
-/// adapter, optimizer, and manifest still match the exact package fingerprinted
-/// before publication; an unreconciled failure or mismatch is returned as
+/// Both writer flavors first claim the same persistent sibling advisory lock;
+/// `create_dir` is then the no-replace claim, a synced private marker proves which
+/// directory this writer owns, and an atomically renamed manifest is the
+/// reader-visible commit marker. A process crash can leave an incomplete claimed
+/// directory, which discovery skips and a later writer refuses to replace;
+/// recovery must explicitly inspect and remove that abandoned claim. Ordinary
+/// operation cleans and durably removes a failed pre-manifest claim only while its
+/// marker still proves ownership. Every successful post-manifest durability fence
+/// verifies both ownership and the visible adapter, optimizer, and manifest against
+/// the exact package fingerprinted before publication. An unreconciled failure,
+/// ownership loss, or package mismatch is returned as
 /// [`CheckpointError::PublicationAmbiguous`] and must not be blindly overwritten.
 pub(crate) fn save_checkpoint_no_replace(
     dir: impl AsRef<Path>,
@@ -596,12 +698,26 @@ pub(crate) fn save_checkpoint_no_replace(
         )
     })?;
     create_directory_all_durable(parent)?;
+    // Ordinary adapter/checkpoint writers take this same destination lock. Keep
+    // it alive through claim cleanup and every post-manifest verification.
+    let _writer_lock = acquire_checkpoint_writer_lock(dir)?;
     std::fs::create_dir(dir).map_err(|error| io(dir, error))?;
+    let ownership = ClaimOwnership::create(dir).map_err(|error| {
+        CheckpointError::PublicationAmbiguous {
+            path: dir.to_path_buf(),
+            detail: format!(
+                "{error}; claim owner marker could not be established, so the destination was preserved"
+            ),
+        }
+    })?;
+    if let Err(error) = sync_directory(dir) {
+        return Err(cleanup_uncommitted_claim(dir, parent, &ownership, error));
+    }
     // Anchor the no-replace claim before writing behind it. A crash may retain
     // an incomplete claim, but a successful return can never depend on an
     // uncommitted directory entry.
     if let Err(error) = sync_no_replace_boundary(parent, NoReplaceSyncPoint::ClaimParent) {
-        return Err(cleanup_uncommitted_claim(dir, parent, error));
+        return Err(cleanup_uncommitted_claim(dir, parent, &ownership, error));
     }
     let manifest_stage = dir.join(format!("{MANIFEST_FILE}.tmp-{}", std::process::id()));
     if let Err(error) = write_checkpoint_contents(
@@ -614,45 +730,94 @@ pub(crate) fn save_checkpoint_no_replace(
         lora_recipe.map(str::to_owned),
         Some(continuation),
     ) {
-        return Err(cleanup_uncommitted_claim(dir, parent, error));
+        return Err(cleanup_uncommitted_claim(dir, parent, &ownership, error));
     }
+    #[cfg(test)]
+    run_no_replace_hook(dir, NoReplaceHookPoint::BeforeFingerprint);
     let expected_package = match checkpoint_package_fingerprint(dir, &manifest_stage) {
         Ok(fingerprint) => fingerprint,
-        Err(error) => return Err(cleanup_uncommitted_claim(dir, parent, error)),
+        Err(error) => {
+            return Err(cleanup_uncommitted_claim(dir, parent, &ownership, error));
+        }
     };
+    #[cfg(test)]
+    run_no_replace_hook(dir, NoReplaceHookPoint::BeforeManifestRename);
     let manifest = dir.join(MANIFEST_FILE);
     if let Err(error) =
         std::fs::rename(&manifest_stage, &manifest).map_err(|error| io(&manifest_stage, error))
     {
-        return Err(cleanup_uncommitted_claim(dir, parent, error));
+        return Err(cleanup_uncommitted_claim(dir, parent, &ownership, error));
     }
+    #[cfg(test)]
+    run_no_replace_hook(dir, NoReplaceHookPoint::BeforeFirstFence);
     match sync_no_replace_publication(dir, parent) {
-        Ok(()) => Ok(()),
+        Ok(()) => verify_visible_owned_package(
+            dir,
+            &manifest,
+            &ownership,
+            &expected_package,
+            "initial durability fence completed",
+        ),
         Err(error) => {
             #[cfg(test)]
-            run_no_replace_recovery_hook(dir);
+            run_no_replace_hook(dir, NoReplaceHookPoint::AfterFirstFenceFailure);
             match sync_no_replace_publication(dir, parent) {
-                Ok(()) => match checkpoint_package_fingerprint(dir, &manifest) {
-                    Ok(visible_package) if visible_package == expected_package => Ok(()),
-                    Ok(_) => Err(CheckpointError::PublicationAmbiguous {
-                        path: dir.to_path_buf(),
-                        detail: format!(
-                            "{error}; durability retry completed but the visible package no longer matches the intended checkpoint"
-                        ),
-                    }),
-                    Err(verification_error) => Err(CheckpointError::PublicationAmbiguous {
-                        path: dir.to_path_buf(),
-                        detail: format!(
-                            "{error}; durability retry completed but visible package verification failed: {verification_error}"
-                        ),
-                    }),
-                },
+                Ok(()) => verify_visible_owned_package(
+                    dir,
+                    &manifest,
+                    &ownership,
+                    &expected_package,
+                    &format!("{error}; durability retry completed"),
+                ),
                 Err(retry_error) => Err(CheckpointError::PublicationAmbiguous {
                     path: dir.to_path_buf(),
                     detail: format!("{error}; durability retry failed: {retry_error}"),
                 }),
             }
         }
+    }
+}
+
+fn verify_visible_owned_package(
+    dir: &Path,
+    manifest_path: &Path,
+    ownership: &ClaimOwnership,
+    expected_package: &CheckpointPackageFingerprint,
+    completed_fence: &str,
+) -> Result<(), CheckpointError> {
+    match ownership.matches(dir) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(CheckpointError::PublicationAmbiguous {
+                path: dir.to_path_buf(),
+                detail: format!(
+                    "{completed_fence}, but destination ownership no longer matches the intended claim"
+                ),
+            });
+        }
+        Err(error) => {
+            return Err(CheckpointError::PublicationAmbiguous {
+                path: dir.to_path_buf(),
+                detail: format!(
+                    "{completed_fence}, but destination ownership verification failed: {error}"
+                ),
+            });
+        }
+    }
+    match checkpoint_package_fingerprint(dir, manifest_path) {
+        Ok(visible_package) if visible_package == *expected_package => Ok(()),
+        Ok(_) => Err(CheckpointError::PublicationAmbiguous {
+            path: dir.to_path_buf(),
+            detail: format!(
+                "{completed_fence}, but the visible package no longer matches the intended checkpoint"
+            ),
+        }),
+        Err(error) => Err(CheckpointError::PublicationAmbiguous {
+            path: dir.to_path_buf(),
+            detail: format!(
+                "{completed_fence}, but visible package verification failed: {error}"
+            ),
+        }),
     }
 }
 
@@ -692,8 +857,18 @@ fn fingerprint_file(path: &Path) -> Result<FileFingerprint, CheckpointError> {
 }
 
 #[cfg(test)]
-fn run_no_replace_recovery_hook(dir: &Path) {
-    let hook = NO_REPLACE_RECOVERY_HOOK.with(|hook| hook.borrow_mut().take());
+fn run_no_replace_hook(dir: &Path, point: NoReplaceHookPoint) {
+    let hook = NO_REPLACE_HOOK.with(|hook| {
+        let mut hook = hook.borrow_mut();
+        if hook
+            .as_ref()
+            .is_some_and(|(hook_point, _)| *hook_point == point)
+        {
+            hook.take().map(|(_, hook)| hook)
+        } else {
+            None
+        }
+    });
     if let Some(hook) = hook {
         hook(dir);
     }
@@ -702,8 +877,28 @@ fn run_no_replace_recovery_hook(dir: &Path) {
 fn cleanup_uncommitted_claim(
     dir: &Path,
     parent: &Path,
+    ownership: &ClaimOwnership,
     original: CheckpointError,
 ) -> CheckpointError {
+    match ownership.matches(dir) {
+        Ok(true) => {}
+        Ok(false) => {
+            return CheckpointError::PublicationAmbiguous {
+                path: dir.to_path_buf(),
+                detail: format!(
+                    "{original}; claim ownership was lost, so the current destination was preserved"
+                ),
+            };
+        }
+        Err(error) => {
+            return CheckpointError::PublicationAmbiguous {
+                path: dir.to_path_buf(),
+                detail: format!(
+                    "{original}; claim ownership could not be verified ({error}), so the current destination was preserved"
+                ),
+            };
+        }
+    }
     match std::fs::remove_dir_all(dir) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1129,6 +1324,7 @@ mod tests {
     impl Drop for TempDir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+            let _ = std::fs::remove_file(sibling_path_with_suffix(&self.0, WRITER_LOCK_SUFFIX));
         }
     }
 
@@ -1412,6 +1608,81 @@ mod tests {
         }
     }
 
+    fn set_no_replace_hook(point: NoReplaceHookPoint, hook: impl FnOnce(&Path) + 'static) {
+        NO_REPLACE_HOOK.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            assert!(
+                slot.is_none(),
+                "a no-replace test hook is already installed"
+            );
+            *slot = Some((point, Box::new(hook)));
+        });
+    }
+
+    fn stage_ordinary_replacement(checkpoints: &Path, label: &str) -> PathBuf {
+        let replacement = checkpoints.join(format!("ordinary-{label}"));
+        save_checkpoint(
+            &replacement,
+            &make_vars(),
+            &make_opt_state(),
+            &[9, 8, 7],
+            99,
+            Some("ordinary-replacement"),
+        )
+        .unwrap();
+        replacement
+    }
+
+    fn install_uncoordinated_replacement_hook(point: NoReplaceHookPoint, replacement: PathBuf) {
+        set_no_replace_hook(point, move |dir| {
+            // Bypass the new public-writer lock only at this deterministic test
+            // seam. `commit_stage` is the ordinary writer's exact atomic
+            // replacement primitive, so this models ownership loss after claim.
+            commit_stage(&replacement, dir).unwrap();
+        });
+    }
+
+    fn assert_ordinary_replacement_visible(checkpoints: &Path, destination: &Path) {
+        assert_eq!(
+            latest_rollout_ledger_continuation(checkpoints).unwrap(),
+            None,
+            "ordinary replacement must not be discovered as a continuation"
+        );
+        assert_eq!(
+            latest_checkpoint(checkpoints).unwrap().unwrap(),
+            LatestCheckpoint {
+                dir: destination.to_path_buf(),
+                step: 99,
+            }
+        );
+        let loaded = load_checkpoint(destination, &make_vars()).unwrap();
+        assert_eq!(loaded.step, 99);
+        assert_eq!(loaded.sampler_state.as_deref(), Some([9, 8, 7].as_slice()));
+        assert_eq!(loaded.lora_recipe.as_deref(), Some("ordinary-replacement"));
+    }
+
+    fn assert_replacement_preserved_at(point: NoReplaceHookPoint, label: &str) {
+        let tmp = TempDir::new(label);
+        let checkpoints = tmp.path().join("checkpoints");
+        let destination = checkpoints.join("step-1");
+        let replacement = stage_ordinary_replacement(&checkpoints, label);
+        install_uncoordinated_replacement_hook(point, replacement);
+
+        assert!(matches!(
+            save_checkpoint_no_replace(
+                &destination,
+                &make_vars(),
+                &make_opt_state(),
+                &[1],
+                None,
+                continuation_manifest(1),
+            ),
+            Err(CheckpointError::PublicationAmbiguous { path, detail })
+                if path == destination && detail.contains("preserved")
+        ));
+        assert_ordinary_replacement_visible(&checkpoints, &destination);
+    }
+
     #[test]
     fn save_checkpoint_round_trips_the_adapter_and_step() {
         let tmp = TempDir::new("v2-adapter");
@@ -1474,6 +1745,71 @@ mod tests {
         let loaded = load_checkpoint(&destination, &vars).unwrap();
         assert_eq!(loaded.step, 1);
         assert!(matches!(loaded.sampler_state.as_deref(), Some([1 | 2])));
+    }
+
+    #[test]
+    fn ordinary_writer_cannot_replace_an_active_continuation_claim() {
+        let tmp = TempDir::new("shared-writer-lock");
+        let checkpoints = tmp.path().join("checkpoints");
+        let destination = checkpoints.join("step-1");
+        let blocked = std::rc::Rc::new(std::cell::Cell::new(false));
+        let hook_blocked = blocked.clone();
+        set_no_replace_hook(NoReplaceHookPoint::BeforeFingerprint, move |dir| {
+            let error = save_checkpoint(
+                dir,
+                &make_vars(),
+                &make_opt_state(),
+                &[9, 8, 7],
+                99,
+                Some("ordinary-replacement"),
+            )
+            .unwrap_err();
+            hook_blocked.set(matches!(
+                error,
+                CheckpointError::Io { source, .. }
+                    if source.kind() == std::io::ErrorKind::WouldBlock
+            ));
+        });
+
+        save_checkpoint_no_replace(
+            &destination,
+            &make_vars(),
+            &make_opt_state(),
+            &[1],
+            None,
+            continuation_manifest(1),
+        )
+        .unwrap();
+
+        assert!(
+            blocked.get(),
+            "ordinary writer did not share the destination lock"
+        );
+        assert_eq!(
+            latest_rollout_ledger_continuation(&checkpoints)
+                .unwrap()
+                .unwrap(),
+            LatestCheckpoint {
+                dir: destination,
+                step: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn pre_fingerprint_ownership_loss_preserves_ordinary_replacement() {
+        assert_replacement_preserved_at(
+            NoReplaceHookPoint::BeforeFingerprint,
+            "pre-fingerprint-replacement",
+        );
+    }
+
+    #[test]
+    fn pre_manifest_rename_ownership_loss_preserves_ordinary_replacement() {
+        assert_replacement_preserved_at(
+            NoReplaceHookPoint::BeforeManifestRename,
+            "pre-manifest-rename-replacement",
+        );
     }
 
     #[test]
@@ -1675,28 +2011,40 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::cognitive_complexity)] // pins publication, discovery, and restore outcomes
-    fn no_replace_checkpoint_recovery_rejects_ordinary_replacement() {
-        let tmp = TempDir::new("no-replace-recovery-replacement");
+    fn no_replace_checkpoint_first_fence_rejects_ordinary_replacement() {
+        let tmp = TempDir::new("no-replace-first-fence-replacement");
         let checkpoints = tmp.path().join("checkpoints");
         let destination = checkpoints.join("step-1");
-        FAIL_NO_REPLACE_SYNCS.with(|failures| {
-            *failures.borrow_mut() = vec![NoReplaceSyncPoint::ManifestDirectory];
-        });
-        NO_REPLACE_RECOVERY_HOOK.with(|hook| {
-            let replacement_vars = make_vars();
-            let replacement_opt = make_opt_state();
-            *hook.borrow_mut() = Some(Box::new(move |dir| {
-                save_checkpoint(
-                    dir,
-                    &replacement_vars,
-                    &replacement_opt,
-                    &[9, 8, 7],
-                    99,
-                    Some("ordinary-replacement"),
-                )
-                .unwrap();
-            }));
+        let replacement = stage_ordinary_replacement(&checkpoints, "first-fence");
+        install_uncoordinated_replacement_hook(NoReplaceHookPoint::BeforeFirstFence, replacement);
+
+        assert!(matches!(
+            save_checkpoint_no_replace(
+                &destination,
+                &make_vars(),
+                &make_opt_state(),
+                &[1],
+                None,
+                continuation_manifest(1),
+            ),
+            Err(CheckpointError::PublicationAmbiguous { path, detail })
+                if path == destination && detail.contains("ownership")
+        ));
+        assert_ordinary_replacement_visible(&checkpoints, &destination);
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // pins first-fence discovery, restore, and retry behavior
+    fn no_replace_checkpoint_first_fence_rejects_manifest_disappearance() {
+        let tmp = TempDir::new("no-replace-first-fence-missing-manifest");
+        let checkpoints = tmp.path().join("checkpoints");
+        let destination = checkpoints.join("step-1");
+        set_no_replace_hook(NoReplaceHookPoint::BeforeFirstFence, |dir| {
+            std::fs::rename(
+                dir.join(MANIFEST_FILE),
+                dir.join("manifest.json.disappeared"),
+            )
+            .unwrap();
         });
 
         assert!(matches!(
@@ -1709,24 +2057,58 @@ mod tests {
                 continuation_manifest(1),
             ),
             Err(CheckpointError::PublicationAmbiguous { path, detail })
-                if path == destination && detail.contains("visible package no longer matches")
+                if path == destination && detail.contains("visible package verification failed")
         ));
+        assert_eq!(latest_checkpoint(&checkpoints).unwrap(), None);
         assert_eq!(
             latest_rollout_ledger_continuation(&checkpoints).unwrap(),
-            None,
-            "ordinary replacement must not remain discoverable as a continuation"
+            None
         );
-        assert_eq!(
-            latest_checkpoint(&checkpoints).unwrap().unwrap(),
-            LatestCheckpoint {
-                dir: destination.clone(),
-                step: 99,
-            }
+        assert!(matches!(
+            load_checkpoint(&destination, &make_vars()),
+            Err(CheckpointError::Io { .. })
+        ));
+        assert!(matches!(
+            save_checkpoint_no_replace(
+                &destination,
+                &make_vars(),
+                &make_opt_state(),
+                &[1],
+                None,
+                continuation_manifest(1),
+            ),
+            Err(CheckpointError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+    }
+
+    #[test]
+    fn no_replace_checkpoint_recovery_rejects_ordinary_replacement() {
+        let tmp = TempDir::new("no-replace-recovery-replacement");
+        let checkpoints = tmp.path().join("checkpoints");
+        let destination = checkpoints.join("step-1");
+        let replacement = stage_ordinary_replacement(&checkpoints, "recovery");
+        FAIL_NO_REPLACE_SYNCS.with(|failures| {
+            *failures.borrow_mut() = vec![NoReplaceSyncPoint::ManifestDirectory];
+        });
+        install_uncoordinated_replacement_hook(
+            NoReplaceHookPoint::AfterFirstFenceFailure,
+            replacement,
         );
-        let loaded = load_checkpoint(&destination, &make_vars()).unwrap();
-        assert_eq!(loaded.step, 99);
-        assert_eq!(loaded.sampler_state.as_deref(), Some([9, 8, 7].as_slice()));
-        assert_eq!(loaded.lora_recipe.as_deref(), Some("ordinary-replacement"));
+
+        assert!(matches!(
+            save_checkpoint_no_replace(
+                &destination,
+                &make_vars(),
+                &make_opt_state(),
+                &[1],
+                None,
+                continuation_manifest(1),
+            ),
+            Err(CheckpointError::PublicationAmbiguous { path, detail })
+                if path == destination && detail.contains("ownership")
+        ));
+        assert_ordinary_replacement_visible(&checkpoints, &destination);
     }
 
     #[test]
@@ -1738,14 +2120,12 @@ mod tests {
         FAIL_NO_REPLACE_SYNCS.with(|failures| {
             *failures.borrow_mut() = vec![NoReplaceSyncPoint::ManifestDirectory];
         });
-        NO_REPLACE_RECOVERY_HOOK.with(|hook| {
-            *hook.borrow_mut() = Some(Box::new(|dir| {
-                std::fs::rename(
-                    dir.join(MANIFEST_FILE),
-                    dir.join("manifest.json.disappeared"),
-                )
-                .unwrap();
-            }));
+        set_no_replace_hook(NoReplaceHookPoint::AfterFirstFenceFailure, |dir| {
+            std::fs::rename(
+                dir.join(MANIFEST_FILE),
+                dir.join("manifest.json.disappeared"),
+            )
+            .unwrap();
         });
 
         assert!(matches!(
