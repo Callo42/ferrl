@@ -15,10 +15,37 @@ use sha2::{Digest, Sha256};
 use crate::grpo::{group_advantages, ScaleRewards};
 
 /// The only rollout-ledger format this release accepts.
-pub const ROLLOUT_LEDGER_FORMAT_VERSION: u32 = 1;
+pub const ROLLOUT_LEDGER_FORMAT_VERSION: u32 = 3;
 
 const PAYLOAD_FILE: &str = "window.json";
 const MANIFEST_FILE: &str = "manifest.json";
+
+#[cfg(test)]
+thread_local! {
+    static POST_MANIFEST_TEST_FAULT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    static SYNCED_DIRECTORIES: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+    static FAIL_SYNC_DIRECTORY_ONCE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn inject_post_manifest_failure_once() {
+    POST_MANIFEST_TEST_FAULT.with(|fault| fault.set(1));
+}
+
+#[cfg(test)]
+pub(crate) fn inject_persistent_post_manifest_sync_failure_once() {
+    POST_MANIFEST_TEST_FAULT.with(|fault| fault.set(2));
+}
+
+#[cfg(test)]
+pub(crate) fn inject_post_manifest_disappearance_once() {
+    POST_MANIFEST_TEST_FAULT.with(|fault| fault.set(3));
+}
+
+#[cfg(test)]
+fn inject_post_manifest_in_place_mutation_once() {
+    POST_MANIFEST_TEST_FAULT.with(|fault| fault.set(4));
+}
 
 /// A rollout-ledger read, write, identity, or semantic validation failure.
 #[derive(Debug, thiserror::Error)]
@@ -37,6 +64,15 @@ pub enum RolloutLedgerError {
     /// The artifact exists already; rollout windows are immutable.
     #[error("rollout ledger window already exists: {0}")]
     AlreadyExists(PathBuf),
+    /// Publication crossed the reader-visible manifest boundary, but the exact
+    /// visible bytes could not be reconciled after a later durability failure.
+    #[error("rollout ledger publication is visible but ambiguous at {path}: {detail}")]
+    PublicationAmbiguous {
+        /// Reader-visible destination that must not be treated as uncommitted.
+        path: PathBuf,
+        /// Original publication/reconciliation failure.
+        detail: String,
+    },
     /// The manifest belongs to a different learner pre-state.
     #[error("rollout ledger identity mismatch")]
     IdentityMismatch,
@@ -54,6 +90,12 @@ impl RolloutLedgerError {
             path: path.into(),
             source,
         }
+    }
+
+    /// Whether the manifest commit marker may already be reader-visible.
+    #[must_use]
+    pub fn may_be_visible(&self) -> bool {
+        matches!(self, Self::PublicationAmbiguous { .. })
     }
 }
 
@@ -78,6 +120,10 @@ pub struct RolloutLedgerIdentity {
     pub adapter_sha256: String,
     /// Exact pre-update optimizer-state digest.
     pub optimizer_sha256: String,
+    /// Exact pre-collection opaque sampler-state digest.
+    pub sampler_sha256: String,
+    /// Exact chain lineage represented by the pre-step continuation.
+    pub lineage_sha256: String,
     /// Outer trainer step that produced this window.
     pub source_step: u64,
     /// Adam update counter before consuming this window.
@@ -143,7 +189,7 @@ pub enum LedgerScoreRequirement {
 pub struct RolloutLedgerGroup {
     /// Zero-based position inside the accumulation window.
     pub accum_index: u32,
-    /// Global prompt ordinal: `step * grad_accum_steps + accum_index` in v1.
+    /// Global prompt ordinal: `step * grad_accum_steps + accum_index` in v2.
     pub prompt_index: u64,
     /// Rectangular rows: prompt tokens followed by padded completion tokens.
     pub token_ids: Vec<Vec<u32>>,
@@ -170,9 +216,9 @@ pub struct RolloutLedgerGroup {
 pub struct RolloutLedgerStep {
     /// Outer trainer step represented by this artifact.
     pub step: u64,
-    /// Execution rank; v1 requires `0`.
+    /// Execution rank; v2 requires `0`.
     pub rank: u32,
-    /// Execution world size; v1 requires `1`.
+    /// Execution world size; v2 requires `1`.
     pub world_size: u32,
     /// Expected number of ordered prompt groups.
     pub grad_accum_steps: u32,
@@ -200,6 +246,8 @@ pub struct RolloutLedgerStep {
     pub old_logprobs: LedgerScoreRequirement,
     /// Required detached reference-policy scoring contract.
     pub reference_logprobs: LedgerScoreRequirement,
+    /// Exact opaque sampler state after the collector produced this window.
+    pub post_rollout_sampler_state: Vec<u8>,
     /// Every prompt group in accumulation order.
     pub groups: Vec<RolloutLedgerGroup>,
 }
@@ -249,6 +297,8 @@ struct RolloutLedgerManifest {
 pub struct RolloutLedgerWriter {
     root: PathBuf,
     identity: RolloutLedgerIdentity,
+    #[cfg(test)]
+    fail_after_manifest_link: bool,
 }
 
 impl RolloutLedgerWriter {
@@ -264,8 +314,13 @@ impl RolloutLedgerWriter {
     ) -> Result<Self, RolloutLedgerError> {
         validate_identity(&identity)?;
         let root = root.into();
-        fs::create_dir_all(&root).map_err(|e| RolloutLedgerError::io(&root, e))?;
-        Ok(Self { root, identity })
+        create_dir_all_durable(&root)?;
+        Ok(Self {
+            root,
+            identity,
+            #[cfg(test)]
+            fail_after_manifest_link: false,
+        })
     }
 
     /// Stage and atomically publish one complete optimizer window.
@@ -273,7 +328,9 @@ impl RolloutLedgerWriter {
     /// The payload is synced first and the manifest is written/synced last inside
     /// a sibling staging directory. An atomic final-directory claim prevents
     /// replacement; the complete staged manifest is then hard-linked last as the
-    /// reader-visible commit marker.
+    /// reader-visible commit marker. Once that link succeeds, every required
+    /// directory sync is retried before success can be reported; a persistent
+    /// durability failure remains ambiguous and must not rewind collector state.
     ///
     /// # Errors
     ///
@@ -334,6 +391,10 @@ impl RolloutLedgerWriter {
         staging: &Path,
         final_dir: &Path,
     ) -> Result<PathBuf, RolloutLedgerError> {
+        let expected_payload = fs::read(staging.join(PAYLOAD_FILE))
+            .map_err(|error| RolloutLedgerError::io(staging.join(PAYLOAD_FILE), error))?;
+        let expected_manifest = fs::read(staging.join(MANIFEST_FILE))
+            .map_err(|error| RolloutLedgerError::io(staging.join(MANIFEST_FILE), error))?;
         match fs::create_dir(final_dir) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -341,6 +402,7 @@ impl RolloutLedgerWriter {
             }
             Err(error) => return Err(RolloutLedgerError::io(final_dir, error)),
         }
+        let mut manifest_linked = false;
         let result = (|| {
             let payload = final_dir.join(PAYLOAD_FILE);
             fs::hard_link(staging.join(PAYLOAD_FILE), &payload)
@@ -350,14 +412,98 @@ impl RolloutLedgerWriter {
             let manifest = final_dir.join(MANIFEST_FILE);
             fs::hard_link(staging.join(MANIFEST_FILE), &manifest)
                 .map_err(|error| RolloutLedgerError::io(&manifest, error))?;
+            manifest_linked = true;
+            #[cfg(test)]
+            if self.fail_after_manifest_link {
+                return Err(RolloutLedgerError::io(
+                    final_dir,
+                    std::io::Error::other("injected post-manifest publication failure"),
+                ));
+            }
+            #[cfg(test)]
+            POST_MANIFEST_TEST_FAULT.with(|fault| match fault.get() {
+                0 => Ok(()),
+                1 => {
+                    fault.set(0);
+                    Err(RolloutLedgerError::io(
+                        final_dir,
+                        std::io::Error::other("injected transient post-manifest failure"),
+                    ))
+                }
+                2 => Err(RolloutLedgerError::io(
+                    final_dir,
+                    std::io::Error::other("injected persistent post-manifest sync failure"),
+                )),
+                3 => {
+                    fault.set(0);
+                    let _ = fs::remove_file(&manifest);
+                    Err(RolloutLedgerError::io(
+                        final_dir,
+                        std::io::Error::other("injected post-link manifest disappearance"),
+                    ))
+                }
+                4 => {
+                    fault.set(0);
+                    let mut file = OpenOptions::new()
+                        .write(true)
+                        .open(&payload)
+                        .map_err(|error| RolloutLedgerError::io(&payload, error))?;
+                    file.write_all(b"x")
+                        .map_err(|error| RolloutLedgerError::io(&payload, error))?;
+                    file.sync_all()
+                        .map_err(|error| RolloutLedgerError::io(&payload, error))?;
+                    Err(RolloutLedgerError::io(
+                        final_dir,
+                        std::io::Error::other("injected in-place post-link mutation"),
+                    ))
+                }
+                other => panic!("unknown post-manifest test fault {other}"),
+            })?;
             sync_dir(final_dir)?;
             sync_dir(&self.root)?;
             Ok(final_dir.to_path_buf())
         })();
-        if result.is_err() && !final_dir.join(MANIFEST_FILE).exists() {
-            let _ = fs::remove_dir_all(final_dir);
+        if let Err(error) = result {
+            if !manifest_linked {
+                let _ = fs::remove_dir_all(final_dir);
+                return Err(error);
+            }
+            let durability = (|| {
+                #[cfg(test)]
+                POST_MANIFEST_TEST_FAULT.with(|fault| {
+                    if fault.replace(0) == 2 {
+                        return Err(RolloutLedgerError::io(
+                            final_dir,
+                            std::io::Error::other("injected persistent post-manifest sync failure"),
+                        ));
+                    }
+                    Ok(())
+                })?;
+                sync_dir(final_dir)?;
+                sync_dir(&self.root)
+            })();
+            let exact_visible = [
+                (PAYLOAD_FILE, expected_payload.as_slice()),
+                (MANIFEST_FILE, expected_manifest.as_slice()),
+            ]
+            .into_iter()
+            .all(|(name, expected)| {
+                fs::read(final_dir.join(name)).is_ok_and(|actual| actual == expected)
+            });
+            if durability.is_ok() && exact_visible {
+                // The manifest boundary was crossed, and all required directory
+                // syncs have now completed. Only this establishes success.
+                return Ok(final_dir.to_path_buf());
+            }
+            return Err(RolloutLedgerError::PublicationAmbiguous {
+                path: final_dir.to_path_buf(),
+                detail: match durability {
+                    Ok(()) => format!("{error}; visible package no longer matches staged bytes"),
+                    Err(sync_error) => format!("{error}; durability retry failed: {sync_error}"),
+                },
+            });
         }
-        result
+        Ok(final_dir.to_path_buf())
     }
 
     /// The ledger root directory.
@@ -473,6 +619,8 @@ fn validate_identity(identity: &RolloutLedgerIdentity) -> Result<(), RolloutLedg
         ("tensor_schema_sha256", &identity.tensor_schema_sha256),
         ("adapter_sha256", &identity.adapter_sha256),
         ("optimizer_sha256", &identity.optimizer_sha256),
+        ("sampler_sha256", &identity.sampler_sha256),
+        ("lineage_sha256", &identity.lineage_sha256),
     ] {
         if digest.len() != 64
             || !digest
@@ -530,7 +678,7 @@ fn controls_from_step(step: &RolloutLedgerStep) -> RolloutLedgerControls {
 fn validate_step(step: &RolloutLedgerStep) -> Result<(), RolloutLedgerError> {
     if step.world_size != 1 || step.rank != 0 {
         return Err(RolloutLedgerError::Invalid(format!(
-            "format v1 is world-1 only (got rank {}/world {})",
+            "format v3 is world-1 only (got rank {}/world {})",
             step.rank, step.world_size
         )));
     }
@@ -849,8 +997,71 @@ fn write_new_synced(path: &Path, bytes: &[u8]) -> Result<(), RolloutLedgerError>
 }
 
 fn sync_dir(path: &Path) -> Result<(), RolloutLedgerError> {
+    // `Path::parent()` represents the ancestor of a one-component relative
+    // path as `""`. Opening that path is not portable; its durable ancestor is
+    // the current directory.
+    let path = if path.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        path
+    };
+    #[cfg(test)]
+    FAIL_SYNC_DIRECTORY_ONCE.with(|failure| {
+        if failure.borrow().as_deref() == Some(path) {
+            failure.borrow_mut().take();
+            return Err(RolloutLedgerError::io(
+                path,
+                std::io::Error::other("injected directory sync failure"),
+            ));
+        }
+        Ok(())
+    })?;
     let dir = File::open(path).map_err(|e| RolloutLedgerError::io(path, e))?;
-    dir.sync_all().map_err(|e| RolloutLedgerError::io(path, e))
+    dir.sync_all()
+        .map_err(|e| RolloutLedgerError::io(path, e))?;
+    #[cfg(test)]
+    SYNCED_DIRECTORIES.with(|paths| paths.borrow_mut().push(path.to_path_buf()));
+    Ok(())
+}
+
+fn create_dir_all_durable(path: &Path) -> Result<(), RolloutLedgerError> {
+    if path.as_os_str().is_empty() {
+        return sync_dir(Path::new("."));
+    }
+    let Some(parent) = path.parent() else {
+        return match fs::metadata(path) {
+            Ok(metadata) if metadata.is_dir() => sync_dir(path),
+            Ok(_) => Err(RolloutLedgerError::io(
+                path,
+                std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "ledger ancestor exists but is not a directory",
+                ),
+            )),
+            Err(error) => Err(RolloutLedgerError::io(path, error)),
+        };
+    };
+    create_dir_all_durable(parent)?;
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(RolloutLedgerError::io(
+                path,
+                std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "ledger root exists but is not a directory",
+                ),
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => match fs::create_dir(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => {}
+            Err(error) => return Err(RolloutLedgerError::io(path, error)),
+        },
+        Err(error) => return Err(RolloutLedgerError::io(path, error)),
+    }
+    sync_dir(path)?;
+    sync_dir(parent)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -877,6 +1088,23 @@ mod tests {
             fs::create_dir_all(&path).unwrap();
             Self(path)
         }
+
+        fn relative(tag: &str, create: bool) -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = PathBuf::from(format!(
+                ".ferrl-rollout-ledger-{tag}-{}-{nonce}",
+                std::process::id()
+            ));
+            assert!(path.is_relative());
+            assert!(!path.exists());
+            if create {
+                fs::create_dir(&path).unwrap();
+            }
+            Self(path)
+        }
     }
 
     impl Drop for TempDir {
@@ -896,6 +1124,8 @@ mod tests {
             tensor_schema_sha256: digest('c'),
             adapter_sha256: digest('d'),
             optimizer_sha256: digest('e'),
+            sampler_sha256: digest('f'),
+            lineage_sha256: digest('1'),
             source_step: 7,
             optimizer_step: 3,
         }
@@ -955,6 +1185,7 @@ mod tests {
             live_items: 1,
             old_logprobs: LedgerScoreRequirement::AdapterEnabledDetached,
             reference_logprobs: LedgerScoreRequirement::AdapterDisabledDetached,
+            post_rollout_sampler_state: vec![1, 2, 3, 4],
             groups: vec![group()],
         }
     }
@@ -1001,6 +1232,149 @@ mod tests {
         assert!(published.join(MANIFEST_FILE).is_file());
         let reader = RolloutLedgerReader::open(&tmp.0, expectations()).unwrap();
         assert_eq!(reader.read_step(7).unwrap().as_step(), &expected);
+    }
+
+    #[test]
+    fn absent_ledger_root_is_durably_anchored_in_its_parent() {
+        let tmp = TempDir::new("absent-ledger-root");
+        let root = tmp.0.join("ledger");
+        SYNCED_DIRECTORIES.with(|paths| paths.borrow_mut().clear());
+
+        RolloutLedgerWriter::create(&root, identity()).unwrap();
+
+        let synced = SYNCED_DIRECTORIES.with(|paths| paths.borrow().clone());
+        assert!(
+            synced.contains(&root),
+            "ledger root was not synced: {synced:?}"
+        );
+        assert!(
+            synced.contains(&tmp.0),
+            "ledger-root entry was not synced in its parent: {synced:?}"
+        );
+    }
+
+    #[test]
+    fn absent_relative_ledger_root_uses_current_directory_as_durable_base() {
+        let root = TempDir::relative("absent-relative-root", false);
+        SYNCED_DIRECTORIES.with(|paths| paths.borrow_mut().clear());
+
+        let writer = RolloutLedgerWriter::create(&root.0, identity()).unwrap();
+        writer.write_step(&step()).unwrap();
+
+        let synced = SYNCED_DIRECTORIES.with(|paths| paths.borrow().clone());
+        assert!(synced.contains(&PathBuf::from(".")), "synced={synced:?}");
+        assert!(synced.contains(&root.0), "synced={synced:?}");
+        RolloutLedgerReader::open(&root.0, expectations())
+            .unwrap()
+            .read_step(7)
+            .unwrap();
+    }
+
+    #[test]
+    fn existing_relative_ledger_root_uses_current_directory_as_durable_base() {
+        let root = TempDir::relative("existing-relative-root", true);
+        SYNCED_DIRECTORIES.with(|paths| paths.borrow_mut().clear());
+
+        let writer = RolloutLedgerWriter::create(&root.0, identity()).unwrap();
+        writer.write_step(&step()).unwrap();
+
+        let synced = SYNCED_DIRECTORIES.with(|paths| paths.borrow().clone());
+        assert!(synced.contains(&PathBuf::from(".")), "synced={synced:?}");
+        assert!(synced.contains(&root.0), "synced={synced:?}");
+        RolloutLedgerReader::open(&root.0, expectations())
+            .unwrap()
+            .read_step(7)
+            .unwrap();
+    }
+
+    #[test]
+    fn ledger_root_creation_retries_a_failed_existing_directory_sync() {
+        let tmp = TempDir::new("ledger-root-sync-retry");
+        let root = tmp.0.join("ledger");
+        FAIL_SYNC_DIRECTORY_ONCE.with(|failure| {
+            *failure.borrow_mut() = Some(root.clone());
+        });
+
+        assert!(matches!(
+            RolloutLedgerWriter::create(&root, identity()),
+            Err(RolloutLedgerError::Io { .. })
+        ));
+        assert!(root.is_dir());
+
+        RolloutLedgerWriter::create(&root, identity()).unwrap();
+        RolloutLedgerWriter::create(&root, identity())
+            .unwrap()
+            .write_step(&step())
+            .unwrap();
+    }
+
+    #[test]
+    fn post_manifest_failure_reconciles_the_visible_exact_window_as_committed() {
+        let tmp = TempDir::new("post-manifest-reconcile");
+        let expected = step();
+        let mut writer = RolloutLedgerWriter::create(&tmp.0, identity()).unwrap();
+        writer.fail_after_manifest_link = true;
+
+        let published = writer.write_step(&expected).unwrap();
+        assert!(published.join(MANIFEST_FILE).is_file());
+        assert_eq!(
+            RolloutLedgerReader::open(&tmp.0, expectations())
+                .unwrap()
+                .read_step(7)
+                .unwrap()
+                .as_step(),
+            &expected
+        );
+    }
+
+    #[test]
+    fn persistent_post_manifest_sync_failure_is_ambiguous_not_success() {
+        let tmp = TempDir::new("persistent-post-manifest-sync");
+        let writer = RolloutLedgerWriter::create(&tmp.0, identity()).unwrap();
+        inject_persistent_post_manifest_sync_failure_once();
+
+        assert!(matches!(
+            writer.write_step(&step()),
+            Err(RolloutLedgerError::PublicationAmbiguous { path, detail })
+                if path == tmp.0.join(step_dir_name(7))
+                    && detail.contains("durability retry failed")
+        ));
+        // The complete package remains visible, so the caller must preserve its
+        // post-collection state despite the ambiguous durability outcome.
+        RolloutLedgerReader::open(&tmp.0, expectations())
+            .unwrap()
+            .read_step(7)
+            .unwrap();
+    }
+
+    #[test]
+    fn post_link_manifest_disappearance_remains_ambiguous() {
+        let tmp = TempDir::new("post-link-disappearance");
+        let writer = RolloutLedgerWriter::create(&tmp.0, identity()).unwrap();
+        inject_post_manifest_disappearance_once();
+
+        assert!(matches!(
+            writer.write_step(&step()),
+            Err(RolloutLedgerError::PublicationAmbiguous { path, detail })
+                if path == tmp.0.join(step_dir_name(7))
+                    && detail.contains("no longer matches")
+        ));
+        assert!(!tmp.0.join(step_dir_name(7)).join(MANIFEST_FILE).exists());
+        assert!(tmp.0.join(step_dir_name(7)).join(PAYLOAD_FILE).exists());
+    }
+
+    #[test]
+    fn post_link_in_place_mutation_cannot_reconcile_against_hard_link_aliases() {
+        let tmp = TempDir::new("post-link-in-place-mutation");
+        let writer = RolloutLedgerWriter::create(&tmp.0, identity()).unwrap();
+        inject_post_manifest_in_place_mutation_once();
+
+        assert!(matches!(
+            writer.write_step(&step()),
+            Err(RolloutLedgerError::PublicationAmbiguous { path, detail })
+                if path == tmp.0.join(step_dir_name(7))
+                    && detail.contains("no longer matches")
+        ));
     }
 
     #[test]
@@ -1278,7 +1652,7 @@ mod tests {
             .write_step(&step())
             .unwrap();
         let mut wrong = expectations();
-        wrong.identity.adapter_sha256 = digest('f');
+        wrong.identity.sampler_sha256 = digest('0');
         assert!(matches!(
             RolloutLedgerReader::open(&tmp.0, wrong)
                 .unwrap()
@@ -1297,7 +1671,7 @@ mod tests {
         let manifest_path = tmp.0.join(step_dir_name(7)).join(MANIFEST_FILE);
         let mut manifest: RolloutLedgerManifest =
             serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
-        manifest.format_version = 2;
+        manifest.format_version = 1;
         fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
         assert!(matches!(
             RolloutLedgerReader::open(&tmp.0, expectations())

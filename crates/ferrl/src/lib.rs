@@ -63,7 +63,11 @@
 //! - the separated rollout/learner artifact contract ([`rollout_ledger`]) — a
 //!   strict, checksummed, no-replace whole-window package whose reader validates
 //!   learner pre-state identity, mandatory structured controls, and every
-//!   rollout/reward/mask invariant before returning [`ValidatedRolloutLedgerStep`];
+//!   rollout/reward/mask invariant before returning [`ValidatedRolloutLedgerStep`].
+//!   Format v3 also binds sampler prestate and chain lineage, transfers the
+//!   collector's exact post-rollout sampler blob, and returns an opaque
+//!   learner-produced receipt for a versioned adapter + Adam + sampler
+//!   continuation whose policy/config/schema/payload lineage is verified;
 //! - held-out evaluation ([`eval`]) — the base model vs. the trained adapter,
 //!   mean reward over a held-out set (the P4 gate's comparison);
 //! - activation checkpointing ([`remat`]) — candle ships no checkpoint
@@ -268,8 +272,8 @@ pub use tensor_parallel::{
 pub use tokenizer::{HfTokenizer, TokenizerError};
 #[doc(inline)]
 pub use trainer::{
-    RewardGroupScope, RunStop, ScalarSchedule, SchedulePoint, TokenizerLike, Trainer,
-    TrainerConfig, TrainerConfigBuilder, TrainerError,
+    RewardGroupScope, RolloutLedgerContinuation, RunStop, ScalarSchedule, SchedulePoint,
+    TokenizerLike, Trainer, TrainerConfig, TrainerConfigBuilder, TrainerError,
 };
 #[doc(inline)]
 pub use trimul::{Distribution, TrimulCase, TrimulError, TrimulReward};

@@ -131,6 +131,42 @@ pub enum TrainerError {
     RolloutLedger(#[from] RolloutLedgerError),
 }
 
+/// Learner-produced, chain-bound state for the next separated rollout step.
+///
+/// The optimizer is intentionally carried inside this opaque receipt: callers
+/// may inspect it for orchestration, but only a successful ledger consumption or
+/// strict continuation restore can construct a value accepted by subsequent
+/// collector/learner/save calls. This prevents publishing mixed adapter, Adam,
+/// sampler, or outer-step state as a completed continuation.
+#[derive(Debug)]
+pub struct RolloutLedgerContinuation {
+    completed_step: u64,
+    optimizer_state: OptimizerState,
+    policy_sha256: String,
+    trainer_config_sha256: String,
+    tensor_schema_sha256: String,
+    adapter_sha256: String,
+    optimizer_sha256: String,
+    sampler_sha256: String,
+    parent_lineage_sha256: String,
+    consumed_ledger_sha256: String,
+    lineage_sha256: String,
+}
+
+impl RolloutLedgerContinuation {
+    /// Number of completed outer ledger steps; this is the next source step.
+    #[must_use]
+    pub fn completed_step(&self) -> u64 {
+        self.completed_step
+    }
+
+    /// Borrow the exact Adam continuation for diagnostics or orchestration.
+    #[must_use]
+    pub fn optimizer_state(&self) -> &OptimizerState {
+        &self.optimizer_state
+    }
+}
+
 /// Bridges prompt / completion text and token ids for the trainer.
 ///
 /// The trainer encodes each prompt to ids for [`Policy::generate`] and decodes
@@ -1756,7 +1792,7 @@ impl Trainer {
     /// `policy_sha256` must be a verified lowercase SHA-256 digest binding the
     /// frozen model content and its execution recipe. It is the sole identity
     /// datum the generic [`Policy`] seam cannot derive from live state today.
-    /// Format v1 does not publish collector performance telemetry; a future
+    /// Format v3 does not publish collector performance telemetry; a future
     /// phase-specific schema can do so without mislabelling asynchronous work as
     /// an ordinary whole trainer step.
     ///
@@ -1774,7 +1810,7 @@ impl Trainer {
         samples: &[Sample<R::Target>],
         root: impl AsRef<Path>,
         policy_sha256: &str,
-        optimizer_state: Option<&OptimizerState>,
+        continuation: Option<&RolloutLedgerContinuation>,
     ) -> Result<PathBuf, TrainerError>
     where
         P: Policy,
@@ -1791,8 +1827,8 @@ impl Trainer {
 
         let vars = policy.trainable_vars();
         let mut opt = self.new_optimizer(vars.clone())?;
-        if let Some(state) = optimizer_state {
-            opt.load_state(state)?;
+        if let Some(state) = continuation {
+            opt.load_state(state.optimizer_state())?;
         }
         let step_lr = self.config.lr_at(step);
         let step_beta = self.config.beta_at(step);
@@ -1800,52 +1836,106 @@ impl Trainer {
         opt.set_learning_rate(step_lr);
         let installed_lr = opt.learning_rate();
         let controls = self.rollout_ledger_controls(step, installed_lr, step_beta)?;
-        let identity = self.rollout_ledger_identity(step, policy, policy_sha256, &vars, &opt)?;
-        // Validate the complete live identity before generation changes policy-local
-        // rollout state, and claim/create only the caller-provided ledger root.
-        let writer = RolloutLedgerWriter::create(root.as_ref(), identity.clone())?;
-
-        let exec = UnshardedPolicyExecution;
-        let mut gpu_mem = StepGpuMemory::new(false);
-        let mut collected = Vec::with_capacity(self.config.grad_accum_steps);
-        for j in 0..self.config.grad_accum_steps {
-            let sel = self.select_prompt(step, j, samples.len());
-            self.record_prompt_selection(&sel);
-            let selected = SelectedSample {
-                sample: &samples[sel.sample_idx],
-                selection: &sel,
-                accum_index: j,
-            };
-            collected.push(self.collect_group(
+        let sampler_prestate = policy.sampler_state()?;
+        let lineage = self.require_rollout_ledger_continuation_state(
+            step,
+            policy,
+            policy_sha256,
+            &vars,
+            &opt,
+            &sampler_prestate,
+            continuation,
+        )?;
+        let outcome: Result<PathBuf, TrainerError> = (|| {
+            let identity = self.rollout_ledger_identity(
                 step,
-                step_beta,
                 policy,
-                reward_fn,
-                tokenizer,
-                &selected,
-                &mut gpu_mem,
-                &exec,
-            )?);
+                policy_sha256,
+                &vars,
+                &opt,
+                &sampler_prestate,
+                &lineage,
+            )?;
+            // Validate the complete live identity before generation changes policy-local
+            // rollout state, and claim/create only the caller-provided ledger root.
+            let writer = RolloutLedgerWriter::create(root.as_ref(), identity.clone())?;
+
+            let exec = UnshardedPolicyExecution;
+            let mut gpu_mem = StepGpuMemory::new(false);
+            let mut collected = Vec::with_capacity(self.config.grad_accum_steps);
+            for j in 0..self.config.grad_accum_steps {
+                let sel = self.select_prompt(step, j, samples.len());
+                self.record_prompt_selection(&sel);
+                let selected = SelectedSample {
+                    sample: &samples[sel.sample_idx],
+                    selection: &sel,
+                    accum_index: j,
+                };
+                collected.push(self.collect_group(
+                    step,
+                    step_beta,
+                    policy,
+                    reward_fn,
+                    tokenizer,
+                    &selected,
+                    &mut gpu_mem,
+                    &exec,
+                )?);
+            }
+            let post_collection_vars = policy.trainable_vars();
+            self.require_same_rollout_ledger_vars(
+                &vars,
+                &post_collection_vars,
+                "rollout collection",
+            )?;
+            // The sampler is expected to advance during generation. Reuse its
+            // captured prestate while verifying every other identity component.
+            let post_collection_identity = self.rollout_ledger_identity(
+                step,
+                policy,
+                policy_sha256,
+                &post_collection_vars,
+                &opt,
+                &sampler_prestate,
+                &lineage,
+            )?;
+            if post_collection_identity != identity {
+                return Err(TrainerError::Contract(
+                    "learner identity changed during rollout collection".into(),
+                ));
+            }
+            let sampler_poststate = policy.sampler_state()?;
+            let payload =
+                self.rollout_ledger_payload(step, &controls, &collected, sampler_poststate)?;
+            writer.write_step(&payload).map_err(TrainerError::from)
+        })();
+        match outcome {
+            Ok(path) => Ok(path),
+            Err(TrainerError::RolloutLedger(error)) if error.may_be_visible() => {
+                // A manifest-bearing ledger may already be consumable. Rewinding
+                // the sampler would split collector state from that visible L_k.
+                Err(TrainerError::RolloutLedger(error))
+            }
+            Err(error) => {
+                if let Err(rollback) =
+                    Self::restore_rollout_ledger_sampler(policy, &sampler_prestate)
+                {
+                    return Err(TrainerError::Contract(format!(
+                        "rollout-ledger collector failed ({error}); restoring its sampler pre-state also failed: {rollback}"
+                    )));
+                }
+                Err(error)
+            }
         }
-        let post_collection_vars = policy.trainable_vars();
-        self.require_same_rollout_ledger_vars(&vars, &post_collection_vars, "rollout collection")?;
-        let post_collection_identity =
-            self.rollout_ledger_identity(step, policy, policy_sha256, &post_collection_vars, &opt)?;
-        if post_collection_identity != identity {
-            return Err(TrainerError::Contract(
-                "learner identity changed during rollout collection".into(),
-            ));
-        }
-        let payload = self.rollout_ledger_payload(step, &controls, &collected)?;
-        writer.write_step(&payload).map_err(TrainerError::from)
     }
 
     /// Validate and consume one world-1 rollout ledger window as one learner
-    /// optimizer step, returning the metrics row and exact post-update Adam state.
-    /// This separated learner API deliberately does not checkpoint: the learner's
-    /// sampler has not advanced through the collector's rollouts, so persisting it
-    /// would create an unfaithful resume. Sampler-state handoff is a later contract.
-    /// Rollout-ledger v1 carries no collector timing or device-memory telemetry, so
+    /// optimizer step, returning the metrics row and an opaque chain-bound
+    /// continuation receipt carrying the exact post-update Adam state.
+    /// This separated learner installs and verifies the collector's exact
+    /// post-rollout sampler state before it returns, making its continuation
+    /// checkpoint-faithful. Rollout-ledger v3 carries no collector timing or
+    /// device-memory telemetry, so
     /// the returned/persisted whole-window performance fields remain explicitly
     /// unmeasured rather than relabelling learner-only work as a complete step.
     /// Exact rollback requires the policy to retain the same trainable [`Var`]
@@ -1870,21 +1960,39 @@ impl Trainer {
         policy: &mut P,
         root: impl AsRef<Path>,
         policy_sha256: &str,
-        optimizer_state: Option<&OptimizerState>,
-    ) -> Result<(Metrics, OptimizerState), TrainerError> {
+        continuation: Option<&RolloutLedgerContinuation>,
+    ) -> Result<(Metrics, RolloutLedgerContinuation), TrainerError> {
         self.require_world_one_rollout_ledger()?;
         self.require_rollout_ledger_step_in_range(step)?;
         validate_external_policy_sha256(policy_sha256)?;
         let vars = policy.trainable_vars();
         let mut opt = self.new_optimizer(vars.clone())?;
-        if let Some(state) = optimizer_state {
-            opt.load_state(state)?;
+        if let Some(state) = continuation {
+            opt.load_state(state.optimizer_state())?;
         }
         let step_lr = self.config.lr_at(step);
         let step_beta = self.config.beta_at(step);
         opt.set_learning_rate(step_lr);
         let controls = self.rollout_ledger_controls(step, opt.learning_rate(), step_beta)?;
-        let identity = self.rollout_ledger_identity(step, policy, policy_sha256, &vars, &opt)?;
+        let sampler_prestate = policy.sampler_state()?;
+        let lineage = self.require_rollout_ledger_continuation_state(
+            step,
+            policy,
+            policy_sha256,
+            &vars,
+            &opt,
+            &sampler_prestate,
+            continuation,
+        )?;
+        let identity = self.rollout_ledger_identity(
+            step,
+            policy,
+            policy_sha256,
+            &vars,
+            &opt,
+            &sampler_prestate,
+            &lineage,
+        )?;
         let reader = RolloutLedgerReader::open(
             root.as_ref(),
             RolloutLedgerExpectations { identity, controls },
@@ -1896,7 +2004,7 @@ impl Trainer {
         let adapter_prestate = Self::snapshot_rollout_ledger_vars(&vars)?;
         let optimizer_prestate = opt.state()?;
         let adapter_enabled_prestate = policy.adapter_enabled();
-        let outcome: Result<(Metrics, OptimizerState), TrainerError> = (|| {
+        let outcome: Result<(Metrics, RolloutLedgerContinuation), TrainerError> = (|| {
             self.require_toggleable_reference_policy(
                 policy,
                 self.config.requires_reference_policy(),
@@ -1907,8 +2015,15 @@ impl Trainer {
                 &post_toggle_vars,
                 "reference-policy preflight",
             )?;
-            let post_toggle_identity =
-                self.rollout_ledger_identity(step, policy, policy_sha256, &post_toggle_vars, &opt)?;
+            let post_toggle_identity = self.rollout_ledger_identity(
+                step,
+                policy,
+                policy_sha256,
+                &post_toggle_vars,
+                &opt,
+                &sampler_prestate,
+                &lineage,
+            )?;
             if post_toggle_identity != validated_identity {
                 return Err(TrainerError::Contract(
                     "learner identity changed during reference-policy preflight".into(),
@@ -1916,7 +2031,7 @@ impl Trainer {
             }
 
             let exec = UnshardedPolicyExecution;
-            // Ledger v1 has no composable collector/learner performance schema.
+            // Ledger v3 has no composable collector/learner performance schema.
             // Keep the existing update instrumentation sink disabled and leave the
             // ordinary whole-window timing/memory fields at their neutral defaults.
             let mut gpu_mem = StepGpuMemory::new(false);
@@ -1948,6 +2063,8 @@ impl Trainer {
                 policy_sha256,
                 &post_scoring_vars,
                 &opt,
+                &sampler_prestate,
+                &lineage,
             )?;
             if post_scoring_identity != validated_identity {
                 return Err(TrainerError::Contract(
@@ -1978,11 +2095,54 @@ impl Trainer {
                 &post_update_vars,
                 "rollout-ledger learner update",
             )?;
+            Self::restore_rollout_ledger_sampler(policy, &payload.post_rollout_sampler_state)?;
+            let post_handoff_vars = policy.trainable_vars();
+            self.require_same_rollout_ledger_vars(
+                &vars,
+                &post_handoff_vars,
+                "rollout-ledger sampler handoff",
+            )?;
             let metrics = self.build_window_metrics(step, step_beta, &stats, &agg, &opt);
-            // Capture the faithful continuation before the final fallible side effect.
             let optimizer_state = opt.state()?;
+            let identity_bytes = serde_json::to_vec(&validated_identity).map_err(|error| {
+                TrainerError::Contract(format!("serialize consumed ledger identity: {error}"))
+            })?;
+            let payload_bytes = serde_json::to_vec(&payload).map_err(|error| {
+                TrainerError::Contract(format!("serialize consumed ledger payload: {error}"))
+            })?;
+            let consumed_ledger_sha256 = domain_sha256(
+                "ferrl.rollout-ledger.consumed-step.v1",
+                &[&identity_bytes, &payload_bytes],
+            );
+            let next_lineage = domain_sha256(
+                "ferrl.rollout-ledger.lineage.v1",
+                &[lineage.as_bytes(), consumed_ledger_sha256.as_bytes()],
+            );
+            let sampler_poststate = policy.sampler_state()?;
+            let post_identity = self.rollout_ledger_identity(
+                step + 1,
+                policy,
+                policy_sha256,
+                &vars,
+                &opt,
+                &sampler_poststate,
+                &next_lineage,
+            )?;
+            let continuation = RolloutLedgerContinuation {
+                completed_step: step + 1,
+                optimizer_state,
+                policy_sha256: post_identity.policy_sha256,
+                trainer_config_sha256: post_identity.trainer_config_sha256,
+                tensor_schema_sha256: post_identity.tensor_schema_sha256,
+                adapter_sha256: post_identity.adapter_sha256,
+                optimizer_sha256: post_identity.optimizer_sha256,
+                sampler_sha256: post_identity.sampler_sha256,
+                parent_lineage_sha256: lineage.clone(),
+                consumed_ledger_sha256,
+                lineage_sha256: next_lineage,
+            };
             self.append_metrics::<P, _>(&metrics, &exec)?;
-            Ok((metrics, optimizer_state))
+            Ok((metrics, continuation))
         })();
 
         match outcome {
@@ -1995,6 +2155,7 @@ impl Trainer {
                     &mut opt,
                     &optimizer_prestate,
                     adapter_enabled_prestate,
+                    &sampler_prestate,
                 ) {
                     return Err(TrainerError::Contract(format!(
                         "rollout-ledger learner failed ({error}); restoring its pre-state also failed: {rollback}"
@@ -2003,6 +2164,298 @@ impl Trainer {
                 Err(error)
             }
         }
+    }
+
+    /// Persist one truthful separated-training continuation after a successful
+    /// [`train_rollout_ledger_step`](Self::train_rollout_ledger_step).
+    ///
+    /// The checkpoint `C_(k+1)` combines the learner's updated adapter and Adam
+    /// state with the collector's post-rollout sampler state installed by ledger
+    /// v3. Both the next collector and learner restore this same checkpoint before
+    /// processing step `k + 1`. Unlike ordinary cadence checkpointing, this role-
+    /// handoff primitive is explicit and never replaces an existing completed-step
+    /// path: a second writer would be a continuation fork, so it fails closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrainerError`] if this is not a world-1 trainer, the receipt's
+    /// completed step is outside `1..=config.steps`, its bound policy/config/schema
+    /// or adapter/Adam/sampler state does not match the live values, the destination
+    /// already exists, or durable checkpoint publication fails.
+    pub fn save_rollout_ledger_continuation<P: Policy>(
+        &self,
+        policy: &P,
+        continuation: &RolloutLedgerContinuation,
+    ) -> Result<PathBuf, TrainerError> {
+        self.require_world_one_rollout_ledger()?;
+        let completed_step = continuation.completed_step;
+        if completed_step == 0 || completed_step > self.config.steps {
+            return Err(TrainerError::Contract(format!(
+                "rollout-ledger continuation step {completed_step} is outside 1..={}",
+                self.config.steps
+            )));
+        }
+        let vars = policy.trainable_vars();
+        let mut opt = self.new_optimizer(vars.clone())?;
+        opt.load_state(continuation.optimizer_state())?;
+        let sampler_state = policy.sampler_state()?;
+        self.require_rollout_ledger_continuation_state(
+            completed_step,
+            policy,
+            &continuation.policy_sha256,
+            &vars,
+            &opt,
+            &sampler_state,
+            Some(continuation),
+        )?;
+        let dir = self.checkpoints_dir.join(format!("step-{completed_step}"));
+        let recipe = policy.lora_recipe();
+        let manifest = crate::checkpoint::RolloutLedgerContinuationManifest {
+            format_version: crate::checkpoint::ROLLOUT_LEDGER_CONTINUATION_FORMAT_VERSION,
+            kind: crate::checkpoint::ROLLOUT_LEDGER_CONTINUATION_KIND.to_owned(),
+            completed_step,
+            policy_sha256: continuation.policy_sha256.clone(),
+            trainer_config_sha256: continuation.trainer_config_sha256.clone(),
+            tensor_schema_sha256: continuation.tensor_schema_sha256.clone(),
+            adapter_sha256: continuation.adapter_sha256.clone(),
+            optimizer_sha256: continuation.optimizer_sha256.clone(),
+            sampler_sha256: continuation.sampler_sha256.clone(),
+            parent_lineage_sha256: continuation.parent_lineage_sha256.clone(),
+            consumed_ledger_sha256: continuation.consumed_ledger_sha256.clone(),
+            lineage_sha256: continuation.lineage_sha256.clone(),
+        };
+        crate::checkpoint::save_checkpoint_no_replace(
+            &dir,
+            &vars,
+            continuation.optimizer_state(),
+            &sampler_state,
+            recipe.as_deref(),
+            manifest,
+        )?;
+        Ok(dir)
+    }
+
+    /// Restore a mandatory adapter + Adam + sampler continuation for a separated
+    /// collector or learner, returning an opaque receipt for the next step.
+    ///
+    /// Adapter-only legacy checkpoints are deliberately rejected: separated
+    /// execution cannot reconstruct the collector's rollout stream or the
+    /// learner's momentum from them. On any load, sampler-installation, or Adam
+    /// validation failure, this method restores and verifies the policy's exact
+    /// adapter and sampler prestate before returning the error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrainerError`] for a non-world-1 trainer, incompatible/missing
+    /// continuation state, recipe or tensor mismatch, invalid outer step, sampler
+    /// restoration failure, or Adam-state mismatch.
+    #[allow(clippy::cognitive_complexity)]
+    pub fn restore_rollout_ledger_continuation<P: Policy>(
+        &self,
+        checkpoint_dir: impl AsRef<Path>,
+        policy: &mut P,
+        policy_sha256: &str,
+    ) -> Result<RolloutLedgerContinuation, TrainerError> {
+        self.require_world_one_rollout_ledger()?;
+        validate_external_policy_sha256(policy_sha256)?;
+        let checkpoint_dir = checkpoint_dir.as_ref();
+        let vars = policy.trainable_vars();
+        let adapter_prestate = Self::snapshot_rollout_ledger_vars(&vars)?;
+        let sampler_prestate = policy.sampler_state()?;
+        let outcome = (|| {
+            let manifest = crate::checkpoint::read_manifest(checkpoint_dir)?;
+            let continuation_manifest =
+                manifest
+                    .rollout_ledger_continuation
+                    .clone()
+                    .ok_or_else(|| {
+                        TrainerError::Contract(
+                            "checkpoint is not a separated rollout-ledger continuation".into(),
+                        )
+                    })?;
+            if continuation_manifest.format_version
+                != crate::checkpoint::ROLLOUT_LEDGER_CONTINUATION_FORMAT_VERSION
+                || continuation_manifest.kind != crate::checkpoint::ROLLOUT_LEDGER_CONTINUATION_KIND
+            {
+                return Err(TrainerError::Contract(format!(
+                    "unsupported rollout-ledger continuation format version {}",
+                    continuation_manifest.format_version
+                )));
+            }
+            if continuation_manifest.completed_step != manifest.step
+                || checkpoint_dir.file_name().and_then(|name| name.to_str())
+                    != Some(format!("step-{}", manifest.step).as_str())
+            {
+                return Err(TrainerError::Contract(
+                    "rollout-ledger continuation outer step does not match its manifest/path"
+                        .into(),
+                ));
+            }
+            if manifest.optimizer_step_t.is_none()
+                || manifest.optimizer_num_vars.is_none()
+                || manifest.sampler_state.is_none()
+            {
+                return Err(TrainerError::Contract(
+                    "rollout-ledger continuation requires adapter, Adam, and sampler state".into(),
+                ));
+            }
+            let current_recipe = policy.lora_recipe();
+            if manifest.lora_recipe != current_recipe {
+                return Err(TrainerError::Contract(format!(
+                    "rollout-ledger continuation adapter recipe {:?} does not match the policy's {current_recipe:?}",
+                    manifest.lora_recipe
+                )));
+            }
+            if continuation_manifest.policy_sha256 != policy_sha256 {
+                return Err(TrainerError::Contract(
+                    "rollout-ledger continuation frozen-policy identity mismatch".into(),
+                ));
+            }
+            validate_external_policy_sha256(&continuation_manifest.parent_lineage_sha256)?;
+            validate_external_policy_sha256(&continuation_manifest.consumed_ledger_sha256)?;
+            validate_external_policy_sha256(&continuation_manifest.lineage_sha256)?;
+            let expected_lineage = domain_sha256(
+                "ferrl.rollout-ledger.lineage.v1",
+                &[
+                    continuation_manifest.parent_lineage_sha256.as_bytes(),
+                    continuation_manifest.consumed_ledger_sha256.as_bytes(),
+                ],
+            );
+            if expected_lineage != continuation_manifest.lineage_sha256 {
+                return Err(TrainerError::Contract(
+                    "rollout-ledger continuation lineage mismatch".into(),
+                ));
+            }
+            let preflight_opt = self.new_optimizer(vars.clone())?;
+            let preflight_identity = self.rollout_ledger_identity(
+                manifest.step,
+                policy,
+                policy_sha256,
+                &vars,
+                &preflight_opt,
+                &sampler_prestate,
+                &continuation_manifest.lineage_sha256,
+            )?;
+            if continuation_manifest.trainer_config_sha256
+                != preflight_identity.trainer_config_sha256
+                || continuation_manifest.tensor_schema_sha256
+                    != preflight_identity.tensor_schema_sha256
+            {
+                return Err(TrainerError::Contract(
+                    "rollout-ledger continuation trainer configuration or tensor schema mismatch"
+                        .into(),
+                ));
+            }
+            let loaded = crate::checkpoint::load_checkpoint(checkpoint_dir, &vars)?;
+            if loaded.step == 0 || loaded.step > self.config.steps {
+                return Err(TrainerError::Contract(format!(
+                    "rollout-ledger continuation step {} is outside 1..={}",
+                    loaded.step, self.config.steps
+                )));
+            }
+            let optimizer_state = loaded.optimizer_state.ok_or_else(|| {
+                TrainerError::Contract("rollout-ledger continuation is missing Adam state".into())
+            })?;
+            let sampler_state = loaded.sampler_state.ok_or_else(|| {
+                TrainerError::Contract(
+                    "rollout-ledger continuation is missing sampler state".into(),
+                )
+            })?;
+            Self::restore_rollout_ledger_sampler(policy, &sampler_state)?;
+            let active_vars = policy.trainable_vars();
+            self.require_same_rollout_ledger_vars(
+                &vars,
+                &active_vars,
+                "rollout-ledger continuation restore",
+            )?;
+            let mut opt = self.new_optimizer(vars.clone())?;
+            opt.load_state(&optimizer_state)?;
+            let actual = self.rollout_ledger_identity(
+                loaded.step,
+                policy,
+                policy_sha256,
+                &vars,
+                &opt,
+                &sampler_state,
+                &continuation_manifest.lineage_sha256,
+            )?;
+            if continuation_manifest.adapter_sha256 != actual.adapter_sha256
+                || continuation_manifest.optimizer_sha256 != actual.optimizer_sha256
+                || continuation_manifest.sampler_sha256 != actual.sampler_sha256
+            {
+                return Err(TrainerError::Contract(
+                    "rollout-ledger continuation payload does not match its bound adapter/Adam/sampler state"
+                        .into(),
+                ));
+            }
+            Ok(RolloutLedgerContinuation {
+                completed_step: loaded.step,
+                optimizer_state,
+                policy_sha256: continuation_manifest.policy_sha256,
+                trainer_config_sha256: continuation_manifest.trainer_config_sha256,
+                tensor_schema_sha256: continuation_manifest.tensor_schema_sha256,
+                adapter_sha256: continuation_manifest.adapter_sha256,
+                optimizer_sha256: continuation_manifest.optimizer_sha256,
+                sampler_sha256: continuation_manifest.sampler_sha256,
+                parent_lineage_sha256: continuation_manifest.parent_lineage_sha256,
+                consumed_ledger_sha256: continuation_manifest.consumed_ledger_sha256,
+                lineage_sha256: continuation_manifest.lineage_sha256,
+            })
+        })();
+        match outcome {
+            Ok(continuation) => Ok(continuation),
+            Err(error) => {
+                let mut failures = Vec::new();
+                for (index, (var, snapshot)) in vars.iter().zip(adapter_prestate.iter()).enumerate()
+                {
+                    if let Err(restore) = var.set(snapshot) {
+                        failures.push(format!("restore adapter tensor {index}: {restore}"));
+                    }
+                }
+                if let Err(restore) =
+                    Self::restore_rollout_ledger_sampler(policy, &sampler_prestate)
+                {
+                    failures.push(format!("restore sampler state: {restore}"));
+                }
+                let active_vars = policy.trainable_vars();
+                if !Self::same_rollout_ledger_vars(&vars, &active_vars) {
+                    failures.push(
+                        "policy trainable-variable binding changed during continuation restore"
+                            .into(),
+                    );
+                }
+                if failures.is_empty() {
+                    Err(error)
+                } else {
+                    Err(TrainerError::Contract(format!(
+                        "rollout-ledger continuation restore failed ({error}); restoring its pre-state also failed: {}",
+                        failures.join("; ")
+                    )))
+                }
+            }
+        }
+    }
+
+    /// Restore the newest complete separated continuation, or return `None` when
+    /// no checkpoint has been published yet.
+    ///
+    /// # Errors
+    ///
+    /// As [`restore_rollout_ledger_continuation`](Self::restore_rollout_ledger_continuation),
+    /// plus checkpoint-directory discovery failures.
+    pub fn restore_latest_rollout_ledger_continuation<P: Policy>(
+        &self,
+        policy: &mut P,
+        policy_sha256: &str,
+    ) -> Result<Option<RolloutLedgerContinuation>, TrainerError> {
+        self.require_world_one_rollout_ledger()?;
+        let Some(latest) =
+            crate::checkpoint::latest_rollout_ledger_continuation(&self.checkpoints_dir)?
+        else {
+            return Ok(None);
+        };
+        self.restore_rollout_ledger_continuation(latest.dir, policy, policy_sha256)
+            .map(Some)
     }
 
     fn require_world_one_rollout_ledger(&self) -> Result<(), TrainerError> {
@@ -2087,6 +2540,20 @@ impl Trainer {
             .collect()
     }
 
+    fn restore_rollout_ledger_sampler<P: Policy>(
+        policy: &mut P,
+        expected: &[u8],
+    ) -> Result<(), TrainerError> {
+        policy.restore_sampler_state(expected)?;
+        let actual = policy.sampler_state()?;
+        if actual != expected {
+            return Err(TrainerError::Contract(
+                "policy did not install the exact rollout-ledger sampler state".into(),
+            ));
+        }
+        Ok(())
+    }
+
     #[allow(clippy::cognitive_complexity)] // rollback must aggregate every independent failure
     fn restore_rollout_ledger_prestate<P: Policy>(
         policy: &mut P,
@@ -2095,12 +2562,16 @@ impl Trainer {
         opt: &mut FerrlAdamW,
         optimizer_prestate: &OptimizerState,
         adapter_enabled_prestate: bool,
+        sampler_prestate: &[u8],
     ) -> Result<(), TrainerError> {
         let mut failures = Vec::new();
         // Restore the flag first: an adversarial policy may replace its live Vars
         // from set_adapter_enabled itself. Only the binding observed after the
         // final flag transition is eligible for a successful rollback.
         policy.set_adapter_enabled(adapter_enabled_prestate);
+        if let Err(error) = Self::restore_rollout_ledger_sampler(policy, sampler_prestate) {
+            failures.push(format!("restore sampler state: {error}"));
+        }
         let active_vars = policy.trainable_vars();
         if !Self::same_rollout_ledger_vars(vars, &active_vars) {
             failures.push(
@@ -2170,6 +2641,84 @@ impl Trainer {
         })
     }
 
+    #[allow(clippy::too_many_arguments)] // verifies the complete live continuation tuple
+    fn require_rollout_ledger_continuation_state<P: Policy>(
+        &self,
+        step: u64,
+        policy: &P,
+        policy_sha256: &str,
+        vars: &[Var],
+        opt: &FerrlAdamW,
+        sampler_state: &[u8],
+        continuation: Option<&RolloutLedgerContinuation>,
+    ) -> Result<String, TrainerError> {
+        let lineage = if let Some(continuation) = continuation {
+            if continuation.completed_step != step {
+                return Err(TrainerError::Contract(format!(
+                    "rollout-ledger continuation completed step {} cannot start step {step}",
+                    continuation.completed_step
+                )));
+            }
+            let expected_lineage = domain_sha256(
+                "ferrl.rollout-ledger.lineage.v1",
+                &[
+                    continuation.parent_lineage_sha256.as_bytes(),
+                    continuation.consumed_ledger_sha256.as_bytes(),
+                ],
+            );
+            if expected_lineage != continuation.lineage_sha256 {
+                return Err(TrainerError::Contract(
+                    "rollout-ledger continuation lineage mismatch".into(),
+                ));
+            }
+            continuation.lineage_sha256.clone()
+        } else {
+            if step != 0 {
+                return Err(TrainerError::Contract(format!(
+                    "rollout-ledger step {step} requires a chain-bound continuation"
+                )));
+            }
+            let provisional = self.rollout_ledger_identity(
+                step,
+                policy,
+                policy_sha256,
+                vars,
+                opt,
+                sampler_state,
+                &"0".repeat(64),
+            )?;
+            let bytes = serde_json::to_vec(&provisional).map_err(|error| {
+                TrainerError::Contract(format!("serialize ledger genesis identity: {error}"))
+            })?;
+            domain_sha256("ferrl.rollout-ledger.genesis.v1", &[&bytes])
+        };
+        let actual = self.rollout_ledger_identity(
+            step,
+            policy,
+            policy_sha256,
+            vars,
+            opt,
+            sampler_state,
+            &lineage,
+        )?;
+        if let Some(continuation) = continuation {
+            let matches = continuation.policy_sha256 == actual.policy_sha256
+                && continuation.trainer_config_sha256 == actual.trainer_config_sha256
+                && continuation.tensor_schema_sha256 == actual.tensor_schema_sha256
+                && continuation.adapter_sha256 == actual.adapter_sha256
+                && continuation.optimizer_sha256 == actual.optimizer_sha256
+                && continuation.sampler_sha256 == actual.sampler_sha256;
+            if !matches {
+                return Err(TrainerError::Contract(
+                    "rollout-ledger continuation does not match the live policy/config/schema/adapter/Adam/sampler state"
+                        .into(),
+                ));
+            }
+        }
+        Ok(lineage)
+    }
+
+    #[allow(clippy::too_many_arguments)] // every identity component stays explicit at call sites
     fn rollout_ledger_identity<P: Policy>(
         &self,
         step: u64,
@@ -2177,6 +2726,8 @@ impl Trainer {
         policy_sha256: &str,
         vars: &[Var],
         opt: &FerrlAdamW,
+        sampler_state: &[u8],
+        lineage_sha256: &str,
     ) -> Result<RolloutLedgerIdentity, TrainerError> {
         let config =
             serde_json::to_vec(&self.config.rollout_ledger_semantics()).map_err(|error| {
@@ -2209,7 +2760,7 @@ impl Trainer {
         let optimizer_step = u64::try_from(optimizer_state.step_t).map_err(|_| {
             TrainerError::Contract("optimizer step does not fit rollout ledger u64".into())
         })?;
-        let optimizer = canonical_tensor_bytes(
+        let optimizer_tensors = canonical_tensor_bytes(
             optimizer_state
                 .first_moments
                 .iter()
@@ -2234,7 +2785,12 @@ impl Trainer {
                 &[&schema],
             ),
             adapter_sha256: domain_sha256("ferrl.rollout-ledger.adapter.v1", &[&adapter]),
-            optimizer_sha256: domain_sha256("ferrl.rollout-ledger.optimizer.v1", &[&optimizer]),
+            optimizer_sha256: domain_sha256(
+                "ferrl.rollout-ledger.optimizer.v2",
+                &[&optimizer_step.to_le_bytes(), &optimizer_tensors],
+            ),
+            sampler_sha256: domain_sha256("ferrl.rollout-ledger.sampler.v1", &[sampler_state]),
+            lineage_sha256: lineage_sha256.to_owned(),
             source_step: step,
             optimizer_step,
         })
@@ -2246,6 +2802,7 @@ impl Trainer {
         step: u64,
         controls: &RolloutLedgerControls,
         collected: &[CollectedGroup],
+        post_rollout_sampler_state: Vec<u8>,
     ) -> Result<RolloutLedgerStep, TrainerError> {
         let mut groups = Vec::with_capacity(collected.len());
         let mut window_tokens = 0_u64;
@@ -2325,6 +2882,7 @@ impl Trainer {
             } else {
                 LedgerScoreRequirement::NotRequired
             },
+            post_rollout_sampler_state,
             groups,
         })
     }
@@ -6969,6 +7527,126 @@ mod tests {
                 })
                 .collect()
         }
+    }
+
+    struct StatefulCandidatePolicy {
+        inner: CandidatePolicy,
+        sampler: u64,
+    }
+
+    impl Policy for StatefulCandidatePolicy {
+        fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
+            let rollout = self.inner.generate(prompt, cfg)?;
+            self.sampler += 1;
+            Ok(rollout)
+        }
+
+        fn token_logprobs(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+            self.inner.token_logprobs(rollout)
+        }
+
+        fn set_adapter_enabled(&mut self, enabled: bool) {
+            self.inner.set_adapter_enabled(enabled);
+        }
+
+        fn adapter_enabled(&self) -> bool {
+            self.inner.adapter_enabled()
+        }
+
+        fn trainable_vars(&self) -> Vec<Var> {
+            self.inner.trainable_vars()
+        }
+
+        fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+            Ok(self.sampler.to_le_bytes().to_vec())
+        }
+
+        fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
+            let bytes: [u8; 8] = state.try_into().map_err(|error| {
+                candle_core::Error::msg(format!("invalid test sampler state: {error}"))
+            })?;
+            self.sampler = u64::from_le_bytes(bytes);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn collector_keeps_poststate_when_post_manifest_failure_reconciles_as_committed() {
+        let tmp = WireTmp::new("ledger-post-manifest-collector");
+        let run = RunDir::create(&tmp.0, "run").unwrap();
+        let config = TrainerConfig {
+            steps: 1,
+            group_size: 3,
+            grad_accum_steps: 1,
+            max_new_tokens: 2,
+            beta: 0.0,
+            checkpoint_every: None,
+            ..TrainerConfig::default()
+        };
+        let mut trainer = Trainer::new(config, &run).unwrap();
+        let logp =
+            Var::from_tensor(&Tensor::zeros((3, 2), DType::F32, &Device::Cpu).unwrap()).unwrap();
+        let mut policy = StatefulCandidatePolicy {
+            inner: CandidatePolicy { logp },
+            sampler: 0,
+        };
+        crate::rollout_ledger::inject_post_manifest_failure_once();
+        let published = trainer
+            .collect_rollout_ledger_step(
+                0,
+                &mut policy,
+                &CandidateReward,
+                &CandidateCodec,
+                &[Sample::new("p", ())],
+                tmp.0.join("ledger"),
+                &"a".repeat(64),
+                None,
+            )
+            .unwrap();
+        assert!(published.join("manifest.json").is_file());
+        assert_eq!(policy.sampler, 1, "collector rewound a visible L_0");
+    }
+
+    #[test]
+    fn collector_keeps_poststate_when_post_manifest_durability_is_ambiguous() {
+        let tmp = WireTmp::new("ledger-ambiguous-post-manifest-collector");
+        let run = RunDir::create(&tmp.0, "run").unwrap();
+        let config = TrainerConfig {
+            steps: 1,
+            group_size: 3,
+            grad_accum_steps: 1,
+            max_new_tokens: 2,
+            beta: 0.0,
+            checkpoint_every: None,
+            ..TrainerConfig::default()
+        };
+        let mut trainer = Trainer::new(config, &run).unwrap();
+        let logp =
+            Var::from_tensor(&Tensor::zeros((3, 2), DType::F32, &Device::Cpu).unwrap()).unwrap();
+        let mut policy = StatefulCandidatePolicy {
+            inner: CandidatePolicy { logp },
+            sampler: 0,
+        };
+        crate::rollout_ledger::inject_persistent_post_manifest_sync_failure_once();
+        assert!(matches!(
+            trainer.collect_rollout_ledger_step(
+                0,
+                &mut policy,
+                &CandidateReward,
+                &CandidateCodec,
+                &[Sample::new("p", ())],
+                tmp.0.join("ledger"),
+                &"a".repeat(64),
+                None,
+            ),
+            Err(TrainerError::RolloutLedger(
+                RolloutLedgerError::PublicationAmbiguous { .. }
+            ))
+        ));
+        assert_eq!(
+            policy.sampler, 1,
+            "collector rewound after crossing the manifest boundary"
+        );
     }
 
     struct TelemetryProbePolicy {
