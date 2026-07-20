@@ -884,11 +884,82 @@ impl Policy for PersistentRollbackFailurePolicy {
     }
 }
 
+#[derive(Debug)]
+struct InjectedCollectiveFailureState {
+    armed: AtomicBool,
+    remaining_successes: AtomicUsize,
+    failed: AtomicBool,
+    calls_after_failure: AtomicUsize,
+}
+
+impl InjectedCollectiveFailureState {
+    fn new(successes_after_arm: usize) -> Self {
+        Self {
+            armed: AtomicBool::new(false),
+            remaining_successes: AtomicUsize::new(successes_after_arm),
+            failed: AtomicBool::new(false),
+            calls_after_failure: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct InjectedRestoreComm {
+    state: Arc<InjectedCollectiveFailureState>,
+}
+
+impl InjectedRestoreComm {
+    fn enter_collective(&self) -> Result<(), CommError> {
+        if self.state.failed.load(Ordering::SeqCst) {
+            self.state
+                .calls_after_failure
+                .fetch_add(1, Ordering::SeqCst);
+            return Err(CommError::Poisoned(
+                "collective issued after injected terminal failure".into(),
+            ));
+        }
+        if !self.state.armed.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let remaining = self.state.remaining_successes.load(Ordering::SeqCst);
+        if remaining > 0 {
+            self.state
+                .remaining_successes
+                .fetch_sub(1, Ordering::SeqCst);
+            return Ok(());
+        }
+        self.state.failed.store(true, Ordering::SeqCst);
+        Err(CommError::Mismatch(
+            "injected terminal continuation-restore failure".into(),
+        ))
+    }
+}
+
+impl Comm for InjectedRestoreComm {
+    fn rank(&self) -> usize {
+        0
+    }
+
+    fn world_size(&self) -> usize {
+        2
+    }
+
+    fn all_reduce_sum(&self, _tensors: &mut Vec<Tensor>) -> Result<(), CommError> {
+        self.enter_collective()
+    }
+
+    fn all_reduce_scalar_sum(&self, value: f64) -> Result<f64, CommError> {
+        self.enter_collective()?;
+        Ok(value)
+    }
+}
+
 struct ContinuationFaultPolicy {
     inner: StatefulScriptedPolicy,
     panic_next_trainable_vars: Cell<bool>,
     fail_restore_call: Option<usize>,
     panic_restore_call: Option<usize>,
+    arm_collective_failure_on_restore_call: Option<(usize, Arc<InjectedCollectiveFailureState>)>,
     restore_calls: usize,
 }
 
@@ -939,7 +1010,15 @@ impl Policy for ContinuationFaultPolicy {
             self.panic_restore_call != Some(self.restore_calls),
             "injected continuation rollback panic"
         );
-        self.inner.restore_sampler_state(state)
+        let result = self.inner.restore_sampler_state(state);
+        if result.is_ok() {
+            if let Some((restore_call, failure)) = &self.arm_collective_failure_on_restore_call {
+                if *restore_call == self.restore_calls {
+                    failure.armed.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+        result
     }
 }
 
@@ -2908,6 +2987,7 @@ fn distributed_continuation_save_preflight_panic_aborts_every_rank() {
                         panic_next_trainable_vars: Cell::new(rank == 1),
                         fail_restore_call: None,
                         panic_restore_call: None,
+                        arm_collective_failure_on_restore_call: None,
                         restore_calls: 0,
                     };
                     let error = trainer
@@ -2998,6 +3078,7 @@ fn distributed_continuation_restore_snapshot_panic_aborts_every_rank() {
                         panic_next_trainable_vars: Cell::new(rank == 0),
                         fail_restore_call: None,
                         panic_restore_call: None,
+                        arm_collective_failure_on_restore_call: None,
                         restore_calls: 0,
                     };
                     let error = trainer
@@ -3089,6 +3170,7 @@ fn distributed_continuation_rollback_panic_requires_discarding_every_rank() {
                         panic_next_trainable_vars: Cell::new(false),
                         fail_restore_call: (rank == 0).then_some(1),
                         panic_restore_call: (rank == 1).then_some(2),
+                        arm_collective_failure_on_restore_call: None,
                         restore_calls: 0,
                     };
                     let error = trainer
@@ -3145,6 +3227,102 @@ fn distributed_continuation_rollback_panic_requires_discarding_every_rank() {
         }
         assert_eq!(adapter_after, adapter_before, "rank {rank} adapter");
         assert_eq!(restore_calls, 2, "rank {rank} restore calls");
+    }
+}
+
+#[test]
+#[allow(clippy::cognitive_complexity)] // terminal communicator oracle at two restore boundaries
+fn distributed_continuation_comm_failure_never_enters_another_collective() {
+    let tmp = TempDir::new("distributed-continuation-terminal-comm");
+    let cfg = TrainerConfig {
+        steps: 1,
+        grad_accum_steps: 1,
+        group_size: 2,
+        beta: 0.0,
+        mu: 1,
+        ..scripted_cfg()
+    };
+    let samples = live_samples();
+    let policy_sha256 = format!("{:064x}", 103);
+    let _seeded = run_stateful_separated_dp(
+        tmp.path(),
+        "terminal-comm-source",
+        &cfg,
+        &samples,
+        &policy_sha256,
+    );
+    let checkpoint = tmp.path().join("terminal-comm-source-continuations/step-1");
+
+    // Arming occurs after the checkpoint sampler is installed. With no allowed
+    // successes the restore-status reduction fails; with two, restore status
+    // and continuation serialization succeed before the first byte-consensus
+    // word fails. Both failures poison the world immediately.
+    for (phase, successes_after_arm) in [("restore-status", 0), ("consensus", 2)] {
+        let failure = Arc::new(InjectedCollectiveFailureState::new(successes_after_arm));
+        let comm = InjectedRestoreComm {
+            state: Arc::clone(&failure),
+        };
+        let run = RunDir::create(tmp.path(), format!("terminal-comm-{phase}")).unwrap();
+        let trainer = Trainer::with_comm(cfg.clone(), &run, comm).unwrap();
+        let inner = StatefulScriptedPolicy::new(
+            SEED.wrapping_add(1_000 + successes_after_arm as u64),
+            1_100 + successes_after_arm as u64,
+        )
+        .unwrap();
+        let adapter_before = var_bits(&inner);
+        let sampler_before = inner.sampler_state().unwrap();
+        let mut policy = ContinuationFaultPolicy {
+            inner,
+            panic_next_trainable_vars: Cell::new(false),
+            fail_restore_call: None,
+            panic_restore_call: None,
+            arm_collective_failure_on_restore_call: Some((1, Arc::clone(&failure))),
+            restore_calls: 0,
+        };
+
+        let error = trainer
+            .restore_rollout_ledger_continuation(&checkpoint, &mut policy, &policy_sha256)
+            .unwrap_err();
+        let TrainerError::Contract(message) = error else {
+            panic!("{phase}: expected terminal discard-world classification, got {error:?}");
+        };
+        assert!(
+            message.contains("the data-parallel world is dead"),
+            "{phase}: {message}"
+        );
+        assert!(
+            message.contains("no further collectives are safe"),
+            "{phase}: {message}"
+        );
+        assert!(
+            message.contains("discard the policy state on every rank"),
+            "{phase}: {message}"
+        );
+        assert!(
+            failure.failed.load(Ordering::SeqCst),
+            "{phase}: communicator fault was not consumed"
+        );
+        assert_eq!(
+            failure.calls_after_failure.load(Ordering::SeqCst),
+            0,
+            "{phase}: restore issued a collective after the world became dead"
+        );
+        assert_eq!(
+            failure.remaining_successes.load(Ordering::SeqCst),
+            0,
+            "{phase}: communicator failed at the wrong restore boundary"
+        );
+        assert_eq!(policy.restore_calls, 2, "{phase}: local rollback calls");
+        assert_eq!(
+            var_bits(&policy),
+            adapter_before,
+            "{phase}: adapter rollback"
+        );
+        assert_eq!(
+            policy.sampler_state().unwrap(),
+            sampler_before,
+            "{phase}: sampler rollback"
+        );
     }
 }
 

@@ -2802,26 +2802,16 @@ impl Trainer {
         let failed_global = match failed_global {
             Ok(failed) => failed,
             Err(comm_error) => {
-                let rollback = self.coordinate_data_parallel_call(
-                    "rollout-ledger continuation restore rollback after status failure",
-                    || {
-                        Self::restore_rollout_ledger_checkpoint_prestate(
-                            policy,
-                            &vars,
-                            &adapter_prestate,
-                            &sampler_prestate,
-                        )
-                    },
-                );
-                return match (outcome, rollback) {
-                    (Err(local_error), Ok(())) => Err(TrainerError::Contract(format!(
-                        "rollout-ledger continuation restore failed ({local_error}); restore-status collective also failed: {comm_error}"
-                    ))),
-                    (Ok(_), Ok(())) => Err(comm_error.into()),
-                    (_, Err(rollback_error)) => Err(TrainerError::Contract(format!(
-                        "rollout-ledger continuation restore lost its status collective ({comm_error}); coordinated rollback also failed ({rollback_error}); discard the policy state on every rank in this data-parallel world"
-                    ))),
-                };
+                let local_error = outcome.as_ref().err().map(ToString::to_string);
+                return Err(Self::terminal_rollout_ledger_restore_comm_failure(
+                    "rollout-ledger continuation restore-status collective",
+                    &comm_error,
+                    local_error.as_deref(),
+                    policy,
+                    &vars,
+                    &adapter_prestate,
+                    &sampler_prestate,
+                ));
             }
         };
         if failed_global > 0.0 {
@@ -2850,7 +2840,7 @@ impl Trainer {
         }
         let continuation = outcome?;
         let consensus = (|| {
-            let bytes = self.coordinate_data_parallel_result(
+            let bytes = self.coordinate_data_parallel_result_comm_first(
                 "rollout-ledger restored continuation serialization",
                 serde_json::to_vec(&(
                     continuation.completed_step,
@@ -2877,6 +2867,17 @@ impl Trainer {
             )
         })();
         if let Err(error) = consensus {
+            if let TrainerError::Comm(comm_error) = &error {
+                return Err(Self::terminal_rollout_ledger_restore_comm_failure(
+                    "restored rollout-ledger continuation consensus",
+                    comm_error,
+                    None,
+                    policy,
+                    &vars,
+                    &adapter_prestate,
+                    &sampler_prestate,
+                ));
+            }
             let rollback = self.coordinate_data_parallel_call(
                 "rollout-ledger continuation consensus rollback",
                 || {
@@ -3042,6 +3043,29 @@ impl Trainer {
         }
     }
 
+    /// Coordinate a rank-local result while treating a collective failure as
+    /// terminal even when this rank also has a more specific local error. Once
+    /// the reduction errors the communicator is dead, so callers must not hide
+    /// that fact and then attempt recovery collectives.
+    fn coordinate_data_parallel_result_comm_first<T>(
+        &self,
+        label: &str,
+        local: Result<T, TrainerError>,
+    ) -> Result<T, TrainerError> {
+        if self.comm.world_size() <= 1 {
+            return local;
+        }
+        let failed_local = if local.is_err() { 1.0 } else { 0.0 };
+        let failed = self.comm.all_reduce_scalar_sum(failed_local)?;
+        match local {
+            Err(error) => Err(error),
+            Ok(_) if failed > 0.0 => Err(TrainerError::Contract(format!(
+                "{label} failed on a peer rank; aborting in lockstep"
+            ))),
+            Ok(value) => Ok(value),
+        }
+    }
+
     /// Catch one rank-local callback panic and globalize the resulting status
     /// before any rank can advance into the next data-parallel collective. The
     /// operation itself must not enter a data-parallel collective.
@@ -3073,24 +3097,18 @@ impl Trainer {
         }
         let digest: [u8; 32] = Sha256::digest(value).into();
         let mut mismatch = false;
-        let mut reduction_error = None;
         for word in digest.chunks_exact(4) {
             let local = u32::from_le_bytes(word.try_into().expect("four-byte digest word"));
-            match self.comm.all_reduce_scalar_sum(if self.comm.rank() == 0 {
+            let canonical = self.comm.all_reduce_scalar_sum(if self.comm.rank() == 0 {
                 f64::from(local)
             } else {
                 0.0
-            }) {
-                Ok(canonical) => mismatch |= canonical != f64::from(local),
-                Err(error) if reduction_error.is_none() => reduction_error = Some(error),
-                Err(_) => {}
-            }
+            })?;
+            mismatch |= canonical != f64::from(local);
         }
-        self.coordinate_data_parallel_result(
+        self.coordinate_data_parallel_result_comm_first(
             label,
-            if let Some(error) = reduction_error {
-                Err(error.into())
-            } else if mismatch {
+            if mismatch {
                 Err(TrainerError::Contract(format!(
                     "{label} differs across data-parallel ranks"
                 )))
@@ -3373,6 +3391,59 @@ impl Trainer {
         } else {
             Err(TrainerError::Contract(failures.join("; ")))
         }
+    }
+
+    /// After a communication failure the data-parallel world is unusable, so
+    /// rollback is strictly local and best-effort. Catch policy panics here;
+    /// this helper must never enter another collective.
+    fn restore_rollout_ledger_checkpoint_prestate_locally<P: Policy>(
+        policy: &mut P,
+        vars: &[Var],
+        adapter_prestate: &[Tensor],
+        sampler_prestate: &[u8],
+    ) -> Result<(), TrainerError> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Self::restore_rollout_ledger_checkpoint_prestate(
+                policy,
+                vars,
+                adapter_prestate,
+                sampler_prestate,
+            )
+        }))
+        .unwrap_or_else(|payload| {
+            Err(TrainerError::Contract(format!(
+                "best-effort local continuation rollback panicked: {}",
+                panic_payload_message(payload.as_ref())
+            )))
+        })
+    }
+
+    fn terminal_rollout_ledger_restore_comm_failure<P: Policy>(
+        phase: &str,
+        comm_error: &crate::comm::CommError,
+        local_error: Option<&str>,
+        policy: &mut P,
+        vars: &[Var],
+        adapter_prestate: &[Tensor],
+        sampler_prestate: &[u8],
+    ) -> TrainerError {
+        let rollback = Self::restore_rollout_ledger_checkpoint_prestate_locally(
+            policy,
+            vars,
+            adapter_prestate,
+            sampler_prestate,
+        );
+        let local_detail = local_error.map_or_else(
+            || "the local restore had completed before communication failed".to_owned(),
+            |error| format!("the local restore also failed: {error}"),
+        );
+        let rollback_detail = match rollback {
+            Ok(()) => "best-effort local rollback completed".to_owned(),
+            Err(error) => format!("best-effort local rollback failed: {error}"),
+        };
+        TrainerError::Contract(format!(
+            "{phase} failed ({comm_error}); {local_detail}; {rollback_detail}; the data-parallel world is dead and no further collectives are safe; discard the policy state on every rank in this data-parallel world"
+        ))
     }
 
     fn restore_rollout_ledger_sampler<P: Policy>(
