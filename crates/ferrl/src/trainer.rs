@@ -2002,6 +2002,19 @@ impl Trainer {
                 // the sampler would split collector state from that visible L_k.
                 Err(TrainerError::RolloutLedger(error))
             }
+            Err(TrainerError::Comm(comm_error)) => {
+                let rollback = Self::catch_local_data_parallel_recovery(
+                    "best-effort local rollout-ledger collector rollback",
+                    || Self::restore_rollout_ledger_sampler(policy, &sampler_prestate),
+                );
+                Err(Self::terminal_data_parallel_comm_failure(
+                    "rollout-ledger collector",
+                    &comm_error,
+                    None,
+                    rollback,
+                    "policy instance",
+                ))
+            }
             Err(error) => {
                 let rollback = self
                     .coordinate_data_parallel_call("rollout-ledger collector rollback", || {
@@ -2260,18 +2273,18 @@ impl Trainer {
                         ))
                     })(),
                 )?;
-                let tokens = self.comm.all_reduce_scalar_sum(local_tokens_f64);
-                let live = self.comm.all_reduce_scalar_sum(local_live_f64);
+                let tokens = self.comm.all_reduce_scalar_sum(local_tokens_f64)?;
+                let live = self.comm.all_reduce_scalar_sum(local_live_f64)?;
                 self.coordinate_data_parallel_result(
                     "rollout-ledger learner global counts",
                     (|| {
                         Ok((
                             exact_reduced_u64(
                                 "rollout-ledger learner completion-token count",
-                                tokens?,
+                                tokens,
                             )?
                             .max(1),
-                            exact_reduced_u64("rollout-ledger learner live-item count", live?)?,
+                            exact_reduced_u64("rollout-ledger learner live-item count", live)?,
                         ))
                     })(),
                 )?
@@ -2378,6 +2391,29 @@ impl Trainer {
 
         match outcome {
             Ok(result) => Ok(result),
+            Err(TrainerError::Comm(comm_error)) => {
+                let rollback = Self::catch_local_data_parallel_recovery(
+                    "best-effort local rollout-ledger learner rollback",
+                    || {
+                        Self::restore_rollout_ledger_prestate(
+                            policy,
+                            &vars,
+                            &adapter_prestate,
+                            &mut opt,
+                            &optimizer_prestate,
+                            adapter_enabled_prestate,
+                            &sampler_prestate,
+                        )
+                    },
+                );
+                Err(Self::terminal_data_parallel_comm_failure(
+                    "rollout-ledger learner",
+                    &comm_error,
+                    None,
+                    rollback,
+                    "policy and optimizer state",
+                ))
+            }
             Err(error) => {
                 let rollback =
                     self.coordinate_data_parallel_call("rollout-ledger learner rollback", || {
@@ -2840,7 +2876,7 @@ impl Trainer {
         }
         let continuation = outcome?;
         let consensus = (|| {
-            let bytes = self.coordinate_data_parallel_result_comm_first(
+            let bytes = self.coordinate_data_parallel_result(
                 "rollout-ledger restored continuation serialization",
                 serde_json::to_vec(&(
                     continuation.completed_step,
@@ -3031,28 +3067,7 @@ impl Trainer {
         if self.comm.world_size() <= 1 {
             return local;
         }
-        let failed_local = if local.is_err() { 1.0 } else { 0.0 };
-        let reduced = self.comm.all_reduce_scalar_sum(failed_local);
-        match (local, reduced) {
-            (Err(error), _) => Err(error),
-            (Ok(_), Err(error)) => Err(error.into()),
-            (Ok(_), Ok(failed)) if failed > 0.0 => Err(TrainerError::Contract(format!(
-                "{label} failed on a peer rank; aborting in lockstep"
-            ))),
-            (Ok(value), Ok(_)) => Ok(value),
-        }
-    }
-
-    /// Coordinate a rank-local result while treating a collective failure as
-    /// terminal even when this rank also has a more specific local error. Once
-    /// the reduction errors the communicator is dead, so callers must not hide
-    /// that fact and then attempt recovery collectives.
-    fn coordinate_data_parallel_result_comm_first<T>(
-        &self,
-        label: &str,
-        local: Result<T, TrainerError>,
-    ) -> Result<T, TrainerError> {
-        if self.comm.world_size() <= 1 {
+        if matches!(&local, Err(TrainerError::Comm(_))) {
             return local;
         }
         let failed_local = if local.is_err() { 1.0 } else { 0.0 };
@@ -3106,7 +3121,7 @@ impl Trainer {
             })?;
             mismatch |= canonical != f64::from(local);
         }
-        self.coordinate_data_parallel_result_comm_first(
+        self.coordinate_data_parallel_result(
             label,
             if mismatch {
                 Err(TrainerError::Contract(format!(
@@ -3131,17 +3146,17 @@ impl Trainer {
             f64::from(local as u32)
         } else {
             0.0
-        });
+        })?;
         let high = self.comm.all_reduce_scalar_sum(if self.comm.rank() == 0 {
             f64::from((local >> 32) as u32)
         } else {
             0.0
-        });
+        })?;
         let (low, high) = self.coordinate_data_parallel_result(
             "distributed rollout-ledger nonce broadcast",
             (|| {
-                let low = exact_reduced_u64("distributed nonce low word", low?)?;
-                let high = exact_reduced_u64("distributed nonce high word", high?)?;
+                let low = exact_reduced_u64("distributed nonce low word", low)?;
+                let high = exact_reduced_u64("distributed nonce high word", high)?;
                 Ok((
                     u32::try_from(low).map_err(|_| {
                         TrainerError::Contract("distributed nonce low word exceeds u32".into())
@@ -3187,16 +3202,7 @@ impl Trainer {
             .map_err(TrainerError::from);
         let shard_failed =
             self.comm
-                .all_reduce_scalar_sum(if shard_local.is_err() { 1.0 } else { 0.0 });
-        let shard_failed = match shard_failed {
-            Ok(value) => value,
-            Err(error) => {
-                return Err(TrainerError::Contract(format!(
-                    "distributed shard-status collective failed ({error}); hidden stage {} was preserved for operator reconciliation",
-                    stage_path.display()
-                )));
-            }
-        };
+                .all_reduce_scalar_sum(if shard_local.is_err() { 1.0 } else { 0.0 })?;
         if shard_failed > 0.0 {
             let cleanup = self.coordinate_data_parallel_result(
                 "distributed rollout-ledger failed-shard cleanup",
@@ -3393,28 +3399,53 @@ impl Trainer {
         }
     }
 
-    /// After a communication failure the data-parallel world is unusable, so
-    /// rollback is strictly local and best-effort. Catch policy panics here;
-    /// this helper must never enter another collective.
+    /// Run recovery after a communication failure without touching the dead
+    /// world. Policy callbacks may panic, so every such local-only recovery is
+    /// contained here before the caller returns a terminal discard result.
+    fn catch_local_data_parallel_recovery<F>(label: &str, operation: F) -> Result<(), TrainerError>
+    where
+        F: FnOnce() -> Result<(), TrainerError>,
+    {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)).unwrap_or_else(
+            |payload| {
+                Err(TrainerError::Contract(format!(
+                    "{label} panicked: {}",
+                    panic_payload_message(payload.as_ref())
+                )))
+            },
+        )
+    }
+
+    fn terminal_data_parallel_comm_failure(
+        phase: &str,
+        comm_error: &crate::comm::CommError,
+        local_detail: Option<&str>,
+        rollback: Result<(), TrainerError>,
+        discard: &str,
+    ) -> TrainerError {
+        let local_detail = local_detail.map_or_else(String::new, |detail| format!("; {detail}"));
+        let rollback_detail = match rollback {
+            Ok(()) => "best-effort local rollback completed".to_owned(),
+            Err(error) => format!("best-effort local rollback failed: {error}"),
+        };
+        TrainerError::Contract(format!(
+            "{phase} communication failed ({comm_error}){local_detail}; {rollback_detail}; the data-parallel world is dead and no further collectives are safe; discard the {discard} on every rank in this data-parallel world"
+        ))
+    }
+
     fn restore_rollout_ledger_checkpoint_prestate_locally<P: Policy>(
         policy: &mut P,
         vars: &[Var],
         adapter_prestate: &[Tensor],
         sampler_prestate: &[u8],
     ) -> Result<(), TrainerError> {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        Self::catch_local_data_parallel_recovery("best-effort local continuation rollback", || {
             Self::restore_rollout_ledger_checkpoint_prestate(
                 policy,
                 vars,
                 adapter_prestate,
                 sampler_prestate,
             )
-        }))
-        .unwrap_or_else(|payload| {
-            Err(TrainerError::Contract(format!(
-                "best-effort local continuation rollback panicked: {}",
-                panic_payload_message(payload.as_ref())
-            )))
         })
     }
 
@@ -3437,13 +3468,13 @@ impl Trainer {
             || "the local restore had completed before communication failed".to_owned(),
             |error| format!("the local restore also failed: {error}"),
         );
-        let rollback_detail = match rollback {
-            Ok(()) => "best-effort local rollback completed".to_owned(),
-            Err(error) => format!("best-effort local rollback failed: {error}"),
-        };
-        TrainerError::Contract(format!(
-            "{phase} failed ({comm_error}); {local_detail}; {rollback_detail}; the data-parallel world is dead and no further collectives are safe; discard the policy state on every rank in this data-parallel world"
-        ))
+        Self::terminal_data_parallel_comm_failure(
+            phase,
+            comm_error,
+            Some(&local_detail),
+            rollback,
+            "policy state",
+        )
     }
 
     fn restore_rollout_ledger_sampler<P: Policy>(
@@ -3804,14 +3835,14 @@ impl Trainer {
                 ))
             })(),
         )?;
-        let tokens = self.comm.all_reduce_scalar_sum(local_tokens_f64);
-        let live = self.comm.all_reduce_scalar_sum(local_live_f64);
+        let tokens = self.comm.all_reduce_scalar_sum(local_tokens_f64)?;
+        let live = self.comm.all_reduce_scalar_sum(local_live_f64)?;
         let (global_tokens, global_live) = self.coordinate_data_parallel_result(
             "rollout-ledger collector global counts",
             (|| {
                 Ok((
-                    exact_reduced_u64("rollout ledger completion-token count", tokens?)?.max(1),
-                    exact_reduced_u64("rollout ledger live-item count", live?)?,
+                    exact_reduced_u64("rollout ledger completion-token count", tokens)?.max(1),
+                    exact_reduced_u64("rollout ledger live-item count", live)?,
                 ))
             })(),
         )?;
@@ -4505,14 +4536,18 @@ impl Trainer {
         if exec.execution_world_size(self.comm.as_ref()) <= 1 {
             return local;
         }
+        if matches!(&local, Err(TrainerError::Comm(_))) {
+            return local;
+        }
         let failed_local = if local.is_err() { 1.0 } else { 0.0 };
-        let reduced = exec.execution_all_reduce_scalar_sum(self.comm.as_ref(), failed_local);
-        match (local, reduced) {
-            (Err(err), _) | (Ok(_), Err(err)) => Err(err),
-            (Ok(_), Ok(failed_global)) if failed_global > 0.0 => Err(TrainerError::Contract(
+        let failed_global =
+            exec.execution_all_reduce_scalar_sum(self.comm.as_ref(), failed_local)?;
+        match local {
+            Err(error) => Err(error),
+            Ok(_) if failed_global > 0.0 => Err(TrainerError::Contract(
                 "checkpoint load/restore failed on a peer rank; aborting in lockstep".into(),
             )),
-            (Ok(loaded), Ok(_)) => Ok(loaded),
+            Ok(loaded) => Ok(loaded),
         }
     }
 
@@ -4677,17 +4712,14 @@ impl Trainer {
         let failed_global = match failed_global {
             Ok(failed) => failed,
             Err(comm_error) => {
-                let rollback = self.writer.truncate_to(rollback_len);
-                return match (append_local, rollback) {
-                    (Err(append_error), Ok(())) => Err(TrainerError::Contract(format!(
-                        "rollout-ledger metrics append failed ({append_error}); append-status collective also failed: {comm_error}"
-                    ))),
-                    (Ok(()), Ok(())) => Err(comm_error.into()),
-                    (local, Err(rollback_error)) => Err(TrainerError::Contract(format!(
-                        "rollout-ledger metrics transaction lost its append-status collective ({comm_error}); local append result was {}; rollback also failed: {rollback_error}",
-                        if local.is_ok() { "success" } else { "failure" }
-                    ))),
-                };
+                let _rollback = Self::catch_local_data_parallel_recovery(
+                    "best-effort local rollout-ledger metrics rollback",
+                    || {
+                        self.writer.truncate_to(rollback_len)?;
+                        Ok(())
+                    },
+                );
+                return Err(comm_error.into());
             }
         };
         if failed_global == 0.0 {
@@ -4700,6 +4732,7 @@ impl Trainer {
         let rollback =
             self.coordinate_data_parallel_result("rollout-ledger metrics rollback", rollback_local);
         match (append_local, rollback) {
+            (_, Err(TrainerError::Comm(comm_error))) => Err(comm_error.into()),
             (_, Err(rollback_error)) => Err(TrainerError::Contract(format!(
                 "rollout-ledger metrics append failed on at least one rank; coordinated rollback failed: {rollback_error}"
             ))),
@@ -5003,14 +5036,18 @@ impl Trainer {
         if exec.execution_world_size(self.comm.as_ref()) <= 1 {
             return local;
         }
+        if matches!(&local, Err(TrainerError::Comm(_))) {
+            return local;
+        }
         let failed_local = if local.is_err() { 1.0 } else { 0.0 };
-        let reduced = exec.execution_all_reduce_scalar_sum(self.comm.as_ref(), failed_local);
-        match (local, reduced) {
-            (Err(err), _) | (Ok(()), Err(err)) => Err(err),
-            (Ok(()), Ok(failed_global)) if failed_global > 0.0 => Err(TrainerError::Contract(
-                format!("{label} failed on a peer rank; aborting in lockstep"),
-            )),
-            (Ok(()), Ok(_)) => Ok(()),
+        let failed_global =
+            exec.execution_all_reduce_scalar_sum(self.comm.as_ref(), failed_local)?;
+        match local {
+            Err(error) => Err(error),
+            Ok(()) if failed_global > 0.0 => Err(TrainerError::Contract(format!(
+                "{label} failed on a peer rank; aborting in lockstep"
+            ))),
+            Ok(()) => Ok(()),
         }
     }
 
@@ -5286,6 +5323,7 @@ impl Trainer {
     /// Score one TP group's rewards on execution rank 0, then broadcast those
     /// canonical scalars before any rank computes advantages or branches on a
     /// degenerate group. DP ranks still score their own prompt shards locally.
+    #[allow(clippy::cognitive_complexity)] // explicit primary/status/value broadcast protocol
     fn coordinate_reward_group<P, R, E>(
         &self,
         reward_fn: &R,
@@ -5326,18 +5364,22 @@ impl Trainer {
         } else {
             Ok(Vec::new())
         };
+        if matches!(&local, Err(TrainerError::Comm(_))) {
+            return local;
+        }
         let failed_local = if local.is_err() { 1.0 } else { 0.0 };
-        let failed_global = exec.execution_all_reduce_scalar_sum(self.comm.as_ref(), failed_local);
-        let local = match (local, failed_global) {
-            (Err(err), _) | (Ok(_), Err(err)) => return Err(err),
-            (Ok(_), Ok(failed)) if failed > 0.0 => {
+        let failed_global =
+            exec.execution_all_reduce_scalar_sum(self.comm.as_ref(), failed_local)?;
+        let local = match local {
+            Err(error) => return Err(error),
+            Ok(_) if failed_global > 0.0 => {
                 return Err(TrainerError::Contract(
                     "reward evaluation failed on tensor-parallel execution rank 0; aborting in \
                      lockstep"
                         .into(),
                 ));
             }
-            (Ok(outcomes), Ok(_)) => outcomes,
+            Ok(outcomes) => outcomes,
         };
 
         let local_reward_bits: Vec<f64> = if is_primary {
@@ -5391,18 +5433,12 @@ impl Trainer {
             }
             RewardGroupScope::DistributedSamePrompt => {
                 let local = RewardStatsAcc::from_rewards(rewards);
-                let count = self.comm.all_reduce_scalar_sum(local.count);
-                let sum = self.comm.all_reduce_scalar_sum(local.sum);
-                let sumsq = self.comm.all_reduce_scalar_sum(local.sumsq);
+                let count = self.comm.all_reduce_scalar_sum(local.count)?;
+                let sum = self.comm.all_reduce_scalar_sum(local.sum)?;
+                let sumsq = self.comm.all_reduce_scalar_sum(local.sumsq)?;
                 let global = self.coordinate_data_parallel_result(
                     "distributed reward-statistics reduction",
-                    (|| {
-                        Ok(RewardStatsAcc {
-                            count: count?,
-                            sum: sum?,
-                            sumsq: sumsq?,
-                        })
-                    })(),
+                    Ok(RewardStatsAcc { count, sum, sumsq }),
                 )?;
                 let count = exact_reduced_u64("distributed reward count", global.count)?;
                 Ok((

@@ -904,11 +904,11 @@ impl InjectedCollectiveFailureState {
 }
 
 #[derive(Debug)]
-struct InjectedRestoreComm {
+struct InjectedFailureComm {
     state: Arc<InjectedCollectiveFailureState>,
 }
 
-impl InjectedRestoreComm {
+impl InjectedFailureComm {
     fn enter_collective(&self) -> Result<(), CommError> {
         if self.state.failed.load(Ordering::SeqCst) {
             self.state
@@ -930,12 +930,12 @@ impl InjectedRestoreComm {
         }
         self.state.failed.store(true, Ordering::SeqCst);
         Err(CommError::Mismatch(
-            "injected terminal continuation-restore failure".into(),
+            "injected terminal data-parallel failure".into(),
         ))
     }
 }
 
-impl Comm for InjectedRestoreComm {
+impl Comm for InjectedFailureComm {
     fn rank(&self) -> usize {
         0
     }
@@ -951,6 +951,99 @@ impl Comm for InjectedRestoreComm {
     fn all_reduce_scalar_sum(&self, value: f64) -> Result<f64, CommError> {
         self.enter_collective()?;
         Ok(value)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeadCommPhase {
+    CollectorGeneration,
+    LearnerDetachedScoring,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DeadCommRollbackFault {
+    ReturnError,
+    Panic,
+}
+
+/// Arms a terminal communicator failure immediately after a policy callback
+/// has made local progress, then faults the local-only sampler rollback. This
+/// proves the trainer classifies the communication failure first and never
+/// tries to coordinate recovery through the poisoned world.
+struct DeadCommRecoveryPolicy {
+    inner: StatefulScriptedPolicy,
+    state: Arc<InjectedCollectiveFailureState>,
+    phase: DeadCommPhase,
+    rollback_fault: DeadCommRollbackFault,
+    post_failure_restore_calls: usize,
+}
+
+impl DeadCommRecoveryPolicy {
+    fn arm_and_fail(&self, message: &'static str) -> CandleResult<()> {
+        self.state.armed.store(true, Ordering::SeqCst);
+        candle_core::bail!("{message}")
+    }
+}
+
+impl Policy for DeadCommRecoveryPolicy {
+    fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
+        self.generate_at(prompt, cfg, 0)
+    }
+
+    fn generate_at(
+        &mut self,
+        prompt: &[u32],
+        cfg: &GenConfig,
+        global_row_base: u64,
+    ) -> CandleResult<Rollout> {
+        let rollout = self.inner.generate_at(prompt, cfg, global_row_base)?;
+        if self.phase == DeadCommPhase::CollectorGeneration {
+            self.arm_and_fail("injected collector failure before terminal status")?;
+        }
+        Ok(rollout)
+    }
+
+    fn token_logprobs(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+        self.inner.token_logprobs(rollout)
+    }
+
+    fn token_logprobs_detached(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+        let logprobs = self.inner.token_logprobs_detached(rollout)?;
+        if self.phase == DeadCommPhase::LearnerDetachedScoring {
+            self.arm_and_fail("injected learner failure before terminal status")?;
+        }
+        Ok(logprobs)
+    }
+
+    fn set_adapter_enabled(&mut self, enabled: bool) {
+        self.inner.set_adapter_enabled(enabled);
+    }
+
+    fn adapter_enabled(&self) -> bool {
+        self.inner.adapter_enabled()
+    }
+
+    fn trainable_vars(&self) -> Vec<Var> {
+        self.inner.trainable_vars()
+    }
+
+    fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+        self.inner.sampler_state()
+    }
+
+    fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
+        if self.state.failed.load(Ordering::SeqCst) {
+            self.post_failure_restore_calls += 1;
+            match self.rollback_fault {
+                DeadCommRollbackFault::ReturnError => {
+                    candle_core::bail!("injected post-communication local rollback failure")
+                }
+                DeadCommRollbackFault::Panic => {
+                    panic!("injected post-communication local rollback panic")
+                }
+            }
+        }
+        self.inner.restore_sampler_state(state)
     }
 }
 
@@ -3259,7 +3352,7 @@ fn distributed_continuation_comm_failure_never_enters_another_collective() {
     // word fails. Both failures poison the world immediately.
     for (phase, successes_after_arm) in [("restore-status", 0), ("consensus", 2)] {
         let failure = Arc::new(InjectedCollectiveFailureState::new(successes_after_arm));
-        let comm = InjectedRestoreComm {
+        let comm = InjectedFailureComm {
             state: Arc::clone(&failure),
         };
         let run = RunDir::create(tmp.path(), format!("terminal-comm-{phase}")).unwrap();
@@ -3323,6 +3416,167 @@ fn distributed_continuation_comm_failure_never_enters_another_collective() {
             sampler_before,
             "{phase}: sampler rollback"
         );
+    }
+}
+
+#[test]
+#[allow(clippy::cognitive_complexity)] // collector/learner x error/panic terminal matrix
+fn distributed_collector_and_learner_comm_failures_never_coordinate_recovery() {
+    let tmp = TempDir::new("distributed-terminal-recovery");
+    let cfg = TrainerConfig {
+        steps: 1,
+        grad_accum_steps: 1,
+        group_size: 2,
+        beta: 0.0,
+        mu: 1,
+        ..scripted_cfg()
+    };
+    let samples = live_samples();
+    let policy_sha256 = format!("{:064x}", 107);
+    let ledger_root = tmp.path().join("learner-source-ledger");
+
+    // Publish one ordinary world-two ledger so the learner cases reach
+    // detached scoring before arming the injected communicator failure.
+    let comms = LocalComm::world_with_timeout(2, std::time::Duration::from_secs(10));
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = comms
+            .into_iter()
+            .map(|comm| {
+                let rank = comm.rank();
+                let cfg = cfg.clone();
+                let samples = samples.clone();
+                let base = tmp.path().to_path_buf();
+                let ledger_root = ledger_root.clone();
+                let policy_sha256 = policy_sha256.clone();
+                scope.spawn(move || {
+                    let run = RunDir::create(&base, format!("terminal-source-rank{rank}")).unwrap();
+                    let mut trainer = Trainer::with_comm(cfg, &run, comm).unwrap();
+                    let mut policy = StatefulScriptedPolicy::new(SEED, 0).unwrap();
+                    trainer
+                        .collect_rollout_ledger_step(
+                            0,
+                            &mut policy,
+                            &EchoOrFlatReward,
+                            &CharTokenizer,
+                            &samples,
+                            &ledger_root,
+                            &policy_sha256,
+                            None,
+                        )
+                        .unwrap();
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    });
+
+    for phase in [
+        DeadCommPhase::CollectorGeneration,
+        DeadCommPhase::LearnerDetachedScoring,
+    ] {
+        for rollback_fault in [
+            DeadCommRollbackFault::ReturnError,
+            DeadCommRollbackFault::Panic,
+        ] {
+            let phase_label = match phase {
+                DeadCommPhase::CollectorGeneration => "collector",
+                DeadCommPhase::LearnerDetachedScoring => "learner",
+            };
+            let fault_label = match rollback_fault {
+                DeadCommRollbackFault::ReturnError => "error",
+                DeadCommRollbackFault::Panic => "panic",
+            };
+            let case = format!("{phase_label}-{fault_label}");
+            let failure = Arc::new(InjectedCollectiveFailureState::new(0));
+            let comm = InjectedFailureComm {
+                state: Arc::clone(&failure),
+            };
+            let run = RunDir::create(tmp.path(), format!("terminal-{case}")).unwrap();
+            let mut trainer = Trainer::with_comm(cfg.clone(), &run, comm).unwrap();
+            let mut policy = DeadCommRecoveryPolicy {
+                inner: StatefulScriptedPolicy::new(SEED, 0).unwrap(),
+                state: Arc::clone(&failure),
+                phase,
+                rollback_fault,
+                post_failure_restore_calls: 0,
+            };
+            let sampler_before = policy.sampler_state().unwrap();
+
+            let error = match phase {
+                DeadCommPhase::CollectorGeneration => trainer
+                    .collect_rollout_ledger_step(
+                        0,
+                        &mut policy,
+                        &EchoOrFlatReward,
+                        &CharTokenizer,
+                        &samples,
+                        tmp.path().join(format!("terminal-{case}-ledger")),
+                        &policy_sha256,
+                        None,
+                    )
+                    .unwrap_err(),
+                DeadCommPhase::LearnerDetachedScoring => trainer
+                    .train_rollout_ledger_step(0, &mut policy, &ledger_root, &policy_sha256, None)
+                    .unwrap_err(),
+            };
+            let TrainerError::Contract(message) = error else {
+                panic!("{case}: expected terminal discard-world classification, got {error:?}");
+            };
+            assert!(
+                message.contains("the data-parallel world is dead"),
+                "{case}: {message}"
+            );
+            assert!(
+                message.contains("no further collectives are safe"),
+                "{case}: {message}"
+            );
+            let expected_discard = match phase {
+                DeadCommPhase::CollectorGeneration => "discard the policy instance on every rank",
+                DeadCommPhase::LearnerDetachedScoring => {
+                    "discard the policy and optimizer state on every rank"
+                }
+            };
+            assert!(message.contains(expected_discard), "{case}: {message}");
+            let expected_rollback = match rollback_fault {
+                DeadCommRollbackFault::ReturnError => {
+                    "injected post-communication local rollback failure"
+                }
+                DeadCommRollbackFault::Panic => "injected post-communication local rollback panic",
+            };
+            assert!(message.contains(expected_rollback), "{case}: {message}");
+            assert!(
+                failure.failed.load(Ordering::SeqCst),
+                "{case}: communicator fault was not consumed"
+            );
+            assert_eq!(
+                failure.calls_after_failure.load(Ordering::SeqCst),
+                0,
+                "{case}: recovery issued a collective after the world became dead"
+            );
+            assert_eq!(
+                failure.remaining_successes.load(Ordering::SeqCst),
+                0,
+                "{case}: communicator failed at the wrong boundary"
+            );
+            assert_eq!(
+                policy.post_failure_restore_calls, 1,
+                "{case}: local rollback fault was not exercised exactly once"
+            );
+            assert_eq!(
+                ferrl::read_metrics(run.metrics_path()).unwrap().len(),
+                0,
+                "{case}: terminal failure published metrics"
+            );
+            if phase == DeadCommPhase::CollectorGeneration {
+                assert_ne!(
+                    policy.sampler_state().unwrap(),
+                    sampler_before,
+                    "{case}: collector did not make progress before rollback failed"
+                );
+            }
+        }
     }
 }
 
