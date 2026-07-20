@@ -54,21 +54,22 @@
 //! Separated rollout continuations use an internal no-replace variant instead:
 //! an atomic destination-directory claim prevents forks, a synced private owner
 //! marker binds cleanup to that exact claim, and a temporary manifest is renamed
-//! into place only after both payload files and the manifest have been synced. The
-//! checkpoint directory is then synced, followed by its parent so the directory
-//! claim itself is durable. Any missing parent chain is created one component at a
-//! time, syncing each new directory entry in its already durable ancestor before
-//! proceeding. Successful publication thus requires a filesystem/platform that
-//! supports advisory file locks plus opening and syncing directories; unsupported
-//! behavior returns an I/O error instead of claiming durability. A failed claim
-//! sync is removed only while the marker proves ownership, and the removal is
-//! synced before returning. Every post-manifest success path verifies that the
-//! owner marker and all three visible files still match the intended package; a
-//! failed fence retries the complete durability boundary before the same check. If
-//! ownership, cleanup, durability, or the exact-package check cannot be confirmed,
-//! the writer returns [`CheckpointError::PublicationAmbiguous`] for explicit
-//! operator reconciliation. A crash may still strand an incomplete claim, but it
-//! cannot expose or overwrite a completed continuation.
+//! into place only after both payload files and the manifest have been synced and
+//! their directory entries durably anchored. The checkpoint directory is synced
+//! again after the rename, followed by its parent so the directory claim itself is
+//! durable. Any missing parent chain is created one component at a time, syncing
+//! each new directory entry in its already durable ancestor before proceeding.
+//! Successful publication thus requires a filesystem/platform that supports
+//! advisory file locks plus opening and syncing directories; unsupported behavior
+//! returns an I/O error instead of claiming durability. A failed pre-manifest fence
+//! is cleaned only while the marker proves ownership, and the removal is synced
+//! before returning. Every post-manifest success path verifies that the owner marker
+//! and all three visible files still match the intended package; a failed fence
+//! retries the complete durability boundary before the same check. If ownership,
+//! cleanup, durability, or the exact-package check cannot be confirmed, the writer
+//! returns [`CheckpointError::PublicationAmbiguous`] for explicit operator
+//! reconciliation. A crash may still strand an incomplete claim, but it cannot
+//! expose or overwrite a completed continuation.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -85,6 +86,7 @@ use crate::optim::OptimizerState;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NoReplaceSyncPoint {
     ClaimParent,
+    PreManifestDirectory,
     ManifestDirectory,
     ManifestParent,
 }
@@ -674,10 +676,12 @@ pub fn save_checkpoint(
 /// directory, which discovery skips and a later writer refuses to replace;
 /// recovery must explicitly inspect and remove that abandoned claim. Ordinary
 /// operation cleans and durably removes a failed pre-manifest claim only while its
-/// marker still proves ownership. Every successful post-manifest durability fence
-/// verifies both ownership and the visible adapter, optimizer, and manifest against
-/// the exact package fingerprinted before publication. An unreconciled failure,
-/// ownership loss, or package mismatch is returned as
+/// marker still proves ownership. The checkpoint directory is synced after all
+/// payload and temporary-manifest entries are created but before the manifest rename;
+/// every successful post-manifest durability fence then verifies both ownership and
+/// the visible adapter, optimizer, and manifest against the exact package
+/// fingerprinted before publication. An unreconciled failure, ownership loss, or
+/// package mismatch is returned as
 /// [`CheckpointError::PublicationAmbiguous`] and must not be blindly overwritten.
 pub(crate) fn save_checkpoint_no_replace(
     dir: impl AsRef<Path>,
@@ -740,6 +744,12 @@ pub(crate) fn save_checkpoint_no_replace(
             return Err(cleanup_uncommitted_claim(dir, parent, &ownership, error));
         }
     };
+    // Anchor the payload and temporary-manifest names before the manifest rename
+    // can make this package discoverable. File syncs alone do not persist new
+    // directory entries across a crash.
+    if let Err(error) = sync_no_replace_boundary(dir, NoReplaceSyncPoint::PreManifestDirectory) {
+        return Err(cleanup_uncommitted_claim(dir, parent, &ownership, error));
+    }
     #[cfg(test)]
     run_no_replace_hook(dir, NoReplaceHookPoint::BeforeManifestRename);
     let manifest = dir.join(MANIFEST_FILE);
@@ -1961,6 +1971,59 @@ mod tests {
                 step: 1,
             }
         );
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // pins cleanup, retry, discovery, and restore outcomes
+    fn no_replace_checkpoint_pre_manifest_sync_failure_removes_claim_for_retry() {
+        let tmp = TempDir::new("no-replace-pre-manifest-sync");
+        let checkpoints = tmp.path().join("checkpoints");
+        let destination = checkpoints.join("step-1");
+        FAIL_NO_REPLACE_SYNCS.with(|failures| {
+            *failures.borrow_mut() = vec![NoReplaceSyncPoint::PreManifestDirectory];
+        });
+
+        assert!(matches!(
+            save_checkpoint_no_replace(
+                &destination,
+                &make_vars(),
+                &make_opt_state(),
+                &[1],
+                None,
+                continuation_manifest(1),
+            ),
+            Err(CheckpointError::Io { .. })
+        ));
+        assert!(
+            !destination.exists(),
+            "failed pre-manifest fence left a retry-blocking claim"
+        );
+        assert_eq!(
+            latest_rollout_ledger_continuation(&checkpoints).unwrap(),
+            None
+        );
+
+        save_checkpoint_no_replace(
+            &destination,
+            &make_vars(),
+            &make_opt_state(),
+            &[1],
+            None,
+            continuation_manifest(1),
+        )
+        .unwrap();
+        assert_eq!(
+            latest_rollout_ledger_continuation(&checkpoints)
+                .unwrap()
+                .unwrap(),
+            LatestCheckpoint {
+                dir: destination.clone(),
+                step: 1,
+            }
+        );
+        let loaded = load_checkpoint(&destination, &make_vars()).unwrap();
+        assert_eq!(loaded.step, 1);
+        assert_eq!(loaded.sampler_state.as_deref(), Some([1].as_slice()));
     }
 
     #[test]
