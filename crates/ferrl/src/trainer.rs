@@ -1855,60 +1855,60 @@ impl Trainer {
             "rollout-ledger root/config/prompt contract",
             &consensus,
         )?;
-        let preflight = (|| {
-            self.require_rollout_ledger_step_in_range(step)?;
-            validate_external_policy_sha256(policy_sha256)?;
-            if samples.is_empty() {
-                return Err(TrainerError::Contract(
-                    "collect_rollout_ledger_step: no samples".into(),
-                ));
-            }
-            let vars = policy.trainable_vars();
-            let mut opt = self.new_optimizer(vars.clone())?;
-            if let Some(state) = continuation {
-                opt.load_state(state.optimizer_state())?;
-            }
-            let step_lr = self.config.lr_at(step);
-            let step_beta = self.config.beta_at(step);
-            self.require_toggleable_reference_policy(
-                policy,
-                self.config.requires_reference_policy(),
-            )?;
-            opt.set_learning_rate(step_lr);
-            let controls = self.rollout_ledger_controls(step, opt.learning_rate(), step_beta)?;
-            let sampler_prestate = policy.sampler_state()?;
-            let lineage = self.require_rollout_ledger_continuation_state(
-                step,
-                policy,
-                policy_sha256,
-                &vars,
-                &opt,
-                &sampler_prestate,
-                continuation,
-            )?;
-            let identity = self.rollout_ledger_identity(
-                step,
-                policy,
-                policy_sha256,
-                &vars,
-                &opt,
-                &sampler_prestate,
-                &lineage,
-            )?;
-            let writer = RolloutLedgerWriter::create(root, identity.clone())?;
-            Ok((
-                vars,
-                opt,
-                step_beta,
-                controls,
-                sampler_prestate,
-                lineage,
-                identity,
-                writer,
-            ))
-        })();
-        let (vars, opt, step_beta, controls, sampler_prestate, lineage, identity, writer) =
-            self.coordinate_data_parallel_result("rollout-ledger collector preflight", preflight)?;
+        let (vars, opt, step_beta, controls, sampler_prestate, lineage, identity, writer) = self
+            .coordinate_data_parallel_call("rollout-ledger collector preflight", || {
+                self.require_rollout_ledger_step_in_range(step)?;
+                validate_external_policy_sha256(policy_sha256)?;
+                if samples.is_empty() {
+                    return Err(TrainerError::Contract(
+                        "collect_rollout_ledger_step: no samples".into(),
+                    ));
+                }
+                let vars = policy.trainable_vars();
+                let mut opt = self.new_optimizer(vars.clone())?;
+                if let Some(state) = continuation {
+                    opt.load_state(state.optimizer_state())?;
+                }
+                let step_lr = self.config.lr_at(step);
+                let step_beta = self.config.beta_at(step);
+                self.require_toggleable_reference_policy(
+                    policy,
+                    self.config.requires_reference_policy(),
+                )?;
+                opt.set_learning_rate(step_lr);
+                let controls =
+                    self.rollout_ledger_controls(step, opt.learning_rate(), step_beta)?;
+                let sampler_prestate = policy.sampler_state()?;
+                let lineage = self.require_rollout_ledger_continuation_state(
+                    step,
+                    policy,
+                    policy_sha256,
+                    &vars,
+                    &opt,
+                    &sampler_prestate,
+                    continuation,
+                )?;
+                let identity = self.rollout_ledger_identity(
+                    step,
+                    policy,
+                    policy_sha256,
+                    &vars,
+                    &opt,
+                    &sampler_prestate,
+                    &lineage,
+                )?;
+                let writer = RolloutLedgerWriter::create(root, identity.clone())?;
+                Ok((
+                    vars,
+                    opt,
+                    step_beta,
+                    controls,
+                    sampler_prestate,
+                    lineage,
+                    identity,
+                    writer,
+                ))
+            })?;
         let identity_bytes = serde_json::to_vec(&(&identity, &controls)).map_err(|error| {
             TrainerError::Contract(format!("serialize rollout-ledger identity: {error}"))
         })?;
@@ -1948,9 +1948,8 @@ impl Trainer {
             })();
             let collected = self
                 .coordinate_data_parallel_result("rollout-ledger group collection", collection)?;
-            let sampler_poststate = self.coordinate_data_parallel_result(
-                "rollout-ledger collector poststate",
-                (|| {
+            let sampler_poststate =
+                self.coordinate_data_parallel_call("rollout-ledger collector poststate", || {
                     let post_collection_vars = policy.trainable_vars();
                     self.require_same_rollout_ledger_vars(
                         &vars,
@@ -1972,8 +1971,7 @@ impl Trainer {
                         ));
                     }
                     Ok(policy.sampler_state()?)
-                })(),
-            )?;
+                })?;
             self.require_data_parallel_consensus_bytes(
                 "rollout-ledger collector sampler poststate",
                 &sampler_poststate,
@@ -2005,11 +2003,13 @@ impl Trainer {
                 Err(TrainerError::RolloutLedger(error))
             }
             Err(error) => {
-                if let Err(rollback) =
-                    Self::restore_rollout_ledger_sampler(policy, &sampler_prestate)
-                {
+                let rollback = self
+                    .coordinate_data_parallel_call("rollout-ledger collector rollback", || {
+                        Self::restore_rollout_ledger_sampler(policy, &sampler_prestate)
+                    });
+                if let Err(rollback) = rollback {
                     return Err(TrainerError::Contract(format!(
-                        "rollout-ledger collector failed ({error}); restoring its sampler pre-state also failed: {rollback}"
+                        "rollout-ledger collector failed ({error}); coordinated sampler rollback also failed ({rollback}); discard the policy instance on every rank in this data-parallel world"
                     )));
                 }
                 Err(error)
@@ -2070,68 +2070,70 @@ impl Trainer {
             "rollout-ledger learner root/config contract",
             &consensus,
         )?;
-        let preflight = (|| {
-            self.require_rollout_ledger_step_in_range(step)?;
-            validate_external_policy_sha256(policy_sha256)?;
-            let vars = policy.trainable_vars();
-            let mut opt = self.new_optimizer(vars.clone())?;
-            if let Some(state) = continuation {
-                opt.load_state(state.optimizer_state())?;
-            }
-            let step_beta = self.config.beta_at(step);
-            opt.set_learning_rate(self.config.lr_at(step));
-            let controls = self.rollout_ledger_controls(step, opt.learning_rate(), step_beta)?;
-            let sampler_prestate = policy.sampler_state()?;
-            let lineage = self.require_rollout_ledger_continuation_state(
-                step,
-                policy,
-                policy_sha256,
-                &vars,
-                &opt,
-                &sampler_prestate,
-                continuation,
-            )?;
-            let identity = self.rollout_ledger_identity(
-                step,
-                policy,
-                policy_sha256,
-                &vars,
-                &opt,
-                &sampler_prestate,
-                &lineage,
-            )?;
-            let reader = RolloutLedgerReader::open(
-                root,
-                RolloutLedgerExpectations {
-                    identity,
-                    controls: controls.clone(),
-                },
-            )?;
-            let validated = if self.comm.world_size() == 1 {
-                reader.read_step(step)?
-            } else {
-                reader.read_distributed_step(
+        let (vars, mut opt, step_beta, _controls, sampler_prestate, lineage, validated) = self
+            .coordinate_data_parallel_call("rollout-ledger learner preflight", || {
+                self.require_rollout_ledger_step_in_range(step)?;
+                validate_external_policy_sha256(policy_sha256)?;
+                let vars = policy.trainable_vars();
+                let mut opt = self.new_optimizer(vars.clone())?;
+                if let Some(state) = continuation {
+                    opt.load_state(state.optimizer_state())?;
+                }
+                let step_beta = self.config.beta_at(step);
+                opt.set_learning_rate(self.config.lr_at(step));
+                let controls =
+                    self.rollout_ledger_controls(step, opt.learning_rate(), step_beta)?;
+                let sampler_prestate = policy.sampler_state()?;
+                let lineage = self.require_rollout_ledger_continuation_state(
                     step,
-                    u32::try_from(self.comm.rank()).map_err(|_| {
-                        TrainerError::Contract("rollout-ledger rank does not fit u32".into())
-                    })?,
-                    u32::try_from(self.comm.world_size()).map_err(|_| {
-                        TrainerError::Contract("rollout-ledger world size does not fit u32".into())
-                    })?,
-                )?
-            };
-            Ok((
-                vars,
-                opt,
-                step_beta,
-                controls,
-                sampler_prestate,
-                lineage,
-                validated,
-            ))
-        })();
-        let (vars, mut opt, step_beta, _controls, sampler_prestate, lineage, validated) =
-            self.coordinate_data_parallel_result("rollout-ledger learner preflight", preflight)?;
+                    policy,
+                    policy_sha256,
+                    &vars,
+                    &opt,
+                    &sampler_prestate,
+                    continuation,
+                )?;
+                let identity = self.rollout_ledger_identity(
+                    step,
+                    policy,
+                    policy_sha256,
+                    &vars,
+                    &opt,
+                    &sampler_prestate,
+                    &lineage,
+                )?;
+                let reader = RolloutLedgerReader::open(
+                    root,
+                    RolloutLedgerExpectations {
+                        identity,
+                        controls: controls.clone(),
+                    },
+                )?;
+                let validated = if self.comm.world_size() == 1 {
+                    reader.read_step(step)?
+                } else {
+                    reader.read_distributed_step(
+                        step,
+                        u32::try_from(self.comm.rank()).map_err(|_| {
+                            TrainerError::Contract("rollout-ledger rank does not fit u32".into())
+                        })?,
+                        u32::try_from(self.comm.world_size()).map_err(|_| {
+                            TrainerError::Contract(
+                                "rollout-ledger world size does not fit u32".into(),
+                            )
+                        })?,
+                    )?
+                };
+                Ok((
+                    vars,
+                    opt,
+                    step_beta,
+                    controls,
+                    sampler_prestate,
+                    lineage,
+                    validated,
+                ))
+            })?;
         let validated_identity = validated.identity().clone();
         let consumed_ledger_sha256 = validated.consumed_ledger_sha256().to_owned();
         self.require_data_parallel_consensus_bytes(
@@ -2140,20 +2142,17 @@ impl Trainer {
         )?;
         let payload = validated.into_step();
         let (adapter_prestate, optimizer_prestate, adapter_enabled_prestate) = self
-            .coordinate_data_parallel_result(
-                "rollout-ledger learner rollback snapshot",
-                (|| {
-                    Ok((
-                        Self::snapshot_rollout_ledger_vars(&vars)?,
-                        opt.state()?,
-                        policy.adapter_enabled(),
-                    ))
-                })(),
-            )?;
+            .coordinate_data_parallel_call("rollout-ledger learner rollback snapshot", || {
+                Ok((
+                    Self::snapshot_rollout_ledger_vars(&vars)?,
+                    opt.state()?,
+                    policy.adapter_enabled(),
+                ))
+            })?;
         let outcome: Result<(Metrics, RolloutLedgerContinuation), TrainerError> = (|| {
-            self.coordinate_data_parallel_result(
+            self.coordinate_data_parallel_call(
                 "rollout-ledger reference-policy preflight",
-                (|| {
+                || {
                     self.require_toggleable_reference_policy(
                         policy,
                         self.config.requires_reference_policy(),
@@ -2179,14 +2178,13 @@ impl Trainer {
                         ));
                     }
                     Ok(())
-                })(),
+                },
             )?;
 
             let exec = UnshardedPolicyExecution;
             let mut gpu_mem = StepGpuMemory::new(false);
-            let (stats, live) = self.coordinate_data_parallel_result(
-                "rollout-ledger detached scoring",
-                (|| {
+            let (stats, live) =
+                self.coordinate_data_parallel_call("rollout-ledger detached scoring", || {
                     let mut stats = Vec::with_capacity(payload.groups.len());
                     let mut live = Vec::with_capacity(payload.groups.len());
                     for group in &payload.groups {
@@ -2224,8 +2222,7 @@ impl Trainer {
                         ));
                     }
                     Ok((stats, live))
-                })(),
-            )?;
+                })?;
             let (local_tokens, local_live) = self.coordinate_data_parallel_result(
                 "rollout-ledger learner local counts",
                 (|| {
@@ -2307,28 +2304,22 @@ impl Trainer {
                     &exec,
                 )?
             };
-            self.coordinate_data_parallel_result(
-                "rollout-ledger learner post-update state",
-                (|| {
-                    let post_update_vars = policy.trainable_vars();
-                    self.require_same_rollout_ledger_vars(
-                        &vars,
-                        &post_update_vars,
-                        "rollout-ledger learner update",
-                    )?;
-                    Self::restore_rollout_ledger_sampler(
-                        policy,
-                        &payload.post_rollout_sampler_state,
-                    )?;
-                    let post_handoff_vars = policy.trainable_vars();
-                    self.require_same_rollout_ledger_vars(
-                        &vars,
-                        &post_handoff_vars,
-                        "rollout-ledger sampler handoff",
-                    )?;
-                    Ok(())
-                })(),
-            )?;
+            self.coordinate_data_parallel_call("rollout-ledger learner post-update state", || {
+                let post_update_vars = policy.trainable_vars();
+                self.require_same_rollout_ledger_vars(
+                    &vars,
+                    &post_update_vars,
+                    "rollout-ledger learner update",
+                )?;
+                Self::restore_rollout_ledger_sampler(policy, &payload.post_rollout_sampler_state)?;
+                let post_handoff_vars = policy.trainable_vars();
+                self.require_same_rollout_ledger_vars(
+                    &vars,
+                    &post_handoff_vars,
+                    "rollout-ledger sampler handoff",
+                )?;
+                Ok(())
+            })?;
             self.require_data_parallel_consensus_bytes(
                 "rollout-ledger learner sampler handoff",
                 &payload.post_rollout_sampler_state,
@@ -2339,9 +2330,9 @@ impl Trainer {
                 "ferrl.rollout-ledger.lineage.v1",
                 &[lineage.as_bytes(), consumed_ledger_sha256.as_bytes()],
             );
-            let (optimizer_state, post_identity) = self.coordinate_data_parallel_result(
+            let (optimizer_state, post_identity) = self.coordinate_data_parallel_call(
                 "rollout-ledger continuation construction",
-                (|| {
+                || {
                     let optimizer_state = opt.state()?;
                     let sampler_poststate = policy.sampler_state()?;
                     let post_identity = self.rollout_ledger_identity(
@@ -2354,7 +2345,7 @@ impl Trainer {
                         &next_lineage,
                     )?;
                     Ok((optimizer_state, post_identity))
-                })(),
+                },
             )?;
             let post_identity_bytes = serde_json::to_vec(&post_identity).map_err(|error| {
                 TrainerError::Contract(format!("serialize post-ledger identity: {error}"))
@@ -2388,17 +2379,21 @@ impl Trainer {
         match outcome {
             Ok(result) => Ok(result),
             Err(error) => {
-                if let Err(rollback) = Self::restore_rollout_ledger_prestate(
-                    policy,
-                    &vars,
-                    &adapter_prestate,
-                    &mut opt,
-                    &optimizer_prestate,
-                    adapter_enabled_prestate,
-                    &sampler_prestate,
-                ) {
+                let rollback =
+                    self.coordinate_data_parallel_call("rollout-ledger learner rollback", || {
+                        Self::restore_rollout_ledger_prestate(
+                            policy,
+                            &vars,
+                            &adapter_prestate,
+                            &mut opt,
+                            &optimizer_prestate,
+                            adapter_enabled_prestate,
+                            &sampler_prestate,
+                        )
+                    });
+                if let Err(rollback) = rollback {
                     return Err(TrainerError::Contract(format!(
-                        "rollout-ledger learner failed ({error}); restoring its pre-state also failed: {rollback}"
+                        "rollout-ledger learner failed ({error}); coordinated adapter/optimizer/sampler rollback also failed ({rollback}); discard the policy and optimizer state on every rank in this data-parallel world"
                     )));
                 }
                 Err(error)
@@ -3040,6 +3035,27 @@ impl Trainer {
             ))),
             (Ok(value), Ok(_)) => Ok(value),
         }
+    }
+
+    /// Catch one rank-local callback panic and globalize the resulting status
+    /// before any rank can advance into the next data-parallel collective. The
+    /// operation itself must not enter a data-parallel collective.
+    fn coordinate_data_parallel_call<T, F>(
+        &self,
+        label: &str,
+        operation: F,
+    ) -> Result<T, TrainerError>
+    where
+        F: FnOnce() -> Result<T, TrainerError>,
+    {
+        let local = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation))
+            .unwrap_or_else(|payload| {
+                Err(TrainerError::Contract(format!(
+                    "{label} panicked: {}",
+                    panic_payload_message(payload.as_ref())
+                )))
+            });
+        self.coordinate_data_parallel_result(label, local)
     }
 
     fn require_data_parallel_consensus_bytes(
@@ -8788,6 +8804,111 @@ mod tests {
         assert!(ledger_root
             .join("step-00000000000000000000/manifest.json")
             .is_file());
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // two exact-existing reconciliation boundaries
+    fn distributed_exact_existing_sync_and_cleanup_faults_preserve_every_sampler() {
+        for fault in ["sync", "cleanup"] {
+            let tmp = WireTmp::new(&format!("distributed-exact-existing-{fault}"));
+            let ledger_root = tmp.0.join("ledger");
+            let final_dir = ledger_root.join("step-00000000000000000000");
+            let handles: Vec<_> = crate::comm::LocalComm::world_with_timeout(
+                2,
+                std::time::Duration::from_secs(10),
+            )
+            .into_iter()
+            .map(|comm| {
+                let base = tmp.0.clone();
+                let ledger_root = ledger_root.clone();
+                let final_dir = final_dir.clone();
+                std::thread::spawn(move || {
+                    let rank = comm.rank();
+                    let run = RunDir::create(&base, format!("{fault}-rank-{rank}")).unwrap();
+                    let config = TrainerConfig {
+                        steps: 1,
+                        group_size: 3,
+                        grad_accum_steps: 1,
+                        max_new_tokens: 2,
+                        beta: 0.0,
+                        checkpoint_every: None,
+                        ..TrainerConfig::default()
+                    };
+                    let mut trainer = Trainer::with_comm(config, &run, comm).unwrap();
+                    let make_policy = || {
+                        let logp = Var::from_tensor(
+                            &Tensor::zeros((3, 2), DType::F32, &Device::Cpu).unwrap(),
+                        )
+                        .unwrap();
+                        StatefulCandidatePolicy {
+                            inner: CandidatePolicy { logp },
+                            sampler: 0,
+                        }
+                    };
+                    let mut first = make_policy();
+                    trainer
+                        .collect_rollout_ledger_step(
+                            0,
+                            &mut first,
+                            &CandidateReward,
+                            &CandidateCodec,
+                            &[Sample::new("p", ()), Sample::new("q", ())],
+                            &ledger_root,
+                            &"d".repeat(64),
+                            None,
+                        )
+                        .unwrap();
+                    assert_eq!(first.sampler, 1);
+
+                    if rank == 0 {
+                        match fault {
+                            "sync" => crate::rollout_ledger::inject_directory_sync_failure_once(
+                                final_dir,
+                            ),
+                            "cleanup" => {
+                                crate::rollout_ledger::inject_distributed_stage_cleanup_failure_once();
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                    let mut retry = make_policy();
+                    let outcome = trainer.collect_rollout_ledger_step(
+                        0,
+                        &mut retry,
+                        &CandidateReward,
+                        &CandidateCodec,
+                        &[Sample::new("p", ()), Sample::new("q", ())],
+                        &ledger_root,
+                        &"d".repeat(64),
+                        None,
+                    );
+                    (rank, outcome, retry.sampler)
+                })
+            })
+            .collect();
+
+            for handle in handles {
+                let (rank, outcome, sampler) = handle.join().unwrap();
+                match fault {
+                    "sync" => assert!(
+                        matches!(
+                            outcome,
+                            Err(TrainerError::RolloutLedger(
+                                RolloutLedgerError::PublicationAmbiguous { .. }
+                            ))
+                        ),
+                        "rank {rank}: {outcome:?}"
+                    ),
+                    "cleanup" => assert!(outcome.is_ok(), "rank {rank}: {outcome:?}"),
+                    _ => unreachable!(),
+                }
+                assert_eq!(
+                    sampler, 1,
+                    "{fault}: rank {rank} rewound after exact visibility"
+                );
+            }
+            assert!(final_dir.join("manifest.json").is_file());
+        }
     }
 
     #[test]

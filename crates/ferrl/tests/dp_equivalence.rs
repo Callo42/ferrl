@@ -576,6 +576,46 @@ impl Policy for FailingScoringPolicy {
     }
 }
 
+struct PanickingDetachedScoringPolicy {
+    inner: ScriptedPolicy,
+    panic_detached: bool,
+}
+
+impl Policy for PanickingDetachedScoringPolicy {
+    fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
+        self.inner.generate(prompt, cfg)
+    }
+
+    fn token_logprobs(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+        self.inner.token_logprobs(rollout)
+    }
+
+    fn token_logprobs_detached(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+        assert!(!self.panic_detached, "injected detached scoring panic");
+        Ok(self.inner.token_logprobs(rollout)?.detach())
+    }
+
+    fn set_adapter_enabled(&mut self, enabled: bool) {
+        self.inner.set_adapter_enabled(enabled);
+    }
+
+    fn adapter_enabled(&self) -> bool {
+        self.inner.adapter_enabled()
+    }
+
+    fn trainable_vars(&self) -> Vec<Var> {
+        self.inner.trainable_vars()
+    }
+
+    fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+        self.inner.sampler_state()
+    }
+
+    fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
+        self.inner.restore_sampler_state(state)
+    }
+}
+
 struct FailingCollectionPolicy {
     inner: StatefulScriptedPolicy,
     fail_generate: bool,
@@ -738,6 +778,107 @@ impl Policy for RejectingSamplerRestorePolicy {
     fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
         if std::mem::take(&mut self.fail_next_restore) {
             candle_core::bail!("injected rank-local continuation sampler failure")
+        }
+        self.inner.restore_sampler_state(state)
+    }
+}
+
+struct PanickingSamplerRestorePolicy {
+    inner: StatefulScriptedPolicy,
+    panic_next_restore: bool,
+}
+
+impl Policy for PanickingSamplerRestorePolicy {
+    fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
+        self.inner.generate(prompt, cfg)
+    }
+
+    fn generate_at(
+        &mut self,
+        prompt: &[u32],
+        cfg: &GenConfig,
+        global_row_base: u64,
+    ) -> CandleResult<Rollout> {
+        self.inner.generate_at(prompt, cfg, global_row_base)
+    }
+
+    fn token_logprobs(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+        self.inner.token_logprobs(rollout)
+    }
+
+    fn set_adapter_enabled(&mut self, enabled: bool) {
+        self.inner.set_adapter_enabled(enabled);
+    }
+
+    fn adapter_enabled(&self) -> bool {
+        self.inner.adapter_enabled()
+    }
+
+    fn trainable_vars(&self) -> Vec<Var> {
+        self.inner.trainable_vars()
+    }
+
+    fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+        self.inner.sampler_state()
+    }
+
+    fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
+        assert!(
+            !std::mem::take(&mut self.panic_next_restore),
+            "injected sampler handoff panic"
+        );
+        self.inner.restore_sampler_state(state)
+    }
+}
+
+struct PersistentRollbackFailurePolicy {
+    inner: StatefulScriptedPolicy,
+    fail_generate: bool,
+    fail_restore: bool,
+    restore_calls: usize,
+}
+
+impl Policy for PersistentRollbackFailurePolicy {
+    fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
+        self.generate_at(prompt, cfg, 0)
+    }
+
+    fn generate_at(
+        &mut self,
+        prompt: &[u32],
+        cfg: &GenConfig,
+        global_row_base: u64,
+    ) -> CandleResult<Rollout> {
+        if self.fail_generate {
+            candle_core::bail!("injected collector failure before rollback")
+        }
+        self.inner.generate_at(prompt, cfg, global_row_base)
+    }
+
+    fn token_logprobs(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+        self.inner.token_logprobs(rollout)
+    }
+
+    fn set_adapter_enabled(&mut self, enabled: bool) {
+        self.inner.set_adapter_enabled(enabled);
+    }
+
+    fn adapter_enabled(&self) -> bool {
+        self.inner.adapter_enabled()
+    }
+
+    fn trainable_vars(&self) -> Vec<Var> {
+        self.inner.trainable_vars()
+    }
+
+    fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+        self.inner.sampler_state()
+    }
+
+    fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
+        self.restore_calls += 1;
+        if self.fail_restore {
+            candle_core::bail!("injected persistent rank-local sampler restore failure")
         }
         self.inner.restore_sampler_state(state)
     }
@@ -1587,7 +1728,7 @@ fn world_one_rollout_ledger_update_is_bit_identical_to_direct_training() {
                 "missing primary replacement failure: {message}"
             );
             assert!(
-                message.contains("restoring its pre-state also failed")
+                message.contains("coordinated adapter/optimizer/sampler rollback also failed")
                     && message.contains("trainable-variable binding changed"),
                 "rollback falsely reported success after rebinding: {message}"
             );
@@ -1674,7 +1815,7 @@ fn world_one_rollout_ledger_update_is_bit_identical_to_direct_training() {
                 "missing post-update replacement failure: {message}"
             );
             assert!(
-                message.contains("restoring its pre-state also failed")
+                message.contains("coordinated adapter/optimizer/sampler rollback also failed")
                     && message.contains("trainable-variable binding changed"),
                 "live-scoring rebinding did not reach terminal rollback failure: {message}"
             );
@@ -2920,6 +3061,92 @@ fn separated_dp_asymmetric_scoring_failures_abort_without_collective_timeout() {
 }
 
 #[test]
+#[allow(clippy::cognitive_complexity)] // asymmetric panic and rollback assertions
+fn separated_dp_asymmetric_detached_scoring_panic_aborts_and_rolls_back_every_rank() {
+    let tmp = TempDir::new("separated-asymmetric-detached-panic");
+    let cfg = TrainerConfig {
+        steps: 1,
+        grad_accum_steps: 1,
+        group_size: 2,
+        beta: 0.0,
+        mu: 1,
+        ..scripted_cfg()
+    };
+    let samples = vec![Sample::new("a", ()), Sample::new("b", ())];
+    let policy_sha256 = format!("{:064x}", 71);
+    let ledger_root = tmp.path().join("ledger");
+    let comms = LocalComm::world_with_timeout(2, std::time::Duration::from_secs(10));
+    let outcomes: Vec<_> = std::thread::scope(|scope| {
+        let handles: Vec<_> = comms
+            .into_iter()
+            .map(|comm| {
+                let rank = comm.rank();
+                let cfg = cfg.clone();
+                let samples = samples.clone();
+                let base = tmp.path().to_path_buf();
+                let ledger_root = ledger_root.clone();
+                let policy_sha256 = policy_sha256.clone();
+                scope.spawn(move || {
+                    let run = RunDir::create(&base, format!("panic-score-rank{rank}")).unwrap();
+                    let mut trainer = Trainer::with_comm(cfg, &run, comm).unwrap();
+                    let mut collector_policy = ScriptedPolicy::new(SEED).unwrap();
+                    trainer
+                        .collect_rollout_ledger_step(
+                            0,
+                            &mut collector_policy,
+                            &EchoOrFlatReward,
+                            &CharTokenizer,
+                            &samples,
+                            &ledger_root,
+                            &policy_sha256,
+                            None,
+                        )
+                        .unwrap();
+                    let mut learner_policy = PanickingDetachedScoringPolicy {
+                        inner: ScriptedPolicy::new(SEED).unwrap(),
+                        panic_detached: rank == 0,
+                    };
+                    let before = var_bits(&learner_policy);
+                    let error = trainer
+                        .train_rollout_ledger_step(
+                            0,
+                            &mut learner_policy,
+                            &ledger_root,
+                            &policy_sha256,
+                            None,
+                        )
+                        .unwrap_err();
+                    (
+                        rank,
+                        error.to_string(),
+                        before,
+                        var_bits(&learner_policy),
+                        ferrl::read_metrics(run.metrics_path()).unwrap().len(),
+                    )
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect()
+    });
+    for (rank, error, before, after, rows) in outcomes {
+        assert!(!error.contains("timeout"), "rank {rank}: {error}");
+        if rank == 0 {
+            assert!(
+                error.contains("detached scoring panicked: injected detached scoring panic"),
+                "rank {rank}: {error}"
+            );
+        } else {
+            assert!(error.contains("peer rank"), "rank {rank}: {error}");
+        }
+        assert_eq!(after, before, "rank {rank} adapter");
+        assert_eq!(rows, 0, "rank {rank} wrote metrics");
+    }
+}
+
+#[test]
 fn separated_dp_asymmetric_backward_failure_aborts_before_gradient_collectives() {
     let tmp = TempDir::new("separated-asymmetric-backward");
     let cfg = TrainerConfig {
@@ -3075,6 +3302,292 @@ fn separated_dp_asymmetric_sampler_handoff_failure_rolls_back_every_rank() {
         assert!(!error.contains("timeout"), "rank {rank}: {error}");
         assert_eq!(adapter_after, adapter_before, "rank {rank} adapter");
         assert_eq!(sampler_after, sampler_before, "rank {rank} sampler");
+        assert_eq!(rows, 0, "rank {rank} wrote metrics");
+    }
+}
+
+#[test]
+#[allow(clippy::cognitive_complexity)] // asymmetric panic and rollback assertions
+fn separated_dp_asymmetric_sampler_handoff_panic_aborts_and_rolls_back_every_rank() {
+    let tmp = TempDir::new("separated-asymmetric-sampler-handoff-panic");
+    let cfg = TrainerConfig {
+        steps: 1,
+        grad_accum_steps: 1,
+        group_size: 2,
+        beta: 0.0,
+        mu: 1,
+        ..scripted_cfg()
+    };
+    let samples = vec![Sample::new("a", ()), Sample::new("b", ())];
+    let policy_sha256 = format!("{:064x}", 73);
+    let ledger_root = tmp.path().join("ledger");
+    let comms = LocalComm::world_with_timeout(2, std::time::Duration::from_secs(10));
+    let outcomes: Vec<_> = std::thread::scope(|scope| {
+        let handles: Vec<_> = comms
+            .into_iter()
+            .map(|comm| {
+                let rank = comm.rank();
+                let cfg = cfg.clone();
+                let samples = samples.clone();
+                let base = tmp.path().to_path_buf();
+                let ledger_root = ledger_root.clone();
+                let policy_sha256 = policy_sha256.clone();
+                scope.spawn(move || {
+                    let run = RunDir::create(&base, format!("panic-handoff-rank{rank}")).unwrap();
+                    let mut trainer = Trainer::with_comm(cfg, &run, comm).unwrap();
+                    let mut collector_policy = StatefulScriptedPolicy::new(SEED, 0).unwrap();
+                    trainer
+                        .collect_rollout_ledger_step(
+                            0,
+                            &mut collector_policy,
+                            &EchoOrFlatReward,
+                            &CharTokenizer,
+                            &samples,
+                            &ledger_root,
+                            &policy_sha256,
+                            None,
+                        )
+                        .unwrap();
+                    let mut learner_policy = PanickingSamplerRestorePolicy {
+                        inner: StatefulScriptedPolicy::new(SEED, 0).unwrap(),
+                        panic_next_restore: rank == 1,
+                    };
+                    let adapter_before = var_bits(&learner_policy);
+                    let sampler_before = learner_policy.sampler_state().unwrap();
+                    let error = trainer
+                        .train_rollout_ledger_step(
+                            0,
+                            &mut learner_policy,
+                            &ledger_root,
+                            &policy_sha256,
+                            None,
+                        )
+                        .unwrap_err();
+                    (
+                        rank,
+                        error.to_string(),
+                        adapter_before,
+                        var_bits(&learner_policy),
+                        sampler_before,
+                        learner_policy.sampler_state().unwrap(),
+                        ferrl::read_metrics(run.metrics_path()).unwrap().len(),
+                    )
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect()
+    });
+    for (rank, error, adapter_before, adapter_after, sampler_before, sampler_after, rows) in
+        outcomes
+    {
+        assert!(!error.contains("timeout"), "rank {rank}: {error}");
+        if rank == 1 {
+            assert!(
+                error.contains("post-update state panicked: injected sampler handoff panic"),
+                "rank {rank}: {error}"
+            );
+        } else {
+            assert!(error.contains("peer rank"), "rank {rank}: {error}");
+        }
+        assert_eq!(adapter_after, adapter_before, "rank {rank} adapter");
+        assert_eq!(sampler_after, sampler_before, "rank {rank} sampler");
+        assert_eq!(rows, 0, "rank {rank} wrote metrics");
+    }
+}
+
+#[test]
+#[allow(clippy::cognitive_complexity)] // asymmetric failure and terminal-state assertions
+fn separated_dp_collector_rollback_failure_requires_discarding_every_rank() {
+    let tmp = TempDir::new("separated-collector-terminal-rollback");
+    let cfg = TrainerConfig {
+        steps: 1,
+        grad_accum_steps: 1,
+        group_size: 2,
+        beta: 0.0,
+        mu: 1,
+        ..scripted_cfg()
+    };
+    let samples = vec![Sample::new("a", ()), Sample::new("b", ())];
+    let policy_sha256 = format!("{:064x}", 79);
+    let ledger_root = tmp.path().join("ledger");
+    let comms = LocalComm::world_with_timeout(2, std::time::Duration::from_secs(10));
+    let outcomes: Vec<_> = std::thread::scope(|scope| {
+        let handles: Vec<_> = comms
+            .into_iter()
+            .map(|comm| {
+                let rank = comm.rank();
+                let cfg = cfg.clone();
+                let samples = samples.clone();
+                let base = tmp.path().to_path_buf();
+                let ledger_root = ledger_root.clone();
+                let policy_sha256 = policy_sha256.clone();
+                scope.spawn(move || {
+                    let run = RunDir::create(&base, format!("collector-rank{rank}")).unwrap();
+                    let mut trainer = Trainer::with_comm(cfg, &run, comm).unwrap();
+                    let mut policy = PersistentRollbackFailurePolicy {
+                        inner: StatefulScriptedPolicy::new(SEED, 0).unwrap(),
+                        fail_generate: rank == 0,
+                        fail_restore: rank == 1,
+                        restore_calls: 0,
+                    };
+                    let sampler_before = policy.sampler_state().unwrap();
+                    let error = trainer
+                        .collect_rollout_ledger_step(
+                            0,
+                            &mut policy,
+                            &EchoOrFlatReward,
+                            &CharTokenizer,
+                            &samples,
+                            &ledger_root,
+                            &policy_sha256,
+                            None,
+                        )
+                        .unwrap_err();
+                    (
+                        rank,
+                        error.to_string(),
+                        sampler_before,
+                        policy.sampler_state().unwrap(),
+                        policy.restore_calls,
+                    )
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect()
+    });
+    for (rank, error, sampler_before, sampler_after, restore_calls) in outcomes {
+        assert!(!error.contains("timeout"), "rank {rank}: {error}");
+        assert!(
+            error.contains("discard the policy instance on every rank"),
+            "rank {rank}: {error}"
+        );
+        if rank == 0 {
+            assert!(error.contains("peer rank"), "rank {rank}: {error}");
+            assert_eq!(sampler_after, sampler_before, "rank {rank} sampler");
+        } else {
+            assert!(
+                error.contains("persistent rank-local sampler restore failure"),
+                "rank {rank}: {error}"
+            );
+            assert_ne!(
+                sampler_after, sampler_before,
+                "rank {rank} fixture did not leave unrestored sampler state"
+            );
+        }
+        assert_eq!(restore_calls, 1, "rank {rank} rollback attempts");
+    }
+}
+
+#[test]
+#[allow(clippy::cognitive_complexity)] // asymmetric failure and terminal-state assertions
+fn separated_dp_persistent_learner_rollback_failure_requires_discarding_every_rank() {
+    let tmp = TempDir::new("separated-learner-terminal-rollback");
+    let cfg = TrainerConfig {
+        steps: 1,
+        grad_accum_steps: 1,
+        group_size: 2,
+        beta: 0.0,
+        mu: 1,
+        ..scripted_cfg()
+    };
+    let samples = vec![Sample::new("a", ()), Sample::new("b", ())];
+    let policy_sha256 = format!("{:064x}", 83);
+    let ledger_root = tmp.path().join("ledger");
+    let comms = LocalComm::world_with_timeout(2, std::time::Duration::from_secs(10));
+    let outcomes: Vec<_> = std::thread::scope(|scope| {
+        let handles: Vec<_> = comms
+            .into_iter()
+            .map(|comm| {
+                let rank = comm.rank();
+                let cfg = cfg.clone();
+                let samples = samples.clone();
+                let base = tmp.path().to_path_buf();
+                let ledger_root = ledger_root.clone();
+                let policy_sha256 = policy_sha256.clone();
+                scope.spawn(move || {
+                    let run = RunDir::create(&base, format!("learner-rank{rank}")).unwrap();
+                    let mut trainer = Trainer::with_comm(cfg, &run, comm).unwrap();
+                    let mut collector_policy = StatefulScriptedPolicy::new(SEED, 0).unwrap();
+                    trainer
+                        .collect_rollout_ledger_step(
+                            0,
+                            &mut collector_policy,
+                            &EchoOrFlatReward,
+                            &CharTokenizer,
+                            &samples,
+                            &ledger_root,
+                            &policy_sha256,
+                            None,
+                        )
+                        .unwrap();
+                    let mut learner_policy = PersistentRollbackFailurePolicy {
+                        inner: StatefulScriptedPolicy::new(SEED, 0).unwrap(),
+                        fail_generate: false,
+                        fail_restore: rank == 1,
+                        restore_calls: 0,
+                    };
+                    let adapter_before = var_bits(&learner_policy);
+                    let sampler_before = learner_policy.sampler_state().unwrap();
+                    let error = trainer
+                        .train_rollout_ledger_step(
+                            0,
+                            &mut learner_policy,
+                            &ledger_root,
+                            &policy_sha256,
+                            None,
+                        )
+                        .unwrap_err();
+                    (
+                        rank,
+                        error.to_string(),
+                        adapter_before,
+                        var_bits(&learner_policy),
+                        sampler_before,
+                        learner_policy.sampler_state().unwrap(),
+                        learner_policy.restore_calls,
+                        ferrl::read_metrics(run.metrics_path()).unwrap().len(),
+                    )
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect()
+    });
+    for (
+        rank,
+        error,
+        adapter_before,
+        adapter_after,
+        sampler_before,
+        sampler_after,
+        restore_calls,
+        rows,
+    ) in outcomes
+    {
+        assert!(!error.contains("timeout"), "rank {rank}: {error}");
+        assert!(
+            error.contains("discard the policy and optimizer state on every rank"),
+            "rank {rank}: {error}"
+        );
+        if rank == 0 {
+            assert!(error.contains("peer rank"), "rank {rank}: {error}");
+        } else {
+            assert!(
+                error.contains("persistent rank-local sampler restore failure"),
+                "rank {rank}: {error}"
+            );
+        }
+        assert_eq!(adapter_after, adapter_before, "rank {rank} adapter");
+        assert_eq!(sampler_after, sampler_before, "rank {rank} sampler");
+        assert_eq!(restore_calls, 2, "rank {rank} handoff plus rollback");
         assert_eq!(rows, 0, "rank {rank} wrote metrics");
     }
 }

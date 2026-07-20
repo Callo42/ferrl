@@ -27,6 +27,7 @@ thread_local! {
     static POST_MANIFEST_TEST_FAULT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
     static SYNCED_DIRECTORIES: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
     static FAIL_SYNC_DIRECTORY_ONCE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    static FAIL_DISTRIBUTED_STAGE_CLEANUP_ONCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -47,6 +48,18 @@ pub(crate) fn inject_post_manifest_disappearance_once() {
 #[cfg(test)]
 fn inject_post_manifest_in_place_mutation_once() {
     POST_MANIFEST_TEST_FAULT.with(|fault| fault.set(4));
+}
+
+#[cfg(test)]
+pub(crate) fn inject_directory_sync_failure_once(path: impl Into<PathBuf>) {
+    FAIL_SYNC_DIRECTORY_ONCE.with(|failure| {
+        *failure.borrow_mut() = Some(path.into());
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn inject_distributed_stage_cleanup_failure_once() {
+    FAIL_DISTRIBUTED_STAGE_CLEANUP_ONCE.with(|failure| failure.set(true));
 }
 
 /// A rollout-ledger read, write, identity, or semantic validation failure.
@@ -720,10 +733,65 @@ impl RolloutLedgerWriter {
         &self,
         stage: &DistributedRolloutLedgerStage,
     ) -> Result<(), RolloutLedgerError> {
+        #[cfg(test)]
+        FAIL_DISTRIBUTED_STAGE_CLEANUP_ONCE.with(|failure| {
+            if failure.replace(false) {
+                return Err(RolloutLedgerError::io(
+                    &stage.path,
+                    std::io::Error::other("injected distributed hidden-stage cleanup failure"),
+                ));
+            }
+            Ok(())
+        })?;
         require_exact_owner(&stage.path, &stage.owner)?;
         fs::remove_dir_all(&stage.path)
             .map_err(|error| RolloutLedgerError::io(&stage.path, error))?;
         sync_dir(&self.root)
+    }
+
+    /// Reconcile a destination that already contains the exact intended global
+    /// package. Once the manifest-bearing bytes have been observed, hidden-stage
+    /// cleanup can no longer downgrade a durably verified publication, while any
+    /// unresolved fence or post-fence identity result is reader-visible
+    /// ambiguity regardless of cleanup outcome.
+    fn reconcile_exact_existing_distributed_package(
+        &self,
+        stage: &DistributedRolloutLedgerStage,
+        expected_files: &[(String, Vec<u8>)],
+    ) -> Option<Result<PathBuf, RolloutLedgerError>> {
+        if !exact_owned_distributed_package(&stage.final_dir, expected_files, None) {
+            return None;
+        }
+
+        let fences = sync_dir(&stage.final_dir).and_then(|()| sync_dir(&self.root));
+        let exact_after_fences =
+            exact_owned_distributed_package(&stage.final_dir, expected_files, None);
+        let cleanup = self.abort_distributed_stage(stage);
+        if fences.is_ok() && exact_after_fences {
+            return Some(Ok(stage.final_dir.clone()));
+        }
+
+        let mut detail = match (fences, exact_after_fences) {
+            (Ok(()), false) => {
+                "exact distributed package changed during post-fence byte verification".into()
+            }
+            (Err(error), true) => format!(
+                "exact distributed package was already visible, but durability reconciliation failed: {error}"
+            ),
+            (Err(error), false) => format!(
+                "exact distributed package was already visible, but durability reconciliation failed: {error}; post-fence byte verification also failed"
+            ),
+            (Ok(()), true) => unreachable!("successful reconciliation returned above"),
+        };
+        if let Err(cleanup_error) = cleanup {
+            detail.push_str(&format!(
+                "; hidden-stage cleanup also failed: {cleanup_error}"
+            ));
+        }
+        Some(Err(RolloutLedgerError::PublicationAmbiguous {
+            path: stage.final_dir.clone(),
+            detail,
+        }))
     }
 
     /// Validate every staged shard and publish one manifest-last distributed step.
@@ -819,10 +887,10 @@ impl RolloutLedgerWriter {
             }
         };
         if stage.final_dir.exists() {
-            let exact = exact_owned_distributed_package(&stage.final_dir, &expected_files, None);
-            if exact && sync_dir(&stage.final_dir).is_ok() && sync_dir(&self.root).is_ok() {
-                self.abort_distributed_stage(stage)?;
-                return Ok(stage.final_dir.clone());
+            if let Some(reconciled) =
+                self.reconcile_exact_existing_distributed_package(stage, &expected_files)
+            {
+                return reconciled;
             }
             return Err(cleanup_unpublished_stage(
                 &self.root,
@@ -832,14 +900,25 @@ impl RolloutLedgerWriter {
             ));
         }
 
-        if let Err(error) = fs::create_dir(&stage.final_dir)
-            .map_err(|error| RolloutLedgerError::io(&stage.final_dir, error))
-        {
+        if let Err(source) = fs::create_dir(&stage.final_dir) {
+            if source.kind() == std::io::ErrorKind::AlreadyExists {
+                if let Some(reconciled) =
+                    self.reconcile_exact_existing_distributed_package(stage, &expected_files)
+                {
+                    return reconciled;
+                }
+                return Err(cleanup_unpublished_stage(
+                    &self.root,
+                    &stage.path,
+                    &stage.owner,
+                    RolloutLedgerError::AlreadyExists(stage.final_dir.clone()),
+                ));
+            }
             return Err(cleanup_unpublished_stage(
                 &self.root,
                 &stage.path,
                 &stage.owner,
-                error,
+                RolloutLedgerError::io(&stage.final_dir, source),
             ));
         }
         if let Err(error) =
