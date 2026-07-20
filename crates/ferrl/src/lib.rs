@@ -64,10 +64,12 @@
 //!   strict, checksummed, no-replace whole-window package whose reader validates
 //!   learner pre-state identity, mandatory structured controls, and every
 //!   rollout/reward/mask invariant before returning [`ValidatedRolloutLedgerStep`].
-//!   Format v3 also binds sampler prestate and chain lineage, transfers the
+//!   Format v4 also binds sampler prestate and chain lineage, transfers the
 //!   collector's exact post-rollout sampler blob, and returns an opaque
 //!   learner-produced receipt for a versioned adapter + Adam + sampler
-//!   continuation whose policy/config/schema/payload lineage is verified;
+//!   continuation whose policy/config/schema/payload lineage is verified. Under
+//!   data parallelism it publishes immutable rank shards behind one global
+//!   manifest-last commit marker and validates the complete world before replay;
 //! - held-out evaluation ([`eval`]) — the base model vs. the trained adapter,
 //!   mean reward over a held-out set (the P4 gate's comparison);
 //! - activation checkpointing ([`remat`]) — candle ships no checkpoint
@@ -242,8 +244,9 @@ pub use remat::{stitched_backward, RematTape};
 pub use reward::{RewardError, RewardFn, RewardOutcome};
 #[doc(inline)]
 pub use rollout_ledger::{
-    LedgerScoreRequirement, RolloutLedgerControls, RolloutLedgerError, RolloutLedgerExpectations,
-    RolloutLedgerGroup, RolloutLedgerIdentity, RolloutLedgerReader, RolloutLedgerStep,
+    DistributedRolloutLedgerStage, LedgerScoreRequirement, RolloutLedgerControls,
+    RolloutLedgerError, RolloutLedgerExpectations, RolloutLedgerGroup, RolloutLedgerGroupScope,
+    RolloutLedgerIdentity, RolloutLedgerReader, RolloutLedgerRewardStats, RolloutLedgerStep,
     RolloutLedgerWriter, ValidatedRolloutLedgerStep, ROLLOUT_LEDGER_FORMAT_VERSION,
 };
 #[doc(inline)]

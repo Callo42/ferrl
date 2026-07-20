@@ -456,14 +456,20 @@ collection and learning. It is separate from `candidates.jsonl`: candidate rows
 are top-K decoded text for artifact triage, while a rollout ledger package holds
 every ordered prompt group required for one optimizer window.
 
-`RolloutLedgerWriter` stages and syncs `window.json`, atomically claims an
-immutable step directory without replacement, and hard-links the complete
-versioned manifest last as the reader-visible commit marker.
+At world one, `RolloutLedgerWriter` stages and syncs `window.json`, atomically
+claims an immutable step directory without replacement, and hard-links the
+complete versioned manifest last as the reader-visible commit marker. Under
+data parallelism, rank 0 owns one hidden stage, every rank writes an immutable
+`rank-<rank>.window.json` shard, and rank 0 publishes one global manifest last
+only after every shard writer is quiescent. The manifest binds the exact rank
+set, byte length, SHA-256, shared controls, topology, and global counts.
 `RolloutLedgerReader` checks the manifest version, byte length, SHA-256, expected
 trainer/model/adapter/optimizer/sampler/lineage identity, mandatory structured learner controls,
 and all token, prompt-order, behavior-logprob, reward, advantage, EOS-mask, and
 scoring-requirement invariants before returning a `ValidatedRolloutLedgerStep`.
-`Trainer::collect_rollout_ledger_step` now publishes one complete world-1 window
+Every DP learner validates every shard and the common manifest before receiving
+only its rank-local payload; every rank derives the same consumed-package lineage.
+`Trainer::collect_rollout_ledger_step` publishes one complete global window
 without old/reference scoring or an optimizer mutation, and
 `Trainer::train_rollout_ledger_step` recomputes the learner pre-state, validates
 the immutable package, performs the required detached scoring, and feeds the
@@ -476,7 +482,7 @@ recipe, which the generic `Policy` seam cannot enumerate today. Collection
 rechecks the live identity before publication so a policy that mutates trainable
 state during generation fails closed.
 
-Ledger format v3 carries the collector's checksummed opaque post-rollout sampler
+Ledger format v4 carries the collector's checksummed opaque post-rollout sampler
 blob. The learner installs and byte-verifies it before returning the exact
 post-update chain-bound continuation receipt or appending its metrics row. The explicit
 `save_rollout_ledger_continuation` primitive accepts only that receipt and then publishes
@@ -484,8 +490,14 @@ post-update chain-bound continuation receipt or appending its metrics row. The e
 both roles restore the same state through
 `restore_rollout_ledger_continuation` (or its latest-checkpoint variant) before
 producing or consuming the next ledger. Its versioned continuation manifest binds
-the frozen-policy digest, learner-semantic configuration, tensor schema, exact
+the DP world size, frozen-policy digest, learner-semantic configuration, tensor schema, exact
 adapter/Adam/sampler payload, outer step, parent lineage, and resulting lineage.
+Continuation format v2 is topology-explicit while legacy v1 remains readable as
+world one. DP runs normally keep rank-local telemetry directories, so
+`save_rollout_ledger_continuation_to` and
+`restore_latest_rollout_ledger_continuation_from` accept one explicit shared
+checkpoint root; rank 0 alone publishes or discovers there, and every peer
+receives the result in lockstep.
 Continuation-specific latest discovery ignores ordinary checkpoints. Adapter-only
 legacy checkpoints fail closed on this separated path. Any failure after validation restores the adapter,
 Adam state, sampler state, and adapter-enabled flag to their exact pre-call state while the policy
@@ -498,23 +510,31 @@ be visible, it never rewinds the sampler; the writer retries every required dire
 sync and reports success only after durability is established and the visible bytes
 still match. A persistent sync failure or post-link disappearance is reported as
 ambiguous for operator reconciliation.
-Because format v3 does not carry
+Because format v4 does not carry
 composable collector performance measurements, the ordinary
 whole-window timing, throughput, GPU-memory, and decoder-cache fields are written
 as explicitly unmeasured rather than populated from learner-only work. Non-finite logprobs,
 advantages, and resolved controls fail closed, while non-finite rewards retain the
 trainer's existing zero-advantage hardening. Unknown ledger manifest and payload
-fields are rejected.
+fields are rejected. Rank-local metrics append is transactional under DP: if
+any rank fails, successful peers truncate to their exact pre-append boundary
+before model, Adam, and sampler rollback.
 
-Format v3 is intentionally world-1 only. It rejects distributed payloads instead
-of treating rank-local rewards or token counts as a complete optimizer window.
+Format v4 supports world-one and data-parallel separated execution. With
+`RewardGroupScope::Local`, each shard stores rank-local reward normalization;
+with `DistributedSamePrompt`, shards for one accumulation position bind the same
+prompt prefix and the exact all-reduced reward count/sum/sum-of-squares used to
+derive their advantages. Global completion-token/live-item counts, canonical
+rank ordering, global rollout-row bases, and rank-identical sampler state are
+validated before scoring. An empty local shard still joins every global update
+with zero gradients. Tensor-parallel separated execution, combined DP×TP, and
+elastic world-size restore remain deliberately fail-closed follow-up work.
 The continuation optimizer digest binds both Adam moments and its bias-correction
 counter. Checkpoint-parent and ledger-root chains are established one component at a time,
 with every entry synced in its ancestor before publication can succeed; retries re-sync
 pre-existing components so a prior failed ancestor sync cannot be skipped. The durable
 multi-step protocol is `C_k → collect L_k → learn L_k → publish
 C_(k+1)`; outer checkpoint progress stays distinct from Adam's update counter.
-DP/TP completeness is a subsequent Phase 1.5C slice built on this contract.
 
 ## Training run layout (`runs/`)
 

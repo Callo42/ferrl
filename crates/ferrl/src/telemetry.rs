@@ -642,6 +642,8 @@ impl Metrics {
 pub struct MetricsWriter {
     path: PathBuf,
     file: File,
+    #[cfg(test)]
+    fail_next_append: bool,
 }
 
 /// One sampled completion persisted to `candidates.jsonl`.
@@ -761,7 +763,12 @@ impl MetricsWriter {
             .append(true)
             .open(&path)
             .map_err(|e| TelemetryError::io(&path, e))?;
-        Ok(Self { path, file })
+        Ok(Self {
+            path,
+            file,
+            #[cfg(test)]
+            fail_next_append: false,
+        })
     }
 
     /// Append one metrics record as a JSON line and flush it.
@@ -770,6 +777,13 @@ impl MetricsWriter {
     ///
     /// Returns [`TelemetryError`] if serialization or the write/flush fails.
     pub fn append(&mut self, metrics: &Metrics) -> Result<(), TelemetryError> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_append) {
+            return Err(TelemetryError::io(
+                &self.path,
+                io::Error::other("injected metrics append failure"),
+            ));
+        }
         // Sanitize non-finite floats so the line stays valid, re-readable JSON.
         let mut line = serde_json::to_string(&metrics.nan_to_num())?;
         line.push('\n');
@@ -779,6 +793,35 @@ impl MetricsWriter {
         self.file
             .flush()
             .map_err(|e| TelemetryError::io(&self.path, e))
+    }
+
+    /// Return the current append boundary for a coordinated transactional write.
+    pub(crate) fn append_boundary(&mut self) -> Result<u64, TelemetryError> {
+        self.file
+            .flush()
+            .map_err(|e| TelemetryError::io(&self.path, e))?;
+        self.file
+            .metadata()
+            .map(|metadata| metadata.len())
+            .map_err(|e| TelemetryError::io(&self.path, e))
+    }
+
+    /// Roll this append-only stream back to a previously observed boundary.
+    pub(crate) fn truncate_to(&mut self, len: u64) -> Result<(), TelemetryError> {
+        self.file
+            .flush()
+            .map_err(|e| TelemetryError::io(&self.path, e))?;
+        self.file
+            .set_len(len)
+            .map_err(|e| TelemetryError::io(&self.path, e))?;
+        self.file
+            .flush()
+            .map_err(|e| TelemetryError::io(&self.path, e))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_append_failure_once(&mut self) {
+        self.fail_next_append = true;
     }
 
     /// The path this writer appends to.

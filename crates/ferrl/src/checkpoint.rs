@@ -111,6 +111,23 @@ thread_local! {
     static NO_REPLACE_HOOK: std::cell::RefCell<Option<(NoReplaceHookPoint, NoReplaceHook)>> = const { std::cell::RefCell::new(None) };
 }
 
+#[cfg(test)]
+pub(crate) fn inject_continuation_pre_manifest_sync_failure_once() {
+    FAIL_NO_REPLACE_SYNCS.with(|failures| {
+        *failures.borrow_mut() = vec![NoReplaceSyncPoint::PreManifestDirectory];
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn inject_persistent_continuation_post_manifest_sync_failure_once() {
+    FAIL_NO_REPLACE_SYNCS.with(|failures| {
+        *failures.borrow_mut() = vec![
+            NoReplaceSyncPoint::ManifestDirectory,
+            NoReplaceSyncPoint::ManifestDirectory,
+        ];
+    });
+}
+
 static CLAIM_TOKEN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 struct CheckpointWriterLock {
@@ -159,7 +176,8 @@ const FORMAT_VERSION: u32 = 3;
 /// checkpoints still load — a resume then falls back to fresh momentum.
 const MIN_FORMAT_VERSION: u32 = 1;
 /// On-disk schema version for separated rollout-ledger continuations.
-pub(crate) const ROLLOUT_LEDGER_CONTINUATION_FORMAT_VERSION: u32 = 1;
+pub(crate) const ROLLOUT_LEDGER_CONTINUATION_FORMAT_VERSION: u32 = 2;
+pub(crate) const MIN_ROLLOUT_LEDGER_CONTINUATION_FORMAT_VERSION: u32 = 1;
 pub(crate) const ROLLOUT_LEDGER_CONTINUATION_KIND: &str = "rollout_ledger";
 
 /// Provenance that distinguishes a separated rollout-ledger continuation from
@@ -169,6 +187,9 @@ pub(crate) const ROLLOUT_LEDGER_CONTINUATION_KIND: &str = "rollout_ledger";
 pub(crate) struct RolloutLedgerContinuationManifest {
     pub(crate) format_version: u32,
     pub(crate) kind: String,
+    /// Absent only in legacy v1 manifests, which are defined as world one.
+    #[serde(default)]
+    pub(crate) world_size: Option<u32>,
     pub(crate) completed_step: u64,
     pub(crate) policy_sha256: String,
     pub(crate) trainer_config_sha256: String,
@@ -1287,7 +1308,16 @@ pub(crate) fn latest_rollout_ledger_continuation(
         let Some(continuation) = manifest.rollout_ledger_continuation else {
             continue;
         };
-        if continuation.format_version != ROLLOUT_LEDGER_CONTINUATION_FORMAT_VERSION
+        let supported_topology = match continuation.format_version {
+            1 => continuation.world_size.is_none(),
+            ROLLOUT_LEDGER_CONTINUATION_FORMAT_VERSION => continuation
+                .world_size
+                .is_some_and(|world_size| world_size > 0),
+            _ => false,
+        };
+        if continuation.format_version < MIN_ROLLOUT_LEDGER_CONTINUATION_FORMAT_VERSION
+            || continuation.format_version > ROLLOUT_LEDGER_CONTINUATION_FORMAT_VERSION
+            || !supported_topology
             || continuation.kind != ROLLOUT_LEDGER_CONTINUATION_KIND
             || continuation.completed_step != manifest.step
             || directory_step != manifest.step
@@ -1597,6 +1627,7 @@ mod tests {
         RolloutLedgerContinuationManifest {
             format_version: ROLLOUT_LEDGER_CONTINUATION_FORMAT_VERSION,
             kind: ROLLOUT_LEDGER_CONTINUATION_KIND.to_owned(),
+            world_size: Some(1),
             completed_step: step,
             policy_sha256: "a".repeat(64),
             trainer_config_sha256: "b".repeat(64),

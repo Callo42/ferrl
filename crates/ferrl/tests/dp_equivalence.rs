@@ -36,7 +36,9 @@
 //! real CUDA/NCCL ranks and prints memory/timing fields for resource regression
 //! checks.
 
-use candle_core::{DType, Device, Result as CandleResult, Tensor, Var, D};
+use candle_core::{
+    CpuStorage, CustomOp1, DType, Device, Layout, Result as CandleResult, Shape, Tensor, Var, D,
+};
 use candle_nn::ops::log_softmax;
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
@@ -51,7 +53,7 @@ use ferrl::trainer::{TokenizerLike, Trainer, TrainerConfig, TrainerError};
 use ferrl::{
     tensors_from_pretrained, varbuilder_from_pretrained, Comm, CommError, LocalComm, LossType,
     Metrics, OptimizerState, Qwen3_5Config, Qwen3_5GradModel, Qwen3_5Policy, RewardError, RewardFn,
-    RolloutLedgerError, Sample, SoloComm,
+    RewardGroupScope, RolloutLedgerError, Sample, SoloComm,
 };
 
 const VOCAB: usize = 5;
@@ -184,15 +186,20 @@ impl StatefulScriptedPolicy {
 
 impl Policy for StatefulScriptedPolicy {
     fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
+        self.generate_at(prompt, cfg, 0)
+    }
+
+    fn generate_at(
+        &mut self,
+        prompt: &[u32],
+        cfg: &GenConfig,
+        global_row_base: u64,
+    ) -> CandleResult<Rollout> {
         let first = prompt[0];
-        let echo_count = if cfg.group_size <= 1 {
-            cfg.group_size
-        } else {
-            1 + usize::try_from(self.sampler_epoch % (cfg.group_size - 1) as u64).unwrap()
-        };
         let token_ids = (0..cfg.group_size)
             .map(|row| {
-                let symbol = if row < echo_count {
+                let row = global_row_base.wrapping_add(row as u64);
+                let symbol = if row.wrapping_add(self.sampler_epoch).is_multiple_of(2) {
                     first
                 } else {
                     (first + 1) % VOCAB as u32
@@ -523,6 +530,219 @@ impl Policy for GatedExtraPolicy {
     }
 }
 
+struct FailingScoringPolicy {
+    inner: ScriptedPolicy,
+    fail_detached: bool,
+    fail_live: bool,
+}
+
+impl Policy for FailingScoringPolicy {
+    fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
+        self.inner.generate(prompt, cfg)
+    }
+
+    fn token_logprobs(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+        if self.fail_live {
+            candle_core::bail!("injected live scoring failure")
+        }
+        self.inner.token_logprobs(rollout)
+    }
+
+    fn token_logprobs_detached(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+        if self.fail_detached {
+            candle_core::bail!("injected detached scoring failure")
+        }
+        Ok(self.inner.token_logprobs(rollout)?.detach())
+    }
+
+    fn set_adapter_enabled(&mut self, enabled: bool) {
+        self.inner.set_adapter_enabled(enabled);
+    }
+
+    fn adapter_enabled(&self) -> bool {
+        self.inner.adapter_enabled()
+    }
+
+    fn trainable_vars(&self) -> Vec<Var> {
+        self.inner.trainable_vars()
+    }
+
+    fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+        self.inner.sampler_state()
+    }
+
+    fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
+        self.inner.restore_sampler_state(state)
+    }
+}
+
+struct FailingCollectionPolicy {
+    inner: StatefulScriptedPolicy,
+    fail_generate: bool,
+}
+
+impl Policy for FailingCollectionPolicy {
+    fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
+        self.generate_at(prompt, cfg, 0)
+    }
+
+    fn generate_at(
+        &mut self,
+        prompt: &[u32],
+        cfg: &GenConfig,
+        global_row_base: u64,
+    ) -> CandleResult<Rollout> {
+        if self.fail_generate {
+            candle_core::bail!("injected rank-local rollout generation failure")
+        }
+        self.inner.generate_at(prompt, cfg, global_row_base)
+    }
+
+    fn token_logprobs(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+        self.inner.token_logprobs(rollout)
+    }
+
+    fn set_adapter_enabled(&mut self, enabled: bool) {
+        self.inner.set_adapter_enabled(enabled);
+    }
+
+    fn adapter_enabled(&self) -> bool {
+        self.inner.adapter_enabled()
+    }
+
+    fn trainable_vars(&self) -> Vec<Var> {
+        self.inner.trainable_vars()
+    }
+
+    fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+        self.inner.sampler_state()
+    }
+
+    fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
+        self.inner.restore_sampler_state(state)
+    }
+}
+
+struct FailingCollectionReward {
+    fail: bool,
+}
+
+impl RewardFn for FailingCollectionReward {
+    type Target = ();
+
+    fn reward(&self, sample: &Sample<()>, completion: &str) -> Result<f32, RewardError> {
+        if self.fail {
+            return Err(RewardError::msg(
+                "injected rank-local rollout reward failure",
+            ));
+        }
+        EchoOrFlatReward.reward(sample, completion)
+    }
+}
+
+struct FailingBackwardOp;
+
+impl CustomOp1 for FailingBackwardOp {
+    fn name(&self) -> &'static str {
+        "injected-failing-backward"
+    }
+
+    fn cpu_fwd(&self, storage: &CpuStorage, layout: &Layout) -> CandleResult<(CpuStorage, Shape)> {
+        Ok((storage.clone(), layout.shape().clone()))
+    }
+}
+
+struct FailingBackwardPolicy {
+    inner: ScriptedPolicy,
+    fail_backward: bool,
+}
+
+impl Policy for FailingBackwardPolicy {
+    fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
+        self.inner.generate(prompt, cfg)
+    }
+
+    fn token_logprobs(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+        let logp = self.inner.token_logprobs(rollout)?;
+        if self.fail_backward {
+            logp.contiguous()?.apply_op1(FailingBackwardOp)
+        } else {
+            Ok(logp)
+        }
+    }
+
+    fn token_logprobs_detached(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+        Ok(self.inner.token_logprobs(rollout)?.detach())
+    }
+
+    fn set_adapter_enabled(&mut self, enabled: bool) {
+        self.inner.set_adapter_enabled(enabled);
+    }
+
+    fn adapter_enabled(&self) -> bool {
+        self.inner.adapter_enabled()
+    }
+
+    fn trainable_vars(&self) -> Vec<Var> {
+        self.inner.trainable_vars()
+    }
+
+    fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+        self.inner.sampler_state()
+    }
+
+    fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
+        self.inner.restore_sampler_state(state)
+    }
+}
+
+struct RejectingSamplerRestorePolicy {
+    inner: StatefulScriptedPolicy,
+    fail_next_restore: bool,
+}
+
+impl Policy for RejectingSamplerRestorePolicy {
+    fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
+        self.inner.generate(prompt, cfg)
+    }
+
+    fn generate_at(
+        &mut self,
+        prompt: &[u32],
+        cfg: &GenConfig,
+        global_row_base: u64,
+    ) -> CandleResult<Rollout> {
+        self.inner.generate_at(prompt, cfg, global_row_base)
+    }
+
+    fn token_logprobs(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+        self.inner.token_logprobs(rollout)
+    }
+
+    fn set_adapter_enabled(&mut self, enabled: bool) {
+        self.inner.set_adapter_enabled(enabled);
+    }
+
+    fn adapter_enabled(&self) -> bool {
+        self.inner.adapter_enabled()
+    }
+
+    fn trainable_vars(&self) -> Vec<Var> {
+        self.inner.trainable_vars()
+    }
+
+    fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+        self.inner.sampler_state()
+    }
+
+    fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
+        if std::mem::take(&mut self.fail_next_restore) {
+            candle_core::bail!("injected rank-local continuation sampler failure")
+        }
+        self.inner.restore_sampler_state(state)
+    }
+}
+
 /// A world-1 spy counting collective invocations — the oracle for the
 /// "world-1 issues no collectives" guard discipline.
 #[derive(Debug)]
@@ -746,6 +966,212 @@ fn run_scripted_single(base: &Path, cfg: &TrainerConfig, samples: &[Sample<()>])
         .train(&mut policy, &EchoOrFlatReward, &CharTokenizer, samples)
         .unwrap();
     (var_bits(&policy), history.0)
+}
+
+type AdamBits = (usize, Vec<Vec<u32>>, Vec<Vec<u32>>);
+
+struct StatefulDirectRank {
+    initial_adapter: Vec<Vec<u32>>,
+    adapter: Vec<Vec<u32>>,
+    metrics: Vec<Metrics>,
+    sampler: Vec<u8>,
+    optimizer: Option<AdamBits>,
+}
+
+struct StatefulSeparatedRank {
+    initial_adapter: Vec<Vec<u32>>,
+    adapter: Vec<Vec<u32>>,
+    metrics: Vec<Metrics>,
+    sampler: Vec<u8>,
+    optimizer: AdamBits,
+    lineage: String,
+}
+
+fn run_stateful_direct_dp(
+    base: &Path,
+    tag: &str,
+    cfg: &TrainerConfig,
+    samples: &[Sample<()>],
+) -> Vec<StatefulDirectRank> {
+    let comms = LocalComm::world_with_timeout(2, std::time::Duration::from_secs(20));
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = comms
+            .into_iter()
+            .map(|comm| {
+                let cfg = cfg.clone();
+                let samples = samples.to_vec();
+                let base = base.to_path_buf();
+                scope.spawn(move || {
+                    let rank = comm.rank();
+                    let mut policy = StatefulScriptedPolicy::new(SEED, 0).unwrap();
+                    let initial_adapter = var_bits(&policy);
+                    let run = RunDir::create(&base, format!("{tag}-direct-rank{rank}")).unwrap();
+                    let mut trainer = Trainer::with_comm(cfg.clone(), &run, comm).unwrap();
+                    let metrics = trainer
+                        .train(&mut policy, &EchoOrFlatReward, &CharTokenizer, &samples)
+                        .unwrap()
+                        .0;
+                    let optimizer = if rank == 0 {
+                        let loaded = ferrl::load_checkpoint(
+                            run.checkpoints_dir().join(format!("step-{}", cfg.steps)),
+                            &policy.trainable_vars(),
+                        )
+                        .unwrap();
+                        Some(optimizer_bits(&loaded.optimizer_state.unwrap()))
+                    } else {
+                        None
+                    };
+                    StatefulDirectRank {
+                        initial_adapter,
+                        adapter: var_bits(&policy),
+                        metrics,
+                        sampler: policy.sampler_state().unwrap(),
+                        optimizer,
+                    }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect()
+    })
+}
+
+#[allow(clippy::cognitive_complexity)] // full three-step two-role restart oracle
+fn run_stateful_separated_dp(
+    base: &Path,
+    tag: &str,
+    cfg: &TrainerConfig,
+    samples: &[Sample<()>],
+    policy_sha256: &str,
+) -> Vec<StatefulSeparatedRank> {
+    let ledger_root = base.join(format!("{tag}-ledger"));
+    let checkpoint_root = base.join(format!("{tag}-continuations"));
+    let comms = LocalComm::world_with_timeout(2, std::time::Duration::from_secs(20));
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = comms
+            .into_iter()
+            .map(|comm| {
+                let cfg = cfg.clone();
+                let samples = samples.to_vec();
+                let base = base.to_path_buf();
+                let ledger_root = ledger_root.clone();
+                let checkpoint_root = checkpoint_root.clone();
+                scope.spawn(move || {
+                    let rank = comm.rank();
+                    let run = RunDir::create(&base, format!("{tag}-separated-rank{rank}")).unwrap();
+                    let mut trainer = Trainer::with_comm(cfg.clone(), &run, comm).unwrap();
+                    let mut collector_policy = StatefulScriptedPolicy::new(SEED, 0).unwrap();
+                    let mut learner_policy = StatefulScriptedPolicy::new(SEED, 0).unwrap();
+                    let initial_adapter = var_bits(&learner_policy);
+                    let mut continuation = None;
+                    let mut metrics = Vec::new();
+
+                    for step in 0..cfg.steps {
+                        trainer
+                            .collect_rollout_ledger_step(
+                                step,
+                                &mut collector_policy,
+                                &EchoOrFlatReward,
+                                &CharTokenizer,
+                                &samples,
+                                &ledger_root,
+                                policy_sha256,
+                                continuation.as_ref(),
+                            )
+                            .unwrap();
+                        let (row, next) = trainer
+                            .train_rollout_ledger_step(
+                                step,
+                                &mut learner_policy,
+                                &ledger_root,
+                                policy_sha256,
+                                continuation.as_ref(),
+                            )
+                            .unwrap();
+                        metrics.push(row);
+                        let checkpoint = trainer
+                            .save_rollout_ledger_continuation_to(
+                                &checkpoint_root,
+                                &learner_policy,
+                                &next,
+                            )
+                            .unwrap();
+
+                        // The continuation package is the role-handoff boundary:
+                        // both independently hosted roles install it before the
+                        // next outer step. Exercise a real process replacement
+                        // after step 0, then keep using the same durable handoff
+                        // on later steps so the collector never runs a newer
+                        // receipt against a stale adapter.
+                        if step == 0 {
+                            collector_policy =
+                                StatefulScriptedPolicy::new(SEED.wrapping_add(101), 777).unwrap();
+                            learner_policy =
+                                StatefulScriptedPolicy::new(SEED.wrapping_add(202), 888).unwrap();
+                        }
+                        let collector_restored = trainer
+                            .restore_rollout_ledger_continuation(
+                                &checkpoint,
+                                &mut collector_policy,
+                                policy_sha256,
+                            )
+                            .unwrap();
+                        let learner_restored = trainer
+                            .restore_rollout_ledger_continuation(
+                                &checkpoint,
+                                &mut learner_policy,
+                                policy_sha256,
+                            )
+                            .unwrap();
+                        assert_eq!(collector_restored.completed_step(), step + 1);
+                        assert_eq!(learner_restored.completed_step(), step + 1);
+                        assert_eq!(collector_restored.world_size(), 2);
+                        assert_eq!(learner_restored.world_size(), 2);
+                        assert_eq!(
+                            optimizer_bits(collector_restored.optimizer_state()),
+                            optimizer_bits(learner_restored.optimizer_state())
+                        );
+                        assert_eq!(var_bits(&collector_policy), var_bits(&learner_policy));
+                        continuation = Some(learner_restored);
+                    }
+
+                    let expected_adapter = var_bits(&learner_policy);
+                    let expected_sampler = learner_policy.sampler_state().unwrap();
+                    let mut latest_policy =
+                        StatefulScriptedPolicy::new(SEED.wrapping_add(303), 999).unwrap();
+                    let latest = trainer
+                        .restore_latest_rollout_ledger_continuation_from(
+                            &checkpoint_root,
+                            &mut latest_policy,
+                            policy_sha256,
+                        )
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(latest.completed_step(), cfg.steps);
+                    assert_eq!(var_bits(&latest_policy), expected_adapter);
+                    assert_eq!(latest_policy.sampler_state().unwrap(), expected_sampler);
+                    assert_eq!(
+                        ferrl::read_metrics(run.metrics_path()).unwrap().len(),
+                        cfg.steps as usize
+                    );
+                    StatefulSeparatedRank {
+                        initial_adapter,
+                        adapter: expected_adapter,
+                        metrics,
+                        sampler: expected_sampler,
+                        optimizer: optimizer_bits(latest.optimizer_state()),
+                        lineage: latest.lineage_sha256().to_owned(),
+                    }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect()
+    })
 }
 
 fn scripted_cfg() -> TrainerConfig {
@@ -1780,6 +2206,45 @@ fn world_one_rollout_ledger_sampler_handoff_and_resume_are_bit_exact() {
     }
     assert_eq!(var_bits(&wrong_adam_policy), wrong_adam_before);
 
+    // The receipt's parent/consumed lineage pair must derive its published
+    // lineage exactly. A stale or cross-wired parent fails before adapter or
+    // sampler mutation.
+    let wrong_lineage = tmp.path().join("wrong-lineage").join("step-1");
+    std::fs::create_dir_all(&wrong_lineage).unwrap();
+    for entry in std::fs::read_dir(&first_continuation).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::copy(entry.path(), wrong_lineage.join(entry.file_name())).unwrap();
+    }
+    let wrong_lineage_manifest_path = wrong_lineage.join("manifest.json");
+    let mut wrong_lineage_manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&wrong_lineage_manifest_path).unwrap()).unwrap();
+    wrong_lineage_manifest["rollout_ledger_continuation"]["parent_lineage_sha256"] =
+        serde_json::json!("f".repeat(64));
+    std::fs::write(
+        &wrong_lineage_manifest_path,
+        serde_json::to_vec_pretty(&wrong_lineage_manifest).unwrap(),
+    )
+    .unwrap();
+    let mut wrong_lineage_policy = StatefulScriptedPolicy::new(SEED.wrapping_add(2), 123).unwrap();
+    let wrong_lineage_adapter_before = var_bits(&wrong_lineage_policy);
+    let wrong_lineage_sampler_before = wrong_lineage_policy.sampler_state().unwrap();
+    match learner.restore_rollout_ledger_continuation(
+        &wrong_lineage,
+        &mut wrong_lineage_policy,
+        &policy_sha256,
+    ) {
+        Err(TrainerError::Contract(message)) => assert!(message.contains("lineage"), "{message}"),
+        other => panic!("expected stale-lineage continuation rejection, got {other:?}"),
+    }
+    assert_eq!(
+        var_bits(&wrong_lineage_policy),
+        wrong_lineage_adapter_before
+    );
+    assert_eq!(
+        wrong_lineage_policy.sampler_state().unwrap(),
+        wrong_lineage_sampler_before
+    );
+
     // Generic cadence checkpoints are not separated continuations and cannot
     // outrank C_1 during continuation-specific latest discovery.
     ferrl::save_checkpoint(
@@ -1916,6 +2381,786 @@ fn world_one_rollout_ledger_sampler_handoff_and_resume_are_bit_exact() {
 }
 
 #[test]
+#[allow(clippy::cognitive_complexity)]
+fn world_two_rollout_ledger_matches_direct_dp_across_restart() {
+    let tmp = TempDir::new("world2-ledger-restart");
+    let samples = live_samples();
+    let policy_sha256 = format!("{:064x}", 29);
+    for (tag, reward_group_scope, grad_accum_steps, group_size) in [
+        ("local", RewardGroupScope::Local, 2, 2),
+        (
+            "same-prompt-singleton",
+            RewardGroupScope::DistributedSamePrompt,
+            1,
+            1,
+        ),
+    ] {
+        let cfg = TrainerConfig {
+            steps: 3,
+            grad_accum_steps,
+            group_size,
+            beta: 0.0,
+            mu: 2,
+            checkpoint_every: Some(1),
+            reward_group_scope,
+            ..scripted_cfg()
+        };
+        let direct = run_stateful_direct_dp(tmp.path(), tag, &cfg, &samples);
+        let separated = run_stateful_separated_dp(tmp.path(), tag, &cfg, &samples, &policy_sha256);
+        assert_eq!(direct.len(), 2);
+        assert_eq!(separated.len(), 2);
+        assert_eq!(direct[0].adapter, direct[1].adapter, "{tag}: direct ranks");
+        assert_eq!(
+            separated[0].adapter, separated[1].adapter,
+            "{tag}: separated ranks"
+        );
+        assert_eq!(
+            separated[0].optimizer, separated[1].optimizer,
+            "{tag}: separated Adam"
+        );
+        assert_eq!(
+            separated[0].sampler, separated[1].sampler,
+            "{tag}: separated sampler"
+        );
+        assert_eq!(separated[0].lineage, separated[1].lineage, "{tag}: lineage");
+        for rank in 0..2 {
+            assert_eq!(
+                separated[rank].adapter, direct[rank].adapter,
+                "{tag}: rank {rank} adapter"
+            );
+            assert_eq!(
+                separated[rank].sampler, direct[rank].sampler,
+                "{tag}: rank {rank} sampler"
+            );
+            assert_eq!(
+                separated[rank].metrics.len(),
+                direct[rank].metrics.len(),
+                "{tag}: rank {rank} metric count"
+            );
+            for (step, (separated_row, direct_row)) in separated[rank]
+                .metrics
+                .iter()
+                .zip(&direct[rank].metrics)
+                .enumerate()
+            {
+                assert_eq!(
+                    deterministic_metrics(separated_row),
+                    deterministic_metrics(direct_row),
+                    "{tag}: rank {rank} step {step} metrics"
+                );
+                assert_ledger_performance_unmeasured(
+                    separated_row,
+                    &format!("{tag}: rank {rank} step {step}"),
+                );
+            }
+        }
+        let direct_optimizer = direct[0]
+            .optimizer
+            .as_ref()
+            .expect("rank 0 direct checkpoint carries Adam");
+        assert_eq!(&separated[0].optimizer, direct_optimizer, "{tag}: Adam");
+        assert_ne!(
+            separated[0].adapter, separated[0].initial_adapter,
+            "{tag}: adapter update was vacuous"
+        );
+        assert_eq!(
+            direct[0].initial_adapter, separated[0].initial_adapter,
+            "{tag}: initial adapters"
+        );
+        assert!(
+            separated[0]
+                .optimizer
+                .1
+                .iter()
+                .flatten()
+                .any(|&bits| bits != 0.0_f32.to_bits()),
+            "{tag}: first Adam moments stayed zero"
+        );
+        assert!(
+            separated[0]
+                .optimizer
+                .2
+                .iter()
+                .flatten()
+                .any(|&bits| bits != 0.0_f32.to_bits()),
+            "{tag}: second Adam moments stayed zero"
+        );
+        assert_ne!(
+            separated[0].sampler,
+            StatefulScriptedPolicy::new(SEED, 0)
+                .unwrap()
+                .sampler_state()
+                .unwrap(),
+            "{tag}: sampler did not advance"
+        );
+
+        let step0 = tmp
+            .path()
+            .join(format!("{tag}-ledger"))
+            .join("step-00000000000000000000");
+        let shard_bytes = [0, 1]
+            .map(|rank| std::fs::read(step0.join(format!("rank-{rank:05}.window.json"))).unwrap());
+        assert_ne!(
+            shard_bytes[0], shard_bytes[1],
+            "{tag}: rank shards are equal"
+        );
+        for rank in 0..2_u64 {
+            let shard: serde_json::Value =
+                serde_json::from_slice(&shard_bytes[rank as usize]).unwrap();
+            let groups = shard["groups"].as_array().unwrap();
+            assert_eq!(groups.len(), grad_accum_steps);
+            for (accum_index, group) in groups.iter().enumerate() {
+                let expected_prompt = match reward_group_scope {
+                    RewardGroupScope::Local => rank * grad_accum_steps as u64 + accum_index as u64,
+                    RewardGroupScope::DistributedSamePrompt => accum_index as u64,
+                };
+                let expected_row =
+                    (rank * grad_accum_steps as u64 + accum_index as u64) * group_size as u64;
+                assert_eq!(group["prompt_index"].as_u64(), Some(expected_prompt));
+                assert_eq!(
+                    group["rollout_global_row_base"].as_u64(),
+                    Some(expected_row)
+                );
+                if reward_group_scope == RewardGroupScope::DistributedSamePrompt {
+                    assert!(
+                        !group["distributed_reward_stats"].is_null(),
+                        "same-prompt singleton omitted global reward statistics"
+                    );
+                    assert!(
+                        group["advantage_bits"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|bits| { bits.as_u64() != Some(u64::from(0.0_f32.to_bits())) }),
+                        "same-prompt singleton stayed locally degenerate"
+                    );
+                }
+            }
+        }
+    }
+
+    let world_one_run = RunDir::create(tmp.path(), "topology-mismatch-world1").unwrap();
+    let world_one_trainer = Trainer::new(
+        TrainerConfig {
+            steps: 3,
+            grad_accum_steps: 2,
+            group_size: 2,
+            beta: 0.0,
+            mu: 2,
+            checkpoint_every: Some(1),
+            reward_group_scope: RewardGroupScope::Local,
+            ..scripted_cfg()
+        },
+        &world_one_run,
+    )
+    .unwrap();
+    let mut world_one_policy = StatefulScriptedPolicy::new(SEED, 0).unwrap();
+    let before = var_bits(&world_one_policy);
+    match world_one_trainer.restore_rollout_ledger_continuation(
+        tmp.path().join("local-continuations/step-1"),
+        &mut world_one_policy,
+        &policy_sha256,
+    ) {
+        Err(TrainerError::Contract(message)) => {
+            assert!(message.contains("world size"), "{message}");
+        }
+        other => panic!("world-one trainer accepted a world-two continuation: {other:?}"),
+    }
+    assert_eq!(var_bits(&world_one_policy), before);
+}
+
+#[test]
+#[allow(clippy::cognitive_complexity)] // assertion-heavy coordinated rollback oracle
+fn distributed_continuation_restore_rolls_back_after_asymmetric_sampler_failure() {
+    let tmp = TempDir::new("distributed-continuation-restore-rollback");
+    let cfg = TrainerConfig {
+        steps: 1,
+        grad_accum_steps: 1,
+        group_size: 2,
+        beta: 0.0,
+        mu: 1,
+        ..scripted_cfg()
+    };
+    let samples = live_samples();
+    let policy_sha256 = format!("{:064x}", 43);
+    let _seeded =
+        run_stateful_separated_dp(tmp.path(), "restore-source", &cfg, &samples, &policy_sha256);
+    let checkpoint = tmp.path().join("restore-source-continuations/step-1");
+    let comms = LocalComm::world_with_timeout(2, std::time::Duration::from_secs(10));
+    let outcomes: Vec<_> = std::thread::scope(|scope| {
+        let handles: Vec<_> = comms
+            .into_iter()
+            .map(|comm| {
+                let rank = comm.rank();
+                let cfg = cfg.clone();
+                let base = tmp.path().to_path_buf();
+                let checkpoint = checkpoint.clone();
+                let policy_sha256 = policy_sha256.clone();
+                scope.spawn(move || {
+                    let run = RunDir::create(&base, format!("restore-rank{rank}")).unwrap();
+                    let trainer = Trainer::with_comm(cfg, &run, comm).unwrap();
+                    let mut policy = RejectingSamplerRestorePolicy {
+                        inner: StatefulScriptedPolicy::new(
+                            SEED.wrapping_add(400 + rank as u64),
+                            500 + rank as u64,
+                        )
+                        .unwrap(),
+                        fail_next_restore: rank == 1,
+                    };
+                    let adapter_before = var_bits(&policy);
+                    let sampler_before = policy.sampler_state().unwrap();
+                    let error = trainer
+                        .restore_rollout_ledger_continuation(
+                            &checkpoint,
+                            &mut policy,
+                            &policy_sha256,
+                        )
+                        .unwrap_err();
+                    (
+                        rank,
+                        error.to_string(),
+                        adapter_before,
+                        var_bits(&policy),
+                        sampler_before,
+                        policy.sampler_state().unwrap(),
+                    )
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect()
+    });
+    for (rank, error, adapter_before, adapter_after, sampler_before, sampler_after) in outcomes {
+        assert!(!error.contains("timeout"), "rank {rank}: {error}");
+        if rank == 0 {
+            assert!(error.contains("peer rank"), "rank {rank}: {error}");
+        } else {
+            assert!(
+                error.contains("injected rank-local continuation sampler failure"),
+                "rank {rank}: {error}"
+            );
+        }
+        assert_eq!(adapter_after, adapter_before, "rank {rank} adapter");
+        assert_eq!(sampler_after, sampler_before, "rank {rank} sampler");
+    }
+}
+
+#[test]
+fn distributed_latest_continuation_scan_failure_is_coordinated_without_mutation() {
+    let tmp = TempDir::new("distributed-continuation-scan-failure");
+    let invalid_root = tmp.path().join("not-a-directory");
+    std::fs::write(&invalid_root, b"not a checkpoint root").unwrap();
+    let cfg = TrainerConfig {
+        steps: 1,
+        grad_accum_steps: 1,
+        group_size: 2,
+        beta: 0.0,
+        ..scripted_cfg()
+    };
+    let policy_sha256 = format!("{:064x}", 47);
+    let comms = LocalComm::world_with_timeout(2, std::time::Duration::from_secs(10));
+    let outcomes: Vec<_> = std::thread::scope(|scope| {
+        let handles: Vec<_> = comms
+            .into_iter()
+            .map(|comm| {
+                let rank = comm.rank();
+                let cfg = cfg.clone();
+                let base = tmp.path().to_path_buf();
+                let invalid_root = invalid_root.clone();
+                let policy_sha256 = policy_sha256.clone();
+                scope.spawn(move || {
+                    let run = RunDir::create(&base, format!("scan-rank{rank}")).unwrap();
+                    let trainer = Trainer::with_comm(cfg, &run, comm).unwrap();
+                    let mut policy =
+                        StatefulScriptedPolicy::new(SEED.wrapping_add(rank as u64), rank as u64)
+                            .unwrap();
+                    let adapter_before = var_bits(&policy);
+                    let sampler_before = policy.sampler_state().unwrap();
+                    let error = trainer
+                        .restore_latest_rollout_ledger_continuation_from(
+                            &invalid_root,
+                            &mut policy,
+                            &policy_sha256,
+                        )
+                        .unwrap_err();
+                    (
+                        rank,
+                        error.to_string(),
+                        adapter_before,
+                        var_bits(&policy),
+                        sampler_before,
+                        policy.sampler_state().unwrap(),
+                    )
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect()
+    });
+    for (rank, error, adapter_before, adapter_after, sampler_before, sampler_after) in outcomes {
+        assert!(!error.contains("timeout"), "rank {rank}: {error}");
+        if rank == 1 {
+            assert!(error.contains("failed to discover"), "rank {rank}: {error}");
+        }
+        assert_eq!(adapter_after, adapter_before, "rank {rank} adapter");
+        assert_eq!(sampler_after, sampler_before, "rank {rank} sampler");
+    }
+}
+
+#[test]
+#[allow(clippy::cognitive_complexity)] // package inspection plus two-rank equivalence assertions
+fn separated_dp_empty_local_shard_still_joins_the_global_update() {
+    let tmp = TempDir::new("separated-empty-shard");
+    let cfg = TrainerConfig {
+        steps: 1,
+        grad_accum_steps: 1,
+        group_size: 2,
+        beta: 0.0,
+        mu: 1,
+        checkpoint_every: Some(1),
+        reward_group_scope: RewardGroupScope::Local,
+        ..scripted_cfg()
+    };
+    let samples = vec![Sample::new("e", ()), Sample::new("a", ())];
+    let policy_sha256 = format!("{:064x}", 31);
+    let ranks =
+        run_stateful_separated_dp(tmp.path(), "empty-local", &cfg, &samples, &policy_sha256);
+    assert_eq!(ranks[0].adapter, ranks[1].adapter);
+    assert_ne!(ranks[0].adapter, ranks[0].initial_adapter);
+    assert!(ranks[0].metrics[0].frac_reward_zero_std > 0.0);
+
+    let step = tmp
+        .path()
+        .join("empty-local-ledger")
+        .join("step-00000000000000000000");
+    let rank0: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(step.join("rank-00000.window.json")).unwrap())
+            .unwrap();
+    let rank1: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(step.join("rank-00001.window.json")).unwrap())
+            .unwrap();
+    assert_eq!(rank0["old_logprobs"], "not_required");
+    assert_eq!(rank1["old_logprobs"], "adapter_enabled_detached");
+    assert_eq!(rank0["live_items"].as_u64(), Some(1));
+    assert_eq!(rank1["live_items"].as_u64(), Some(1));
+}
+
+#[test]
+#[allow(clippy::cognitive_complexity)] // paired generation/reward failure variants
+fn separated_dp_asymmetric_collection_failures_rewind_every_sampler_before_stats() {
+    for mode in ["generation", "reward"] {
+        let tmp = TempDir::new(&format!("separated-collection-{mode}"));
+        let cfg = TrainerConfig {
+            steps: 1,
+            grad_accum_steps: 1,
+            group_size: 2,
+            beta: 0.0,
+            mu: 1,
+            ..scripted_cfg()
+        };
+        let samples = live_samples();
+        let policy_sha256 = format!("{:064x}", 59);
+        let ledger_root = tmp.path().join("ledger");
+        let comms = LocalComm::world_with_timeout(2, std::time::Duration::from_secs(10));
+        let outcomes: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = comms
+                .into_iter()
+                .map(|comm| {
+                    let rank = comm.rank();
+                    let cfg = cfg.clone();
+                    let samples = samples.clone();
+                    let base = tmp.path().to_path_buf();
+                    let ledger_root = ledger_root.clone();
+                    let policy_sha256 = policy_sha256.clone();
+                    scope.spawn(move || {
+                        let run = RunDir::create(&base, format!("{mode}-rank{rank}")).unwrap();
+                        let mut trainer = Trainer::with_comm(cfg, &run, comm).unwrap();
+                        let mut policy = FailingCollectionPolicy {
+                            inner: StatefulScriptedPolicy::new(SEED, 0).unwrap(),
+                            fail_generate: mode == "generation" && rank == 0,
+                        };
+                        let adapter_before = var_bits(&policy);
+                        let sampler_before = policy.sampler_state().unwrap();
+                        let error = trainer
+                            .collect_rollout_ledger_step(
+                                0,
+                                &mut policy,
+                                &FailingCollectionReward {
+                                    fail: mode == "reward" && rank == 0,
+                                },
+                                &CharTokenizer,
+                                &samples,
+                                &ledger_root,
+                                &policy_sha256,
+                                None,
+                            )
+                            .unwrap_err();
+                        (
+                            rank,
+                            error.to_string(),
+                            adapter_before,
+                            var_bits(&policy),
+                            sampler_before,
+                            policy.sampler_state().unwrap(),
+                        )
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        });
+        for (rank, error, adapter_before, adapter_after, sampler_before, sampler_after) in outcomes
+        {
+            assert!(!error.contains("timeout"), "{mode}: rank {rank}: {error}");
+            assert_eq!(adapter_after, adapter_before, "{mode}: rank {rank} adapter");
+            assert_eq!(sampler_after, sampler_before, "{mode}: rank {rank} sampler");
+        }
+        if ledger_root.exists() {
+            assert!(std::fs::read_dir(&ledger_root).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("step-")
+            }));
+        }
+    }
+}
+
+#[test]
+#[allow(clippy::type_complexity)] // explicit before/after rollback tuple
+fn separated_dp_asymmetric_scoring_failures_abort_without_collective_timeout() {
+    for (mode, fail_detached, fail_live) in
+        [("detached", true, false), ("live-scoring", false, true)]
+    {
+        let tmp = TempDir::new(&format!("separated-asymmetric-{mode}"));
+        let cfg = TrainerConfig {
+            steps: 1,
+            grad_accum_steps: 1,
+            group_size: 2,
+            beta: 0.0,
+            mu: 1,
+            ..scripted_cfg()
+        };
+        let samples = vec![Sample::new("a", ()), Sample::new("b", ())];
+        let policy_sha256 = format!("{:064x}", 37);
+        let ledger_root = tmp.path().join("ledger");
+        let comms = LocalComm::world_with_timeout(2, std::time::Duration::from_secs(10));
+        let outcomes: Vec<(String, Vec<Vec<u32>>, Vec<Vec<u32>>, usize)> =
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = comms
+                    .into_iter()
+                    .map(|comm| {
+                        let cfg = cfg.clone();
+                        let samples = samples.clone();
+                        let base = tmp.path().to_path_buf();
+                        let ledger_root = ledger_root.clone();
+                        let policy_sha256 = policy_sha256.clone();
+                        scope.spawn(move || {
+                            let rank = comm.rank();
+                            let run = RunDir::create(&base, format!("{mode}-rank{rank}")).unwrap();
+                            let mut trainer = Trainer::with_comm(cfg, &run, comm).unwrap();
+                            let mut collector_policy = ScriptedPolicy::new(SEED).unwrap();
+                            trainer
+                                .collect_rollout_ledger_step(
+                                    0,
+                                    &mut collector_policy,
+                                    &EchoOrFlatReward,
+                                    &CharTokenizer,
+                                    &samples,
+                                    &ledger_root,
+                                    &policy_sha256,
+                                    None,
+                                )
+                                .unwrap();
+                            let mut learner_policy = FailingScoringPolicy {
+                                inner: ScriptedPolicy::new(SEED).unwrap(),
+                                fail_detached: rank == 0 && fail_detached,
+                                fail_live: rank == 0 && fail_live,
+                            };
+                            let before = var_bits(&learner_policy);
+                            let error = trainer
+                                .train_rollout_ledger_step(
+                                    0,
+                                    &mut learner_policy,
+                                    &ledger_root,
+                                    &policy_sha256,
+                                    None,
+                                )
+                                .unwrap_err();
+                            (
+                                error.to_string(),
+                                before,
+                                var_bits(&learner_policy),
+                                ferrl::read_metrics(run.metrics_path()).unwrap().len(),
+                            )
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().unwrap())
+                    .collect()
+            });
+        for (rank, (error, before, after, metric_rows)) in outcomes.iter().enumerate() {
+            assert!(
+                !error.contains("timeout"),
+                "{mode}: rank {rank} stalled instead of aborting: {error}"
+            );
+            assert_eq!(after, before, "{mode}: rank {rank} was not rolled back");
+            assert_eq!(*metric_rows, 0, "{mode}: rank {rank} wrote metrics");
+        }
+    }
+}
+
+#[test]
+fn separated_dp_asymmetric_backward_failure_aborts_before_gradient_collectives() {
+    let tmp = TempDir::new("separated-asymmetric-backward");
+    let cfg = TrainerConfig {
+        steps: 1,
+        grad_accum_steps: 1,
+        group_size: 2,
+        beta: 0.0,
+        mu: 1,
+        ..scripted_cfg()
+    };
+    let samples = vec![Sample::new("a", ()), Sample::new("b", ())];
+    let policy_sha256 = format!("{:064x}", 61);
+    let ledger_root = tmp.path().join("ledger");
+    let comms = LocalComm::world_with_timeout(2, std::time::Duration::from_secs(10));
+    let outcomes: Vec<_> = std::thread::scope(|scope| {
+        let handles: Vec<_> = comms
+            .into_iter()
+            .map(|comm| {
+                let rank = comm.rank();
+                let cfg = cfg.clone();
+                let samples = samples.clone();
+                let base = tmp.path().to_path_buf();
+                let ledger_root = ledger_root.clone();
+                let policy_sha256 = policy_sha256.clone();
+                scope.spawn(move || {
+                    let run = RunDir::create(&base, format!("backward-rank{rank}")).unwrap();
+                    let mut trainer = Trainer::with_comm(cfg, &run, comm).unwrap();
+                    let mut collector_policy = ScriptedPolicy::new(SEED).unwrap();
+                    trainer
+                        .collect_rollout_ledger_step(
+                            0,
+                            &mut collector_policy,
+                            &EchoOrFlatReward,
+                            &CharTokenizer,
+                            &samples,
+                            &ledger_root,
+                            &policy_sha256,
+                            None,
+                        )
+                        .unwrap();
+                    let mut learner_policy = FailingBackwardPolicy {
+                        inner: ScriptedPolicy::new(SEED).unwrap(),
+                        fail_backward: rank == 0,
+                    };
+                    let before = var_bits(&learner_policy);
+                    let error = trainer
+                        .train_rollout_ledger_step(
+                            0,
+                            &mut learner_policy,
+                            &ledger_root,
+                            &policy_sha256,
+                            None,
+                        )
+                        .unwrap_err();
+                    (
+                        rank,
+                        error.to_string(),
+                        before,
+                        var_bits(&learner_policy),
+                        ferrl::read_metrics(run.metrics_path()).unwrap().len(),
+                    )
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect()
+    });
+    for (rank, error, before, after, rows) in outcomes {
+        assert!(!error.contains("timeout"), "rank {rank}: {error}");
+        assert_eq!(after, before, "rank {rank} adapter");
+        assert_eq!(rows, 0, "rank {rank} wrote metrics");
+    }
+}
+
+#[test]
+fn separated_dp_asymmetric_sampler_handoff_failure_rolls_back_every_rank() {
+    let tmp = TempDir::new("separated-asymmetric-sampler-handoff");
+    let cfg = TrainerConfig {
+        steps: 1,
+        grad_accum_steps: 1,
+        group_size: 2,
+        beta: 0.0,
+        mu: 1,
+        ..scripted_cfg()
+    };
+    let samples = vec![Sample::new("a", ()), Sample::new("b", ())];
+    let policy_sha256 = format!("{:064x}", 67);
+    let ledger_root = tmp.path().join("ledger");
+    let comms = LocalComm::world_with_timeout(2, std::time::Duration::from_secs(10));
+    let outcomes: Vec<_> = std::thread::scope(|scope| {
+        let handles: Vec<_> = comms
+            .into_iter()
+            .map(|comm| {
+                let rank = comm.rank();
+                let cfg = cfg.clone();
+                let samples = samples.clone();
+                let base = tmp.path().to_path_buf();
+                let ledger_root = ledger_root.clone();
+                let policy_sha256 = policy_sha256.clone();
+                scope.spawn(move || {
+                    let run = RunDir::create(&base, format!("handoff-rank{rank}")).unwrap();
+                    let mut trainer = Trainer::with_comm(cfg, &run, comm).unwrap();
+                    let mut collector_policy = StatefulScriptedPolicy::new(SEED, 0).unwrap();
+                    trainer
+                        .collect_rollout_ledger_step(
+                            0,
+                            &mut collector_policy,
+                            &EchoOrFlatReward,
+                            &CharTokenizer,
+                            &samples,
+                            &ledger_root,
+                            &policy_sha256,
+                            None,
+                        )
+                        .unwrap();
+                    let mut learner_policy = RejectingSamplerRestorePolicy {
+                        inner: StatefulScriptedPolicy::new(SEED, 0).unwrap(),
+                        fail_next_restore: rank == 1,
+                    };
+                    let adapter_before = var_bits(&learner_policy);
+                    let sampler_before = learner_policy.sampler_state().unwrap();
+                    let error = trainer
+                        .train_rollout_ledger_step(
+                            0,
+                            &mut learner_policy,
+                            &ledger_root,
+                            &policy_sha256,
+                            None,
+                        )
+                        .unwrap_err();
+                    (
+                        rank,
+                        error.to_string(),
+                        adapter_before,
+                        var_bits(&learner_policy),
+                        sampler_before,
+                        learner_policy.sampler_state().unwrap(),
+                        ferrl::read_metrics(run.metrics_path()).unwrap().len(),
+                    )
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect()
+    });
+    for (rank, error, adapter_before, adapter_after, sampler_before, sampler_after, rows) in
+        outcomes
+    {
+        assert!(!error.contains("timeout"), "rank {rank}: {error}");
+        assert_eq!(adapter_after, adapter_before, "rank {rank} adapter");
+        assert_eq!(sampler_after, sampler_before, "rank {rank} sampler");
+        assert_eq!(rows, 0, "rank {rank} wrote metrics");
+    }
+}
+
+#[test]
+fn separated_dp_rejects_config_and_sampler_mismatch_before_publication() {
+    for mismatch in ["reward-scope", "sampler"] {
+        let tmp = TempDir::new(&format!("separated-preflight-{mismatch}"));
+        let ledger_root = tmp.path().join("ledger");
+        let samples = live_samples();
+        let policy_sha256 = format!("{:064x}", 41);
+        let comms = LocalComm::world_with_timeout(2, std::time::Duration::from_secs(10));
+        let outcomes: Vec<(String, Vec<u8>, Vec<u8>)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = comms
+                .into_iter()
+                .map(|comm| {
+                    let rank = comm.rank();
+                    let cfg = TrainerConfig {
+                        steps: 1,
+                        grad_accum_steps: 1,
+                        beta: 0.0,
+                        reward_group_scope: if mismatch == "reward-scope" && rank == 1 {
+                            RewardGroupScope::DistributedSamePrompt
+                        } else {
+                            RewardGroupScope::Local
+                        },
+                        ..scripted_cfg()
+                    };
+                    let samples = samples.clone();
+                    let base = tmp.path().to_path_buf();
+                    let ledger_root = ledger_root.clone();
+                    let policy_sha256 = policy_sha256.clone();
+                    scope.spawn(move || {
+                        let run = RunDir::create(&base, format!("{mismatch}-rank{rank}")).unwrap();
+                        let mut trainer = Trainer::with_comm(cfg, &run, comm).unwrap();
+                        let mut policy = StatefulScriptedPolicy::new(
+                            SEED,
+                            if mismatch == "sampler" {
+                                rank as u64
+                            } else {
+                                0
+                            },
+                        )
+                        .unwrap();
+                        let before = policy.sampler_state().unwrap();
+                        let error = trainer
+                            .collect_rollout_ledger_step(
+                                0,
+                                &mut policy,
+                                &EchoOrFlatReward,
+                                &CharTokenizer,
+                                &samples,
+                                &ledger_root,
+                                &policy_sha256,
+                                None,
+                            )
+                            .unwrap_err();
+                        (error.to_string(), before, policy.sampler_state().unwrap())
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        });
+        for (rank, (error, before, after)) in outcomes.iter().enumerate() {
+            assert!(
+                !error.contains("timeout"),
+                "{mismatch}: rank {rank}: {error}"
+            );
+            assert_eq!(after, before, "{mismatch}: rank {rank} sampler advanced");
+        }
+        if ledger_root.exists() {
+            assert!(std::fs::read_dir(&ledger_root).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("step-")
+            }));
+        }
+    }
+}
+
+#[test]
 fn relative_run_dir_continuation_saves_and_restores() {
     let root = RelativeTempRoot::new("continuation");
     let runs_root = root.path().join("runs");
@@ -1966,6 +3211,89 @@ fn relative_run_dir_continuation_saves_and_restores() {
     assert_eq!(restored.completed_step(), 1);
     assert_eq!(var_bits(&restored_policy), expected_adapter);
     assert_eq!(restored_policy.sampler_state().unwrap(), expected_sampler);
+}
+
+#[test]
+#[allow(clippy::cognitive_complexity)] // fixture conversion plus full payload comparison
+fn world_one_restores_legacy_v1_rollout_ledger_continuation() {
+    let tmp = TempDir::new("legacy-v1-rollout-ledger-continuation");
+    let ledger_root = tmp.path().join("ledger");
+    let samples = live_samples();
+    let cfg = TrainerConfig {
+        steps: 1,
+        grad_accum_steps: 1,
+        group_size: 2,
+        beta: 0.0,
+        mu: 1,
+        ..scripted_cfg()
+    };
+    let policy_sha256 = format!("{:064x}", 53);
+
+    let collector_run = RunDir::create(tmp.path(), "collector").unwrap();
+    let mut collector = Trainer::new(cfg.clone(), &collector_run).unwrap();
+    let mut collector_policy = StatefulScriptedPolicy::new(SEED, 0).unwrap();
+    collector
+        .collect_rollout_ledger_step(
+            0,
+            &mut collector_policy,
+            &EchoOrFlatReward,
+            &CharTokenizer,
+            &samples,
+            &ledger_root,
+            &policy_sha256,
+            None,
+        )
+        .unwrap();
+
+    let learner_run = RunDir::create(tmp.path(), "learner").unwrap();
+    let mut learner = Trainer::new(cfg.clone(), &learner_run).unwrap();
+    let mut learner_policy = StatefulScriptedPolicy::new(SEED, 0).unwrap();
+    let (_, continuation) = learner
+        .train_rollout_ledger_step(0, &mut learner_policy, &ledger_root, &policy_sha256, None)
+        .unwrap();
+    let expected_adapter = var_bits(&learner_policy);
+    let expected_sampler = learner_policy.sampler_state().unwrap();
+    let expected_optimizer = optimizer_bits(continuation.optimizer_state());
+    let current = learner
+        .save_rollout_ledger_continuation(&learner_policy, &continuation)
+        .unwrap();
+
+    let legacy = tmp.path().join("legacy/step-1");
+    std::fs::create_dir_all(&legacy).unwrap();
+    for entry in std::fs::read_dir(current).unwrap() {
+        let entry = entry.unwrap();
+        assert!(entry.file_type().unwrap().is_file());
+        std::fs::copy(entry.path(), legacy.join(entry.file_name())).unwrap();
+    }
+    let manifest_path = legacy.join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    let continuation_manifest = manifest["rollout_ledger_continuation"]
+        .as_object_mut()
+        .unwrap();
+    assert_eq!(continuation_manifest["world_size"].as_u64(), Some(1));
+    continuation_manifest.insert("format_version".into(), serde_json::json!(1));
+    continuation_manifest.remove("world_size");
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let restore_run = RunDir::create(tmp.path(), "legacy-restore").unwrap();
+    let restore_trainer = Trainer::new(cfg, &restore_run).unwrap();
+    let mut restored_policy = StatefulScriptedPolicy::new(SEED.wrapping_add(1), 99).unwrap();
+    let restored = restore_trainer
+        .restore_rollout_ledger_continuation(&legacy, &mut restored_policy, &policy_sha256)
+        .unwrap();
+    assert_eq!(restored.completed_step(), 1);
+    assert_eq!(restored.world_size(), 1);
+    assert_eq!(var_bits(&restored_policy), expected_adapter);
+    assert_eq!(restored_policy.sampler_state().unwrap(), expected_sampler);
+    assert_eq!(
+        optimizer_bits(restored.optimizer_state()),
+        expected_optimizer
+    );
 }
 
 // ---- gate 4: degenerate shards ------------------------------------------------
