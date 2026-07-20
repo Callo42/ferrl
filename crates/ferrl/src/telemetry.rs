@@ -644,6 +644,10 @@ pub struct MetricsWriter {
     file: File,
     #[cfg(test)]
     fail_next_append: bool,
+    #[cfg(test)]
+    fail_next_truncate: bool,
+    #[cfg(test)]
+    panic_next_truncate: bool,
 }
 
 /// One sampled completion persisted to `candidates.jsonl`.
@@ -768,6 +772,10 @@ impl MetricsWriter {
             file,
             #[cfg(test)]
             fail_next_append: false,
+            #[cfg(test)]
+            fail_next_truncate: false,
+            #[cfg(test)]
+            panic_next_truncate: false,
         })
     }
 
@@ -808,6 +816,19 @@ impl MetricsWriter {
 
     /// Roll this append-only stream back to a previously observed boundary.
     pub(crate) fn truncate_to(&mut self, len: u64) -> Result<(), TelemetryError> {
+        #[cfg(test)]
+        {
+            assert!(
+                !std::mem::take(&mut self.panic_next_truncate),
+                "injected metrics truncate panic"
+            );
+            if std::mem::take(&mut self.fail_next_truncate) {
+                return Err(TelemetryError::io(
+                    &self.path,
+                    io::Error::other("injected metrics truncate failure"),
+                ));
+            }
+        }
         self.file
             .flush()
             .map_err(|e| TelemetryError::io(&self.path, e))?;
@@ -822,6 +843,16 @@ impl MetricsWriter {
     #[cfg(test)]
     pub(crate) fn inject_append_failure_once(&mut self) {
         self.fail_next_append = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_truncate_failure_once(&mut self) {
+        self.fail_next_truncate = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_truncate_panic_once(&mut self) {
+        self.panic_next_truncate = true;
     }
 
     /// The path this writer appends to.

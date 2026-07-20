@@ -126,6 +126,34 @@ pub enum TrainerError {
     /// timing out, or a poisoned world) — see [`crate::comm`].
     #[error(transparent)]
     Comm(#[from] crate::comm::CommError),
+    /// A reader-visible publication may exist, but the status collective failed,
+    /// so callers must preserve publication-side state and discard the dead world.
+    #[error(
+        "{artifact} publication may be visible at {path}; {detail}; communication failed ({communication}); the data-parallel world is dead and no further collectives are safe; discard the communicator"
+    )]
+    PublicationAmbiguousAfterComm {
+        /// Human-readable artifact kind (continuation or rollout ledger).
+        artifact: &'static str,
+        /// Reader-visible destination whose publication is uncertain.
+        path: PathBuf,
+        /// Publication boundary crossed before communication failed.
+        detail: String,
+        /// Terminal collective failure that killed the data-parallel world.
+        #[source]
+        communication: Box<crate::comm::CommError>,
+    },
+    /// Metrics publication lost its status collective after the local append;
+    /// the learner envelope must combine telemetry and model rollback outcomes.
+    #[error(
+        "rollout-ledger metrics append-status communication failed ({communication}); {telemetry_rollback}"
+    )]
+    RolloutLedgerMetricsComm {
+        /// Terminal collective failure that killed the data-parallel world.
+        #[source]
+        communication: Box<crate::comm::CommError>,
+        /// Exact success/failure detail from panic-contained local truncation.
+        telemetry_rollback: String,
+    },
     /// A separated rollout/learner ledger could not be published or validated.
     #[error(transparent)]
     RolloutLedger(#[from] RolloutLedgerError),
@@ -1997,6 +2025,7 @@ impl Trainer {
         })();
         match outcome {
             Ok(path) => Ok(path),
+            Err(error @ TrainerError::PublicationAmbiguousAfterComm { .. }) => Err(error),
             Err(TrainerError::RolloutLedger(error)) if error.may_be_visible() => {
                 // A manifest-bearing ledger may already be consumable. Rewinding
                 // the sampler would split collector state from that visible L_k.
@@ -2391,6 +2420,32 @@ impl Trainer {
 
         match outcome {
             Ok(result) => Ok(result),
+            Err(TrainerError::RolloutLedgerMetricsComm {
+                communication,
+                telemetry_rollback,
+            }) => {
+                let rollback = Self::catch_local_data_parallel_recovery(
+                    "best-effort local rollout-ledger learner rollback",
+                    || {
+                        Self::restore_rollout_ledger_prestate(
+                            policy,
+                            &vars,
+                            &adapter_prestate,
+                            &mut opt,
+                            &optimizer_prestate,
+                            adapter_enabled_prestate,
+                            &sampler_prestate,
+                        )
+                    },
+                );
+                Err(Self::terminal_data_parallel_comm_failure(
+                    "rollout-ledger metrics publication",
+                    &communication,
+                    Some(&telemetry_rollback),
+                    rollback,
+                    "policy and optimizer state",
+                ))
+            }
             Err(TrainerError::Comm(comm_error)) => {
                 let rollback = Self::catch_local_data_parallel_recovery(
                     "best-effort local rollout-ledger learner rollback",
@@ -2577,14 +2632,13 @@ impl Trainer {
         let publication_signal = match publication_signal {
             Ok(signal) => signal,
             Err(error) => {
-                return Err(TrainerError::Checkpoint(
-                    crate::checkpoint::CheckpointError::PublicationAmbiguous {
-                        path: dir,
-                        detail: format!(
-                            "continuation publication-status collective failed after rank 0 entered no-replace publication: {error}"
-                        ),
-                    },
-                ));
+                return Err(TrainerError::PublicationAmbiguousAfterComm {
+                    artifact: "rollout-ledger continuation",
+                    path: dir,
+                    detail: "rank 0 entered no-replace publication before the status collective"
+                        .into(),
+                    communication: Box::new(error),
+                });
             }
         };
         if publication_signal > 1.5 {
@@ -3258,14 +3312,13 @@ impl Trainer {
         let publication_signal = match publication_signal {
             Ok(value) => value,
             Err(error) => {
-                return Err(TrainerError::RolloutLedger(
-                    RolloutLedgerError::PublicationAmbiguous {
-                        path: final_dir,
-                        detail: format!(
-                            "publication-status collective failed after rank 0 entered the manifest commit phase: {error}"
-                        ),
-                    },
-                ));
+                return Err(TrainerError::PublicationAmbiguousAfterComm {
+                    artifact: "distributed rollout ledger",
+                    path: final_dir,
+                    detail: "rank 0 entered the manifest commit phase before the status collective"
+                        .into(),
+                    communication: Box::new(error),
+                });
             }
         };
         if publication_signal > 1.5 {
@@ -3414,6 +3467,15 @@ impl Trainer {
                 )))
             },
         )
+    }
+
+    fn rollout_ledger_metrics_rollback_detail(rollback: &Result<(), TrainerError>) -> String {
+        match rollback {
+            Ok(()) => "best-effort local metrics rollback completed".into(),
+            Err(error) => format!(
+                "best-effort local metrics rollback failed: {error}; rank-local metrics telemetry may contain a row for a rolled-back learner step and must be repaired or discarded"
+            ),
+        }
     }
 
     fn terminal_data_parallel_comm_failure(
@@ -4712,27 +4774,37 @@ impl Trainer {
         let failed_global = match failed_global {
             Ok(failed) => failed,
             Err(comm_error) => {
-                let _rollback = Self::catch_local_data_parallel_recovery(
+                let rollback = Self::catch_local_data_parallel_recovery(
                     "best-effort local rollout-ledger metrics rollback",
                     || {
                         self.writer.truncate_to(rollback_len)?;
                         Ok(())
                     },
                 );
-                return Err(comm_error.into());
+                return Err(TrainerError::RolloutLedgerMetricsComm {
+                    communication: Box::new(comm_error),
+                    telemetry_rollback: Self::rollout_ledger_metrics_rollback_detail(&rollback),
+                });
             }
         };
         if failed_global == 0.0 {
             return append_local;
         }
-        let rollback_local = self
-            .writer
-            .truncate_to(rollback_len)
-            .map_err(TrainerError::from);
+        let rollback_local =
+            Self::catch_local_data_parallel_recovery("rollout-ledger metrics rollback", || {
+                self.writer.truncate_to(rollback_len)?;
+                Ok(())
+            });
+        let rollback_detail = Self::rollout_ledger_metrics_rollback_detail(&rollback_local);
         let rollback =
             self.coordinate_data_parallel_result("rollout-ledger metrics rollback", rollback_local);
         match (append_local, rollback) {
-            (_, Err(TrainerError::Comm(comm_error))) => Err(comm_error.into()),
+            (_, Err(TrainerError::Comm(comm_error))) => {
+                Err(TrainerError::RolloutLedgerMetricsComm {
+                    communication: Box::new(comm_error),
+                    telemetry_rollback: rollback_detail,
+                })
+            }
             (_, Err(rollback_error)) => Err(TrainerError::Contract(format!(
                 "rollout-ledger metrics append failed on at least one rank; coordinated rollback failed: {rollback_error}"
             ))),
@@ -8776,6 +8848,263 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct ArmedCollectiveFailureState {
+        remaining_successes: std::sync::atomic::AtomicUsize,
+        failed: std::sync::atomic::AtomicBool,
+        calls_after_failure: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ArmedCollectiveFailureState {
+        fn new(remaining_successes: usize) -> Self {
+            Self {
+                remaining_successes: std::sync::atomic::AtomicUsize::new(remaining_successes),
+                failed: std::sync::atomic::AtomicBool::new(false),
+                calls_after_failure: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn enter(&self, armed: bool) -> Result<(), crate::comm::CommError> {
+            use std::sync::atomic::Ordering;
+
+            if self.failed.load(Ordering::SeqCst) {
+                self.calls_after_failure.fetch_add(1, Ordering::SeqCst);
+                return Err(crate::comm::CommError::Poisoned(
+                    "collective issued after injected terminal failure".into(),
+                ));
+            }
+            if !armed {
+                return Ok(());
+            }
+            let remaining = self.remaining_successes.load(Ordering::SeqCst);
+            if remaining > 0 {
+                self.remaining_successes.fetch_sub(1, Ordering::SeqCst);
+                return Ok(());
+            }
+            self.failed.store(true, Ordering::SeqCst);
+            Err(crate::comm::CommError::Mismatch(
+                "injected terminal collective-chain failure".into(),
+            ))
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailAfterArmComm<C> {
+        inner: C,
+        armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        state: std::sync::Arc<ArmedCollectiveFailureState>,
+    }
+
+    impl<C: crate::comm::Comm> crate::comm::Comm for FailAfterArmComm<C> {
+        fn rank(&self) -> usize {
+            self.inner.rank()
+        }
+
+        fn world_size(&self) -> usize {
+            self.inner.world_size()
+        }
+
+        fn validate_all_reduce_sum(
+            &self,
+            tensors: &[Tensor],
+        ) -> Result<(), crate::comm::CommError> {
+            self.inner.validate_all_reduce_sum(tensors)
+        }
+
+        fn all_reduce_sum(&self, tensors: &mut Vec<Tensor>) -> Result<(), crate::comm::CommError> {
+            self.state
+                .enter(self.armed.load(std::sync::atomic::Ordering::SeqCst))?;
+            self.inner.all_reduce_sum(tensors)
+        }
+
+        fn all_reduce_scalar_sum(&self, value: f64) -> Result<f64, crate::comm::CommError> {
+            self.state
+                .enter(self.armed.load(std::sync::atomic::Ordering::SeqCst))?;
+            self.inner.all_reduce_scalar_sum(value)
+        }
+    }
+
+    #[derive(Debug)]
+    struct MetricsStatusFailureState {
+        failed: std::sync::atomic::AtomicBool,
+        calls_after_failure: std::sync::atomic::AtomicUsize,
+    }
+
+    impl MetricsStatusFailureState {
+        fn new() -> Self {
+            Self {
+                failed: std::sync::atomic::AtomicBool::new(false),
+                calls_after_failure: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailAtMetricsStatusComm<C> {
+        inner: C,
+        metrics_path: PathBuf,
+        state: std::sync::Arc<MetricsStatusFailureState>,
+    }
+
+    impl<C: crate::comm::Comm> FailAtMetricsStatusComm<C> {
+        fn enter(&self) -> Result<(), crate::comm::CommError> {
+            use std::sync::atomic::Ordering;
+
+            if self.state.failed.load(Ordering::SeqCst) {
+                self.state
+                    .calls_after_failure
+                    .fetch_add(1, Ordering::SeqCst);
+                return Err(crate::comm::CommError::Poisoned(
+                    "collective issued after injected metrics-status failure".into(),
+                ));
+            }
+            if std::fs::metadata(&self.metrics_path).is_ok_and(|metadata| metadata.len() > 0) {
+                self.state.failed.store(true, Ordering::SeqCst);
+                return Err(crate::comm::CommError::Mismatch(
+                    "injected metrics append-status failure".into(),
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    impl<C: crate::comm::Comm> crate::comm::Comm for FailAtMetricsStatusComm<C> {
+        fn rank(&self) -> usize {
+            self.inner.rank()
+        }
+
+        fn world_size(&self) -> usize {
+            self.inner.world_size()
+        }
+
+        fn validate_all_reduce_sum(
+            &self,
+            tensors: &[Tensor],
+        ) -> Result<(), crate::comm::CommError> {
+            self.inner.validate_all_reduce_sum(tensors)
+        }
+
+        fn all_reduce_sum(&self, tensors: &mut Vec<Tensor>) -> Result<(), crate::comm::CommError> {
+            self.enter()?;
+            self.inner.all_reduce_sum(tensors)
+        }
+
+        fn all_reduce_scalar_sum(&self, value: f64) -> Result<f64, crate::comm::CommError> {
+            self.enter()?;
+            self.inner.all_reduce_scalar_sum(value)
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum CandidatePolicyArmPoint {
+        DetachedScoring,
+        SamplerState(usize),
+    }
+
+    struct ArmedCandidatePolicy {
+        inner: StatefulCandidatePolicy,
+        armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        arm_point: CandidatePolicyArmPoint,
+        sampler_state_calls: std::cell::Cell<usize>,
+    }
+
+    impl Policy for ArmedCandidatePolicy {
+        fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
+            self.inner.generate(prompt, cfg)
+        }
+
+        fn generate_at(
+            &mut self,
+            prompt: &[u32],
+            cfg: &GenConfig,
+            global_row_base: u64,
+        ) -> CandleResult<Rollout> {
+            self.inner.generate_at(prompt, cfg, global_row_base)
+        }
+
+        fn token_logprobs(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+            self.inner.token_logprobs(rollout)
+        }
+
+        fn token_logprobs_detached(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+            let logprobs = self.inner.token_logprobs_detached(rollout)?;
+            if matches!(self.arm_point, CandidatePolicyArmPoint::DetachedScoring) {
+                self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(logprobs)
+        }
+
+        fn set_adapter_enabled(&mut self, enabled: bool) {
+            self.inner.set_adapter_enabled(enabled);
+        }
+
+        fn adapter_enabled(&self) -> bool {
+            self.inner.adapter_enabled()
+        }
+
+        fn trainable_vars(&self) -> Vec<Var> {
+            self.inner.trainable_vars()
+        }
+
+        fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+            let call = self.sampler_state_calls.get() + 1;
+            self.sampler_state_calls.set(call);
+            if matches!(self.arm_point, CandidatePolicyArmPoint::SamplerState(expected) if call == expected)
+            {
+                self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            self.inner.sampler_state()
+        }
+
+        fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
+            self.inner.restore_sampler_state(state)
+        }
+    }
+
+    struct ArmedCandidateReward {
+        armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl RewardFn for ArmedCandidateReward {
+        type Target = ();
+
+        fn reward(&self, sample: &Sample<()>, completion: &str) -> Result<f32, RewardError> {
+            CandidateReward.reward(sample, completion)
+        }
+
+        fn reward_group_detailed(
+            &self,
+            sample: &Sample<()>,
+            completions: &[String],
+        ) -> Result<Vec<crate::RewardOutcome>, RewardError> {
+            let outcomes = CandidateReward.reward_group_detailed(sample, completions)?;
+            self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(outcomes)
+        }
+    }
+
+    fn stateful_candidate_policy() -> StatefulCandidatePolicy {
+        let logp =
+            Var::from_tensor(&Tensor::zeros((3, 2), DType::F32, &Device::Cpu).unwrap()).unwrap();
+        StatefulCandidatePolicy {
+            inner: CandidatePolicy { logp },
+            sampler: 0,
+        }
+    }
+
+    fn candidate_ledger_config() -> TrainerConfig {
+        TrainerConfig {
+            steps: 1,
+            group_size: 3,
+            grad_accum_steps: 1,
+            max_new_tokens: 2,
+            beta: 0.0,
+            mu: 1,
+            checkpoint_every: None,
+            ..TrainerConfig::default()
+        }
+    }
+
     #[test]
     fn collector_keeps_poststate_when_post_manifest_failure_reconciles_as_committed() {
         let tmp = WireTmp::new("ledger-post-manifest-collector");
@@ -9243,6 +9572,576 @@ mod tests {
                 handle.join().unwrap();
             }
             assert!(checkpoint_root.join("step-1/manifest.json").is_file());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // explicit two-rank fault protocol
+    fn distributed_ledger_publication_comm_failure_preserves_visibility_and_dead_world() {
+        use std::sync::atomic::Ordering;
+
+        let tmp = WireTmp::new("distributed-ledger-publication-terminal-comm");
+        let ledger_root = tmp.0.join("ledger");
+        let final_dir = ledger_root.join("step-00000000000000000000");
+        let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Arming on the collector's second sampler snapshot leaves exactly 21
+        // successful collectives through shard status; the next call is the
+        // manifest-publication status reduction and must fail on both ranks.
+        let states: Vec<_> = (0..2)
+            .map(|_| std::sync::Arc::new(ArmedCollectiveFailureState::new(21)))
+            .collect();
+        let comms =
+            crate::comm::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(10));
+        let outcomes: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = comms
+                .into_iter()
+                .zip(states.iter().cloned())
+                .map(|(inner, state)| {
+                    let rank = inner.rank();
+                    let base = tmp.0.clone();
+                    let ledger_root = ledger_root.clone();
+                    let final_dir = final_dir.clone();
+                    let armed = std::sync::Arc::clone(&armed);
+                    scope.spawn(move || {
+                        let comm = FailAfterArmComm {
+                            inner,
+                            armed: std::sync::Arc::clone(&armed),
+                            state,
+                        };
+                        let run = RunDir::create(&base, format!("rank-{rank}")).unwrap();
+                        let mut trainer =
+                            Trainer::with_comm(candidate_ledger_config(), &run, comm).unwrap();
+                        let mut policy = ArmedCandidatePolicy {
+                            inner: stateful_candidate_policy(),
+                            armed,
+                            arm_point: CandidatePolicyArmPoint::SamplerState(2),
+                            sampler_state_calls: std::cell::Cell::new(0),
+                        };
+                        let error = trainer
+                            .collect_rollout_ledger_step(
+                                0,
+                                &mut policy,
+                                &CandidateReward,
+                                &CandidateCodec,
+                                &[Sample::new("p", ()), Sample::new("q", ())],
+                                &ledger_root,
+                                &"f".repeat(64),
+                                None,
+                            )
+                            .unwrap_err();
+                        match &error {
+                            TrainerError::PublicationAmbiguousAfterComm {
+                                artifact,
+                                path,
+                                communication: _,
+                                detail: _,
+                            } => {
+                                assert_eq!(*artifact, "distributed rollout ledger");
+                                assert_eq!(path, &final_dir);
+                            }
+                            other => panic!(
+                                "rank {rank}: expected publication+communication ambiguity, got {other:?}"
+                            ),
+                        }
+                        (rank, error.to_string(), policy.inner.sampler)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        });
+
+        for (rank, message, sampler) in outcomes {
+            assert!(
+                message.contains("publication may be visible"),
+                "rank {rank}: {message}"
+            );
+            assert!(
+                message.contains("data-parallel world is dead"),
+                "rank {rank}: {message}"
+            );
+            assert!(
+                message.contains("discard the communicator"),
+                "rank {rank}: {message}"
+            );
+            assert_eq!(
+                sampler, 1,
+                "rank {rank} rewound a potentially visible ledger"
+            );
+        }
+        for (rank, state) in states.iter().enumerate() {
+            assert!(
+                state.failed.load(Ordering::SeqCst),
+                "rank {rank}: fault not consumed"
+            );
+            assert_eq!(
+                state.remaining_successes.load(Ordering::SeqCst),
+                0,
+                "rank {rank}: failed at the wrong publication boundary"
+            );
+            assert_eq!(
+                state.calls_after_failure.load(Ordering::SeqCst),
+                0,
+                "rank {rank}: collective issued after publication-status failure"
+            );
+        }
+        assert!(final_dir.join("manifest.json").is_file());
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // explicit two-rank fault protocol
+    fn distributed_continuation_publication_comm_failure_preserves_visibility_and_dead_world() {
+        use std::sync::atomic::Ordering;
+
+        let tmp = WireTmp::new("distributed-continuation-publication-terminal-comm");
+        let ledger_root = tmp.0.join("ledger");
+        let checkpoint_root = tmp.0.join("continuations");
+        let final_dir = checkpoint_root.join("step-1");
+        let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        // Save preflight, serialization, and the eight-word digest consensus
+        // consume 11 successful reductions. Publication status is the next one.
+        let states: Vec<_> = (0..2)
+            .map(|_| std::sync::Arc::new(ArmedCollectiveFailureState::new(11)))
+            .collect();
+        let comms =
+            crate::comm::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(10));
+        let outcomes: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = comms
+                .into_iter()
+                .zip(states.iter().cloned())
+                .map(|(inner, state)| {
+                    let rank = inner.rank();
+                    let base = tmp.0.clone();
+                    let ledger_root = ledger_root.clone();
+                    let checkpoint_root = checkpoint_root.clone();
+                    let final_dir = final_dir.clone();
+                    let armed = std::sync::Arc::clone(&armed);
+                    let barrier = std::sync::Arc::clone(&barrier);
+                    scope.spawn(move || {
+                        let comm = FailAfterArmComm {
+                            inner,
+                            armed: std::sync::Arc::clone(&armed),
+                            state,
+                        };
+                        let run = RunDir::create(&base, format!("rank-{rank}")).unwrap();
+                        let mut trainer =
+                            Trainer::with_comm(candidate_ledger_config(), &run, comm).unwrap();
+                        let mut collector = stateful_candidate_policy();
+                        trainer
+                            .collect_rollout_ledger_step(
+                                0,
+                                &mut collector,
+                                &CandidateReward,
+                                &CandidateCodec,
+                                &[Sample::new("p", ()), Sample::new("q", ())],
+                                &ledger_root,
+                                &"1".repeat(64),
+                                None,
+                            )
+                            .unwrap();
+                        let mut learner = stateful_candidate_policy();
+                        let (_, continuation) = trainer
+                            .train_rollout_ledger_step(
+                                0,
+                                &mut learner,
+                                &ledger_root,
+                                &"1".repeat(64),
+                                None,
+                            )
+                            .unwrap();
+                        barrier.wait();
+                        if rank == 0 {
+                            armed.store(true, Ordering::SeqCst);
+                        }
+                        barrier.wait();
+                        let error = trainer
+                            .save_rollout_ledger_continuation_to(
+                                &checkpoint_root,
+                                &learner,
+                                &continuation,
+                            )
+                            .unwrap_err();
+                        match &error {
+                            TrainerError::PublicationAmbiguousAfterComm {
+                                artifact,
+                                path,
+                                communication: _,
+                                detail: _,
+                            } => {
+                                assert_eq!(*artifact, "rollout-ledger continuation");
+                                assert_eq!(path, &final_dir);
+                            }
+                            other => panic!(
+                                "rank {rank}: expected publication+communication ambiguity, got {other:?}"
+                            ),
+                        }
+                        (rank, error.to_string())
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        });
+
+        for (rank, message) in outcomes {
+            assert!(
+                message.contains("publication may be visible"),
+                "rank {rank}: {message}"
+            );
+            assert!(
+                message.contains("data-parallel world is dead"),
+                "rank {rank}: {message}"
+            );
+            assert!(
+                message.contains("discard the communicator"),
+                "rank {rank}: {message}"
+            );
+        }
+        for (rank, state) in states.iter().enumerate() {
+            assert!(
+                state.failed.load(Ordering::SeqCst),
+                "rank {rank}: fault not consumed"
+            );
+            assert_eq!(state.remaining_successes.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                state.calls_after_failure.load(Ordering::SeqCst),
+                0,
+                "rank {rank}: collective issued after publication-status failure"
+            );
+        }
+        assert!(final_dir.join("manifest.json").is_file());
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // explicit two-rank fault protocol
+    fn learner_count_chain_stops_after_first_failed_reduction() {
+        use std::sync::atomic::Ordering;
+
+        let tmp = WireTmp::new("learner-count-chain-terminal-comm");
+        let ledger_root = tmp.0.join("ledger");
+        let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // After detached scoring: scoring status, local-count status, exact
+        // conversion, and token reduction succeed; live-count reduction fails.
+        let states: Vec<_> = (0..2)
+            .map(|_| std::sync::Arc::new(ArmedCollectiveFailureState::new(4)))
+            .collect();
+        let comms =
+            crate::comm::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(10));
+        let outcomes: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = comms
+                .into_iter()
+                .zip(states.iter().cloned())
+                .map(|(inner, state)| {
+                    let rank = inner.rank();
+                    let base = tmp.0.clone();
+                    let ledger_root = ledger_root.clone();
+                    let armed = std::sync::Arc::clone(&armed);
+                    scope.spawn(move || {
+                        let comm = FailAfterArmComm {
+                            inner,
+                            armed: std::sync::Arc::clone(&armed),
+                            state,
+                        };
+                        let run = RunDir::create(&base, format!("rank-{rank}")).unwrap();
+                        let mut trainer =
+                            Trainer::with_comm(candidate_ledger_config(), &run, comm).unwrap();
+                        let mut collector = stateful_candidate_policy();
+                        trainer
+                            .collect_rollout_ledger_step(
+                                0,
+                                &mut collector,
+                                &CandidateReward,
+                                &CandidateCodec,
+                                &[Sample::new("p", ()), Sample::new("q", ())],
+                                &ledger_root,
+                                &"2".repeat(64),
+                                None,
+                            )
+                            .unwrap();
+                        let mut learner = ArmedCandidatePolicy {
+                            inner: stateful_candidate_policy(),
+                            armed,
+                            arm_point: CandidatePolicyArmPoint::DetachedScoring,
+                            sampler_state_calls: std::cell::Cell::new(0),
+                        };
+                        let error = trainer
+                            .train_rollout_ledger_step(
+                                0,
+                                &mut learner,
+                                &ledger_root,
+                                &"2".repeat(64),
+                                None,
+                            )
+                            .unwrap_err();
+                        (rank, error.to_string())
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        });
+
+        for (rank, message) in outcomes {
+            assert!(
+                message.contains("data-parallel world is dead"),
+                "rank {rank}: {message}"
+            );
+            assert!(message.contains("discard the policy and optimizer state"));
+        }
+        for (rank, state) in states.iter().enumerate() {
+            assert!(
+                state.failed.load(Ordering::SeqCst),
+                "rank {rank}: fault not consumed"
+            );
+            assert_eq!(state.remaining_successes.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                state.calls_after_failure.load(Ordering::SeqCst),
+                0,
+                "rank {rank}: learner issued a reduction after live-count failure"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // explicit two-rank fault protocol
+    fn reward_statistics_chain_stops_after_first_failed_reduction() {
+        use std::sync::atomic::Ordering;
+
+        let tmp = WireTmp::new("reward-stat-chain-terminal-comm");
+        let ledger_root = tmp.0.join("ledger");
+        let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Reward callback arming is followed by rollout/reward status, candidate
+        // write status, and reward-count reduction. Reward-sum then fails, so
+        // sum-of-squares must never be attempted.
+        let states: Vec<_> = (0..2)
+            .map(|_| std::sync::Arc::new(ArmedCollectiveFailureState::new(3)))
+            .collect();
+        let comms =
+            crate::comm::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(10));
+        let outcomes: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = comms
+                .into_iter()
+                .zip(states.iter().cloned())
+                .map(|(inner, state)| {
+                    let rank = inner.rank();
+                    let base = tmp.0.clone();
+                    let ledger_root = ledger_root.clone();
+                    let armed = std::sync::Arc::clone(&armed);
+                    scope.spawn(move || {
+                        let comm = FailAfterArmComm {
+                            inner,
+                            armed: std::sync::Arc::clone(&armed),
+                            state,
+                        };
+                        let run = RunDir::create(&base, format!("rank-{rank}")).unwrap();
+                        let mut config = candidate_ledger_config();
+                        config.reward_group_scope = RewardGroupScope::DistributedSamePrompt;
+                        let mut trainer = Trainer::with_comm(config, &run, comm).unwrap();
+                        let mut policy = stateful_candidate_policy();
+                        let error = trainer
+                            .collect_rollout_ledger_step(
+                                0,
+                                &mut policy,
+                                &ArmedCandidateReward { armed },
+                                &CandidateCodec,
+                                &[Sample::new("p", ()), Sample::new("q", ())],
+                                &ledger_root,
+                                &"3".repeat(64),
+                                None,
+                            )
+                            .unwrap_err();
+                        (rank, error.to_string(), policy.sampler)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        });
+
+        for (rank, message, sampler) in outcomes {
+            assert!(
+                message.contains("data-parallel world is dead"),
+                "rank {rank}: {message}"
+            );
+            assert_eq!(
+                sampler, 0,
+                "rank {rank}: local sampler rollback did not run"
+            );
+        }
+        for (rank, state) in states.iter().enumerate() {
+            assert!(
+                state.failed.load(Ordering::SeqCst),
+                "rank {rank}: fault not consumed"
+            );
+            assert_eq!(state.remaining_successes.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                state.calls_after_failure.load(Ordering::SeqCst),
+                0,
+                "rank {rank}: reward sumsq reduction ran after reward-sum failure"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // explicit fault matrix and two-rank protocol
+    fn distributed_metrics_comm_failure_reports_truncate_error_and_panic() {
+        use std::sync::atomic::Ordering;
+
+        for (fault, injected_message) in [
+            ("error", "injected metrics truncate failure"),
+            ("panic", "injected metrics truncate panic"),
+        ] {
+            let tmp = WireTmp::new(&format!("distributed-metrics-terminal-{fault}"));
+            let ledger_root = tmp.0.join("ledger");
+            let states: Vec<_> = (0..2)
+                .map(|_| std::sync::Arc::new(MetricsStatusFailureState::new()))
+                .collect();
+            let comms =
+                crate::comm::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(10));
+            let outcomes: Vec<_> = std::thread::scope(|scope| {
+                let handles: Vec<_> = comms
+                    .into_iter()
+                    .zip(states.iter().cloned())
+                    .map(|(inner, state)| {
+                        let rank = inner.rank();
+                        let base = tmp.0.clone();
+                        let ledger_root = ledger_root.clone();
+                        scope.spawn(move || {
+                            let run = RunDir::create(&base, format!("rank-{rank}")).unwrap();
+                            let comm = FailAtMetricsStatusComm {
+                                inner,
+                                metrics_path: run.metrics_path().to_path_buf(),
+                                state,
+                            };
+                            let mut trainer =
+                                Trainer::with_comm(candidate_ledger_config(), &run, comm).unwrap();
+                            let mut collector = stateful_candidate_policy();
+                            trainer
+                                .collect_rollout_ledger_step(
+                                    0,
+                                    &mut collector,
+                                    &CandidateReward,
+                                    &CandidateCodec,
+                                    &[Sample::new("p", ()), Sample::new("q", ())],
+                                    &ledger_root,
+                                    &"4".repeat(64),
+                                    None,
+                                )
+                                .unwrap();
+
+                            let mut learner = stateful_candidate_policy();
+                            let adapter_before = learner
+                                .inner
+                                .logp
+                                .as_tensor()
+                                .flatten_all()
+                                .unwrap()
+                                .to_vec1::<f32>()
+                                .unwrap();
+                            let sampler_before = learner.sampler;
+                            match fault {
+                                "error" => trainer.writer.inject_truncate_failure_once(),
+                                "panic" => trainer.writer.inject_truncate_panic_once(),
+                                other => unreachable!("unknown metrics rollback fault {other}"),
+                            }
+                            let error = trainer
+                                .train_rollout_ledger_step(
+                                    0,
+                                    &mut learner,
+                                    &ledger_root,
+                                    &"4".repeat(64),
+                                    None,
+                                )
+                                .unwrap_err();
+                            let adapter_after = learner
+                                .inner
+                                .logp
+                                .as_tensor()
+                                .flatten_all()
+                                .unwrap()
+                                .to_vec1::<f32>()
+                                .unwrap();
+                            (
+                                rank,
+                                error.to_string(),
+                                adapter_before,
+                                adapter_after,
+                                sampler_before,
+                                learner.sampler,
+                                crate::telemetry::read_metrics(run.metrics_path())
+                                    .unwrap()
+                                    .len(),
+                            )
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().unwrap())
+                    .collect()
+            });
+
+            for (
+                rank,
+                message,
+                adapter_before,
+                adapter_after,
+                sampler_before,
+                sampler_after,
+                rows,
+            ) in outcomes
+            {
+                assert!(
+                    message.contains("data-parallel world is dead"),
+                    "{fault} rank {rank}: {message}"
+                );
+                assert!(
+                    message.contains("best-effort local metrics rollback failed"),
+                    "{fault} rank {rank}: {message}"
+                );
+                assert!(
+                    message.contains(injected_message),
+                    "{fault} rank {rank}: {message}"
+                );
+                assert!(
+                    message.contains("must be repaired or discarded"),
+                    "{fault} rank {rank}: {message}"
+                );
+                assert!(
+                    message.contains("best-effort local rollback completed"),
+                    "{fault} rank {rank}: {message}"
+                );
+                assert!(
+                    message.contains("discard the policy and optimizer state"),
+                    "{fault} rank {rank}: {message}"
+                );
+                assert_eq!(adapter_after, adapter_before, "{fault} rank {rank} adapter");
+                assert_eq!(sampler_after, sampler_before, "{fault} rank {rank} sampler");
+                assert_eq!(
+                    rows, 1,
+                    "{fault} rank {rank}: injected truncate fault unexpectedly removed the row"
+                );
+            }
+            for (rank, state) in states.iter().enumerate() {
+                assert!(
+                    state.failed.load(Ordering::SeqCst),
+                    "{fault} rank {rank}: metrics status fault not consumed"
+                );
+                assert_eq!(
+                    state.calls_after_failure.load(Ordering::SeqCst),
+                    0,
+                    "{fault} rank {rank}: collective issued after metrics status failure"
+                );
+            }
         }
     }
 
