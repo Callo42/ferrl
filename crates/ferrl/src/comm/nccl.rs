@@ -27,6 +27,14 @@
 //! before entering the payload collective; Gemma adapter validation is the
 //! production example.
 //!
+//! Status rendezvous can globalize an ordinary returned error or a Rust panic
+//! only while every rank remains alive and able to enter the control
+//! collective. They cannot recover a peer that is killed, loses its CUDA
+//! context, or stalls in a backend/allocation before that rendezvous. Real NCCL
+//! launches therefore still require allocation-wide external supervision that
+//! terminates every rank when one process exits or exceeds its wall-clock
+//! budget; this is a launcher/job contract, not an in-process `Comm` guarantee.
+//!
 //! ## Determinism: cross-rank agreement, not a sequential fold
 //!
 //! NCCL guarantees **every rank receives the bit-identical all-reduce output** —

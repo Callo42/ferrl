@@ -63,6 +63,42 @@ use crate::tensor_parallel::{
     TensorParallelPlan,
 };
 
+#[cfg(test)]
+thread_local! {
+    static DENSE_TENSOR_PARALLEL_LOCAL_STAGE_FAULT:
+        std::cell::RefCell<Option<(&'static str, bool)>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn inject_dense_tensor_parallel_local_stage_failure_once(
+    stage: &'static str,
+    panic: bool,
+) {
+    DENSE_TENSOR_PARALLEL_LOCAL_STAGE_FAULT.with(|fault| fault.replace(Some((stage, panic))));
+}
+
+#[cfg(test)]
+pub(crate) fn dense_tensor_parallel_local_stage_fault_consumed() -> bool {
+    DENSE_TENSOR_PARALLEL_LOCAL_STAGE_FAULT.with(|fault| fault.borrow().is_none())
+}
+
+#[cfg(test)]
+fn maybe_inject_dense_tensor_parallel_local_stage_failure(stage: &str) -> CandleResult<()> {
+    let behavior = DENSE_TENSOR_PARALLEL_LOCAL_STAGE_FAULT.with(|fault| {
+        let mut fault = fault.borrow_mut();
+        if fault.as_ref().is_some_and(|(target, _)| *target == stage) {
+            fault.take().map(|(_, panic)| panic)
+        } else {
+            None
+        }
+    });
+    match behavior {
+        Some(true) => panic!("injected {stage} panic"),
+        Some(false) => candle_core::bail!("injected {stage} failure"),
+        None => Ok(()),
+    }
+}
+
 /// The per-architecture seam of the shared dense backbone.
 ///
 /// An implementor is a zero-sized marker (e.g. `QwenArch`, `LlamaArch`) that
@@ -125,7 +161,11 @@ fn coordinate_tensor_parallel_local_call<T>(
     call: impl FnOnce() -> CandleResult<T>,
 ) -> CandleResult<T> {
     match comm {
-        Some(comm) => coordinate_local_candle_call(comm, label, call),
+        Some(comm) => coordinate_local_candle_call(comm, label, || {
+            #[cfg(test)]
+            maybe_inject_dense_tensor_parallel_local_stage_failure(label)?;
+            call()
+        }),
         None if plan.is_sharded() => candle_core::bail!(
             "{label} for tensor-parallel world size {} needs a communicator",
             plan.world_size()

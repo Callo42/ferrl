@@ -196,6 +196,12 @@ impl StatefulScriptedPolicy {
         self.tp_gradient_multiplier = multiplier;
         self
     }
+
+    fn tp_gradient_partition(&self, comm: &dyn Comm) -> Vec<usize> {
+        (0..self.trainable_vars().len())
+            .filter(|index| index % comm.world_size() == comm.rank())
+            .collect()
+    }
 }
 
 impl Policy for StatefulScriptedPolicy {
@@ -296,11 +302,10 @@ impl TensorParallelPolicy for StatefulScriptedPolicy {
     fn token_logprobs_tensor_parallel(
         &self,
         rollout: &Rollout,
-        comm: &dyn Comm,
+        _comm: &dyn Comm,
     ) -> CandleResult<Tensor> {
         let full = self.token_logprobs(rollout)?;
-        let coefficient = self.tp_gradient_multiplier / comm.world_size() as f64;
-        let partial = full.affine(coefficient, 0.0)?;
+        let partial = full.affine(self.tp_gradient_multiplier, 0.0)?;
         let gradient_carrier = partial.broadcast_sub(&partial.detach())?;
         full.detach().broadcast_add(&gradient_carrier)
     }
@@ -316,9 +321,21 @@ impl TensorParallelPolicy for StatefulScriptedPolicy {
     fn backward_tensor_parallel(
         &self,
         loss: &Tensor,
-        _comm: &dyn Comm,
+        comm: &dyn Comm,
     ) -> CandleResult<candle_core::backprop::GradStore> {
-        loss.backward()
+        let mut grads = loss.backward()?;
+        for (index, var) in self.trainable_vars().iter().enumerate() {
+            if index % comm.world_size() != comm.rank() {
+                if let Some(zero) = grads
+                    .get(var.as_tensor())
+                    .map(Tensor::zeros_like)
+                    .transpose()?
+                {
+                    grads.insert(var.as_tensor(), zero);
+                }
+            }
+        }
+        Ok(grads)
     }
 
     fn supports_sharded_tensor_parallel_backward(&self) -> bool {
@@ -3081,6 +3098,7 @@ struct StatefulTpRank {
     sampler: Vec<u8>,
     optimizer: AdamBits,
     lineages: Vec<String>,
+    tp_gradient_partition: Vec<usize>,
 }
 
 fn copy_checkpoint_package(source: &Path, destination: &Path) {
@@ -3172,6 +3190,7 @@ fn run_stateful_world_one_reference(
         sampler: policy.sampler_state().unwrap(),
         optimizer: optimizer_bits(&loaded.optimizer_state.unwrap()),
         lineages: Vec::new(),
+        tp_gradient_partition: (0..policy.trainable_vars().len()).collect(),
     }
 }
 
@@ -3206,6 +3225,7 @@ fn run_stateful_direct_tp_scaled(
                     let mut policy = StatefulScriptedPolicy::new(SEED, 0)
                         .unwrap()
                         .with_tp_gradient_multiplier(tp_gradient_multiplier);
+                    let tp_gradient_partition = policy.tp_gradient_partition(&comm);
                     let initial_adapter = var_bits(&policy);
                     let run = RunDir::create(&base, format!("{tag}-rank{rank}")).unwrap();
                     let metrics_path = run.metrics_path().to_path_buf();
@@ -3235,6 +3255,7 @@ fn run_stateful_direct_tp_scaled(
                         sampler: policy.sampler_state().unwrap(),
                         optimizer: optimizer_bits(&loaded.optimizer_state.unwrap()),
                         lineages: Vec::new(),
+                        tp_gradient_partition,
                     }
                 })
             })
@@ -3368,6 +3389,7 @@ fn run_stateful_separated_tp(
                     }
 
                     let continuation = continuation.unwrap();
+                    let tp_gradient_partition = learner.tp_gradient_partition(&comm);
                     StatefulTpRank {
                         initial_adapter,
                         adapter: var_bits(&learner),
@@ -3376,6 +3398,7 @@ fn run_stateful_separated_tp(
                         sampler: learner.sampler_state().unwrap(),
                         optimizer: optimizer_bits(continuation.optimizer_state()),
                         lineages,
+                        tp_gradient_partition,
                     }
                 })
             })
@@ -3428,6 +3451,24 @@ fn world_two_tensor_parallel_rollout_ledger_matches_direct_across_restart() {
         .lineages
         .windows(2)
         .all(|pair| pair[0] != pair[1]));
+    assert!(!direct[0].tp_gradient_partition.is_empty());
+    assert!(!direct[1].tp_gradient_partition.is_empty());
+    assert_ne!(
+        direct[0].tp_gradient_partition,
+        direct[1].tp_gradient_partition
+    );
+    assert_eq!(
+        separated[0].tp_gradient_partition,
+        direct[0].tp_gradient_partition
+    );
+    assert_eq!(
+        separated[1].tp_gradient_partition,
+        direct[1].tp_gradient_partition
+    );
+    let mut reconstructed_partition = direct[0].tp_gradient_partition.clone();
+    reconstructed_partition.extend_from_slice(&direct[1].tp_gradient_partition);
+    reconstructed_partition.sort_unstable();
+    assert_eq!(reconstructed_partition, reference.tp_gradient_partition);
 
     for rank in 0..2 {
         assert_eq!(direct[rank].adapter, reference.adapter);

@@ -136,8 +136,11 @@ pub type MergedDecoder = DenseCachedDecoder;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::comm::LocalComm;
-    use crate::dense::DenseLayer;
+    use crate::comm::{Comm, CommError, LocalComm};
+    use crate::dense::{
+        dense_tensor_parallel_local_stage_fault_consumed,
+        inject_dense_tensor_parallel_local_stage_failure_once, DenseLayer,
+    };
     use crate::lora::{DenseLoraTargets, Proj};
     use crate::model::GradModel;
     use crate::nn::{grad_coverage, RmsNorm};
@@ -152,6 +155,9 @@ mod tests {
     use candle_nn::{Activation, VarBuilder};
     use candle_transformers::models::qwen3::ModelForCausalLM;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
 
     fn dev() -> Device {
         Device::Cpu
@@ -789,6 +795,35 @@ mod tests {
         cfg
     }
 
+    #[derive(Debug)]
+    struct CountingTensorComm {
+        inner: LocalComm,
+        tensor_payload_calls: Arc<AtomicUsize>,
+    }
+
+    impl Comm for CountingTensorComm {
+        fn rank(&self) -> usize {
+            self.inner.rank()
+        }
+
+        fn world_size(&self) -> usize {
+            self.inner.world_size()
+        }
+
+        fn validate_all_reduce_sum(&self, tensors: &[Tensor]) -> Result<(), CommError> {
+            self.inner.validate_all_reduce_sum(tensors)
+        }
+
+        fn all_reduce_sum(&self, tensors: &mut Vec<Tensor>) -> Result<(), CommError> {
+            self.tensor_payload_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.all_reduce_sum(tensors)
+        }
+
+        fn all_reduce_scalar_sum(&self, value: f64) -> Result<f64, CommError> {
+            self.inner.all_reduce_scalar_sum(value)
+        }
+    }
+
     fn assert_rank_tp_projection_grads_live(
         rank: usize,
         vars: &[Var],
@@ -999,6 +1034,83 @@ mod tests {
                 worst <= 1e-5,
                 "rank {rank} TP collective logits diverged from unsharded logits: {worst}"
             );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn dense_builtin_forward_and_cached_stages_coordinate_asymmetric_errors_and_panics() {
+        for (cached, stage) in [
+            (false, "dense attention boundary completion"),
+            (true, "dense cached attention boundary completion"),
+        ] {
+            for panic in [false, true] {
+                let cfg = tiny_tp_gqa_cfg();
+                let weights = weight_map(&cfg);
+                let input = ids(4);
+                let tensor_payload_calls = Arc::new(AtomicUsize::new(0));
+                let errors = std::thread::scope(|scope| {
+                    let handles = LocalComm::world_with_timeout(2, Duration::from_secs(2))
+                        .into_iter()
+                        .map(|inner| {
+                            let cfg = cfg.clone();
+                            let weights = weights.clone();
+                            let input = input.clone();
+                            let tensor_payload_calls = Arc::clone(&tensor_payload_calls);
+                            scope.spawn(move || {
+                                let rank = inner.rank();
+                                let comm = CountingTensorComm {
+                                    inner,
+                                    tensor_payload_calls,
+                                };
+                                let model = QwenGradModel::load_with_targets(
+                                    &cfg,
+                                    &VarBuilder::from_tensors(weights, DType::F32, &dev()),
+                                    2,
+                                    4.0,
+                                    DType::F32,
+                                    DenseLoraTargets::industrial(),
+                                )
+                                .unwrap();
+                                if rank == 1 {
+                                    inject_dense_tensor_parallel_local_stage_failure_once(
+                                        stage, panic,
+                                    );
+                                }
+                                let result = if cached {
+                                    let mut decoder = model.merged_decoder().unwrap();
+                                    decoder.forward_tensor_parallel(&input, 0, &comm)
+                                } else {
+                                    model.forward_tensor_parallel(&input, &comm)
+                                };
+                                (
+                                    rank,
+                                    result.unwrap_err().to_string(),
+                                    dense_tensor_parallel_local_stage_fault_consumed(),
+                                )
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    handles
+                        .into_iter()
+                        .map(|handle| handle.join().unwrap())
+                        .collect::<Vec<_>>()
+                });
+
+                for (rank, error, fault_consumed) in errors {
+                    if rank == 1 {
+                        assert!(error.contains(&format!("injected {stage}")), "{error}");
+                        assert!(fault_consumed, "{stage} injector was not consumed");
+                    } else {
+                        assert!(error.contains("failed on a peer"), "{error}");
+                    }
+                }
+                assert_eq!(
+                    tensor_payload_calls.load(Ordering::SeqCst),
+                    2,
+                    "cached={cached} panic={panic}: a later MLP payload was entered"
+                );
+            }
         }
     }
 

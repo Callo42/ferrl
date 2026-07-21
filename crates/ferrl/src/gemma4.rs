@@ -4206,9 +4206,13 @@ mod tests {
     #[test]
     #[allow(clippy::cognitive_complexity)]
     fn gemma4_builtin_forward_stages_coordinate_asymmetric_errors_and_panics() {
-        for (cached, stage) in [
-            (false, "Gemma4 attention boundary completion"),
-            (true, "Gemma4 cached attention boundary completion"),
+        for (mode, stage, expected_tensor_calls) in [
+            ("full", "Gemma4 attention boundary completion", 2),
+            ("full", "Gemma4 MLP boundary completion", 4),
+            ("cached", "Gemma4 cached attention boundary completion", 2),
+            ("cached", "Gemma4 cached MLP boundary completion", 4),
+            ("remat", "Gemma4 rematerialized attention capture", 0),
+            ("remat", "Gemma4 rematerialized MLP capture", 2),
         ] {
             for panic in [false, true] {
                 let mut cfg = tiny_cfg();
@@ -4233,7 +4237,7 @@ mod tests {
                                     inner,
                                     tensor_payload_calls,
                                 };
-                                let model = Gemma4GradModel::load_with_targets(
+                                let mut model = Gemma4GradModel::load_with_targets(
                                     &cfg,
                                     &VarBuilder::from_tensors(weights, DType::F32, &dev()),
                                     2,
@@ -4245,11 +4249,17 @@ mod tests {
                                 if rank == 1 {
                                     inject_tensor_parallel_local_stage_failure_once(stage, panic);
                                 }
-                                let result = if cached {
-                                    let mut decoder = model.merged_decoder().unwrap();
-                                    decoder.forward_tensor_parallel(&input, 0, &comm)
-                                } else {
-                                    model.forward_tensor_parallel(&input, &comm)
+                                let result = match mode {
+                                    "full" => model.forward_tensor_parallel(&input, &comm),
+                                    "cached" => {
+                                        let mut decoder = model.merged_decoder().unwrap();
+                                        decoder.forward_tensor_parallel(&input, 0, &comm)
+                                    }
+                                    "remat" => {
+                                        model.set_activation_checkpointing(true);
+                                        model.forward_tensor_parallel(&input, &comm)
+                                    }
+                                    other => unreachable!("unknown test mode {other}"),
                                 };
                                 (
                                     rank,
@@ -4275,8 +4285,8 @@ mod tests {
                 }
                 assert_eq!(
                     tensor_payload_calls.load(std::sync::atomic::Ordering::SeqCst),
-                    2,
-                    "cached={cached} panic={panic}: a later MLP payload was entered"
+                    expected_tensor_calls,
+                    "mode={mode} stage={stage} panic={panic}: a later tensor payload was entered"
                 );
             }
         }
