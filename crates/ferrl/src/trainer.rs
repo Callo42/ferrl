@@ -86,8 +86,8 @@ use crate::policy::{GenConfig, Policy, Rollout, TensorParallelPolicy};
 use crate::reward::{RewardError, RewardFn, RewardOutcome};
 use crate::rollout_ledger::{
     LedgerScoreRequirement, RolloutLedgerControls, RolloutLedgerError, RolloutLedgerExpectations,
-    RolloutLedgerGroup, RolloutLedgerIdentity, RolloutLedgerReader, RolloutLedgerStep,
-    RolloutLedgerWriter,
+    RolloutLedgerGroup, RolloutLedgerGroupScope, RolloutLedgerIdentity, RolloutLedgerReader,
+    RolloutLedgerRewardStats, RolloutLedgerStep, RolloutLedgerWriter,
 };
 use crate::sample::Sample;
 use crate::telemetry::{
@@ -126,6 +126,34 @@ pub enum TrainerError {
     /// timing out, or a poisoned world) — see [`crate::comm`].
     #[error(transparent)]
     Comm(#[from] crate::comm::CommError),
+    /// A reader-visible publication may exist, but the status collective failed,
+    /// so callers must preserve publication-side state and discard the dead world.
+    #[error(
+        "{artifact} publication may be visible at {path}; {detail}; communication failed ({communication}); the data-parallel world is dead and no further collectives are safe; discard the communicator"
+    )]
+    PublicationAmbiguousAfterComm {
+        /// Human-readable artifact kind (continuation or rollout ledger).
+        artifact: &'static str,
+        /// Reader-visible destination whose publication is uncertain.
+        path: PathBuf,
+        /// Publication boundary crossed before communication failed.
+        detail: String,
+        /// Terminal collective failure that killed the data-parallel world.
+        #[source]
+        communication: Box<crate::comm::CommError>,
+    },
+    /// Metrics publication lost its status collective after the local append;
+    /// the learner envelope must combine telemetry and model rollback outcomes.
+    #[error(
+        "rollout-ledger metrics append-status communication failed ({communication}); {telemetry_rollback}"
+    )]
+    RolloutLedgerMetricsComm {
+        /// Terminal collective failure that killed the data-parallel world.
+        #[source]
+        communication: Box<crate::comm::CommError>,
+        /// Exact success/failure detail from panic-contained local truncation.
+        telemetry_rollback: String,
+    },
     /// A separated rollout/learner ledger could not be published or validated.
     #[error(transparent)]
     RolloutLedger(#[from] RolloutLedgerError),
@@ -141,6 +169,7 @@ pub enum TrainerError {
 #[derive(Debug)]
 pub struct RolloutLedgerContinuation {
     completed_step: u64,
+    world_size: u32,
     optimizer_state: OptimizerState,
     policy_sha256: String,
     trainer_config_sha256: String,
@@ -158,6 +187,18 @@ impl RolloutLedgerContinuation {
     #[must_use]
     pub fn completed_step(&self) -> u64 {
         self.completed_step
+    }
+
+    /// Data-parallel topology bound to this continuation.
+    #[must_use]
+    pub fn world_size(&self) -> u32 {
+        self.world_size
+    }
+
+    /// Exact chain lineage represented by the post-step continuation.
+    #[must_use]
+    pub fn lineage_sha256(&self) -> &str {
+        &self.lineage_sha256
     }
 
     /// Borrow the exact Adam continuation for diagnostics or orchestration.
@@ -1178,9 +1219,11 @@ struct LiveItem {
 struct CollectedGroup {
     accum_index: u32,
     prompt_index: u64,
+    rollout_global_row_base: u64,
     rollout: Rollout,
     rewards: Vec<f32>,
     advantages: Vec<f64>,
+    distributed_reward_stats: Option<RolloutLedgerRewardStats>,
     mask_rows: Vec<Vec<f64>>,
     stat: PromptStat,
     surrogate_live: bool,
@@ -1786,19 +1829,19 @@ impl Trainer {
         self
     }
 
-    /// Collect and atomically publish one world-1 rollout window without scoring
+    /// Collect and atomically publish one global rollout window without scoring
     /// old/reference log-probabilities or mutating learner parameters.
     ///
     /// `policy_sha256` must be a verified lowercase SHA-256 digest binding the
     /// frozen model content and its execution recipe. It is the sole identity
     /// datum the generic [`Policy`] seam cannot derive from live state today.
-    /// Format v3 does not publish collector performance telemetry; a future
+    /// Format v4 does not publish collector performance telemetry; a future
     /// phase-specific schema can do so without mislabelling asynchronous work as
     /// an ordinary whole trainer step.
     ///
     /// # Errors
     ///
-    /// Returns [`TrainerError`] for a non-world-1 trainer, an out-of-range step,
+    /// Returns [`TrainerError`] for an invalid DP topology, an out-of-range step,
     /// malformed identity/state, collection failure, or publication failure.
     #[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
     pub fn collect_rollout_ledger_step<P, R>(
@@ -1816,112 +1859,199 @@ impl Trainer {
         P: Policy,
         R: RewardFn,
     {
-        self.require_world_one_rollout_ledger()?;
-        self.require_rollout_ledger_step_in_range(step)?;
-        validate_external_policy_sha256(policy_sha256)?;
-        if samples.is_empty() {
-            return Err(TrainerError::Contract(
-                "collect_rollout_ledger_step: no samples".into(),
-            ));
-        }
-
-        let vars = policy.trainable_vars();
-        let mut opt = self.new_optimizer(vars.clone())?;
-        if let Some(state) = continuation {
-            opt.load_state(state.optimizer_state())?;
-        }
-        let step_lr = self.config.lr_at(step);
-        let step_beta = self.config.beta_at(step);
-        self.require_toggleable_reference_policy(policy, self.config.requires_reference_policy())?;
-        opt.set_learning_rate(step_lr);
-        let installed_lr = opt.learning_rate();
-        let controls = self.rollout_ledger_controls(step, installed_lr, step_beta)?;
-        let sampler_prestate = policy.sampler_state()?;
-        let lineage = self.require_rollout_ledger_continuation_state(
-            step,
-            policy,
-            policy_sha256,
-            &vars,
-            &opt,
+        self.require_rollout_ledger_topology()?;
+        let root = root.as_ref();
+        let consensus = self.coordinate_data_parallel_result(
+            "rollout-ledger distributed input serialization",
+            serde_json::to_vec(&(
+                &self.config,
+                root.as_os_str().as_encoded_bytes(),
+                policy_sha256,
+                continuation.is_some(),
+                samples
+                    .iter()
+                    .map(|sample| sample.prompt.as_str())
+                    .collect::<Vec<_>>(),
+            ))
+            .map_err(|error| {
+                TrainerError::Contract(format!(
+                    "serialize distributed rollout-ledger inputs: {error}"
+                ))
+            }),
+        )?;
+        self.require_data_parallel_consensus_bytes(
+            "rollout-ledger root/config/prompt contract",
+            &consensus,
+        )?;
+        let (vars, opt, step_beta, controls, sampler_prestate, lineage, identity, writer) = self
+            .coordinate_data_parallel_call("rollout-ledger collector preflight", || {
+                self.require_rollout_ledger_step_in_range(step)?;
+                validate_external_policy_sha256(policy_sha256)?;
+                if samples.is_empty() {
+                    return Err(TrainerError::Contract(
+                        "collect_rollout_ledger_step: no samples".into(),
+                    ));
+                }
+                let vars = policy.trainable_vars();
+                let mut opt = self.new_optimizer(vars.clone())?;
+                if let Some(state) = continuation {
+                    opt.load_state(state.optimizer_state())?;
+                }
+                let step_lr = self.config.lr_at(step);
+                let step_beta = self.config.beta_at(step);
+                self.require_toggleable_reference_policy(
+                    policy,
+                    self.config.requires_reference_policy(),
+                )?;
+                opt.set_learning_rate(step_lr);
+                let controls =
+                    self.rollout_ledger_controls(step, opt.learning_rate(), step_beta)?;
+                let sampler_prestate = policy.sampler_state()?;
+                let lineage = self.require_rollout_ledger_continuation_state(
+                    step,
+                    policy,
+                    policy_sha256,
+                    &vars,
+                    &opt,
+                    &sampler_prestate,
+                    continuation,
+                )?;
+                let identity = self.rollout_ledger_identity(
+                    step,
+                    policy,
+                    policy_sha256,
+                    &vars,
+                    &opt,
+                    &sampler_prestate,
+                    &lineage,
+                )?;
+                let writer = RolloutLedgerWriter::create(root, identity.clone())?;
+                Ok((
+                    vars,
+                    opt,
+                    step_beta,
+                    controls,
+                    sampler_prestate,
+                    lineage,
+                    identity,
+                    writer,
+                ))
+            })?;
+        let identity_bytes = serde_json::to_vec(&(&identity, &controls)).map_err(|error| {
+            TrainerError::Contract(format!("serialize rollout-ledger identity: {error}"))
+        })?;
+        self.require_data_parallel_consensus_bytes(
+            "rollout-ledger collector identity/controls",
+            &identity_bytes,
+        )?;
+        self.require_data_parallel_consensus_bytes(
+            "rollout-ledger collector sampler prestate",
             &sampler_prestate,
-            continuation,
         )?;
         let outcome: Result<PathBuf, TrainerError> = (|| {
-            let identity = self.rollout_ledger_identity(
-                step,
-                policy,
-                policy_sha256,
-                &vars,
-                &opt,
-                &sampler_prestate,
-                &lineage,
-            )?;
-            // Validate the complete live identity before generation changes policy-local
-            // rollout state, and claim/create only the caller-provided ledger root.
-            let writer = RolloutLedgerWriter::create(root.as_ref(), identity.clone())?;
-
             let exec = UnshardedPolicyExecution;
             let mut gpu_mem = StepGpuMemory::new(false);
-            let mut collected = Vec::with_capacity(self.config.grad_accum_steps);
-            for j in 0..self.config.grad_accum_steps {
-                let sel = self.select_prompt(step, j, samples.len());
-                self.record_prompt_selection(&sel);
-                let selected = SelectedSample {
-                    sample: &samples[sel.sample_idx],
-                    selection: &sel,
-                    accum_index: j,
-                };
-                collected.push(self.collect_group(
+            let collection = (|| {
+                let mut collected = Vec::with_capacity(self.config.grad_accum_steps);
+                for j in 0..self.config.grad_accum_steps {
+                    let sel = self.select_prompt(step, j, samples.len());
+                    self.record_prompt_selection(&sel);
+                    let selected = SelectedSample {
+                        sample: &samples[sel.sample_idx],
+                        selection: &sel,
+                        accum_index: j,
+                    };
+                    collected.push(self.collect_group(
+                        step,
+                        step_beta,
+                        policy,
+                        reward_fn,
+                        tokenizer,
+                        &selected,
+                        &mut gpu_mem,
+                        &exec,
+                    )?);
+                }
+                Ok(collected)
+            })();
+            let collected = self
+                .coordinate_data_parallel_result("rollout-ledger group collection", collection)?;
+            let sampler_poststate =
+                self.coordinate_data_parallel_call("rollout-ledger collector poststate", || {
+                    let post_collection_vars = policy.trainable_vars();
+                    self.require_same_rollout_ledger_vars(
+                        &vars,
+                        &post_collection_vars,
+                        "rollout collection",
+                    )?;
+                    let post_collection_identity = self.rollout_ledger_identity(
+                        step,
+                        policy,
+                        policy_sha256,
+                        &post_collection_vars,
+                        &opt,
+                        &sampler_prestate,
+                        &lineage,
+                    )?;
+                    if post_collection_identity != identity {
+                        return Err(TrainerError::Contract(
+                            "learner identity changed during rollout collection".into(),
+                        ));
+                    }
+                    Ok(policy.sampler_state()?)
+                })?;
+            self.require_data_parallel_consensus_bytes(
+                "rollout-ledger collector sampler poststate",
+                &sampler_poststate,
+            )?;
+            let (window_tokens, live_items) =
+                self.rollout_ledger_global_counts(&collected, step_beta)?;
+            let payload = self.coordinate_data_parallel_result(
+                "rollout-ledger payload construction",
+                self.rollout_ledger_payload(
                     step,
-                    step_beta,
-                    policy,
-                    reward_fn,
-                    tokenizer,
-                    &selected,
-                    &mut gpu_mem,
-                    &exec,
-                )?);
-            }
-            let post_collection_vars = policy.trainable_vars();
-            self.require_same_rollout_ledger_vars(
-                &vars,
-                &post_collection_vars,
-                "rollout collection",
+                    &controls,
+                    &collected,
+                    sampler_poststate,
+                    window_tokens,
+                    live_items,
+                ),
             )?;
-            // The sampler is expected to advance during generation. Reuse its
-            // captured prestate while verifying every other identity component.
-            let post_collection_identity = self.rollout_ledger_identity(
-                step,
-                policy,
-                policy_sha256,
-                &post_collection_vars,
-                &opt,
-                &sampler_prestate,
-                &lineage,
-            )?;
-            if post_collection_identity != identity {
-                return Err(TrainerError::Contract(
-                    "learner identity changed during rollout collection".into(),
-                ));
+            if self.comm.world_size() == 1 {
+                writer.write_step(&payload).map_err(TrainerError::from)
+            } else {
+                self.publish_distributed_rollout_ledger_step(&writer, &payload, &controls)
             }
-            let sampler_poststate = policy.sampler_state()?;
-            let payload =
-                self.rollout_ledger_payload(step, &controls, &collected, sampler_poststate)?;
-            writer.write_step(&payload).map_err(TrainerError::from)
         })();
         match outcome {
             Ok(path) => Ok(path),
+            Err(error @ TrainerError::PublicationAmbiguousAfterComm { .. }) => Err(error),
             Err(TrainerError::RolloutLedger(error)) if error.may_be_visible() => {
                 // A manifest-bearing ledger may already be consumable. Rewinding
                 // the sampler would split collector state from that visible L_k.
                 Err(TrainerError::RolloutLedger(error))
             }
+            Err(TrainerError::Comm(comm_error)) => {
+                let rollback = Self::catch_local_data_parallel_recovery(
+                    "best-effort local rollout-ledger collector rollback",
+                    || Self::restore_rollout_ledger_sampler(policy, &sampler_prestate),
+                );
+                Err(Self::terminal_data_parallel_comm_failure(
+                    "rollout-ledger collector",
+                    &comm_error,
+                    None,
+                    rollback,
+                    "policy instance",
+                ))
+            }
             Err(error) => {
-                if let Err(rollback) =
-                    Self::restore_rollout_ledger_sampler(policy, &sampler_prestate)
-                {
+                let rollback = self
+                    .coordinate_data_parallel_call("rollout-ledger collector rollback", || {
+                        Self::restore_rollout_ledger_sampler(policy, &sampler_prestate)
+                    });
+                if let Err(rollback) = rollback {
                     return Err(TrainerError::Contract(format!(
-                        "rollout-ledger collector failed ({error}); restoring its sampler pre-state also failed: {rollback}"
+                        "rollout-ledger collector failed ({error}); coordinated sampler rollback also failed ({rollback}); discard the policy instance on every rank in this data-parallel world"
                     )));
                 }
                 Err(error)
@@ -1929,12 +2059,12 @@ impl Trainer {
         }
     }
 
-    /// Validate and consume one world-1 rollout ledger window as one learner
+    /// Validate and consume this rank's shard of one global rollout ledger window
     /// optimizer step, returning the metrics row and an opaque chain-bound
     /// continuation receipt carrying the exact post-update Adam state.
     /// This separated learner installs and verifies the collector's exact
     /// post-rollout sampler state before it returns, making its continuation
-    /// checkpoint-faithful. Rollout-ledger v3 carries no collector timing or
+    /// checkpoint-faithful. Rollout-ledger v4 carries no collector timing or
     /// device-memory telemetry, so
     /// the returned/persisted whole-window performance fields remain explicitly
     /// unmeasured rather than relabelling learner-only work as a complete step.
@@ -1950,7 +2080,7 @@ impl Trainer {
     ///
     /// # Errors
     ///
-    /// Returns [`TrainerError`] for a non-world-1 trainer, an out-of-range step,
+    /// Returns [`TrainerError`] for an invalid DP topology, an out-of-range step,
     /// malformed/mismatched learner state, invalid ledger data, scoring/backward
     /// failure, a grad-canary failure, or a metrics write failure.
     #[allow(clippy::cognitive_complexity)]
@@ -1962,116 +2092,243 @@ impl Trainer {
         policy_sha256: &str,
         continuation: Option<&RolloutLedgerContinuation>,
     ) -> Result<(Metrics, RolloutLedgerContinuation), TrainerError> {
-        self.require_world_one_rollout_ledger()?;
-        self.require_rollout_ledger_step_in_range(step)?;
-        validate_external_policy_sha256(policy_sha256)?;
-        let vars = policy.trainable_vars();
-        let mut opt = self.new_optimizer(vars.clone())?;
-        if let Some(state) = continuation {
-            opt.load_state(state.optimizer_state())?;
-        }
-        let step_lr = self.config.lr_at(step);
-        let step_beta = self.config.beta_at(step);
-        opt.set_learning_rate(step_lr);
-        let controls = self.rollout_ledger_controls(step, opt.learning_rate(), step_beta)?;
-        let sampler_prestate = policy.sampler_state()?;
-        let lineage = self.require_rollout_ledger_continuation_state(
-            step,
-            policy,
-            policy_sha256,
-            &vars,
-            &opt,
-            &sampler_prestate,
-            continuation,
-        )?;
-        let identity = self.rollout_ledger_identity(
-            step,
-            policy,
-            policy_sha256,
-            &vars,
-            &opt,
-            &sampler_prestate,
-            &lineage,
-        )?;
-        let reader = RolloutLedgerReader::open(
-            root.as_ref(),
-            RolloutLedgerExpectations { identity, controls },
-        )?;
-        // No policy mutation occurs until the complete artifact is validated.
-        let validated = reader.read_step(step)?;
-        let validated_identity = validated.identity().clone();
-        let payload = validated.into_step();
-        let adapter_prestate = Self::snapshot_rollout_ledger_vars(&vars)?;
-        let optimizer_prestate = opt.state()?;
-        let adapter_enabled_prestate = policy.adapter_enabled();
-        let outcome: Result<(Metrics, RolloutLedgerContinuation), TrainerError> = (|| {
-            self.require_toggleable_reference_policy(
-                policy,
-                self.config.requires_reference_policy(),
-            )?;
-            let post_toggle_vars = policy.trainable_vars();
-            self.require_same_rollout_ledger_vars(
-                &vars,
-                &post_toggle_vars,
-                "reference-policy preflight",
-            )?;
-            let post_toggle_identity = self.rollout_ledger_identity(
-                step,
-                policy,
+        self.require_rollout_ledger_topology()?;
+        let root = root.as_ref();
+        let consensus = self.coordinate_data_parallel_result(
+            "rollout-ledger learner input serialization",
+            serde_json::to_vec(&(
+                &self.config,
+                root.as_os_str().as_encoded_bytes(),
                 policy_sha256,
-                &post_toggle_vars,
-                &opt,
-                &sampler_prestate,
-                &lineage,
+                continuation.is_some(),
+            ))
+            .map_err(|error| {
+                TrainerError::Contract(format!(
+                    "serialize distributed rollout-ledger learner inputs: {error}"
+                ))
+            }),
+        )?;
+        self.require_data_parallel_consensus_bytes(
+            "rollout-ledger learner root/config contract",
+            &consensus,
+        )?;
+        let (vars, mut opt, step_beta, _controls, sampler_prestate, lineage, validated) = self
+            .coordinate_data_parallel_call("rollout-ledger learner preflight", || {
+                self.require_rollout_ledger_step_in_range(step)?;
+                validate_external_policy_sha256(policy_sha256)?;
+                let vars = policy.trainable_vars();
+                let mut opt = self.new_optimizer(vars.clone())?;
+                if let Some(state) = continuation {
+                    opt.load_state(state.optimizer_state())?;
+                }
+                let step_beta = self.config.beta_at(step);
+                opt.set_learning_rate(self.config.lr_at(step));
+                let controls =
+                    self.rollout_ledger_controls(step, opt.learning_rate(), step_beta)?;
+                let sampler_prestate = policy.sampler_state()?;
+                let lineage = self.require_rollout_ledger_continuation_state(
+                    step,
+                    policy,
+                    policy_sha256,
+                    &vars,
+                    &opt,
+                    &sampler_prestate,
+                    continuation,
+                )?;
+                let identity = self.rollout_ledger_identity(
+                    step,
+                    policy,
+                    policy_sha256,
+                    &vars,
+                    &opt,
+                    &sampler_prestate,
+                    &lineage,
+                )?;
+                let reader = RolloutLedgerReader::open(
+                    root,
+                    RolloutLedgerExpectations {
+                        identity,
+                        controls: controls.clone(),
+                    },
+                )?;
+                let validated = if self.comm.world_size() == 1 {
+                    reader.read_step(step)?
+                } else {
+                    reader.read_distributed_step(
+                        step,
+                        u32::try_from(self.comm.rank()).map_err(|_| {
+                            TrainerError::Contract("rollout-ledger rank does not fit u32".into())
+                        })?,
+                        u32::try_from(self.comm.world_size()).map_err(|_| {
+                            TrainerError::Contract(
+                                "rollout-ledger world size does not fit u32".into(),
+                            )
+                        })?,
+                    )?
+                };
+                Ok((
+                    vars,
+                    opt,
+                    step_beta,
+                    controls,
+                    sampler_prestate,
+                    lineage,
+                    validated,
+                ))
+            })?;
+        let validated_identity = validated.identity().clone();
+        let consumed_ledger_sha256 = validated.consumed_ledger_sha256().to_owned();
+        self.require_data_parallel_consensus_bytes(
+            "rollout-ledger committed world manifest",
+            consumed_ledger_sha256.as_bytes(),
+        )?;
+        let payload = validated.into_step();
+        let (adapter_prestate, optimizer_prestate, adapter_enabled_prestate) = self
+            .coordinate_data_parallel_call("rollout-ledger learner rollback snapshot", || {
+                Ok((
+                    Self::snapshot_rollout_ledger_vars(&vars)?,
+                    opt.state()?,
+                    policy.adapter_enabled(),
+                ))
+            })?;
+        let outcome: Result<(Metrics, RolloutLedgerContinuation), TrainerError> = (|| {
+            self.coordinate_data_parallel_call(
+                "rollout-ledger reference-policy preflight",
+                || {
+                    self.require_toggleable_reference_policy(
+                        policy,
+                        self.config.requires_reference_policy(),
+                    )?;
+                    let post_toggle_vars = policy.trainable_vars();
+                    self.require_same_rollout_ledger_vars(
+                        &vars,
+                        &post_toggle_vars,
+                        "reference-policy preflight",
+                    )?;
+                    let post_toggle_identity = self.rollout_ledger_identity(
+                        step,
+                        policy,
+                        policy_sha256,
+                        &post_toggle_vars,
+                        &opt,
+                        &sampler_prestate,
+                        &lineage,
+                    )?;
+                    if post_toggle_identity != validated_identity {
+                        return Err(TrainerError::Contract(
+                            "learner identity changed during reference-policy preflight".into(),
+                        ));
+                    }
+                    Ok(())
+                },
             )?;
-            if post_toggle_identity != validated_identity {
-                return Err(TrainerError::Contract(
-                    "learner identity changed during reference-policy preflight".into(),
-                ));
-            }
 
             let exec = UnshardedPolicyExecution;
-            // Ledger v3 has no composable collector/learner performance schema.
-            // Keep the existing update instrumentation sink disabled and leave the
-            // ordinary whole-window timing/memory fields at their neutral defaults.
             let mut gpu_mem = StepGpuMemory::new(false);
-            let mut stats = Vec::with_capacity(payload.groups.len());
-            let mut live = Vec::with_capacity(payload.live_items as usize);
-            for group in &payload.groups {
-                let collected = self.collected_group_from_ledger(group)?;
-                let (stat, item) = self.materialize_collected_group(
-                    policy,
-                    collected,
-                    step_beta,
-                    &mut gpu_mem,
-                    &exec,
+            let (stats, live) =
+                self.coordinate_data_parallel_call("rollout-ledger detached scoring", || {
+                    let mut stats = Vec::with_capacity(payload.groups.len());
+                    let mut live = Vec::with_capacity(payload.groups.len());
+                    for group in &payload.groups {
+                        let collected = self.collected_group_from_ledger(group)?;
+                        let (stat, item) = self.materialize_collected_group(
+                            policy,
+                            collected,
+                            step_beta,
+                            &mut gpu_mem,
+                            &exec,
+                        )?;
+                        stats.push(stat);
+                        if let Some(item) = item {
+                            live.push(item);
+                        }
+                    }
+                    let post_scoring_vars = policy.trainable_vars();
+                    self.require_same_rollout_ledger_vars(
+                        &vars,
+                        &post_scoring_vars,
+                        "detached ledger scoring",
+                    )?;
+                    let post_scoring_identity = self.rollout_ledger_identity(
+                        step,
+                        policy,
+                        policy_sha256,
+                        &post_scoring_vars,
+                        &opt,
+                        &sampler_prestate,
+                        &lineage,
+                    )?;
+                    if post_scoring_identity != validated_identity {
+                        return Err(TrainerError::Contract(
+                            "learner identity changed during detached ledger scoring".into(),
+                        ));
+                    }
+                    Ok((stats, live))
+                })?;
+            let (local_tokens, local_live) = self.coordinate_data_parallel_result(
+                "rollout-ledger learner local counts",
+                (|| {
+                    let tokens = stats.iter().try_fold(0_u64, |total, stat| {
+                        total
+                            .checked_add(u64::try_from(stat.completion_tokens).map_err(|_| {
+                                TrainerError::Contract(
+                                    "learner completion-token count overflows u64".into(),
+                                )
+                            })?)
+                            .ok_or_else(|| {
+                                TrainerError::Contract(
+                                    "learner completion-token total overflow".into(),
+                                )
+                            })
+                    })?;
+                    Ok((
+                        tokens,
+                        u64::try_from(live.len()).map_err(|_| {
+                            TrainerError::Contract("learner live-item count overflows u64".into())
+                        })?,
+                    ))
+                })(),
+            )?;
+            let (actual_window_tokens, actual_live_items) = if self.comm.world_size() > 1 {
+                let (local_tokens_f64, local_live_f64) = self.coordinate_data_parallel_result(
+                    "rollout-ledger learner exact count conversion",
+                    (|| {
+                        Ok((
+                            exact_u64_as_f64(
+                                "rollout-ledger learner completion-token count",
+                                local_tokens,
+                            )?,
+                            exact_u64_as_f64("rollout-ledger learner live-item count", local_live)?,
+                        ))
+                    })(),
                 )?;
-                stats.push(stat);
-                if let Some(item) = item {
-                    live.push(item);
-                }
+                let tokens = self.comm.all_reduce_scalar_sum(local_tokens_f64)?;
+                let live = self.comm.all_reduce_scalar_sum(local_live_f64)?;
+                self.coordinate_data_parallel_result(
+                    "rollout-ledger learner global counts",
+                    (|| {
+                        Ok((
+                            exact_reduced_u64(
+                                "rollout-ledger learner completion-token count",
+                                tokens,
+                            )?
+                            .max(1),
+                            exact_reduced_u64("rollout-ledger learner live-item count", live)?,
+                        ))
+                    })(),
+                )?
+            } else {
+                (local_tokens.max(1), local_live)
+            };
+            if actual_window_tokens != payload.window_tokens
+                || actual_live_items != u64::from(payload.live_items)
+            {
+                return Err(TrainerError::Contract(format!(
+                    "rollout-ledger runtime global counts {actual_window_tokens}/{actual_live_items} do not match committed {}/{}",
+                    payload.window_tokens, payload.live_items
+                )));
             }
-            let post_scoring_vars = policy.trainable_vars();
-            self.require_same_rollout_ledger_vars(
-                &vars,
-                &post_scoring_vars,
-                "detached ledger scoring",
-            )?;
-            let post_scoring_identity = self.rollout_ledger_identity(
-                step,
-                policy,
-                policy_sha256,
-                &post_scoring_vars,
-                &opt,
-                &sampler_prestate,
-                &lineage,
-            )?;
-            if post_scoring_identity != validated_identity {
-                return Err(TrainerError::Contract(
-                    "learner identity changed during detached ledger scoring".into(),
-                ));
-            }
-            let agg = if live.is_empty() {
+            let agg = if payload.live_items == 0 {
                 InnerAgg::default()
             } else {
                 let mut ctx = UpdateCtx {
@@ -2089,47 +2346,63 @@ impl Trainer {
                     &exec,
                 )?
             };
-            let post_update_vars = policy.trainable_vars();
-            self.require_same_rollout_ledger_vars(
-                &vars,
-                &post_update_vars,
-                "rollout-ledger learner update",
+            self.coordinate_data_parallel_call("rollout-ledger learner post-update state", || {
+                let post_update_vars = policy.trainable_vars();
+                self.require_same_rollout_ledger_vars(
+                    &vars,
+                    &post_update_vars,
+                    "rollout-ledger learner update",
+                )?;
+                Self::restore_rollout_ledger_sampler(policy, &payload.post_rollout_sampler_state)?;
+                let post_handoff_vars = policy.trainable_vars();
+                self.require_same_rollout_ledger_vars(
+                    &vars,
+                    &post_handoff_vars,
+                    "rollout-ledger sampler handoff",
+                )?;
+                Ok(())
+            })?;
+            self.require_data_parallel_consensus_bytes(
+                "rollout-ledger learner sampler handoff",
+                &payload.post_rollout_sampler_state,
             )?;
-            Self::restore_rollout_ledger_sampler(policy, &payload.post_rollout_sampler_state)?;
-            let post_handoff_vars = policy.trainable_vars();
-            self.require_same_rollout_ledger_vars(
-                &vars,
-                &post_handoff_vars,
-                "rollout-ledger sampler handoff",
-            )?;
+
             let metrics = self.build_window_metrics(step, step_beta, &stats, &agg, &opt);
-            let optimizer_state = opt.state()?;
-            let identity_bytes = serde_json::to_vec(&validated_identity).map_err(|error| {
-                TrainerError::Contract(format!("serialize consumed ledger identity: {error}"))
-            })?;
-            let payload_bytes = serde_json::to_vec(&payload).map_err(|error| {
-                TrainerError::Contract(format!("serialize consumed ledger payload: {error}"))
-            })?;
-            let consumed_ledger_sha256 = domain_sha256(
-                "ferrl.rollout-ledger.consumed-step.v1",
-                &[&identity_bytes, &payload_bytes],
-            );
             let next_lineage = domain_sha256(
                 "ferrl.rollout-ledger.lineage.v1",
                 &[lineage.as_bytes(), consumed_ledger_sha256.as_bytes()],
             );
-            let sampler_poststate = policy.sampler_state()?;
-            let post_identity = self.rollout_ledger_identity(
-                step + 1,
-                policy,
-                policy_sha256,
-                &vars,
-                &opt,
-                &sampler_poststate,
-                &next_lineage,
+            let (optimizer_state, post_identity) = self.coordinate_data_parallel_call(
+                "rollout-ledger continuation construction",
+                || {
+                    let optimizer_state = opt.state()?;
+                    let sampler_poststate = policy.sampler_state()?;
+                    let post_identity = self.rollout_ledger_identity(
+                        step + 1,
+                        policy,
+                        policy_sha256,
+                        &vars,
+                        &opt,
+                        &sampler_poststate,
+                        &next_lineage,
+                    )?;
+                    Ok((optimizer_state, post_identity))
+                },
+            )?;
+            let post_identity_bytes = serde_json::to_vec(&post_identity).map_err(|error| {
+                TrainerError::Contract(format!("serialize post-ledger identity: {error}"))
+            })?;
+            self.require_data_parallel_consensus_bytes(
+                "rollout-ledger continuation state",
+                &post_identity_bytes,
             )?;
             let continuation = RolloutLedgerContinuation {
                 completed_step: step + 1,
+                world_size: u32::try_from(self.comm.world_size()).map_err(|_| {
+                    TrainerError::Contract(
+                        "rollout-ledger world size does not fit continuation u32".into(),
+                    )
+                })?,
                 optimizer_state,
                 policy_sha256: post_identity.policy_sha256,
                 trainer_config_sha256: post_identity.trainer_config_sha256,
@@ -2138,27 +2411,80 @@ impl Trainer {
                 optimizer_sha256: post_identity.optimizer_sha256,
                 sampler_sha256: post_identity.sampler_sha256,
                 parent_lineage_sha256: lineage.clone(),
-                consumed_ledger_sha256,
+                consumed_ledger_sha256: consumed_ledger_sha256.clone(),
                 lineage_sha256: next_lineage,
             };
-            self.append_metrics::<P, _>(&metrics, &exec)?;
+            self.append_rollout_ledger_metrics(&metrics)?;
             Ok((metrics, continuation))
         })();
 
         match outcome {
             Ok(result) => Ok(result),
+            Err(TrainerError::RolloutLedgerMetricsComm {
+                communication,
+                telemetry_rollback,
+            }) => {
+                let rollback = Self::catch_local_data_parallel_recovery(
+                    "best-effort local rollout-ledger learner rollback",
+                    || {
+                        Self::restore_rollout_ledger_prestate(
+                            policy,
+                            &vars,
+                            &adapter_prestate,
+                            &mut opt,
+                            &optimizer_prestate,
+                            adapter_enabled_prestate,
+                            &sampler_prestate,
+                        )
+                    },
+                );
+                Err(Self::terminal_data_parallel_comm_failure(
+                    "rollout-ledger metrics publication",
+                    &communication,
+                    Some(&telemetry_rollback),
+                    rollback,
+                    "policy and optimizer state",
+                ))
+            }
+            Err(TrainerError::Comm(comm_error)) => {
+                let rollback = Self::catch_local_data_parallel_recovery(
+                    "best-effort local rollout-ledger learner rollback",
+                    || {
+                        Self::restore_rollout_ledger_prestate(
+                            policy,
+                            &vars,
+                            &adapter_prestate,
+                            &mut opt,
+                            &optimizer_prestate,
+                            adapter_enabled_prestate,
+                            &sampler_prestate,
+                        )
+                    },
+                );
+                Err(Self::terminal_data_parallel_comm_failure(
+                    "rollout-ledger learner",
+                    &comm_error,
+                    None,
+                    rollback,
+                    "policy and optimizer state",
+                ))
+            }
             Err(error) => {
-                if let Err(rollback) = Self::restore_rollout_ledger_prestate(
-                    policy,
-                    &vars,
-                    &adapter_prestate,
-                    &mut opt,
-                    &optimizer_prestate,
-                    adapter_enabled_prestate,
-                    &sampler_prestate,
-                ) {
+                let rollback =
+                    self.coordinate_data_parallel_call("rollout-ledger learner rollback", || {
+                        Self::restore_rollout_ledger_prestate(
+                            policy,
+                            &vars,
+                            &adapter_prestate,
+                            &mut opt,
+                            &optimizer_prestate,
+                            adapter_enabled_prestate,
+                            &sampler_prestate,
+                        )
+                    });
+                if let Err(rollback) = rollback {
                     return Err(TrainerError::Contract(format!(
-                        "rollout-ledger learner failed ({error}); restoring its pre-state also failed: {rollback}"
+                        "rollout-ledger learner failed ({error}); coordinated adapter/optimizer/sampler rollback also failed ({rollback}); discard the policy and optimizer state on every rank in this data-parallel world"
                     )));
                 }
                 Err(error)
@@ -2171,14 +2497,14 @@ impl Trainer {
     ///
     /// The checkpoint `C_(k+1)` combines the learner's updated adapter and Adam
     /// state with the collector's post-rollout sampler state installed by ledger
-    /// v3. Both the next collector and learner restore this same checkpoint before
+    /// v4. Both the next collector and learner restore this same checkpoint before
     /// processing step `k + 1`. Unlike ordinary cadence checkpointing, this role-
     /// handoff primitive is explicit and never replaces an existing completed-step
     /// path: a second writer would be a continuation fork, so it fails closed.
     ///
     /// # Errors
     ///
-    /// Returns [`TrainerError`] if this is not a world-1 trainer, the receipt's
+    /// Returns [`TrainerError`] if the DP topology is invalid, the receipt's
     /// completed step is outside `1..=config.steps`, its bound policy/config/schema
     /// or adapter/Adam/sampler state does not match the live values, the destination
     /// already exists, or durable checkpoint publication fails.
@@ -2187,51 +2513,154 @@ impl Trainer {
         policy: &P,
         continuation: &RolloutLedgerContinuation,
     ) -> Result<PathBuf, TrainerError> {
-        self.require_world_one_rollout_ledger()?;
-        let completed_step = continuation.completed_step;
-        if completed_step == 0 || completed_step > self.config.steps {
-            return Err(TrainerError::Contract(format!(
-                "rollout-ledger continuation step {completed_step} is outside 1..={}",
-                self.config.steps
-            )));
-        }
-        let vars = policy.trainable_vars();
-        let mut opt = self.new_optimizer(vars.clone())?;
-        opt.load_state(continuation.optimizer_state())?;
-        let sampler_state = policy.sampler_state()?;
-        self.require_rollout_ledger_continuation_state(
-            completed_step,
-            policy,
-            &continuation.policy_sha256,
-            &vars,
-            &opt,
-            &sampler_state,
-            Some(continuation),
+        self.save_rollout_ledger_continuation_to(&self.checkpoints_dir, policy, continuation)
+    }
+
+    /// Persist a continuation below an explicit shared checkpoint root.
+    ///
+    /// Distributed trainers normally use distinct rank-local [`RunDir`]s for
+    /// telemetry. Every rank must therefore call this variant with the same
+    /// shared root; rank 0 alone publishes `step-<completed>`, while all peers
+    /// validate and receive the publication outcome in lockstep.
+    ///
+    /// # Errors
+    ///
+    /// As [`save_rollout_ledger_continuation`](Self::save_rollout_ledger_continuation),
+    /// plus a cross-rank destination mismatch.
+    pub fn save_rollout_ledger_continuation_to<P: Policy>(
+        &self,
+        checkpoints_dir: impl AsRef<Path>,
+        policy: &P,
+        continuation: &RolloutLedgerContinuation,
+    ) -> Result<PathBuf, TrainerError> {
+        self.require_rollout_ledger_topology()?;
+        let checkpoints_dir = checkpoints_dir.as_ref();
+        let (vars, sampler_state, dir, recipe, manifest) = self.coordinate_data_parallel_call(
+            "rollout-ledger continuation save preflight",
+            || {
+                let completed_step = continuation.completed_step;
+                if completed_step == 0 || completed_step > self.config.steps {
+                    return Err(TrainerError::Contract(format!(
+                        "rollout-ledger continuation step {completed_step} is outside 1..={}",
+                        self.config.steps
+                    )));
+                }
+                let vars = policy.trainable_vars();
+                let mut opt = self.new_optimizer(vars.clone())?;
+                opt.load_state(continuation.optimizer_state())?;
+                let sampler_state = policy.sampler_state()?;
+                self.require_rollout_ledger_continuation_state(
+                    completed_step,
+                    policy,
+                    &continuation.policy_sha256,
+                    &vars,
+                    &opt,
+                    &sampler_state,
+                    Some(continuation),
+                )?;
+                let dir = checkpoints_dir.join(format!("step-{completed_step}"));
+                let recipe = policy.lora_recipe();
+                let manifest = crate::checkpoint::RolloutLedgerContinuationManifest {
+                    format_version: crate::checkpoint::ROLLOUT_LEDGER_CONTINUATION_FORMAT_VERSION,
+                    kind: crate::checkpoint::ROLLOUT_LEDGER_CONTINUATION_KIND.to_owned(),
+                    world_size: Some(continuation.world_size),
+                    completed_step,
+                    policy_sha256: continuation.policy_sha256.clone(),
+                    trainer_config_sha256: continuation.trainer_config_sha256.clone(),
+                    tensor_schema_sha256: continuation.tensor_schema_sha256.clone(),
+                    adapter_sha256: continuation.adapter_sha256.clone(),
+                    optimizer_sha256: continuation.optimizer_sha256.clone(),
+                    sampler_sha256: continuation.sampler_sha256.clone(),
+                    parent_lineage_sha256: continuation.parent_lineage_sha256.clone(),
+                    consumed_ledger_sha256: continuation.consumed_ledger_sha256.clone(),
+                    lineage_sha256: continuation.lineage_sha256.clone(),
+                };
+                Ok((vars, sampler_state, dir, recipe, manifest))
+            },
         )?;
-        let dir = self.checkpoints_dir.join(format!("step-{completed_step}"));
-        let recipe = policy.lora_recipe();
-        let manifest = crate::checkpoint::RolloutLedgerContinuationManifest {
-            format_version: crate::checkpoint::ROLLOUT_LEDGER_CONTINUATION_FORMAT_VERSION,
-            kind: crate::checkpoint::ROLLOUT_LEDGER_CONTINUATION_KIND.to_owned(),
-            completed_step,
-            policy_sha256: continuation.policy_sha256.clone(),
-            trainer_config_sha256: continuation.trainer_config_sha256.clone(),
-            tensor_schema_sha256: continuation.tensor_schema_sha256.clone(),
-            adapter_sha256: continuation.adapter_sha256.clone(),
-            optimizer_sha256: continuation.optimizer_sha256.clone(),
-            sampler_sha256: continuation.sampler_sha256.clone(),
-            parent_lineage_sha256: continuation.parent_lineage_sha256.clone(),
-            consumed_ledger_sha256: continuation.consumed_ledger_sha256.clone(),
-            lineage_sha256: continuation.lineage_sha256.clone(),
+        let consensus = self.coordinate_data_parallel_result(
+            "rollout-ledger continuation save serialization",
+            serde_json::to_vec(&(
+                dir.as_os_str().as_encoded_bytes(),
+                recipe.as_deref(),
+                &manifest,
+            ))
+            .map_err(|error| {
+                TrainerError::Contract(format!(
+                    "serialize rollout-ledger continuation save contract: {error}"
+                ))
+            }),
+        )?;
+        self.require_data_parallel_consensus_bytes(
+            "rollout-ledger continuation save contract",
+            &consensus,
+        )?;
+
+        let save_local = if self.comm.rank() == 0 {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::checkpoint::save_checkpoint_no_replace(
+                    &dir,
+                    &vars,
+                    continuation.optimizer_state(),
+                    &sampler_state,
+                    recipe.as_deref(),
+                    manifest,
+                )
+                .map_err(TrainerError::from)
+            }))
+            .unwrap_or_else(|payload| {
+                Err(TrainerError::Contract(format!(
+                    "rollout-ledger continuation publication panicked: {}",
+                    panic_payload_message(payload.as_ref())
+                )))
+            })
+        } else {
+            Ok(())
         };
-        crate::checkpoint::save_checkpoint_no_replace(
-            &dir,
-            &vars,
-            continuation.optimizer_state(),
-            &sampler_state,
-            recipe.as_deref(),
-            manifest,
-        )?;
+        let publication_signal = match &save_local {
+            Ok(()) => 0.0,
+            Err(TrainerError::Checkpoint(
+                crate::checkpoint::CheckpointError::PublicationAmbiguous { .. },
+            )) => 2.0,
+            Err(_) => 1.0,
+        };
+        let publication_signal = self.comm.all_reduce_scalar_sum(if self.comm.rank() == 0 {
+            publication_signal
+        } else {
+            0.0
+        });
+        let publication_signal = match publication_signal {
+            Ok(signal) => signal,
+            Err(error) => {
+                return Err(TrainerError::PublicationAmbiguousAfterComm {
+                    artifact: "rollout-ledger continuation",
+                    path: dir,
+                    detail: "rank 0 entered no-replace publication before the status collective"
+                        .into(),
+                    communication: Box::new(error),
+                });
+            }
+        };
+        if publication_signal > 1.5 {
+            return match save_local {
+                Err(error) => Err(error),
+                Ok(()) => Err(TrainerError::Checkpoint(
+                    crate::checkpoint::CheckpointError::PublicationAmbiguous {
+                        path: dir,
+                        detail: "rank 0 reported ambiguous continuation publication".into(),
+                    },
+                )),
+            };
+        }
+        if publication_signal > 0.5 {
+            return match save_local {
+                Err(error) => Err(error),
+                Ok(()) => Err(TrainerError::Contract(
+                    "rank 0 failed before continuation publication; every rank may retry".into(),
+                )),
+            };
+        }
+        save_local?;
         Ok(dir)
     }
 
@@ -2246,7 +2675,7 @@ impl Trainer {
     ///
     /// # Errors
     ///
-    /// Returns [`TrainerError`] for a non-world-1 trainer, incompatible/missing
+    /// Returns [`TrainerError`] for an invalid DP topology, incompatible/missing
     /// continuation state, recipe or tensor mismatch, invalid outer step, sampler
     /// restoration failure, or Adam-state mismatch.
     #[allow(clippy::cognitive_complexity)]
@@ -2256,13 +2685,32 @@ impl Trainer {
         policy: &mut P,
         policy_sha256: &str,
     ) -> Result<RolloutLedgerContinuation, TrainerError> {
-        self.require_world_one_rollout_ledger()?;
-        validate_external_policy_sha256(policy_sha256)?;
+        self.require_rollout_ledger_topology()?;
         let checkpoint_dir = checkpoint_dir.as_ref();
-        let vars = policy.trainable_vars();
-        let adapter_prestate = Self::snapshot_rollout_ledger_vars(&vars)?;
-        let sampler_prestate = policy.sampler_state()?;
-        let outcome = (|| {
+        let restore_input = self.coordinate_data_parallel_result(
+            "rollout-ledger continuation restore input serialization",
+            serde_json::to_vec(&(checkpoint_dir.as_os_str().as_encoded_bytes(), policy_sha256))
+                .map_err(|error| {
+                    TrainerError::Contract(format!(
+                        "serialize rollout-ledger continuation restore inputs: {error}"
+                    ))
+                }),
+        )?;
+        self.require_data_parallel_consensus_bytes(
+            "rollout-ledger continuation restore path/policy",
+            &restore_input,
+        )?;
+        let (vars, adapter_prestate, sampler_prestate) = self.coordinate_data_parallel_call(
+            "rollout-ledger continuation restore snapshot",
+            || {
+                validate_external_policy_sha256(policy_sha256)?;
+                let vars = policy.trainable_vars();
+                let adapter_prestate = Self::snapshot_rollout_ledger_vars(&vars)?;
+                let sampler_prestate = policy.sampler_state()?;
+                Ok((vars, adapter_prestate, sampler_prestate))
+            },
+        )?;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let manifest = crate::checkpoint::read_manifest(checkpoint_dir)?;
             let continuation_manifest =
                 manifest
@@ -2274,12 +2722,42 @@ impl Trainer {
                         )
                     })?;
             if continuation_manifest.format_version
-                != crate::checkpoint::ROLLOUT_LEDGER_CONTINUATION_FORMAT_VERSION
-                || continuation_manifest.kind != crate::checkpoint::ROLLOUT_LEDGER_CONTINUATION_KIND
+                < crate::checkpoint::MIN_ROLLOUT_LEDGER_CONTINUATION_FORMAT_VERSION
+                || continuation_manifest.format_version
+                    > crate::checkpoint::ROLLOUT_LEDGER_CONTINUATION_FORMAT_VERSION
+                || continuation_manifest.kind
+                    != crate::checkpoint::ROLLOUT_LEDGER_CONTINUATION_KIND
             {
                 return Err(TrainerError::Contract(format!(
                     "unsupported rollout-ledger continuation format version {}",
                     continuation_manifest.format_version
+                )));
+            }
+            let manifest_world_size = match (
+                continuation_manifest.format_version,
+                continuation_manifest.world_size,
+            ) {
+                (1, None) => 1,
+                (crate::checkpoint::ROLLOUT_LEDGER_CONTINUATION_FORMAT_VERSION, Some(world_size))
+                    if world_size > 0 =>
+                {
+                    world_size
+                }
+                _ => {
+                    return Err(TrainerError::Contract(
+                        "rollout-ledger continuation topology is malformed for its format version"
+                            .into(),
+                    ));
+                }
+            };
+            let current_world_size = u32::try_from(self.comm.world_size()).map_err(|_| {
+                TrainerError::Contract(
+                    "rollout-ledger world size does not fit continuation u32".into(),
+                )
+            })?;
+            if manifest_world_size != current_world_size {
+                return Err(TrainerError::Contract(format!(
+                    "rollout-ledger continuation world size {manifest_world_size} does not match current world {current_world_size}"
                 )));
             }
             if continuation_manifest.completed_step != manifest.step
@@ -2390,6 +2868,7 @@ impl Trainer {
             }
             Ok(RolloutLedgerContinuation {
                 completed_step: loaded.step,
+                world_size: manifest_world_size,
                 optimizer_state,
                 policy_sha256: continuation_manifest.policy_sha256,
                 trainer_config_sha256: continuation_manifest.trainer_config_sha256,
@@ -2401,39 +2880,113 @@ impl Trainer {
                 consumed_ledger_sha256: continuation_manifest.consumed_ledger_sha256,
                 lineage_sha256: continuation_manifest.lineage_sha256,
             })
-        })();
-        match outcome {
-            Ok(continuation) => Ok(continuation),
-            Err(error) => {
-                let mut failures = Vec::new();
-                for (index, (var, snapshot)) in vars.iter().zip(adapter_prestate.iter()).enumerate()
-                {
-                    if let Err(restore) = var.set(snapshot) {
-                        failures.push(format!("restore adapter tensor {index}: {restore}"));
-                    }
-                }
-                if let Err(restore) =
-                    Self::restore_rollout_ledger_sampler(policy, &sampler_prestate)
-                {
-                    failures.push(format!("restore sampler state: {restore}"));
-                }
-                let active_vars = policy.trainable_vars();
-                if !Self::same_rollout_ledger_vars(&vars, &active_vars) {
-                    failures.push(
-                        "policy trainable-variable binding changed during continuation restore"
-                            .into(),
-                    );
-                }
-                if failures.is_empty() {
-                    Err(error)
-                } else {
-                    Err(TrainerError::Contract(format!(
-                        "rollout-ledger continuation restore failed ({error}); restoring its pre-state also failed: {}",
-                        failures.join("; ")
-                    )))
-                }
+        }))
+        .unwrap_or_else(|payload| {
+            Err(TrainerError::Contract(format!(
+                "rollout-ledger continuation restore panicked: {}",
+                panic_payload_message(payload.as_ref())
+            )))
+        });
+        let failed_local = if outcome.is_err() { 1.0 } else { 0.0 };
+        let failed_global = self.comm.all_reduce_scalar_sum(failed_local);
+        let failed_global = match failed_global {
+            Ok(failed) => failed,
+            Err(comm_error) => {
+                let local_error = outcome.as_ref().err().map(ToString::to_string);
+                return Err(Self::terminal_rollout_ledger_restore_comm_failure(
+                    "rollout-ledger continuation restore-status collective",
+                    &comm_error,
+                    local_error.as_deref(),
+                    policy,
+                    &vars,
+                    &adapter_prestate,
+                    &sampler_prestate,
+                ));
             }
+        };
+        if failed_global > 0.0 {
+            let local_error = outcome.err();
+            let rollback = self.coordinate_data_parallel_call(
+                "rollout-ledger continuation restore rollback",
+                || {
+                    Self::restore_rollout_ledger_checkpoint_prestate(
+                        policy,
+                        &vars,
+                        &adapter_prestate,
+                        &sampler_prestate,
+                    )
+                },
+            );
+            return match (local_error, rollback) {
+                (_, Err(rollback_error)) => Err(TrainerError::Contract(format!(
+                    "rollout-ledger continuation restore failed on at least one rank; coordinated rollback failed ({rollback_error}); discard the policy state on every rank in this data-parallel world"
+                ))),
+                (Some(error), Ok(())) => Err(error),
+                (None, Ok(())) => Err(TrainerError::Contract(
+                    "rollout-ledger continuation restore failed on a peer rank; every rank restored its pre-state"
+                        .into(),
+                )),
+            };
         }
+        let continuation = outcome?;
+        let consensus = (|| {
+            let bytes = self.coordinate_data_parallel_result(
+                "rollout-ledger restored continuation serialization",
+                serde_json::to_vec(&(
+                    continuation.completed_step,
+                    continuation.world_size,
+                    &continuation.policy_sha256,
+                    &continuation.trainer_config_sha256,
+                    &continuation.tensor_schema_sha256,
+                    &continuation.adapter_sha256,
+                    &continuation.optimizer_sha256,
+                    &continuation.sampler_sha256,
+                    &continuation.parent_lineage_sha256,
+                    &continuation.consumed_ledger_sha256,
+                    &continuation.lineage_sha256,
+                ))
+                .map_err(|error| {
+                    TrainerError::Contract(format!(
+                        "serialize restored rollout-ledger continuation: {error}"
+                    ))
+                }),
+            )?;
+            self.require_data_parallel_consensus_bytes(
+                "restored rollout-ledger continuation",
+                &bytes,
+            )
+        })();
+        if let Err(error) = consensus {
+            if let TrainerError::Comm(comm_error) = &error {
+                return Err(Self::terminal_rollout_ledger_restore_comm_failure(
+                    "restored rollout-ledger continuation consensus",
+                    comm_error,
+                    None,
+                    policy,
+                    &vars,
+                    &adapter_prestate,
+                    &sampler_prestate,
+                ));
+            }
+            let rollback = self.coordinate_data_parallel_call(
+                "rollout-ledger continuation consensus rollback",
+                || {
+                    Self::restore_rollout_ledger_checkpoint_prestate(
+                        policy,
+                        &vars,
+                        &adapter_prestate,
+                        &sampler_prestate,
+                    )
+                },
+            );
+            return match rollback {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(TrainerError::Contract(format!(
+                    "restored continuation consensus failed ({error}); coordinated rollback also failed ({rollback_error}); discard the policy state on every rank in this data-parallel world"
+                ))),
+            };
+        }
+        Ok(continuation)
     }
 
     /// Restore the newest complete separated continuation, or return `None` when
@@ -2448,25 +3001,348 @@ impl Trainer {
         policy: &mut P,
         policy_sha256: &str,
     ) -> Result<Option<RolloutLedgerContinuation>, TrainerError> {
-        self.require_world_one_rollout_ledger()?;
-        let Some(latest) =
-            crate::checkpoint::latest_rollout_ledger_continuation(&self.checkpoints_dir)?
-        else {
-            return Ok(None);
-        };
-        self.restore_rollout_ledger_continuation(latest.dir, policy, policy_sha256)
-            .map(Some)
+        self.restore_latest_rollout_ledger_continuation_from(
+            &self.checkpoints_dir,
+            policy,
+            policy_sha256,
+        )
     }
 
-    fn require_world_one_rollout_ledger(&self) -> Result<(), TrainerError> {
-        if self.comm.rank() != 0 || self.comm.world_size() != 1 {
+    /// Discover on rank 0 and restore from an explicit shared checkpoint root.
+    ///
+    /// # Errors
+    ///
+    /// As [`restore_latest_rollout_ledger_continuation`](Self::restore_latest_rollout_ledger_continuation),
+    /// plus a cross-rank discovery-root mismatch.
+    pub fn restore_latest_rollout_ledger_continuation_from<P: Policy>(
+        &self,
+        checkpoints_dir: impl AsRef<Path>,
+        policy: &mut P,
+        policy_sha256: &str,
+    ) -> Result<Option<RolloutLedgerContinuation>, TrainerError> {
+        self.require_rollout_ledger_topology()?;
+        let checkpoints_dir = checkpoints_dir.as_ref();
+        let discovery_input = self.coordinate_data_parallel_result(
+            "rollout-ledger latest-discovery input serialization",
+            serde_json::to_vec(&(
+                checkpoints_dir.as_os_str().as_encoded_bytes(),
+                policy_sha256,
+            ))
+            .map_err(|error| {
+                TrainerError::Contract(format!(
+                    "serialize rollout-ledger latest-discovery inputs: {error}"
+                ))
+            }),
+        )?;
+        self.require_data_parallel_consensus_bytes(
+            "rollout-ledger latest-discovery root/policy",
+            &discovery_input,
+        )?;
+        let latest_local = if self.comm.rank() == 0 {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let latest = crate::checkpoint::latest_rollout_ledger_continuation(
+                    checkpoints_dir,
+                )?;
+                if latest
+                    .as_ref()
+                    .is_some_and(|latest| latest.step > 9_007_199_254_740_991)
+                {
+                    return Err(TrainerError::Contract(
+                        "latest continuation step cannot be represented exactly by the data-parallel discovery signal"
+                            .into(),
+                    ));
+                }
+                Ok(latest)
+            }))
+            .unwrap_or_else(|payload| {
+                Err(TrainerError::Contract(format!(
+                    "rollout-ledger latest-continuation discovery panicked: {}",
+                    panic_payload_message(payload.as_ref())
+                )))
+            })
+        } else {
+            Ok(None)
+        };
+        let decision = match &latest_local {
+            Ok(Some(latest)) => ResumeDecision::Resume(latest.step),
+            Ok(None) => ResumeDecision::Fresh,
+            Err(_) => ResumeDecision::ScanFailed,
+        };
+        let signal = self.comm.all_reduce_scalar_sum(if self.comm.rank() == 0 {
+            decision.encode()
+        } else {
+            0.0
+        })?;
+        match ResumeDecision::decode(signal) {
+            ResumeDecision::Fresh => Ok(None),
+            ResumeDecision::ScanFailed => match latest_local {
+                Err(error) => Err(error),
+                Ok(_) => Err(TrainerError::Contract(
+                    "rank 0 failed to discover the latest rollout-ledger continuation".into(),
+                )),
+            },
+            ResumeDecision::Resume(step) => {
+                if let Ok(Some(latest)) = &latest_local {
+                    if latest.step != step {
+                        return Err(TrainerError::Contract(
+                            "rank-0 continuation discovery disagrees with its broadcast step"
+                                .into(),
+                        ));
+                    }
+                }
+                let dir = checkpoints_dir.join(format!("step-{step}"));
+                self.restore_rollout_ledger_continuation(dir, policy, policy_sha256)
+                    .map(Some)
+            }
+        }
+    }
+
+    fn require_rollout_ledger_topology(&self) -> Result<(), TrainerError> {
+        if self.comm.world_size() == 0 || self.comm.rank() >= self.comm.world_size() {
             return Err(TrainerError::Contract(format!(
-                "rollout ledger trainer integration is world-1 only (got rank {}/world {})",
+                "invalid rollout-ledger data-parallel rank {}/world {}",
                 self.comm.rank(),
                 self.comm.world_size()
             )));
         }
+        u32::try_from(self.comm.rank())
+            .map_err(|_| TrainerError::Contract("rollout-ledger rank does not fit u32".into()))?;
+        u32::try_from(self.comm.world_size()).map_err(|_| {
+            TrainerError::Contract("rollout-ledger world size does not fit u32".into())
+        })?;
         Ok(())
+    }
+
+    fn coordinate_data_parallel_result<T>(
+        &self,
+        label: &str,
+        local: Result<T, TrainerError>,
+    ) -> Result<T, TrainerError> {
+        if self.comm.world_size() <= 1 {
+            return local;
+        }
+        if matches!(&local, Err(TrainerError::Comm(_))) {
+            return local;
+        }
+        let failed_local = if local.is_err() { 1.0 } else { 0.0 };
+        let failed = self.comm.all_reduce_scalar_sum(failed_local)?;
+        match local {
+            Err(error) => Err(error),
+            Ok(_) if failed > 0.0 => Err(TrainerError::Contract(format!(
+                "{label} failed on a peer rank; aborting in lockstep"
+            ))),
+            Ok(value) => Ok(value),
+        }
+    }
+
+    /// Catch one rank-local callback panic and globalize the resulting status
+    /// before any rank can advance into the next data-parallel collective. The
+    /// operation itself must not enter a data-parallel collective.
+    fn coordinate_data_parallel_call<T, F>(
+        &self,
+        label: &str,
+        operation: F,
+    ) -> Result<T, TrainerError>
+    where
+        F: FnOnce() -> Result<T, TrainerError>,
+    {
+        let local = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation))
+            .unwrap_or_else(|payload| {
+                Err(TrainerError::Contract(format!(
+                    "{label} panicked: {}",
+                    panic_payload_message(payload.as_ref())
+                )))
+            });
+        self.coordinate_data_parallel_result(label, local)
+    }
+
+    fn require_data_parallel_consensus_bytes(
+        &self,
+        label: &str,
+        value: &[u8],
+    ) -> Result<(), TrainerError> {
+        if self.comm.world_size() <= 1 {
+            return Ok(());
+        }
+        let digest: [u8; 32] = Sha256::digest(value).into();
+        let mut mismatch = false;
+        for word in digest.chunks_exact(4) {
+            let local = u32::from_le_bytes(word.try_into().expect("four-byte digest word"));
+            let canonical = self.comm.all_reduce_scalar_sum(if self.comm.rank() == 0 {
+                f64::from(local)
+            } else {
+                0.0
+            })?;
+            mismatch |= canonical != f64::from(local);
+        }
+        self.coordinate_data_parallel_result(
+            label,
+            if mismatch {
+                Err(TrainerError::Contract(format!(
+                    "{label} differs across data-parallel ranks"
+                )))
+            } else {
+                Ok(())
+            },
+        )
+    }
+
+    fn distributed_rollout_ledger_nonce(&self) -> Result<u64, TrainerError> {
+        let local = if self.comm.rank() == 0 {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos() as u64);
+            now ^ u64::from(std::process::id())
+        } else {
+            0
+        };
+        let low = self.comm.all_reduce_scalar_sum(if self.comm.rank() == 0 {
+            f64::from(local as u32)
+        } else {
+            0.0
+        })?;
+        let high = self.comm.all_reduce_scalar_sum(if self.comm.rank() == 0 {
+            f64::from((local >> 32) as u32)
+        } else {
+            0.0
+        })?;
+        let (low, high) = self.coordinate_data_parallel_result(
+            "distributed rollout-ledger nonce broadcast",
+            (|| {
+                let low = exact_reduced_u64("distributed nonce low word", low)?;
+                let high = exact_reduced_u64("distributed nonce high word", high)?;
+                Ok((
+                    u32::try_from(low).map_err(|_| {
+                        TrainerError::Contract("distributed nonce low word exceeds u32".into())
+                    })?,
+                    u32::try_from(high).map_err(|_| {
+                        TrainerError::Contract("distributed nonce high word exceeds u32".into())
+                    })?,
+                ))
+            })(),
+        )?;
+        Ok(u64::from(low) | (u64::from(high) << 32))
+    }
+
+    #[allow(clippy::cognitive_complexity)] // explicit staged-publication state machine
+    fn publish_distributed_rollout_ledger_step(
+        &self,
+        writer: &RolloutLedgerWriter,
+        payload: &RolloutLedgerStep,
+        controls: &RolloutLedgerControls,
+    ) -> Result<PathBuf, TrainerError> {
+        let world_size = u32::try_from(self.comm.world_size()).map_err(|_| {
+            TrainerError::Contract("rollout-ledger world size does not fit u32".into())
+        })?;
+        let nonce = self.distributed_rollout_ledger_nonce()?;
+        let stage = self.coordinate_data_parallel_result(
+            "distributed rollout-ledger stage claim",
+            if self.comm.rank() == 0 {
+                writer
+                    .create_distributed_stage(payload.step, world_size, nonce)
+                    .map(Some)
+                    .map_err(TrainerError::from)
+            } else {
+                Ok(None)
+            },
+        )?;
+        let stage_path = stage.as_ref().map_or_else(
+            || writer.distributed_stage_path(payload.step, nonce),
+            |stage| stage.path().to_path_buf(),
+        );
+
+        let shard_local = writer
+            .write_distributed_shard(&stage_path, payload)
+            .map_err(TrainerError::from);
+        let shard_failed =
+            self.comm
+                .all_reduce_scalar_sum(if shard_local.is_err() { 1.0 } else { 0.0 })?;
+        if shard_failed > 0.0 {
+            let cleanup = self.coordinate_data_parallel_result(
+                "distributed rollout-ledger failed-shard cleanup",
+                if self.comm.rank() == 0 {
+                    writer
+                        .abort_distributed_stage(
+                            stage
+                                .as_ref()
+                                .expect("rank 0 owns the coordinated distributed stage"),
+                        )
+                        .map_err(TrainerError::from)
+                } else {
+                    Ok(())
+                },
+            );
+            cleanup?;
+            return match shard_local {
+                Err(error) => Err(error),
+                Ok(_) => Err(TrainerError::Contract(
+                    "distributed rollout-ledger shard write failed on a peer rank; the owned stage was cleaned and every rank may retry"
+                        .into(),
+                )),
+            };
+        }
+        shard_local?;
+
+        let commit_local = if self.comm.rank() == 0 {
+            writer
+                .commit_distributed_stage(
+                    stage
+                        .as_ref()
+                        .expect("rank 0 owns the coordinated distributed stage"),
+                    payload.step,
+                    world_size,
+                    controls,
+                )
+                .map(Some)
+                .map_err(TrainerError::from)
+        } else {
+            Ok(None)
+        };
+        let publication_signal = match &commit_local {
+            Ok(_) => 0.0,
+            Err(TrainerError::RolloutLedger(error)) if error.may_be_visible() => 2.0,
+            Err(_) => 1.0,
+        };
+        let publication_signal = self.comm.all_reduce_scalar_sum(if self.comm.rank() == 0 {
+            publication_signal
+        } else {
+            0.0
+        });
+        let final_dir = writer.root().join(format!("step-{:020}", payload.step));
+        let publication_signal = match publication_signal {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(TrainerError::PublicationAmbiguousAfterComm {
+                    artifact: "distributed rollout ledger",
+                    path: final_dir,
+                    detail: "rank 0 entered the manifest commit phase before the status collective"
+                        .into(),
+                    communication: Box::new(error),
+                });
+            }
+        };
+        if publication_signal > 1.5 {
+            return match commit_local {
+                Err(error) => Err(error),
+                Ok(_) => Err(TrainerError::RolloutLedger(
+                    RolloutLedgerError::PublicationAmbiguous {
+                        path: final_dir,
+                        detail: "rank 0 reported ambiguous distributed publication; sampler state was preserved on every rank"
+                            .into(),
+                    },
+                )),
+            };
+        }
+        if publication_signal > 0.5 {
+            return match commit_local {
+                Err(error) => Err(error),
+                Ok(_) => Err(TrainerError::Contract(
+                    "rank 0 failed before distributed rollout-ledger visibility; every rank may rewind and retry"
+                        .into(),
+                )),
+            };
+        }
+        Ok(commit_local.ok().flatten().unwrap_or(final_dir))
     }
 
     fn require_rollout_ledger_step_in_range(&self, step: u64) -> Result<(), TrainerError> {
@@ -2538,6 +3414,129 @@ impl Trainer {
         vars.iter()
             .map(|var| Ok(var.as_tensor().copy()?.contiguous()?))
             .collect()
+    }
+
+    fn restore_rollout_ledger_checkpoint_prestate<P: Policy>(
+        policy: &mut P,
+        vars: &[Var],
+        adapter_prestate: &[Tensor],
+        sampler_prestate: &[u8],
+    ) -> Result<(), TrainerError> {
+        let mut failures = Vec::new();
+        if vars.len() != adapter_prestate.len() {
+            failures.push(format!(
+                "adapter snapshot has {} tensors for {} live variables",
+                adapter_prestate.len(),
+                vars.len()
+            ));
+        } else {
+            for (index, (var, snapshot)) in vars.iter().zip(adapter_prestate).enumerate() {
+                if let Err(error) = var.set(snapshot) {
+                    failures.push(format!("restore adapter tensor {index}: {error}"));
+                }
+            }
+        }
+        if let Err(error) = Self::restore_rollout_ledger_sampler(policy, sampler_prestate) {
+            failures.push(format!("restore sampler state: {error}"));
+        }
+        let active_vars = policy.trainable_vars();
+        if !Self::same_rollout_ledger_vars(vars, &active_vars) {
+            failures.push(
+                "policy trainable-variable binding changed during continuation restore".into(),
+            );
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(TrainerError::Contract(failures.join("; ")))
+        }
+    }
+
+    /// Run recovery after a communication failure without touching the dead
+    /// world. Policy callbacks may panic, so every such local-only recovery is
+    /// contained here before the caller returns a terminal discard result.
+    fn catch_local_data_parallel_recovery<F>(label: &str, operation: F) -> Result<(), TrainerError>
+    where
+        F: FnOnce() -> Result<(), TrainerError>,
+    {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)).unwrap_or_else(
+            |payload| {
+                Err(TrainerError::Contract(format!(
+                    "{label} panicked: {}",
+                    panic_payload_message(payload.as_ref())
+                )))
+            },
+        )
+    }
+
+    fn rollout_ledger_metrics_rollback_detail(rollback: &Result<(), TrainerError>) -> String {
+        match rollback {
+            Ok(()) => "best-effort local metrics rollback completed".into(),
+            Err(error) => format!(
+                "best-effort local metrics rollback failed: {error}; rank-local metrics telemetry may contain a row for a rolled-back learner step and must be repaired or discarded"
+            ),
+        }
+    }
+
+    fn terminal_data_parallel_comm_failure(
+        phase: &str,
+        comm_error: &crate::comm::CommError,
+        local_detail: Option<&str>,
+        rollback: Result<(), TrainerError>,
+        discard: &str,
+    ) -> TrainerError {
+        let local_detail = local_detail.map_or_else(String::new, |detail| format!("; {detail}"));
+        let rollback_detail = match rollback {
+            Ok(()) => "best-effort local rollback completed".to_owned(),
+            Err(error) => format!("best-effort local rollback failed: {error}"),
+        };
+        TrainerError::Contract(format!(
+            "{phase} communication failed ({comm_error}){local_detail}; {rollback_detail}; the data-parallel world is dead and no further collectives are safe; discard the {discard} on every rank in this data-parallel world"
+        ))
+    }
+
+    fn restore_rollout_ledger_checkpoint_prestate_locally<P: Policy>(
+        policy: &mut P,
+        vars: &[Var],
+        adapter_prestate: &[Tensor],
+        sampler_prestate: &[u8],
+    ) -> Result<(), TrainerError> {
+        Self::catch_local_data_parallel_recovery("best-effort local continuation rollback", || {
+            Self::restore_rollout_ledger_checkpoint_prestate(
+                policy,
+                vars,
+                adapter_prestate,
+                sampler_prestate,
+            )
+        })
+    }
+
+    fn terminal_rollout_ledger_restore_comm_failure<P: Policy>(
+        phase: &str,
+        comm_error: &crate::comm::CommError,
+        local_error: Option<&str>,
+        policy: &mut P,
+        vars: &[Var],
+        adapter_prestate: &[Tensor],
+        sampler_prestate: &[u8],
+    ) -> TrainerError {
+        let rollback = Self::restore_rollout_ledger_checkpoint_prestate_locally(
+            policy,
+            vars,
+            adapter_prestate,
+            sampler_prestate,
+        );
+        let local_detail = local_error.map_or_else(
+            || "the local restore had completed before communication failed".to_owned(),
+            |error| format!("the local restore also failed: {error}"),
+        );
+        Self::terminal_data_parallel_comm_failure(
+            phase,
+            comm_error,
+            Some(&local_detail),
+            rollback,
+            "policy state",
+        )
     }
 
     fn restore_rollout_ledger_sampler<P: Policy>(
@@ -2629,6 +3628,12 @@ impl Trainer {
             grad_accum_steps,
             group_size,
             completion_width,
+            reward_group_scope: match self.config.reward_group_scope {
+                RewardGroupScope::Local => RolloutLedgerGroupScope::Local,
+                RewardGroupScope::DistributedSamePrompt => {
+                    RolloutLedgerGroupScope::DistributedSamePrompt
+                }
+            },
             scale_rewards: self.config.scale_rewards,
             eos_token_id: self.config.eos_token_id,
             truncation_masking: self.config.truncation_masking,
@@ -2653,6 +3658,17 @@ impl Trainer {
         continuation: Option<&RolloutLedgerContinuation>,
     ) -> Result<String, TrainerError> {
         let lineage = if let Some(continuation) = continuation {
+            let current_world_size = u32::try_from(self.comm.world_size()).map_err(|_| {
+                TrainerError::Contract(
+                    "rollout-ledger world size does not fit continuation u32".into(),
+                )
+            })?;
+            if continuation.world_size != current_world_size {
+                return Err(TrainerError::Contract(format!(
+                    "rollout-ledger continuation world size {} cannot run in world {current_world_size}",
+                    continuation.world_size
+                )));
+            }
             if continuation.completed_step != step {
                 return Err(TrainerError::Contract(format!(
                     "rollout-ledger continuation completed step {} cannot start step {step}",
@@ -2702,17 +3718,37 @@ impl Trainer {
             &lineage,
         )?;
         if let Some(continuation) = continuation {
-            let matches = continuation.policy_sha256 == actual.policy_sha256
-                && continuation.trainer_config_sha256 == actual.trainer_config_sha256
-                && continuation.tensor_schema_sha256 == actual.tensor_schema_sha256
-                && continuation.adapter_sha256 == actual.adapter_sha256
-                && continuation.optimizer_sha256 == actual.optimizer_sha256
-                && continuation.sampler_sha256 == actual.sampler_sha256;
-            if !matches {
-                return Err(TrainerError::Contract(
-                    "rollout-ledger continuation does not match the live policy/config/schema/adapter/Adam/sampler state"
-                        .into(),
-                ));
+            let mismatches = [
+                ("policy", continuation.policy_sha256 != actual.policy_sha256),
+                (
+                    "trainer config",
+                    continuation.trainer_config_sha256 != actual.trainer_config_sha256,
+                ),
+                (
+                    "tensor schema",
+                    continuation.tensor_schema_sha256 != actual.tensor_schema_sha256,
+                ),
+                (
+                    "adapter",
+                    continuation.adapter_sha256 != actual.adapter_sha256,
+                ),
+                (
+                    "Adam",
+                    continuation.optimizer_sha256 != actual.optimizer_sha256,
+                ),
+                (
+                    "sampler",
+                    continuation.sampler_sha256 != actual.sampler_sha256,
+                ),
+            ]
+            .into_iter()
+            .filter_map(|(label, differs)| differs.then_some(label))
+            .collect::<Vec<_>>();
+            if !mismatches.is_empty() {
+                return Err(TrainerError::Contract(format!(
+                    "rollout-ledger continuation does not match live {} state",
+                    mismatches.join("/")
+                )));
             }
         }
         Ok(lineage)
@@ -2729,12 +3765,25 @@ impl Trainer {
         sampler_state: &[u8],
         lineage_sha256: &str,
     ) -> Result<RolloutLedgerIdentity, TrainerError> {
-        let config =
-            serde_json::to_vec(&self.config.rollout_ledger_semantics()).map_err(|error| {
-                TrainerError::Contract(format!(
-                    "serialize learner-semantic trainer config for ledger identity: {error}"
-                ))
-            })?;
+        let (config, config_domain) = if self.comm.world_size() == 1 {
+            (
+                serde_json::to_vec(&self.config.rollout_ledger_semantics()),
+                "ferrl.rollout-ledger.trainer-config.v1",
+            )
+        } else {
+            (
+                serde_json::to_vec(&(
+                    self.config.rollout_ledger_semantics(),
+                    self.comm.world_size(),
+                )),
+                "ferrl.rollout-ledger.trainer-config.v2",
+            )
+        };
+        let config = config.map_err(|error| {
+            TrainerError::Contract(format!(
+                "serialize learner-semantic trainer config for ledger identity: {error}"
+            ))
+        })?;
         let schema: Vec<(String, Vec<usize>, String)> = vars
             .iter()
             .enumerate()
@@ -2775,10 +3824,7 @@ impl Trainer {
                 ),
         )?;
         Ok(RolloutLedgerIdentity {
-            trainer_config_sha256: domain_sha256(
-                "ferrl.rollout-ledger.trainer-config.v1",
-                &[&config],
-            ),
+            trainer_config_sha256: domain_sha256(config_domain, &[&config]),
             policy_sha256: policy_sha256.to_owned(),
             tensor_schema_sha256: domain_sha256(
                 "ferrl.rollout-ledger.tensor-schema.v1",
@@ -2796,6 +3842,80 @@ impl Trainer {
         })
     }
 
+    fn rollout_ledger_global_counts(
+        &self,
+        collected: &[CollectedGroup],
+        beta: f64,
+    ) -> Result<(u64, u32), TrainerError> {
+        let (local_tokens, local_live) = self.coordinate_data_parallel_result(
+            "rollout-ledger local count derivation",
+            (|| {
+                let local_tokens = collected.iter().try_fold(0_u64, |total, item| {
+                    item.rollout
+                        .completion_lens
+                        .iter()
+                        .try_fold(total, |total, &len| {
+                            total
+                                .checked_add(u64::try_from(len).map_err(|_| {
+                                    TrainerError::Contract(
+                                        "completion length does not fit rollout ledger u64".into(),
+                                    )
+                                })?)
+                                .ok_or_else(|| {
+                                    TrainerError::Contract(
+                                        "rollout ledger window token count overflow".into(),
+                                    )
+                                })
+                        })
+                })?;
+                let local_live = u64::try_from(
+                    collected
+                        .iter()
+                        .filter(|item| beta > 0.0 || item.surrogate_live)
+                        .count(),
+                )
+                .map_err(|_| {
+                    TrainerError::Contract("rollout ledger live-item count overflows u64".into())
+                })?;
+                Ok((local_tokens, local_live))
+            })(),
+        )?;
+        if self.comm.world_size() == 1 {
+            return Ok((
+                local_tokens.max(1),
+                u32::try_from(local_live).map_err(|_| {
+                    TrainerError::Contract("rollout ledger live-item count overflows u32".into())
+                })?,
+            ));
+        }
+        let (local_tokens_f64, local_live_f64) = self.coordinate_data_parallel_result(
+            "rollout-ledger collector exact count conversion",
+            (|| {
+                Ok((
+                    exact_u64_as_f64("rollout ledger completion-token count", local_tokens)?,
+                    exact_u64_as_f64("rollout ledger live-item count", local_live)?,
+                ))
+            })(),
+        )?;
+        let tokens = self.comm.all_reduce_scalar_sum(local_tokens_f64)?;
+        let live = self.comm.all_reduce_scalar_sum(local_live_f64)?;
+        let (global_tokens, global_live) = self.coordinate_data_parallel_result(
+            "rollout-ledger collector global counts",
+            (|| {
+                Ok((
+                    exact_reduced_u64("rollout ledger completion-token count", tokens)?.max(1),
+                    exact_reduced_u64("rollout ledger live-item count", live)?,
+                ))
+            })(),
+        )?;
+        Ok((
+            global_tokens,
+            u32::try_from(global_live).map_err(|_| {
+                TrainerError::Contract("rollout ledger global live-item count overflows u32".into())
+            })?,
+        ))
+    }
+
     #[allow(clippy::cognitive_complexity)]
     fn rollout_ledger_payload(
         &self,
@@ -2803,10 +3923,11 @@ impl Trainer {
         controls: &RolloutLedgerControls,
         collected: &[CollectedGroup],
         post_rollout_sampler_state: Vec<u8>,
+        window_tokens: u64,
+        live_items: u32,
     ) -> Result<RolloutLedgerStep, TrainerError> {
         let mut groups = Vec::with_capacity(collected.len());
-        let mut window_tokens = 0_u64;
-        let mut live_items = 0_u32;
+        let mut local_live_items = 0_u32;
         let beta = f64::from_bits(controls.effective_beta_bits);
         for item in collected {
             let completion_lens: Vec<u32> = item
@@ -2821,19 +3942,15 @@ impl Trainer {
                     })
                 })
                 .collect::<Result<_, _>>()?;
-            for &len in &completion_lens {
-                window_tokens = window_tokens.checked_add(u64::from(len)).ok_or_else(|| {
-                    TrainerError::Contract("rollout ledger window token count overflow".into())
-                })?;
-            }
             if beta > 0.0 || item.surrogate_live {
-                live_items = live_items.checked_add(1).ok_or_else(|| {
+                local_live_items = local_live_items.checked_add(1).ok_or_else(|| {
                     TrainerError::Contract("rollout ledger live item count overflow".into())
                 })?;
             }
             groups.push(RolloutLedgerGroup {
                 accum_index: item.accum_index,
                 prompt_index: item.prompt_index,
+                rollout_global_row_base: item.rollout_global_row_base,
                 token_ids: item.rollout.token_ids.clone(),
                 prompt_len: u32::try_from(item.rollout.prompt_len).map_err(|_| {
                     TrainerError::Contract("prompt length does not fit rollout ledger u32".into())
@@ -2845,6 +3962,7 @@ impl Trainer {
                         .collect()
                 }),
                 reward_bits: item.rewards.iter().map(|value| value.to_bits()).collect(),
+                distributed_reward_stats: item.distributed_reward_stats,
                 advantage_bits: item
                     .advantages
                     .iter()
@@ -2857,22 +3975,31 @@ impl Trainer {
                     .collect(),
             });
         }
+        let rank = u32::try_from(self.comm.rank()).map_err(|_| {
+            TrainerError::Contract("data-parallel rank does not fit rollout ledger u32".into())
+        })?;
+        let world_size = u32::try_from(self.comm.world_size()).map_err(|_| {
+            TrainerError::Contract(
+                "data-parallel world size does not fit rollout ledger u32".into(),
+            )
+        })?;
         Ok(RolloutLedgerStep {
             step,
-            rank: 0,
-            world_size: 1,
+            rank,
+            world_size,
             grad_accum_steps: controls.grad_accum_steps,
             group_size: controls.group_size,
             completion_width: controls.completion_width,
+            reward_group_scope: controls.reward_group_scope,
             scale_rewards: controls.scale_rewards,
             eos_token_id: controls.eos_token_id,
             truncation_masking: controls.truncation_masking,
             tis_imp_ratio_cap_bits: controls.tis_imp_ratio_cap_bits,
             effective_lr_bits: controls.effective_lr_bits,
             effective_beta_bits: controls.effective_beta_bits,
-            window_tokens: window_tokens.max(1),
+            window_tokens,
             live_items,
-            old_logprobs: if live_items > 0 {
+            old_logprobs: if local_live_items > 0 {
                 LedgerScoreRequirement::AdapterEnabledDetached
             } else {
                 LedgerScoreRequirement::NotRequired
@@ -2918,14 +4045,12 @@ impl Trainer {
             .iter()
             .map(|&bits| f32::from_bits(bits))
             .collect();
-        let rewards_f64: Vec<f64> = rewards.iter().map(|&value| f64::from(value)).collect();
-        let production_advantages = group_advantages(&rewards_f64, self.config.scale_rewards);
-        let surrogate_live = production_advantages.iter().any(|&value| value != 0.0);
-        let advantages = group
+        let advantages: Vec<f64> = group
             .advantage_bits
             .iter()
             .map(|&bits| f64::from(f32::from_bits(bits)))
             .collect();
+        let surrogate_live = advantages.iter().any(|&value| value != 0.0);
         let mask_rows: Vec<Vec<f64>> = group
             .loss_mask
             .iter()
@@ -2958,9 +4083,11 @@ impl Trainer {
         Ok(CollectedGroup {
             accum_index: group.accum_index,
             prompt_index: group.prompt_index,
+            rollout_global_row_base: group.rollout_global_row_base,
             rollout,
             rewards,
             advantages,
+            distributed_reward_stats: group.distributed_reward_stats,
             mask_rows,
             stat,
             surrogate_live,
@@ -3471,14 +4598,18 @@ impl Trainer {
         if exec.execution_world_size(self.comm.as_ref()) <= 1 {
             return local;
         }
+        if matches!(&local, Err(TrainerError::Comm(_))) {
+            return local;
+        }
         let failed_local = if local.is_err() { 1.0 } else { 0.0 };
-        let reduced = exec.execution_all_reduce_scalar_sum(self.comm.as_ref(), failed_local);
-        match (local, reduced) {
-            (Err(err), _) | (Ok(_), Err(err)) => Err(err),
-            (Ok(_), Ok(failed_global)) if failed_global > 0.0 => Err(TrainerError::Contract(
+        let failed_global =
+            exec.execution_all_reduce_scalar_sum(self.comm.as_ref(), failed_local)?;
+        match local {
+            Err(error) => Err(error),
+            Ok(_) if failed_global > 0.0 => Err(TrainerError::Contract(
                 "checkpoint load/restore failed on a peer rank; aborting in lockstep".into(),
             )),
-            (Ok(loaded), Ok(_)) => Ok(loaded),
+            Ok(loaded) => Ok(loaded),
         }
     }
 
@@ -3621,6 +4752,68 @@ impl Trainer {
             }
             Ok(())
         })
+    }
+
+    /// Append one separated-learner metrics row transactionally across every
+    /// rank-local run directory. If any append fails, all successful peers
+    /// truncate back to their pre-append boundary before the learner rolls its
+    /// model/Adam/sampler state back.
+    fn append_rollout_ledger_metrics(&mut self, metrics: &Metrics) -> Result<(), TrainerError> {
+        if self.comm.world_size() <= 1 {
+            self.writer.append(metrics)?;
+            return Ok(());
+        }
+        let rollback_len = self.writer.append_boundary().map_err(TrainerError::from);
+        let rollback_len = self.coordinate_data_parallel_result(
+            "rollout-ledger metrics rollback boundary",
+            rollback_len,
+        )?;
+        let append_local = self.writer.append(metrics).map_err(TrainerError::from);
+        let failed_local = if append_local.is_err() { 1.0 } else { 0.0 };
+        let failed_global = self.comm.all_reduce_scalar_sum(failed_local);
+        let failed_global = match failed_global {
+            Ok(failed) => failed,
+            Err(comm_error) => {
+                let rollback = Self::catch_local_data_parallel_recovery(
+                    "best-effort local rollout-ledger metrics rollback",
+                    || {
+                        self.writer.truncate_to(rollback_len)?;
+                        Ok(())
+                    },
+                );
+                return Err(TrainerError::RolloutLedgerMetricsComm {
+                    communication: Box::new(comm_error),
+                    telemetry_rollback: Self::rollout_ledger_metrics_rollback_detail(&rollback),
+                });
+            }
+        };
+        if failed_global == 0.0 {
+            return append_local;
+        }
+        let rollback_local =
+            Self::catch_local_data_parallel_recovery("rollout-ledger metrics rollback", || {
+                self.writer.truncate_to(rollback_len)?;
+                Ok(())
+            });
+        let rollback_detail = Self::rollout_ledger_metrics_rollback_detail(&rollback_local);
+        let rollback =
+            self.coordinate_data_parallel_result("rollout-ledger metrics rollback", rollback_local);
+        match (append_local, rollback) {
+            (_, Err(TrainerError::Comm(comm_error))) => {
+                Err(TrainerError::RolloutLedgerMetricsComm {
+                    communication: Box::new(comm_error),
+                    telemetry_rollback: rollback_detail,
+                })
+            }
+            (_, Err(rollback_error)) => Err(TrainerError::Contract(format!(
+                "rollout-ledger metrics append failed on at least one rank; coordinated rollback failed: {rollback_error}"
+            ))),
+            (Err(append_error), Ok(())) => Err(append_error),
+            (Ok(()), Ok(())) => Err(TrainerError::Contract(
+                "rollout-ledger metrics append failed on a peer rank; every rank-local stream was rolled back"
+                    .into(),
+            )),
+        }
     }
 
     /// One optimizer step over a window of `grad_accum_steps` prompts: collect each
@@ -3905,18 +5098,28 @@ impl Trainer {
         E: PolicyExecution<P>,
         F: FnOnce(&mut Self) -> Result<(), TrainerError>,
     {
-        let local = op(self);
+        let local = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| op(self)))
+            .unwrap_or_else(|payload| {
+                Err(TrainerError::Contract(format!(
+                    "{label} panicked: {}",
+                    panic_payload_message(payload.as_ref())
+                )))
+            });
         if exec.execution_world_size(self.comm.as_ref()) <= 1 {
             return local;
         }
+        if matches!(&local, Err(TrainerError::Comm(_))) {
+            return local;
+        }
         let failed_local = if local.is_err() { 1.0 } else { 0.0 };
-        let reduced = exec.execution_all_reduce_scalar_sum(self.comm.as_ref(), failed_local);
-        match (local, reduced) {
-            (Err(err), _) | (Ok(()), Err(err)) => Err(err),
-            (Ok(()), Ok(failed_global)) if failed_global > 0.0 => Err(TrainerError::Contract(
-                format!("{label} failed on a peer rank; aborting in lockstep"),
-            )),
-            (Ok(()), Ok(_)) => Ok(()),
+        let failed_global =
+            exec.execution_all_reduce_scalar_sum(self.comm.as_ref(), failed_local)?;
+        match local {
+            Err(error) => Err(error),
+            Ok(()) if failed_global > 0.0 => Err(TrainerError::Contract(format!(
+                "{label} failed on a peer rank; aborting in lockstep"
+            ))),
+            Ok(()) => Ok(()),
         }
     }
 
@@ -3997,87 +5200,81 @@ impl Trainer {
         R: RewardFn,
         E: PolicyExecution<P>,
     {
-        // Rollout with the adapter on, then score it.
-        policy.set_adapter_enabled(true);
-        let prompt_ids = tokenizer.encode(&selected.sample.prompt);
-        // A prompt that encodes to zero tokens (a real tokenizer can yield `[]` for
-        // empty/whitespace input) must fail HERE, before generate: teacher-forced
-        // scoring needs >= 1 prompt token, and a policy that builds an empty input
-        // and reads the last position (`len - 1`) underflows/panics. The rollout
-        // contract (`prompt_len >= 1`) is otherwise only checked after generation.
-        if prompt_ids.is_empty() {
-            return Err(TrainerError::Contract(format!(
-                "prompt encoded to zero tokens: {:?}",
-                selected.sample.prompt
-            )));
-        }
-        // Derive the rollout config from the trainer config (single source of truth;
-        // see `impl From<&TrainerConfig> for GenConfig`) so the two cannot drift.
-        let gen = GenConfig::from(&self.config);
-        // See `select_prompt`: prompt selection and rollout RNG row ranges differ
-        // in distributed same-prompt mode.
-        gpu_mem.record("rollout_start");
-        let rollout = exec.generate_at_instrumented(
-            policy,
-            &prompt_ids,
-            &gen,
-            selected.selection.rollout_global_row_base,
-            gpu_mem.recorder(),
-        )?;
-        gpu_mem.record("rollout_end");
-        // Validate the rollout BEFORE decoding/scoring it: completion_dims rejects
-        // an empty, ragged, or shorter-than-prompt rollout (and a misaligned
-        // behavior-log-prob capture), so the decode slice `ids[prompt_len..]`
-        // cannot panic on malformed Policy output.
-        let (_, comp_len) = completion_dims(&rollout)?;
-        if comp_len != self.config.max_new_tokens {
-            return Err(TrainerError::Contract(format!(
-                "Policy::generate returned completion width {comp_len}, expected max_new_tokens {}",
-                self.config.max_new_tokens
-            )));
-        }
-        // The TIS weight is undefined without the behavior policy's probabilities;
-        // fail loud on the FIRST prompt rather than silently training uncorrected.
-        if self.config.tis && rollout.rollout_logprobs.is_none() {
-            return Err(TrainerError::Contract(
-                "tis is enabled but Policy::generate captured no rollout log-probs \
-                 (Rollout::rollout_logprobs is None) — this policy cannot supply the \
-                 behavior probabilities the correction needs"
-                    .into(),
-            ));
-        }
-        // Policy::generate is contracted to return exactly `group_size` completions.
-        // An underfilled rollout would otherwise become a degenerate single-item
-        // group (all-zero advantages -> silently skipped); an overfilled one would
-        // silently change the effective group size. Reject either.
-        if rollout.len() != self.config.group_size {
-            return Err(TrainerError::Contract(format!(
-                "Policy::generate returned {} completions for group_size {}",
+        // Everything before distributed reward-stat collectives is rank-local and
+        // fallible. Catch panics and globalize the result before any rank enters
+        // those collectives, otherwise one bad generator/reward strands its peers.
+        let pre_stats = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            policy.set_adapter_enabled(true);
+            let prompt_ids = tokenizer.encode(&selected.sample.prompt);
+            if prompt_ids.is_empty() {
+                return Err(TrainerError::Contract(format!(
+                    "prompt encoded to zero tokens: {:?}",
+                    selected.sample.prompt
+                )));
+            }
+            let gen = GenConfig::from(&self.config);
+            gpu_mem.record("rollout_start");
+            let rollout = exec.generate_at_instrumented(
+                policy,
+                &prompt_ids,
+                &gen,
+                selected.selection.rollout_global_row_base,
+                gpu_mem.recorder(),
+            )?;
+            gpu_mem.record("rollout_end");
+            let (_, comp_len) = completion_dims(&rollout)?;
+            if comp_len != self.config.max_new_tokens {
+                return Err(TrainerError::Contract(format!(
+                    "Policy::generate returned completion width {comp_len}, expected max_new_tokens {}",
+                    self.config.max_new_tokens
+                )));
+            }
+            if self.config.tis && rollout.rollout_logprobs.is_none() {
+                return Err(TrainerError::Contract(
+                    "tis is enabled but Policy::generate captured no rollout log-probs \
+                     (Rollout::rollout_logprobs is None) — this policy cannot supply the \
+                     behavior probabilities the correction needs"
+                        .into(),
+                ));
+            }
+            if rollout.len() != self.config.group_size {
+                return Err(TrainerError::Contract(format!(
+                    "Policy::generate returned {} completions for group_size {}",
+                    rollout.len(),
+                    self.config.group_size
+                )));
+            }
+            let completions = decode_completions(&rollout, tokenizer);
+            gpu_mem.record("reward_start");
+            let reward_outcomes = self.coordinate_reward_group(
+                reward_fn,
+                selected.sample,
+                &completions,
                 rollout.len(),
-                self.config.group_size
-            )));
-        }
-        let completions = decode_completions(&rollout, tokenizer);
-        gpu_mem.record("reward_start");
-        let reward_outcomes = self.coordinate_reward_group(
-            reward_fn,
-            selected.sample,
-            &completions,
-            rollout.len(),
-            exec,
-        )?;
-        gpu_mem.record("reward_end");
-        let rewards: Vec<f32> = reward_outcomes
-            .iter()
-            .map(|outcome| outcome.reward)
-            .collect();
-        if rewards.len() != rollout.len() {
-            return Err(TrainerError::Contract(format!(
-                "reward_group_detailed returned {} rewards for {} completions",
-                rewards.len(),
-                rollout.len()
-            )));
-        }
+                exec,
+            )?;
+            gpu_mem.record("reward_end");
+            let rewards: Vec<f32> = reward_outcomes
+                .iter()
+                .map(|outcome| outcome.reward)
+                .collect();
+            if rewards.len() != rollout.len() {
+                return Err(TrainerError::Contract(format!(
+                    "reward_group_detailed returned {} rewards for {} completions",
+                    rewards.len(),
+                    rollout.len()
+                )));
+            }
+            Ok((rollout, comp_len, completions, reward_outcomes, rewards))
+        }))
+        .unwrap_or_else(|payload| {
+            Err(TrainerError::Contract(format!(
+                "rollout/reward evaluation panicked: {}",
+                panic_payload_message(payload.as_ref())
+            )))
+        });
+        let (rollout, comp_len, completions, reward_outcomes, rewards) =
+            self.coordinate_data_parallel_result("rollout/reward group preflight", pre_stats)?;
         self.write_candidate_records(
             CandidateWriteCtx {
                 step,
@@ -4092,61 +5289,47 @@ impl Trainer {
             &rollout,
             exec,
         )?;
-
-        // Length-aware loss mask: column j of sequence i is a real completion token
-        // (kept, 1.0) iff j < completion_lens[i]; the EOS padding at and beyond that
-        // index is masked out (0.0). With eos_token_id == None every length is the
-        // full width, so every row is all-ones — bit-identical to the legacy mask.
         let mut mask_rows = length_mask_rows(&rollout, comp_len);
-
-        // DAPO overlong filtering (TRL `mask_truncated_completions`): zero the
-        // whole mask row of any completion that ran to the full width without
-        // sampling EOS. The completion still feeds the reward statistics /
-        // advantages and the DAPO normalizer (matching TRL); only its loss
-        // tokens are removed. Inert when eos_token_id is None.
         let truncated = if self.config.truncation_masking {
             mask_truncated_rows(&rollout, comp_len, self.config.eos_token_id, &mut mask_rows)
         } else {
             0
         };
-        // zero_mask_rows counts any all-pad row — truncation-masked completions
-        // land here too, so a batch that lost loss signal stays observable.
         let dropped = zero_mask_rows(&mask_rows);
-
-        // Group-normalized advantages (scalar oracle). A group whose advantages are
-        // all exactly zero — no reward spread, or non-finite rewards forced to a 0
-        // advantage — carries no SURROGATE gradient. With `beta == 0` (no KL term)
-        // it is therefore a complete no-op and is skipped (no snapshot, no update,
-        // no canary). With `beta > 0` it must stay LIVE: TRL keeps every
-        // completion in the batch, and the KL penalty still pulls a
-        // zero-advantage group toward the reference (its surrogate contributes
-        // exactly 0 — the zero-advantage guard in the clipped surrogate — but the
-        // k3 term carries gradient). Skipping it would silently drop that
-        // regularization, diverging from TRL whenever rewards saturate mid-run.
-        let rewards_f64: Vec<f64> = rewards.iter().map(|&r| f64::from(r)).collect();
-        let advantages = self.reward_group_advantages(&rewards_f64)?;
-        let degenerate = advantages.iter().all(|a| *a == 0.0);
-        let stat = PromptStat {
-            completion_len: mean_completion_len(&rollout),
-            completion_tokens: rollout.completion_lens.iter().sum(),
-            dropped,
-            truncated,
-            degenerate,
-            ratio_stats: None,
-            rewards: rewards.clone(),
-        };
-        Ok(CollectedGroup {
-            accum_index: u32::try_from(selected.accum_index).map_err(|_| {
-                TrainerError::Contract("accumulation index does not fit rollout ledger u32".into())
-            })?,
-            prompt_index: selected.selection.prompt_index,
-            rollout,
-            rewards,
-            advantages,
-            mask_rows,
-            stat,
-            surrogate_live: !degenerate,
-        })
+        let rewards_f64: Vec<f64> = rewards.iter().map(|&reward| f64::from(reward)).collect();
+        let (advantages, distributed_reward_stats) =
+            self.reward_group_advantages_with_stats(&rewards_f64)?;
+        self.coordinate_data_parallel_result(
+            "rollout-ledger group finalization",
+            (|| {
+                let degenerate = advantages.iter().all(|advantage| *advantage == 0.0);
+                let stat = PromptStat {
+                    completion_len: mean_completion_len(&rollout),
+                    completion_tokens: rollout.completion_lens.iter().sum(),
+                    dropped,
+                    truncated,
+                    degenerate,
+                    ratio_stats: None,
+                    rewards: rewards.clone(),
+                };
+                Ok(CollectedGroup {
+                    accum_index: u32::try_from(selected.accum_index).map_err(|_| {
+                        TrainerError::Contract(
+                            "accumulation index does not fit rollout ledger u32".into(),
+                        )
+                    })?,
+                    prompt_index: selected.selection.prompt_index,
+                    rollout_global_row_base: selected.selection.rollout_global_row_base,
+                    rollout,
+                    rewards,
+                    advantages,
+                    distributed_reward_stats,
+                    mask_rows,
+                    stat,
+                    surrogate_live: !degenerate,
+                })
+            })(),
+        )
     }
 
     /// Learner half of one collected group: enforce the production F64 liveness
@@ -4212,6 +5395,7 @@ impl Trainer {
     /// Score one TP group's rewards on execution rank 0, then broadcast those
     /// canonical scalars before any rank computes advantages or branches on a
     /// degenerate group. DP ranks still score their own prompt shards locally.
+    #[allow(clippy::cognitive_complexity)] // explicit primary/status/value broadcast protocol
     fn coordinate_reward_group<P, R, E>(
         &self,
         reward_fn: &R,
@@ -4252,18 +5436,22 @@ impl Trainer {
         } else {
             Ok(Vec::new())
         };
+        if matches!(&local, Err(TrainerError::Comm(_))) {
+            return local;
+        }
         let failed_local = if local.is_err() { 1.0 } else { 0.0 };
-        let failed_global = exec.execution_all_reduce_scalar_sum(self.comm.as_ref(), failed_local);
-        let local = match (local, failed_global) {
-            (Err(err), _) | (Ok(_), Err(err)) => return Err(err),
-            (Ok(_), Ok(failed)) if failed > 0.0 => {
+        let failed_global =
+            exec.execution_all_reduce_scalar_sum(self.comm.as_ref(), failed_local)?;
+        let local = match local {
+            Err(error) => return Err(error),
+            Ok(_) if failed_global > 0.0 => {
                 return Err(TrainerError::Contract(
                     "reward evaluation failed on tensor-parallel execution rank 0; aborting in \
                      lockstep"
                         .into(),
                 ));
             }
-            (Ok(outcomes), Ok(_)) => outcomes,
+            Ok(outcomes) => outcomes,
         };
 
         let local_reward_bits: Vec<f64> = if is_primary {
@@ -4298,23 +5486,40 @@ impl Trainer {
         }
     }
 
+    #[cfg(test)]
     fn reward_group_advantages(&self, rewards: &[f64]) -> Result<Vec<f64>, TrainerError> {
+        self.reward_group_advantages_with_stats(rewards)
+            .map(|(advantages, _)| advantages)
+    }
+
+    fn reward_group_advantages_with_stats(
+        &self,
+        rewards: &[f64],
+    ) -> Result<(Vec<f64>, Option<RolloutLedgerRewardStats>), TrainerError> {
         match self.config.reward_group_scope {
-            RewardGroupScope::Local => Ok(group_advantages(rewards, self.config.scale_rewards)),
+            RewardGroupScope::Local => {
+                Ok((group_advantages(rewards, self.config.scale_rewards), None))
+            }
             RewardGroupScope::DistributedSamePrompt if self.comm.world_size() == 1 => {
-                Ok(group_advantages(rewards, self.config.scale_rewards))
+                Ok((group_advantages(rewards, self.config.scale_rewards), None))
             }
             RewardGroupScope::DistributedSamePrompt => {
                 let local = RewardStatsAcc::from_rewards(rewards);
-                let global = RewardStatsAcc {
-                    count: self.comm.all_reduce_scalar_sum(local.count)?,
-                    sum: self.comm.all_reduce_scalar_sum(local.sum)?,
-                    sumsq: self.comm.all_reduce_scalar_sum(local.sumsq)?,
-                };
-                Ok(advantages_from_stats(
-                    rewards,
-                    global,
-                    self.config.scale_rewards,
+                let count = self.comm.all_reduce_scalar_sum(local.count)?;
+                let sum = self.comm.all_reduce_scalar_sum(local.sum)?;
+                let sumsq = self.comm.all_reduce_scalar_sum(local.sumsq)?;
+                let global = self.coordinate_data_parallel_result(
+                    "distributed reward-statistics reduction",
+                    Ok(RewardStatsAcc { count, sum, sumsq }),
+                )?;
+                let count = exact_reduced_u64("distributed reward count", global.count)?;
+                Ok((
+                    advantages_from_stats(rewards, global, self.config.scale_rewards),
+                    Some(RolloutLedgerRewardStats {
+                        count,
+                        sum_bits: global.sum.to_bits(),
+                        sumsq_bits: global.sumsq.to_bits(),
+                    }),
                 ))
             }
         }
@@ -4379,88 +5584,127 @@ impl Trainer {
         E: PolicyExecution<P>,
     {
         let vars = ctx.vars;
-        let mut acc: Vec<Option<Tensor>> = vec![None; vars.len()];
-        let mut covered = vec![true; vars.len()];
-        let mut sum_kl = 0.0_f32;
-        let mut sum_clip = 0.0_f32;
-        for item in live {
-            ctx.gpu_mem.record("item_backward_start");
-            let (grads, kl, clip_frac) =
-                self.item_backward_with_execution(policy, item, window_tokens, vars, beta, exec)?;
-            ctx.gpu_mem.record("item_backward_end");
-            sum_kl += kl;
-            sum_clip += clip_frac;
-            fold_var_grads(vars, &grads, &mut acc, &mut covered)?;
-        }
-        let (kl, clip_frac, mut uncovered_global) = if self.comm.world_size() > 1 {
+        let local_accumulation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut acc: Vec<Option<Tensor>> = vec![None; vars.len()];
+            let mut covered = vec![true; vars.len()];
+            let mut sum_kl = 0.0_f32;
+            let mut sum_clip = 0.0_f32;
+            for item in live {
+                ctx.gpu_mem.record("item_backward_start");
+                let (grads, kl, clip_frac) = self.item_backward_with_execution(
+                    policy,
+                    item,
+                    window_tokens,
+                    vars,
+                    beta,
+                    exec,
+                )?;
+                ctx.gpu_mem.record("item_backward_end");
+                sum_kl += kl;
+                sum_clip += clip_frac;
+                fold_var_grads(vars, &grads, &mut acc, &mut covered)?;
+            }
+            // Materialize every zero contribution before any rank enters the
+            // gradient collective. A rank-local allocation/device failure is
+            // therefore globalized by the status rendezvous below rather than
+            // stranding peers inside `all_reduce_sum`.
+            materialize_zero_grad_slots(vars, &mut acc)?;
+            Ok((acc, covered, sum_kl, sum_clip))
+        }))
+        .unwrap_or_else(|payload| {
+            Err(TrainerError::Contract(format!(
+                "local backward accumulation panicked: {}",
+                panic_payload_message(payload.as_ref())
+            )))
+        });
+        let (mut acc, covered, sum_kl, sum_clip) = self
+            .coordinate_data_parallel_result("local backward accumulation", local_accumulation)?;
+        let reduced = if self.comm.world_size() > 1 {
             ctx.gpu_mem.record("grad_all_reduce_start");
-            self.reduce_epoch(vars, &mut acc, &covered, sum_kl, sum_clip, n_live_global)?
+            self.reduce_epoch(vars, &mut acc, &covered, sum_kl, sum_clip, n_live_global)
         } else {
-            (
+            Ok((
                 sum_kl / n_live_global as f32,
                 sum_clip / n_live_global as f32,
                 0.0,
-            )
+            ))
         };
+        let (kl, clip_frac, mut uncovered_global) =
+            self.coordinate_data_parallel_result("gradient reduction", reduced)?;
         ctx.gpu_mem.record("grad_all_reduce_end");
-        if exec.model_parallel_world_size() > 1 {
+        let model_parallel = if exec.model_parallel_world_size() > 1 {
             ctx.gpu_mem.record("tp_grad_all_reduce_start");
-            uncovered_global += exec.reduce_model_parallel_grads(vars, &mut acc, &covered)?;
+            exec.reduce_model_parallel_grads(vars, &mut acc, &covered)
+        } else {
+            Ok(0.0)
+        };
+        uncovered_global += self
+            .coordinate_data_parallel_result("model-parallel gradient reduction", model_parallel)?;
+        if exec.model_parallel_world_size() > 1 {
             ctx.gpu_mem.record("tp_grad_all_reduce_end");
         }
-        ctx.gpu_mem.record("grad_store_compact_start");
-        // Build a fresh tiny store instead of reusing the last backward's full store. Candle's
-        // backward store also contains unrelated intermediate-node gradients; keeping it alive
-        // through the reduce/optimizer handoff was pure peak-memory pressure.
-        let store = empty_grad_store(vars)?;
-        let mut store = combine_into_store(vars, store, &mut acc, &covered);
-        ctx.gpu_mem.record("grad_store_compact_end");
-        let cov = grad_coverage(vars, &store)?;
-        // Fatal: a missing var (candle's silent-skip landmine — an absent grad entry)
-        // or a non-finite accumulated gradient (a blowup).
-        if !cov.is_covered() || cov.nonfinite > 0 {
-            cov.clone().into_result()?;
-        }
-        // The canary verdict is global under DP: a var missing from a PEER rank's
-        // backward poisons the reduced sum every rank just stepped from, so a rank
-        // that is locally covered must abort too — in lockstep with the rank that
-        // reports the detail above.
-        if uncovered_global > 0.0 {
-            return Err(TrainerError::Contract(format!(
-                "grad-coverage canary failed on a peer rank ({uncovered_global} uncovered \
-                 var-gradients across the world) — aborting in lockstep"
-            )));
-        }
-        if !cov.is_live() {
-            // Covered + finite + all-zero accumulated gradient: no usable signal this
-            // epoch (every live prompt fully clipped, or advantages cancelling). Skip
-            // the optimizer step rather than mislabel it a dead forward.
-            return Ok(InnerAgg {
+        let post_reduce = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ctx.gpu_mem.record("grad_store_compact_start");
+            // Build a fresh tiny store instead of reusing the last backward's full store. Candle's
+            // backward store also contains unrelated intermediate-node gradients; keeping it alive
+            // through the reduce/optimizer handoff was pure peak-memory pressure.
+            let store = empty_grad_store(vars)?;
+            let mut store = combine_into_store(vars, store, &mut acc, &covered);
+            ctx.gpu_mem.record("grad_store_compact_end");
+            let cov = grad_coverage(vars, &store)?;
+            // Fatal: a missing var (candle's silent-skip landmine — an absent grad entry)
+            // or a non-finite accumulated gradient (a blowup).
+            if !cov.is_covered() || cov.nonfinite > 0 {
+                cov.clone().into_result()?;
+            }
+            // The canary verdict is global under DP: a var missing from a PEER rank's
+            // backward poisons the reduced sum every rank just stepped from, so a rank
+            // that is locally covered must abort too — in lockstep with the rank that
+            // reports the detail above.
+            if uncovered_global > 0.0 {
+                return Err(TrainerError::Contract(format!(
+                    "grad-coverage canary failed on a peer rank ({uncovered_global} uncovered \
+                     var-gradients across the world) — aborting in lockstep"
+                )));
+            }
+            if !cov.is_live() {
+                // Covered + finite + all-zero accumulated gradient: no usable signal this
+                // epoch (every live prompt fully clipped, or advantages cancelling). Skip
+                // the optimizer step rather than mislabel it a dead forward.
+                return Ok(InnerAgg {
+                    kl,
+                    clip_frac,
+                    grad_norm: 0.0,
+                });
+            }
+            // Global-norm gradient clipping (the verl/TRL standard): scale every
+            // trainable-var gradient by `max / norm` when the accumulated norm
+            // exceeds the configured maximum. The reported `grad_norm` metric stays
+            // the PRE-clip norm — the doc promise it always made.
+            let grad_norm = global_grad_norm(vars, &store)?;
+            if let Some(max) = self.config.max_grad_norm {
+                if grad_norm > max {
+                    ctx.gpu_mem.record("grad_clip_start");
+                    scale_var_grads(vars, &mut store, max / grad_norm)?;
+                    ctx.gpu_mem.record("grad_clip_end");
+                }
+            }
+            ctx.gpu_mem.record("optimizer_start");
+            ctx.opt.step(&store)?;
+            ctx.gpu_mem.record("optimizer_end");
+            Ok(InnerAgg {
                 kl,
                 clip_frac,
-                grad_norm: 0.0,
-            });
-        }
-        // Global-norm gradient clipping (the verl/TRL standard): scale every
-        // trainable-var gradient by `max / norm` when the accumulated norm
-        // exceeds the configured maximum. The reported `grad_norm` metric stays
-        // the PRE-clip norm — the doc promise it always made.
-        let grad_norm = global_grad_norm(vars, &store)?;
-        if let Some(max) = self.config.max_grad_norm {
-            if grad_norm > max {
-                ctx.gpu_mem.record("grad_clip_start");
-                scale_var_grads(vars, &mut store, max / grad_norm)?;
-                ctx.gpu_mem.record("grad_clip_end");
-            }
-        }
-        ctx.gpu_mem.record("optimizer_start");
-        ctx.opt.step(&store)?;
-        ctx.gpu_mem.record("optimizer_end");
-        Ok(InnerAgg {
-            kl,
-            clip_frac,
-            grad_norm: grad_norm as f32,
-        })
+                grad_norm: grad_norm as f32,
+            })
+        }))
+        .unwrap_or_else(|payload| {
+            Err(TrainerError::Contract(format!(
+                "post-reduction optimizer work panicked: {}",
+                panic_payload_message(payload.as_ref())
+            )))
+        });
+        self.coordinate_data_parallel_result("post-reduction optimizer work", post_reduce)
     }
 
     /// The per-epoch DP collective sequence (world > 1 only): all-reduce-sum
@@ -4794,6 +6038,26 @@ fn validate_external_policy_sha256(digest: &str) -> Result<(), TrainerError> {
     ))
 }
 
+fn exact_reduced_u64(label: &str, value: f64) -> Result<u64, TrainerError> {
+    const MAX_EXACT_F64_INTEGER: f64 = 9_007_199_254_740_992.0;
+    if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > MAX_EXACT_F64_INTEGER {
+        return Err(TrainerError::Contract(format!(
+            "{label} reduction {value:?} is not an exact nonnegative integer representable in f64"
+        )));
+    }
+    Ok(value as u64)
+}
+
+fn exact_u64_as_f64(label: &str, value: u64) -> Result<f64, TrainerError> {
+    const MAX_EXACT_F64_U64: u64 = 9_007_199_254_740_992;
+    if value > MAX_EXACT_F64_U64 {
+        return Err(TrainerError::Contract(format!(
+            "{label} {value} cannot be represented exactly for scalar reduction"
+        )));
+    }
+    Ok(value as f64)
+}
+
 fn domain_sha256(domain: &str, fields: &[&[u8]]) -> String {
     let mut hasher = Sha256::new();
     hasher.update((domain.len() as u64).to_le_bytes());
@@ -5079,6 +6343,19 @@ fn fold_var_grads(
     Ok(())
 }
 
+/// Materialize the additive identity for every locally absent gradient before a
+/// distributed reduction. Every rank must enter the tensor collective with the
+/// same tensor count, shapes, dtypes, and devices even when one rank had no live
+/// items (or no local backward reached a particular variable).
+fn materialize_zero_grad_slots(vars: &[Var], acc: &mut [Option<Tensor>]) -> CandleResult<()> {
+    for (slot, var) in acc.iter_mut().zip(vars) {
+        if slot.is_none() {
+            *slot = Some(var.as_tensor().zeros_like()?);
+        }
+    }
+    Ok(())
+}
+
 fn reduce_accumulated_grads(
     comm: &dyn Comm,
     vars: &[Var],
@@ -5088,11 +6365,12 @@ fn reduce_accumulated_grads(
     for start in (0..vars.len()).step_by(GRAD_REDUCE_CHUNK) {
         let end = (start + GRAD_REDUCE_CHUNK).min(vars.len());
         let mut flat = Vec::with_capacity(end - start);
-        for i in start..end {
-            flat.push(match acc[i].take() {
-                Some(g) => g,
-                None => vars[i].as_tensor().zeros_like()?,
-            });
+        for (i, slot) in acc.iter_mut().enumerate().take(end).skip(start) {
+            flat.push(slot.take().ok_or_else(|| {
+                TrainerError::Contract(format!(
+                    "gradient slot {i} was not materialized before reduction"
+                ))
+            })?);
         }
         comm.all_reduce_sum(&mut flat)?;
         for (slot, g) in acc[start..end].iter_mut().zip(flat) {
@@ -7570,6 +8848,263 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct ArmedCollectiveFailureState {
+        remaining_successes: std::sync::atomic::AtomicUsize,
+        failed: std::sync::atomic::AtomicBool,
+        calls_after_failure: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ArmedCollectiveFailureState {
+        fn new(remaining_successes: usize) -> Self {
+            Self {
+                remaining_successes: std::sync::atomic::AtomicUsize::new(remaining_successes),
+                failed: std::sync::atomic::AtomicBool::new(false),
+                calls_after_failure: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn enter(&self, armed: bool) -> Result<(), crate::comm::CommError> {
+            use std::sync::atomic::Ordering;
+
+            if self.failed.load(Ordering::SeqCst) {
+                self.calls_after_failure.fetch_add(1, Ordering::SeqCst);
+                return Err(crate::comm::CommError::Poisoned(
+                    "collective issued after injected terminal failure".into(),
+                ));
+            }
+            if !armed {
+                return Ok(());
+            }
+            let remaining = self.remaining_successes.load(Ordering::SeqCst);
+            if remaining > 0 {
+                self.remaining_successes.fetch_sub(1, Ordering::SeqCst);
+                return Ok(());
+            }
+            self.failed.store(true, Ordering::SeqCst);
+            Err(crate::comm::CommError::Mismatch(
+                "injected terminal collective-chain failure".into(),
+            ))
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailAfterArmComm<C> {
+        inner: C,
+        armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        state: std::sync::Arc<ArmedCollectiveFailureState>,
+    }
+
+    impl<C: crate::comm::Comm> crate::comm::Comm for FailAfterArmComm<C> {
+        fn rank(&self) -> usize {
+            self.inner.rank()
+        }
+
+        fn world_size(&self) -> usize {
+            self.inner.world_size()
+        }
+
+        fn validate_all_reduce_sum(
+            &self,
+            tensors: &[Tensor],
+        ) -> Result<(), crate::comm::CommError> {
+            self.inner.validate_all_reduce_sum(tensors)
+        }
+
+        fn all_reduce_sum(&self, tensors: &mut Vec<Tensor>) -> Result<(), crate::comm::CommError> {
+            self.state
+                .enter(self.armed.load(std::sync::atomic::Ordering::SeqCst))?;
+            self.inner.all_reduce_sum(tensors)
+        }
+
+        fn all_reduce_scalar_sum(&self, value: f64) -> Result<f64, crate::comm::CommError> {
+            self.state
+                .enter(self.armed.load(std::sync::atomic::Ordering::SeqCst))?;
+            self.inner.all_reduce_scalar_sum(value)
+        }
+    }
+
+    #[derive(Debug)]
+    struct MetricsStatusFailureState {
+        failed: std::sync::atomic::AtomicBool,
+        calls_after_failure: std::sync::atomic::AtomicUsize,
+    }
+
+    impl MetricsStatusFailureState {
+        fn new() -> Self {
+            Self {
+                failed: std::sync::atomic::AtomicBool::new(false),
+                calls_after_failure: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailAtMetricsStatusComm<C> {
+        inner: C,
+        metrics_path: PathBuf,
+        state: std::sync::Arc<MetricsStatusFailureState>,
+    }
+
+    impl<C: crate::comm::Comm> FailAtMetricsStatusComm<C> {
+        fn enter(&self) -> Result<(), crate::comm::CommError> {
+            use std::sync::atomic::Ordering;
+
+            if self.state.failed.load(Ordering::SeqCst) {
+                self.state
+                    .calls_after_failure
+                    .fetch_add(1, Ordering::SeqCst);
+                return Err(crate::comm::CommError::Poisoned(
+                    "collective issued after injected metrics-status failure".into(),
+                ));
+            }
+            if std::fs::metadata(&self.metrics_path).is_ok_and(|metadata| metadata.len() > 0) {
+                self.state.failed.store(true, Ordering::SeqCst);
+                return Err(crate::comm::CommError::Mismatch(
+                    "injected metrics append-status failure".into(),
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    impl<C: crate::comm::Comm> crate::comm::Comm for FailAtMetricsStatusComm<C> {
+        fn rank(&self) -> usize {
+            self.inner.rank()
+        }
+
+        fn world_size(&self) -> usize {
+            self.inner.world_size()
+        }
+
+        fn validate_all_reduce_sum(
+            &self,
+            tensors: &[Tensor],
+        ) -> Result<(), crate::comm::CommError> {
+            self.inner.validate_all_reduce_sum(tensors)
+        }
+
+        fn all_reduce_sum(&self, tensors: &mut Vec<Tensor>) -> Result<(), crate::comm::CommError> {
+            self.enter()?;
+            self.inner.all_reduce_sum(tensors)
+        }
+
+        fn all_reduce_scalar_sum(&self, value: f64) -> Result<f64, crate::comm::CommError> {
+            self.enter()?;
+            self.inner.all_reduce_scalar_sum(value)
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum CandidatePolicyArmPoint {
+        DetachedScoring,
+        SamplerState(usize),
+    }
+
+    struct ArmedCandidatePolicy {
+        inner: StatefulCandidatePolicy,
+        armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        arm_point: CandidatePolicyArmPoint,
+        sampler_state_calls: std::cell::Cell<usize>,
+    }
+
+    impl Policy for ArmedCandidatePolicy {
+        fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
+            self.inner.generate(prompt, cfg)
+        }
+
+        fn generate_at(
+            &mut self,
+            prompt: &[u32],
+            cfg: &GenConfig,
+            global_row_base: u64,
+        ) -> CandleResult<Rollout> {
+            self.inner.generate_at(prompt, cfg, global_row_base)
+        }
+
+        fn token_logprobs(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+            self.inner.token_logprobs(rollout)
+        }
+
+        fn token_logprobs_detached(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+            let logprobs = self.inner.token_logprobs_detached(rollout)?;
+            if matches!(self.arm_point, CandidatePolicyArmPoint::DetachedScoring) {
+                self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(logprobs)
+        }
+
+        fn set_adapter_enabled(&mut self, enabled: bool) {
+            self.inner.set_adapter_enabled(enabled);
+        }
+
+        fn adapter_enabled(&self) -> bool {
+            self.inner.adapter_enabled()
+        }
+
+        fn trainable_vars(&self) -> Vec<Var> {
+            self.inner.trainable_vars()
+        }
+
+        fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+            let call = self.sampler_state_calls.get() + 1;
+            self.sampler_state_calls.set(call);
+            if matches!(self.arm_point, CandidatePolicyArmPoint::SamplerState(expected) if call == expected)
+            {
+                self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            self.inner.sampler_state()
+        }
+
+        fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
+            self.inner.restore_sampler_state(state)
+        }
+    }
+
+    struct ArmedCandidateReward {
+        armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl RewardFn for ArmedCandidateReward {
+        type Target = ();
+
+        fn reward(&self, sample: &Sample<()>, completion: &str) -> Result<f32, RewardError> {
+            CandidateReward.reward(sample, completion)
+        }
+
+        fn reward_group_detailed(
+            &self,
+            sample: &Sample<()>,
+            completions: &[String],
+        ) -> Result<Vec<crate::RewardOutcome>, RewardError> {
+            let outcomes = CandidateReward.reward_group_detailed(sample, completions)?;
+            self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(outcomes)
+        }
+    }
+
+    fn stateful_candidate_policy() -> StatefulCandidatePolicy {
+        let logp =
+            Var::from_tensor(&Tensor::zeros((3, 2), DType::F32, &Device::Cpu).unwrap()).unwrap();
+        StatefulCandidatePolicy {
+            inner: CandidatePolicy { logp },
+            sampler: 0,
+        }
+    }
+
+    fn candidate_ledger_config() -> TrainerConfig {
+        TrainerConfig {
+            steps: 1,
+            group_size: 3,
+            grad_accum_steps: 1,
+            max_new_tokens: 2,
+            beta: 0.0,
+            mu: 1,
+            checkpoint_every: None,
+            ..TrainerConfig::default()
+        }
+    }
+
     #[test]
     fn collector_keeps_poststate_when_post_manifest_failure_reconciles_as_committed() {
         let tmp = WireTmp::new("ledger-post-manifest-collector");
@@ -7647,6 +9182,1195 @@ mod tests {
             policy.sampler, 1,
             "collector rewound after crossing the manifest boundary"
         );
+    }
+
+    #[test]
+    fn distributed_collector_propagates_post_manifest_ambiguity_to_every_rank() {
+        let tmp = WireTmp::new("distributed-ledger-post-manifest-ambiguity");
+        let ledger_root = tmp.0.join("ledger");
+        let handles: Vec<_> = crate::comm::LocalComm::world_with_timeout(
+            2,
+            std::time::Duration::from_secs(10),
+        )
+        .into_iter()
+        .map(|comm| {
+            let base = tmp.0.clone();
+            let ledger_root = ledger_root.clone();
+            std::thread::spawn(move || {
+                let rank = comm.rank();
+                let run = RunDir::create(&base, format!("rank-{rank}")).unwrap();
+                let config = TrainerConfig {
+                    steps: 1,
+                    group_size: 3,
+                    grad_accum_steps: 1,
+                    max_new_tokens: 2,
+                    beta: 0.0,
+                    checkpoint_every: None,
+                    ..TrainerConfig::default()
+                };
+                let mut trainer = Trainer::with_comm(config, &run, comm).unwrap();
+                let logp =
+                    Var::from_tensor(&Tensor::zeros((3, 2), DType::F32, &Device::Cpu).unwrap())
+                        .unwrap();
+                let mut policy = StatefulCandidatePolicy {
+                    inner: CandidatePolicy { logp },
+                    sampler: 0,
+                };
+                if rank == 0 {
+                    crate::rollout_ledger::inject_persistent_post_manifest_sync_failure_once();
+                }
+                let error = trainer
+                    .collect_rollout_ledger_step(
+                        0,
+                        &mut policy,
+                        &CandidateReward,
+                        &CandidateCodec,
+                        &[Sample::new("p", ()), Sample::new("q", ())],
+                        &ledger_root,
+                        &"a".repeat(64),
+                        None,
+                    )
+                    .unwrap_err();
+                assert!(matches!(
+                    error,
+                    TrainerError::RolloutLedger(RolloutLedgerError::PublicationAmbiguous { .. })
+                ));
+                policy.sampler
+            })
+        })
+        .collect();
+        for handle in handles {
+            assert_eq!(handle.join().unwrap(), 1);
+        }
+        assert!(ledger_root
+            .join("step-00000000000000000000/manifest.json")
+            .is_file());
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // two exact-existing reconciliation boundaries
+    fn distributed_exact_existing_sync_and_cleanup_faults_preserve_every_sampler() {
+        for fault in ["sync", "cleanup"] {
+            let tmp = WireTmp::new(&format!("distributed-exact-existing-{fault}"));
+            let ledger_root = tmp.0.join("ledger");
+            let final_dir = ledger_root.join("step-00000000000000000000");
+            let handles: Vec<_> = crate::comm::LocalComm::world_with_timeout(
+                2,
+                std::time::Duration::from_secs(10),
+            )
+            .into_iter()
+            .map(|comm| {
+                let base = tmp.0.clone();
+                let ledger_root = ledger_root.clone();
+                let final_dir = final_dir.clone();
+                std::thread::spawn(move || {
+                    let rank = comm.rank();
+                    let run = RunDir::create(&base, format!("{fault}-rank-{rank}")).unwrap();
+                    let config = TrainerConfig {
+                        steps: 1,
+                        group_size: 3,
+                        grad_accum_steps: 1,
+                        max_new_tokens: 2,
+                        beta: 0.0,
+                        checkpoint_every: None,
+                        ..TrainerConfig::default()
+                    };
+                    let mut trainer = Trainer::with_comm(config, &run, comm).unwrap();
+                    let make_policy = || {
+                        let logp = Var::from_tensor(
+                            &Tensor::zeros((3, 2), DType::F32, &Device::Cpu).unwrap(),
+                        )
+                        .unwrap();
+                        StatefulCandidatePolicy {
+                            inner: CandidatePolicy { logp },
+                            sampler: 0,
+                        }
+                    };
+                    let mut first = make_policy();
+                    trainer
+                        .collect_rollout_ledger_step(
+                            0,
+                            &mut first,
+                            &CandidateReward,
+                            &CandidateCodec,
+                            &[Sample::new("p", ()), Sample::new("q", ())],
+                            &ledger_root,
+                            &"d".repeat(64),
+                            None,
+                        )
+                        .unwrap();
+                    assert_eq!(first.sampler, 1);
+
+                    if rank == 0 {
+                        match fault {
+                            "sync" => crate::rollout_ledger::inject_directory_sync_failure_once(
+                                final_dir,
+                            ),
+                            "cleanup" => {
+                                crate::rollout_ledger::inject_distributed_stage_cleanup_failure_once();
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                    let mut retry = make_policy();
+                    let outcome = trainer.collect_rollout_ledger_step(
+                        0,
+                        &mut retry,
+                        &CandidateReward,
+                        &CandidateCodec,
+                        &[Sample::new("p", ()), Sample::new("q", ())],
+                        &ledger_root,
+                        &"d".repeat(64),
+                        None,
+                    );
+                    let cleanup_faults_consumed =
+                        crate::rollout_ledger::distributed_stage_cleanup_faults_consumed();
+                    (rank, outcome, retry.sampler, cleanup_faults_consumed)
+                })
+            })
+            .collect();
+
+            for handle in handles {
+                let (rank, outcome, sampler, cleanup_faults_consumed) = handle.join().unwrap();
+                match fault {
+                    "sync" => assert!(
+                        matches!(
+                            outcome,
+                            Err(TrainerError::RolloutLedger(
+                                RolloutLedgerError::PublicationAmbiguous { .. }
+                            ))
+                        ),
+                        "rank {rank}: {outcome:?}"
+                    ),
+                    "cleanup" => assert!(outcome.is_ok(), "rank {rank}: {outcome:?}"),
+                    _ => unreachable!(),
+                }
+                assert_eq!(
+                    cleanup_faults_consumed,
+                    u32::from(fault == "cleanup" && rank == 0),
+                    "{fault}: rank {rank} cleanup injector consumption"
+                );
+                assert_eq!(
+                    sampler, 1,
+                    "{fault}: rank {rank} rewound after exact visibility"
+                );
+            }
+            assert!(final_dir.join("manifest.json").is_file());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // three marker-exact payload uncertainty modes
+    fn distributed_exact_marker_payload_uncertainty_preserves_every_sampler() {
+        for fault in ["mutated", "missing", "read-failure"] {
+            let tmp = WireTmp::new(&format!("distributed-exact-marker-{fault}"));
+            let ledger_root = tmp.0.join("ledger");
+            let final_dir = ledger_root.join("step-00000000000000000000");
+            let payload_path = final_dir.join("rank-00000.window.json");
+            let handles: Vec<_> = crate::comm::LocalComm::world_with_timeout(
+                2,
+                std::time::Duration::from_secs(10),
+            )
+            .into_iter()
+            .map(|comm| {
+                let base = tmp.0.clone();
+                let ledger_root = ledger_root.clone();
+                let payload_path = payload_path.clone();
+                std::thread::spawn(move || {
+                    let rank = comm.rank();
+                    let run = RunDir::create(&base, format!("{fault}-rank-{rank}")).unwrap();
+                    let config = TrainerConfig {
+                        steps: 1,
+                        group_size: 3,
+                        grad_accum_steps: 1,
+                        max_new_tokens: 2,
+                        beta: 0.0,
+                        checkpoint_every: None,
+                        ..TrainerConfig::default()
+                    };
+                    let mut trainer = Trainer::with_comm(config, &run, comm).unwrap();
+                    let make_policy = || {
+                        let logp = Var::from_tensor(
+                            &Tensor::zeros((3, 2), DType::F32, &Device::Cpu).unwrap(),
+                        )
+                        .unwrap();
+                        StatefulCandidatePolicy {
+                            inner: CandidatePolicy { logp },
+                            sampler: 0,
+                        }
+                    };
+                    let mut first = make_policy();
+                    trainer
+                        .collect_rollout_ledger_step(
+                            0,
+                            &mut first,
+                            &CandidateReward,
+                            &CandidateCodec,
+                            &[Sample::new("p", ()), Sample::new("q", ())],
+                            &ledger_root,
+                            &"e".repeat(64),
+                            None,
+                        )
+                        .unwrap();
+                    assert_eq!(first.sampler, 1);
+                    let manifest_path = ledger_root
+                        .join("step-00000000000000000000")
+                        .join("manifest.json");
+                    let exact_manifest = std::fs::read(&manifest_path).unwrap();
+
+                    if rank == 0 {
+                        match fault {
+                            "mutated" => std::fs::write(&payload_path, b"corrupt").unwrap(),
+                            "missing" => std::fs::remove_file(&payload_path).unwrap(),
+                            "read-failure" => crate::rollout_ledger::inject_distributed_reconciliation_read_failure_once(&payload_path),
+                            _ => unreachable!(),
+                        }
+                    }
+                    let mut retry = make_policy();
+                    let outcome = trainer.collect_rollout_ledger_step(
+                        0,
+                        &mut retry,
+                        &CandidateReward,
+                        &CandidateCodec,
+                        &[Sample::new("p", ()), Sample::new("q", ())],
+                        &ledger_root,
+                        &"e".repeat(64),
+                        None,
+                    );
+                    assert_eq!(std::fs::read(manifest_path).unwrap(), exact_manifest);
+                    (rank, outcome, retry.sampler)
+                })
+            })
+            .collect();
+
+            for handle in handles {
+                let (rank, outcome, sampler) = handle.join().unwrap();
+                assert!(
+                    matches!(
+                        outcome,
+                        Err(TrainerError::RolloutLedger(
+                            RolloutLedgerError::PublicationAmbiguous { .. }
+                        ))
+                    ),
+                    "{fault}: rank {rank}: {outcome:?}"
+                );
+                assert_eq!(
+                    sampler, 1,
+                    "{fault}: rank {rank} rewound after the exact manifest became visible"
+                );
+            }
+            assert!(final_dir.join("manifest.json").is_file());
+            match fault {
+                "mutated" => assert_eq!(std::fs::read(&payload_path).unwrap(), b"corrupt"),
+                "missing" => assert!(!payload_path.exists()),
+                "read-failure" => assert!(payload_path.is_file()),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn distributed_continuation_publication_broadcasts_retry_and_ambiguity() {
+        for persistent_post_manifest in [false, true] {
+            let tag = if persistent_post_manifest {
+                "post-manifest"
+            } else {
+                "pre-manifest"
+            };
+            let tmp = WireTmp::new(&format!("distributed-continuation-{tag}"));
+            let ledger_root = tmp.0.join("ledger");
+            let checkpoint_root = tmp.0.join("continuations");
+            let handles: Vec<_> = crate::comm::LocalComm::world_with_timeout(
+                2,
+                std::time::Duration::from_secs(10),
+            )
+            .into_iter()
+            .map(|comm| {
+                let base = tmp.0.clone();
+                let ledger_root = ledger_root.clone();
+                let checkpoint_root = checkpoint_root.clone();
+                std::thread::spawn(move || {
+                    let rank = comm.rank();
+                    let run = RunDir::create(&base, format!("rank-{rank}")).unwrap();
+                    let config = TrainerConfig {
+                        steps: 1,
+                        group_size: 3,
+                        grad_accum_steps: 1,
+                        max_new_tokens: 2,
+                        beta: 0.0,
+                        checkpoint_every: None,
+                        ..TrainerConfig::default()
+                    };
+                    let mut trainer = Trainer::with_comm(config, &run, comm).unwrap();
+                    let make_policy = || {
+                        let logp = Var::from_tensor(
+                            &Tensor::zeros((3, 2), DType::F32, &Device::Cpu).unwrap(),
+                        )
+                        .unwrap();
+                        StatefulCandidatePolicy {
+                            inner: CandidatePolicy { logp },
+                            sampler: 0,
+                        }
+                    };
+                    let mut collector_policy = make_policy();
+                    trainer
+                        .collect_rollout_ledger_step(
+                            0,
+                            &mut collector_policy,
+                            &CandidateReward,
+                            &CandidateCodec,
+                            &[Sample::new("p", ()), Sample::new("q", ())],
+                            &ledger_root,
+                            &"b".repeat(64),
+                            None,
+                        )
+                        .unwrap();
+                    let mut learner_policy = make_policy();
+                    let (_, continuation) = trainer
+                        .train_rollout_ledger_step(
+                            0,
+                            &mut learner_policy,
+                            &ledger_root,
+                            &"b".repeat(64),
+                            None,
+                        )
+                        .unwrap();
+                    if rank == 0 {
+                        if persistent_post_manifest {
+                            crate::checkpoint::inject_persistent_continuation_post_manifest_sync_failure_once();
+                        } else {
+                            crate::checkpoint::inject_continuation_pre_manifest_sync_failure_once();
+                        }
+                    }
+                    let first = trainer.save_rollout_ledger_continuation_to(
+                        &checkpoint_root,
+                        &learner_policy,
+                        &continuation,
+                    );
+                    if persistent_post_manifest {
+                        assert!(matches!(
+                            first,
+                            Err(TrainerError::Checkpoint(
+                                crate::checkpoint::CheckpointError::PublicationAmbiguous { .. }
+                            ))
+                        ));
+                    } else {
+                        assert!(first.is_err());
+                        trainer
+                            .save_rollout_ledger_continuation_to(
+                                &checkpoint_root,
+                                &learner_policy,
+                                &continuation,
+                            )
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+            for handle in handles {
+                handle.join().unwrap();
+            }
+            assert!(checkpoint_root.join("step-1/manifest.json").is_file());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // explicit two-rank fault protocol
+    fn distributed_ledger_publication_comm_failure_preserves_visibility_and_dead_world() {
+        use std::sync::atomic::Ordering;
+
+        let tmp = WireTmp::new("distributed-ledger-publication-terminal-comm");
+        let ledger_root = tmp.0.join("ledger");
+        let final_dir = ledger_root.join("step-00000000000000000000");
+        let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Arming on the collector's second sampler snapshot leaves exactly 21
+        // successful collectives through shard status; the next call is the
+        // manifest-publication status reduction and must fail on both ranks.
+        let states: Vec<_> = (0..2)
+            .map(|_| std::sync::Arc::new(ArmedCollectiveFailureState::new(21)))
+            .collect();
+        let comms =
+            crate::comm::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(10));
+        let outcomes: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = comms
+                .into_iter()
+                .zip(states.iter().cloned())
+                .map(|(inner, state)| {
+                    let rank = inner.rank();
+                    let base = tmp.0.clone();
+                    let ledger_root = ledger_root.clone();
+                    let final_dir = final_dir.clone();
+                    let armed = std::sync::Arc::clone(&armed);
+                    scope.spawn(move || {
+                        let comm = FailAfterArmComm {
+                            inner,
+                            armed: std::sync::Arc::clone(&armed),
+                            state,
+                        };
+                        let run = RunDir::create(&base, format!("rank-{rank}")).unwrap();
+                        let mut trainer =
+                            Trainer::with_comm(candidate_ledger_config(), &run, comm).unwrap();
+                        let mut policy = ArmedCandidatePolicy {
+                            inner: stateful_candidate_policy(),
+                            armed,
+                            arm_point: CandidatePolicyArmPoint::SamplerState(2),
+                            sampler_state_calls: std::cell::Cell::new(0),
+                        };
+                        let error = trainer
+                            .collect_rollout_ledger_step(
+                                0,
+                                &mut policy,
+                                &CandidateReward,
+                                &CandidateCodec,
+                                &[Sample::new("p", ()), Sample::new("q", ())],
+                                &ledger_root,
+                                &"f".repeat(64),
+                                None,
+                            )
+                            .unwrap_err();
+                        match &error {
+                            TrainerError::PublicationAmbiguousAfterComm {
+                                artifact,
+                                path,
+                                communication: _,
+                                detail: _,
+                            } => {
+                                assert_eq!(*artifact, "distributed rollout ledger");
+                                assert_eq!(path, &final_dir);
+                            }
+                            other => panic!(
+                                "rank {rank}: expected publication+communication ambiguity, got {other:?}"
+                            ),
+                        }
+                        (rank, error.to_string(), policy.inner.sampler)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        });
+
+        for (rank, message, sampler) in outcomes {
+            assert!(
+                message.contains("publication may be visible"),
+                "rank {rank}: {message}"
+            );
+            assert!(
+                message.contains("data-parallel world is dead"),
+                "rank {rank}: {message}"
+            );
+            assert!(
+                message.contains("discard the communicator"),
+                "rank {rank}: {message}"
+            );
+            assert_eq!(
+                sampler, 1,
+                "rank {rank} rewound a potentially visible ledger"
+            );
+        }
+        for (rank, state) in states.iter().enumerate() {
+            assert!(
+                state.failed.load(Ordering::SeqCst),
+                "rank {rank}: fault not consumed"
+            );
+            assert_eq!(
+                state.remaining_successes.load(Ordering::SeqCst),
+                0,
+                "rank {rank}: failed at the wrong publication boundary"
+            );
+            assert_eq!(
+                state.calls_after_failure.load(Ordering::SeqCst),
+                0,
+                "rank {rank}: collective issued after publication-status failure"
+            );
+        }
+        assert!(final_dir.join("manifest.json").is_file());
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // explicit two-rank fault protocol
+    fn distributed_continuation_publication_comm_failure_preserves_visibility_and_dead_world() {
+        use std::sync::atomic::Ordering;
+
+        let tmp = WireTmp::new("distributed-continuation-publication-terminal-comm");
+        let ledger_root = tmp.0.join("ledger");
+        let checkpoint_root = tmp.0.join("continuations");
+        let final_dir = checkpoint_root.join("step-1");
+        let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        // Save preflight, serialization, and the eight-word digest consensus
+        // consume 11 successful reductions. Publication status is the next one.
+        let states: Vec<_> = (0..2)
+            .map(|_| std::sync::Arc::new(ArmedCollectiveFailureState::new(11)))
+            .collect();
+        let comms =
+            crate::comm::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(10));
+        let outcomes: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = comms
+                .into_iter()
+                .zip(states.iter().cloned())
+                .map(|(inner, state)| {
+                    let rank = inner.rank();
+                    let base = tmp.0.clone();
+                    let ledger_root = ledger_root.clone();
+                    let checkpoint_root = checkpoint_root.clone();
+                    let final_dir = final_dir.clone();
+                    let armed = std::sync::Arc::clone(&armed);
+                    let barrier = std::sync::Arc::clone(&barrier);
+                    scope.spawn(move || {
+                        let comm = FailAfterArmComm {
+                            inner,
+                            armed: std::sync::Arc::clone(&armed),
+                            state,
+                        };
+                        let run = RunDir::create(&base, format!("rank-{rank}")).unwrap();
+                        let mut trainer =
+                            Trainer::with_comm(candidate_ledger_config(), &run, comm).unwrap();
+                        let mut collector = stateful_candidate_policy();
+                        trainer
+                            .collect_rollout_ledger_step(
+                                0,
+                                &mut collector,
+                                &CandidateReward,
+                                &CandidateCodec,
+                                &[Sample::new("p", ()), Sample::new("q", ())],
+                                &ledger_root,
+                                &"1".repeat(64),
+                                None,
+                            )
+                            .unwrap();
+                        let mut learner = stateful_candidate_policy();
+                        let (_, continuation) = trainer
+                            .train_rollout_ledger_step(
+                                0,
+                                &mut learner,
+                                &ledger_root,
+                                &"1".repeat(64),
+                                None,
+                            )
+                            .unwrap();
+                        barrier.wait();
+                        if rank == 0 {
+                            armed.store(true, Ordering::SeqCst);
+                        }
+                        barrier.wait();
+                        let error = trainer
+                            .save_rollout_ledger_continuation_to(
+                                &checkpoint_root,
+                                &learner,
+                                &continuation,
+                            )
+                            .unwrap_err();
+                        match &error {
+                            TrainerError::PublicationAmbiguousAfterComm {
+                                artifact,
+                                path,
+                                communication: _,
+                                detail: _,
+                            } => {
+                                assert_eq!(*artifact, "rollout-ledger continuation");
+                                assert_eq!(path, &final_dir);
+                            }
+                            other => panic!(
+                                "rank {rank}: expected publication+communication ambiguity, got {other:?}"
+                            ),
+                        }
+                        (rank, error.to_string())
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        });
+
+        for (rank, message) in outcomes {
+            assert!(
+                message.contains("publication may be visible"),
+                "rank {rank}: {message}"
+            );
+            assert!(
+                message.contains("data-parallel world is dead"),
+                "rank {rank}: {message}"
+            );
+            assert!(
+                message.contains("discard the communicator"),
+                "rank {rank}: {message}"
+            );
+        }
+        for (rank, state) in states.iter().enumerate() {
+            assert!(
+                state.failed.load(Ordering::SeqCst),
+                "rank {rank}: fault not consumed"
+            );
+            assert_eq!(state.remaining_successes.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                state.calls_after_failure.load(Ordering::SeqCst),
+                0,
+                "rank {rank}: collective issued after publication-status failure"
+            );
+        }
+        assert!(final_dir.join("manifest.json").is_file());
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // explicit two-rank fault protocol
+    fn nonce_chain_stops_after_first_failed_reduction() {
+        use std::sync::atomic::Ordering;
+
+        let tmp = WireTmp::new("nonce-chain-first-terminal-comm");
+        let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        // Fail nonce-low immediately. Any eager nonce-high call is therefore a
+        // collective after terminal communication failure and must be observed.
+        let states: Vec<_> = (0..2)
+            .map(|_| std::sync::Arc::new(ArmedCollectiveFailureState::new(0)))
+            .collect();
+        let comms =
+            crate::comm::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(10));
+        let outcomes: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = comms
+                .into_iter()
+                .zip(states.iter().cloned())
+                .map(|(inner, state)| {
+                    let rank = inner.rank();
+                    let base = tmp.0.clone();
+                    let armed = std::sync::Arc::clone(&armed);
+                    scope.spawn(move || {
+                        let comm = FailAfterArmComm {
+                            inner,
+                            armed,
+                            state,
+                        };
+                        let run = RunDir::create(&base, format!("rank-{rank}")).unwrap();
+                        let trainer =
+                            Trainer::with_comm(candidate_ledger_config(), &run, comm).unwrap();
+                        let error = trainer.distributed_rollout_ledger_nonce().unwrap_err();
+                        (rank, error)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        });
+
+        for (rank, error) in outcomes {
+            assert!(
+                matches!(&error, TrainerError::Comm(_)),
+                "rank {rank}: expected nonce-low communication failure, got {error:?}"
+            );
+        }
+        for (rank, state) in states.iter().enumerate() {
+            assert!(
+                state.failed.load(Ordering::SeqCst),
+                "rank {rank}: nonce-low fault not consumed"
+            );
+            assert_eq!(state.remaining_successes.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                state.calls_after_failure.load(Ordering::SeqCst),
+                0,
+                "rank {rank}: nonce-high ran after nonce-low communication failure"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // explicit two-rank fault protocol
+    fn collector_count_chain_stops_after_first_failed_reduction() {
+        use std::sync::atomic::Ordering;
+
+        let tmp = WireTmp::new("collector-count-chain-first-terminal-comm");
+        let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        // Local derivation and exact conversion each coordinate once. Fail the
+        // following token-count reduction; an eager live-count call must trip
+        // the post-failure counter.
+        let states: Vec<_> = (0..2)
+            .map(|_| std::sync::Arc::new(ArmedCollectiveFailureState::new(2)))
+            .collect();
+        let comms =
+            crate::comm::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(10));
+        let outcomes: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = comms
+                .into_iter()
+                .zip(states.iter().cloned())
+                .map(|(inner, state)| {
+                    let rank = inner.rank();
+                    let base = tmp.0.clone();
+                    let armed = std::sync::Arc::clone(&armed);
+                    scope.spawn(move || {
+                        let comm = FailAfterArmComm {
+                            inner,
+                            armed,
+                            state,
+                        };
+                        let run = RunDir::create(&base, format!("rank-{rank}")).unwrap();
+                        let trainer =
+                            Trainer::with_comm(candidate_ledger_config(), &run, comm).unwrap();
+                        let error = trainer.rollout_ledger_global_counts(&[], 0.0).unwrap_err();
+                        (rank, error)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        });
+
+        for (rank, error) in outcomes {
+            assert!(
+                matches!(&error, TrainerError::Comm(_)),
+                "rank {rank}: expected token-count communication failure, got {error:?}"
+            );
+        }
+        for (rank, state) in states.iter().enumerate() {
+            assert!(
+                state.failed.load(Ordering::SeqCst),
+                "rank {rank}: token-count fault not consumed"
+            );
+            assert_eq!(state.remaining_successes.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                state.calls_after_failure.load(Ordering::SeqCst),
+                0,
+                "rank {rank}: live-count ran after token-count communication failure"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // explicit two-rank fault protocol
+    fn learner_count_chain_stops_after_first_failed_reduction() {
+        use std::sync::atomic::Ordering;
+
+        let tmp = WireTmp::new("learner-count-chain-terminal-comm");
+        let ledger_root = tmp.0.join("ledger");
+        let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // After detached scoring: scoring status, local-count status, exact
+        // conversion succeed; token-count then fails, so live-count must never
+        // be attempted.
+        let states: Vec<_> = (0..2)
+            .map(|_| std::sync::Arc::new(ArmedCollectiveFailureState::new(3)))
+            .collect();
+        let comms =
+            crate::comm::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(10));
+        let outcomes: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = comms
+                .into_iter()
+                .zip(states.iter().cloned())
+                .map(|(inner, state)| {
+                    let rank = inner.rank();
+                    let base = tmp.0.clone();
+                    let ledger_root = ledger_root.clone();
+                    let armed = std::sync::Arc::clone(&armed);
+                    scope.spawn(move || {
+                        let comm = FailAfterArmComm {
+                            inner,
+                            armed: std::sync::Arc::clone(&armed),
+                            state,
+                        };
+                        let run = RunDir::create(&base, format!("rank-{rank}")).unwrap();
+                        let mut trainer =
+                            Trainer::with_comm(candidate_ledger_config(), &run, comm).unwrap();
+                        let mut collector = stateful_candidate_policy();
+                        trainer
+                            .collect_rollout_ledger_step(
+                                0,
+                                &mut collector,
+                                &CandidateReward,
+                                &CandidateCodec,
+                                &[Sample::new("p", ()), Sample::new("q", ())],
+                                &ledger_root,
+                                &"2".repeat(64),
+                                None,
+                            )
+                            .unwrap();
+                        let mut learner = ArmedCandidatePolicy {
+                            inner: stateful_candidate_policy(),
+                            armed,
+                            arm_point: CandidatePolicyArmPoint::DetachedScoring,
+                            sampler_state_calls: std::cell::Cell::new(0),
+                        };
+                        let error = trainer
+                            .train_rollout_ledger_step(
+                                0,
+                                &mut learner,
+                                &ledger_root,
+                                &"2".repeat(64),
+                                None,
+                            )
+                            .unwrap_err();
+                        (rank, error.to_string())
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        });
+
+        for (rank, message) in outcomes {
+            assert!(
+                message.contains("data-parallel world is dead"),
+                "rank {rank}: {message}"
+            );
+            assert!(message.contains("discard the policy and optimizer state"));
+        }
+        for (rank, state) in states.iter().enumerate() {
+            assert!(
+                state.failed.load(Ordering::SeqCst),
+                "rank {rank}: fault not consumed"
+            );
+            assert_eq!(state.remaining_successes.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                state.calls_after_failure.load(Ordering::SeqCst),
+                0,
+                "rank {rank}: learner live-count ran after token-count communication failure"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // explicit two-rank fault protocol
+    fn reward_statistics_chain_stops_after_first_failed_reduction() {
+        use std::sync::atomic::Ordering;
+
+        let tmp = WireTmp::new("reward-stat-chain-terminal-comm");
+        let ledger_root = tmp.0.join("ledger");
+        let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Reward callback arming is followed by rollout/reward status and the
+        // reward-count reduction. Reward-sum then fails, so sum-of-squares must
+        // never be attempted.
+        let states: Vec<_> = (0..2)
+            .map(|_| std::sync::Arc::new(ArmedCollectiveFailureState::new(2)))
+            .collect();
+        let comms =
+            crate::comm::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(10));
+        let outcomes: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = comms
+                .into_iter()
+                .zip(states.iter().cloned())
+                .map(|(inner, state)| {
+                    let rank = inner.rank();
+                    let base = tmp.0.clone();
+                    let ledger_root = ledger_root.clone();
+                    let armed = std::sync::Arc::clone(&armed);
+                    scope.spawn(move || {
+                        let comm = FailAfterArmComm {
+                            inner,
+                            armed: std::sync::Arc::clone(&armed),
+                            state,
+                        };
+                        let run = RunDir::create(&base, format!("rank-{rank}")).unwrap();
+                        let mut config = candidate_ledger_config();
+                        config.reward_group_scope = RewardGroupScope::DistributedSamePrompt;
+                        config.candidate_log_top_k = 0;
+                        let mut trainer = Trainer::with_comm(config, &run, comm).unwrap();
+                        let mut policy = stateful_candidate_policy();
+                        let error = trainer
+                            .collect_rollout_ledger_step(
+                                0,
+                                &mut policy,
+                                &ArmedCandidateReward { armed },
+                                &CandidateCodec,
+                                &[Sample::new("p", ()), Sample::new("q", ())],
+                                &ledger_root,
+                                &"3".repeat(64),
+                                None,
+                            )
+                            .unwrap_err();
+                        (rank, error.to_string(), policy.sampler)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        });
+
+        for (rank, message, sampler) in outcomes {
+            assert!(
+                message.contains("data-parallel world is dead"),
+                "rank {rank}: {message}"
+            );
+            assert_eq!(
+                sampler, 0,
+                "rank {rank}: local sampler rollback did not run"
+            );
+        }
+        for (rank, state) in states.iter().enumerate() {
+            assert!(
+                state.failed.load(Ordering::SeqCst),
+                "rank {rank}: fault not consumed"
+            );
+            assert_eq!(state.remaining_successes.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                state.calls_after_failure.load(Ordering::SeqCst),
+                0,
+                "rank {rank}: reward sumsq reduction ran after reward-sum failure"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // explicit fault matrix and two-rank protocol
+    fn distributed_metrics_comm_failure_reports_truncate_error_and_panic() {
+        use std::sync::atomic::Ordering;
+
+        for (fault, injected_message) in [
+            ("error", "injected metrics truncate failure"),
+            ("panic", "injected metrics truncate panic"),
+        ] {
+            let tmp = WireTmp::new(&format!("distributed-metrics-terminal-{fault}"));
+            let ledger_root = tmp.0.join("ledger");
+            let states: Vec<_> = (0..2)
+                .map(|_| std::sync::Arc::new(MetricsStatusFailureState::new()))
+                .collect();
+            let comms =
+                crate::comm::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(10));
+            let outcomes: Vec<_> = std::thread::scope(|scope| {
+                let handles: Vec<_> = comms
+                    .into_iter()
+                    .zip(states.iter().cloned())
+                    .map(|(inner, state)| {
+                        let rank = inner.rank();
+                        let base = tmp.0.clone();
+                        let ledger_root = ledger_root.clone();
+                        scope.spawn(move || {
+                            let run = RunDir::create(&base, format!("rank-{rank}")).unwrap();
+                            let comm = FailAtMetricsStatusComm {
+                                inner,
+                                metrics_path: run.metrics_path().to_path_buf(),
+                                state,
+                            };
+                            let mut trainer =
+                                Trainer::with_comm(candidate_ledger_config(), &run, comm).unwrap();
+                            let mut collector = stateful_candidate_policy();
+                            trainer
+                                .collect_rollout_ledger_step(
+                                    0,
+                                    &mut collector,
+                                    &CandidateReward,
+                                    &CandidateCodec,
+                                    &[Sample::new("p", ()), Sample::new("q", ())],
+                                    &ledger_root,
+                                    &"4".repeat(64),
+                                    None,
+                                )
+                                .unwrap();
+
+                            let mut learner = stateful_candidate_policy();
+                            let adapter_before = learner
+                                .inner
+                                .logp
+                                .as_tensor()
+                                .flatten_all()
+                                .unwrap()
+                                .to_vec1::<f32>()
+                                .unwrap();
+                            let sampler_before = learner.sampler;
+                            match fault {
+                                "error" => trainer.writer.inject_truncate_failure_once(),
+                                "panic" => trainer.writer.inject_truncate_panic_once(),
+                                other => unreachable!("unknown metrics rollback fault {other}"),
+                            }
+                            let error = trainer
+                                .train_rollout_ledger_step(
+                                    0,
+                                    &mut learner,
+                                    &ledger_root,
+                                    &"4".repeat(64),
+                                    None,
+                                )
+                                .unwrap_err();
+                            let adapter_after = learner
+                                .inner
+                                .logp
+                                .as_tensor()
+                                .flatten_all()
+                                .unwrap()
+                                .to_vec1::<f32>()
+                                .unwrap();
+                            (
+                                rank,
+                                error.to_string(),
+                                adapter_before,
+                                adapter_after,
+                                sampler_before,
+                                learner.sampler,
+                                crate::telemetry::read_metrics(run.metrics_path())
+                                    .unwrap()
+                                    .len(),
+                            )
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().unwrap())
+                    .collect()
+            });
+
+            for (
+                rank,
+                message,
+                adapter_before,
+                adapter_after,
+                sampler_before,
+                sampler_after,
+                rows,
+            ) in outcomes
+            {
+                assert!(
+                    message.contains("data-parallel world is dead"),
+                    "{fault} rank {rank}: {message}"
+                );
+                assert!(
+                    message.contains("best-effort local metrics rollback failed"),
+                    "{fault} rank {rank}: {message}"
+                );
+                assert!(
+                    message.contains(injected_message),
+                    "{fault} rank {rank}: {message}"
+                );
+                assert!(
+                    message.contains("must be repaired or discarded"),
+                    "{fault} rank {rank}: {message}"
+                );
+                assert!(
+                    message.contains("best-effort local rollback completed"),
+                    "{fault} rank {rank}: {message}"
+                );
+                assert!(
+                    message.contains("discard the policy and optimizer state"),
+                    "{fault} rank {rank}: {message}"
+                );
+                assert_eq!(adapter_after, adapter_before, "{fault} rank {rank} adapter");
+                assert_eq!(sampler_after, sampler_before, "{fault} rank {rank} sampler");
+                assert_eq!(
+                    rows, 1,
+                    "{fault} rank {rank}: injected truncate fault unexpectedly removed the row"
+                );
+            }
+            for (rank, state) in states.iter().enumerate() {
+                assert!(
+                    state.failed.load(Ordering::SeqCst),
+                    "{fault} rank {rank}: metrics status fault not consumed"
+                );
+                assert_eq!(
+                    state.calls_after_failure.load(Ordering::SeqCst),
+                    0,
+                    "{fault} rank {rank}: collective issued after metrics status failure"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn distributed_metrics_failure_truncates_successful_peers_and_rolls_back_state() {
+        let tmp = WireTmp::new("distributed-ledger-metrics-transaction");
+        let ledger_root = tmp.0.join("ledger");
+        let handles: Vec<_> =
+            crate::comm::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(10))
+                .into_iter()
+                .map(|comm| {
+                    let base = tmp.0.clone();
+                    let ledger_root = ledger_root.clone();
+                    std::thread::spawn(move || {
+                        let rank = comm.rank();
+                        let run = RunDir::create(&base, format!("rank-{rank}")).unwrap();
+                        let config = TrainerConfig {
+                            steps: 1,
+                            group_size: 3,
+                            grad_accum_steps: 1,
+                            max_new_tokens: 2,
+                            beta: 0.0,
+                            mu: 1,
+                            checkpoint_every: None,
+                            ..TrainerConfig::default()
+                        };
+                        let mut trainer = Trainer::with_comm(config, &run, comm).unwrap();
+                        let make_policy = || {
+                            let logp = Var::from_tensor(
+                                &Tensor::zeros((3, 2), DType::F32, &Device::Cpu).unwrap(),
+                            )
+                            .unwrap();
+                            StatefulCandidatePolicy {
+                                inner: CandidatePolicy { logp },
+                                sampler: 0,
+                            }
+                        };
+                        let mut collector_policy = make_policy();
+                        trainer
+                            .collect_rollout_ledger_step(
+                                0,
+                                &mut collector_policy,
+                                &CandidateReward,
+                                &CandidateCodec,
+                                &[Sample::new("p", ()), Sample::new("q", ())],
+                                &ledger_root,
+                                &"c".repeat(64),
+                                None,
+                            )
+                            .unwrap();
+                        let mut learner_policy = make_policy();
+                        let adapter_before = learner_policy
+                            .inner
+                            .logp
+                            .as_tensor()
+                            .flatten_all()
+                            .unwrap()
+                            .to_vec1::<f32>()
+                            .unwrap();
+                        let sampler_before = learner_policy.sampler;
+                        if rank == 1 {
+                            trainer.writer.inject_append_failure_once();
+                        }
+                        let error = trainer
+                            .train_rollout_ledger_step(
+                                0,
+                                &mut learner_policy,
+                                &ledger_root,
+                                &"c".repeat(64),
+                                None,
+                            )
+                            .unwrap_err();
+                        let adapter_after = learner_policy
+                            .inner
+                            .logp
+                            .as_tensor()
+                            .flatten_all()
+                            .unwrap()
+                            .to_vec1::<f32>()
+                            .unwrap();
+                        (
+                            rank,
+                            error.to_string(),
+                            adapter_before,
+                            adapter_after,
+                            sampler_before,
+                            learner_policy.sampler,
+                            crate::telemetry::read_metrics(run.metrics_path())
+                                .unwrap()
+                                .len(),
+                        )
+                    })
+                })
+                .collect();
+        for handle in handles {
+            let (rank, error, adapter_before, adapter_after, sampler_before, sampler_after, rows) =
+                handle.join().unwrap();
+            assert!(!error.contains("timeout"), "rank {rank}: {error}");
+            assert_eq!(adapter_after, adapter_before, "rank {rank} adapter");
+            assert_eq!(sampler_after, sampler_before, "rank {rank} sampler");
+            assert_eq!(rows, 0, "rank {rank} retained a metrics row");
+        }
     }
 
     struct TelemetryProbePolicy {
@@ -9659,7 +12383,7 @@ mod tests {
     }
 
     #[test]
-    fn reduce_epoch_treats_empty_peer_shard_as_zeros_across_chunk_boundary() {
+    fn reduce_epoch_reduces_materialized_empty_peer_shard_across_chunk_boundary() {
         std::thread::scope(|scope| {
             let comms = crate::comm::LocalComm::world(2);
             let handles: Vec<_> = comms
@@ -9692,6 +12416,7 @@ mod tests {
                         } else {
                             vec![None; vars.len()]
                         };
+                        materialize_zero_grad_slots(&vars, &mut acc).unwrap();
                         let covered = vec![true; vars.len()];
 
                         let (kl, clip, uncovered) = trainer

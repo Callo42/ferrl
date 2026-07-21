@@ -12,19 +12,24 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::grpo::{group_advantages, ScaleRewards};
+use crate::grpo::{group_advantages, ScaleRewards, GROUP_STD_EPS};
 
 /// The only rollout-ledger format this release accepts.
-pub const ROLLOUT_LEDGER_FORMAT_VERSION: u32 = 3;
+pub const ROLLOUT_LEDGER_FORMAT_VERSION: u32 = 4;
 
 const PAYLOAD_FILE: &str = "window.json";
 const MANIFEST_FILE: &str = "manifest.json";
+const DISTRIBUTED_MANIFEST_KIND: &str = "distributed_rollout_ledger";
+const DISTRIBUTED_OWNER_FILE: &str = ".ferrl-ledger-owner";
 
 #[cfg(test)]
 thread_local! {
     static POST_MANIFEST_TEST_FAULT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
     static SYNCED_DIRECTORIES: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
     static FAIL_SYNC_DIRECTORY_ONCE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    static FAIL_DISTRIBUTED_STAGE_CLEANUP_ONCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static DISTRIBUTED_STAGE_CLEANUP_FAULTS_CONSUMED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static FAIL_DISTRIBUTED_RECONCILIATION_READ_ONCE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -45,6 +50,31 @@ pub(crate) fn inject_post_manifest_disappearance_once() {
 #[cfg(test)]
 fn inject_post_manifest_in_place_mutation_once() {
     POST_MANIFEST_TEST_FAULT.with(|fault| fault.set(4));
+}
+
+#[cfg(test)]
+pub(crate) fn inject_directory_sync_failure_once(path: impl Into<PathBuf>) {
+    FAIL_SYNC_DIRECTORY_ONCE.with(|failure| {
+        *failure.borrow_mut() = Some(path.into());
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn inject_distributed_stage_cleanup_failure_once() {
+    DISTRIBUTED_STAGE_CLEANUP_FAULTS_CONSUMED.with(|count| count.set(0));
+    FAIL_DISTRIBUTED_STAGE_CLEANUP_ONCE.with(|failure| failure.set(true));
+}
+
+#[cfg(test)]
+pub(crate) fn distributed_stage_cleanup_faults_consumed() -> u32 {
+    DISTRIBUTED_STAGE_CLEANUP_FAULTS_CONSUMED.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn inject_distributed_reconciliation_read_failure_once(path: impl Into<PathBuf>) {
+    FAIL_DISTRIBUTED_RECONCILIATION_READ_ONCE.with(|failure| {
+        *failure.borrow_mut() = Some(path.into());
+    });
 }
 
 /// A rollout-ledger read, write, identity, or semantic validation failure.
@@ -71,6 +101,16 @@ pub enum RolloutLedgerError {
         /// Reader-visible destination that must not be treated as uncommitted.
         path: PathBuf,
         /// Original publication/reconciliation failure.
+        detail: String,
+    },
+    /// Publication did not cross the reader-visible manifest boundary, but an
+    /// owned staging/final claim could not be durably cleaned. Sampler rollback
+    /// remains safe; an operator must reconcile the leftover before retry.
+    #[error("rollout ledger unpublished claim requires reconciliation at {path}: {detail}")]
+    UnpublishedClaimAmbiguous {
+        /// Hidden stage or manifest-less destination blocking retry.
+        path: PathBuf,
+        /// Original failure plus the failed cleanup/ownership action.
         detail: String,
     },
     /// The manifest belongs to a different learner pre-state.
@@ -144,6 +184,8 @@ pub struct RolloutLedgerControls {
     pub group_size: u32,
     /// Rectangular completion width in every group.
     pub completion_width: u32,
+    /// Whether reward normalization is rank-local or spans same-prompt shards.
+    pub reward_group_scope: RolloutLedgerGroupScope,
     /// Reward-to-advantage scaling rule.
     pub scale_rewards: ScaleRewards,
     /// EOS token used for completion and truncation semantics.
@@ -156,6 +198,32 @@ pub struct RolloutLedgerControls {
     pub effective_lr_bits: u64,
     /// Resolved KL coefficient as exact f64 bits.
     pub effective_beta_bits: u64,
+}
+
+/// How a distributed ledger forms each reward-normalization group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RolloutLedgerGroupScope {
+    /// Each rank's completions form an independent reward group.
+    Local,
+    /// The same accumulation position across every rank forms one reward group.
+    DistributedSamePrompt,
+}
+
+/// Exact distributed reward statistics used to derive one shard's advantages.
+///
+/// Scalar collectives may associate floating-point additions differently from a
+/// host-side replay. The ledger therefore records the rank-identical values the
+/// collector actually received and validates every advantage against these bits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RolloutLedgerRewardStats {
+    /// Number of finite rewards across the whole same-prompt group.
+    pub count: u64,
+    /// Exact f64 bits of the all-reduced finite-reward sum.
+    pub sum_bits: u64,
+    /// Exact f64 bits of the all-reduced squared-reward sum.
+    pub sumsq_bits: u64,
 }
 
 /// Mandatory learner pre-state and structured controls for reading a window.
@@ -189,8 +257,10 @@ pub enum LedgerScoreRequirement {
 pub struct RolloutLedgerGroup {
     /// Zero-based position inside the accumulation window.
     pub accum_index: u32,
-    /// Global prompt ordinal: `step * grad_accum_steps + accum_index` in v2.
+    /// Global prompt ordinal under the configured local/same-prompt DP topology.
     pub prompt_index: u64,
+    /// Global first rollout-row ordinal used to derive this shard's RNG substreams.
+    pub rollout_global_row_base: u64,
     /// Rectangular rows: prompt tokens followed by padded completion tokens.
     pub token_ids: Vec<Vec<u32>>,
     /// Number of leading prompt tokens shared by this group's rows.
@@ -204,21 +274,24 @@ pub struct RolloutLedgerGroup {
     /// Non-finite rewards are preserved because the trainer deliberately excludes
     /// them from group statistics and assigns them zero advantage.
     pub reward_bits: Vec<u32>,
+    /// Canonical cross-rank reward statistics in distributed same-prompt mode.
+    /// Rank-local groups and every world-1 group carry `None`.
+    pub distributed_reward_stats: Option<RolloutLedgerRewardStats>,
     /// Learner constants derived from rewards, stored as exact finite f32 bits.
     pub advantage_bits: Vec<u32>,
     /// Exact final loss mask (`0` or `1`) with shape `[group, completion_width]`.
     pub loss_mask: Vec<Vec<u8>>,
 }
 
-/// One complete world-1 optimizer window.
+/// One rank's complete shard of an optimizer window.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RolloutLedgerStep {
     /// Outer trainer step represented by this artifact.
     pub step: u64,
-    /// Execution rank; v2 requires `0`.
+    /// Execution rank in `0..world_size`.
     pub rank: u32,
-    /// Execution world size; v2 requires `1`.
+    /// Data-parallel execution world size.
     pub world_size: u32,
     /// Expected number of ordered prompt groups.
     pub grad_accum_steps: u32,
@@ -226,6 +299,8 @@ pub struct RolloutLedgerStep {
     pub group_size: u32,
     /// Rectangular completion width in every group.
     pub completion_width: u32,
+    /// Reward-normalization topology used by the collector.
+    pub reward_group_scope: RolloutLedgerGroupScope,
     /// Reward-to-advantage scaling rule used by the collector.
     pub scale_rewards: ScaleRewards,
     /// EOS token used to derive truncation masking, if any.
@@ -238,9 +313,9 @@ pub struct RolloutLedgerStep {
     pub effective_lr_bits: u64,
     /// Resolved KL coefficient as exact finite f64 bits.
     pub effective_beta_bits: u64,
-    /// DAPO denominator: the sum of real completion lengths, clamped to at least `1`.
+    /// Global DAPO denominator: every rank's real completion lengths, clamped to `1`.
     pub window_tokens: u64,
-    /// Number of groups that must enter the learner update.
+    /// Global number of groups that must enter the learner update.
     pub live_items: u32,
     /// Required detached old-policy scoring contract.
     pub old_logprobs: LedgerScoreRequirement,
@@ -260,6 +335,7 @@ pub struct RolloutLedgerStep {
 pub struct ValidatedRolloutLedgerStep {
     identity: RolloutLedgerIdentity,
     step: RolloutLedgerStep,
+    consumed_ledger_sha256: String,
 }
 
 impl ValidatedRolloutLedgerStep {
@@ -280,6 +356,12 @@ impl ValidatedRolloutLedgerStep {
     pub fn into_step(self) -> RolloutLedgerStep {
         self.step
     }
+
+    /// Exact world package digest used to advance separated-training lineage.
+    #[must_use]
+    pub fn consumed_ledger_sha256(&self) -> &str {
+        &self.consumed_ledger_sha256
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -292,6 +374,45 @@ struct RolloutLedgerManifest {
     payload_sha256: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DistributedShardManifest {
+    rank: u32,
+    payload_file: String,
+    payload_len: u64,
+    payload_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DistributedRolloutLedgerManifest {
+    format_version: u32,
+    kind: String,
+    identity: RolloutLedgerIdentity,
+    step: u64,
+    world_size: u32,
+    controls: RolloutLedgerControls,
+    window_tokens: u64,
+    live_items: u32,
+    shards: Vec<DistributedShardManifest>,
+}
+
+/// Rank-0-owned staging claim for one distributed optimizer window.
+#[derive(Debug, Clone)]
+pub struct DistributedRolloutLedgerStage {
+    path: PathBuf,
+    final_dir: PathBuf,
+    owner: Vec<u8>,
+}
+
+impl DistributedRolloutLedgerStage {
+    /// Private staging directory shared by the ranks until publication commits.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
 /// Atomically publishes immutable rollout-window packages beneath one root.
 #[derive(Debug, Clone)]
 pub struct RolloutLedgerWriter {
@@ -302,6 +423,13 @@ pub struct RolloutLedgerWriter {
 }
 
 impl RolloutLedgerWriter {
+    pub(crate) fn distributed_stage_path(&self, step: u64, nonce: u64) -> PathBuf {
+        self.root.join(format!(
+            ".tmp-{}-distributed-{nonce:016x}",
+            step_dir_name(step)
+        ))
+    }
+
     /// Create a writer bound to one exact learner pre-state identity.
     ///
     /// # Errors
@@ -338,6 +466,12 @@ impl RolloutLedgerWriter {
     /// failures, or an attempt to overwrite an existing window.
     pub fn write_step(&self, step: &RolloutLedgerStep) -> Result<PathBuf, RolloutLedgerError> {
         validate_step(step)?;
+        if step.rank != 0 || step.world_size != 1 {
+            return Err(RolloutLedgerError::Invalid(format!(
+                "write_step requires a world-1 payload (got rank {}/world {})",
+                step.rank, step.world_size
+            )));
+        }
         if step.step != self.identity.source_step {
             return Err(RolloutLedgerError::Invalid(format!(
                 "payload step {} does not match identity source_step {}",
@@ -461,6 +595,19 @@ impl RolloutLedgerWriter {
             })?;
             sync_dir(final_dir)?;
             sync_dir(&self.root)?;
+            if !exact_files_visible(
+                final_dir,
+                &[
+                    (PAYLOAD_FILE, expected_payload.as_slice()),
+                    (MANIFEST_FILE, expected_manifest.as_slice()),
+                ],
+            ) {
+                return Err(RolloutLedgerError::PublicationAmbiguous {
+                    path: final_dir.to_path_buf(),
+                    detail: "visible package no longer matches staged bytes after the initial durability fence"
+                        .into(),
+                });
+            }
             Ok(final_dir.to_path_buf())
         })();
         if let Err(error) = result {
@@ -482,14 +629,13 @@ impl RolloutLedgerWriter {
                 sync_dir(final_dir)?;
                 sync_dir(&self.root)
             })();
-            let exact_visible = [
-                (PAYLOAD_FILE, expected_payload.as_slice()),
-                (MANIFEST_FILE, expected_manifest.as_slice()),
-            ]
-            .into_iter()
-            .all(|(name, expected)| {
-                fs::read(final_dir.join(name)).is_ok_and(|actual| actual == expected)
-            });
+            let exact_visible = exact_files_visible(
+                final_dir,
+                &[
+                    (PAYLOAD_FILE, expected_payload.as_slice()),
+                    (MANIFEST_FILE, expected_manifest.as_slice()),
+                ],
+            );
             if durability.is_ok() && exact_visible {
                 // The manifest boundary was crossed, and all required directory
                 // syncs have now completed. Only this establishes success.
@@ -504,6 +650,442 @@ impl RolloutLedgerWriter {
             });
         }
         Ok(final_dir.to_path_buf())
+    }
+
+    /// Create rank 0's private staging directory for one distributed window.
+    ///
+    /// Every rank must wait for the caller to coordinate this successful claim
+    /// before writing its shard through [`write_distributed_shard`](Self::write_distributed_shard).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RolloutLedgerError`] for an invalid topology, step mismatch, or
+    /// failure to durably create the staging claim.
+    pub fn create_distributed_stage(
+        &self,
+        step: u64,
+        world_size: u32,
+        nonce: u64,
+    ) -> Result<DistributedRolloutLedgerStage, RolloutLedgerError> {
+        if world_size <= 1 {
+            return Err(RolloutLedgerError::Invalid(
+                "distributed ledger staging requires world_size > 1".into(),
+            ));
+        }
+        if step != self.identity.source_step {
+            return Err(RolloutLedgerError::Invalid(format!(
+                "distributed stage step {step} does not match identity source_step {}",
+                self.identity.source_step
+            )));
+        }
+        let path = self.distributed_stage_path(step, nonce);
+        fs::create_dir(&path).map_err(|error| RolloutLedgerError::io(&path, error))?;
+        let owner = format!(
+            "{}:{:?}:{nonce:016x}",
+            std::process::id(),
+            std::thread::current().id()
+        )
+        .into_bytes();
+        if let Err(error) = write_new_synced(&path.join(DISTRIBUTED_OWNER_FILE), &owner) {
+            return Err(RolloutLedgerError::UnpublishedClaimAmbiguous {
+                path,
+                detail: format!(
+                    "{error}; owner marker was not established, so the hidden stage was preserved"
+                ),
+            });
+        }
+        if let Err(error) = sync_dir(&path).and_then(|()| sync_dir(&self.root)) {
+            return Err(cleanup_unpublished_stage(&self.root, &path, &owner, error));
+        }
+        Ok(DistributedRolloutLedgerStage {
+            path,
+            final_dir: self.root.join(step_dir_name(step)),
+            owner,
+        })
+    }
+
+    /// Write and sync this rank's immutable payload into a coordinated stage.
+    ///
+    /// The caller must globalize every rank's result before rank 0 either commits
+    /// or cleans the stage; cleanup while a peer may still be writing is forbidden.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RolloutLedgerError`] for an invalid shard or an I/O failure.
+    pub fn write_distributed_shard(
+        &self,
+        stage: impl AsRef<Path>,
+        step: &RolloutLedgerStep,
+    ) -> Result<PathBuf, RolloutLedgerError> {
+        validate_step(step)?;
+        if step.world_size <= 1 || step.rank >= step.world_size {
+            return Err(RolloutLedgerError::Invalid(format!(
+                "distributed shard has invalid rank {}/world {}",
+                step.rank, step.world_size
+            )));
+        }
+        if step.step != self.identity.source_step {
+            return Err(RolloutLedgerError::Invalid(format!(
+                "payload step {} does not match identity source_step {}",
+                step.step, self.identity.source_step
+            )));
+        }
+        let stage = stage.as_ref();
+        let payload_path = stage.join(distributed_payload_name(step.rank));
+        let payload = serde_json::to_vec(step)?;
+        write_new_synced(&payload_path, &payload)?;
+        Ok(payload_path)
+    }
+
+    /// Remove an uncommitted distributed stage after every rank has reported
+    /// quiescence through the communicator.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RolloutLedgerError`] if ownership changed or cleanup cannot be
+    /// durably anchored in the ledger root.
+    pub fn abort_distributed_stage(
+        &self,
+        stage: &DistributedRolloutLedgerStage,
+    ) -> Result<(), RolloutLedgerError> {
+        #[cfg(test)]
+        FAIL_DISTRIBUTED_STAGE_CLEANUP_ONCE.with(|failure| {
+            if failure.replace(false) {
+                DISTRIBUTED_STAGE_CLEANUP_FAULTS_CONSUMED
+                    .with(|count| count.set(count.get().saturating_add(1)));
+                return Err(RolloutLedgerError::io(
+                    &stage.path,
+                    std::io::Error::other("injected distributed hidden-stage cleanup failure"),
+                ));
+            }
+            Ok(())
+        })?;
+        require_exact_owner(&stage.path, &stage.owner)?;
+        fs::remove_dir_all(&stage.path)
+            .map_err(|error| RolloutLedgerError::io(&stage.path, error))?;
+        sync_dir(&self.root)
+    }
+
+    /// Classify an existing destination marker-first and reconcile it when the
+    /// intended commit marker may be reader-visible. Hidden-stage cleanup cannot
+    /// downgrade a durably verified publication, while payload uncertainty or an
+    /// unresolved fence is publication ambiguity regardless of cleanup outcome.
+    fn reconcile_existing_distributed_package(
+        &self,
+        stage: &DistributedRolloutLedgerStage,
+        expected_files: &[(String, Vec<u8>)],
+    ) -> Option<Result<PathBuf, RolloutLedgerError>> {
+        match probe_existing_distributed_package(&stage.final_dir, expected_files) {
+            ExistingDistributedPackageProbe::RetryableMarker => return None,
+            ExistingDistributedPackageProbe::Exact => {}
+            ExistingDistributedPackageProbe::Ambiguous(mut detail) => {
+                if let Err(cleanup_error) = self.abort_distributed_stage(stage) {
+                    detail.push_str(&format!(
+                        "; hidden-stage cleanup also failed: {cleanup_error}"
+                    ));
+                }
+                return Some(Err(RolloutLedgerError::PublicationAmbiguous {
+                    path: stage.final_dir.clone(),
+                    detail,
+                }));
+            }
+        }
+
+        let fences = sync_dir(&stage.final_dir).and_then(|()| sync_dir(&self.root));
+        let post_fence = probe_existing_distributed_package(&stage.final_dir, expected_files);
+        let cleanup = self.abort_distributed_stage(stage);
+        if fences.is_ok() && matches!(&post_fence, ExistingDistributedPackageProbe::Exact) {
+            return Some(Ok(stage.final_dir.clone()));
+        }
+
+        let mut detail = match (fences, post_fence) {
+            (Ok(()), ExistingDistributedPackageProbe::RetryableMarker) => {
+                "the exact distributed manifest changed or disappeared during post-fence verification"
+                    .into()
+            }
+            (Ok(()), ExistingDistributedPackageProbe::Ambiguous(detail)) => detail,
+            (Err(error), ExistingDistributedPackageProbe::Exact) => format!(
+                "exact distributed package was already visible, but durability reconciliation failed: {error}"
+            ),
+            (Err(error), ExistingDistributedPackageProbe::RetryableMarker) => format!(
+                "exact distributed package was already visible, but durability reconciliation failed: {error}; its manifest also changed or disappeared during post-fence verification"
+            ),
+            (Err(error), ExistingDistributedPackageProbe::Ambiguous(detail)) => format!(
+                "exact distributed package was already visible, but durability reconciliation failed: {error}; post-fence verification was also ambiguous: {detail}"
+            ),
+            (Ok(()), ExistingDistributedPackageProbe::Exact) => {
+                unreachable!("successful reconciliation returned above")
+            }
+        };
+        if let Err(cleanup_error) = cleanup {
+            detail.push_str(&format!(
+                "; hidden-stage cleanup also failed: {cleanup_error}"
+            ));
+        }
+        Some(Err(RolloutLedgerError::PublicationAmbiguous {
+            path: stage.final_dir.clone(),
+            detail,
+        }))
+    }
+
+    /// Validate every staged shard and publish one manifest-last distributed step.
+    ///
+    /// The caller must invoke this only on rank 0 after a successful shard-status
+    /// collective proves every peer has stopped writing the stage.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RolloutLedgerError`] for a missing/mismatched shard, conflicting
+    /// existing step, failed durability fence, or ambiguous post-manifest state.
+    pub fn commit_distributed_stage(
+        &self,
+        stage: &DistributedRolloutLedgerStage,
+        step: u64,
+        world_size: u32,
+        controls: &RolloutLedgerControls,
+    ) -> Result<PathBuf, RolloutLedgerError> {
+        let prepared = (|| {
+            validate_controls(controls)?;
+            if world_size <= 1 || step != self.identity.source_step {
+                return Err(RolloutLedgerError::Invalid(
+                    "distributed commit topology does not match the writer identity".into(),
+                ));
+            }
+            require_exact_owner(&stage.path, &stage.owner)?;
+            let mut packages = Vec::with_capacity(world_size as usize);
+            let mut shards = Vec::with_capacity(world_size as usize);
+            for rank in 0..world_size {
+                let name = distributed_payload_name(rank);
+                let path = stage.path.join(&name);
+                let bytes =
+                    fs::read(&path).map_err(|error| RolloutLedgerError::io(&path, error))?;
+                let payload: RolloutLedgerStep = serde_json::from_slice(&bytes)?;
+                if payload.step != step || payload.rank != rank || payload.world_size != world_size
+                {
+                    return Err(RolloutLedgerError::Invalid(format!(
+                        "distributed shard {rank} declares step/rank/world {}/{}/{}",
+                        payload.step, payload.rank, payload.world_size
+                    )));
+                }
+                if controls_from_step(&payload) != *controls {
+                    return Err(RolloutLedgerError::LearnerControlsMismatch);
+                }
+                let validation = validate_step(&payload)?;
+                let payload_len = u64::try_from(bytes.len()).map_err(|_| {
+                    RolloutLedgerError::Invalid(
+                        "distributed payload length does not fit u64".into(),
+                    )
+                })?;
+                shards.push(DistributedShardManifest {
+                    rank,
+                    payload_file: name,
+                    payload_len,
+                    payload_sha256: sha256_hex(&bytes),
+                });
+                packages.push((payload, bytes, validation));
+            }
+            validate_distributed_packages(&packages, controls)?;
+            let first = &packages[0].0;
+            let manifest = DistributedRolloutLedgerManifest {
+                format_version: ROLLOUT_LEDGER_FORMAT_VERSION,
+                kind: DISTRIBUTED_MANIFEST_KIND.to_owned(),
+                identity: self.identity.clone(),
+                step,
+                world_size,
+                controls: controls.clone(),
+                window_tokens: first.window_tokens,
+                live_items: first.live_items,
+                shards,
+            };
+            let mut manifest_bytes = serde_json::to_vec(&manifest)?;
+            manifest_bytes.push(b'\n');
+            let staged_manifest = stage.path.join(MANIFEST_FILE);
+            write_new_synced(&staged_manifest, &manifest_bytes)?;
+            sync_dir(&stage.path)?;
+            let expected_files: Vec<(String, Vec<u8>)> = packages
+                .iter()
+                .map(|(payload, bytes, _)| (distributed_payload_name(payload.rank), bytes.clone()))
+                .chain(std::iter::once((MANIFEST_FILE.to_owned(), manifest_bytes)))
+                .collect();
+            Ok((expected_files, staged_manifest))
+        })();
+        let (expected_files, staged_manifest) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return Err(cleanup_unpublished_stage(
+                    &self.root,
+                    &stage.path,
+                    &stage.owner,
+                    error,
+                ));
+            }
+        };
+        if stage.final_dir.exists() {
+            if let Some(reconciled) =
+                self.reconcile_existing_distributed_package(stage, &expected_files)
+            {
+                return reconciled;
+            }
+            return Err(cleanup_unpublished_stage(
+                &self.root,
+                &stage.path,
+                &stage.owner,
+                RolloutLedgerError::AlreadyExists(stage.final_dir.clone()),
+            ));
+        }
+
+        if let Err(source) = fs::create_dir(&stage.final_dir) {
+            if let Some(reconciled) =
+                self.reconcile_existing_distributed_package(stage, &expected_files)
+            {
+                return reconciled;
+            }
+            let error = if source.kind() == std::io::ErrorKind::AlreadyExists {
+                RolloutLedgerError::AlreadyExists(stage.final_dir.clone())
+            } else {
+                RolloutLedgerError::io(&stage.final_dir, source)
+            };
+            return Err(cleanup_unpublished_stage(
+                &self.root,
+                &stage.path,
+                &stage.owner,
+                error,
+            ));
+        }
+        if let Err(error) =
+            write_new_synced(&stage.final_dir.join(DISTRIBUTED_OWNER_FILE), &stage.owner)
+        {
+            return Err(cleanup_distributed_claim(self, stage, error));
+        }
+        if let Err(error) = sync_dir(&stage.final_dir).and_then(|()| sync_dir(&self.root)) {
+            return Err(cleanup_distributed_claim(self, stage, error));
+        }
+
+        let mut manifest_linked = false;
+        let publication = (|| {
+            for (name, _) in &expected_files {
+                if name == MANIFEST_FILE {
+                    continue;
+                }
+                let destination = stage.final_dir.join(name);
+                fs::hard_link(stage.path.join(name), &destination)
+                    .map_err(|error| RolloutLedgerError::io(&destination, error))?;
+            }
+            sync_dir(&stage.final_dir)?;
+            let destination_manifest = stage.final_dir.join(MANIFEST_FILE);
+            fs::hard_link(&staged_manifest, &destination_manifest)
+                .map_err(|error| RolloutLedgerError::io(&destination_manifest, error))?;
+            manifest_linked = true;
+            #[cfg(test)]
+            POST_MANIFEST_TEST_FAULT.with(|fault| match fault.get() {
+                0 => Ok(()),
+                1 => {
+                    fault.set(0);
+                    Err(RolloutLedgerError::io(
+                        &stage.final_dir,
+                        std::io::Error::other(
+                            "injected transient distributed post-manifest failure",
+                        ),
+                    ))
+                }
+                2 => Err(RolloutLedgerError::io(
+                    &stage.final_dir,
+                    std::io::Error::other(
+                        "injected persistent distributed post-manifest sync failure",
+                    ),
+                )),
+                3 => {
+                    fault.set(0);
+                    let _ = fs::remove_file(&destination_manifest);
+                    Err(RolloutLedgerError::io(
+                        &stage.final_dir,
+                        std::io::Error::other(
+                            "injected distributed post-link manifest disappearance",
+                        ),
+                    ))
+                }
+                4 => {
+                    fault.set(0);
+                    let payload = stage.final_dir.join(distributed_payload_name(0));
+                    let mut file = OpenOptions::new()
+                        .write(true)
+                        .open(&payload)
+                        .map_err(|error| RolloutLedgerError::io(&payload, error))?;
+                    file.write_all(b"x")
+                        .map_err(|error| RolloutLedgerError::io(&payload, error))?;
+                    file.sync_all()
+                        .map_err(|error| RolloutLedgerError::io(&payload, error))?;
+                    Err(RolloutLedgerError::io(
+                        &stage.final_dir,
+                        std::io::Error::other("injected distributed in-place post-link mutation"),
+                    ))
+                }
+                other => Err(RolloutLedgerError::Invalid(format!(
+                    "unknown distributed post-manifest test fault {other}"
+                ))),
+            })?;
+            sync_dir(&stage.final_dir)?;
+            sync_dir(&self.root)?;
+            if !exact_owned_distributed_package(
+                &stage.final_dir,
+                &expected_files,
+                Some(&stage.owner),
+            ) {
+                return Err(RolloutLedgerError::PublicationAmbiguous {
+                    path: stage.final_dir.clone(),
+                    detail: "visible distributed package does not match the staged rank shards"
+                        .into(),
+                });
+            }
+            Ok(stage.final_dir.clone())
+        })();
+
+        match publication {
+            Ok(path) => {
+                let _ = fs::remove_dir_all(&stage.path);
+                Ok(path)
+            }
+            Err(error) if !manifest_linked => Err(cleanup_distributed_claim(self, stage, error)),
+            Err(error) => {
+                let retry = (|| {
+                    #[cfg(test)]
+                    POST_MANIFEST_TEST_FAULT.with(|fault| {
+                        if fault.replace(0) == 2 {
+                            return Err(RolloutLedgerError::io(
+                                &stage.final_dir,
+                                std::io::Error::other(
+                                    "injected persistent distributed post-manifest sync failure",
+                                ),
+                            ));
+                        }
+                        Ok(())
+                    })?;
+                    sync_dir(&stage.final_dir)?;
+                    sync_dir(&self.root)
+                })();
+                let exact = exact_owned_distributed_package(
+                    &stage.final_dir,
+                    &expected_files,
+                    Some(&stage.owner),
+                );
+                if retry.is_ok() && exact {
+                    let _ = fs::remove_dir_all(&stage.path);
+                    Ok(stage.final_dir.clone())
+                } else {
+                    Err(RolloutLedgerError::PublicationAmbiguous {
+                        path: stage.final_dir.clone(),
+                        detail: match retry {
+                            Ok(()) => format!(
+                                "{error}; visible distributed package no longer matches staged bytes"
+                            ),
+                            Err(sync_error) => {
+                                format!("{error}; durability retry failed: {sync_error}")
+                            }
+                        },
+                    })
+                }
+            }
+        }
     }
 
     /// The ledger root directory.
@@ -553,6 +1135,11 @@ impl RolloutLedgerReader {
         let manifest_path = dir.join(MANIFEST_FILE);
         let manifest_bytes =
             fs::read(&manifest_path).map_err(|e| RolloutLedgerError::io(&manifest_path, e))?;
+        if serde_json::from_slice::<DistributedRolloutLedgerManifest>(&manifest_bytes).is_ok() {
+            return Err(RolloutLedgerError::Invalid(
+                "distributed ledger requires read_distributed_step with explicit rank/world".into(),
+            ));
+        }
         let manifest: RolloutLedgerManifest = serde_json::from_slice(&manifest_bytes)?;
         if manifest.format_version != ROLLOUT_LEDGER_FORMAT_VERSION {
             return Err(RolloutLedgerError::Invalid(format!(
@@ -570,24 +1157,24 @@ impl RolloutLedgerReader {
             )));
         }
         let payload_path = dir.join(PAYLOAD_FILE);
-        let payload =
+        let payload_bytes =
             fs::read(&payload_path).map_err(|e| RolloutLedgerError::io(&payload_path, e))?;
-        let payload_len = u64::try_from(payload.len())
+        let payload_len = u64::try_from(payload_bytes.len())
             .map_err(|_| RolloutLedgerError::Invalid("payload length does not fit u64".into()))?;
         if payload_len != manifest.payload_len {
             return Err(RolloutLedgerError::Invalid(format!(
                 "payload length {} does not match manifest {}",
-                payload.len(),
+                payload_bytes.len(),
                 manifest.payload_len
             )));
         }
-        let actual = sha256_hex(&payload);
+        let actual = sha256_hex(&payload_bytes);
         if actual != manifest.payload_sha256 {
             return Err(RolloutLedgerError::Invalid(
                 "payload checksum mismatch".into(),
             ));
         }
-        let payload: RolloutLedgerStep = serde_json::from_slice(&payload)?;
+        let payload: RolloutLedgerStep = serde_json::from_slice(&payload_bytes)?;
         if payload.step != step || payload.step != manifest.identity.source_step {
             return Err(RolloutLedgerError::Invalid(format!(
                 "payload step {} does not match requested/source step {step}",
@@ -595,13 +1182,139 @@ impl RolloutLedgerReader {
             )));
         }
         validate_step(&payload)?;
+        if payload.rank != 0 || payload.world_size != 1 {
+            return Err(RolloutLedgerError::Invalid(format!(
+                "world-1 package declares rank {}/world {}",
+                payload.rank, payload.world_size
+            )));
+        }
         let actual_controls = controls_from_step(&payload);
         if actual_controls != self.expected.controls {
             return Err(RolloutLedgerError::LearnerControlsMismatch);
         }
+        let consumed_ledger_sha256 = consumed_world_one_sha256(&manifest_bytes, &payload_bytes);
         Ok(ValidatedRolloutLedgerStep {
             identity: manifest.identity,
             step: payload,
+            consumed_ledger_sha256,
+        })
+    }
+
+    /// Read and validate every shard of one committed distributed optimizer window.
+    ///
+    /// The root manifest is the only commit marker. It must bind exactly one
+    /// canonical shard for every rank, all global counts and reward statistics
+    /// are checked before the caller receives this rank's payload, and every rank
+    /// derives the same consumed-package digest from the exact manifest bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RolloutLedgerError`] for an absent/partial/corrupt package,
+    /// topology or identity mismatch, or invalid cross-rank semantics.
+    pub fn read_distributed_step(
+        &self,
+        step: u64,
+        rank: u32,
+        world_size: u32,
+    ) -> Result<ValidatedRolloutLedgerStep, RolloutLedgerError> {
+        if world_size <= 1 || rank >= world_size {
+            return Err(RolloutLedgerError::Invalid(format!(
+                "invalid distributed reader rank {rank}/world {world_size}"
+            )));
+        }
+        let dir = self.root.join(step_dir_name(step));
+        let manifest_path = dir.join(MANIFEST_FILE);
+        let manifest_bytes = fs::read(&manifest_path)
+            .map_err(|error| RolloutLedgerError::io(&manifest_path, error))?;
+        let manifest: DistributedRolloutLedgerManifest = serde_json::from_slice(&manifest_bytes)?;
+        if manifest.format_version != ROLLOUT_LEDGER_FORMAT_VERSION
+            || manifest.kind != DISTRIBUTED_MANIFEST_KIND
+        {
+            return Err(RolloutLedgerError::Invalid(format!(
+                "unsupported distributed rollout-ledger format {}/{}",
+                manifest.kind, manifest.format_version
+            )));
+        }
+        if manifest.identity != self.expected.identity {
+            return Err(RolloutLedgerError::IdentityMismatch);
+        }
+        if manifest.controls != self.expected.controls {
+            return Err(RolloutLedgerError::LearnerControlsMismatch);
+        }
+        if manifest.step != step
+            || manifest.identity.source_step != step
+            || manifest.world_size != world_size
+        {
+            return Err(RolloutLedgerError::Invalid(format!(
+                "distributed manifest step/world {}/{} does not match requested {step}/{world_size}",
+                manifest.step, manifest.world_size
+            )));
+        }
+        if manifest.shards.len() != world_size as usize {
+            return Err(RolloutLedgerError::Invalid(format!(
+                "distributed manifest has {} shards, expected {world_size}",
+                manifest.shards.len()
+            )));
+        }
+
+        let mut packages = Vec::with_capacity(world_size as usize);
+        for (index, shard) in manifest.shards.iter().enumerate() {
+            let expected_rank = u32::try_from(index)
+                .map_err(|_| RolloutLedgerError::Invalid("shard rank overflows u32".into()))?;
+            let expected_name = distributed_payload_name(expected_rank);
+            if shard.rank != expected_rank || shard.payload_file != expected_name {
+                return Err(RolloutLedgerError::Invalid(format!(
+                    "distributed shard {index} is not the canonical rank/file entry"
+                )));
+            }
+            let path = dir.join(&shard.payload_file);
+            let bytes = fs::read(&path).map_err(|error| RolloutLedgerError::io(&path, error))?;
+            let len = u64::try_from(bytes.len()).map_err(|_| {
+                RolloutLedgerError::Invalid("distributed payload length does not fit u64".into())
+            })?;
+            if len != shard.payload_len || sha256_hex(&bytes) != shard.payload_sha256 {
+                return Err(RolloutLedgerError::Invalid(format!(
+                    "distributed shard {expected_rank} length/checksum mismatch"
+                )));
+            }
+            let payload: RolloutLedgerStep = serde_json::from_slice(&bytes)?;
+            if payload.step != step
+                || payload.rank != expected_rank
+                || payload.world_size != world_size
+                || controls_from_step(&payload) != manifest.controls
+            {
+                return Err(RolloutLedgerError::Invalid(format!(
+                    "distributed shard {expected_rank} topology/controls mismatch"
+                )));
+            }
+            let validation = validate_step(&payload)?;
+            packages.push((payload, bytes, validation));
+        }
+        validate_distributed_packages(&packages, &manifest.controls)?;
+        if packages[0].0.window_tokens != manifest.window_tokens
+            || packages[0].0.live_items != manifest.live_items
+        {
+            return Err(RolloutLedgerError::Invalid(
+                "distributed manifest global counts do not match its shards".into(),
+            ));
+        }
+        let consumed_ledger_sha256 = consumed_distributed_sha256(
+            &manifest_bytes,
+            packages.iter().map(|(_, bytes, _)| bytes.as_slice()),
+        );
+        let payload = packages
+            .into_iter()
+            .nth(rank as usize)
+            .ok_or_else(|| {
+                RolloutLedgerError::Invalid(
+                    "requested distributed rank is absent after package validation".into(),
+                )
+            })?
+            .0;
+        Ok(ValidatedRolloutLedgerStep {
+            identity: manifest.identity,
+            step: payload,
+            consumed_ledger_sha256,
         })
     }
 
@@ -665,6 +1378,7 @@ fn controls_from_step(step: &RolloutLedgerStep) -> RolloutLedgerControls {
         grad_accum_steps: step.grad_accum_steps,
         group_size: step.group_size,
         completion_width: step.completion_width,
+        reward_group_scope: step.reward_group_scope,
         scale_rewards: step.scale_rewards,
         eos_token_id: step.eos_token_id,
         truncation_masking: step.truncation_masking,
@@ -674,11 +1388,17 @@ fn controls_from_step(step: &RolloutLedgerStep) -> RolloutLedgerControls {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct StepValidation {
+    completion_tokens: u64,
+    live_items: u32,
+}
+
 #[allow(clippy::cognitive_complexity)] // ordered whole-window preflight is clearest in one pass
-fn validate_step(step: &RolloutLedgerStep) -> Result<(), RolloutLedgerError> {
-    if step.world_size != 1 || step.rank != 0 {
+fn validate_step(step: &RolloutLedgerStep) -> Result<StepValidation, RolloutLedgerError> {
+    if step.world_size == 0 || step.rank >= step.world_size {
         return Err(RolloutLedgerError::Invalid(format!(
-            "format v3 is world-1 only (got rank {}/world {})",
+            "invalid rollout-ledger rank {}/world {}",
             step.rank, step.world_size
         )));
     }
@@ -707,10 +1427,24 @@ fn validate_step(step: &RolloutLedgerStep) -> Result<(), RolloutLedgerError> {
             step.groups.len()
         )));
     }
-    let prompt_base = step
+    let accum_u64 = u64::from(step.grad_accum_steps);
+    let world_u64 = u64::from(step.world_size);
+    let rank_u64 = u64::from(step.rank);
+    let prompt_base = match step.reward_group_scope {
+        RolloutLedgerGroupScope::Local => step
+            .step
+            .checked_mul(accum_u64)
+            .and_then(|value| value.checked_mul(world_u64))
+            .and_then(|value| value.checked_add(rank_u64.checked_mul(accum_u64)?)),
+        RolloutLedgerGroupScope::DistributedSamePrompt => step.step.checked_mul(accum_u64),
+    }
+    .ok_or_else(|| RolloutLedgerError::Invalid("prompt ordinal overflow".into()))?;
+    let shard_base = step
         .step
-        .checked_mul(u64::from(step.grad_accum_steps))
-        .ok_or_else(|| RolloutLedgerError::Invalid("prompt ordinal overflow".into()))?;
+        .checked_mul(accum_u64)
+        .and_then(|value| value.checked_mul(world_u64))
+        .and_then(|value| value.checked_add(rank_u64.checked_mul(accum_u64)?))
+        .ok_or_else(|| RolloutLedgerError::Invalid("rollout row ordinal overflow".into()))?;
     let mut token_total = 0_u64;
     let mut live = 0_u32;
     for (index, group) in step.groups.iter().enumerate() {
@@ -731,6 +1465,16 @@ fn validate_step(step: &RolloutLedgerStep) -> Result<(), RolloutLedgerError> {
                 group.prompt_index
             )));
         }
+        let expected_row_base = shard_base
+            .checked_add(u64::from(group.accum_index))
+            .and_then(|value| value.checked_mul(u64::from(step.group_size)))
+            .ok_or_else(|| RolloutLedgerError::Invalid("rollout row ordinal overflow".into()))?;
+        if group.rollout_global_row_base != expected_row_base {
+            return Err(RolloutLedgerError::Invalid(format!(
+                "group {index} has rollout_global_row_base {}, expected {expected_row_base}",
+                group.rollout_global_row_base
+            )));
+        }
         let surrogate_live = validate_group(step, group, group_size, width)?;
         token_total = group
             .completion_lens
@@ -746,18 +1490,20 @@ fn validate_step(step: &RolloutLedgerStep) -> Result<(), RolloutLedgerError> {
                 .ok_or_else(|| RolloutLedgerError::Invalid("live item count overflow".into()))?;
         }
     }
-    let expected_window_tokens = token_total.max(1);
-    if expected_window_tokens != step.window_tokens {
-        return Err(RolloutLedgerError::Invalid(format!(
-            "window_tokens {} does not match clamped completion total {expected_window_tokens}",
-            step.window_tokens
-        )));
-    }
-    if live != step.live_items {
-        return Err(RolloutLedgerError::Invalid(format!(
-            "live_items {} does not match derived count {live}",
-            step.live_items
-        )));
+    if step.world_size == 1 {
+        let expected_window_tokens = token_total.max(1);
+        if expected_window_tokens != step.window_tokens {
+            return Err(RolloutLedgerError::Invalid(format!(
+                "window_tokens {} does not match clamped completion total {expected_window_tokens}",
+                step.window_tokens
+            )));
+        }
+        if live != step.live_items {
+            return Err(RolloutLedgerError::Invalid(format!(
+                "live_items {} does not match derived count {live}",
+                step.live_items
+            )));
+        }
     }
     let expected_old = if live > 0 {
         LedgerScoreRequirement::AdapterEnabledDetached
@@ -769,7 +1515,10 @@ fn validate_step(step: &RolloutLedgerStep) -> Result<(), RolloutLedgerError> {
             "old scoring requirement does not match the derived live-item count".into(),
         ));
     }
-    Ok(())
+    Ok(StepValidation {
+        completion_tokens: token_total,
+        live_items: live,
+    })
 }
 
 fn validate_group(
@@ -815,7 +1564,24 @@ fn validate_group(
         .iter()
         .map(|&bits| f64::from(f32::from_bits(bits)))
         .collect();
-    let expected_advantages = group_advantages(&rewards, step.scale_rewards);
+    let distributed_stats_required = step.world_size > 1
+        && step.reward_group_scope == RolloutLedgerGroupScope::DistributedSamePrompt;
+    let expected_advantages = match (distributed_stats_required, group.distributed_reward_stats) {
+        (false, None) => group_advantages(&rewards, step.scale_rewards),
+        (true, Some(stats)) => {
+            advantages_from_distributed_stats(&rewards, stats, step.scale_rewards)?
+        }
+        (false, Some(_)) => {
+            return Err(RolloutLedgerError::Invalid(
+                "rank-local/world-1 group carries distributed reward statistics".into(),
+            ));
+        }
+        (true, None) => {
+            return Err(RolloutLedgerError::Invalid(
+                "distributed same-prompt group is missing canonical reward statistics".into(),
+            ));
+        }
+    };
     for (row, &expected_advantage) in expected_advantages.iter().enumerate() {
         validate_group_row(
             step,
@@ -831,6 +1597,183 @@ fn validate_group(
     Ok(expected_advantages
         .iter()
         .any(|&advantage| advantage != 0.0))
+}
+
+fn advantages_from_distributed_stats(
+    rewards: &[f64],
+    stats: RolloutLedgerRewardStats,
+    scale: ScaleRewards,
+) -> Result<Vec<f64>, RolloutLedgerError> {
+    let sum = f64::from_bits(stats.sum_bits);
+    let sumsq = f64::from_bits(stats.sumsq_bits);
+    if !sum.is_finite() || !sumsq.is_finite() || sumsq < 0.0 {
+        return Err(RolloutLedgerError::Invalid(
+            "distributed reward statistics must be finite with nonnegative sumsq".into(),
+        ));
+    }
+    if stats.count == 0 && (sum != 0.0 || sumsq != 0.0) {
+        return Err(RolloutLedgerError::Invalid(
+            "empty distributed reward statistics must have zero sums".into(),
+        ));
+    }
+    let count = stats.count as f64;
+    let (mean, std) = if count == 0.0 {
+        (0.0, 0.0)
+    } else {
+        let mean = sum / count;
+        let std = if count < 2.0 {
+            0.0
+        } else {
+            ((sumsq - (sum * sum / count)) / (count - 1.0))
+                .max(0.0)
+                .sqrt()
+        };
+        (mean, std)
+    };
+    let denominator = match scale {
+        ScaleRewards::None => 1.0,
+        ScaleRewards::Group => std + GROUP_STD_EPS,
+    };
+    Ok(rewards
+        .iter()
+        .map(|&reward| {
+            let advantage = (reward - mean) / denominator;
+            if advantage.is_finite() {
+                advantage
+            } else {
+                0.0
+            }
+        })
+        .collect())
+}
+
+fn local_reward_stats(rewards: &[u32]) -> (u64, f64, f64) {
+    rewards
+        .iter()
+        .map(|&bits| f64::from(f32::from_bits(bits)))
+        .filter(|reward| reward.is_finite())
+        .fold((0_u64, 0.0, 0.0), |(count, sum, sumsq), reward| {
+            (count + 1, sum + reward, sumsq + reward * reward)
+        })
+}
+
+fn validate_distributed_packages(
+    packages: &[(RolloutLedgerStep, Vec<u8>, StepValidation)],
+    controls: &RolloutLedgerControls,
+) -> Result<(), RolloutLedgerError> {
+    let first = packages.first().ok_or_else(|| {
+        RolloutLedgerError::Invalid("distributed package contains no shards".into())
+    })?;
+    let world_size = first.0.world_size;
+    if world_size <= 1 || packages.len() != world_size as usize {
+        return Err(RolloutLedgerError::Invalid(
+            "distributed shard count does not match world_size".into(),
+        ));
+    }
+    let mut completion_tokens = 0_u64;
+    let mut live_items = 0_u32;
+    for (index, (payload, _, validation)) in packages.iter().enumerate() {
+        let rank = u32::try_from(index)
+            .map_err(|_| RolloutLedgerError::Invalid("distributed rank overflows u32".into()))?;
+        if payload.rank != rank
+            || payload.world_size != world_size
+            || payload.step != first.0.step
+            || controls_from_step(payload) != *controls
+            || payload.window_tokens != first.0.window_tokens
+            || payload.live_items != first.0.live_items
+            || payload.post_rollout_sampler_state != first.0.post_rollout_sampler_state
+        {
+            return Err(RolloutLedgerError::Invalid(format!(
+                "distributed shard {rank} disagrees on topology, controls, global counts, or sampler state"
+            )));
+        }
+        completion_tokens = completion_tokens
+            .checked_add(validation.completion_tokens)
+            .ok_or_else(|| {
+                RolloutLedgerError::Invalid("distributed completion-token total overflow".into())
+            })?;
+        live_items = live_items
+            .checked_add(validation.live_items)
+            .ok_or_else(|| {
+                RolloutLedgerError::Invalid("distributed live-item total overflow".into())
+            })?;
+    }
+    if first.0.window_tokens != completion_tokens.max(1) || first.0.live_items != live_items {
+        return Err(RolloutLedgerError::Invalid(format!(
+            "distributed global counts {}/{} do not match derived {}/{}",
+            first.0.window_tokens,
+            first.0.live_items,
+            completion_tokens.max(1),
+            live_items
+        )));
+    }
+
+    if controls.reward_group_scope == RolloutLedgerGroupScope::DistributedSamePrompt {
+        for group_index in 0..controls.grad_accum_steps as usize {
+            let canonical = packages[0].0.groups[group_index]
+                .distributed_reward_stats
+                .ok_or_else(|| {
+                    RolloutLedgerError::Invalid(
+                        "distributed same-prompt group is missing reward statistics".into(),
+                    )
+                })?;
+            let mut count = 0_u64;
+            let mut sums = Vec::with_capacity(packages.len());
+            let mut sumsqs = Vec::with_capacity(packages.len());
+            let canonical_prompt_len = packages[0].0.groups[group_index].prompt_len;
+            let canonical_prompt = {
+                let group = &packages[0].0.groups[group_index];
+                &group.token_ids[0][..canonical_prompt_len as usize]
+            };
+            for (payload, _, _) in packages {
+                let group = &payload.groups[group_index];
+                if group.distributed_reward_stats != Some(canonical) {
+                    return Err(RolloutLedgerError::Invalid(format!(
+                        "distributed reward statistics disagree at accumulation group {group_index}"
+                    )));
+                }
+                if group.prompt_len != canonical_prompt_len
+                    || &group.token_ids[0][..group.prompt_len as usize] != canonical_prompt
+                {
+                    return Err(RolloutLedgerError::Invalid(format!(
+                        "distributed same-prompt prefixes disagree at accumulation group {group_index}"
+                    )));
+                }
+                let (local_count, local_sum, local_sumsq) = local_reward_stats(&group.reward_bits);
+                count = count.checked_add(local_count).ok_or_else(|| {
+                    RolloutLedgerError::Invalid("distributed reward count overflow".into())
+                })?;
+                sums.push(local_sum);
+                sumsqs.push(local_sumsq);
+            }
+            if canonical.count != count
+                || !plausible_reduced_sum(f64::from_bits(canonical.sum_bits), &sums)
+                || !plausible_reduced_sum(f64::from_bits(canonical.sumsq_bits), &sumsqs)
+            {
+                return Err(RolloutLedgerError::Invalid(format!(
+                    "distributed reward statistics do not match shard rewards at accumulation group {group_index}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn plausible_reduced_sum(actual: f64, contributions: &[f64]) -> bool {
+    if !actual.is_finite() || contributions.iter().any(|value| !value.is_finite()) {
+        return false;
+    }
+    let expected = contributions
+        .iter()
+        .copied()
+        .fold(0.0, |sum, value| sum + value);
+    if actual.to_bits() == expected.to_bits() {
+        return true;
+    }
+    let magnitude = contributions.iter().map(|value| value.abs()).sum::<f64>();
+    let tolerance =
+        (contributions.len().max(1) as f64 * f64::EPSILON * magnitude * 8.0).max(f64::MIN_POSITIVE);
+    (actual - expected).abs() <= tolerance
 }
 
 #[allow(clippy::too_many_arguments)] // the row contract is clearer with named source fields
@@ -1064,6 +2007,200 @@ fn create_dir_all_durable(path: &Path) -> Result<(), RolloutLedgerError> {
     sync_dir(parent)
 }
 
+fn distributed_payload_name(rank: u32) -> String {
+    format!("rank-{rank:05}.window.json")
+}
+
+fn exact_files_visible(dir: &Path, expected: &[(&str, &[u8])]) -> bool {
+    expected.iter().all(|(name, bytes)| {
+        fs::read(dir.join(name)).is_ok_and(|actual| actual.as_slice() == *bytes)
+    })
+}
+
+enum ExistingDistributedPackageProbe {
+    /// The marker is definitely absent or contains different readable bytes, so
+    /// the destination cannot be the intended reader-visible publication.
+    RetryableMarker,
+    /// The intended marker and every named payload are exactly readable.
+    Exact,
+    /// The intended marker may be visible, or is exact while a payload is not
+    /// exactly readable. Sampler rollback would split state from publication.
+    Ambiguous(String),
+}
+
+fn read_distributed_reconciliation_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    #[cfg(test)]
+    {
+        let injected = FAIL_DISTRIBUTED_RECONCILIATION_READ_ONCE.with(|failure| {
+            let matches = failure.borrow().as_deref() == Some(path);
+            if matches {
+                failure.borrow_mut().take();
+            }
+            matches
+        });
+        if injected {
+            return Err(std::io::Error::other(
+                "injected distributed reconciliation read failure",
+            ));
+        }
+    }
+    fs::read(path)
+}
+
+/// Probe the commit marker before any payload. Only a definitely absent or
+/// different readable marker is retryable; once the exact intended marker is
+/// visible, every payload mismatch, absence, or read error is publication
+/// ambiguity rather than evidence that nothing was committed.
+fn probe_existing_distributed_package(
+    dir: &Path,
+    expected: &[(String, Vec<u8>)],
+) -> ExistingDistributedPackageProbe {
+    let Some((_, expected_manifest)) = expected.iter().find(|(name, _)| name == MANIFEST_FILE)
+    else {
+        return ExistingDistributedPackageProbe::Ambiguous(
+            "staged distributed package has no expected manifest bytes".into(),
+        );
+    };
+    let manifest_path = dir.join(MANIFEST_FILE);
+    match read_distributed_reconciliation_file(&manifest_path) {
+        Ok(actual) if actual.as_slice() != expected_manifest.as_slice() => {
+            return ExistingDistributedPackageProbe::RetryableMarker;
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return ExistingDistributedPackageProbe::RetryableMarker;
+        }
+        Err(error) => {
+            return ExistingDistributedPackageProbe::Ambiguous(format!(
+                "distributed manifest could not be classified as absent or different: {error}"
+            ));
+        }
+    }
+
+    for (name, expected_bytes) in expected {
+        if name == MANIFEST_FILE {
+            continue;
+        }
+        let path = dir.join(name);
+        match read_distributed_reconciliation_file(&path) {
+            Ok(actual) if actual.as_slice() == expected_bytes.as_slice() => {}
+            Ok(_) => {
+                return ExistingDistributedPackageProbe::Ambiguous(format!(
+                    "the exact distributed manifest is visible, but payload {name} differs from the intended bytes"
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return ExistingDistributedPackageProbe::Ambiguous(format!(
+                    "the exact distributed manifest is visible, but payload {name} is missing"
+                ));
+            }
+            Err(error) => {
+                return ExistingDistributedPackageProbe::Ambiguous(format!(
+                    "the exact distributed manifest is visible, but payload {name} could not be read: {error}"
+                ));
+            }
+        }
+    }
+    ExistingDistributedPackageProbe::Exact
+}
+
+fn exact_owned_distributed_package(
+    dir: &Path,
+    expected: &[(String, Vec<u8>)],
+    owner: Option<&[u8]>,
+) -> bool {
+    owner.is_none_or(|owner| {
+        fs::read(dir.join(DISTRIBUTED_OWNER_FILE)).is_ok_and(|actual| actual == owner)
+    }) && expected.iter().all(|(name, bytes)| {
+        fs::read(dir.join(name)).is_ok_and(|actual| actual.as_slice() == bytes.as_slice())
+    })
+}
+
+fn require_exact_owner(dir: &Path, owner: &[u8]) -> Result<(), RolloutLedgerError> {
+    match fs::read(dir.join(DISTRIBUTED_OWNER_FILE)) {
+        Ok(actual) if actual == owner => Ok(()),
+        Ok(_) => Err(RolloutLedgerError::UnpublishedClaimAmbiguous {
+            path: dir.to_path_buf(),
+            detail: "distributed staging ownership changed; the directory was preserved".into(),
+        }),
+        Err(error) => Err(RolloutLedgerError::UnpublishedClaimAmbiguous {
+            path: dir.to_path_buf(),
+            detail: format!(
+                "distributed staging ownership could not be verified ({error}); the directory was preserved"
+            ),
+        }),
+    }
+}
+
+fn cleanup_unpublished_stage(
+    root: &Path,
+    stage: &Path,
+    owner: &[u8],
+    original: RolloutLedgerError,
+) -> RolloutLedgerError {
+    let cleanup = (|| {
+        require_exact_owner(stage, owner)?;
+        fs::remove_dir_all(stage).map_err(|error| RolloutLedgerError::io(stage, error))?;
+        sync_dir(root)
+    })();
+    match cleanup {
+        Ok(()) => original,
+        Err(cleanup_error) => RolloutLedgerError::UnpublishedClaimAmbiguous {
+            path: stage.to_path_buf(),
+            detail: format!("{original}; hidden-stage cleanup failed: {cleanup_error}"),
+        },
+    }
+}
+
+fn cleanup_distributed_claim(
+    writer: &RolloutLedgerWriter,
+    stage: &DistributedRolloutLedgerStage,
+    original: RolloutLedgerError,
+) -> RolloutLedgerError {
+    let cleanup = (|| {
+        require_exact_owner(&stage.final_dir, &stage.owner)?;
+        fs::remove_dir_all(&stage.final_dir)
+            .map_err(|error| RolloutLedgerError::io(&stage.final_dir, error))?;
+        sync_dir(&writer.root)?;
+        require_exact_owner(&stage.path, &stage.owner)?;
+        fs::remove_dir_all(&stage.path)
+            .map_err(|error| RolloutLedgerError::io(&stage.path, error))?;
+        sync_dir(&writer.root)
+    })();
+    match cleanup {
+        Ok(()) => original,
+        Err(cleanup_error) => RolloutLedgerError::UnpublishedClaimAmbiguous {
+            path: stage.final_dir.clone(),
+            detail: format!("{original}; owned pre-manifest claim cleanup failed: {cleanup_error}"),
+        },
+    }
+}
+
+fn consumed_world_one_sha256(manifest: &[u8], payload: &[u8]) -> String {
+    hash_ordered_parts("ferrl.rollout-ledger.consumed-step.v1", [manifest, payload])
+}
+
+fn consumed_distributed_sha256<'a>(
+    manifest: &'a [u8],
+    shards: impl IntoIterator<Item = &'a [u8]>,
+) -> String {
+    hash_ordered_parts(
+        "ferrl.rollout-ledger.consumed-distributed-step.v1",
+        std::iter::once(manifest).chain(shards),
+    )
+}
+
+fn hash_ordered_parts<'a>(domain: &str, parts: impl IntoIterator<Item = &'a [u8]>) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(domain.as_bytes());
+    hasher.update([0]);
+    for part in parts {
+        hasher.update((part.len() as u64).to_le_bytes());
+        hasher.update(part);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -1147,6 +2284,7 @@ mod tests {
         RolloutLedgerGroup {
             accum_index: 0,
             prompt_index: 7,
+            rollout_global_row_base: 14,
             token_ids: vec![vec![5, 6, 9, 9], vec![5, 7, 8, 3]],
             prompt_len: 1,
             completion_lens: vec![2, 3],
@@ -1159,6 +2297,7 @@ mod tests {
                 ],
             ]),
             reward_bits: rewards.into_iter().map(f32::to_bits).collect(),
+            distributed_reward_stats: None,
             advantage_bits: advantages
                 .into_iter()
                 .map(|value| (value as f32).to_bits())
@@ -1175,6 +2314,7 @@ mod tests {
             grad_accum_steps: 1,
             group_size: 2,
             completion_width: 3,
+            reward_group_scope: RolloutLedgerGroupScope::Local,
             scale_rewards: ScaleRewards::Group,
             eos_token_id: Some(9),
             truncation_masking: true,
@@ -1206,6 +2346,61 @@ mod tests {
         value
     }
 
+    fn distributed_step(rank: u32, scope: RolloutLedgerGroupScope) -> RolloutLedgerStep {
+        let mut value = step();
+        value.rank = rank;
+        value.world_size = 2;
+        value.reward_group_scope = scope;
+        value.window_tokens = 10;
+        value.live_items = 2;
+        value.groups[0].prompt_index = match scope {
+            RolloutLedgerGroupScope::Local => 14 + u64::from(rank),
+            RolloutLedgerGroupScope::DistributedSamePrompt => 7,
+        };
+        value.groups[0].rollout_global_row_base = (14 + u64::from(rank)) * 2;
+        if scope == RolloutLedgerGroupScope::DistributedSamePrompt {
+            let rewards = if rank == 0 {
+                vec![1.0_f32, 2.0]
+            } else {
+                vec![3.0_f32, 4.0]
+            };
+            let stats = RolloutLedgerRewardStats {
+                count: 4,
+                sum_bits: 10.0_f64.to_bits(),
+                sumsq_bits: 30.0_f64.to_bits(),
+            };
+            value.groups[0].reward_bits = rewards.iter().copied().map(f32::to_bits).collect();
+            value.groups[0].distributed_reward_stats = Some(stats);
+            value.groups[0].advantage_bits = advantages_from_distributed_stats(
+                &rewards.iter().copied().map(f64::from).collect::<Vec<_>>(),
+                stats,
+                value.scale_rewards,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|advantage| (advantage as f32).to_bits())
+            .collect();
+        }
+        value
+    }
+
+    fn publish_distributed(
+        root: &Path,
+        scope: RolloutLedgerGroupScope,
+        nonce: u64,
+    ) -> (PathBuf, [RolloutLedgerStep; 2]) {
+        let writer = RolloutLedgerWriter::create(root, identity()).unwrap();
+        let shards = [distributed_step(0, scope), distributed_step(1, scope)];
+        let stage = writer.create_distributed_stage(7, 2, nonce).unwrap();
+        for shard in &shards {
+            writer.write_distributed_shard(stage.path(), shard).unwrap();
+        }
+        let path = writer
+            .commit_distributed_stage(&stage, 7, 2, &controls_from_step(&shards[0]))
+            .unwrap();
+        (path, shards)
+    }
+
     fn rewrite_payload(root: &Path, mutate: impl FnOnce(&mut RolloutLedgerStep)) {
         let dir = root.join(step_dir_name(7));
         let payload_path = dir.join(PAYLOAD_FILE);
@@ -1220,6 +2415,29 @@ mod tests {
         manifest.payload_len = u64::try_from(bytes.len()).unwrap();
         manifest.payload_sha256 = sha256_hex(&bytes);
         fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    }
+
+    fn rewrite_distributed_shard(
+        root: &Path,
+        rank: u32,
+        mutate: impl FnOnce(&mut RolloutLedgerStep),
+    ) {
+        let dir = root.join(step_dir_name(7));
+        let manifest_path = dir.join(MANIFEST_FILE);
+        let mut manifest: DistributedRolloutLedgerManifest =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        let shard = &mut manifest.shards[rank as usize];
+        let payload_path = dir.join(&shard.payload_file);
+        let mut payload: RolloutLedgerStep =
+            serde_json::from_slice(&fs::read(&payload_path).unwrap()).unwrap();
+        mutate(&mut payload);
+        let payload_bytes = serde_json::to_vec(&payload).unwrap();
+        fs::write(&payload_path, &payload_bytes).unwrap();
+        shard.payload_len = payload_bytes.len() as u64;
+        shard.payload_sha256 = sha256_hex(&payload_bytes);
+        let mut manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        manifest_bytes.push(b'\n');
+        fs::write(manifest_path, manifest_bytes).unwrap();
     }
 
     #[test]
@@ -1384,6 +2602,10 @@ mod tests {
             |expected| expected.controls.grad_accum_steps = 2,
             |expected| expected.controls.group_size = 3,
             |expected| expected.controls.completion_width = 4,
+            |expected| {
+                expected.controls.reward_group_scope =
+                    RolloutLedgerGroupScope::DistributedSamePrompt;
+            },
             |expected| expected.controls.scale_rewards = ScaleRewards::None,
             |expected| expected.controls.eos_token_id = None,
             |expected| expected.controls.truncation_masking = false,
@@ -1550,6 +2772,273 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cognitive_complexity)] // assertion-heavy two-scope package oracle
+    fn distributed_manifest_roundtrip_validates_every_rank_shard() {
+        for (index, scope) in [
+            RolloutLedgerGroupScope::Local,
+            RolloutLedgerGroupScope::DistributedSamePrompt,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let tmp = TempDir::new(&format!("distributed-roundtrip-{index}"));
+            let (published, shards) = publish_distributed(&tmp.0, scope, index as u64 + 1);
+            let expected = RolloutLedgerExpectations {
+                identity: identity(),
+                controls: controls_from_step(&shards[0]),
+            };
+            let rank0 = RolloutLedgerReader::open(&tmp.0, expected.clone())
+                .unwrap()
+                .read_distributed_step(7, 0, 2)
+                .unwrap();
+            let rank1 = RolloutLedgerReader::open(&tmp.0, expected)
+                .unwrap()
+                .read_distributed_step(7, 1, 2)
+                .unwrap();
+            assert_eq!(rank0.as_step(), &shards[0]);
+            assert_eq!(rank1.as_step(), &shards[1]);
+            assert_eq!(
+                rank0.consumed_ledger_sha256(),
+                rank1.consumed_ledger_sha256()
+            );
+            assert!(published.join(MANIFEST_FILE).is_file());
+            assert!(published.join(distributed_payload_name(0)).is_file());
+            assert!(published.join(distributed_payload_name(1)).is_file());
+        }
+    }
+
+    #[test]
+    fn distributed_staged_manifest_fence_failure_cleans_and_retries() {
+        let tmp = TempDir::new("distributed-staged-manifest-fence");
+        let writer = RolloutLedgerWriter::create(&tmp.0, identity()).unwrap();
+        let shards = [
+            distributed_step(0, RolloutLedgerGroupScope::Local),
+            distributed_step(1, RolloutLedgerGroupScope::Local),
+        ];
+        let stage = writer.create_distributed_stage(7, 2, 41).unwrap();
+        for shard in &shards {
+            writer.write_distributed_shard(stage.path(), shard).unwrap();
+        }
+        FAIL_SYNC_DIRECTORY_ONCE.with(|failure| {
+            *failure.borrow_mut() = Some(stage.path().to_path_buf());
+        });
+        assert!(matches!(
+            writer.commit_distributed_stage(&stage, 7, 2, &controls_from_step(&shards[0]),),
+            Err(RolloutLedgerError::Io { .. })
+        ));
+        assert!(!stage.path().exists());
+        assert!(!tmp.0.join(step_dir_name(7)).exists());
+
+        let (_, retry_shards) = publish_distributed(&tmp.0, RolloutLedgerGroupScope::Local, 42);
+        RolloutLedgerReader::open(
+            &tmp.0,
+            RolloutLedgerExpectations {
+                identity: identity(),
+                controls: controls_from_step(&retry_shards[0]),
+            },
+        )
+        .unwrap()
+        .read_distributed_step(7, 0, 2)
+        .unwrap();
+    }
+
+    #[test]
+    fn distributed_shard_write_failure_cleans_and_retries() {
+        let tmp = TempDir::new("distributed-shard-write-retry");
+        let writer = RolloutLedgerWriter::create(&tmp.0, identity()).unwrap();
+        let shards = [
+            distributed_step(0, RolloutLedgerGroupScope::Local),
+            distributed_step(1, RolloutLedgerGroupScope::Local),
+        ];
+        let stage = writer.create_distributed_stage(7, 2, 45).unwrap();
+        writer
+            .write_distributed_shard(stage.path(), &shards[0])
+            .unwrap();
+        fs::write(stage.path().join(distributed_payload_name(1)), b"occupied").unwrap();
+        assert!(matches!(
+            writer.write_distributed_shard(stage.path(), &shards[1]),
+            Err(RolloutLedgerError::Io { .. })
+        ));
+        writer.abort_distributed_stage(&stage).unwrap();
+        assert!(!stage.path().exists());
+
+        let (_, retry_shards) = publish_distributed(&tmp.0, RolloutLedgerGroupScope::Local, 46);
+        RolloutLedgerReader::open(
+            &tmp.0,
+            RolloutLedgerExpectations {
+                identity: identity(),
+                controls: controls_from_step(&retry_shards[0]),
+            },
+        )
+        .unwrap()
+        .read_distributed_step(7, 1, 2)
+        .unwrap();
+    }
+
+    #[test]
+    fn distributed_conflict_cleans_only_the_hidden_owned_stage() {
+        let tmp = TempDir::new("distributed-conflict-cleanup");
+        let writer = RolloutLedgerWriter::create(&tmp.0, identity()).unwrap();
+        let shards = [
+            distributed_step(0, RolloutLedgerGroupScope::Local),
+            distributed_step(1, RolloutLedgerGroupScope::Local),
+        ];
+        let stage = writer.create_distributed_stage(7, 2, 51).unwrap();
+        for shard in &shards {
+            writer.write_distributed_shard(stage.path(), shard).unwrap();
+        }
+        let winner = tmp.0.join(step_dir_name(7));
+        fs::create_dir(&winner).unwrap();
+        assert!(matches!(
+            writer.commit_distributed_stage(
+                &stage,
+                7,
+                2,
+                &controls_from_step(&shards[0]),
+            ),
+            Err(RolloutLedgerError::AlreadyExists(path)) if path == winner
+        ));
+        assert!(!stage.path().exists());
+        assert_eq!(fs::read_dir(winner).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn distributed_persistent_post_manifest_failure_is_visible_and_ambiguous() {
+        let tmp = TempDir::new("distributed-post-manifest-ambiguous");
+        let writer = RolloutLedgerWriter::create(&tmp.0, identity()).unwrap();
+        let shards = [
+            distributed_step(0, RolloutLedgerGroupScope::Local),
+            distributed_step(1, RolloutLedgerGroupScope::Local),
+        ];
+        let stage = writer.create_distributed_stage(7, 2, 61).unwrap();
+        for shard in &shards {
+            writer.write_distributed_shard(stage.path(), shard).unwrap();
+        }
+        inject_persistent_post_manifest_sync_failure_once();
+        assert!(matches!(
+            writer.commit_distributed_stage(
+                &stage,
+                7,
+                2,
+                &controls_from_step(&shards[0]),
+            ),
+            Err(RolloutLedgerError::PublicationAmbiguous { path, .. })
+                if path == tmp.0.join(step_dir_name(7))
+        ));
+        RolloutLedgerReader::open(
+            &tmp.0,
+            RolloutLedgerExpectations {
+                identity: identity(),
+                controls: controls_from_step(&shards[0]),
+            },
+        )
+        .unwrap()
+        .read_distributed_step(7, 1, 2)
+        .unwrap();
+    }
+
+    #[test]
+    fn distributed_reader_rejects_a_mutated_nonlocal_shard() {
+        let tmp = TempDir::new("distributed-nonlocal-mutation");
+        let (published, shards) = publish_distributed(&tmp.0, RolloutLedgerGroupScope::Local, 71);
+        let nonlocal = published.join(distributed_payload_name(1));
+        let mut bytes = fs::read(&nonlocal).unwrap();
+        bytes[0] ^= 1;
+        fs::write(nonlocal, bytes).unwrap();
+        assert!(matches!(
+            RolloutLedgerReader::open(
+                &tmp.0,
+                RolloutLedgerExpectations {
+                    identity: identity(),
+                    controls: controls_from_step(&shards[0]),
+                },
+            )
+            .unwrap()
+            .read_distributed_step(7, 0, 2),
+            Err(RolloutLedgerError::Invalid(message)) if message.contains("checksum")
+        ));
+    }
+
+    #[test]
+    fn distributed_reader_rejects_cross_shard_semantic_mutations() {
+        type Mutation = fn(&mut RolloutLedgerStep);
+        let cases: Vec<Mutation> = vec![
+            |value| {
+                for row in &mut value.groups[0].token_ids {
+                    row[0] = 6;
+                }
+            },
+            |value| value.groups[0].rollout_global_row_base += 1,
+            |value| value.post_rollout_sampler_state.push(9),
+            |value| value.window_tokens += 1,
+            |value| value.world_size = 3,
+            |value| value.rank = 0,
+        ];
+        for (index, mutate) in cases.into_iter().enumerate() {
+            let tmp = TempDir::new(&format!("distributed-semantic-{index}"));
+            let (_, shards) = publish_distributed(
+                &tmp.0,
+                RolloutLedgerGroupScope::DistributedSamePrompt,
+                80 + index as u64,
+            );
+            rewrite_distributed_shard(&tmp.0, 1, mutate);
+            assert!(matches!(
+                RolloutLedgerReader::open(
+                    &tmp.0,
+                    RolloutLedgerExpectations {
+                        identity: identity(),
+                        controls: controls_from_step(&shards[0]),
+                    },
+                )
+                .unwrap()
+                .read_distributed_step(7, 0, 2),
+                Err(RolloutLedgerError::Invalid(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn distributed_reader_rejects_missing_shards_and_noncanonical_order() {
+        let missing = TempDir::new("distributed-missing-shard");
+        let (published, shards) =
+            publish_distributed(&missing.0, RolloutLedgerGroupScope::Local, 91);
+        fs::remove_file(published.join(distributed_payload_name(1))).unwrap();
+        assert!(matches!(
+            RolloutLedgerReader::open(
+                &missing.0,
+                RolloutLedgerExpectations {
+                    identity: identity(),
+                    controls: controls_from_step(&shards[0]),
+                },
+            )
+            .unwrap()
+            .read_distributed_step(7, 0, 2),
+            Err(RolloutLedgerError::Io { .. })
+        ));
+
+        let reordered = TempDir::new("distributed-reordered-shards");
+        let (published, shards) =
+            publish_distributed(&reordered.0, RolloutLedgerGroupScope::Local, 92);
+        let manifest_path = published.join(MANIFEST_FILE);
+        let mut manifest: DistributedRolloutLedgerManifest =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest.shards.swap(0, 1);
+        fs::write(manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(matches!(
+            RolloutLedgerReader::open(
+                &reordered.0,
+                RolloutLedgerExpectations {
+                    identity: identity(),
+                    controls: controls_from_step(&shards[0]),
+                },
+            )
+            .unwrap()
+            .read_distributed_step(7, 0, 2),
+            Err(RolloutLedgerError::Invalid(message)) if message.contains("canonical")
+        ));
+    }
+
+    #[test]
     fn zero_token_degenerate_window_uses_clamped_denominator_and_no_scoring() {
         let value = degenerate_zero_token_step();
         validate_step(&value).unwrap();
@@ -1606,8 +3095,10 @@ mod tests {
         let mut second = value.groups[0].clone();
         value.groups[0].accum_index = 0;
         value.groups[0].prompt_index = 14;
+        value.groups[0].rollout_global_row_base = 28;
         second.accum_index = 1;
         second.prompt_index = 15;
+        second.rollout_global_row_base = 30;
         value.groups.push(second);
         value.window_tokens = 10;
         value.live_items = 2;
