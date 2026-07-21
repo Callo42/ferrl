@@ -419,26 +419,46 @@ pub fn all_reduce_sum_straight_through(
     plan: TensorParallelPlan,
     comm: &dyn Comm,
 ) -> CandleResult<Tensor> {
-    validate_comm_plan(plan, comm)?;
-    if !plan.is_sharded() {
+    let staged = coordinate_local_candle_call(
+        comm,
+        "tensor-parallel activation all-reduce staging",
+        || {
+            validate_comm_plan(plan, comm)?;
+            if !plan.is_sharded() {
+                return Ok(None);
+            }
+            let original_dtype = partial.dtype();
+            let staged = match original_dtype {
+                DType::F32 | DType::F64 => partial.contiguous()?,
+                _ => partial.to_dtype(DType::F32)?.contiguous()?,
+            };
+            let reduced = vec![staged];
+            comm.validate_all_reduce_sum(&reduced).map_err(|error| {
+                CandleError::Msg(format!(
+                    "tensor-parallel activation all-reduce payload is invalid: {error}"
+                ))
+            })?;
+            Ok(Some((original_dtype, reduced)))
+        },
+    )?;
+    let Some((original_dtype, mut reduced)) = staged else {
         return Ok(partial.clone());
-    }
-
-    let original_dtype = partial.dtype();
-    let staged = match original_dtype {
-        DType::F32 | DType::F64 => partial.contiguous()?,
-        _ => partial.to_dtype(DType::F32)?.contiguous()?,
     };
-    let mut reduced = vec![staged];
     comm_to_candle(comm.all_reduce_sum(&mut reduced))?;
-    let Some(mut reduced) = reduced.pop() else {
-        candle_core::bail!("tensor_parallel all-reduce returned no tensors");
-    };
-    if reduced.dtype() != original_dtype {
-        reduced = reduced.to_dtype(original_dtype)?;
-    }
-    let correction = reduced.broadcast_sub(partial)?.detach();
-    partial.broadcast_add(&correction)
+    coordinate_local_candle_call(
+        comm,
+        "tensor-parallel activation all-reduce readback",
+        || {
+            let Some(mut reduced) = reduced.pop() else {
+                candle_core::bail!("tensor_parallel all-reduce returned no tensors");
+            };
+            if reduced.dtype() != original_dtype {
+                reduced = reduced.to_dtype(original_dtype)?;
+            }
+            let correction = reduced.broadcast_sub(partial)?.detach();
+            partial.broadcast_add(&correction)
+        },
+    )
 }
 
 /// Sum a detached tensor value across TP ranks.
@@ -451,33 +471,86 @@ pub(crate) fn all_reduce_sum_value(
     plan: TensorParallelPlan,
     comm: &dyn Comm,
 ) -> CandleResult<Tensor> {
-    validate_comm_plan(plan, comm)?;
-    if !plan.is_sharded() {
+    let staged =
+        coordinate_local_candle_call(comm, "tensor-parallel cotangent all-reduce staging", || {
+            validate_comm_plan(plan, comm)?;
+            if !plan.is_sharded() {
+                return Ok(None);
+            }
+            let original_dtype = value.dtype();
+            let staged = match original_dtype {
+                DType::F32 | DType::F64 => value.detach().contiguous()?,
+                _ => value.to_dtype(DType::F32)?.detach().contiguous()?,
+            };
+            let reduced = vec![staged];
+            comm.validate_all_reduce_sum(&reduced).map_err(|error| {
+                CandleError::Msg(format!(
+                    "tensor-parallel cotangent all-reduce payload is invalid: {error}"
+                ))
+            })?;
+            Ok(Some((original_dtype, reduced)))
+        })?;
+    let Some((original_dtype, mut reduced)) = staged else {
         return Ok(value.detach());
-    }
-
-    let original_dtype = value.dtype();
-    let staged = match original_dtype {
-        DType::F32 | DType::F64 => value.detach().contiguous()?,
-        _ => value.to_dtype(DType::F32)?.detach().contiguous()?,
     };
-    let mut reduced = vec![staged];
     comm_to_candle(comm.all_reduce_sum(&mut reduced))?;
-    let Some(mut reduced) = reduced.pop() else {
-        candle_core::bail!("tensor_parallel cotangent all-reduce returned no tensors");
-    };
-    if reduced.dtype() != original_dtype {
-        reduced = reduced.to_dtype(original_dtype)?;
-    }
-    Ok(reduced.detach())
+    coordinate_local_candle_call(
+        comm,
+        "tensor-parallel cotangent all-reduce readback",
+        || {
+            let Some(mut reduced) = reduced.pop() else {
+                candle_core::bail!("tensor_parallel cotangent all-reduce returned no tensors");
+            };
+            if reduced.dtype() != original_dtype {
+                reduced = reduced.to_dtype(original_dtype)?;
+            }
+            Ok(reduced.detach())
+        },
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::comm::{Comm, LocalComm};
+    use crate::comm::{Comm, CommError, LocalComm};
     use candle_core::{Device, Var, D};
     use candle_nn::ops::log_softmax;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct CountAndCorruptReadbackComm<C> {
+        inner: C,
+        tensor_calls: Arc<AtomicUsize>,
+        clear_after_reduce: bool,
+    }
+
+    impl<C: Comm> Comm for CountAndCorruptReadbackComm<C> {
+        fn rank(&self) -> usize {
+            self.inner.rank()
+        }
+
+        fn world_size(&self) -> usize {
+            self.inner.world_size()
+        }
+
+        fn validate_all_reduce_sum(&self, tensors: &[Tensor]) -> Result<(), CommError> {
+            self.inner.validate_all_reduce_sum(tensors)
+        }
+
+        fn all_reduce_sum(&self, tensors: &mut Vec<Tensor>) -> Result<(), CommError> {
+            self.tensor_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.all_reduce_sum(tensors)?;
+            if self.clear_after_reduce {
+                tensors.clear();
+            }
+            Ok(())
+        }
+
+        fn all_reduce_scalar_sum(&self, value: f64) -> Result<f64, CommError> {
+            self.inner.all_reduce_scalar_sum(value)
+        }
+    }
 
     fn tensor(data: &[f32], shape: impl Into<candle_core::Shape>) -> Tensor {
         Tensor::from_vec(data.to_vec(), shape, &Device::Cpu).unwrap()
@@ -705,6 +778,86 @@ mod tests {
         assert_eq!(results[1].1, vec![5.0, 8.0]);
         assert_eq!(results[0].2, vec![1.0, 1.0]);
         assert_eq!(results[1].2, vec![2.0, 2.0]);
+    }
+
+    #[test]
+    fn activation_all_reduce_coordinates_asymmetric_preflight_before_payload() {
+        let tensor_calls = Arc::new(AtomicUsize::new(0));
+        let results = std::thread::scope(|scope| {
+            let handles = LocalComm::world_with_timeout(2, std::time::Duration::from_secs(2))
+                .into_iter()
+                .map(|inner| {
+                    let tensor_calls = Arc::clone(&tensor_calls);
+                    scope.spawn(move || {
+                        let rank = inner.rank();
+                        let comm = CountAndCorruptReadbackComm {
+                            inner,
+                            tensor_calls,
+                            clear_after_reduce: false,
+                        };
+                        let plan = TensorParallelPlan::new(0, 2).unwrap();
+                        let partial = tensor(&[rank as f32 + 1.0], 1);
+                        all_reduce_sum_straight_through(&partial, plan, &comm)
+                            .map(|_| ())
+                            .map_err(|error| error.to_string())
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(results.iter().all(Result::is_err), "{results:?}");
+        assert!(results[1]
+            .as_ref()
+            .unwrap_err()
+            .contains("does not match communicator"));
+        assert!(results[0]
+            .as_ref()
+            .unwrap_err()
+            .contains("failed on a peer"));
+        assert_eq!(tensor_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn cotangent_all_reduce_coordinates_asymmetric_readback_before_return() {
+        let tensor_calls = Arc::new(AtomicUsize::new(0));
+        let results = std::thread::scope(|scope| {
+            let handles = LocalComm::world_with_timeout(2, std::time::Duration::from_secs(2))
+                .into_iter()
+                .map(|inner| {
+                    let tensor_calls = Arc::clone(&tensor_calls);
+                    scope.spawn(move || {
+                        let rank = inner.rank();
+                        let plan = plan_from_comm(&inner).unwrap();
+                        let comm = CountAndCorruptReadbackComm {
+                            inner,
+                            tensor_calls,
+                            clear_after_reduce: rank == 1,
+                        };
+                        let value = tensor(&[rank as f32 + 1.0], 1);
+                        all_reduce_sum_value(&value, plan, &comm)
+                            .map(|_| ())
+                            .map_err(|error| error.to_string())
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(results.iter().all(Result::is_err), "{results:?}");
+        assert!(results[1]
+            .as_ref()
+            .unwrap_err()
+            .contains("returned no tensors"));
+        assert!(results[0]
+            .as_ref()
+            .unwrap_err()
+            .contains("failed on a peer"));
+        assert_eq!(tensor_calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]

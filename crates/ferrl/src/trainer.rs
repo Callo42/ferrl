@@ -1255,6 +1255,18 @@ struct CollectedGroup {
     surrogate_live: bool,
 }
 
+/// Exact policy state owned by one direct-training rollout group. Under the
+/// TP-world-one plus DP topology, detached learner scoring is coordinated over
+/// DP only after collection has completed. Keep the pre-group state so a
+/// rank-local hook failure cannot leave sampler, adapter mode, or adapter
+/// tensors mutated while its peers return from the status rendezvous.
+struct RolloutGroupPrestate {
+    vars: Vec<Var>,
+    adapter: Vec<Tensor>,
+    adapter_enabled: bool,
+    sampler: Vec<u8>,
+}
+
 fn slice_live_item(item: &LiveItem, start: usize, len: usize) -> CandleResult<LiveItem> {
     let end = start + len;
     let rollout = Rollout::new(
@@ -2161,6 +2173,7 @@ impl Trainer {
                             &selected,
                             &mut gpu_mem,
                             exec,
+                            None,
                         )?);
                     }
                     Ok(collected)
@@ -2233,15 +2246,25 @@ impl Trainer {
                     is_execution_primary,
                 )
             } else if self.comm.world_size() == 1 {
-                writer
-                    .as_ref()
-                    .ok_or_else(|| {
-                        TrainerError::Contract(
-                            "world-one rollout-ledger writer was not constructed".into(),
-                        )
-                    })?
-                    .write_step(&payload)
-                    .map_err(TrainerError::from)
+                let writer = writer.as_ref().ok_or_else(|| {
+                    TrainerError::Contract(
+                        "world-one rollout-ledger writer was not constructed".into(),
+                    )
+                })?;
+                let final_dir = writer.root().join(format!("step-{:020}", payload.step));
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    writer.write_step(&payload)
+                }))
+                .unwrap_or_else(|panic| {
+                    Err(RolloutLedgerError::PublicationAmbiguous {
+                        path: final_dir,
+                        detail: format!(
+                            "world-one rollout-ledger publisher panicked after entry: {}",
+                            panic_payload_message(panic.as_ref())
+                        ),
+                    })
+                })
+                .map_err(TrainerError::from)
             } else {
                 self.publish_distributed_rollout_ledger_step(
                     writer.as_ref().ok_or_else(|| {
@@ -3214,7 +3237,8 @@ impl Trainer {
         E: PolicyExecution<P>,
     {
         self.require_rollout_ledger_topology()?;
-        let execution_comm = exec.execution_comm(self.comm.as_ref());
+        let trainer_comm = Arc::clone(&self.comm);
+        let execution_comm = exec.execution_comm(trainer_comm.as_ref());
         let tensor_parallel_world_size = exec.model_parallel_world_size();
         let checkpoint_dir = checkpoint_dir.as_ref();
         let restore_input = Self::coordinate_comm_result(
@@ -3990,9 +4014,10 @@ impl Trainer {
         }
         shard_local?;
 
+        let final_dir = writer.root().join(format!("step-{:020}", payload.step));
         let commit_local = if self.comm.rank() == 0 {
-            writer
-                .commit_distributed_stage(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                writer.commit_distributed_stage(
                     stage
                         .as_ref()
                         .expect("rank 0 owns the coordinated distributed stage"),
@@ -4000,8 +4025,18 @@ impl Trainer {
                     world_size,
                     controls,
                 )
-                .map(Some)
-                .map_err(TrainerError::from)
+            }))
+            .unwrap_or_else(|panic| {
+                Err(RolloutLedgerError::PublicationAmbiguous {
+                    path: final_dir.clone(),
+                    detail: format!(
+                        "distributed rollout-ledger publisher panicked after entry: {}",
+                        panic_payload_message(panic.as_ref())
+                    ),
+                })
+            })
+            .map(Some)
+            .map_err(TrainerError::from)
         } else {
             Ok(None)
         };
@@ -4015,7 +4050,6 @@ impl Trainer {
         } else {
             0.0
         });
-        let final_dir = writer.root().join(format!("step-{:020}", payload.step));
         let publication_signal = match publication_signal {
             Ok(value) => value,
             Err(error) => {
@@ -4202,6 +4236,159 @@ impl Trainer {
         vars.iter()
             .map(|var| Ok(var.as_tensor().copy()?.contiguous()?))
             .collect()
+    }
+
+    fn snapshot_rollout_group_prestate<P: Policy>(
+        policy: &P,
+    ) -> Result<RolloutGroupPrestate, TrainerError> {
+        let adapter_enabled = policy.adapter_enabled();
+        let vars = policy.trainable_vars();
+        let adapter = Self::snapshot_rollout_ledger_vars(&vars)?;
+        let sampler = policy.sampler_state()?;
+        Ok(RolloutGroupPrestate {
+            vars,
+            adapter,
+            adapter_enabled,
+            sampler,
+        })
+    }
+
+    #[allow(clippy::cognitive_complexity)]
+    fn restore_rollout_group_prestate<P: Policy>(
+        policy: &mut P,
+        prestate: &RolloutGroupPrestate,
+    ) -> Result<(), TrainerError> {
+        let mut failures = Vec::new();
+        // Restore the flag first because an opaque policy is allowed to choose
+        // its active trainable-variable binding from the adapter mode.
+        policy.set_adapter_enabled(prestate.adapter_enabled);
+        if let Err(error) = Self::restore_rollout_ledger_sampler(policy, &prestate.sampler) {
+            failures.push(format!("restore sampler state: {error}"));
+        }
+        let active_vars = policy.trainable_vars();
+        if !Self::same_rollout_ledger_vars(&prestate.vars, &active_vars) {
+            failures.push(
+                "policy trainable-variable binding changed and cannot be restored through the Policy seam"
+                    .into(),
+            );
+        }
+        if prestate.vars.len() != prestate.adapter.len() {
+            failures.push(format!(
+                "adapter snapshot has {} tensors for {} live variables",
+                prestate.adapter.len(),
+                prestate.vars.len()
+            ));
+        } else {
+            for (index, (var, snapshot)) in prestate.vars.iter().zip(&prestate.adapter).enumerate()
+            {
+                if let Err(error) = var.set(snapshot) {
+                    failures.push(format!("restore adapter tensor {index}: {error}"));
+                }
+            }
+        }
+        if policy.adapter_enabled() != prestate.adapter_enabled {
+            failures.push("policy did not restore the exact adapter-enabled state".into());
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(TrainerError::Contract(failures.join("; ")))
+        }
+    }
+
+    fn rollback_rollout_group_failure<P: Policy>(
+        policy: &mut P,
+        prestate: Option<&RolloutGroupPrestate>,
+        execution_comm: &dyn Comm,
+        error: TrainerError,
+    ) -> TrainerError {
+        let restore = || {
+            let prestate = prestate.ok_or_else(|| {
+                TrainerError::Contract(
+                    "rollout-group prestate snapshot did not complete before failure".into(),
+                )
+            })?;
+            Self::restore_rollout_group_prestate(policy, prestate)
+        };
+
+        match error {
+            TrainerError::Comm(comm_error) => {
+                let rollback = Self::catch_local_distributed_recovery(
+                    "best-effort local direct rollout-group rollback",
+                    restore,
+                );
+                Self::terminal_distributed_comm_failure(
+                    "direct rollout group",
+                    &comm_error,
+                    None,
+                    rollback,
+                    "policy instance",
+                )
+            }
+            TrainerError::TensorParallelExecutionTerminal {
+                operation,
+                mut detail,
+            } => {
+                let rollback = Self::catch_local_distributed_recovery(
+                    "best-effort local direct rollout-group rollback",
+                    restore,
+                );
+                match rollback {
+                    Ok(()) => detail.push_str("; local rollout-group rollback succeeded"),
+                    Err(error) => detail.push_str(&format!(
+                        "; local rollout-group rollback failed ({error}); policy state is partial"
+                    )),
+                }
+                TrainerError::TensorParallelExecutionTerminal { operation, detail }
+            }
+            error @ (TrainerError::PublicationAmbiguousAfterComm { .. }
+            | TrainerError::RolloutLedgerMetricsComm { .. }) => {
+                // These variants cannot arise from ordinary direct group work,
+                // but their contract says the communicator is already dead.
+                // Preserve that structured classification and never rendezvous.
+                let _ = Self::catch_local_distributed_recovery(
+                    "best-effort local direct rollout-group rollback",
+                    restore,
+                );
+                error
+            }
+            error => {
+                let rollback_local = Self::catch_local_distributed_recovery(
+                    "direct rollout-group rollback",
+                    restore,
+                );
+                let local_rollback_error = rollback_local.as_ref().err().map(ToString::to_string);
+                match Self::coordinate_comm_result(
+                    execution_comm,
+                    "direct rollout-group rollback",
+                    rollback_local,
+                ) {
+                    Ok(()) => error,
+                    Err(TrainerError::Comm(comm_error)) => {
+                        let local_detail = format!(
+                            "direct rollout group failed ({error}); {}",
+                            local_rollback_error.as_ref().map_or(
+                                "the local policy rollback completed".to_owned(),
+                                |rollback| format!("the local policy rollback failed: {rollback}")
+                            )
+                        );
+                        let rollback = local_rollback_error.map_or(Ok(()), |rollback| {
+                            Err(TrainerError::Contract(rollback))
+                        });
+                        Self::terminal_distributed_comm_failure(
+                            "direct rollout-group rollback status",
+                            &comm_error,
+                            Some(&local_detail),
+                            rollback,
+                            "policy instance",
+                        )
+                    }
+                    Err(rollback) => TrainerError::Contract(format!(
+                        "direct rollout group failed ({error}); coordinated adapter/sampler/adapter-mode rollback also failed ({rollback}); discard the policy instance on every rank in this execution world"
+                    )),
+                }
+            }
+        }
     }
 
     fn restore_rollout_ledger_checkpoint_prestate<P: Policy>(
@@ -5348,11 +5535,11 @@ impl Trainer {
         if comm.world_size() <= 1 {
             return Ok(());
         }
-        let unsupported_local = if policy.supports_sharded_tensor_parallel_backward() {
-            0.0
-        } else {
-            1.0
-        };
+        let supported =
+            Self::coordinate_comm_call(comm, "tensor-parallel backward capability probe", || {
+                Ok(policy.supports_sharded_tensor_parallel_backward())
+            })?;
+        let unsupported_local = if supported { 0.0 } else { 1.0 };
         let unsupported = comm.all_reduce_scalar_sum(unsupported_local)?;
         if unsupported > 0.0 {
             return Err(TrainerError::Contract(
@@ -6118,10 +6305,53 @@ impl Trainer {
         R: RewardFn,
         E: PolicyExecution<P>,
     {
-        let collected = self.collect_group(
-            step, beta, policy, reward_fn, tokenizer, selected, gpu_mem, exec,
-        )?;
-        self.materialize_collected_group(policy, collected, beta, gpu_mem, exec)
+        let trainer_comm = Arc::clone(&self.comm);
+        let execution_comm = exec.execution_comm(trainer_comm.as_ref());
+        let coordinate_over_data_parallel =
+            exec.model_parallel_world_size() <= 1 && execution_comm.world_size() > 1;
+        if coordinate_over_data_parallel {
+            let mut prestate = None;
+            let collected = match self.collect_group(
+                step,
+                beta,
+                policy,
+                reward_fn,
+                tokenizer,
+                selected,
+                gpu_mem,
+                exec,
+                Some(&mut prestate),
+            ) {
+                Ok(collected) => collected,
+                Err(error) => {
+                    return Err(Self::rollback_rollout_group_failure(
+                        policy,
+                        prestate.as_ref(),
+                        execution_comm,
+                        error,
+                    ));
+                }
+            };
+            let materialized = Self::coordinate_comm_call(
+                execution_comm,
+                "rollout group learner materialization",
+                || self.materialize_collected_group(policy, collected, beta, gpu_mem, exec),
+            );
+            match materialized {
+                Ok(materialized) => Ok(materialized),
+                Err(error) => Err(Self::rollback_rollout_group_failure(
+                    policy,
+                    prestate.as_ref(),
+                    execution_comm,
+                    error,
+                )),
+            }
+        } else {
+            let collected = self.collect_group(
+                step, beta, policy, reward_fn, tokenizer, selected, gpu_mem, exec, None,
+            )?;
+            self.materialize_collected_group(policy, collected, beta, gpu_mem, exec)
+        }
     }
 
     /// Collector half of one prompt group: rollout → reward → host-side mask and
@@ -6137,6 +6367,7 @@ impl Trainer {
         selected: &SelectedSample<'_, R::Target>,
         gpu_mem: &mut StepGpuMemory,
         exec: &E,
+        rollback_prestate: Option<&mut Option<RolloutGroupPrestate>>,
     ) -> Result<CollectedGroup, TrainerError>
     where
         P: Policy,
@@ -6149,6 +6380,9 @@ impl Trainer {
         // finished local tokenizer/toggle work.
         let (prompt_ids, gen) =
             Self::coordinate_comm_call(execution_comm, "rollout generation preflight", || {
+                if let Some(prestate) = rollback_prestate {
+                    *prestate = Some(Self::snapshot_rollout_group_prestate(policy)?);
+                }
                 policy.set_adapter_enabled(true);
                 let prompt_ids = tokenizer.encode(&selected.sample.prompt);
                 if prompt_ids.is_empty() {
@@ -10282,6 +10516,119 @@ mod tests {
     }
 
     #[test]
+    fn world_one_publication_panic_is_ambiguous_loadable_and_preserves_sampler() {
+        let tmp = WireTmp::new("ledger-world-one-publication-panic");
+        let ledger_root = tmp.0.join("ledger");
+        let run = RunDir::create(&tmp.0, "run").unwrap();
+        let mut trainer = Trainer::new(candidate_ledger_config(), &run).unwrap();
+        let mut collector = stateful_candidate_policy();
+        crate::rollout_ledger::inject_post_manifest_panic_once();
+        let error = trainer
+            .collect_rollout_ledger_step(
+                0,
+                &mut collector,
+                &CandidateReward,
+                &CandidateCodec,
+                &[Sample::new("p", ())],
+                &ledger_root,
+                &"6".repeat(64),
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            TrainerError::RolloutLedger(RolloutLedgerError::PublicationAmbiguous { .. })
+        ));
+        assert_eq!(collector.sampler, 1);
+        assert!(ledger_root
+            .join("step-00000000000000000000/manifest.json")
+            .is_file());
+
+        let mut learner = stateful_candidate_policy();
+        let (_, continuation) = trainer
+            .train_rollout_ledger_step(0, &mut learner, &ledger_root, &"6".repeat(64), None)
+            .unwrap();
+        assert_eq!(learner.sampler, 1);
+        assert_eq!(continuation.completed_step(), 1);
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn distributed_publication_panic_is_ambiguous_loadable_and_preserves_every_sampler() {
+        let tmp = WireTmp::new("ledger-distributed-publication-panic");
+        let ledger_root = tmp.0.join("ledger");
+        let outcomes = std::thread::scope(|scope| {
+            let handles =
+                crate::comm::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(10))
+                    .into_iter()
+                    .map(|comm| {
+                        let base = tmp.0.clone();
+                        let ledger_root = ledger_root.clone();
+                        scope.spawn(move || {
+                            let rank = comm.rank();
+                            let run = RunDir::create(&base, format!("rank-{rank}")).unwrap();
+                            let mut trainer =
+                                Trainer::with_comm(candidate_ledger_config(), &run, comm).unwrap();
+                            let mut collector = stateful_candidate_policy();
+                            if rank == 0 {
+                                crate::rollout_ledger::inject_post_manifest_panic_once();
+                            }
+                            let collect_error = trainer
+                                .collect_rollout_ledger_step(
+                                    0,
+                                    &mut collector,
+                                    &CandidateReward,
+                                    &CandidateCodec,
+                                    &[Sample::new("p", ()), Sample::new("q", ())],
+                                    &ledger_root,
+                                    &"5".repeat(64),
+                                    None,
+                                )
+                                .unwrap_err();
+                            let mut learner = stateful_candidate_policy();
+                            let (_, continuation) = trainer
+                                .train_rollout_ledger_step(
+                                    0,
+                                    &mut learner,
+                                    &ledger_root,
+                                    &"5".repeat(64),
+                                    None,
+                                )
+                                .unwrap();
+                            (
+                                rank,
+                                collect_error,
+                                collector.sampler,
+                                learner.sampler,
+                                continuation.completed_step(),
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        for (rank, error, collector_sampler, learner_sampler, completed_step) in outcomes {
+            assert!(
+                matches!(
+                    error,
+                    TrainerError::RolloutLedger(RolloutLedgerError::PublicationAmbiguous { .. })
+                ),
+                "rank {rank}: {error:?}"
+            );
+            assert_eq!(collector_sampler, 1, "rank {rank} collector sampler");
+            assert_eq!(learner_sampler, 1, "rank {rank} learner sampler");
+            assert_eq!(completed_step, 1, "rank {rank} continuation step");
+        }
+        assert!(ledger_root
+            .join("step-00000000000000000000/manifest.json")
+            .is_file());
+    }
+
+    #[test]
     #[allow(clippy::cognitive_complexity)]
     fn tensor_parallel_ledger_and_continuation_ambiguity_preserve_visible_state() {
         let tmp = WireTmp::new("tp-ledger-continuation-ambiguity");
@@ -10974,6 +11321,9 @@ mod tests {
                             arm_point: CandidatePolicyArmPoint::SamplerState(2),
                             sampler_state_calls: std::cell::Cell::new(0),
                         };
+                        if rank == 0 {
+                            crate::rollout_ledger::inject_post_manifest_panic_once();
+                        }
                         let error = trainer
                             .collect_rollout_ledger_step(
                                 0,
@@ -11837,6 +12187,39 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct CountScalarComm<C> {
+        inner: C,
+        scalar_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl<C: Comm> Comm for CountScalarComm<C> {
+        fn rank(&self) -> usize {
+            self.inner.rank()
+        }
+
+        fn world_size(&self) -> usize {
+            self.inner.world_size()
+        }
+
+        fn validate_all_reduce_sum(
+            &self,
+            tensors: &[Tensor],
+        ) -> Result<(), crate::comm::CommError> {
+            self.inner.validate_all_reduce_sum(tensors)
+        }
+
+        fn all_reduce_sum(&self, tensors: &mut Vec<Tensor>) -> Result<(), crate::comm::CommError> {
+            self.inner.all_reduce_sum(tensors)
+        }
+
+        fn all_reduce_scalar_sum(&self, value: f64) -> Result<f64, crate::comm::CommError> {
+            self.scalar_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.all_reduce_scalar_sum(value)
+        }
+    }
+
     #[derive(Clone, Default)]
     struct TpProbeCalls {
         generate: usize,
@@ -11851,6 +12234,7 @@ mod tests {
         logp: Var,
         enabled: bool,
         sharded_backward: bool,
+        panic_backward_capability: bool,
         calls: std::sync::Arc<std::sync::Mutex<TpProbeCalls>>,
     }
 
@@ -11894,6 +12278,9 @@ mod tests {
 
     impl TensorParallelPolicy for TpProbePolicy {
         fn supports_sharded_tensor_parallel_backward(&self) -> bool {
+            if self.panic_backward_capability {
+                panic!("injected backward capability panic");
+            }
             self.sharded_backward
         }
 
@@ -12108,6 +12495,7 @@ mod tests {
                 logp,
                 enabled: true,
                 sharded_backward: true,
+                panic_backward_capability: false,
                 calls: std::sync::Arc::clone(&calls),
             },
             calls,
@@ -12157,6 +12545,7 @@ mod tests {
                         .map(|_| ())
                 }
                 TpSeparatedFailureBehavior::Error => {
+                    self.arm.store(true, std::sync::atomic::Ordering::SeqCst);
                     candle_core::bail!("injected opaque tensor-parallel policy error")
                 }
                 TpSeparatedFailureBehavior::Panic => {
@@ -12488,6 +12877,7 @@ mod tests {
                 "communication-error",
                 TpSeparatedFailureBehavior::CommunicationError,
             ),
+            ("error", TpSeparatedFailureBehavior::Error),
             ("panic", TpSeparatedFailureBehavior::Panic),
         ] {
             let outcomes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -12573,7 +12963,9 @@ mod tests {
                     TpSeparatedFailureBehavior::Panic => {
                         "policy hook panicked: injected opaque tensor-parallel policy panic"
                     }
-                    TpSeparatedFailureBehavior::Error => unreachable!(),
+                    TpSeparatedFailureBehavior::Error => {
+                        "injected opaque tensor-parallel policy error"
+                    }
                 };
                 assert!(
                     matches!(&error, TrainerError::TensorParallelExecutionTerminal {
@@ -12663,6 +13055,7 @@ mod tests {
                 "communication-error",
                 TpSeparatedFailureBehavior::CommunicationError,
             ),
+            ("error", TpSeparatedFailureBehavior::Error),
             ("panic", TpSeparatedFailureBehavior::Panic),
         ] {
             for (case, failure, operation) in [
@@ -12794,7 +13187,9 @@ mod tests {
                         TpSeparatedFailureBehavior::Panic => {
                             "policy hook panicked: injected opaque tensor-parallel policy panic"
                         }
-                        TpSeparatedFailureBehavior::Error => unreachable!(),
+                        TpSeparatedFailureBehavior::Error => {
+                            "injected opaque tensor-parallel policy error"
+                        }
                     };
                     assert!(
                         matches!(&error, TrainerError::TensorParallelExecutionTerminal {
@@ -13026,6 +13421,67 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn tensor_parallel_backward_capability_panic_stops_before_unsupported_reduction() {
+        let tmp = WireTmp::new("tp-backward-capability-panic");
+        let scalar_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let errors = std::thread::scope(|scope| {
+            let handles =
+                crate::comm::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(2))
+                    .into_iter()
+                    .map(|inner| {
+                        let root = tmp.0.clone();
+                        let scalar_calls = std::sync::Arc::clone(&scalar_calls);
+                        scope.spawn(move || {
+                            let rank = inner.rank();
+                            let comm = CountScalarComm {
+                                inner,
+                                scalar_calls,
+                            };
+                            let run = RunDir::create(&root, format!("rank-{rank}")).unwrap();
+                            let trainer = Trainer::new(TrainerConfig::default(), &run).unwrap();
+                            let (mut policy, calls) = tp_probe_policy();
+                            policy.panic_backward_capability = rank == 1;
+                            let error = trainer
+                                .validate_tensor_parallel_backward(&policy, &comm)
+                                .unwrap_err()
+                                .to_string();
+                            (rank, error, calls)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        for (rank, error, calls) in errors {
+            if rank == 1 {
+                assert!(
+                    error.contains("injected backward capability panic"),
+                    "{error}"
+                );
+            } else {
+                assert!(
+                    error.contains("capability probe failed on a peer"),
+                    "{error}"
+                );
+            }
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.generate, 0);
+            assert_eq!(calls.live_logp, 0);
+            assert_eq!(calls.detached_logp, 0);
+            assert_eq!(calls.backward, 0);
+        }
+        assert_eq!(
+            scalar_calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the unsupported-count reduction ran after capability panic"
+        );
+    }
+
+    #[test]
     #[allow(clippy::cognitive_complexity)] // assertion-heavy two-rank reward/ledger contract
     fn train_tensor_parallel_broadcasts_primary_rewards_and_diagnostics() {
         let results = run_coordinated_tp_reward_case(
@@ -13247,6 +13703,121 @@ mod tests {
                     };
                     assert!(error.contains(expected), "behavior={behavior:?}: {error}");
                 }
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn tensor_parallel_world_one_detached_scoring_failures_coordinate_over_data_parallel() {
+        for behavior in [
+            TpSeparatedFailureBehavior::Error,
+            TpSeparatedFailureBehavior::Panic,
+        ] {
+            let tmp = WireTmp::new(match behavior {
+                TpSeparatedFailureBehavior::Error => "tp1-dp2-detached-error",
+                TpSeparatedFailureBehavior::Panic => "tp1-dp2-detached-panic",
+                TpSeparatedFailureBehavior::CommunicationError => unreachable!(),
+            });
+            let outcomes = std::thread::scope(|scope| {
+                let handles = crate::comm::LocalComm::world_with_timeout(
+                    2,
+                    std::time::Duration::from_millis(500),
+                )
+                .into_iter()
+                .map(|dp_comm| {
+                    let base = tmp.0.clone();
+                    scope.spawn(move || {
+                        let rank = dp_comm.rank();
+                        let run = RunDir::create(&base, format!("rank-{rank}")).unwrap();
+                        let mut trainer = Trainer::with_comm(
+                            TrainerConfig {
+                                steps: 1,
+                                group_size: 2,
+                                max_new_tokens: 1,
+                                lr: 0.0,
+                                ..TrainerConfig::default()
+                            },
+                            &run,
+                            dp_comm,
+                        )
+                        .unwrap();
+                        let (inner, _) = tp_probe_policy();
+                        let mut policy = TpSeparatedFailingPolicy {
+                            inner,
+                            arm: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                            failure: TpSeparatedHookFailure::DetachedScoring,
+                            behavior,
+                            fail_this_rank: rank == 1,
+                            sampler_state: std::cell::RefCell::new(vec![17]),
+                        };
+                        let before_adapter =
+                            policy.inner.logp.as_tensor().to_vec2::<f32>().unwrap();
+                        let before_sampler = policy.sampler_state().unwrap();
+                        let error = trainer
+                            .train_tensor_parallel(
+                                &mut policy,
+                                &TpProbeReward,
+                                &TpProbeCodec,
+                                &[Sample::new("prompt", ())],
+                                &SoloComm,
+                            )
+                            .unwrap_err()
+                            .to_string();
+                        (
+                            rank,
+                            error,
+                            before_adapter,
+                            policy.inner.logp.as_tensor().to_vec2::<f32>().unwrap(),
+                            before_sampler,
+                            policy.sampler_state().unwrap(),
+                            policy.adapter_enabled(),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+
+            for (
+                rank,
+                error,
+                adapter_before,
+                adapter_after,
+                sampler_before,
+                sampler_after,
+                adapter_enabled,
+            ) in outcomes
+            {
+                if rank == 0 {
+                    assert!(
+                        error.contains("rollout group learner materialization failed on a peer"),
+                        "behavior={behavior:?}: {error}"
+                    );
+                } else {
+                    let expected = match behavior {
+                        TpSeparatedFailureBehavior::Error => {
+                            "injected opaque tensor-parallel policy error"
+                        }
+                        TpSeparatedFailureBehavior::Panic => {
+                            "detached scoring policy hook panicked"
+                        }
+                        TpSeparatedFailureBehavior::CommunicationError => unreachable!(),
+                    };
+                    assert!(error.contains(expected), "behavior={behavior:?}: {error}");
+                }
+                assert_eq!(
+                    adapter_after, adapter_before,
+                    "rank {rank} adapter rollback"
+                );
+                assert_eq!(
+                    sampler_after, sampler_before,
+                    "rank {rank} sampler rollback"
+                );
+                assert!(adapter_enabled, "rank {rank} adapter-mode rollback");
             }
         }
     }

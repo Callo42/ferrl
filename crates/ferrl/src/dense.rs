@@ -59,7 +59,8 @@ use crate::model::{CachedDecoder, GradModel};
 use crate::nn::RmsNorm;
 use crate::remat::{stitched_backward, RematTape};
 use crate::tensor_parallel::{
-    all_reduce_sum_straight_through, plan_from_comm, ShardRange, TensorParallelPlan,
+    all_reduce_sum_straight_through, coordinate_local_candle_call, plan_from_comm, ShardRange,
+    TensorParallelPlan,
 };
 
 /// The per-architecture seam of the shared dense backbone.
@@ -114,6 +115,22 @@ fn reduce_row_parallel_output(
             "tensor_parallel row-parallel output for world_size {} needs a communicator",
             plan.world_size()
         ),
+    }
+}
+
+fn coordinate_tensor_parallel_local_call<T>(
+    plan: TensorParallelPlan,
+    comm: Option<&dyn Comm>,
+    label: &str,
+    call: impl FnOnce() -> CandleResult<T>,
+) -> CandleResult<T> {
+    match comm {
+        Some(comm) => coordinate_local_candle_call(comm, label, call),
+        None if plan.is_sharded() => candle_core::bail!(
+            "{label} for tensor-parallel world size {} needs a communicator",
+            plan.world_size()
+        ),
+        None => call(),
     }
 }
 
@@ -224,81 +241,72 @@ impl DenseAttention {
         plan: TensorParallelPlan,
         comm: Option<&dyn Comm>,
     ) -> CandleResult<Tensor> {
-        let (b, l, _) = x.dims3()?;
-        let in_dtype = x.dtype();
-        let heads = tp_shard(plan, "num_attention_heads", self.num_heads)?.len;
-        let kv_heads = tp_shard(plan, "num_key_value_heads", self.num_kv_heads)?.len;
-        let attn_hidden = heads * self.head_dim;
-
-        // 1. Projections, each adapted or frozen per the recipe.
-        let q = self
-            .q_proj
-            .column_parallel_forward(x, plan, "attention_q_out")?;
-        let k = self
-            .k_proj
-            .column_parallel_forward(x, plan, "attention_k_out")?;
-        let v = self
-            .v_proj
-            .column_parallel_forward(x, plan, "attention_v_out")?;
-
-        // 2. (B, L, H, D) -> (B, H, L, D).
-        let q = q.reshape((b, l, heads, self.head_dim))?.transpose(1, 2)?;
-        let k = k
-            .reshape((b, l, kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let v = v
-            .reshape((b, l, kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-
-        // 3. Per-head QK-Norm (grad-safe rms_norm_slow) BEFORE RoPE — Qwen only.
-        let (q, k) = match &self.qk_norm {
-            Some((qn, kn)) => (qn.forward(&q.contiguous()?)?, kn.forward(&k.contiguous()?)?),
-            None => (q, k),
-        };
-
-        // 4. RoPE (grad-safe rope_slow; half-width cos/sin).
-        let (cos, sin) = rot.slice(l)?;
-        let q = rope_slow(&q.contiguous()?, &cos, &sin)?;
-        let k = rope_slow(&k.contiguous()?, &cos, &sin)?;
-
-        // 5. (no KV cache) GQA repeat.
-        let k = repeat_kv(&k, self.num_kv_groups)?.contiguous()?;
-        let v = repeat_kv(&v.contiguous()?, self.num_kv_groups)?.contiguous()?;
-
-        // 6. Optional F32 force-cast (the Llama shipped non-flash path; a
-        //    grad-safe identity at F32, the same numerics at BF16), then scaled
-        //    dot-product attention with the grad-safe softmax. Scaling is a
-        //    division by sqrt(head_dim) for both architectures.
-        let (q, k, v) = if self.sdpa_f32 {
-            (
-                q.to_dtype(DType::F32)?,
-                k.to_dtype(DType::F32)?,
-                v.to_dtype(DType::F32)?,
-            )
-        } else {
-            (q, k, v)
-        };
-        let mut scores = (q.contiguous()?.matmul(&k.transpose(2, 3)?.contiguous()?)?
-            / (self.head_dim as f64).sqrt())?;
-        if let Some(m) = mask {
-            scores = scores.broadcast_add(m)?;
-        }
-        let probs = softmax(&scores, D::Minus1)?;
-        let ctx = probs.matmul(&v)?;
-        let ctx = if self.sdpa_f32 {
-            ctx.to_dtype(in_dtype)?
-        } else {
-            ctx
-        };
-
-        // 7. Output projection.
-        let ctx = ctx
-            .transpose(1, 2)?
-            .contiguous()?
-            .reshape((b, l, attn_hidden))?;
-        let partial =
-            self.o_proj
-                .row_parallel_forward_partial_from_shard(&ctx, plan, "attention_hidden")?;
+        let partial = coordinate_tensor_parallel_local_call(
+            plan,
+            comm,
+            "dense attention payload staging",
+            || {
+                let (b, l, _) = x.dims3()?;
+                let in_dtype = x.dtype();
+                let heads = tp_shard(plan, "num_attention_heads", self.num_heads)?.len;
+                let kv_heads = tp_shard(plan, "num_key_value_heads", self.num_kv_heads)?.len;
+                let attn_hidden = heads * self.head_dim;
+                let q = self
+                    .q_proj
+                    .column_parallel_forward(x, plan, "attention_q_out")?;
+                let k = self
+                    .k_proj
+                    .column_parallel_forward(x, plan, "attention_k_out")?;
+                let v = self
+                    .v_proj
+                    .column_parallel_forward(x, plan, "attention_v_out")?;
+                let q = q.reshape((b, l, heads, self.head_dim))?.transpose(1, 2)?;
+                let k = k
+                    .reshape((b, l, kv_heads, self.head_dim))?
+                    .transpose(1, 2)?;
+                let v = v
+                    .reshape((b, l, kv_heads, self.head_dim))?
+                    .transpose(1, 2)?;
+                let (q, k) = match &self.qk_norm {
+                    Some((qn, kn)) => {
+                        (qn.forward(&q.contiguous()?)?, kn.forward(&k.contiguous()?)?)
+                    }
+                    None => (q, k),
+                };
+                let (cos, sin) = rot.slice(l)?;
+                let q = rope_slow(&q.contiguous()?, &cos, &sin)?;
+                let k = rope_slow(&k.contiguous()?, &cos, &sin)?;
+                let k = repeat_kv(&k, self.num_kv_groups)?.contiguous()?;
+                let v = repeat_kv(&v.contiguous()?, self.num_kv_groups)?.contiguous()?;
+                let (q, k, v) = if self.sdpa_f32 {
+                    (
+                        q.to_dtype(DType::F32)?,
+                        k.to_dtype(DType::F32)?,
+                        v.to_dtype(DType::F32)?,
+                    )
+                } else {
+                    (q, k, v)
+                };
+                let mut scores = (q.contiguous()?.matmul(&k.transpose(2, 3)?.contiguous()?)?
+                    / (self.head_dim as f64).sqrt())?;
+                if let Some(m) = mask {
+                    scores = scores.broadcast_add(m)?;
+                }
+                let probs = softmax(&scores, D::Minus1)?;
+                let ctx = probs.matmul(&v)?;
+                let ctx = if self.sdpa_f32 {
+                    ctx.to_dtype(in_dtype)?
+                } else {
+                    ctx
+                };
+                let ctx = ctx
+                    .transpose(1, 2)?
+                    .contiguous()?
+                    .reshape((b, l, attn_hidden))?;
+                self.o_proj
+                    .row_parallel_forward_partial_from_shard(&ctx, plan, "attention_hidden")
+            },
+        )?;
         reduce_row_parallel_output(&partial, plan, comm)
     }
 
@@ -383,19 +391,22 @@ impl DenseMlp {
         plan: TensorParallelPlan,
         comm: Option<&dyn Comm>,
     ) -> CandleResult<Tensor> {
-        let lhs = self
-            .gate_proj
-            .column_parallel_forward(x, plan, "intermediate_size")?
-            .apply(&self.act)?;
-        let rhs = self
-            .up_proj
-            .column_parallel_forward(x, plan, "intermediate_size")?;
-        let hidden = lhs.broadcast_mul(&rhs)?;
-        let partial = self.down_proj.row_parallel_forward_partial_from_shard(
-            &hidden,
-            plan,
-            "intermediate_size",
-        )?;
+        let partial =
+            coordinate_tensor_parallel_local_call(plan, comm, "dense MLP payload staging", || {
+                let lhs = self
+                    .gate_proj
+                    .column_parallel_forward(x, plan, "intermediate_size")?
+                    .apply(&self.act)?;
+                let rhs = self
+                    .up_proj
+                    .column_parallel_forward(x, plan, "intermediate_size")?;
+                let hidden = lhs.broadcast_mul(&rhs)?;
+                self.down_proj.row_parallel_forward_partial_from_shard(
+                    &hidden,
+                    plan,
+                    "intermediate_size",
+                )
+            })?;
         reduce_row_parallel_output(&partial, plan, comm)
     }
 
@@ -489,14 +500,29 @@ impl DenseLayer {
         plan: TensorParallelPlan,
         comm: Option<&dyn Comm>,
     ) -> CandleResult<Tensor> {
-        let h = self.ln1.forward(x)?;
+        let h = coordinate_tensor_parallel_local_call(
+            plan,
+            comm,
+            "dense attention boundary preparation",
+            || self.ln1.forward(x),
+        )?;
         let h = self
             .attn
             .forward_tensor_parallel(&h, mask, rot, plan, comm)?;
-        let x = x.broadcast_add(&h)?;
-        let h2 = self.ln2.forward(&x)?;
+        let (x, h2) = coordinate_tensor_parallel_local_call(
+            plan,
+            comm,
+            "dense attention boundary completion",
+            || {
+                let x = x.broadcast_add(&h)?;
+                let h2 = self.ln2.forward(&x)?;
+                Ok((x, h2))
+            },
+        )?;
         let h2 = self.mlp.forward_tensor_parallel(&h2, plan, comm)?;
-        x.broadcast_add(&h2)
+        coordinate_tensor_parallel_local_call(plan, comm, "dense MLP boundary completion", || {
+            x.broadcast_add(&h2)
+        })
     }
 
     fn set_adapter_enabled(&mut self, enabled: bool) {
@@ -790,20 +816,34 @@ impl<A: DenseArch> DenseGradModel<A> {
         window: Option<(usize, usize)>,
         comm: &dyn Comm,
     ) -> CandleResult<Tensor> {
-        if self.remat {
-            candle_core::bail!(
-                "{}::forward_tensor_parallel: activation checkpointing is not wired for \
-                 tensor-parallel execution yet",
-                A::LABEL
-            );
-        }
-        let plan = plan_from_comm(comm)?;
-        self.validate_tensor_parallel_execution_support()?;
-        let (mut h, mask) = self.embed_and_mask(input_ids)?;
+        let plan =
+            coordinate_local_candle_call(comm, "dense tensor-parallel forward preflight", || {
+                if self.remat {
+                    candle_core::bail!(
+                        "{}::forward_tensor_parallel: activation checkpointing is not wired for \
+                         tensor-parallel execution yet",
+                        A::LABEL
+                    );
+                }
+                let plan = plan_from_comm(comm)?;
+                self.validate_tensor_parallel_execution_support()?;
+                Ok(plan)
+            })?;
+        let (mut h, mask) = coordinate_tensor_parallel_local_call(
+            plan,
+            Some(comm),
+            "dense tensor-parallel input staging",
+            || self.embed_and_mask(input_ids),
+        )?;
         for layer in &self.layers {
             h = layer.forward_tensor_parallel(&h, mask.as_ref(), &self.rot, plan, Some(comm))?;
         }
-        self.norm_and_head(&h, window)
+        coordinate_tensor_parallel_local_call(
+            plan,
+            Some(comm),
+            "dense tensor-parallel output staging",
+            || self.norm_and_head(&h, window),
+        )
     }
 
     fn validate_tensor_parallel_execution_support(&self) -> CandleResult<()> {
@@ -952,23 +992,39 @@ impl<A: DenseArch> DenseGradModel<A> {
         window: Option<(usize, usize)>,
         comm: &dyn Comm,
     ) -> CandleResult<Tensor> {
-        if self.remat {
-            candle_core::bail!(
-                "{}::forward_tensor_parallel_detached: activation checkpointing is not wired for \
-                 tensor-parallel execution yet",
-                A::LABEL
-            );
-        }
-        let plan = plan_from_comm(comm)?;
-        self.validate_tensor_parallel_execution_support()?;
-        let (mut h, mask) = self.embed_and_mask(input_ids)?;
-        h = h.detach();
+        let (plan, mut h, mask) = coordinate_local_candle_call(
+            comm,
+            "dense detached tensor-parallel input staging",
+            || {
+                if self.remat {
+                    candle_core::bail!(
+                        "{}::forward_tensor_parallel_detached: activation checkpointing is not \
+                         wired for tensor-parallel execution yet",
+                        A::LABEL
+                    );
+                }
+                let plan = plan_from_comm(comm)?;
+                self.validate_tensor_parallel_execution_support()?;
+                let (h, mask) = self.embed_and_mask(input_ids)?;
+                Ok((plan, h.detach(), mask))
+            },
+        )?;
         for layer in &self.layers {
-            h = layer
-                .forward_tensor_parallel(&h, mask.as_ref(), &self.rot, plan, Some(comm))?
-                .detach();
+            let next =
+                layer.forward_tensor_parallel(&h, mask.as_ref(), &self.rot, plan, Some(comm))?;
+            h = coordinate_tensor_parallel_local_call(
+                plan,
+                Some(comm),
+                "dense detached tensor-parallel layer completion",
+                || Ok(next.detach()),
+            )?;
         }
-        Ok(self.norm_and_head(&h, window)?.detach())
+        coordinate_tensor_parallel_local_call(
+            plan,
+            Some(comm),
+            "dense detached tensor-parallel output staging",
+            || Ok(self.norm_and_head(&h, window)?.detach()),
+        )
     }
 
     /// Back-propagate a loss built from this model's logits: plain
@@ -1304,73 +1360,75 @@ impl DenseMergedAttention {
         plan: TensorParallelPlan,
         comm: &dyn Comm,
     ) -> CandleResult<Tensor> {
-        let (b, l, _) = x.dims3()?;
-        let in_dtype = x.dtype();
-        let heads = tp_shard(plan, "num_attention_heads", self.num_heads)?.len;
-        let kv_heads = tp_shard(plan, "num_key_value_heads", self.num_kv_heads)?.len;
-        let attn_hidden = heads * self.head_dim;
-
-        let q = self
-            .q_weight
-            .column_parallel_forward(x, plan, "attention_q_out")?;
-        let k = self
-            .k_weight
-            .column_parallel_forward(x, plan, "attention_k_out")?;
-        let v = self
-            .v_weight
-            .column_parallel_forward(x, plan, "attention_v_out")?;
-
-        let q = q.reshape((b, l, heads, self.head_dim))?.transpose(1, 2)?;
-        let k = k
-            .reshape((b, l, kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let v = v
-            .reshape((b, l, kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-
-        let (q, k) = match &self.qk_norm {
-            Some((qn, kn)) => (qn.forward(&q.contiguous()?)?, kn.forward(&k.contiguous()?)?),
-            None => (q, k),
-        };
-
-        let (cos, sin) = rot.slice_at(offset, l)?;
-        let q = rope_slow(&q.contiguous()?, &cos, &sin)?;
-        let k = rope_slow(&k.contiguous()?, &cos, &sin)?;
-
-        let (k, v) = self.cache.append(&k.contiguous()?, &v.contiguous()?)?;
-        let k = repeat_kv(&k, self.num_kv_groups)?.contiguous()?;
-        let v = repeat_kv(&v, self.num_kv_groups)?.contiguous()?;
-
-        let (q, k, v) = if self.sdpa_f32 {
-            (
-                q.to_dtype(DType::F32)?,
-                k.to_dtype(DType::F32)?,
-                v.to_dtype(DType::F32)?,
-            )
-        } else {
-            (q, k, v)
-        };
-        let mut scores = (q.contiguous()?.matmul(&k.transpose(2, 3)?.contiguous()?)?
-            / (self.head_dim as f64).sqrt())?;
-        if let Some(m) = mask {
-            scores = scores.broadcast_add(m)?;
-        }
-        let probs = softmax(&scores, D::Minus1)?;
-        let ctx = probs.matmul(&v)?;
-        let ctx = if self.sdpa_f32 {
-            ctx.to_dtype(in_dtype)?
-        } else {
-            ctx
-        };
-
-        let ctx = ctx
-            .transpose(1, 2)?
-            .contiguous()?
-            .reshape((b, l, attn_hidden))?;
-        let partial = self.o_weight.row_parallel_forward_partial_from_shard(
-            &ctx,
+        let partial = coordinate_tensor_parallel_local_call(
             plan,
-            "attention_hidden",
+            Some(comm),
+            "dense cached attention payload staging",
+            || {
+                let (b, l, _) = x.dims3()?;
+                let in_dtype = x.dtype();
+                let heads = tp_shard(plan, "num_attention_heads", self.num_heads)?.len;
+                let kv_heads = tp_shard(plan, "num_key_value_heads", self.num_kv_heads)?.len;
+                let attn_hidden = heads * self.head_dim;
+                let q = self
+                    .q_weight
+                    .column_parallel_forward(x, plan, "attention_q_out")?;
+                let k = self
+                    .k_weight
+                    .column_parallel_forward(x, plan, "attention_k_out")?;
+                let v = self
+                    .v_weight
+                    .column_parallel_forward(x, plan, "attention_v_out")?;
+                let q = q.reshape((b, l, heads, self.head_dim))?.transpose(1, 2)?;
+                let k = k
+                    .reshape((b, l, kv_heads, self.head_dim))?
+                    .transpose(1, 2)?;
+                let v = v
+                    .reshape((b, l, kv_heads, self.head_dim))?
+                    .transpose(1, 2)?;
+                let (q, k) = match &self.qk_norm {
+                    Some((qn, kn)) => {
+                        (qn.forward(&q.contiguous()?)?, kn.forward(&k.contiguous()?)?)
+                    }
+                    None => (q, k),
+                };
+                let (cos, sin) = rot.slice_at(offset, l)?;
+                let q = rope_slow(&q.contiguous()?, &cos, &sin)?;
+                let k = rope_slow(&k.contiguous()?, &cos, &sin)?;
+                let (k, v) = self.cache.append(&k.contiguous()?, &v.contiguous()?)?;
+                let k = repeat_kv(&k, self.num_kv_groups)?.contiguous()?;
+                let v = repeat_kv(&v, self.num_kv_groups)?.contiguous()?;
+                let (q, k, v) = if self.sdpa_f32 {
+                    (
+                        q.to_dtype(DType::F32)?,
+                        k.to_dtype(DType::F32)?,
+                        v.to_dtype(DType::F32)?,
+                    )
+                } else {
+                    (q, k, v)
+                };
+                let mut scores = (q.contiguous()?.matmul(&k.transpose(2, 3)?.contiguous()?)?
+                    / (self.head_dim as f64).sqrt())?;
+                if let Some(m) = mask {
+                    scores = scores.broadcast_add(m)?;
+                }
+                let probs = softmax(&scores, D::Minus1)?;
+                let ctx = probs.matmul(&v)?;
+                let ctx = if self.sdpa_f32 {
+                    ctx.to_dtype(in_dtype)?
+                } else {
+                    ctx
+                };
+                let ctx = ctx
+                    .transpose(1, 2)?
+                    .contiguous()?
+                    .reshape((b, l, attn_hidden))?;
+                self.o_weight.row_parallel_forward_partial_from_shard(
+                    &ctx,
+                    plan,
+                    "attention_hidden",
+                )
+            },
         )?;
         reduce_row_parallel_output(&partial, plan, Some(comm))
     }
@@ -1420,18 +1478,25 @@ impl DenseMergedMlp {
         plan: TensorParallelPlan,
         comm: &dyn Comm,
     ) -> CandleResult<Tensor> {
-        let lhs = self
-            .gate_weight
-            .column_parallel_forward(x, plan, "intermediate_size")?
-            .apply(&self.act)?;
-        let rhs = self
-            .up_weight
-            .column_parallel_forward(x, plan, "intermediate_size")?;
-        let hidden = lhs.broadcast_mul(&rhs)?;
-        let partial = self.down_weight.row_parallel_forward_partial_from_shard(
-            &hidden,
+        let partial = coordinate_tensor_parallel_local_call(
             plan,
-            "intermediate_size",
+            Some(comm),
+            "dense cached MLP payload staging",
+            || {
+                let lhs = self
+                    .gate_weight
+                    .column_parallel_forward(x, plan, "intermediate_size")?
+                    .apply(&self.act)?;
+                let rhs = self
+                    .up_weight
+                    .column_parallel_forward(x, plan, "intermediate_size")?;
+                let hidden = lhs.broadcast_mul(&rhs)?;
+                self.down_weight.row_parallel_forward_partial_from_shard(
+                    &hidden,
+                    plan,
+                    "intermediate_size",
+                )
+            },
         )?;
         reduce_row_parallel_output(&partial, plan, Some(comm))
     }
@@ -1476,14 +1541,32 @@ impl DenseMergedLayer {
         plan: TensorParallelPlan,
         comm: &dyn Comm,
     ) -> CandleResult<Tensor> {
-        let h = self.ln1.forward(x)?;
+        let h = coordinate_tensor_parallel_local_call(
+            plan,
+            Some(comm),
+            "dense cached attention boundary preparation",
+            || self.ln1.forward(x),
+        )?;
         let h = self
             .attn
             .forward_tensor_parallel(&h, offset, mask, rot, plan, comm)?;
-        let x = x.broadcast_add(&h)?;
-        let h2 = self.ln2.forward(&x)?;
+        let (x, h2) = coordinate_tensor_parallel_local_call(
+            plan,
+            Some(comm),
+            "dense cached attention boundary completion",
+            || {
+                let x = x.broadcast_add(&h)?;
+                let h2 = self.ln2.forward(&x)?;
+                Ok((x, h2))
+            },
+        )?;
         let h2 = self.mlp.forward_tensor_parallel(&h2, plan, comm)?;
-        x.broadcast_add(&h2)
+        coordinate_tensor_parallel_local_call(
+            plan,
+            Some(comm),
+            "dense cached MLP boundary completion",
+            || x.broadcast_add(&h2),
+        )
     }
 }
 
@@ -1624,38 +1707,53 @@ impl DenseCachedDecoder {
         offset: usize,
         comm: &dyn Comm,
     ) -> CandleResult<Tensor> {
-        let plan = plan_from_comm(comm)?;
-        self.validate_tensor_parallel_execution_support()?;
-        let (b, l) = input_ids.dims2()?;
-        let cached = self
-            .layers
-            .first()
-            .map_or(0, |layer| layer.attn.cache.current_seq_len());
-        if offset != cached {
-            candle_core::bail!(
-                "DenseCachedDecoder::forward_tensor_parallel: offset {offset} != cached \
-                 sequence length {cached} (pass offset == tokens already decoded; 0 to prefill)"
-            );
-        }
-        self.validate_tensor_parallel_plan(plan)?;
-        let ids = input_ids.flatten_all()?;
-        let mut h = self
-            .embed
-            .index_select(&ids, 0)?
-            .reshape((b, l, self.hidden))?;
-        let mask = if l == 1 {
-            None
-        } else {
-            Some(causal_mask_at(offset, l, self.mask_dtype, &self.device)?)
-        };
+        let (plan, mut h, mask) = coordinate_local_candle_call(
+            comm,
+            "dense cached tensor-parallel input staging",
+            || {
+                let plan = plan_from_comm(comm)?;
+                self.validate_tensor_parallel_execution_support()?;
+                let (b, l) = input_ids.dims2()?;
+                let cached = self
+                    .layers
+                    .first()
+                    .map_or(0, |layer| layer.attn.cache.current_seq_len());
+                if offset != cached {
+                    candle_core::bail!(
+                        "DenseCachedDecoder::forward_tensor_parallel: offset {offset} != cached \
+                         sequence length {cached} (pass offset == tokens already decoded; 0 to \
+                         prefill)"
+                    );
+                }
+                self.validate_tensor_parallel_plan(plan)?;
+                let ids = input_ids.flatten_all()?;
+                let h = self
+                    .embed
+                    .index_select(&ids, 0)?
+                    .reshape((b, l, self.hidden))?;
+                let mask = if l == 1 {
+                    None
+                } else {
+                    Some(causal_mask_at(offset, l, self.mask_dtype, &self.device)?)
+                };
+                Ok((plan, h, mask))
+            },
+        )?;
         for layer in &mut self.layers {
             h = layer.forward_tensor_parallel(&h, offset, mask.as_ref(), &self.rot, plan, comm)?;
         }
-        let h = self.norm.forward(&h)?;
-        match &self.lm_head {
-            Some(w) => frozen_linear(&h, w),
-            None => frozen_linear(&h, &self.embed),
-        }
+        coordinate_tensor_parallel_local_call(
+            plan,
+            Some(comm),
+            "dense cached tensor-parallel output staging",
+            || {
+                let h = self.norm.forward(&h)?;
+                match &self.lm_head {
+                    Some(w) => frozen_linear(&h, w),
+                    None => frozen_linear(&h, &self.embed),
+                }
+            },
+        )
     }
 
     fn validate_tensor_parallel_plan(&self, plan: TensorParallelPlan) -> CandleResult<()> {

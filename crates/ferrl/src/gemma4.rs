@@ -39,6 +39,8 @@ use crate::tensor_parallel::{
 #[cfg(test)]
 thread_local! {
     static ADAPTER_VALIDATION_STAGE_FAULT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    static TENSOR_PARALLEL_LOCAL_STAGE_FAULT:
+        std::cell::RefCell<Option<(&'static str, bool)>> = const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -56,6 +58,33 @@ fn take_adapter_validation_stage_fault(stage: u8) -> bool {
             false
         }
     })
+}
+
+#[cfg(test)]
+fn inject_tensor_parallel_local_stage_failure_once(stage: &'static str, panic: bool) {
+    TENSOR_PARALLEL_LOCAL_STAGE_FAULT.with(|fault| fault.replace(Some((stage, panic))));
+}
+
+#[cfg(test)]
+fn tensor_parallel_local_stage_fault_consumed() -> bool {
+    TENSOR_PARALLEL_LOCAL_STAGE_FAULT.with(|fault| fault.borrow().is_none())
+}
+
+#[cfg(test)]
+fn maybe_inject_tensor_parallel_local_stage_failure(stage: &str) -> CandleResult<()> {
+    let behavior = TENSOR_PARALLEL_LOCAL_STAGE_FAULT.with(|fault| {
+        let mut fault = fault.borrow_mut();
+        if fault.as_ref().is_some_and(|(target, _)| *target == stage) {
+            fault.take().map(|(_, panic)| panic)
+        } else {
+            None
+        }
+    });
+    match behavior {
+        Some(true) => panic!("injected {stage} panic"),
+        Some(false) => bail!("injected {stage} failure"),
+        None => Ok(()),
+    }
 }
 
 /// The checkpoint prefix used by public Gemma 4 conditional-generation
@@ -86,6 +115,26 @@ fn reduce_row_parallel_output(
     }
 }
 
+fn coordinate_tensor_parallel_local_call<T>(
+    plan: TensorParallelPlan,
+    comm: Option<&dyn Comm>,
+    label: &str,
+    call: impl FnOnce() -> CandleResult<T>,
+) -> CandleResult<T> {
+    match comm {
+        Some(comm) => coordinate_local_candle_call(comm, label, || {
+            #[cfg(test)]
+            maybe_inject_tensor_parallel_local_stage_failure(label)?;
+            call()
+        }),
+        None if plan.is_sharded() => candle_core::bail!(
+            "{label} for tensor-parallel world size {} needs a communicator",
+            plan.world_size()
+        ),
+        None => call(),
+    }
+}
+
 fn validate_activation_checkpointing_consensus(
     remat: bool,
     plan: TensorParallelPlan,
@@ -98,8 +147,8 @@ fn validate_activation_checkpointing_consensus(
         comm_to_candle(comm.all_reduce_scalar_sum(if remat { 1.0 } else { 0.0 }))?;
     if checkpointed_count != 0.0 && checkpointed_count != plan.world_size() as f64 {
         bail!(
-            "Gemma4GradModel::backward_tensor_parallel: activation-checkpointing state differs \
-             across tensor-parallel ranks"
+            "Gemma4 tensor-parallel execution: activation-checkpointing state differs across \
+             tensor-parallel ranks"
         )
     }
     Ok(())
@@ -144,9 +193,8 @@ fn validate_replicated_adapter_values(
             ),
         };
     }
-    let digest = adapter_manifest_digest(vars, recipe);
     let world = plan.world_size() as f64;
-    let mut reduced_manifest = coordinate_local_candle_call(
+    let (digest, mut reduced_manifest) = coordinate_local_candle_call(
         comm,
         "Gemma4 tensor-parallel adapter manifest staging",
         || {
@@ -154,8 +202,9 @@ fn validate_replicated_adapter_values(
             if take_adapter_validation_stage_fault(1) {
                 bail!("injected adapter manifest staging failure")
             }
+            let digest = adapter_manifest_digest(vars, recipe);
             let manifest = Tensor::from_vec(digest.map(f64::from).to_vec(), digest.len(), device)?;
-            Ok(vec![manifest])
+            Ok((digest, vec![manifest]))
         },
     )?;
     comm_to_candle(comm.all_reduce_sum(&mut reduced_manifest))?;
@@ -1045,50 +1094,57 @@ impl Gemma4Attention {
         plan: TensorParallelPlan,
         comm: Option<&dyn Comm>,
     ) -> CandleResult<Tensor> {
-        let (b, l, _) = x.dims3()?;
-        let in_dtype = x.dtype();
-        let offset = 0;
-        let heads = tp_shard(plan, "num_attention_heads", self.num_heads)?.len;
-        let kv_heads = tp_shard(plan, "num_key_value_heads", self.num_kv_heads)?.len;
-        let attn_hidden = heads * self.head_dim;
-        let q = self
-            .q_proj
-            .column_parallel_forward(x, plan, "attention_q_out")?;
-        let k_raw = self
-            .k_proj
-            .column_parallel_forward(x, plan, "attention_k_out")?;
-        let v_raw = match &self.v_proj {
-            Some(v) => v.column_parallel_forward(x, plan, "attention_v_out")?,
-            None => k_raw.clone(),
-        };
+        let partial = coordinate_tensor_parallel_local_call(
+            plan,
+            comm,
+            "Gemma4 attention payload staging",
+            || {
+                let (b, l, _) = x.dims3()?;
+                let in_dtype = x.dtype();
+                let offset = 0;
+                let heads = tp_shard(plan, "num_attention_heads", self.num_heads)?.len;
+                let kv_heads = tp_shard(plan, "num_key_value_heads", self.num_kv_heads)?.len;
+                let attn_hidden = heads * self.head_dim;
+                let q = self
+                    .q_proj
+                    .column_parallel_forward(x, plan, "attention_q_out")?;
+                let k_raw = self
+                    .k_proj
+                    .column_parallel_forward(x, plan, "attention_k_out")?;
+                let v_raw = match &self.v_proj {
+                    Some(v) => v.column_parallel_forward(x, plan, "attention_v_out")?,
+                    None => k_raw.clone(),
+                };
 
-        let q = q.reshape((b, l, heads, self.head_dim))?;
-        let k = k_raw.reshape((b, l, kv_heads, self.head_dim))?;
-        let v = v_raw.reshape((b, l, kv_heads, self.head_dim))?;
+                let q = q.reshape((b, l, heads, self.head_dim))?;
+                let k = k_raw.reshape((b, l, kv_heads, self.head_dim))?;
+                let v = v_raw.reshape((b, l, kv_heads, self.head_dim))?;
 
-        let q = self.q_norm.forward(&q)?.transpose(1, 2)?;
-        let k = self.k_norm.forward(&k)?;
-        let v = self.v_norm.forward(&v)?.transpose(1, 2)?;
-        let k = rot.apply(self.kind, &k.transpose(1, 2)?, offset, l)?;
-        let q = rot.apply(self.kind, &q, offset, l)?;
+                let q = self.q_norm.forward(&q)?.transpose(1, 2)?;
+                let k = self.k_norm.forward(&k)?;
+                let v = self.v_norm.forward(&v)?.transpose(1, 2)?;
+                let k = rot.apply(self.kind, &k.transpose(1, 2)?, offset, l)?;
+                let q = rot.apply(self.kind, &q, offset, l)?;
 
-        let v = v.contiguous()?;
-        let k = repeat_kv(&k, self.num_kv_groups)?.contiguous()?;
-        let v = repeat_kv(&v, self.num_kv_groups)?.contiguous()?;
+                let v = v.contiguous()?;
+                let k = repeat_kv(&k, self.num_kv_groups)?.contiguous()?;
+                let v = repeat_kv(&v, self.num_kv_groups)?.contiguous()?;
 
-        let mut scores = q.contiguous()?.matmul(&k.transpose(2, 3)?.contiguous()?)?;
-        if let Some(m) = mask {
-            scores = scores.broadcast_add(m)?;
-        }
-        let probs = softmax(&scores.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(in_dtype)?;
-        let ctx = probs.matmul(&v)?;
-        let ctx = ctx
-            .transpose(1, 2)?
-            .contiguous()?
-            .reshape((b, l, attn_hidden))?;
-        let partial =
-            self.o_proj
-                .row_parallel_forward_partial_from_shard(&ctx, plan, "attention_hidden")?;
+                let mut scores = q.contiguous()?.matmul(&k.transpose(2, 3)?.contiguous()?)?;
+                if let Some(m) = mask {
+                    scores = scores.broadcast_add(m)?;
+                }
+                let probs =
+                    softmax(&scores.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(in_dtype)?;
+                let ctx = probs.matmul(&v)?;
+                let ctx = ctx
+                    .transpose(1, 2)?
+                    .contiguous()?
+                    .reshape((b, l, attn_hidden))?;
+                self.o_proj
+                    .row_parallel_forward_partial_from_shard(&ctx, plan, "attention_hidden")
+            },
+        )?;
         reduce_row_parallel_output(&partial, plan, comm)
     }
 
@@ -1185,17 +1241,24 @@ impl Gemma4Mlp {
         plan: TensorParallelPlan,
         comm: Option<&dyn Comm>,
     ) -> CandleResult<Tensor> {
-        let g = self
-            .gate_proj
-            .column_parallel_forward(x, plan, "intermediate_size")?;
-        let u = self
-            .up_proj
-            .column_parallel_forward(x, plan, "intermediate_size")?;
-        let h = self.act.forward(&g)?.broadcast_mul(&u)?;
-        let partial = self.down_proj.row_parallel_forward_partial_from_shard(
-            &h,
+        let partial = coordinate_tensor_parallel_local_call(
             plan,
-            "intermediate_size",
+            comm,
+            "Gemma4 MLP payload staging",
+            || {
+                let g = self
+                    .gate_proj
+                    .column_parallel_forward(x, plan, "intermediate_size")?;
+                let u = self
+                    .up_proj
+                    .column_parallel_forward(x, plan, "intermediate_size")?;
+                let h = self.act.forward(&g)?.broadcast_mul(&u)?;
+                self.down_proj.row_parallel_forward_partial_from_shard(
+                    &h,
+                    plan,
+                    "intermediate_size",
+                )
+            },
         )?;
         reduce_row_parallel_output(&partial, plan, comm)
     }
@@ -1312,17 +1375,31 @@ impl Gemma4Layer {
         comm: Option<&dyn Comm>,
         reduce_boundary_backward: bool,
     ) -> CandleResult<Tensor> {
-        let residual = if reduce_boundary_backward {
-            Self::reduced_backward_residual(x, plan)?
-        } else {
-            x.clone()
-        };
-        let h = self.input_layernorm.forward(x)?;
+        let (residual, h) = coordinate_tensor_parallel_local_call(
+            plan,
+            comm,
+            "Gemma4 attention boundary preparation",
+            || {
+                let residual = if reduce_boundary_backward {
+                    Self::reduced_backward_residual(x, plan)?
+                } else {
+                    x.clone()
+                };
+                Ok((residual, self.input_layernorm.forward(x)?))
+            },
+        )?;
         let h = self
             .attn
             .forward_at_tensor_parallel(&h, masks.get(self.kind), rot, plan, comm)?;
-        let h = self.post_attention_layernorm.forward(&h)?;
-        residual.broadcast_add(&h)
+        coordinate_tensor_parallel_local_call(
+            plan,
+            comm,
+            "Gemma4 attention boundary completion",
+            || {
+                let h = self.post_attention_layernorm.forward(&h)?;
+                residual.broadcast_add(&h)
+            },
+        )
     }
 
     fn forward_mlp_tensor_parallel(
@@ -1332,16 +1409,25 @@ impl Gemma4Layer {
         comm: Option<&dyn Comm>,
         reduce_boundary_backward: bool,
     ) -> CandleResult<Tensor> {
-        let residual = if reduce_boundary_backward {
-            Self::reduced_backward_residual(x, plan)?
-        } else {
-            x.clone()
-        };
-        let h2 = self.pre_feedforward_layernorm.forward(x)?;
+        let (residual, h2) = coordinate_tensor_parallel_local_call(
+            plan,
+            comm,
+            "Gemma4 MLP boundary preparation",
+            || {
+                let residual = if reduce_boundary_backward {
+                    Self::reduced_backward_residual(x, plan)?
+                } else {
+                    x.clone()
+                };
+                Ok((residual, self.pre_feedforward_layernorm.forward(x)?))
+            },
+        )?;
         let h2 = self.mlp.forward_tensor_parallel(&h2, plan, comm)?;
-        let h2 = self.post_feedforward_layernorm.forward(&h2)?;
-        let x = residual.broadcast_add(&h2)?;
-        x.broadcast_mul(&self.layer_scalar)
+        coordinate_tensor_parallel_local_call(plan, comm, "Gemma4 MLP boundary completion", || {
+            let h2 = self.post_feedforward_layernorm.forward(&h2)?;
+            let x = residual.broadcast_add(&h2)?;
+            x.broadcast_mul(&self.layer_scalar)
+        })
     }
 
     fn set_adapter_enabled(&mut self, enabled: bool) {
@@ -1626,16 +1712,31 @@ impl Gemma4GradModel {
         window: Option<(usize, usize)>,
         comm: &dyn Comm,
     ) -> CandleResult<Tensor> {
-        let plan = plan_from_comm(comm)?;
-        self.validate_tensor_parallel_execution_support(plan)?;
-        if self.remat {
+        let (plan, remat) =
+            coordinate_local_candle_call(comm, "Gemma4 tensor-parallel forward preflight", || {
+                let plan = plan_from_comm(comm)?;
+                self.validate_tensor_parallel_execution_support(plan)?;
+                Ok((plan, self.remat))
+            })?;
+        validate_activation_checkpointing_consensus(remat, plan, comm)?;
+        if remat {
             return self.forward_tensor_parallel_remat(input_ids, window, plan, comm);
         }
-        let (mut h, masks) = self.embed_and_masks(input_ids)?;
+        let (mut h, masks) = coordinate_tensor_parallel_local_call(
+            plan,
+            Some(comm),
+            "Gemma4 tensor-parallel forward input staging",
+            || self.embed_and_masks(input_ids),
+        )?;
         for layer in &self.layers {
             h = layer.forward_tensor_parallel(&h, &masks, &self.rot, plan, Some(comm))?;
         }
-        self.norm_head_softcap(&h, window)
+        coordinate_tensor_parallel_local_call(
+            plan,
+            Some(comm),
+            "Gemma4 tensor-parallel forward output staging",
+            || self.norm_head_softcap(&h, window),
+        )
     }
 
     fn validate_tensor_parallel_execution_support(
@@ -1776,16 +1877,31 @@ impl Gemma4GradModel {
         window: Option<(usize, usize)>,
         comm: &dyn Comm,
     ) -> CandleResult<Tensor> {
-        let plan = plan_from_comm(comm)?;
-        self.validate_tensor_parallel_execution_support(plan)?;
-        let (mut h, masks) = self.embed_and_masks(input_ids)?;
-        h = h.detach();
+        let (plan, mut h, masks) = coordinate_local_candle_call(
+            comm,
+            "Gemma4 detached tensor-parallel input staging",
+            || {
+                let plan = plan_from_comm(comm)?;
+                self.validate_tensor_parallel_execution_support(plan)?;
+                let (h, masks) = self.embed_and_masks(input_ids)?;
+                Ok((plan, h.detach(), masks))
+            },
+        )?;
         for layer in &self.layers {
-            h = layer
-                .forward_tensor_parallel(&h, &masks, &self.rot, plan, Some(comm))?
-                .detach();
+            let next = layer.forward_tensor_parallel(&h, &masks, &self.rot, plan, Some(comm))?;
+            h = coordinate_tensor_parallel_local_call(
+                plan,
+                Some(comm),
+                "Gemma4 detached tensor-parallel layer completion",
+                || Ok(next.detach()),
+            )?;
         }
-        Ok(self.norm_head_softcap(&h, window)?.detach())
+        coordinate_tensor_parallel_local_call(
+            plan,
+            Some(comm),
+            "Gemma4 detached tensor-parallel output staging",
+            || Ok(self.norm_head_softcap(&h, window)?.detach()),
+        )
     }
 
     fn forward_remat(
@@ -1816,11 +1932,24 @@ impl Gemma4GradModel {
         plan: TensorParallelPlan,
         comm: &dyn Comm,
     ) -> CandleResult<Tensor> {
-        self.tape.borrow_mut().take();
-        let (mut h, masks) = self.embed_and_masks(input_ids)?;
-        let mut tape = RematTape::new(self.adapter_enabled);
+        let (mut h, masks, mut tape) = coordinate_tensor_parallel_local_call(
+            plan,
+            Some(comm),
+            "Gemma4 rematerialized tensor-parallel input staging",
+            || {
+                self.tape.borrow_mut().take();
+                let (h, masks) = self.embed_and_masks(input_ids)?;
+                let tape = RematTape::new(self.adapter_enabled);
+                Ok((h, masks, tape))
+            },
+        )?;
         for layer in &self.layers {
-            let x = tape.capture(&h)?;
+            let x = coordinate_tensor_parallel_local_call(
+                plan,
+                Some(comm),
+                "Gemma4 rematerialized attention capture",
+                || tape.capture(&h),
+            )?;
             h = layer.forward_attention_tensor_parallel(
                 &x,
                 &masks,
@@ -1829,16 +1958,28 @@ impl Gemma4GradModel {
                 Some(comm),
                 true,
             )?;
-            let x = tape.capture(&h)?;
+            let x = coordinate_tensor_parallel_local_call(
+                plan,
+                Some(comm),
+                "Gemma4 rematerialized MLP capture",
+                || tape.capture(&h),
+            )?;
             h = layer.forward_mlp_tensor_parallel(&x, plan, Some(comm), true)?;
         }
-        let x = tape.capture(&h)?;
-        let logits = self.norm_head_softcap(&x, window)?;
-        *self.tape.borrow_mut() = Some(Gemma4RematTape {
-            tape,
-            execution: Gemma4RematExecution::TensorParallel(plan),
-        });
-        Ok(logits)
+        coordinate_tensor_parallel_local_call(
+            plan,
+            Some(comm),
+            "Gemma4 rematerialized tensor-parallel output staging",
+            || {
+                let x = tape.capture(&h)?;
+                let logits = self.norm_head_softcap(&x, window)?;
+                *self.tape.borrow_mut() = Some(Gemma4RematTape {
+                    tape,
+                    execution: Gemma4RematExecution::TensorParallel(plan),
+                });
+                Ok(logits)
+            },
+        )
     }
 
     /// Backward through the most recent loss.
@@ -1893,7 +2034,11 @@ impl Gemma4GradModel {
         loss: &Tensor,
         comm: &dyn Comm,
     ) -> CandleResult<GradStore> {
-        let plan = plan_from_comm(comm)?;
+        let plan = coordinate_local_candle_call(
+            comm,
+            "Gemma4 tensor-parallel backward preflight",
+            || plan_from_comm(comm),
+        )?;
         validate_activation_checkpointing_consensus(self.remat, plan, comm)?;
         if !self.remat {
             self.validate_tensor_parallel_execution_support(plan)?;
@@ -1918,10 +2063,14 @@ impl Gemma4GradModel {
         };
         let adapters_match =
             adapters_enabled == 0.0 || adapters_enabled == plan.world_size() as f64;
-        let trainable = self.trainable_vars();
+        let (trainable, adapter_recipe) = coordinate_local_candle_call(
+            comm,
+            "Gemma4 tensor-parallel backward adapter staging",
+            || Ok((self.trainable_vars(), self.targets.canonical())),
+        )?;
         let adapter_values_match = match validate_replicated_adapter_values(
             &trainable,
-            &self.targets.canonical(),
+            &adapter_recipe,
             &self.device,
             plan,
             comm,
@@ -1929,68 +2078,60 @@ impl Gemma4GradModel {
             Err(error) if is_comm_failure(&error) => return Err(error),
             result => result,
         };
-        let local = (|| {
-            self.validate_tensor_parallel_execution_support(plan)?;
-            let Some(captured) = self.tape.borrow_mut().take() else {
-                bail!(
-                    "Gemma4GradModel::backward_tensor_parallel: activation checkpointing is on \
-                     but no tape exists"
-                )
-            };
-            if !adapters_match {
-                bail!(
-                    "Gemma4GradModel::backward_tensor_parallel: adapter enabled state differs \
-                     across tensor-parallel ranks"
-                )
-            }
-            adapter_values_match?;
-            if captured.execution != Gemma4RematExecution::TensorParallel(plan) {
-                bail!(
-                    "Gemma4GradModel::backward_tensor_parallel: pending tape execution {:?} does \
-                     not match live tensor-parallel rank {}/world {}",
-                    captured.execution,
-                    plan.rank(),
-                    plan.world_size()
-                )
-            }
-            let tape = captured.tape;
-            let expected_segments = self.layers.len() * 2;
-            if tape.segments() != expected_segments {
-                bail!(
-                    "Gemma4GradModel::backward_tensor_parallel: tape has {} sublayer segments, \
-                     expected {} for {} layers",
-                    tape.segments(),
-                    expected_segments,
-                    self.layers.len()
-                )
-            }
-            if tape.adapter_enabled() != self.adapter_enabled {
-                bail!(
-                    "Gemma4GradModel::backward_tensor_parallel: adapter toggle changed between \
-                     forward and backward"
-                )
-            }
-            let l = tape.first_boundary_dims().map(|d| d[1]).unwrap_or_default();
-            let masks = masks_at(0, l, self.sliding_window, self.dtype, &self.device)?;
-            let prepared = prepare_stitched_backward(loss, &tape)?;
-            Ok((tape, masks, prepared))
-        })();
-        let (tape, masks, prepared) = if plan.is_sharded() {
-            let failed_local = if local.is_err() { 1.0 } else { 0.0 };
-            let failed_global = comm_to_candle(comm.all_reduce_scalar_sum(failed_local))?;
-            match local {
-                Err(error) => return Err(error),
-                Ok(_) if failed_global > 0.0 => {
+        let (tape, masks, prepared) = coordinate_local_candle_call(
+            comm,
+            "Gemma4 tensor-parallel backward readiness",
+            || {
+                #[cfg(test)]
+                maybe_inject_tensor_parallel_local_stage_failure(
+                    "Gemma4 tensor-parallel backward readiness",
+                )?;
+                self.validate_tensor_parallel_execution_support(plan)?;
+                let Some(captured) = self.tape.borrow_mut().take() else {
                     bail!(
-                        "Gemma4GradModel::backward_tensor_parallel: backward readiness failed on \
-                         a peer tensor-parallel rank; aborting before rematerialization replay"
+                        "Gemma4GradModel::backward_tensor_parallel: activation checkpointing is \
+                         on but no tape exists"
+                    )
+                };
+                if !adapters_match {
+                    bail!(
+                        "Gemma4GradModel::backward_tensor_parallel: adapter enabled state differs \
+                         across tensor-parallel ranks"
                     )
                 }
-                Ok(ready) => ready,
-            }
-        } else {
-            local?
-        };
+                adapter_values_match?;
+                if captured.execution != Gemma4RematExecution::TensorParallel(plan) {
+                    bail!(
+                        "Gemma4GradModel::backward_tensor_parallel: pending tape execution {:?} \
+                         does not match live tensor-parallel rank {}/world {}",
+                        captured.execution,
+                        plan.rank(),
+                        plan.world_size()
+                    )
+                }
+                let tape = captured.tape;
+                let expected_segments = self.layers.len() * 2;
+                if tape.segments() != expected_segments {
+                    bail!(
+                        "Gemma4GradModel::backward_tensor_parallel: tape has {} sublayer \
+                         segments, expected {} for {} layers",
+                        tape.segments(),
+                        expected_segments,
+                        self.layers.len()
+                    )
+                }
+                if tape.adapter_enabled() != self.adapter_enabled {
+                    bail!(
+                        "Gemma4GradModel::backward_tensor_parallel: adapter toggle changed \
+                         between forward and backward"
+                    )
+                }
+                let l = tape.first_boundary_dims().map(|d| d[1]).unwrap_or_default();
+                let masks = masks_at(0, l, self.sliding_window, self.dtype, &self.device)?;
+                let prepared = prepare_stitched_backward(loss, &tape)?;
+                Ok((tape, masks, prepared))
+            },
+        )?;
         finish_stitched_backward_with_cotangent(
             prepared,
             &tape,
@@ -2011,6 +2152,19 @@ impl Gemma4GradModel {
                 }
             },
             |_, cot| all_reduce_sum_value(cot, plan, comm),
+            |i, local_vjp| {
+                coordinate_local_candle_call(
+                    comm,
+                    &format!("Gemma4 tensor-parallel segment {i} local VJP"),
+                    || {
+                        #[cfg(test)]
+                        maybe_inject_tensor_parallel_local_stage_failure(
+                            "Gemma4 tensor-parallel local VJP",
+                        )?;
+                        local_vjp
+                    },
+                )
+            },
         )
     }
 
@@ -2365,62 +2519,70 @@ impl Gemma4MergedAttention {
         plan: TensorParallelPlan,
         comm: &dyn Comm,
     ) -> CandleResult<Tensor> {
-        let (b, l, _) = x.dims3()?;
-        let in_dtype = x.dtype();
-        let heads = tp_shard(plan, "num_attention_heads", self.num_heads)?.len;
-        let kv_heads = tp_shard(plan, "num_key_value_heads", self.num_kv_heads)?.len;
-        let attn_hidden = heads * self.head_dim;
-
-        let q = self
-            .q_weight
-            .column_parallel_forward(x, plan, "attention_q_out")?;
-        let k_raw = self
-            .k_weight
-            .column_parallel_forward(x, plan, "attention_k_out")?;
-        let v_raw = match &self.v_weight {
-            Some(w) => w.column_parallel_forward(x, plan, "attention_v_out")?,
-            None => k_raw.clone(),
-        };
-
-        let q = q.reshape((b, l, heads, self.head_dim))?;
-        let k = k_raw.reshape((b, l, kv_heads, self.head_dim))?;
-        let v = v_raw.reshape((b, l, kv_heads, self.head_dim))?;
-        let q = self.q_norm.forward(&q)?.transpose(1, 2)?;
-        let k = self.k_norm.forward(&k)?;
-        let v = self.v_norm.forward(&v)?.transpose(1, 2)?;
-        let k = rot.apply(self.kind, &k.transpose(1, 2)?, offset, l)?;
-        let q = rot.apply(self.kind, &q, offset, l)?;
-        let (k, v, key_start) = self.cache.append(&k, &v.contiguous()?)?;
-        let sliding_mask = if self.kind == Gemma4LayerType::SlidingAttention {
-            Some(attention_mask_for_keys(
-                offset,
-                l,
-                key_start,
-                k.dim(2)?,
-                self.cache.max_retained,
-                in_dtype,
-                x.device(),
-            )?)
-        } else {
-            None
-        };
-        let mask = sliding_mask.as_ref().or(mask);
-        let k = repeat_kv(&k, self.num_kv_groups)?.contiguous()?;
-        let v = repeat_kv(&v, self.num_kv_groups)?.contiguous()?;
-        let mut scores = q.contiguous()?.matmul(&k.transpose(2, 3)?.contiguous()?)?;
-        if let Some(m) = mask {
-            scores = scores.broadcast_add(m)?;
-        }
-        let probs = softmax(&scores.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(in_dtype)?;
-        let ctx = probs.matmul(&v)?;
-        let ctx = ctx
-            .transpose(1, 2)?
-            .contiguous()?
-            .reshape((b, l, attn_hidden))?;
-        let partial = self.o_weight.row_parallel_forward_partial_from_shard(
-            &ctx,
+        let partial = coordinate_tensor_parallel_local_call(
             plan,
-            "attention_hidden",
+            Some(comm),
+            "Gemma4 cached attention payload staging",
+            || {
+                let (b, l, _) = x.dims3()?;
+                let in_dtype = x.dtype();
+                let heads = tp_shard(plan, "num_attention_heads", self.num_heads)?.len;
+                let kv_heads = tp_shard(plan, "num_key_value_heads", self.num_kv_heads)?.len;
+                let attn_hidden = heads * self.head_dim;
+
+                let q = self
+                    .q_weight
+                    .column_parallel_forward(x, plan, "attention_q_out")?;
+                let k_raw = self
+                    .k_weight
+                    .column_parallel_forward(x, plan, "attention_k_out")?;
+                let v_raw = match &self.v_weight {
+                    Some(w) => w.column_parallel_forward(x, plan, "attention_v_out")?,
+                    None => k_raw.clone(),
+                };
+
+                let q = q.reshape((b, l, heads, self.head_dim))?;
+                let k = k_raw.reshape((b, l, kv_heads, self.head_dim))?;
+                let v = v_raw.reshape((b, l, kv_heads, self.head_dim))?;
+                let q = self.q_norm.forward(&q)?.transpose(1, 2)?;
+                let k = self.k_norm.forward(&k)?;
+                let v = self.v_norm.forward(&v)?.transpose(1, 2)?;
+                let k = rot.apply(self.kind, &k.transpose(1, 2)?, offset, l)?;
+                let q = rot.apply(self.kind, &q, offset, l)?;
+                let (k, v, key_start) = self.cache.append(&k, &v.contiguous()?)?;
+                let sliding_mask = if self.kind == Gemma4LayerType::SlidingAttention {
+                    Some(attention_mask_for_keys(
+                        offset,
+                        l,
+                        key_start,
+                        k.dim(2)?,
+                        self.cache.max_retained,
+                        in_dtype,
+                        x.device(),
+                    )?)
+                } else {
+                    None
+                };
+                let mask = sliding_mask.as_ref().or(mask);
+                let k = repeat_kv(&k, self.num_kv_groups)?.contiguous()?;
+                let v = repeat_kv(&v, self.num_kv_groups)?.contiguous()?;
+                let mut scores = q.contiguous()?.matmul(&k.transpose(2, 3)?.contiguous()?)?;
+                if let Some(m) = mask {
+                    scores = scores.broadcast_add(m)?;
+                }
+                let probs =
+                    softmax(&scores.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(in_dtype)?;
+                let ctx = probs.matmul(&v)?;
+                let ctx = ctx
+                    .transpose(1, 2)?
+                    .contiguous()?
+                    .reshape((b, l, attn_hidden))?;
+                self.o_weight.row_parallel_forward_partial_from_shard(
+                    &ctx,
+                    plan,
+                    "attention_hidden",
+                )
+            },
         )?;
         reduce_row_parallel_output(&partial, plan, Some(comm))
     }
@@ -2474,17 +2636,24 @@ impl Gemma4MergedMlp {
         plan: TensorParallelPlan,
         comm: &dyn Comm,
     ) -> CandleResult<Tensor> {
-        let g = self
-            .gate_weight
-            .column_parallel_forward(x, plan, "intermediate_size")?;
-        let u = self
-            .up_weight
-            .column_parallel_forward(x, plan, "intermediate_size")?;
-        let h = self.act.forward(&g)?.broadcast_mul(&u)?;
-        let partial = self.down_weight.row_parallel_forward_partial_from_shard(
-            &h,
+        let partial = coordinate_tensor_parallel_local_call(
             plan,
-            "intermediate_size",
+            Some(comm),
+            "Gemma4 cached MLP payload staging",
+            || {
+                let g = self
+                    .gate_weight
+                    .column_parallel_forward(x, plan, "intermediate_size")?;
+                let u = self
+                    .up_weight
+                    .column_parallel_forward(x, plan, "intermediate_size")?;
+                let h = self.act.forward(&g)?.broadcast_mul(&u)?;
+                self.down_weight.row_parallel_forward_partial_from_shard(
+                    &h,
+                    plan,
+                    "intermediate_size",
+                )
+            },
         )?;
         reduce_row_parallel_output(&partial, plan, Some(comm))
     }
@@ -2548,17 +2717,37 @@ impl Gemma4MergedLayer {
         plan: TensorParallelPlan,
         comm: &dyn Comm,
     ) -> CandleResult<Tensor> {
-        let h = self.input_layernorm.forward(x)?;
+        let h = coordinate_tensor_parallel_local_call(
+            plan,
+            Some(comm),
+            "Gemma4 cached attention boundary preparation",
+            || self.input_layernorm.forward(x),
+        )?;
         let h =
             self.attn
                 .forward_tensor_parallel(&h, offset, masks.get(self.kind), rot, plan, comm)?;
-        let h = self.post_attention_layernorm.forward(&h)?;
-        let x = x.broadcast_add(&h)?;
-        let h2 = self.pre_feedforward_layernorm.forward(&x)?;
+        let (x, h2) = coordinate_tensor_parallel_local_call(
+            plan,
+            Some(comm),
+            "Gemma4 cached attention boundary completion",
+            || {
+                let h = self.post_attention_layernorm.forward(&h)?;
+                let x = x.broadcast_add(&h)?;
+                let h2 = self.pre_feedforward_layernorm.forward(&x)?;
+                Ok((x, h2))
+            },
+        )?;
         let h2 = self.mlp.forward_tensor_parallel(&h2, plan, comm)?;
-        let h2 = self.post_feedforward_layernorm.forward(&h2)?;
-        let x = x.broadcast_add(&h2)?;
-        x.broadcast_mul(&self.layer_scalar)
+        coordinate_tensor_parallel_local_call(
+            plan,
+            Some(comm),
+            "Gemma4 cached MLP boundary completion",
+            || {
+                let h2 = self.post_feedforward_layernorm.forward(&h2)?;
+                let x = x.broadcast_add(&h2)?;
+                x.broadcast_mul(&self.layer_scalar)
+            },
+        )
     }
 
     fn reset_cache(&mut self) {
@@ -2653,33 +2842,47 @@ impl Gemma4MergedDecoder {
         offset: usize,
         comm: &dyn Comm,
     ) -> CandleResult<Tensor> {
-        let plan = plan_from_comm(comm)?;
-        self.validate_tensor_parallel_execution_support(plan)?;
-        let (b, l) = input_ids.dims2()?;
-        let cached = self
-            .layers
-            .first()
-            .map_or(0, |layer| layer.attn.current_seq_len());
-        if offset != cached {
-            bail!(
-                "Gemma4MergedDecoder::forward_tensor_parallel: offset {offset} != cached \
-                 sequence length {cached}"
-            );
-        }
-        self.validate_tensor_parallel_plan(plan)?;
-        let ids = input_ids.flatten_all()?;
-        let mut h = (self
-            .embed
-            .index_select(&ids, 0)?
-            .reshape((b, l, self.hidden))?
-            * self.embed_scale)?;
-        let masks = merged_masks_at(offset, l, self.dtype, &self.device)?;
+        let (plan, mut h, masks) = coordinate_local_candle_call(
+            comm,
+            "Gemma4 cached tensor-parallel input staging",
+            || {
+                let plan = plan_from_comm(comm)?;
+                self.validate_tensor_parallel_execution_support(plan)?;
+                let (b, l) = input_ids.dims2()?;
+                let cached = self
+                    .layers
+                    .first()
+                    .map_or(0, |layer| layer.attn.current_seq_len());
+                if offset != cached {
+                    bail!(
+                        "Gemma4MergedDecoder::forward_tensor_parallel: offset {offset} != cached \
+                         sequence length {cached}"
+                    );
+                }
+                self.validate_tensor_parallel_plan(plan)?;
+                let ids = input_ids.flatten_all()?;
+                let h = (self
+                    .embed
+                    .index_select(&ids, 0)?
+                    .reshape((b, l, self.hidden))?
+                    * self.embed_scale)?;
+                let masks = merged_masks_at(offset, l, self.dtype, &self.device)?;
+                Ok((plan, h, masks))
+            },
+        )?;
         for layer in &mut self.layers {
             h = layer.forward_tensor_parallel(&h, offset, &masks, &self.rot, plan, comm)?;
         }
-        let h = self.norm.forward(&h)?;
-        let logits = frozen_linear(&h, &self.embed)?;
-        softcap(&logits, self.final_logit_softcap)
+        coordinate_tensor_parallel_local_call(
+            plan,
+            Some(comm),
+            "Gemma4 cached tensor-parallel output staging",
+            || {
+                let h = self.norm.forward(&h)?;
+                let logits = frozen_linear(&h, &self.embed)?;
+                softcap(&logits, self.final_logit_softcap)
+            },
+        )
     }
 
     fn validate_tensor_parallel_plan(&self, plan: TensorParallelPlan) -> CandleResult<()> {
@@ -3646,7 +3849,7 @@ mod tests {
         for (rank, error) in errors {
             if rank == 0 {
                 assert!(error.contains("readiness failed on a peer"), "{error}");
-                assert!(error.contains("before rematerialization replay"), "{error}");
+                assert!(error.contains("before the next collective"), "{error}");
             } else {
                 assert!(
                     error.contains("does not reach the tape's tail boundary"),
@@ -3940,6 +4143,36 @@ mod tests {
         tensor_payload_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
+    #[derive(Debug)]
+    struct CountingTensorComm {
+        inner: LocalComm,
+        tensor_payload_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Comm for CountingTensorComm {
+        fn rank(&self) -> usize {
+            self.inner.rank()
+        }
+
+        fn world_size(&self) -> usize {
+            self.inner.world_size()
+        }
+
+        fn validate_all_reduce_sum(&self, tensors: &[Tensor]) -> Result<(), CommError> {
+            self.inner.validate_all_reduce_sum(tensors)
+        }
+
+        fn all_reduce_sum(&self, tensors: &mut Vec<Tensor>) -> Result<(), CommError> {
+            self.tensor_payload_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.all_reduce_sum(tensors)
+        }
+
+        fn all_reduce_scalar_sum(&self, value: f64) -> Result<f64, CommError> {
+            self.inner.all_reduce_scalar_sum(value)
+        }
+    }
+
     impl Comm for WrongDeviceComm {
         fn rank(&self) -> usize {
             self.inner.rank()
@@ -3967,6 +4200,180 @@ mod tests {
 
         fn all_reduce_scalar_sum(&self, value: f64) -> Result<f64, CommError> {
             self.inner.all_reduce_scalar_sum(value)
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn gemma4_builtin_forward_stages_coordinate_asymmetric_errors_and_panics() {
+        for (cached, stage) in [
+            (false, "Gemma4 attention boundary completion"),
+            (true, "Gemma4 cached attention boundary completion"),
+        ] {
+            for panic in [false, true] {
+                let mut cfg = tiny_cfg();
+                cfg.text_config.num_key_value_heads = 2;
+                cfg.text_config.num_global_key_value_heads = 2;
+                cfg.validate().unwrap();
+                let weights = weight_map(&cfg);
+                let input = ids(4);
+                let tensor_payload_calls =
+                    std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let errors = std::thread::scope(|scope| {
+                    let handles = LocalComm::world_with_timeout(2, Duration::from_secs(2))
+                        .into_iter()
+                        .map(|inner| {
+                            let cfg = cfg.clone();
+                            let weights = weights.clone();
+                            let input = input.clone();
+                            let tensor_payload_calls = std::sync::Arc::clone(&tensor_payload_calls);
+                            scope.spawn(move || {
+                                let rank = inner.rank();
+                                let comm = CountingTensorComm {
+                                    inner,
+                                    tensor_payload_calls,
+                                };
+                                let model = Gemma4GradModel::load_with_targets(
+                                    &cfg,
+                                    &VarBuilder::from_tensors(weights, DType::F32, &dev()),
+                                    2,
+                                    4.0,
+                                    DType::F32,
+                                    DenseLoraTargets::industrial(),
+                                )
+                                .unwrap();
+                                if rank == 1 {
+                                    inject_tensor_parallel_local_stage_failure_once(stage, panic);
+                                }
+                                let result = if cached {
+                                    let mut decoder = model.merged_decoder().unwrap();
+                                    decoder.forward_tensor_parallel(&input, 0, &comm)
+                                } else {
+                                    model.forward_tensor_parallel(&input, &comm)
+                                };
+                                (
+                                    rank,
+                                    result.unwrap_err().to_string(),
+                                    tensor_parallel_local_stage_fault_consumed(),
+                                )
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    handles
+                        .into_iter()
+                        .map(|handle| handle.join().unwrap())
+                        .collect::<Vec<_>>()
+                });
+
+                for (rank, error, fault_consumed) in errors {
+                    if rank == 1 {
+                        assert!(error.contains(&format!("injected {stage}")), "{error}");
+                        assert!(fault_consumed, "{stage} injector was not consumed");
+                    } else {
+                        assert!(error.contains("failed on a peer"), "{error}");
+                    }
+                }
+                assert_eq!(
+                    tensor_payload_calls.load(std::sync::atomic::Ordering::SeqCst),
+                    2,
+                    "cached={cached} panic={panic}: a later MLP payload was entered"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn gemma4_backward_coordinates_readiness_and_local_vjp_failures_before_payloads() {
+        for (stage, expected_tensor_calls) in [
+            ("Gemma4 tensor-parallel backward readiness", 4),
+            ("Gemma4 tensor-parallel local VJP", 6),
+        ] {
+            for panic in [false, true] {
+                let mut cfg = tiny_cfg();
+                cfg.text_config.num_key_value_heads = 2;
+                cfg.text_config.num_global_key_value_heads = 2;
+                cfg.validate().unwrap();
+                let weights = weight_map(&cfg);
+                let input = ids(4);
+                let tensor_payload_calls =
+                    std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+                let errors = std::thread::scope(|scope| {
+                    let handles = LocalComm::world_with_timeout(2, Duration::from_secs(2))
+                        .into_iter()
+                        .map(|inner| {
+                            let cfg = cfg.clone();
+                            let weights = weights.clone();
+                            let input = input.clone();
+                            let tensor_payload_calls = std::sync::Arc::clone(&tensor_payload_calls);
+                            let barrier = std::sync::Arc::clone(&barrier);
+                            scope.spawn(move || {
+                                let rank = inner.rank();
+                                let comm = CountingTensorComm {
+                                    inner,
+                                    tensor_payload_calls: std::sync::Arc::clone(
+                                        &tensor_payload_calls,
+                                    ),
+                                };
+                                let mut model = Gemma4GradModel::load_with_targets(
+                                    &cfg,
+                                    &VarBuilder::from_tensors(weights, DType::F32, &dev()),
+                                    2,
+                                    4.0,
+                                    DType::F32,
+                                    DenseLoraTargets::industrial(),
+                                )
+                                .unwrap();
+                                arm_adapter_deterministic(&model);
+                                model.set_activation_checkpointing(true);
+                                let loss = model
+                                    .forward_tensor_parallel(&input, &comm)
+                                    .unwrap()
+                                    .sqr()
+                                    .unwrap()
+                                    .sum_all()
+                                    .unwrap();
+                                barrier.wait();
+                                if rank == 0 {
+                                    tensor_payload_calls
+                                        .store(0, std::sync::atomic::Ordering::SeqCst);
+                                }
+                                barrier.wait();
+                                if rank == 1 {
+                                    inject_tensor_parallel_local_stage_failure_once(stage, panic);
+                                }
+                                (
+                                    rank,
+                                    model
+                                        .backward_tensor_parallel(&loss, &comm)
+                                        .unwrap_err()
+                                        .to_string(),
+                                    tensor_parallel_local_stage_fault_consumed(),
+                                )
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    handles
+                        .into_iter()
+                        .map(|handle| handle.join().unwrap())
+                        .collect::<Vec<_>>()
+                });
+
+                for (rank, error, fault_consumed) in errors {
+                    if rank == 1 {
+                        assert!(error.contains(&format!("injected {stage}")), "{error}");
+                        assert!(fault_consumed, "{stage} injector was not consumed");
+                    } else {
+                        assert!(error.contains("failed on a peer"), "{error}");
+                    }
+                }
+                assert_eq!(
+                    tensor_payload_calls.load(std::sync::atomic::Ordering::SeqCst),
+                    expected_tensor_calls,
+                    "stage={stage} panic={panic}: a later backward payload was entered"
+                );
+            }
         }
     }
 
@@ -4098,10 +4505,11 @@ mod tests {
                             .unwrap()
                             .sum_all()
                             .unwrap();
-                        // Backward performs activation-checkpointing and adapter-enabled
-                        // consensus before adapter payload validation. Fail that validation's
-                        // first collective and prove readiness never performs another one.
-                        comm.arm_after(2);
+                        // Backward performs plan, activation-checkpointing, adapter-enabled,
+                        // and local adapter-state coordination before adapter payload
+                        // validation. Fail that validation's first status collective and prove
+                        // readiness never performs another one.
+                        comm.arm_after(4);
                         let error = model.backward_tensor_parallel(&loss, &comm).unwrap_err();
                         assert!(is_comm_failure(&error), "{error}");
                         error.to_string()

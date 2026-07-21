@@ -172,6 +172,7 @@ struct StatefulScriptedPolicy {
     inner: ScriptedPolicy,
     sampler_epoch: u64,
     expected_tp_rank: Option<usize>,
+    tp_gradient_multiplier: f64,
 }
 
 impl StatefulScriptedPolicy {
@@ -182,11 +183,17 @@ impl StatefulScriptedPolicy {
             inner: ScriptedPolicy::new(seed)?,
             sampler_epoch,
             expected_tp_rank: None,
+            tp_gradient_multiplier: 1.0,
         })
     }
 
     fn expect_tp_rank(mut self, rank: usize) -> Self {
         self.expected_tp_rank = Some(rank);
+        self
+    }
+
+    fn with_tp_gradient_multiplier(mut self, multiplier: f64) -> Self {
+        self.tp_gradient_multiplier = multiplier;
         self
     }
 }
@@ -292,11 +299,10 @@ impl TensorParallelPolicy for StatefulScriptedPolicy {
         comm: &dyn Comm,
     ) -> CandleResult<Tensor> {
         let full = self.token_logprobs(rollout)?;
-        let denominator = (comm.world_size() * (comm.world_size() + 1) / 2) as f64;
-        let coefficient = (comm.rank() + 1) as f64 / denominator;
+        let coefficient = self.tp_gradient_multiplier / comm.world_size() as f64;
         let partial = full.affine(coefficient, 0.0)?;
-        let correction = full.broadcast_sub(&partial)?.detach();
-        partial.broadcast_add(&correction)
+        let gradient_carrier = partial.broadcast_sub(&partial.detach())?;
+        full.detach().broadcast_add(&gradient_carrier)
     }
 
     fn token_logprobs_tensor_parallel_detached(
@@ -3136,12 +3142,55 @@ fn package_file_bytes(path: &Path) -> Vec<(String, Vec<u8>)> {
     files
 }
 
+fn run_stateful_world_one_reference(
+    base: &Path,
+    cfg: &TrainerConfig,
+    samples: &[Sample<()>],
+) -> StatefulTpRank {
+    let checkpoint_root = base.join("tp-world-one-reference-checkpoints");
+    let mut policy = StatefulScriptedPolicy::new(SEED, 0).unwrap();
+    let initial_adapter = var_bits(&policy);
+    let run = RunDir::create(base, "tp-world-one-reference").unwrap();
+    let metrics_path = run.metrics_path().to_path_buf();
+    let mut trainer = Trainer::new(cfg.clone(), &run)
+        .unwrap()
+        .with_checkpoints_dir(&checkpoint_root);
+    let metrics = trainer
+        .train(&mut policy, &EchoOrFlatReward, &CharTokenizer, samples)
+        .unwrap()
+        .0;
+    let loaded = ferrl::load_checkpoint(
+        checkpoint_root.join(format!("step-{}", cfg.steps)),
+        &policy.trainable_vars(),
+    )
+    .unwrap();
+    StatefulTpRank {
+        initial_adapter,
+        adapter: var_bits(&policy),
+        metrics,
+        metrics_rows: ferrl::read_metrics(metrics_path).unwrap().len(),
+        sampler: policy.sampler_state().unwrap(),
+        optimizer: optimizer_bits(&loaded.optimizer_state.unwrap()),
+        lineages: Vec::new(),
+    }
+}
+
 fn run_stateful_direct_tp(
     base: &Path,
     cfg: &TrainerConfig,
     samples: &[Sample<()>],
 ) -> Vec<StatefulTpRank> {
-    let checkpoint_root = base.join("tp-direct-checkpoints");
+    run_stateful_direct_tp_scaled(base, cfg, samples, "tp-direct", 1.0)
+}
+
+fn run_stateful_direct_tp_scaled(
+    base: &Path,
+    cfg: &TrainerConfig,
+    samples: &[Sample<()>],
+    tag: &str,
+    tp_gradient_multiplier: f64,
+) -> Vec<StatefulTpRank> {
+    let checkpoint_root = base.join(format!("{tag}-checkpoints"));
     let comms = LocalComm::world_with_timeout(2, std::time::Duration::from_secs(20));
     std::thread::scope(|scope| {
         let handles: Vec<_> = comms
@@ -3151,11 +3200,14 @@ fn run_stateful_direct_tp(
                 let samples = samples.to_vec();
                 let base = base.to_path_buf();
                 let checkpoint_root = checkpoint_root.clone();
+                let tag = tag.to_owned();
                 scope.spawn(move || {
                     let rank = comm.rank();
-                    let mut policy = StatefulScriptedPolicy::new(SEED, 0).unwrap();
+                    let mut policy = StatefulScriptedPolicy::new(SEED, 0)
+                        .unwrap()
+                        .with_tp_gradient_multiplier(tp_gradient_multiplier);
                     let initial_adapter = var_bits(&policy);
-                    let run = RunDir::create(&base, format!("tp-direct-rank{rank}")).unwrap();
+                    let run = RunDir::create(&base, format!("{tag}-rank{rank}")).unwrap();
                     let metrics_path = run.metrics_path().to_path_buf();
                     let mut trainer = Trainer::new(cfg.clone(), &run)
                         .unwrap()
@@ -3346,13 +3398,17 @@ fn world_two_tensor_parallel_rollout_ledger_matches_direct_across_restart() {
         beta: 0.0,
         mu: 2,
         checkpoint_every: Some(1),
+        max_grad_norm: None,
         reward_group_scope: RewardGroupScope::Local,
         ..scripted_cfg()
     };
     let samples = live_samples();
     let policy_sha256 = format!("{:064x}", 89);
+    let reference = run_stateful_world_one_reference(tmp.path(), &cfg, &samples);
     let direct = run_stateful_direct_tp(tmp.path(), &cfg, &samples);
     let separated = run_stateful_separated_tp(tmp.path(), &cfg, &samples, &policy_sha256);
+    let wrong_scaled =
+        run_stateful_direct_tp_scaled(tmp.path(), &cfg, &samples, "tp-wrong-scale", 0.5);
 
     assert_eq!(direct.len(), 2);
     assert_eq!(separated.len(), 2);
@@ -3374,6 +3430,12 @@ fn world_two_tensor_parallel_rollout_ledger_matches_direct_across_restart() {
         .all(|pair| pair[0] != pair[1]));
 
     for rank in 0..2 {
+        assert_eq!(direct[rank].adapter, reference.adapter);
+        assert_eq!(direct[rank].optimizer, reference.optimizer);
+        assert_eq!(separated[rank].adapter, reference.adapter);
+        assert_eq!(separated[rank].optimizer, reference.optimizer);
+        assert_eq!(direct[rank].sampler, reference.sampler);
+        assert_eq!(separated[rank].sampler, reference.sampler);
         assert_eq!(separated[rank].adapter, direct[rank].adapter);
         assert_eq!(separated[rank].optimizer, direct[rank].optimizer);
         assert_eq!(separated[rank].sampler, direct[rank].sampler);
@@ -3399,6 +3461,7 @@ fn world_two_tensor_parallel_rollout_ledger_matches_direct_across_restart() {
     assert_eq!(direct[1].metrics_rows, 0);
     assert_eq!(separated[0].metrics_rows, cfg.steps as usize);
     assert_eq!(separated[1].metrics_rows, 0);
+    assert_ne!(reference.adapter, reference.initial_adapter);
     assert_ne!(separated[0].adapter, separated[0].initial_adapter);
     assert_ne!(
         separated[0].sampler,
@@ -3413,6 +3476,25 @@ fn world_two_tensor_parallel_rollout_ledger_matches_direct_across_restart() {
         .iter()
         .flatten()
         .any(|bits| *bits != 0.0_f32.to_bits()));
+    assert!(reference
+        .optimizer
+        .1
+        .iter()
+        .flatten()
+        .any(|bits| *bits != 0.0_f32.to_bits()));
+    assert!(reference
+        .optimizer
+        .2
+        .iter()
+        .flatten()
+        .any(|bits| *bits != 0.0_f32.to_bits()));
+    assert!(reference.metrics.iter().all(|row| row.grad_norm > 0.0));
+    assert_ne!(wrong_scaled[0].optimizer, reference.optimizer);
+    assert!(
+        wrong_scaled[0].adapter != reference.adapter
+            || wrong_scaled[0].optimizer != reference.optimizer,
+        "wrong tensor-parallel gradient scaling escaped the semantic oracle"
+    );
     assert!(separated[0]
         .optimizer
         .2
