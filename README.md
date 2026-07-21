@@ -538,10 +538,11 @@ sampling, readback, and telemetry work at every TP collective boundary.
 Because format v4 does not carry
 composable collector performance measurements, the ordinary
 whole-window timing, throughput, GPU-memory, and decoder-cache fields are written
-as explicitly unmeasured rather than populated from learner-only work. Non-finite logprobs,
-advantages, and resolved controls fail closed, while non-finite rewards retain the
-trainer's existing zero-advantage hardening. Unknown ledger manifest and payload
-fields are rejected. Rank-local metrics append is transactional under DP: if
+as explicitly unmeasured rather than populated from learner-only work. Non-finite
+rewards, logprobs, advantages, and resolved controls fail closed; invalid rewards
+are rejected before candidate/ledger publication, statistics, advantages, metrics,
+or learner scoring. Unknown ledger manifest and payload fields are rejected.
+Rank-local metrics append is transactional under DP: if
 any rank fails, successful peers truncate to their exact pre-append boundary
 before model, Adam, and sampler rollback.
 

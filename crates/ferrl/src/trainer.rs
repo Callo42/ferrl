@@ -83,7 +83,7 @@ use crate::grpo::{
 use crate::nn::grad_coverage;
 use crate::optim::{FerrlAdamW, OptimizerState};
 use crate::policy::{GenConfig, Policy, Rollout, TensorParallelPolicy};
-use crate::reward::{RewardError, RewardFn, RewardOutcome};
+use crate::reward::{validate_reward_values, RewardError, RewardFn, RewardOutcome};
 use crate::rollout_ledger::{
     LedgerScoreRequirement, RolloutLedgerControls, RolloutLedgerError, RolloutLedgerExpectations,
     RolloutLedgerGroup, RolloutLedgerGroupScope, RolloutLedgerIdentity, RolloutLedgerReader,
@@ -115,8 +115,8 @@ pub enum TrainerError {
     /// number of completions).
     #[error("contract violation: {0}")]
     Contract(String),
-    /// A [`RewardFn`] could not compute a reward — its (possibly external)
-    /// verifier failed (a sandbox, IO, network, or judge error).
+    /// A [`RewardFn`] could not compute a finite reward — its (possibly external)
+    /// verifier failed or returned a non-finite value.
     #[error(transparent)]
     Reward(#[from] RewardError),
     /// Writing a periodic adapter checkpoint failed.
@@ -6630,6 +6630,8 @@ impl Trainer {
                     outcomes.len()
                 )));
             }
+            let rewards: Vec<f32> = outcomes.iter().map(|outcome| outcome.reward).collect();
+            validate_reward_values(&rewards)?;
             Ok(outcomes)
         };
 
@@ -6731,7 +6733,14 @@ impl Trainer {
                 let sumsq = self.comm.all_reduce_scalar_sum(local.sumsq)?;
                 let global = self.coordinate_data_parallel_result(
                     "distributed reward-statistics reduction",
-                    Ok(RewardStatsAcc { count, sum, sumsq }),
+                    if count.is_finite() && sum.is_finite() && sumsq.is_finite() && sumsq >= 0.0 {
+                        Ok(RewardStatsAcc { count, sum, sumsq })
+                    } else {
+                        Err(TrainerError::Contract(
+                            "distributed reward statistics must be finite with nonnegative sumsq"
+                                .into(),
+                        ))
+                    },
                 )?;
                 let count = exact_reduced_u64("distributed reward count", global.count)?;
                 Ok((
@@ -7265,8 +7274,7 @@ impl Trainer {
         m.reward_mean = mean;
         m.reward_std = std;
         // Fraction of the window's groups that were degenerate no-ops — tied to the
-        // same condition that drove each skip, so metric and optimizer never disagree
-        // (covers all-non-finite groups too, forced to all-zero advantages).
+        // same condition that drove each skip, so metric and optimizer never disagree.
         let degenerate = stats.iter().filter(|s| s.degenerate).count();
         m.frac_reward_zero_std = degenerate as f32 / stats.len() as f32;
         m.completion_len = stats.iter().map(|s| s.completion_len).sum::<f32>() / stats.len() as f32;
@@ -7379,16 +7387,10 @@ fn canonical_tensor_bytes<'a>(
     })
 }
 
-/// Candidate ledger ordering: higher finite reward first; non-finite rewards sort
-/// after every finite candidate so a verifier glitch cannot hide the best usable
-/// completion.
+/// Candidate ledger ordering after reward validation: higher reward first.
 fn candidate_reward_order(a: f32, b: f32) -> std::cmp::Ordering {
-    match (a.is_finite(), b.is_finite()) {
-        (true, true) => b.total_cmp(&a),
-        (true, false) => std::cmp::Ordering::Less,
-        (false, true) => std::cmp::Ordering::Greater,
-        (false, false) => a.total_cmp(&b),
-    }
+    debug_assert!(a.is_finite() && b.is_finite());
+    b.total_cmp(&a)
 }
 
 /// A window's folded rollout-ratio telemetry (see [`fold_ratio_stats`]).
@@ -7836,24 +7838,39 @@ fn mean_completion_len(rollout: &Rollout) -> f32 {
     total as f32 / rollout.len() as f32
 }
 
-/// Reward `(mean, population-std)` over the **finite** rewards in a group. A
-/// non-finite reward is ignored — mirroring [`group_advantages`], which drops it
-/// from the group statistics — so one bad completion does not collapse the
-/// headline metric. A group with no finite rewards reports `(0, 0)`.
+/// Reward `(mean, population-std)` over an already validated reward group.
 fn reward_stats(rewards: &[f32]) -> (f32, f32) {
-    let finite: Vec<f32> = rewards.iter().copied().filter(|r| r.is_finite()).collect();
-    if finite.is_empty() {
+    debug_assert!(rewards.iter().all(|reward| reward.is_finite()));
+    if rewards.is_empty() {
         return (0.0, 0.0);
     }
-    let n = finite.len() as f32;
-    let mean = finite.iter().sum::<f32>() / n;
-    let var = finite.iter().map(|&r| (r - mean).powi(2)).sum::<f32>() / n;
-    (mean, var.sqrt())
+    let n = rewards.len() as f32;
+    let mean = rewards.iter().sum::<f32>() / n;
+    let var = rewards
+        .iter()
+        .map(|&reward| (reward - mean).powi(2))
+        .sum::<f32>()
+        / n;
+    if mean.is_finite() && var.is_finite() {
+        return (mean, var.sqrt());
+    }
+
+    // Keep existing f32 arithmetic for ordinary groups and widen only when a
+    // finite reward set overflowed an intermediate sum or square.
+    let n = rewards.len() as f64;
+    let mean = rewards.iter().map(|&reward| f64::from(reward)).sum::<f64>() / n;
+    let var = rewards
+        .iter()
+        .map(|&reward| (f64::from(reward) - mean).powi(2))
+        .sum::<f64>()
+        / n;
+    (mean as f32, var.sqrt() as f32)
 }
 
 impl RewardStatsAcc {
     fn from_rewards(rewards: &[f64]) -> Self {
-        rewards.iter().copied().filter(|r| r.is_finite()).fold(
+        debug_assert!(rewards.iter().all(|reward| reward.is_finite()));
+        rewards.iter().copied().fold(
             Self {
                 count: 0.0,
                 sum: 0.0,
@@ -7889,17 +7906,7 @@ fn advantages_from_stats(rewards: &[f64], stats: RewardStatsAcc, scale: ScaleRew
         ScaleRewards::None => 1.0,
         ScaleRewards::Group => std + GROUP_STD_EPS,
     };
-    rewards
-        .iter()
-        .map(|&r| {
-            let a = (r - mean) / denom;
-            if a.is_finite() {
-                a
-            } else {
-                0.0
-            }
-        })
-        .collect()
+    rewards.iter().map(|&r| (r - mean) / denom).collect()
 }
 
 /// The raw importance ratio `exp(logp - logp_old)`. At `mu = 1` the snapshot
@@ -9784,7 +9791,7 @@ mod tests {
 
     #[test]
     fn distributed_reward_group_stats_match_local_for_one_rank() {
-        let rewards = [1.0, f64::NAN, 3.0];
+        let rewards = [1.0, 2.0, 3.0];
         let local = group_advantages(&rewards, ScaleRewards::Group);
         let via_stats = advantages_from_stats(
             &rewards,
@@ -10010,16 +10017,14 @@ mod tests {
     }
 
     #[test]
-    fn reward_stats_ignores_non_finite_rewards() {
-        // One bad completion must not collapse the headline metric: the finite
-        // rewards still produce mean=2, mirroring how group_advantages isolates it.
-        let (mean, std) = reward_stats(&[1.0, f32::NAN, 3.0]);
+    fn reward_stats_uses_every_validated_reward() {
+        let (mean, std) = reward_stats(&[1.0, 2.0, 3.0]);
         assert_relative_eq!(mean, 2.0, epsilon = TOL);
-        assert!(std.is_finite());
-        let (mean, _) = reward_stats(&[1.0, f32::INFINITY, 3.0]);
-        assert_relative_eq!(mean, 2.0, epsilon = TOL);
-        // No finite rewards -> (0, 0), not NaN.
-        let (mean, std) = reward_stats(&[f32::NAN, f32::NAN]);
+        assert_relative_eq!(std, (2.0_f32 / 3.0).sqrt(), epsilon = TOL);
+        let (mean, std) = reward_stats(&[f32::MAX, f32::MAX]);
+        assert_eq!(mean, f32::MAX);
+        assert_eq!(std, 0.0);
+        let (mean, std) = reward_stats(&[]);
         assert_eq!(mean, 0.0);
         assert_eq!(std, 0.0);
     }
@@ -10072,7 +10077,7 @@ mod tests {
 
         fn reward(&self, _sample: &Sample<()>, completion: &str) -> Result<f32, RewardError> {
             Ok(match completion {
-                "7,7" => f32::NAN,
+                "7,7" => 0.0,
                 "9,9" => 2.0,
                 _ => 1.0,
             })
@@ -10094,6 +10099,36 @@ mod tests {
                     })
                 })
                 .collect()
+        }
+    }
+
+    struct RankedNonFiniteReward {
+        invalid: bool,
+    }
+
+    impl RewardFn for RankedNonFiniteReward {
+        type Target = ();
+
+        fn reward(&self, _sample: &Sample<()>, _completion: &str) -> Result<f32, RewardError> {
+            unreachable!("the ranked non-finite reward test uses the detailed group seam")
+        }
+
+        fn reward_group_detailed(
+            &self,
+            _sample: &Sample<()>,
+            completions: &[String],
+        ) -> Result<Vec<RewardOutcome>, RewardError> {
+            Ok(completions
+                .iter()
+                .enumerate()
+                .map(|(index, _)| {
+                    RewardOutcome::reward(if self.invalid && index == 1 {
+                        f32::NAN
+                    } else {
+                        index as f32
+                    })
+                })
+                .collect())
         }
     }
 
@@ -10434,6 +10469,43 @@ mod tests {
             checkpoint_every: None,
             ..TrainerConfig::default()
         }
+    }
+
+    #[test]
+    fn collector_rejects_nonfinite_reward_before_candidate_or_ledger_publication() {
+        let tmp = WireTmp::new("ledger-nonfinite-reward");
+        let run = RunDir::create(&tmp.0, "run").unwrap();
+        let ledger_root = tmp.0.join("ledger");
+        let mut config = candidate_ledger_config();
+        config.candidate_log_top_k = 1;
+        let mut trainer = Trainer::new(config, &run).unwrap();
+        let mut policy = stateful_candidate_policy();
+
+        let error = trainer
+            .collect_rollout_ledger_step(
+                0,
+                &mut policy,
+                &RankedNonFiniteReward { invalid: true },
+                &CandidateCodec,
+                &[Sample::new("prompt", ())],
+                &ledger_root,
+                &"2".repeat(64),
+                None,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            TrainerError::Reward(error) if error.to_string().contains("non-finite")
+        ));
+        assert_eq!(
+            policy.sampler, 0,
+            "failed collection must roll back sampler"
+        );
+        assert!(std::fs::read_to_string(run.candidates_path())
+            .unwrap_or_default()
+            .is_empty());
+        assert!(!ledger_root.join("step-00000000000000000000").exists());
     }
 
     #[test]
@@ -12425,6 +12497,7 @@ mod tests {
     fn run_coordinated_tp_reward_case(
         modes: [CoordinatedTpRewardMode; 2],
         candidate_log_top_k: usize,
+        beta: f64,
     ) -> Vec<CoordinatedTpRunResult> {
         let tmp = WireTmp::new("tp-coordinated-reward");
         let results = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -12443,6 +12516,7 @@ mod tests {
                             group_size: 2,
                             max_new_tokens: 1,
                             lr: 0.0,
+                            beta,
                             candidate_log_top_k,
                             ..TrainerConfig::default()
                         };
@@ -13490,6 +13564,7 @@ mod tests {
                 CoordinatedTpRewardMode::Scores([2.0, 0.0]),
             ],
             2,
+            0.0,
         );
 
         assert_eq!(results[0].reward_calls, 1);
@@ -13525,6 +13600,7 @@ mod tests {
             let results = run_coordinated_tp_reward_case(
                 [mode, CoordinatedTpRewardMode::Scores([0.0, 2.0])],
                 0,
+                0.0,
             );
             assert_eq!(results[0].reward_calls, 1);
             assert_eq!(results[1].reward_calls, 0);
@@ -13550,6 +13626,41 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cognitive_complexity)] // paired invalid groups and rank-specific errors
+    fn train_tensor_parallel_rejects_nonfinite_rewards_before_candidates_or_kl_scoring() {
+        for invalid in [[1.0, f32::NAN], [f32::NEG_INFINITY, f32::INFINITY]] {
+            let results = run_coordinated_tp_reward_case(
+                [
+                    CoordinatedTpRewardMode::Scores(invalid),
+                    CoordinatedTpRewardMode::Scores([0.0, 2.0]),
+                ],
+                2,
+                0.1,
+            );
+            assert_eq!(results[0].reward_calls, 1);
+            assert_eq!(results[1].reward_calls, 0);
+            assert!(matches!(
+                results[0].result.as_ref().unwrap_err(),
+                TrainerError::Reward(error) if error.to_string().contains("non-finite")
+            ));
+            assert!(matches!(
+                results[1].result.as_ref().unwrap_err(),
+                TrainerError::Contract(message)
+                    if message.contains("reward evaluation failed on tensor-parallel execution rank 0")
+            ));
+            for result in &results {
+                assert!(
+                    result.candidates.is_empty(),
+                    "invalid rewards must not reach candidate publication"
+                );
+                assert_eq!(result.policy_calls.detached_logp, 0);
+                assert_eq!(result.policy_calls.live_logp, 0);
+                assert_eq!(result.policy_calls.backward, 0);
+            }
+        }
+    }
+
+    #[test]
     #[allow(clippy::cognitive_complexity)] // paired rank-specific panic assertions
     fn train_tensor_parallel_coordinates_primary_reward_panic() {
         let results = run_coordinated_tp_reward_case(
@@ -13558,6 +13669,7 @@ mod tests {
                 CoordinatedTpRewardMode::Scores([0.0, 2.0]),
             ],
             0,
+            0.0,
         );
         assert_eq!(results[0].reward_calls, 1);
         assert_eq!(results[1].reward_calls, 0);
@@ -13586,6 +13698,7 @@ mod tests {
                 CoordinatedTpRewardMode::Scores([0.0, 2.0]),
             ],
             0,
+            0.0,
         );
         for result in &degenerate {
             let history = &result.result.as_ref().unwrap().0;
@@ -13600,6 +13713,7 @@ mod tests {
                 CoordinatedTpRewardMode::Scores([1.0, 1.0]),
             ],
             0,
+            0.0,
         );
         for result in &live {
             let history = &result.result.as_ref().unwrap().0;
@@ -14390,6 +14504,77 @@ mod tests {
                 .and_then(|m| m.get("completion")),
             Some(&serde_json::json!("2,2"))
         );
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // explicit asymmetric two-rank abort assertions
+    fn data_parallel_nonfinite_reward_aborts_every_rank_before_publication() {
+        let tmp = WireTmp::new("dp-nonfinite-reward");
+        let results = std::thread::scope(|scope| {
+            let handles: Vec<_> =
+                crate::comm::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(2))
+                    .into_iter()
+                    .map(|comm| {
+                        let rank = comm.rank();
+                        let root = tmp.0.clone();
+                        scope.spawn(move || {
+                            let run = RunDir::create(&root, format!("rank-{rank}")).unwrap();
+                            let cfg = TrainerConfig {
+                                steps: 1,
+                                group_size: 3,
+                                max_new_tokens: 2,
+                                beta: 0.0,
+                                lr: 0.0,
+                                candidate_log_top_k: 1,
+                                ..TrainerConfig::default()
+                            };
+                            let rows: [&[f32]; 3] = [&[-1.0, -1.0], &[-1.0, -1.0], &[-1.0, -1.0]];
+                            let logp = Var::from_tensor(&mat(&rows)).unwrap();
+                            let mut policy = CandidatePolicy { logp };
+                            let mut trainer = Trainer::with_comm(cfg, &run, comm).unwrap();
+                            let result = trainer.train(
+                                &mut policy,
+                                &RankedNonFiniteReward { invalid: rank == 0 },
+                                &CandidateCodec,
+                                &[Sample::new("prompt", ())],
+                            );
+                            let candidates =
+                                std::fs::read_to_string(run.candidates_path()).unwrap_or_default();
+                            let metrics =
+                                std::fs::read_to_string(run.metrics_path()).unwrap_or_default();
+                            (rank, result, candidates, metrics)
+                        })
+                    })
+                    .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        for (rank, result, candidates, metrics) in results {
+            let error = result.unwrap_err();
+            if rank == 0 {
+                assert!(
+                    matches!(
+                        &error,
+                        TrainerError::Reward(error) if error.to_string().contains("non-finite")
+                    ),
+                    "unexpected rank-{rank} error: {error:?}"
+                );
+            } else {
+                assert!(
+                    matches!(
+                        &error,
+                        TrainerError::Contract(message)
+                            if message.contains("rollout/reward evaluation failed on a peer rank")
+                    ),
+                    "unexpected rank-{rank} error: {error:?}"
+                );
+            }
+            assert!(candidates.is_empty());
+            assert!(metrics.is_empty());
+        }
     }
 
     // ---- completion_lens consumption (length-aware mask / decode / metric) --

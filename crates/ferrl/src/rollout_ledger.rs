@@ -223,9 +223,9 @@ pub enum RolloutLedgerGroupScope {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RolloutLedgerRewardStats {
-    /// Number of finite rewards across the whole same-prompt group.
+    /// Number of rewards across the whole same-prompt group.
     pub count: u64,
-    /// Exact f64 bits of the all-reduced finite-reward sum.
+    /// Exact f64 bits of the all-reduced reward sum.
     pub sum_bits: u64,
     /// Exact f64 bits of the all-reduced squared-reward sum.
     pub sumsq_bits: u64,
@@ -255,8 +255,8 @@ pub enum LedgerScoreRequirement {
 /// One prompt group's host-side inputs inside an optimizer window.
 ///
 /// Float fields use IEEE-754 bit patterns so the JSON wire is exact and cannot
-/// sanitize `NaN`/infinity silently. Validation rejects non-finite logprobs and
-/// advantages; rewards retain the trainer's explicit non-finite hardening.
+/// sanitize `NaN`/infinity silently. Validation rejects non-finite rewards,
+/// logprobs, and advantages before learner scoring or mutation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RolloutLedgerGroup {
@@ -274,10 +274,7 @@ pub struct RolloutLedgerGroup {
     pub completion_lens: Vec<u32>,
     /// Optional draw-time behavior log-probability bits, ragged to real lengths.
     pub behavior_logprob_bits: Option<Vec<Vec<u32>>>,
-    /// One exact reward bit pattern per completion.
-    ///
-    /// Non-finite rewards are preserved because the trainer deliberately excludes
-    /// them from group statistics and assigns them zero advantage.
+    /// One exact finite reward bit pattern per completion.
     pub reward_bits: Vec<u32>,
     /// Canonical cross-rank reward statistics in distributed same-prompt mode.
     /// Rank-local groups and every world-1 group carry `None`.
@@ -1576,8 +1573,9 @@ fn validate_group(
     let rewards: Vec<f64> = group
         .reward_bits
         .iter()
-        .map(|&bits| f64::from(f32::from_bits(bits)))
-        .collect();
+        .enumerate()
+        .map(|(row, &bits)| finite_f32(bits, &format!("reward row {row}")).map(f64::from))
+        .collect::<Result<_, _>>()?;
     let distributed_stats_required = step.world_size > 1
         && step.reward_group_scope == RolloutLedgerGroupScope::DistributedSamePrompt;
     let expected_advantages = match (distributed_stats_required, group.distributed_reward_stats) {
@@ -1648,24 +1646,26 @@ fn advantages_from_distributed_stats(
         ScaleRewards::None => 1.0,
         ScaleRewards::Group => std + GROUP_STD_EPS,
     };
-    Ok(rewards
+    rewards
         .iter()
-        .map(|&reward| {
+        .enumerate()
+        .map(|(row, &reward)| {
             let advantage = (reward - mean) / denominator;
             if advantage.is_finite() {
-                advantage
+                Ok(advantage)
             } else {
-                0.0
+                Err(RolloutLedgerError::Invalid(format!(
+                    "derived advantage row {row} must be finite"
+                )))
             }
         })
-        .collect())
+        .collect()
 }
 
 fn local_reward_stats(rewards: &[u32]) -> (u64, f64, f64) {
     rewards
         .iter()
         .map(|&bits| f64::from(f32::from_bits(bits)))
-        .filter(|reward| reward.is_finite())
         .fold((0_u64, 0.0, 0.0), |(count, sum, sumsq), reward| {
             (count + 1, sum + reward, sumsq + reward * reward)
         })
@@ -3130,22 +3130,18 @@ mod tests {
     }
 
     #[test]
-    fn nonfinite_rewards_keep_the_trainer_zero_advantage_semantics() {
+    fn nonfinite_rewards_are_rejected_before_advantage_validation() {
         for reward_bits in [
             vec![f32::NAN.to_bits(), 3.0_f32.to_bits()],
             vec![f32::NEG_INFINITY.to_bits(), f32::INFINITY.to_bits()],
         ] {
             let mut value = step();
-            let rewards: Vec<f64> = reward_bits
-                .iter()
-                .map(|&bits| f64::from(f32::from_bits(bits)))
-                .collect();
             value.groups[0].reward_bits = reward_bits;
-            value.groups[0].advantage_bits = group_advantages(&rewards, value.scale_rewards)
-                .into_iter()
-                .map(|advantage| (advantage as f32).to_bits())
-                .collect();
-            validate_step(&value).unwrap();
+            value.groups[0].advantage_bits = vec![0.0_f32.to_bits(); 2];
+            assert!(matches!(
+                validate_step(&value),
+                Err(RolloutLedgerError::Invalid(message)) if message.contains("reward")
+            ));
         }
     }
 

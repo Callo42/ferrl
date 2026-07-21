@@ -2018,6 +2018,8 @@ fn trimul_score(args: &TrimulScoreArgs) -> Result<(), CliError> {
             inputs.len()
         )));
     }
+    let rewards: Vec<f32> = outcomes.iter().map(|outcome| outcome.reward).collect();
+    validate_trimul_score_rewards(&rewards)?;
 
     let mut file = OpenOptions::new()
         .write(true)
@@ -2069,9 +2071,7 @@ fn trimul_score(args: &TrimulScoreArgs) -> Result<(), CliError> {
         args.out.display()
     );
     println!("ferrl: positives {positive}/{}", inputs.len());
-    if max_reward.is_finite() {
-        println!("ferrl: max_reward {max_reward}");
-    }
+    println!("ferrl: max_reward {max_reward}");
     if !diagnostics.is_empty() {
         println!(
             "ferrl: diagnostics {}",
@@ -2281,16 +2281,17 @@ fn default_trimul_score_jsonl_source_id(label: &str, file_index: usize, line: us
     format!("{label}:jsonl:{file_index}:line:{line}")
 }
 
-fn finite_score_reward(reward: f32) -> f32 {
-    if reward.is_finite() {
-        reward
-    } else if reward.is_nan() {
-        0.0
-    } else if reward.is_sign_positive() {
-        f32::MAX
-    } else {
-        f32::MIN
+fn validate_trimul_score_rewards(rewards: &[f32]) -> Result<(), CliError> {
+    if let Some((index, reward)) = rewards
+        .iter()
+        .enumerate()
+        .find(|(_, reward)| !reward.is_finite())
+    {
+        return Err(CliError::msg(format!(
+            "trimul scoring returned non-finite reward {reward:?} at group index {index}"
+        )));
     }
+    Ok(())
 }
 
 fn trimul_score_record(
@@ -2302,6 +2303,7 @@ fn trimul_score_record(
     prompt_sha256: &str,
     config_sha256: &str,
 ) -> TrimulScoreRecord {
+    debug_assert!(reward.is_finite());
     let completion_sha256 = sha256_hex(input.completion.as_bytes());
     TrimulScoreRecord {
         task: "trimul",
@@ -2312,7 +2314,7 @@ fn trimul_score_record(
         world_size: input.world_size,
         prompt_index: input.prompt_index,
         group_index: input.group_index,
-        reward: finite_score_reward(reward),
+        reward,
         reward_diagnostic,
         reward_metadata,
         input_metadata: input.metadata.clone(),
@@ -5795,7 +5797,7 @@ mod tests {
         let record = trimul_score_record(
             &args,
             &input,
-            f32::NAN,
+            1.25,
             Some("trimul:no_code".to_string()),
             Some(serde_json::json!({"reward_scheme": "trimul_shaped_v1"})),
             "prompt-hash",
@@ -5804,13 +5806,22 @@ mod tests {
 
         let row = serde_json::to_value(record).unwrap();
 
-        assert_eq!(row["reward"], 0.0);
+        assert_eq!(row["reward"], 1.25);
         assert_eq!(row["reward_metadata"]["reward_scheme"], "trimul_shaped_v1");
         assert_eq!(row["input_metadata"]["input"], "meta");
         assert_eq!(row["completion_sha256"], sha256_hex(b"abc"));
         assert_eq!(row["external_score"]["source_id"], "public-source-7");
         assert_eq!(row["external_score"]["source_index"], 7);
         assert!(row["external_score"].get("source").is_none());
+    }
+
+    #[test]
+    fn trimul_score_rejects_nonfinite_rewards_before_record_construction() {
+        validate_trimul_score_rewards(&[0.0, 1.0]).unwrap();
+        for rewards in [vec![0.0, f32::NAN], vec![f32::NEG_INFINITY, f32::INFINITY]] {
+            let error = validate_trimul_score_rewards(&rewards).unwrap_err();
+            assert!(error.to_string().contains("non-finite reward"));
+        }
     }
 
     /// The clap surface parses the run-report subcommand.

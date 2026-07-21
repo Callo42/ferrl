@@ -113,6 +113,13 @@ fn cuda_memory_snapshot_impl() -> Option<GpuMemorySnapshot> {
 /// Errors raised while setting up or writing run telemetry.
 #[derive(Debug, thiserror::Error)]
 pub enum TelemetryError {
+    /// A candidate record carried a non-finite reward and was rejected before
+    /// serialization or file mutation.
+    #[error("candidate reward must be finite, got {value:?}")]
+    NonFiniteCandidateReward {
+        /// Rejected IEEE-754 value.
+        value: f32,
+    },
     /// A filesystem operation (create dir / open / write) failed.
     #[error("telemetry io error at {path}: {source}")]
     Io {
@@ -691,7 +698,9 @@ pub struct CandidateRecord {
 }
 
 impl CandidateRecord {
-    /// A copy with a finite reward so `candidates.jsonl` stays re-readable JSON.
+    /// A copy with a finite reward for callers that explicitly need numerical
+    /// saturation outside [`CandidateWriter`]. The writer itself rejects
+    /// non-finite rewards instead of silently rewriting evidence.
     #[must_use]
     pub fn nan_to_num(&self) -> Self {
         let mut out = self.clone();
@@ -735,9 +744,16 @@ impl CandidateWriter {
     ///
     /// # Errors
     ///
-    /// Returns [`TelemetryError`] if serialization or the write/flush fails.
+    /// Returns [`TelemetryError::NonFiniteCandidateReward`] without writing if
+    /// `record.reward` is non-finite, or another [`TelemetryError`] if
+    /// serialization or the write/flush fails.
     pub fn append(&mut self, record: &CandidateRecord) -> Result<(), TelemetryError> {
-        let mut line = serde_json::to_string(&record.nan_to_num())?;
+        if !record.reward.is_finite() {
+            return Err(TelemetryError::NonFiniteCandidateReward {
+                value: record.reward,
+            });
+        }
+        let mut line = serde_json::to_string(record)?;
         line.push('\n');
         self.file
             .write_all(line.as_bytes())
@@ -2351,7 +2367,7 @@ mod tests {
             world_size: 1,
             prompt_index: 12,
             group_index: 1,
-            reward: f32::NAN,
+            reward: 1.25,
             completion_len_tokens: 42,
             reward_diagnostic: Some("trimul:no_submission".to_string()),
             reward_metadata: Some(serde_json::json!({ "task": "trimul" })),
@@ -2366,7 +2382,7 @@ mod tests {
         let parsed: CandidateRecord = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(parsed.step, 3);
         assert_eq!(parsed.group_index, 1);
-        assert_eq!(parsed.reward, 0.0);
+        assert_eq!(parsed.reward, 1.25);
         assert_eq!(
             parsed.reward_diagnostic.as_deref(),
             Some("trimul:no_submission")
@@ -2376,6 +2392,38 @@ mod tests {
             Some(&serde_json::json!("trimul"))
         );
         assert!(parsed.completion.contains("custom_kernel"));
+    }
+
+    #[test]
+    fn candidate_writer_rejects_nonfinite_rewards_without_writing() {
+        let tmp = TempDir::new("candidates-nonfinite");
+        let rd = RunDir::create(tmp.path(), "run-candidates-nonfinite").unwrap();
+        let mut writer = rd.candidate_writer().unwrap();
+        for reward in [f32::NAN, f32::NEG_INFINITY, f32::INFINITY] {
+            let error = writer
+                .append(&CandidateRecord {
+                    step: 0,
+                    rank: 0,
+                    world_size: 1,
+                    prompt_index: 0,
+                    group_index: 0,
+                    reward,
+                    completion_len_tokens: 1,
+                    reward_diagnostic: None,
+                    reward_metadata: None,
+                    completion: "candidate".into(),
+                })
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                TelemetryError::NonFiniteCandidateReward { value }
+                    if value.to_bits() == reward.to_bits()
+            ));
+        }
+        drop(writer);
+        assert!(std::fs::read_to_string(rd.candidates_path())
+            .unwrap_or_default()
+            .is_empty());
     }
 
     #[test]
