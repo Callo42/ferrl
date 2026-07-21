@@ -47,13 +47,13 @@ use std::sync::Arc;
 
 use ferrl::lora::LoraLinear;
 use ferrl::nn::RmsNorm;
-use ferrl::policy::{GenConfig, Policy, Rollout};
+use ferrl::policy::{GenConfig, Policy, Rollout, TensorParallelPolicy};
 use ferrl::telemetry::RunDir;
 use ferrl::trainer::{TokenizerLike, Trainer, TrainerConfig, TrainerError};
 use ferrl::{
     tensors_from_pretrained, varbuilder_from_pretrained, Comm, CommError, LocalComm, LossType,
-    Metrics, OptimizerState, Qwen3_5Config, Qwen3_5GradModel, Qwen3_5Policy, RewardError, RewardFn,
-    RewardGroupScope, RolloutLedgerError, Sample, SoloComm,
+    Metrics, ModelTelemetryRecorder, OptimizerState, Qwen3_5Config, Qwen3_5GradModel,
+    Qwen3_5Policy, RewardError, RewardFn, RewardGroupScope, RolloutLedgerError, Sample, SoloComm,
 };
 
 const VOCAB: usize = 5;
@@ -171,6 +171,7 @@ impl Policy for ScriptedPolicy {
 struct StatefulScriptedPolicy {
     inner: ScriptedPolicy,
     sampler_epoch: u64,
+    expected_tp_rank: Option<usize>,
 }
 
 impl StatefulScriptedPolicy {
@@ -180,7 +181,13 @@ impl StatefulScriptedPolicy {
         Ok(Self {
             inner: ScriptedPolicy::new(seed)?,
             sampler_epoch,
+            expected_tp_rank: None,
         })
+    }
+
+    fn expect_tp_rank(mut self, rank: usize) -> Self {
+        self.expected_tp_rank = Some(rank);
+        self
     }
 }
 
@@ -243,6 +250,73 @@ impl Policy for StatefulScriptedPolicy {
         epoch.copy_from_slice(&state[4..]);
         self.sampler_epoch = u64::from_le_bytes(epoch);
         Ok(())
+    }
+}
+
+impl TensorParallelPolicy for StatefulScriptedPolicy {
+    fn validate_tensor_parallel_execution(&self, comm: &dyn Comm) -> CandleResult<()> {
+        if comm.world_size() == 0 || comm.rank() >= comm.world_size() {
+            candle_core::bail!(
+                "invalid tensor-parallel rank {}/world {}",
+                comm.rank(),
+                comm.world_size()
+            );
+        }
+        if self
+            .expected_tp_rank
+            .is_some_and(|rank| rank != comm.rank())
+        {
+            candle_core::bail!(
+                "stored tensor-parallel shard rank {:?} does not match communicator rank {}",
+                self.expected_tp_rank,
+                comm.rank()
+            );
+        }
+        Ok(())
+    }
+
+    fn generate_at_tensor_parallel_instrumented(
+        &mut self,
+        prompt: &[u32],
+        cfg: &GenConfig,
+        global_row_base: u64,
+        _comm: &dyn Comm,
+        _telemetry: Option<&mut dyn ModelTelemetryRecorder>,
+    ) -> CandleResult<Rollout> {
+        self.generate_at(prompt, cfg, global_row_base)
+    }
+
+    fn token_logprobs_tensor_parallel(
+        &self,
+        rollout: &Rollout,
+        comm: &dyn Comm,
+    ) -> CandleResult<Tensor> {
+        let full = self.token_logprobs(rollout)?;
+        let denominator = (comm.world_size() * (comm.world_size() + 1) / 2) as f64;
+        let coefficient = (comm.rank() + 1) as f64 / denominator;
+        let partial = full.affine(coefficient, 0.0)?;
+        let correction = full.broadcast_sub(&partial)?.detach();
+        partial.broadcast_add(&correction)
+    }
+
+    fn token_logprobs_tensor_parallel_detached(
+        &self,
+        rollout: &Rollout,
+        _comm: &dyn Comm,
+    ) -> CandleResult<Tensor> {
+        Ok(self.token_logprobs(rollout)?.detach())
+    }
+
+    fn backward_tensor_parallel(
+        &self,
+        loss: &Tensor,
+        _comm: &dyn Comm,
+    ) -> CandleResult<candle_core::backprop::GradStore> {
+        loss.backward()
+    }
+
+    fn supports_sharded_tensor_parallel_backward(&self) -> bool {
+        true
     }
 }
 
@@ -780,6 +854,58 @@ impl Policy for RejectingSamplerRestorePolicy {
             candle_core::bail!("injected rank-local continuation sampler failure")
         }
         self.inner.restore_sampler_state(state)
+    }
+}
+
+impl TensorParallelPolicy for RejectingSamplerRestorePolicy {
+    fn validate_tensor_parallel_execution(&self, comm: &dyn Comm) -> CandleResult<()> {
+        self.inner.validate_tensor_parallel_execution(comm)
+    }
+
+    fn generate_at_tensor_parallel_instrumented(
+        &mut self,
+        prompt: &[u32],
+        cfg: &GenConfig,
+        global_row_base: u64,
+        comm: &dyn Comm,
+        telemetry: Option<&mut dyn ModelTelemetryRecorder>,
+    ) -> CandleResult<Rollout> {
+        self.inner.generate_at_tensor_parallel_instrumented(
+            prompt,
+            cfg,
+            global_row_base,
+            comm,
+            telemetry,
+        )
+    }
+
+    fn token_logprobs_tensor_parallel(
+        &self,
+        rollout: &Rollout,
+        comm: &dyn Comm,
+    ) -> CandleResult<Tensor> {
+        self.inner.token_logprobs_tensor_parallel(rollout, comm)
+    }
+
+    fn token_logprobs_tensor_parallel_detached(
+        &self,
+        rollout: &Rollout,
+        comm: &dyn Comm,
+    ) -> CandleResult<Tensor> {
+        self.inner
+            .token_logprobs_tensor_parallel_detached(rollout, comm)
+    }
+
+    fn backward_tensor_parallel(
+        &self,
+        loss: &Tensor,
+        comm: &dyn Comm,
+    ) -> CandleResult<candle_core::backprop::GradStore> {
+        self.inner.backward_tensor_parallel(loss, comm)
+    }
+
+    fn supports_sharded_tensor_parallel_backward(&self) -> bool {
+        true
     }
 }
 
@@ -2941,6 +3067,884 @@ fn world_two_rollout_ledger_matches_direct_dp_across_restart() {
     assert_eq!(var_bits(&world_one_policy), before);
 }
 
+struct StatefulTpRank {
+    initial_adapter: Vec<Vec<u32>>,
+    adapter: Vec<Vec<u32>>,
+    metrics: Vec<Metrics>,
+    metrics_rows: usize,
+    sampler: Vec<u8>,
+    optimizer: AdamBits,
+    lineages: Vec<String>,
+}
+
+fn copy_checkpoint_package(source: &Path, destination: &Path) {
+    std::fs::create_dir_all(destination).unwrap();
+    for entry in std::fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        assert!(entry.file_type().unwrap().is_file());
+        std::fs::copy(entry.path(), destination.join(entry.file_name())).unwrap();
+    }
+}
+
+fn rewrite_continuation_topology(
+    checkpoint: &Path,
+    format_version: u64,
+    tensor_parallel_layout: Option<&str>,
+) {
+    let manifest_path = checkpoint.join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    let continuation = manifest["rollout_ledger_continuation"]
+        .as_object_mut()
+        .unwrap();
+    continuation.insert("format_version".into(), serde_json::json!(format_version));
+    match format_version {
+        1 => {
+            continuation.remove("world_size");
+            continuation.remove("tensor_parallel_world_size");
+            continuation.remove("tensor_parallel_layout");
+        }
+        2 => {
+            continuation.remove("tensor_parallel_world_size");
+            continuation.remove("tensor_parallel_layout");
+        }
+        3 => {
+            continuation.insert(
+                "tensor_parallel_layout".into(),
+                serde_json::json!(tensor_parallel_layout.unwrap()),
+            );
+        }
+        other => panic!("unsupported test continuation version {other}"),
+    }
+    std::fs::write(manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+}
+
+fn package_file_bytes(path: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut files: Vec<_> = std::fs::read_dir(path)
+        .unwrap()
+        .filter(|entry| entry.as_ref().unwrap().file_name() != ".ferrl-continuation-owner")
+        .map(|entry| {
+            let entry = entry.unwrap();
+            assert!(entry.file_type().unwrap().is_file());
+            (
+                entry.file_name().to_string_lossy().into_owned(),
+                std::fs::read(entry.path()).unwrap(),
+            )
+        })
+        .collect();
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    files
+}
+
+fn run_stateful_direct_tp(
+    base: &Path,
+    cfg: &TrainerConfig,
+    samples: &[Sample<()>],
+) -> Vec<StatefulTpRank> {
+    let checkpoint_root = base.join("tp-direct-checkpoints");
+    let comms = LocalComm::world_with_timeout(2, std::time::Duration::from_secs(20));
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = comms
+            .into_iter()
+            .map(|comm| {
+                let cfg = cfg.clone();
+                let samples = samples.to_vec();
+                let base = base.to_path_buf();
+                let checkpoint_root = checkpoint_root.clone();
+                scope.spawn(move || {
+                    let rank = comm.rank();
+                    let mut policy = StatefulScriptedPolicy::new(SEED, 0).unwrap();
+                    let initial_adapter = var_bits(&policy);
+                    let run = RunDir::create(&base, format!("tp-direct-rank{rank}")).unwrap();
+                    let metrics_path = run.metrics_path().to_path_buf();
+                    let mut trainer = Trainer::new(cfg.clone(), &run)
+                        .unwrap()
+                        .with_checkpoints_dir(&checkpoint_root);
+                    let metrics = trainer
+                        .train_tensor_parallel(
+                            &mut policy,
+                            &EchoOrFlatReward,
+                            &CharTokenizer,
+                            &samples,
+                            &comm,
+                        )
+                        .unwrap()
+                        .0;
+                    let loaded = ferrl::load_checkpoint(
+                        checkpoint_root.join(format!("step-{}", cfg.steps)),
+                        &policy.trainable_vars(),
+                    )
+                    .unwrap();
+                    StatefulTpRank {
+                        initial_adapter,
+                        adapter: var_bits(&policy),
+                        metrics,
+                        metrics_rows: ferrl::read_metrics(metrics_path).unwrap().len(),
+                        sampler: policy.sampler_state().unwrap(),
+                        optimizer: optimizer_bits(&loaded.optimizer_state.unwrap()),
+                        lineages: Vec::new(),
+                    }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect()
+    })
+}
+
+#[allow(clippy::cognitive_complexity)]
+fn run_stateful_separated_tp(
+    base: &Path,
+    cfg: &TrainerConfig,
+    samples: &[Sample<()>],
+    policy_sha256: &str,
+) -> Vec<StatefulTpRank> {
+    let ledger_root = base.join("tp-separated-ledger");
+    let checkpoint_root = base.join("tp-separated-continuations");
+    let comms = LocalComm::world_with_timeout(2, std::time::Duration::from_secs(20));
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = comms
+            .into_iter()
+            .map(|comm| {
+                let cfg = cfg.clone();
+                let samples = samples.to_vec();
+                let base = base.to_path_buf();
+                let ledger_root = ledger_root.clone();
+                let checkpoint_root = checkpoint_root.clone();
+                let policy_sha256 = policy_sha256.to_owned();
+                scope.spawn(move || {
+                    let rank = comm.rank();
+                    let run = RunDir::create(&base, format!("tp-separated-rank{rank}")).unwrap();
+                    let metrics_path = run.metrics_path().to_path_buf();
+                    let mut trainer = Trainer::new(cfg.clone(), &run).unwrap();
+                    let mut collector = StatefulScriptedPolicy::new(SEED, 0).unwrap();
+                    let mut learner = StatefulScriptedPolicy::new(SEED, 0).unwrap();
+                    let initial_adapter = var_bits(&learner);
+                    let mut continuation = None;
+                    let mut metrics = Vec::new();
+                    let mut lineages = Vec::new();
+
+                    for step in 0..cfg.steps {
+                        trainer
+                            .collect_rollout_ledger_step_tensor_parallel(
+                                step,
+                                &mut collector,
+                                &EchoOrFlatReward,
+                                &CharTokenizer,
+                                &samples,
+                                &ledger_root,
+                                &policy_sha256,
+                                continuation.as_ref(),
+                                &comm,
+                            )
+                            .unwrap();
+                        let (row, next) = trainer
+                            .train_rollout_ledger_step_tensor_parallel(
+                                step,
+                                &mut learner,
+                                &ledger_root,
+                                &policy_sha256,
+                                continuation.as_ref(),
+                                &comm,
+                            )
+                            .unwrap();
+                        metrics.push(row);
+                        lineages.push(next.lineage_sha256().to_owned());
+                        let checkpoint = trainer
+                            .save_rollout_ledger_continuation_to_tensor_parallel(
+                                &checkpoint_root,
+                                &learner,
+                                &next,
+                                &comm,
+                            )
+                            .unwrap();
+
+                        if step == 0 {
+                            collector =
+                                StatefulScriptedPolicy::new(SEED.wrapping_add(501), 700).unwrap();
+                            learner =
+                                StatefulScriptedPolicy::new(SEED.wrapping_add(777), 900).unwrap();
+                        }
+                        let collector_receipt = trainer
+                            .restore_rollout_ledger_continuation_tensor_parallel(
+                                &checkpoint,
+                                &mut collector,
+                                &policy_sha256,
+                                &comm,
+                            )
+                            .unwrap();
+                        let learner_receipt = if step == 0 {
+                            trainer
+                                .restore_latest_rollout_ledger_continuation_from_tensor_parallel(
+                                    &checkpoint_root,
+                                    &mut learner,
+                                    &policy_sha256,
+                                    &comm,
+                                )
+                                .unwrap()
+                                .unwrap()
+                        } else {
+                            trainer
+                                .restore_rollout_ledger_continuation_tensor_parallel(
+                                    &checkpoint,
+                                    &mut learner,
+                                    &policy_sha256,
+                                    &comm,
+                                )
+                                .unwrap()
+                        };
+                        assert_eq!(collector_receipt.completed_step(), step + 1);
+                        assert_eq!(learner_receipt.completed_step(), step + 1);
+                        assert_eq!(collector_receipt.world_size(), 1);
+                        assert_eq!(collector_receipt.tensor_parallel_world_size(), 2);
+                        assert_eq!(
+                            collector_receipt.tensor_parallel_layout(),
+                            "tensor_parallel.communicator_rank_ascending.v1"
+                        );
+                        assert_eq!(var_bits(&collector), var_bits(&learner));
+                        assert_eq!(
+                            collector.sampler_state().unwrap(),
+                            learner.sampler_state().unwrap()
+                        );
+                        assert_eq!(
+                            optimizer_bits(collector_receipt.optimizer_state()),
+                            optimizer_bits(learner_receipt.optimizer_state())
+                        );
+                        continuation = Some(learner_receipt);
+                    }
+
+                    let continuation = continuation.unwrap();
+                    StatefulTpRank {
+                        initial_adapter,
+                        adapter: var_bits(&learner),
+                        metrics,
+                        metrics_rows: ferrl::read_metrics(metrics_path).unwrap().len(),
+                        sampler: learner.sampler_state().unwrap(),
+                        optimizer: optimizer_bits(continuation.optimizer_state()),
+                        lineages,
+                    }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect()
+    })
+}
+
+#[test]
+#[allow(clippy::cognitive_complexity)]
+fn world_two_tensor_parallel_rollout_ledger_matches_direct_across_restart() {
+    let tmp = TempDir::new("world2-tp-ledger-restart");
+    let cfg = TrainerConfig {
+        steps: 3,
+        grad_accum_steps: 2,
+        group_size: 2,
+        beta: 0.0,
+        mu: 2,
+        checkpoint_every: Some(1),
+        reward_group_scope: RewardGroupScope::Local,
+        ..scripted_cfg()
+    };
+    let samples = live_samples();
+    let policy_sha256 = format!("{:064x}", 89);
+    let direct = run_stateful_direct_tp(tmp.path(), &cfg, &samples);
+    let separated = run_stateful_separated_tp(tmp.path(), &cfg, &samples, &policy_sha256);
+
+    assert_eq!(direct.len(), 2);
+    assert_eq!(separated.len(), 2);
+    assert_eq!(direct[0].adapter, direct[1].adapter, "direct TP adapters");
+    assert_eq!(
+        separated[0].adapter, separated[1].adapter,
+        "separated TP adapters"
+    );
+    assert_eq!(direct[0].optimizer, direct[1].optimizer, "direct TP Adam");
+    assert_eq!(
+        separated[0].optimizer, separated[1].optimizer,
+        "separated TP Adam"
+    );
+    assert_eq!(separated[0].lineages, separated[1].lineages);
+    assert_eq!(separated[0].lineages.len(), cfg.steps as usize);
+    assert!(separated[0]
+        .lineages
+        .windows(2)
+        .all(|pair| pair[0] != pair[1]));
+
+    for rank in 0..2 {
+        assert_eq!(separated[rank].adapter, direct[rank].adapter);
+        assert_eq!(separated[rank].optimizer, direct[rank].optimizer);
+        assert_eq!(separated[rank].sampler, direct[rank].sampler);
+        assert_eq!(separated[rank].metrics.len(), cfg.steps as usize);
+        for (step, (separated_row, direct_row)) in separated[rank]
+            .metrics
+            .iter()
+            .zip(&direct[rank].metrics)
+            .enumerate()
+        {
+            assert_eq!(
+                deterministic_metrics(separated_row),
+                deterministic_metrics(direct_row),
+                "rank {rank} step {step} TP direct/separated metrics"
+            );
+            assert_ledger_performance_unmeasured(
+                separated_row,
+                &format!("rank {rank} step {step} TP separated"),
+            );
+        }
+    }
+    assert_eq!(direct[0].metrics_rows, cfg.steps as usize);
+    assert_eq!(direct[1].metrics_rows, 0);
+    assert_eq!(separated[0].metrics_rows, cfg.steps as usize);
+    assert_eq!(separated[1].metrics_rows, 0);
+    assert_ne!(separated[0].adapter, separated[0].initial_adapter);
+    assert_ne!(
+        separated[0].sampler,
+        StatefulScriptedPolicy::new(SEED, 0)
+            .unwrap()
+            .sampler_state()
+            .unwrap()
+    );
+    assert!(separated[0]
+        .optimizer
+        .1
+        .iter()
+        .flatten()
+        .any(|bits| *bits != 0.0_f32.to_bits()));
+    assert!(separated[0]
+        .optimizer
+        .2
+        .iter()
+        .flatten()
+        .any(|bits| *bits != 0.0_f32.to_bits()));
+
+    for step in 0..cfg.steps {
+        let ledger = tmp
+            .path()
+            .join("tp-separated-ledger")
+            .join(format!("step-{step:020}"));
+        assert!(ledger.join("manifest.json").is_file());
+        assert!(ledger.join("window.json").is_file());
+        assert!(!ledger.join("rank-00000.window.json").exists());
+        assert!(!ledger.join("rank-00001.window.json").exists());
+        let payload: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(ledger.join("window.json")).unwrap()).unwrap();
+        assert_eq!(payload["rank"].as_u64(), Some(0));
+        assert_eq!(payload["world_size"].as_u64(), Some(1));
+
+        let continuation = tmp
+            .path()
+            .join("tp-separated-continuations")
+            .join(format!("step-{}", step + 1));
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(continuation.join("manifest.json")).unwrap())
+                .unwrap();
+        let provenance = &manifest["rollout_ledger_continuation"];
+        assert_eq!(provenance["world_size"].as_u64(), Some(1));
+        assert_eq!(provenance["tensor_parallel_world_size"].as_u64(), Some(2));
+        assert_eq!(
+            provenance["tensor_parallel_layout"].as_str(),
+            Some("tensor_parallel.communicator_rank_ascending.v1")
+        );
+        let names: Vec<_> = std::fs::read_dir(&continuation)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().all(|name| !name.contains("rank-")));
+    }
+}
+
+#[test]
+#[allow(clippy::cognitive_complexity)]
+fn world_one_tensor_parallel_ledger_wrappers_are_byte_compatible() {
+    let tmp = TempDir::new("world1-tp-ledger-compatibility");
+    let cfg = TrainerConfig {
+        steps: 1,
+        grad_accum_steps: 2,
+        group_size: 2,
+        beta: 0.0,
+        mu: 2,
+        ..scripted_cfg()
+    };
+    let samples = live_samples();
+    let policy_sha256 = format!("{:064x}", 97);
+
+    let ordinary_run = RunDir::create(tmp.path(), "ordinary").unwrap();
+    let ordinary_ledger = tmp.path().join("ordinary-ledger");
+    let ordinary_checkpoints = tmp.path().join("ordinary-continuations");
+    let mut ordinary_trainer = Trainer::new(cfg.clone(), &ordinary_run).unwrap();
+    let mut ordinary_collector = StatefulScriptedPolicy::new(SEED, 0).unwrap();
+    let mut ordinary_learner = StatefulScriptedPolicy::new(SEED, 0).unwrap();
+    ordinary_trainer
+        .collect_rollout_ledger_step(
+            0,
+            &mut ordinary_collector,
+            &EchoOrFlatReward,
+            &CharTokenizer,
+            &samples,
+            &ordinary_ledger,
+            &policy_sha256,
+            None,
+        )
+        .unwrap();
+    let (ordinary_metrics, ordinary_continuation) = ordinary_trainer
+        .train_rollout_ledger_step(
+            0,
+            &mut ordinary_learner,
+            &ordinary_ledger,
+            &policy_sha256,
+            None,
+        )
+        .unwrap();
+    let ordinary_checkpoint = ordinary_trainer
+        .save_rollout_ledger_continuation_to(
+            &ordinary_checkpoints,
+            &ordinary_learner,
+            &ordinary_continuation,
+        )
+        .unwrap();
+
+    let wrapper_run = RunDir::create(tmp.path(), "tp-wrapper").unwrap();
+    let wrapper_ledger = tmp.path().join("tp-wrapper-ledger");
+    let wrapper_checkpoints = tmp.path().join("tp-wrapper-continuations");
+    let mut wrapper_trainer = Trainer::new(cfg, &wrapper_run).unwrap();
+    let mut wrapper_collector = StatefulScriptedPolicy::new(SEED, 0).unwrap();
+    let mut wrapper_learner = StatefulScriptedPolicy::new(SEED, 0).unwrap();
+    let mut comms = LocalComm::world(1);
+    let comm = comms.pop().unwrap();
+    wrapper_trainer
+        .collect_rollout_ledger_step_tensor_parallel(
+            0,
+            &mut wrapper_collector,
+            &EchoOrFlatReward,
+            &CharTokenizer,
+            &samples,
+            &wrapper_ledger,
+            &policy_sha256,
+            None,
+            &comm,
+        )
+        .unwrap();
+    let (wrapper_metrics, wrapper_continuation) = wrapper_trainer
+        .train_rollout_ledger_step_tensor_parallel(
+            0,
+            &mut wrapper_learner,
+            &wrapper_ledger,
+            &policy_sha256,
+            None,
+            &comm,
+        )
+        .unwrap();
+    let wrapper_checkpoint = wrapper_trainer
+        .save_rollout_ledger_continuation_to_tensor_parallel(
+            &wrapper_checkpoints,
+            &wrapper_learner,
+            &wrapper_continuation,
+            &comm,
+        )
+        .unwrap();
+
+    assert_eq!(
+        package_file_bytes(&ordinary_ledger.join("step-00000000000000000000")),
+        package_file_bytes(&wrapper_ledger.join("step-00000000000000000000"))
+    );
+    assert_eq!(
+        package_file_bytes(&ordinary_checkpoint),
+        package_file_bytes(&wrapper_checkpoint)
+    );
+    assert!(ordinary_checkpoint
+        .join(".ferrl-continuation-owner")
+        .is_file());
+    assert!(wrapper_checkpoint
+        .join(".ferrl-continuation-owner")
+        .is_file());
+    assert_eq!(var_bits(&ordinary_collector), var_bits(&wrapper_collector));
+    assert_eq!(var_bits(&ordinary_learner), var_bits(&wrapper_learner));
+    assert_eq!(
+        ordinary_collector.sampler_state().unwrap(),
+        wrapper_collector.sampler_state().unwrap()
+    );
+    assert_eq!(
+        ordinary_learner.sampler_state().unwrap(),
+        wrapper_learner.sampler_state().unwrap()
+    );
+    assert_eq!(
+        optimizer_bits(ordinary_continuation.optimizer_state()),
+        optimizer_bits(wrapper_continuation.optimizer_state())
+    );
+    assert_eq!(
+        ordinary_continuation.lineage_sha256(),
+        wrapper_continuation.lineage_sha256()
+    );
+    assert_eq!(ordinary_continuation.world_size(), 1);
+    assert_eq!(ordinary_continuation.tensor_parallel_world_size(), 1);
+    assert_eq!(wrapper_continuation.world_size(), 1);
+    assert_eq!(wrapper_continuation.tensor_parallel_world_size(), 1);
+    assert_eq!(
+        deterministic_metrics(&ordinary_metrics),
+        deterministic_metrics(&wrapper_metrics)
+    );
+}
+
+#[test]
+#[allow(clippy::cognitive_complexity)]
+fn tensor_parallel_ledger_topology_rejects_before_state_or_root_mutation() {
+    let tmp = TempDir::new("tp-ledger-topology-rejection");
+    let cfg = TrainerConfig {
+        steps: 1,
+        grad_accum_steps: 1,
+        group_size: 2,
+        beta: 0.0,
+        mu: 1,
+        ..scripted_cfg()
+    };
+    let samples = live_samples();
+    let policy_sha256 = format!("{:064x}", 101);
+    let seeded = run_stateful_separated_tp(tmp.path(), &cfg, &samples, &policy_sha256);
+    assert_eq!(seeded.len(), 2);
+    let checkpoint = tmp.path().join("tp-separated-continuations/step-1");
+
+    let world_one_run = RunDir::create(tmp.path(), "restore-world1").unwrap();
+    let world_one_trainer = Trainer::new(cfg.clone(), &world_one_run).unwrap();
+    let mut world_one_policy = StatefulScriptedPolicy::new(SEED.wrapping_add(1), 99).unwrap();
+    let world_one_adapter = var_bits(&world_one_policy);
+    let world_one_sampler = world_one_policy.sampler_state().unwrap();
+    let mut world_one_comms = LocalComm::world(1);
+    let world_one_comm = world_one_comms.pop().unwrap();
+    let world_one_error = world_one_trainer
+        .restore_rollout_ledger_continuation_tensor_parallel(
+            &checkpoint,
+            &mut world_one_policy,
+            &policy_sha256,
+            &world_one_comm,
+        )
+        .unwrap_err();
+    assert!(
+        world_one_error
+            .to_string()
+            .contains("tensor-parallel world size 2 does not match current world 1"),
+        "{world_one_error}"
+    );
+    assert_eq!(var_bits(&world_one_policy), world_one_adapter);
+    assert_eq!(world_one_policy.sampler_state().unwrap(), world_one_sampler);
+
+    let world_three = LocalComm::world_with_timeout(3, std::time::Duration::from_secs(10));
+    let world_three_outcomes: Vec<_> = std::thread::scope(|scope| {
+        let handles: Vec<_> = world_three
+            .into_iter()
+            .map(|comm| {
+                let rank = comm.rank();
+                let cfg = cfg.clone();
+                let base = tmp.path().to_path_buf();
+                let checkpoint = checkpoint.clone();
+                let policy_sha256 = policy_sha256.clone();
+                scope.spawn(move || {
+                    let run = RunDir::create(&base, format!("restore-world3-rank{rank}")).unwrap();
+                    let trainer = Trainer::new(cfg, &run).unwrap();
+                    let mut policy = StatefulScriptedPolicy::new(
+                        SEED.wrapping_add(10 + rank as u64),
+                        120 + rank as u64,
+                    )
+                    .unwrap();
+                    let adapter = var_bits(&policy);
+                    let sampler = policy.sampler_state().unwrap();
+                    let error = trainer
+                        .restore_rollout_ledger_continuation_tensor_parallel(
+                            checkpoint,
+                            &mut policy,
+                            &policy_sha256,
+                            &comm,
+                        )
+                        .unwrap_err();
+                    (
+                        error.to_string(),
+                        adapter,
+                        var_bits(&policy),
+                        sampler,
+                        policy.sampler_state().unwrap(),
+                    )
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect()
+    });
+    for (rank, (error, adapter_before, adapter_after, sampler_before, sampler_after)) in
+        world_three_outcomes.iter().enumerate()
+    {
+        assert!(
+            error.contains("tensor-parallel world size 2 does not match current world 3"),
+            "rank {rank}: {error}"
+        );
+        assert_eq!(adapter_after, adapter_before, "rank {rank} adapter");
+        assert_eq!(sampler_after, sampler_before, "rank {rank} sampler");
+    }
+
+    let restore_failure_comms =
+        LocalComm::world_with_timeout(2, std::time::Duration::from_secs(10));
+    let restore_failure_outcomes: Vec<_> = std::thread::scope(|scope| {
+        let handles: Vec<_> = restore_failure_comms
+            .into_iter()
+            .map(|comm| {
+                let rank = comm.rank();
+                let cfg = cfg.clone();
+                let base = tmp.path().to_path_buf();
+                let checkpoint = checkpoint.clone();
+                let policy_sha256 = policy_sha256.clone();
+                scope.spawn(move || {
+                    let run = RunDir::create(&base, format!("restore-failure-rank{rank}")).unwrap();
+                    let trainer = Trainer::new(cfg, &run).unwrap();
+                    let mut policy = RejectingSamplerRestorePolicy {
+                        inner: StatefulScriptedPolicy::new(
+                            SEED.wrapping_add(70 + rank as u64),
+                            220 + rank as u64,
+                        )
+                        .unwrap(),
+                        fail_next_restore: rank == 1,
+                    };
+                    let adapter = var_bits(&policy);
+                    let sampler = policy.sampler_state().unwrap();
+                    let error = trainer
+                        .restore_rollout_ledger_continuation_tensor_parallel(
+                            checkpoint,
+                            &mut policy,
+                            &policy_sha256,
+                            &comm,
+                        )
+                        .unwrap_err();
+                    (
+                        error.to_string(),
+                        adapter,
+                        var_bits(&policy),
+                        sampler,
+                        policy.sampler_state().unwrap(),
+                    )
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect()
+    });
+    for (rank, (error, adapter_before, adapter_after, sampler_before, sampler_after)) in
+        restore_failure_outcomes.iter().enumerate()
+    {
+        if rank == 0 {
+            assert!(
+                error.contains("restore failed on a peer rank"),
+                "rank {rank}: {error}"
+            );
+        } else {
+            assert!(
+                error.contains("injected rank-local continuation sampler failure"),
+                "rank {rank}: {error}"
+            );
+        }
+        assert_eq!(adapter_after, adapter_before, "rank {rank} adapter");
+        assert_eq!(sampler_after, sampler_before, "rank {rank} sampler");
+    }
+
+    for version in [1_u64, 2] {
+        let legacy_root = tmp.path().join(format!("legacy-v{version}"));
+        let legacy = legacy_root.join("step-1");
+        copy_checkpoint_package(&checkpoint, &legacy);
+        rewrite_continuation_topology(&legacy, version, None);
+        let comms = LocalComm::world_with_timeout(2, std::time::Duration::from_secs(10));
+        let outcomes: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = comms
+                .into_iter()
+                .map(|comm| {
+                    let rank = comm.rank();
+                    let cfg = cfg.clone();
+                    let base = tmp.path().to_path_buf();
+                    let legacy_root = legacy_root.clone();
+                    let policy_sha256 = policy_sha256.clone();
+                    scope.spawn(move || {
+                        let run =
+                            RunDir::create(&base, format!("legacy-v{version}-rank{rank}")).unwrap();
+                        let trainer = Trainer::new(cfg, &run).unwrap();
+                        let mut policy = StatefulScriptedPolicy::new(
+                            SEED.wrapping_add(30 + rank as u64),
+                            160 + rank as u64,
+                        )
+                        .unwrap();
+                        let adapter = var_bits(&policy);
+                        let sampler = policy.sampler_state().unwrap();
+                        let error = trainer
+                            .restore_latest_rollout_ledger_continuation_from_tensor_parallel(
+                                &legacy_root,
+                                &mut policy,
+                                &policy_sha256,
+                                &comm,
+                            )
+                            .unwrap_err();
+                        (
+                            error.to_string(),
+                            adapter,
+                            var_bits(&policy),
+                            sampler,
+                            policy.sampler_state().unwrap(),
+                        )
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        });
+        for (rank, (error, adapter_before, adapter_after, sampler_before, sampler_after)) in
+            outcomes.iter().enumerate()
+        {
+            assert!(
+                error.contains("tensor-parallel world size 1 does not match current world 2"),
+                "legacy v{version} rank {rank}: {error}"
+            );
+            assert_eq!(
+                adapter_after, adapter_before,
+                "legacy v{version} rank {rank}"
+            );
+            assert_eq!(
+                sampler_after, sampler_before,
+                "legacy v{version} rank {rank}"
+            );
+        }
+    }
+
+    let wrong_layout = tmp.path().join("wrong-layout/step-1");
+    copy_checkpoint_package(&checkpoint, &wrong_layout);
+    rewrite_continuation_topology(&wrong_layout, 3, Some("tensor_parallel.swapped.v0"));
+    let comms = LocalComm::world_with_timeout(2, std::time::Duration::from_secs(10));
+    let layout_errors: Vec<_> = std::thread::scope(|scope| {
+        let handles: Vec<_> = comms
+            .into_iter()
+            .map(|comm| {
+                let rank = comm.rank();
+                let cfg = cfg.clone();
+                let base = tmp.path().to_path_buf();
+                let wrong_layout = wrong_layout.clone();
+                let policy_sha256 = policy_sha256.clone();
+                scope.spawn(move || {
+                    let run = RunDir::create(&base, format!("wrong-layout-rank{rank}")).unwrap();
+                    let trainer = Trainer::new(cfg, &run).unwrap();
+                    let mut policy = StatefulScriptedPolicy::new(SEED, 0).unwrap();
+                    let before = var_bits(&policy);
+                    let error = trainer
+                        .restore_rollout_ledger_continuation_tensor_parallel(
+                            wrong_layout,
+                            &mut policy,
+                            &policy_sha256,
+                            &comm,
+                        )
+                        .unwrap_err();
+                    (error.to_string(), before, var_bits(&policy))
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect()
+    });
+    for (rank, (error, before, after)) in layout_errors.iter().enumerate() {
+        assert!(error.contains("is unsupported"), "rank {rank}: {error}");
+        assert_eq!(after, before, "rank {rank} adapter");
+    }
+
+    let swapped_root = tmp.path().join("swapped-plan-ledger");
+    let comms = LocalComm::world_with_timeout(2, std::time::Duration::from_secs(10));
+    let swapped_outcomes: Vec<_> = std::thread::scope(|scope| {
+        let handles: Vec<_> = comms
+            .into_iter()
+            .map(|comm| {
+                let rank = comm.rank();
+                let cfg = cfg.clone();
+                let samples = samples.clone();
+                let base = tmp.path().to_path_buf();
+                let swapped_root = swapped_root.clone();
+                let policy_sha256 = policy_sha256.clone();
+                scope.spawn(move || {
+                    let run = RunDir::create(&base, format!("swapped-plan-rank{rank}")).unwrap();
+                    let mut trainer = Trainer::new(cfg, &run).unwrap();
+                    let mut policy = StatefulScriptedPolicy::new(SEED, 0)
+                        .unwrap()
+                        .expect_tp_rank(0);
+                    let sampler = policy.sampler_state().unwrap();
+                    let error = trainer
+                        .collect_rollout_ledger_step_tensor_parallel(
+                            0,
+                            &mut policy,
+                            &EchoOrFlatReward,
+                            &CharTokenizer,
+                            &samples,
+                            swapped_root,
+                            &policy_sha256,
+                            None,
+                            &comm,
+                        )
+                        .unwrap_err();
+                    (error.to_string(), sampler, policy.sampler_state().unwrap())
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect()
+    });
+    for (rank, (error, before, after)) in swapped_outcomes.iter().enumerate() {
+        if rank == 0 {
+            assert!(
+                error.contains("failed on a peer rank"),
+                "rank {rank}: {error}"
+            );
+        } else {
+            assert!(
+                error.contains("stored tensor-parallel shard rank"),
+                "rank {rank}: {error}"
+            );
+        }
+        assert_eq!(after, before, "rank {rank} sampler");
+    }
+    assert!(!swapped_root.exists());
+
+    let combined_root = tmp.path().join("combined-dp-tp-ledger");
+    let mut data_parallel_comms = LocalComm::world(2);
+    let data_parallel_comm = data_parallel_comms.remove(0);
+    let mut tensor_parallel_comms = LocalComm::world(2);
+    let tensor_parallel_comm = tensor_parallel_comms.remove(0);
+    let combined_run = RunDir::create(tmp.path(), "combined-dp-tp").unwrap();
+    let mut combined_trainer = Trainer::with_comm(cfg, &combined_run, data_parallel_comm).unwrap();
+    let mut combined_policy = StatefulScriptedPolicy::new(SEED, 0).unwrap();
+    let combined_sampler = combined_policy.sampler_state().unwrap();
+    let combined_error = combined_trainer
+        .collect_rollout_ledger_step_tensor_parallel(
+            0,
+            &mut combined_policy,
+            &EchoOrFlatReward,
+            &CharTokenizer,
+            &samples,
+            &combined_root,
+            &policy_sha256,
+            None,
+            &tensor_parallel_comm,
+        )
+        .unwrap_err();
+    assert!(
+        combined_error
+            .to_string()
+            .contains("simultaneous sharded data-parallel and tensor-parallel"),
+        "{combined_error}"
+    );
+    assert_eq!(combined_policy.sampler_state().unwrap(), combined_sampler);
+    assert!(!combined_root.exists());
+}
+
 #[test]
 #[allow(clippy::cognitive_complexity)] // assertion-heavy coordinated rollback oracle
 fn distributed_continuation_restore_rolls_back_after_asymmetric_sampler_failure() {
@@ -3380,7 +4384,7 @@ fn distributed_continuation_comm_failure_never_enters_another_collective() {
             panic!("{phase}: expected terminal discard-world classification, got {error:?}");
         };
         assert!(
-            message.contains("the data-parallel world is dead"),
+            message.contains("the distributed execution world is dead"),
             "{phase}: {message}"
         );
         assert!(
@@ -3525,7 +4529,7 @@ fn distributed_collector_and_learner_comm_failures_never_coordinate_recovery() {
                 panic!("{case}: expected terminal discard-world classification, got {error:?}");
             };
             assert!(
-                message.contains("the data-parallel world is dead"),
+                message.contains("the distributed execution world is dead"),
                 "{case}: {message}"
             );
             assert!(
@@ -4577,8 +5581,14 @@ fn world_one_restores_legacy_v1_rollout_ledger_continuation() {
         .as_object_mut()
         .unwrap();
     assert_eq!(continuation_manifest["world_size"].as_u64(), Some(1));
+    assert_eq!(
+        continuation_manifest["tensor_parallel_world_size"].as_u64(),
+        Some(1)
+    );
     continuation_manifest.insert("format_version".into(), serde_json::json!(1));
     continuation_manifest.remove("world_size");
+    continuation_manifest.remove("tensor_parallel_world_size");
+    continuation_manifest.remove("tensor_parallel_layout");
     std::fs::write(
         &manifest_path,
         serde_json::to_vec_pretty(&manifest).unwrap(),

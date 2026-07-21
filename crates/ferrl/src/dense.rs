@@ -302,6 +302,20 @@ impl DenseAttention {
         reduce_row_parallel_output(&partial, plan, comm)
     }
 
+    fn validate_tensor_parallel_plan(&self, plan: TensorParallelPlan) -> CandleResult<()> {
+        self.q_proj
+            .validate_column_parallel_support(plan, "attention_q_out")?;
+        self.k_proj
+            .validate_column_parallel_support(plan, "attention_k_out")?;
+        self.v_proj
+            .validate_column_parallel_support(plan, "attention_v_out")?;
+        self.o_proj
+            .validate_row_parallel_support(plan, "attention_hidden")?;
+        tp_shard(plan, "num_attention_heads", self.num_heads)?;
+        tp_shard(plan, "num_key_value_heads", self.num_kv_heads)?;
+        Ok(())
+    }
+
     fn set_adapter_enabled(&mut self, enabled: bool) {
         self.q_proj.set_enabled(enabled);
         self.k_proj.set_enabled(enabled);
@@ -385,6 +399,15 @@ impl DenseMlp {
         reduce_row_parallel_output(&partial, plan, comm)
     }
 
+    fn validate_tensor_parallel_plan(&self, plan: TensorParallelPlan) -> CandleResult<()> {
+        self.gate_proj
+            .validate_column_parallel_support(plan, "intermediate_size")?;
+        self.up_proj
+            .validate_column_parallel_support(plan, "intermediate_size")?;
+        self.down_proj
+            .validate_row_parallel_support(plan, "intermediate_size")
+    }
+
     fn set_adapter_enabled(&mut self, enabled: bool) {
         self.gate_proj.set_enabled(enabled);
         self.up_proj.set_enabled(enabled);
@@ -451,6 +474,11 @@ impl DenseLayer {
         rot: &RotaryTables,
     ) -> CandleResult<Tensor> {
         self.forward_tensor_parallel(x, mask, rot, TensorParallelPlan::single(), None)
+    }
+
+    fn validate_tensor_parallel_plan(&self, plan: TensorParallelPlan) -> CandleResult<()> {
+        self.attn.validate_tensor_parallel_plan(plan)?;
+        self.mlp.validate_tensor_parallel_plan(plan)
     }
 
     fn forward_tensor_parallel(
@@ -790,6 +818,13 @@ impl<A: DenseArch> DenseGradModel<A> {
         Ok(())
     }
 
+    fn validate_tensor_parallel_plan(&self, plan: TensorParallelPlan) -> CandleResult<()> {
+        for layer in &self.layers {
+            layer.validate_tensor_parallel_plan(plan)?;
+        }
+        Ok(())
+    }
+
     /// Shared prologue of every full-sequence walk: the token embedding plus the
     /// full causal mask (`None` at seq-len 1). The mask dtype is `self.mask_dtype`
     /// — F32 when the attention scores are F32 (Llama), the model dtype otherwise.
@@ -1073,6 +1108,18 @@ impl<A: DenseArch> GradModel for DenseGradModel<A> {
         len: usize,
     ) -> CandleResult<Tensor> {
         DenseGradModel::forward_detached_narrowed(self, input_ids, start, len)
+    }
+
+    fn validate_tensor_parallel_execution(&self, comm: &dyn Comm) -> CandleResult<()> {
+        let plan = plan_from_comm(comm)?;
+        if self.remat {
+            candle_core::bail!(
+                "{} tensor-parallel execution does not support activation checkpointing",
+                A::LABEL
+            );
+        }
+        self.validate_tensor_parallel_execution_support()?;
+        self.validate_tensor_parallel_plan(plan)
     }
 
     fn forward_tensor_parallel(&self, input_ids: &Tensor, comm: &dyn Comm) -> CandleResult<Tensor> {

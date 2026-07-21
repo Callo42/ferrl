@@ -746,6 +746,37 @@ pub(crate) enum Proj {
 }
 
 impl Proj {
+    fn base_weight(&self) -> &FrozenLinearWeight {
+        match self {
+            Self::Frozen(weight) => weight,
+            Self::Lora(layer) => &layer.base_weight,
+        }
+    }
+
+    pub(crate) fn validate_column_parallel_support(
+        &self,
+        plan: TensorParallelPlan,
+        label: &'static str,
+    ) -> CandleResult<()> {
+        let weight = self.base_weight();
+        weight.validate_tensor_parallel_layout(plan, ProjectionShardAxis::Column, label)?;
+        let (out, _) = weight.dims2()?;
+        tp_shard(plan, label, out)?;
+        Ok(())
+    }
+
+    pub(crate) fn validate_row_parallel_support(
+        &self,
+        plan: TensorParallelPlan,
+        label: &'static str,
+    ) -> CandleResult<()> {
+        let weight = self.base_weight();
+        weight.validate_tensor_parallel_layout(plan, ProjectionShardAxis::Row, label)?;
+        let (_, input) = weight.dims2()?;
+        tp_shard(plan, label, input)?;
+        Ok(())
+    }
+
     /// Load `<name>.weight` of `shape` from `vb`, adapted iff `adapted`.
     pub(crate) fn load(
         vb: &VarBuilder,

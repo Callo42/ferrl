@@ -122,14 +122,26 @@ pub enum TrainerError {
     /// Writing a periodic adapter checkpoint failed.
     #[error(transparent)]
     Checkpoint(#[from] crate::checkpoint::CheckpointError),
-    /// A data-parallel collective failed (contribution mismatch, a peer rank
-    /// timing out, or a poisoned world) — see [`crate::comm`].
+    /// A data- or tensor-parallel collective failed (contribution mismatch, a
+    /// peer rank timing out, or a poisoned world) — see [`crate::comm`].
     #[error(transparent)]
     Comm(#[from] crate::comm::CommError),
+    /// An opaque tensor-parallel policy hook either observed a collective
+    /// failure or panicked inside its lockstep collective region. The trainer
+    /// must not probe the communicator with a later status rendezvous.
+    #[error(
+        "tensor-parallel {operation} entered a terminal distributed state: {detail}; no further collectives are safe; discard the tensor-parallel communicator and policy instance"
+    )]
+    TensorParallelExecutionTerminal {
+        /// Policy hook that failed.
+        operation: &'static str,
+        /// Preserved communication error or panic diagnostic.
+        detail: String,
+    },
     /// A reader-visible publication may exist, but the status collective failed,
     /// so callers must preserve publication-side state and discard the dead world.
     #[error(
-        "{artifact} publication may be visible at {path}; {detail}; communication failed ({communication}); the data-parallel world is dead and no further collectives are safe; discard the communicator"
+        "{artifact} publication may be visible at {path}; {detail}; communication failed ({communication}); the distributed execution world is dead and no further collectives are safe; discard the communicator"
     )]
     PublicationAmbiguousAfterComm {
         /// Human-readable artifact kind (continuation or rollout ledger).
@@ -170,6 +182,8 @@ pub enum TrainerError {
 pub struct RolloutLedgerContinuation {
     completed_step: u64,
     world_size: u32,
+    tensor_parallel_world_size: u32,
+    tensor_parallel_layout: String,
     optimizer_state: OptimizerState,
     policy_sha256: String,
     trainer_config_sha256: String,
@@ -193,6 +207,18 @@ impl RolloutLedgerContinuation {
     #[must_use]
     pub fn world_size(&self) -> u32 {
         self.world_size
+    }
+
+    /// Tensor-parallel topology bound to this continuation.
+    #[must_use]
+    pub fn tensor_parallel_world_size(&self) -> u32 {
+        self.tensor_parallel_world_size
+    }
+
+    /// Canonical ordering used to bind TP communicator ranks to model shards.
+    #[must_use]
+    pub fn tensor_parallel_layout(&self) -> &str {
+        &self.tensor_parallel_layout
     }
 
     /// Exact chain lineage represented by the post-step continuation.
@@ -1178,7 +1204,7 @@ pub struct Trainer {
     /// The data-parallel collective seam ([`SoloComm`] for a single-rank run).
     /// Every call site is guarded on `world_size() > 1`, so the world-1 path
     /// is byte-for-byte the pre-DP trainer.
-    comm: Box<dyn Comm>,
+    comm: Arc<dyn Comm>,
     /// Optional cooperative preemption flag (see
     /// [`with_preemption_flag`](Self::with_preemption_flag)). When `Some` and set,
     /// the loop writes a final checkpoint and stops at the next step boundary. Safe
@@ -1452,6 +1478,10 @@ struct UpdateCtx<'a> {
 }
 
 trait PolicyExecution<P: Policy> {
+    fn execution_comm<'a>(&'a self, trainer_comm: &'a dyn Comm) -> &'a dyn Comm {
+        trainer_comm
+    }
+
     fn generate_at_instrumented(
         &self,
         policy: &mut P,
@@ -1459,22 +1489,26 @@ trait PolicyExecution<P: Policy> {
         cfg: &GenConfig,
         global_row_base: u64,
         telemetry: Option<&mut dyn ModelTelemetryRecorder>,
-    ) -> CandleResult<Rollout>;
+    ) -> Result<Rollout, TrainerError>;
 
-    fn token_logprobs(&self, policy: &P, rollout: &Rollout) -> CandleResult<Tensor>;
+    fn token_logprobs(&self, policy: &P, rollout: &Rollout) -> Result<Tensor, TrainerError>;
 
-    fn token_logprobs_detached(&self, policy: &P, rollout: &Rollout) -> CandleResult<Tensor>;
+    fn token_logprobs_detached(
+        &self,
+        policy: &P,
+        rollout: &Rollout,
+    ) -> Result<Tensor, TrainerError>;
 
-    fn backward(&self, policy: &P, loss: &Tensor) -> CandleResult<GradStore> {
-        policy.backward(loss)
+    fn backward(&self, policy: &P, loss: &Tensor) -> Result<GradStore, TrainerError> {
+        policy.backward(loss).map_err(TrainerError::from)
     }
 
     fn execution_rank(&self, trainer_comm: &dyn Comm) -> usize {
-        trainer_comm.rank()
+        self.execution_comm(trainer_comm).rank()
     }
 
     fn execution_world_size(&self, trainer_comm: &dyn Comm) -> usize {
-        trainer_comm.world_size()
+        self.execution_comm(trainer_comm).world_size()
     }
 
     fn is_execution_primary(&self, trainer_comm: &dyn Comm) -> bool {
@@ -1494,7 +1528,9 @@ trait PolicyExecution<P: Policy> {
         trainer_comm: &dyn Comm,
         value: f64,
     ) -> Result<f64, TrainerError> {
-        Ok(trainer_comm.all_reduce_scalar_sum(value)?)
+        Ok(self
+            .execution_comm(trainer_comm)
+            .all_reduce_scalar_sum(value)?)
     }
 
     fn reduce_model_parallel_grads(
@@ -1518,16 +1554,24 @@ impl<P: Policy> PolicyExecution<P> for UnshardedPolicyExecution {
         cfg: &GenConfig,
         global_row_base: u64,
         telemetry: Option<&mut dyn ModelTelemetryRecorder>,
-    ) -> CandleResult<Rollout> {
-        policy.generate_at_instrumented(prompt, cfg, global_row_base, telemetry)
+    ) -> Result<Rollout, TrainerError> {
+        policy
+            .generate_at_instrumented(prompt, cfg, global_row_base, telemetry)
+            .map_err(TrainerError::from)
     }
 
-    fn token_logprobs(&self, policy: &P, rollout: &Rollout) -> CandleResult<Tensor> {
-        policy.token_logprobs(rollout)
+    fn token_logprobs(&self, policy: &P, rollout: &Rollout) -> Result<Tensor, TrainerError> {
+        policy.token_logprobs(rollout).map_err(TrainerError::from)
     }
 
-    fn token_logprobs_detached(&self, policy: &P, rollout: &Rollout) -> CandleResult<Tensor> {
-        policy.token_logprobs_detached(rollout)
+    fn token_logprobs_detached(
+        &self,
+        policy: &P,
+        rollout: &Rollout,
+    ) -> Result<Tensor, TrainerError> {
+        policy
+            .token_logprobs_detached(rollout)
+            .map_err(TrainerError::from)
     }
 }
 
@@ -1536,7 +1580,47 @@ struct TensorParallelPolicyExecution<'a> {
     comm: &'a dyn Comm,
 }
 
+impl TensorParallelPolicyExecution<'_> {
+    fn active_comm<'a>(&'a self, trainer_comm: &'a dyn Comm) -> &'a dyn Comm {
+        if self.comm.world_size() > 1 {
+            self.comm
+        } else {
+            trainer_comm
+        }
+    }
+}
+
+fn tensor_parallel_policy_call<T>(
+    operation: &'static str,
+    comm: &dyn Comm,
+    call: impl FnOnce() -> CandleResult<T>,
+) -> Result<T, TrainerError> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(call)) {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error))
+            if comm.world_size() > 1 || crate::tensor_parallel::is_comm_failure(&error) =>
+        {
+            Err(TrainerError::TensorParallelExecutionTerminal {
+                operation,
+                detail: error.to_string(),
+            })
+        }
+        Ok(Err(error)) => Err(TrainerError::Candle(error)),
+        Err(payload) => Err(TrainerError::TensorParallelExecutionTerminal {
+            operation,
+            detail: format!(
+                "policy hook panicked: {}",
+                panic_payload_message(payload.as_ref())
+            ),
+        }),
+    }
+}
+
 impl<P: TensorParallelPolicy> PolicyExecution<P> for TensorParallelPolicyExecution<'_> {
+    fn execution_comm<'a>(&'a self, trainer_comm: &'a dyn Comm) -> &'a dyn Comm {
+        self.active_comm(trainer_comm)
+    }
+
     fn generate_at_instrumented(
         &self,
         policy: &mut P,
@@ -1544,42 +1628,46 @@ impl<P: TensorParallelPolicy> PolicyExecution<P> for TensorParallelPolicyExecuti
         cfg: &GenConfig,
         global_row_base: u64,
         telemetry: Option<&mut dyn ModelTelemetryRecorder>,
-    ) -> CandleResult<Rollout> {
-        policy.generate_at_tensor_parallel_instrumented(
-            prompt,
-            cfg,
-            global_row_base,
-            self.comm,
-            telemetry,
-        )
+    ) -> Result<Rollout, TrainerError> {
+        tensor_parallel_policy_call("rollout generation", self.comm, || {
+            policy.generate_at_tensor_parallel_instrumented(
+                prompt,
+                cfg,
+                global_row_base,
+                self.comm,
+                telemetry,
+            )
+        })
     }
 
-    fn token_logprobs(&self, policy: &P, rollout: &Rollout) -> CandleResult<Tensor> {
-        policy.token_logprobs_tensor_parallel(rollout, self.comm)
+    fn token_logprobs(&self, policy: &P, rollout: &Rollout) -> Result<Tensor, TrainerError> {
+        tensor_parallel_policy_call("differentiable scoring", self.comm, || {
+            policy.token_logprobs_tensor_parallel(rollout, self.comm)
+        })
     }
 
-    fn token_logprobs_detached(&self, policy: &P, rollout: &Rollout) -> CandleResult<Tensor> {
-        policy.token_logprobs_tensor_parallel_detached(rollout, self.comm)
+    fn token_logprobs_detached(
+        &self,
+        policy: &P,
+        rollout: &Rollout,
+    ) -> Result<Tensor, TrainerError> {
+        tensor_parallel_policy_call("detached scoring", self.comm, || {
+            policy.token_logprobs_tensor_parallel_detached(rollout, self.comm)
+        })
     }
 
-    fn backward(&self, policy: &P, loss: &Tensor) -> CandleResult<GradStore> {
-        policy.backward_tensor_parallel(loss, self.comm)
+    fn backward(&self, policy: &P, loss: &Tensor) -> Result<GradStore, TrainerError> {
+        tensor_parallel_policy_call("backward", self.comm, || {
+            policy.backward_tensor_parallel(loss, self.comm)
+        })
     }
 
     fn execution_rank(&self, trainer_comm: &dyn Comm) -> usize {
-        if self.comm.world_size() > 1 {
-            self.comm.rank()
-        } else {
-            trainer_comm.rank()
-        }
+        self.active_comm(trainer_comm).rank()
     }
 
     fn execution_world_size(&self, trainer_comm: &dyn Comm) -> usize {
-        if self.comm.world_size() > 1 {
-            self.comm.world_size()
-        } else {
-            trainer_comm.world_size()
-        }
+        self.active_comm(trainer_comm).world_size()
     }
 
     fn is_execution_primary(&self, trainer_comm: &dyn Comm) -> bool {
@@ -1607,11 +1695,9 @@ impl<P: TensorParallelPolicy> PolicyExecution<P> for TensorParallelPolicyExecuti
         trainer_comm: &dyn Comm,
         value: f64,
     ) -> Result<f64, TrainerError> {
-        if self.comm.world_size() > 1 {
-            Ok(self.comm.all_reduce_scalar_sum(value)?)
-        } else {
-            Ok(trainer_comm.all_reduce_scalar_sum(value)?)
-        }
+        Ok(self
+            .active_comm(trainer_comm)
+            .all_reduce_scalar_sum(value)?)
     }
 
     fn reduce_model_parallel_grads(
@@ -1782,7 +1868,7 @@ impl Trainer {
             config,
             writer,
             checkpoints_dir: run.checkpoints_dir(),
-            comm: Box::new(comm),
+            comm: Arc::new(comm),
             preempt: None,
             candidate_writer,
         })
@@ -1859,9 +1945,89 @@ impl Trainer {
         P: Policy,
         R: RewardFn,
     {
+        let exec = UnshardedPolicyExecution;
+        self.collect_rollout_ledger_step_with_execution(
+            step,
+            policy,
+            reward_fn,
+            tokenizer,
+            samples,
+            root,
+            policy_sha256,
+            continuation,
+            &exec,
+        )
+    }
+
+    /// Collect one logical rollout window through an explicit tensor-parallel
+    /// policy execution world. Every TP rank executes the model and validates
+    /// identical logical payload bytes; execution rank 0 alone publishes the
+    /// world-one ledger package.
+    ///
+    /// # Errors
+    ///
+    /// As [`collect_rollout_ledger_step`](Self::collect_rollout_ledger_step),
+    /// plus invalid or simultaneous sharded DP×TP execution.
+    #[allow(clippy::too_many_arguments)]
+    pub fn collect_rollout_ledger_step_tensor_parallel<P, R>(
+        &mut self,
+        step: u64,
+        policy: &mut P,
+        reward_fn: &R,
+        tokenizer: &dyn TokenizerLike,
+        samples: &[Sample<R::Target>],
+        root: impl AsRef<Path>,
+        policy_sha256: &str,
+        continuation: Option<&RolloutLedgerContinuation>,
+        tensor_parallel_comm: &dyn Comm,
+    ) -> Result<PathBuf, TrainerError>
+    where
+        P: TensorParallelPolicy,
+        R: RewardFn,
+    {
+        self.validate_tensor_parallel_comm(tensor_parallel_comm)?;
+        self.validate_tensor_parallel_policy_execution(policy, tensor_parallel_comm)?;
+        let exec = TensorParallelPolicyExecution {
+            comm: tensor_parallel_comm,
+        };
+        self.collect_rollout_ledger_step_with_execution(
+            step,
+            policy,
+            reward_fn,
+            tokenizer,
+            samples,
+            root,
+            policy_sha256,
+            continuation,
+            &exec,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
+    fn collect_rollout_ledger_step_with_execution<P, R, E>(
+        &mut self,
+        step: u64,
+        policy: &mut P,
+        reward_fn: &R,
+        tokenizer: &dyn TokenizerLike,
+        samples: &[Sample<R::Target>],
+        root: impl AsRef<Path>,
+        policy_sha256: &str,
+        continuation: Option<&RolloutLedgerContinuation>,
+        exec: &E,
+    ) -> Result<PathBuf, TrainerError>
+    where
+        P: Policy,
+        R: RewardFn,
+        E: PolicyExecution<P>,
+    {
         self.require_rollout_ledger_topology()?;
+        let trainer_comm = Arc::clone(&self.comm);
+        let execution_comm = exec.execution_comm(trainer_comm.as_ref());
+        let tensor_parallel_world_size = exec.model_parallel_world_size();
         let root = root.as_ref();
-        let consensus = self.coordinate_data_parallel_result(
+        let consensus = Self::coordinate_comm_result(
+            execution_comm,
             "rollout-ledger distributed input serialization",
             serde_json::to_vec(&(
                 &self.config,
@@ -1879,134 +2045,161 @@ impl Trainer {
                 ))
             }),
         )?;
-        self.require_data_parallel_consensus_bytes(
+        Self::require_comm_consensus_bytes(
+            execution_comm,
             "rollout-ledger root/config/prompt contract",
             &consensus,
         )?;
-        let (vars, opt, step_beta, controls, sampler_prestate, lineage, identity, writer) = self
-            .coordinate_data_parallel_call("rollout-ledger collector preflight", || {
-                self.require_rollout_ledger_step_in_range(step)?;
-                validate_external_policy_sha256(policy_sha256)?;
-                if samples.is_empty() {
-                    return Err(TrainerError::Contract(
-                        "collect_rollout_ledger_step: no samples".into(),
-                    ));
-                }
-                let vars = policy.trainable_vars();
-                let mut opt = self.new_optimizer(vars.clone())?;
-                if let Some(state) = continuation {
-                    opt.load_state(state.optimizer_state())?;
-                }
-                let step_lr = self.config.lr_at(step);
-                let step_beta = self.config.beta_at(step);
-                self.require_toggleable_reference_policy(
-                    policy,
-                    self.config.requires_reference_policy(),
-                )?;
-                opt.set_learning_rate(step_lr);
-                let controls =
-                    self.rollout_ledger_controls(step, opt.learning_rate(), step_beta)?;
-                let sampler_prestate = policy.sampler_state()?;
-                let lineage = self.require_rollout_ledger_continuation_state(
-                    step,
-                    policy,
-                    policy_sha256,
-                    &vars,
-                    &opt,
-                    &sampler_prestate,
-                    continuation,
-                )?;
-                let identity = self.rollout_ledger_identity(
-                    step,
-                    policy,
-                    policy_sha256,
-                    &vars,
-                    &opt,
-                    &sampler_prestate,
-                    &lineage,
-                )?;
-                let writer = RolloutLedgerWriter::create(root, identity.clone())?;
-                Ok((
-                    vars,
-                    opt,
-                    step_beta,
-                    controls,
-                    sampler_prestate,
-                    lineage,
-                    identity,
-                    writer,
-                ))
-            })?;
+        let (vars, opt, step_beta, controls, sampler_prestate, lineage, identity) =
+            Self::coordinate_comm_call(
+                execution_comm,
+                "rollout-ledger collector preflight",
+                || {
+                    self.require_rollout_ledger_step_in_range(step)?;
+                    validate_external_policy_sha256(policy_sha256)?;
+                    if samples.is_empty() {
+                        return Err(TrainerError::Contract(
+                            "collect_rollout_ledger_step: no samples".into(),
+                        ));
+                    }
+                    let vars = policy.trainable_vars();
+                    let mut opt = self.new_optimizer(vars.clone())?;
+                    if let Some(state) = continuation {
+                        opt.load_state(state.optimizer_state())?;
+                    }
+                    let step_lr = self.config.lr_at(step);
+                    let step_beta = self.config.beta_at(step);
+                    self.require_toggleable_reference_policy(
+                        policy,
+                        self.config.requires_reference_policy(),
+                    )?;
+                    opt.set_learning_rate(step_lr);
+                    let controls =
+                        self.rollout_ledger_controls(step, opt.learning_rate(), step_beta)?;
+                    let sampler_prestate = policy.sampler_state()?;
+                    let lineage = self
+                        .require_rollout_ledger_continuation_state_with_model_parallel(
+                            step,
+                            policy,
+                            policy_sha256,
+                            &vars,
+                            &opt,
+                            &sampler_prestate,
+                            continuation,
+                            tensor_parallel_world_size,
+                        )?;
+                    let identity = self.rollout_ledger_identity_with_model_parallel(
+                        step,
+                        policy,
+                        policy_sha256,
+                        &vars,
+                        &opt,
+                        &sampler_prestate,
+                        &lineage,
+                        tensor_parallel_world_size,
+                    )?;
+                    Ok((
+                        vars,
+                        opt,
+                        step_beta,
+                        controls,
+                        sampler_prestate,
+                        lineage,
+                        identity,
+                    ))
+                },
+            )?;
         let identity_bytes = serde_json::to_vec(&(&identity, &controls)).map_err(|error| {
             TrainerError::Contract(format!("serialize rollout-ledger identity: {error}"))
         })?;
-        self.require_data_parallel_consensus_bytes(
+        Self::require_comm_consensus_bytes(
+            execution_comm,
             "rollout-ledger collector identity/controls",
             &identity_bytes,
         )?;
-        self.require_data_parallel_consensus_bytes(
+        Self::require_comm_consensus_bytes(
+            execution_comm,
             "rollout-ledger collector sampler prestate",
             &sampler_prestate,
         )?;
-        let outcome: Result<PathBuf, TrainerError> = (|| {
-            let exec = UnshardedPolicyExecution;
-            let mut gpu_mem = StepGpuMemory::new(false);
-            let collection = (|| {
-                let mut collected = Vec::with_capacity(self.config.grad_accum_steps);
-                for j in 0..self.config.grad_accum_steps {
-                    let sel = self.select_prompt(step, j, samples.len());
-                    self.record_prompt_selection(&sel);
-                    let selected = SelectedSample {
-                        sample: &samples[sel.sample_idx],
-                        selection: &sel,
-                        accum_index: j,
-                    };
-                    collected.push(self.collect_group(
-                        step,
-                        step_beta,
-                        policy,
-                        reward_fn,
-                        tokenizer,
-                        &selected,
-                        &mut gpu_mem,
-                        &exec,
-                    )?);
+        let is_execution_primary = exec.is_execution_primary(self.comm.as_ref());
+        let writer =
+            Self::coordinate_comm_call(execution_comm, "rollout-ledger writer creation", || {
+                if tensor_parallel_world_size <= 1 || is_execution_primary {
+                    RolloutLedgerWriter::create(root, identity.clone())
+                        .map(Some)
+                        .map_err(TrainerError::from)
+                } else {
+                    Ok(None)
                 }
-                Ok(collected)
-            })();
-            let collected = self
-                .coordinate_data_parallel_result("rollout-ledger group collection", collection)?;
-            let sampler_poststate =
-                self.coordinate_data_parallel_call("rollout-ledger collector poststate", || {
+            })?;
+        let outcome: Result<PathBuf, TrainerError> = (|| {
+            let mut gpu_mem = StepGpuMemory::new(false);
+            let collected = Self::coordinate_comm_call(
+                execution_comm,
+                "rollout-ledger group collection",
+                || {
+                    let mut collected = Vec::with_capacity(self.config.grad_accum_steps);
+                    for j in 0..self.config.grad_accum_steps {
+                        let sel = self.select_prompt(step, j, samples.len());
+                        self.record_prompt_selection(&sel);
+                        let selected = SelectedSample {
+                            sample: &samples[sel.sample_idx],
+                            selection: &sel,
+                            accum_index: j,
+                        };
+                        collected.push(self.collect_group(
+                            step,
+                            step_beta,
+                            policy,
+                            reward_fn,
+                            tokenizer,
+                            &selected,
+                            &mut gpu_mem,
+                            exec,
+                        )?);
+                    }
+                    Ok(collected)
+                },
+            )?;
+            let sampler_poststate = Self::coordinate_comm_call(
+                execution_comm,
+                "rollout-ledger collector poststate",
+                || {
                     let post_collection_vars = policy.trainable_vars();
                     self.require_same_rollout_ledger_vars(
                         &vars,
                         &post_collection_vars,
                         "rollout collection",
                     )?;
-                    let post_collection_identity = self.rollout_ledger_identity(
-                        step,
-                        policy,
-                        policy_sha256,
-                        &post_collection_vars,
-                        &opt,
-                        &sampler_prestate,
-                        &lineage,
-                    )?;
+                    let post_collection_identity = self
+                        .rollout_ledger_identity_with_model_parallel(
+                            step,
+                            policy,
+                            policy_sha256,
+                            &post_collection_vars,
+                            &opt,
+                            &sampler_prestate,
+                            &lineage,
+                            tensor_parallel_world_size,
+                        )?;
                     if post_collection_identity != identity {
                         return Err(TrainerError::Contract(
                             "learner identity changed during rollout collection".into(),
                         ));
                     }
                     Ok(policy.sampler_state()?)
-                })?;
-            self.require_data_parallel_consensus_bytes(
+                },
+            )?;
+            Self::require_comm_consensus_bytes(
+                execution_comm,
                 "rollout-ledger collector sampler poststate",
                 &sampler_poststate,
             )?;
             let (window_tokens, live_items) =
                 self.rollout_ledger_global_counts(&collected, step_beta)?;
-            let payload = self.coordinate_data_parallel_result(
+            let payload = Self::coordinate_comm_result(
+                execution_comm,
                 "rollout-ledger payload construction",
                 self.rollout_ledger_payload(
                     step,
@@ -2017,10 +2210,44 @@ impl Trainer {
                     live_items,
                 ),
             )?;
-            if self.comm.world_size() == 1 {
-                writer.write_step(&payload).map_err(TrainerError::from)
+            if tensor_parallel_world_size > 1 {
+                let payload_bytes = serde_json::to_vec(&payload).map_err(|error| {
+                    TrainerError::Contract(format!(
+                        "serialize tensor-parallel rollout-ledger payload: {error}"
+                    ))
+                })?;
+                Self::require_comm_consensus_bytes(
+                    execution_comm,
+                    "tensor-parallel rollout-ledger logical payload",
+                    &payload_bytes,
+                )?;
+                self.publish_tensor_parallel_rollout_ledger_step(
+                    writer.as_ref(),
+                    root,
+                    &payload,
+                    execution_comm,
+                    is_execution_primary,
+                )
+            } else if self.comm.world_size() == 1 {
+                writer
+                    .as_ref()
+                    .ok_or_else(|| {
+                        TrainerError::Contract(
+                            "world-one rollout-ledger writer was not constructed".into(),
+                        )
+                    })?
+                    .write_step(&payload)
+                    .map_err(TrainerError::from)
             } else {
-                self.publish_distributed_rollout_ledger_step(&writer, &payload, &controls)
+                self.publish_distributed_rollout_ledger_step(
+                    writer.as_ref().ok_or_else(|| {
+                        TrainerError::Contract(
+                            "distributed rollout-ledger writer was not constructed".into(),
+                        )
+                    })?,
+                    &payload,
+                    &controls,
+                )
             }
         })();
         match outcome {
@@ -2031,12 +2258,28 @@ impl Trainer {
                 // the sampler would split collector state from that visible L_k.
                 Err(TrainerError::RolloutLedger(error))
             }
+            Err(TrainerError::TensorParallelExecutionTerminal {
+                operation,
+                mut detail,
+            }) => {
+                let rollback = Self::catch_local_distributed_recovery(
+                    "best-effort local tensor-parallel rollout-ledger collector rollback",
+                    || Self::restore_rollout_ledger_sampler(policy, &sampler_prestate),
+                );
+                match rollback {
+                    Ok(()) => detail.push_str("; local sampler rollback succeeded"),
+                    Err(error) => detail.push_str(&format!(
+                        "; local sampler rollback failed ({error}); policy state is partial"
+                    )),
+                }
+                Err(TrainerError::TensorParallelExecutionTerminal { operation, detail })
+            }
             Err(TrainerError::Comm(comm_error)) => {
-                let rollback = Self::catch_local_data_parallel_recovery(
+                let rollback = Self::catch_local_distributed_recovery(
                     "best-effort local rollout-ledger collector rollback",
                     || Self::restore_rollout_ledger_sampler(policy, &sampler_prestate),
                 );
-                Err(Self::terminal_data_parallel_comm_failure(
+                Err(Self::terminal_distributed_comm_failure(
                     "rollout-ledger collector",
                     &comm_error,
                     None,
@@ -2045,13 +2288,14 @@ impl Trainer {
                 ))
             }
             Err(error) => {
-                let rollback = self
-                    .coordinate_data_parallel_call("rollout-ledger collector rollback", || {
-                        Self::restore_rollout_ledger_sampler(policy, &sampler_prestate)
-                    });
+                let rollback = Self::coordinate_comm_call(
+                    execution_comm,
+                    "rollout-ledger collector rollback",
+                    || Self::restore_rollout_ledger_sampler(policy, &sampler_prestate),
+                );
                 if let Err(rollback) = rollback {
                     return Err(TrainerError::Contract(format!(
-                        "rollout-ledger collector failed ({error}); coordinated sampler rollback also failed ({rollback}); discard the policy instance on every rank in this data-parallel world"
+                        "rollout-ledger collector failed ({error}); coordinated sampler rollback also failed ({rollback}); discard the policy instance on every rank in this execution world"
                     )));
                 }
                 Err(error)
@@ -2092,15 +2336,79 @@ impl Trainer {
         policy_sha256: &str,
         continuation: Option<&RolloutLedgerContinuation>,
     ) -> Result<(Metrics, RolloutLedgerContinuation), TrainerError> {
+        let exec = UnshardedPolicyExecution;
+        self.train_rollout_ledger_step_with_execution(
+            step,
+            policy,
+            root,
+            policy_sha256,
+            continuation,
+            &exec,
+        )
+    }
+
+    /// Consume one logical ledger window through an explicit tensor-parallel
+    /// policy execution world. Every TP rank validates the same package and
+    /// runs scoring/backward; replicated adapter gradients are sum-reduced
+    /// before the optimizer step and execution rank 0 owns metrics publication.
+    ///
+    /// # Errors
+    ///
+    /// As [`train_rollout_ledger_step`](Self::train_rollout_ledger_step), plus
+    /// invalid, forward-only, or simultaneous sharded DP×TP execution.
+    pub fn train_rollout_ledger_step_tensor_parallel<P: TensorParallelPolicy>(
+        &mut self,
+        step: u64,
+        policy: &mut P,
+        root: impl AsRef<Path>,
+        policy_sha256: &str,
+        continuation: Option<&RolloutLedgerContinuation>,
+        tensor_parallel_comm: &dyn Comm,
+    ) -> Result<(Metrics, RolloutLedgerContinuation), TrainerError> {
+        self.validate_tensor_parallel_comm(tensor_parallel_comm)?;
+        self.validate_tensor_parallel_policy_execution(policy, tensor_parallel_comm)?;
+        self.validate_tensor_parallel_backward(policy, tensor_parallel_comm)?;
+        let exec = TensorParallelPolicyExecution {
+            comm: tensor_parallel_comm,
+        };
+        self.train_rollout_ledger_step_with_execution(
+            step,
+            policy,
+            root,
+            policy_sha256,
+            continuation,
+            &exec,
+        )
+    }
+
+    #[allow(clippy::cognitive_complexity)]
+    fn train_rollout_ledger_step_with_execution<P, E>(
+        &mut self,
+        step: u64,
+        policy: &mut P,
+        root: impl AsRef<Path>,
+        policy_sha256: &str,
+        continuation: Option<&RolloutLedgerContinuation>,
+        exec: &E,
+    ) -> Result<(Metrics, RolloutLedgerContinuation), TrainerError>
+    where
+        P: Policy,
+        E: PolicyExecution<P>,
+    {
         self.require_rollout_ledger_topology()?;
+        let trainer_comm = Arc::clone(&self.comm);
+        let execution_comm = exec.execution_comm(trainer_comm.as_ref());
+        let tensor_parallel_world_size = exec.model_parallel_world_size();
         let root = root.as_ref();
-        let consensus = self.coordinate_data_parallel_result(
+        let consensus = Self::coordinate_comm_result(
+            execution_comm,
             "rollout-ledger learner input serialization",
             serde_json::to_vec(&(
                 &self.config,
                 root.as_os_str().as_encoded_bytes(),
                 policy_sha256,
                 continuation.is_some(),
+                tensor_parallel_world_size,
             ))
             .map_err(|error| {
                 TrainerError::Contract(format!(
@@ -2108,12 +2416,13 @@ impl Trainer {
                 ))
             }),
         )?;
-        self.require_data_parallel_consensus_bytes(
+        Self::require_comm_consensus_bytes(
+            execution_comm,
             "rollout-ledger learner root/config contract",
             &consensus,
         )?;
-        let (vars, mut opt, step_beta, _controls, sampler_prestate, lineage, validated) = self
-            .coordinate_data_parallel_call("rollout-ledger learner preflight", || {
+        let (vars, mut opt, step_beta, _controls, sampler_prestate, lineage, validated) =
+            Self::coordinate_comm_call(execution_comm, "rollout-ledger learner preflight", || {
                 self.require_rollout_ledger_step_in_range(step)?;
                 validate_external_policy_sha256(policy_sha256)?;
                 let vars = policy.trainable_vars();
@@ -2126,7 +2435,7 @@ impl Trainer {
                 let controls =
                     self.rollout_ledger_controls(step, opt.learning_rate(), step_beta)?;
                 let sampler_prestate = policy.sampler_state()?;
-                let lineage = self.require_rollout_ledger_continuation_state(
+                let lineage = self.require_rollout_ledger_continuation_state_with_model_parallel(
                     step,
                     policy,
                     policy_sha256,
@@ -2134,8 +2443,9 @@ impl Trainer {
                     &opt,
                     &sampler_prestate,
                     continuation,
+                    tensor_parallel_world_size,
                 )?;
-                let identity = self.rollout_ledger_identity(
+                let identity = self.rollout_ledger_identity_with_model_parallel(
                     step,
                     policy,
                     policy_sha256,
@@ -2143,6 +2453,7 @@ impl Trainer {
                     &opt,
                     &sampler_prestate,
                     &lineage,
+                    tensor_parallel_world_size,
                 )?;
                 let reader = RolloutLedgerReader::open(
                     root,
@@ -2178,21 +2489,27 @@ impl Trainer {
             })?;
         let validated_identity = validated.identity().clone();
         let consumed_ledger_sha256 = validated.consumed_ledger_sha256().to_owned();
-        self.require_data_parallel_consensus_bytes(
+        Self::require_comm_consensus_bytes(
+            execution_comm,
             "rollout-ledger committed world manifest",
             consumed_ledger_sha256.as_bytes(),
         )?;
         let payload = validated.into_step();
-        let (adapter_prestate, optimizer_prestate, adapter_enabled_prestate) = self
-            .coordinate_data_parallel_call("rollout-ledger learner rollback snapshot", || {
-                Ok((
-                    Self::snapshot_rollout_ledger_vars(&vars)?,
-                    opt.state()?,
-                    policy.adapter_enabled(),
-                ))
-            })?;
+        let (adapter_prestate, optimizer_prestate, adapter_enabled_prestate) =
+            Self::coordinate_comm_call(
+                execution_comm,
+                "rollout-ledger learner rollback snapshot",
+                || {
+                    Ok((
+                        Self::snapshot_rollout_ledger_vars(&vars)?,
+                        opt.state()?,
+                        policy.adapter_enabled(),
+                    ))
+                },
+            )?;
         let outcome: Result<(Metrics, RolloutLedgerContinuation), TrainerError> = (|| {
-            self.coordinate_data_parallel_call(
+            Self::coordinate_comm_call(
+                execution_comm,
                 "rollout-ledger reference-policy preflight",
                 || {
                     self.require_toggleable_reference_policy(
@@ -2205,7 +2522,7 @@ impl Trainer {
                         &post_toggle_vars,
                         "reference-policy preflight",
                     )?;
-                    let post_toggle_identity = self.rollout_ledger_identity(
+                    let post_toggle_identity = self.rollout_ledger_identity_with_model_parallel(
                         step,
                         policy,
                         policy_sha256,
@@ -2213,6 +2530,7 @@ impl Trainer {
                         &opt,
                         &sampler_prestate,
                         &lineage,
+                        tensor_parallel_world_size,
                     )?;
                     if post_toggle_identity != validated_identity {
                         return Err(TrainerError::Contract(
@@ -2223,10 +2541,11 @@ impl Trainer {
                 },
             )?;
 
-            let exec = UnshardedPolicyExecution;
             let mut gpu_mem = StepGpuMemory::new(false);
-            let (stats, live) =
-                self.coordinate_data_parallel_call("rollout-ledger detached scoring", || {
+            let (stats, live) = Self::coordinate_comm_call(
+                execution_comm,
+                "rollout-ledger detached scoring",
+                || {
                     let mut stats = Vec::with_capacity(payload.groups.len());
                     let mut live = Vec::with_capacity(payload.groups.len());
                     for group in &payload.groups {
@@ -2236,7 +2555,7 @@ impl Trainer {
                             collected,
                             step_beta,
                             &mut gpu_mem,
-                            &exec,
+                            exec,
                         )?;
                         stats.push(stat);
                         if let Some(item) = item {
@@ -2249,7 +2568,7 @@ impl Trainer {
                         &post_scoring_vars,
                         "detached ledger scoring",
                     )?;
-                    let post_scoring_identity = self.rollout_ledger_identity(
+                    let post_scoring_identity = self.rollout_ledger_identity_with_model_parallel(
                         step,
                         policy,
                         policy_sha256,
@@ -2257,6 +2576,7 @@ impl Trainer {
                         &opt,
                         &sampler_prestate,
                         &lineage,
+                        tensor_parallel_world_size,
                     )?;
                     if post_scoring_identity != validated_identity {
                         return Err(TrainerError::Contract(
@@ -2264,8 +2584,10 @@ impl Trainer {
                         ));
                     }
                     Ok((stats, live))
-                })?;
-            let (local_tokens, local_live) = self.coordinate_data_parallel_result(
+                },
+            )?;
+            let (local_tokens, local_live) = Self::coordinate_comm_result(
+                execution_comm,
                 "rollout-ledger learner local counts",
                 (|| {
                     let tokens = stats.iter().try_fold(0_u64, |total, stat| {
@@ -2289,6 +2611,19 @@ impl Trainer {
                     ))
                 })(),
             )?;
+            if tensor_parallel_world_size > 1 {
+                let local_count_bytes =
+                    serde_json::to_vec(&(local_tokens, local_live)).map_err(|error| {
+                        TrainerError::Contract(format!(
+                            "serialize tensor-parallel learner counts: {error}"
+                        ))
+                    })?;
+                Self::require_comm_consensus_bytes(
+                    execution_comm,
+                    "tensor-parallel rollout-ledger learner counts",
+                    &local_count_bytes,
+                )?;
+            }
             let (actual_window_tokens, actual_live_items) = if self.comm.world_size() > 1 {
                 let (local_tokens_f64, local_live_f64) = self.coordinate_data_parallel_result(
                     "rollout-ledger learner exact count conversion",
@@ -2343,26 +2678,34 @@ impl Trainer {
                     payload.window_tokens as f64,
                     f64::from(payload.live_items),
                     step_beta,
-                    &exec,
+                    exec,
                 )?
             };
-            self.coordinate_data_parallel_call("rollout-ledger learner post-update state", || {
-                let post_update_vars = policy.trainable_vars();
-                self.require_same_rollout_ledger_vars(
-                    &vars,
-                    &post_update_vars,
-                    "rollout-ledger learner update",
-                )?;
-                Self::restore_rollout_ledger_sampler(policy, &payload.post_rollout_sampler_state)?;
-                let post_handoff_vars = policy.trainable_vars();
-                self.require_same_rollout_ledger_vars(
-                    &vars,
-                    &post_handoff_vars,
-                    "rollout-ledger sampler handoff",
-                )?;
-                Ok(())
-            })?;
-            self.require_data_parallel_consensus_bytes(
+            Self::coordinate_comm_call(
+                execution_comm,
+                "rollout-ledger learner post-update state",
+                || {
+                    let post_update_vars = policy.trainable_vars();
+                    self.require_same_rollout_ledger_vars(
+                        &vars,
+                        &post_update_vars,
+                        "rollout-ledger learner update",
+                    )?;
+                    Self::restore_rollout_ledger_sampler(
+                        policy,
+                        &payload.post_rollout_sampler_state,
+                    )?;
+                    let post_handoff_vars = policy.trainable_vars();
+                    self.require_same_rollout_ledger_vars(
+                        &vars,
+                        &post_handoff_vars,
+                        "rollout-ledger sampler handoff",
+                    )?;
+                    Ok(())
+                },
+            )?;
+            Self::require_comm_consensus_bytes(
+                execution_comm,
                 "rollout-ledger learner sampler handoff",
                 &payload.post_rollout_sampler_state,
             )?;
@@ -2372,12 +2715,13 @@ impl Trainer {
                 "ferrl.rollout-ledger.lineage.v1",
                 &[lineage.as_bytes(), consumed_ledger_sha256.as_bytes()],
             );
-            let (optimizer_state, post_identity) = self.coordinate_data_parallel_call(
+            let (optimizer_state, post_identity) = Self::coordinate_comm_call(
+                execution_comm,
                 "rollout-ledger continuation construction",
                 || {
                     let optimizer_state = opt.state()?;
                     let sampler_poststate = policy.sampler_state()?;
-                    let post_identity = self.rollout_ledger_identity(
+                    let post_identity = self.rollout_ledger_identity_with_model_parallel(
                         step + 1,
                         policy,
                         policy_sha256,
@@ -2385,6 +2729,7 @@ impl Trainer {
                         &opt,
                         &sampler_poststate,
                         &next_lineage,
+                        tensor_parallel_world_size,
                     )?;
                     Ok((optimizer_state, post_identity))
                 },
@@ -2392,7 +2737,8 @@ impl Trainer {
             let post_identity_bytes = serde_json::to_vec(&post_identity).map_err(|error| {
                 TrainerError::Contract(format!("serialize post-ledger identity: {error}"))
             })?;
-            self.require_data_parallel_consensus_bytes(
+            Self::require_comm_consensus_bytes(
+                execution_comm,
                 "rollout-ledger continuation state",
                 &post_identity_bytes,
             )?;
@@ -2403,6 +2749,15 @@ impl Trainer {
                         "rollout-ledger world size does not fit continuation u32".into(),
                     )
                 })?,
+                tensor_parallel_world_size: u32::try_from(tensor_parallel_world_size).map_err(
+                    |_| {
+                        TrainerError::Contract(
+                            "tensor-parallel world size does not fit continuation u32".into(),
+                        )
+                    },
+                )?,
+                tensor_parallel_layout: crate::checkpoint::ROLLOUT_LEDGER_CONTINUATION_LAYOUT
+                    .to_owned(),
                 optimizer_state,
                 policy_sha256: post_identity.policy_sha256,
                 trainer_config_sha256: post_identity.trainer_config_sha256,
@@ -2414,7 +2769,12 @@ impl Trainer {
                 consumed_ledger_sha256: consumed_ledger_sha256.clone(),
                 lineage_sha256: next_lineage,
             };
-            self.append_rollout_ledger_metrics(&metrics)?;
+            self.append_rollout_ledger_metrics_with_execution(
+                &metrics,
+                execution_comm,
+                exec.is_execution_primary(self.comm.as_ref()),
+                tensor_parallel_world_size > 1,
+            )?;
             Ok((metrics, continuation))
         })();
 
@@ -2424,7 +2784,7 @@ impl Trainer {
                 communication,
                 telemetry_rollback,
             }) => {
-                let rollback = Self::catch_local_data_parallel_recovery(
+                let rollback = Self::catch_local_distributed_recovery(
                     "best-effort local rollout-ledger learner rollback",
                     || {
                         Self::restore_rollout_ledger_prestate(
@@ -2438,7 +2798,7 @@ impl Trainer {
                         )
                     },
                 );
-                Err(Self::terminal_data_parallel_comm_failure(
+                Err(Self::terminal_distributed_comm_failure(
                     "rollout-ledger metrics publication",
                     &communication,
                     Some(&telemetry_rollback),
@@ -2447,7 +2807,7 @@ impl Trainer {
                 ))
             }
             Err(TrainerError::Comm(comm_error)) => {
-                let rollback = Self::catch_local_data_parallel_recovery(
+                let rollback = Self::catch_local_distributed_recovery(
                     "best-effort local rollout-ledger learner rollback",
                     || {
                         Self::restore_rollout_ledger_prestate(
@@ -2461,7 +2821,7 @@ impl Trainer {
                         )
                     },
                 );
-                Err(Self::terminal_data_parallel_comm_failure(
+                Err(Self::terminal_distributed_comm_failure(
                     "rollout-ledger learner",
                     &comm_error,
                     None,
@@ -2469,9 +2829,13 @@ impl Trainer {
                     "policy and optimizer state",
                 ))
             }
-            Err(error) => {
-                let rollback =
-                    self.coordinate_data_parallel_call("rollout-ledger learner rollback", || {
+            Err(TrainerError::TensorParallelExecutionTerminal {
+                operation,
+                mut detail,
+            }) => {
+                let rollback = Self::catch_local_distributed_recovery(
+                    "best-effort local tensor-parallel rollout-ledger learner rollback",
+                    || {
                         Self::restore_rollout_ledger_prestate(
                             policy,
                             &vars,
@@ -2481,10 +2845,37 @@ impl Trainer {
                             adapter_enabled_prestate,
                             &sampler_prestate,
                         )
-                    });
+                    },
+                );
+                match rollback {
+                    Ok(()) => detail.push_str(
+                        "; local adapter/optimizer/sampler rollback succeeded",
+                    ),
+                    Err(error) => detail.push_str(&format!(
+                        "; local adapter/optimizer/sampler rollback failed ({error}); policy state is partial"
+                    )),
+                }
+                Err(TrainerError::TensorParallelExecutionTerminal { operation, detail })
+            }
+            Err(error) => {
+                let rollback = Self::coordinate_comm_call(
+                    execution_comm,
+                    "rollout-ledger learner rollback",
+                    || {
+                        Self::restore_rollout_ledger_prestate(
+                            policy,
+                            &vars,
+                            &adapter_prestate,
+                            &mut opt,
+                            &optimizer_prestate,
+                            adapter_enabled_prestate,
+                            &sampler_prestate,
+                        )
+                    },
+                );
                 if let Err(rollback) = rollback {
                     return Err(TrainerError::Contract(format!(
-                        "rollout-ledger learner failed ({error}); coordinated adapter/optimizer/sampler rollback also failed ({rollback}); discard the policy and optimizer state on every rank in this data-parallel world"
+                        "rollout-ledger learner failed ({error}); coordinated adapter/optimizer/sampler rollback also failed ({rollback}); discard the policy and optimizer state on every rank in this execution world"
                     )));
                 }
                 Err(error)
@@ -2516,6 +2907,28 @@ impl Trainer {
         self.save_rollout_ledger_continuation_to(&self.checkpoints_dir, policy, continuation)
     }
 
+    /// Persist a tensor-parallel separated continuation below this trainer's
+    /// checkpoint root. Every rank validates the same replicated adapter,
+    /// optimizer, sampler, lineage, and topology; execution rank 0 alone writes.
+    ///
+    /// # Errors
+    ///
+    /// As [`save_rollout_ledger_continuation`](Self::save_rollout_ledger_continuation),
+    /// plus invalid or simultaneous sharded DP×TP execution.
+    pub fn save_rollout_ledger_continuation_tensor_parallel<P: TensorParallelPolicy>(
+        &self,
+        policy: &P,
+        continuation: &RolloutLedgerContinuation,
+        tensor_parallel_comm: &dyn Comm,
+    ) -> Result<PathBuf, TrainerError> {
+        self.save_rollout_ledger_continuation_to_tensor_parallel(
+            &self.checkpoints_dir,
+            policy,
+            continuation,
+            tensor_parallel_comm,
+        )
+    }
+
     /// Persist a continuation below an explicit shared checkpoint root.
     ///
     /// Distributed trainers normally use distinct rank-local [`RunDir`]s for
@@ -2533,9 +2946,61 @@ impl Trainer {
         policy: &P,
         continuation: &RolloutLedgerContinuation,
     ) -> Result<PathBuf, TrainerError> {
+        let exec = UnshardedPolicyExecution;
+        self.save_rollout_ledger_continuation_to_with_execution(
+            checkpoints_dir,
+            policy,
+            continuation,
+            &exec,
+        )
+    }
+
+    /// Persist a tensor-parallel separated continuation below an explicit
+    /// shared checkpoint root.
+    ///
+    /// # Errors
+    ///
+    /// As [`save_rollout_ledger_continuation_to`](Self::save_rollout_ledger_continuation_to),
+    /// plus invalid or simultaneous sharded DP×TP execution.
+    pub fn save_rollout_ledger_continuation_to_tensor_parallel<P: TensorParallelPolicy>(
+        &self,
+        checkpoints_dir: impl AsRef<Path>,
+        policy: &P,
+        continuation: &RolloutLedgerContinuation,
+        tensor_parallel_comm: &dyn Comm,
+    ) -> Result<PathBuf, TrainerError> {
+        self.validate_tensor_parallel_comm(tensor_parallel_comm)?;
+        self.validate_tensor_parallel_policy_execution(policy, tensor_parallel_comm)?;
+        let exec = TensorParallelPolicyExecution {
+            comm: tensor_parallel_comm,
+        };
+        self.save_rollout_ledger_continuation_to_with_execution(
+            checkpoints_dir,
+            policy,
+            continuation,
+            &exec,
+        )
+    }
+
+    fn save_rollout_ledger_continuation_to_with_execution<P, E>(
+        &self,
+        checkpoints_dir: impl AsRef<Path>,
+        policy: &P,
+        continuation: &RolloutLedgerContinuation,
+        exec: &E,
+    ) -> Result<PathBuf, TrainerError>
+    where
+        P: Policy,
+        E: PolicyExecution<P>,
+    {
         self.require_rollout_ledger_topology()?;
+        let trainer_comm = Arc::clone(&self.comm);
+        let execution_comm = exec.execution_comm(trainer_comm.as_ref());
+        let tensor_parallel_world_size = exec.model_parallel_world_size();
+        let is_execution_primary = exec.is_execution_primary(self.comm.as_ref());
         let checkpoints_dir = checkpoints_dir.as_ref();
-        let (vars, sampler_state, dir, recipe, manifest) = self.coordinate_data_parallel_call(
+        let (vars, sampler_state, dir, recipe, manifest) = Self::coordinate_comm_call(
+            execution_comm,
             "rollout-ledger continuation save preflight",
             || {
                 let completed_step = continuation.completed_step;
@@ -2549,7 +3014,7 @@ impl Trainer {
                 let mut opt = self.new_optimizer(vars.clone())?;
                 opt.load_state(continuation.optimizer_state())?;
                 let sampler_state = policy.sampler_state()?;
-                self.require_rollout_ledger_continuation_state(
+                self.require_rollout_ledger_continuation_state_with_model_parallel(
                     completed_step,
                     policy,
                     &continuation.policy_sha256,
@@ -2557,6 +3022,7 @@ impl Trainer {
                     &opt,
                     &sampler_state,
                     Some(continuation),
+                    tensor_parallel_world_size,
                 )?;
                 let dir = checkpoints_dir.join(format!("step-{completed_step}"));
                 let recipe = policy.lora_recipe();
@@ -2564,6 +3030,8 @@ impl Trainer {
                     format_version: crate::checkpoint::ROLLOUT_LEDGER_CONTINUATION_FORMAT_VERSION,
                     kind: crate::checkpoint::ROLLOUT_LEDGER_CONTINUATION_KIND.to_owned(),
                     world_size: Some(continuation.world_size),
+                    tensor_parallel_world_size: Some(continuation.tensor_parallel_world_size),
+                    tensor_parallel_layout: Some(continuation.tensor_parallel_layout.clone()),
                     completed_step,
                     policy_sha256: continuation.policy_sha256.clone(),
                     trainer_config_sha256: continuation.trainer_config_sha256.clone(),
@@ -2578,7 +3046,8 @@ impl Trainer {
                 Ok((vars, sampler_state, dir, recipe, manifest))
             },
         )?;
-        let consensus = self.coordinate_data_parallel_result(
+        let consensus = Self::coordinate_comm_result(
+            execution_comm,
             "rollout-ledger continuation save serialization",
             serde_json::to_vec(&(
                 dir.as_os_str().as_encoded_bytes(),
@@ -2591,12 +3060,13 @@ impl Trainer {
                 ))
             }),
         )?;
-        self.require_data_parallel_consensus_bytes(
+        Self::require_comm_consensus_bytes(
+            execution_comm,
             "rollout-ledger continuation save contract",
             &consensus,
         )?;
 
-        let save_local = if self.comm.rank() == 0 {
+        let save_local = if is_execution_primary {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 crate::checkpoint::save_checkpoint_no_replace(
                     &dir,
@@ -2624,7 +3094,7 @@ impl Trainer {
             )) => 2.0,
             Err(_) => 1.0,
         };
-        let publication_signal = self.comm.all_reduce_scalar_sum(if self.comm.rank() == 0 {
+        let publication_signal = execution_comm.all_reduce_scalar_sum(if is_execution_primary {
             publication_signal
         } else {
             0.0
@@ -2635,8 +3105,7 @@ impl Trainer {
                 return Err(TrainerError::PublicationAmbiguousAfterComm {
                     artifact: "rollout-ledger continuation",
                     path: dir,
-                    detail: "rank 0 entered no-replace publication before the status collective"
-                        .into(),
+                    detail: "execution rank 0 entered no-replace publication before the status collective".into(),
                     communication: Box::new(error),
                 });
             }
@@ -2647,7 +3116,8 @@ impl Trainer {
                 Ok(()) => Err(TrainerError::Checkpoint(
                     crate::checkpoint::CheckpointError::PublicationAmbiguous {
                         path: dir,
-                        detail: "rank 0 reported ambiguous continuation publication".into(),
+                        detail: "execution rank 0 reported ambiguous continuation publication"
+                            .into(),
                     },
                 )),
             };
@@ -2656,7 +3126,8 @@ impl Trainer {
             return match save_local {
                 Err(error) => Err(error),
                 Ok(()) => Err(TrainerError::Contract(
-                    "rank 0 failed before continuation publication; every rank may retry".into(),
+                    "execution rank 0 failed before continuation publication; every rank may retry"
+                        .into(),
                 )),
             };
         }
@@ -2685,9 +3156,60 @@ impl Trainer {
         policy: &mut P,
         policy_sha256: &str,
     ) -> Result<RolloutLedgerContinuation, TrainerError> {
+        let exec = UnshardedPolicyExecution;
+        self.restore_rollout_ledger_continuation_with_execution(
+            checkpoint_dir,
+            policy,
+            policy_sha256,
+            &exec,
+        )
+    }
+
+    /// Restore a tensor-parallel separated continuation on every execution
+    /// rank, validating the saved DP×TP topology before policy mutation.
+    ///
+    /// # Errors
+    ///
+    /// As [`restore_rollout_ledger_continuation`](Self::restore_rollout_ledger_continuation),
+    /// plus invalid or simultaneous sharded DP×TP execution.
+    pub fn restore_rollout_ledger_continuation_tensor_parallel<P: TensorParallelPolicy>(
+        &self,
+        checkpoint_dir: impl AsRef<Path>,
+        policy: &mut P,
+        policy_sha256: &str,
+        tensor_parallel_comm: &dyn Comm,
+    ) -> Result<RolloutLedgerContinuation, TrainerError> {
+        self.validate_tensor_parallel_comm(tensor_parallel_comm)?;
+        self.validate_tensor_parallel_policy_execution(policy, tensor_parallel_comm)?;
+        let exec = TensorParallelPolicyExecution {
+            comm: tensor_parallel_comm,
+        };
+        self.restore_rollout_ledger_continuation_with_execution(
+            checkpoint_dir,
+            policy,
+            policy_sha256,
+            &exec,
+        )
+    }
+
+    #[allow(clippy::cognitive_complexity)]
+    fn restore_rollout_ledger_continuation_with_execution<P, E>(
+        &self,
+        checkpoint_dir: impl AsRef<Path>,
+        policy: &mut P,
+        policy_sha256: &str,
+        exec: &E,
+    ) -> Result<RolloutLedgerContinuation, TrainerError>
+    where
+        P: Policy,
+        E: PolicyExecution<P>,
+    {
         self.require_rollout_ledger_topology()?;
+        let execution_comm = exec.execution_comm(self.comm.as_ref());
+        let tensor_parallel_world_size = exec.model_parallel_world_size();
         let checkpoint_dir = checkpoint_dir.as_ref();
-        let restore_input = self.coordinate_data_parallel_result(
+        let restore_input = Self::coordinate_comm_result(
+            execution_comm,
             "rollout-ledger continuation restore input serialization",
             serde_json::to_vec(&(checkpoint_dir.as_os_str().as_encoded_bytes(), policy_sha256))
                 .map_err(|error| {
@@ -2696,11 +3218,13 @@ impl Trainer {
                     ))
                 }),
         )?;
-        self.require_data_parallel_consensus_bytes(
+        Self::require_comm_consensus_bytes(
+            execution_comm,
             "rollout-ledger continuation restore path/policy",
             &restore_input,
         )?;
-        let (vars, adapter_prestate, sampler_prestate) = self.coordinate_data_parallel_call(
+        let (vars, adapter_prestate, sampler_prestate) = Self::coordinate_comm_call(
+            execution_comm,
             "rollout-ledger continuation restore snapshot",
             || {
                 validate_external_policy_sha256(policy_sha256)?;
@@ -2733,15 +3257,33 @@ impl Trainer {
                     continuation_manifest.format_version
                 )));
             }
-            let manifest_world_size = match (
+            let (
+                manifest_world_size,
+                manifest_tensor_parallel_world_size,
+                manifest_tensor_parallel_layout,
+            ) = match (
                 continuation_manifest.format_version,
                 continuation_manifest.world_size,
+                continuation_manifest.tensor_parallel_world_size,
+                continuation_manifest.tensor_parallel_layout.as_deref(),
             ) {
-                (1, None) => 1,
-                (crate::checkpoint::ROLLOUT_LEDGER_CONTINUATION_FORMAT_VERSION, Some(world_size))
-                    if world_size > 0 =>
-                {
-                    world_size
+                (1, None, None, None) => (
+                    1,
+                    1,
+                    crate::checkpoint::ROLLOUT_LEDGER_CONTINUATION_LAYOUT,
+                ),
+                (2, Some(world_size), None, None) if world_size > 0 => (
+                    world_size,
+                    1,
+                    crate::checkpoint::ROLLOUT_LEDGER_CONTINUATION_LAYOUT,
+                ),
+                (
+                    crate::checkpoint::ROLLOUT_LEDGER_CONTINUATION_FORMAT_VERSION,
+                    Some(world_size),
+                    Some(tensor_parallel_world_size),
+                    Some(tensor_parallel_layout),
+                ) if world_size > 0 && tensor_parallel_world_size > 0 => {
+                    (world_size, tensor_parallel_world_size, tensor_parallel_layout)
                 }
                 _ => {
                     return Err(TrainerError::Contract(
@@ -2758,6 +3300,24 @@ impl Trainer {
             if manifest_world_size != current_world_size {
                 return Err(TrainerError::Contract(format!(
                     "rollout-ledger continuation world size {manifest_world_size} does not match current world {current_world_size}"
+                )));
+            }
+            let current_tensor_parallel_world_size =
+                u32::try_from(tensor_parallel_world_size).map_err(|_| {
+                    TrainerError::Contract(
+                        "tensor-parallel world size does not fit continuation u32".into(),
+                    )
+                })?;
+            if manifest_tensor_parallel_world_size != current_tensor_parallel_world_size {
+                return Err(TrainerError::Contract(format!(
+                    "rollout-ledger continuation tensor-parallel world size {manifest_tensor_parallel_world_size} does not match current world {current_tensor_parallel_world_size}"
+                )));
+            }
+            if manifest_tensor_parallel_layout
+                != crate::checkpoint::ROLLOUT_LEDGER_CONTINUATION_LAYOUT
+            {
+                return Err(TrainerError::Contract(format!(
+                    "rollout-ledger continuation tensor-parallel layout {manifest_tensor_parallel_layout:?} is unsupported"
                 )));
             }
             if continuation_manifest.completed_step != manifest.step
@@ -2805,7 +3365,7 @@ impl Trainer {
                 ));
             }
             let preflight_opt = self.new_optimizer(vars.clone())?;
-            let preflight_identity = self.rollout_ledger_identity(
+            let preflight_identity = self.rollout_ledger_identity_with_model_parallel(
                 manifest.step,
                 policy,
                 policy_sha256,
@@ -2813,6 +3373,7 @@ impl Trainer {
                 &preflight_opt,
                 &sampler_prestate,
                 &continuation_manifest.lineage_sha256,
+                tensor_parallel_world_size,
             )?;
             if continuation_manifest.trainer_config_sha256
                 != preflight_identity.trainer_config_sha256
@@ -2848,7 +3409,7 @@ impl Trainer {
             )?;
             let mut opt = self.new_optimizer(vars.clone())?;
             opt.load_state(&optimizer_state)?;
-            let actual = self.rollout_ledger_identity(
+            let actual = self.rollout_ledger_identity_with_model_parallel(
                 loaded.step,
                 policy,
                 policy_sha256,
@@ -2856,6 +3417,7 @@ impl Trainer {
                 &opt,
                 &sampler_state,
                 &continuation_manifest.lineage_sha256,
+                tensor_parallel_world_size,
             )?;
             if continuation_manifest.adapter_sha256 != actual.adapter_sha256
                 || continuation_manifest.optimizer_sha256 != actual.optimizer_sha256
@@ -2869,6 +3431,8 @@ impl Trainer {
             Ok(RolloutLedgerContinuation {
                 completed_step: loaded.step,
                 world_size: manifest_world_size,
+                tensor_parallel_world_size: manifest_tensor_parallel_world_size,
+                tensor_parallel_layout: manifest_tensor_parallel_layout.to_owned(),
                 optimizer_state,
                 policy_sha256: continuation_manifest.policy_sha256,
                 trainer_config_sha256: continuation_manifest.trainer_config_sha256,
@@ -2888,7 +3452,7 @@ impl Trainer {
             )))
         });
         let failed_local = if outcome.is_err() { 1.0 } else { 0.0 };
-        let failed_global = self.comm.all_reduce_scalar_sum(failed_local);
+        let failed_global = execution_comm.all_reduce_scalar_sum(failed_local);
         let failed_global = match failed_global {
             Ok(failed) => failed,
             Err(comm_error) => {
@@ -2906,7 +3470,8 @@ impl Trainer {
         };
         if failed_global > 0.0 {
             let local_error = outcome.err();
-            let rollback = self.coordinate_data_parallel_call(
+            let rollback = Self::coordinate_comm_call(
+                execution_comm,
                 "rollout-ledger continuation restore rollback",
                 || {
                     Self::restore_rollout_ledger_checkpoint_prestate(
@@ -2919,7 +3484,7 @@ impl Trainer {
             );
             return match (local_error, rollback) {
                 (_, Err(rollback_error)) => Err(TrainerError::Contract(format!(
-                    "rollout-ledger continuation restore failed on at least one rank; coordinated rollback failed ({rollback_error}); discard the policy state on every rank in this data-parallel world"
+                    "rollout-ledger continuation restore failed on at least one rank; coordinated rollback failed ({rollback_error}); discard the policy state on every rank in this execution world"
                 ))),
                 (Some(error), Ok(())) => Err(error),
                 (None, Ok(())) => Err(TrainerError::Contract(
@@ -2930,11 +3495,14 @@ impl Trainer {
         }
         let continuation = outcome?;
         let consensus = (|| {
-            let bytes = self.coordinate_data_parallel_result(
+            let bytes = Self::coordinate_comm_result(
+                execution_comm,
                 "rollout-ledger restored continuation serialization",
                 serde_json::to_vec(&(
                     continuation.completed_step,
                     continuation.world_size,
+                    continuation.tensor_parallel_world_size,
+                    &continuation.tensor_parallel_layout,
                     &continuation.policy_sha256,
                     &continuation.trainer_config_sha256,
                     &continuation.tensor_schema_sha256,
@@ -2951,7 +3519,8 @@ impl Trainer {
                     ))
                 }),
             )?;
-            self.require_data_parallel_consensus_bytes(
+            Self::require_comm_consensus_bytes(
+                execution_comm,
                 "restored rollout-ledger continuation",
                 &bytes,
             )
@@ -2968,7 +3537,8 @@ impl Trainer {
                     &sampler_prestate,
                 ));
             }
-            let rollback = self.coordinate_data_parallel_call(
+            let rollback = Self::coordinate_comm_call(
+                execution_comm,
                 "rollout-ledger continuation consensus rollback",
                 || {
                     Self::restore_rollout_ledger_checkpoint_prestate(
@@ -2982,7 +3552,7 @@ impl Trainer {
             return match rollback {
                 Ok(()) => Err(error),
                 Err(rollback_error) => Err(TrainerError::Contract(format!(
-                    "restored continuation consensus failed ({error}); coordinated rollback also failed ({rollback_error}); discard the policy state on every rank in this data-parallel world"
+                    "restored continuation consensus failed ({error}); coordinated rollback also failed ({rollback_error}); discard the policy state on every rank in this execution world"
                 ))),
             };
         }
@@ -3008,6 +3578,27 @@ impl Trainer {
         )
     }
 
+    /// Restore the newest tensor-parallel separated continuation below this
+    /// trainer's checkpoint root.
+    ///
+    /// # Errors
+    ///
+    /// As [`restore_latest_rollout_ledger_continuation`](Self::restore_latest_rollout_ledger_continuation),
+    /// plus invalid or simultaneous sharded DP×TP execution.
+    pub fn restore_latest_rollout_ledger_continuation_tensor_parallel<P: TensorParallelPolicy>(
+        &self,
+        policy: &mut P,
+        policy_sha256: &str,
+        tensor_parallel_comm: &dyn Comm,
+    ) -> Result<Option<RolloutLedgerContinuation>, TrainerError> {
+        self.restore_latest_rollout_ledger_continuation_from_tensor_parallel(
+            &self.checkpoints_dir,
+            policy,
+            policy_sha256,
+            tensor_parallel_comm,
+        )
+    }
+
     /// Discover on rank 0 and restore from an explicit shared checkpoint root.
     ///
     /// # Errors
@@ -3020,9 +3611,61 @@ impl Trainer {
         policy: &mut P,
         policy_sha256: &str,
     ) -> Result<Option<RolloutLedgerContinuation>, TrainerError> {
+        let exec = UnshardedPolicyExecution;
+        self.restore_latest_rollout_ledger_continuation_from_with_execution(
+            checkpoints_dir,
+            policy,
+            policy_sha256,
+            &exec,
+        )
+    }
+
+    /// Discover on tensor-parallel execution rank 0 and restore from an
+    /// explicit shared checkpoint root on every rank.
+    ///
+    /// # Errors
+    ///
+    /// As [`restore_latest_rollout_ledger_continuation_from`](Self::restore_latest_rollout_ledger_continuation_from),
+    /// plus invalid or simultaneous sharded DP×TP execution.
+    pub fn restore_latest_rollout_ledger_continuation_from_tensor_parallel<
+        P: TensorParallelPolicy,
+    >(
+        &self,
+        checkpoints_dir: impl AsRef<Path>,
+        policy: &mut P,
+        policy_sha256: &str,
+        tensor_parallel_comm: &dyn Comm,
+    ) -> Result<Option<RolloutLedgerContinuation>, TrainerError> {
+        self.validate_tensor_parallel_comm(tensor_parallel_comm)?;
+        self.validate_tensor_parallel_policy_execution(policy, tensor_parallel_comm)?;
+        let exec = TensorParallelPolicyExecution {
+            comm: tensor_parallel_comm,
+        };
+        self.restore_latest_rollout_ledger_continuation_from_with_execution(
+            checkpoints_dir,
+            policy,
+            policy_sha256,
+            &exec,
+        )
+    }
+
+    fn restore_latest_rollout_ledger_continuation_from_with_execution<P, E>(
+        &self,
+        checkpoints_dir: impl AsRef<Path>,
+        policy: &mut P,
+        policy_sha256: &str,
+        exec: &E,
+    ) -> Result<Option<RolloutLedgerContinuation>, TrainerError>
+    where
+        P: Policy,
+        E: PolicyExecution<P>,
+    {
         self.require_rollout_ledger_topology()?;
+        let execution_comm = exec.execution_comm(self.comm.as_ref());
+        let is_execution_primary = exec.is_execution_primary(self.comm.as_ref());
         let checkpoints_dir = checkpoints_dir.as_ref();
-        let discovery_input = self.coordinate_data_parallel_result(
+        let discovery_input = Self::coordinate_comm_result(
+            execution_comm,
             "rollout-ledger latest-discovery input serialization",
             serde_json::to_vec(&(
                 checkpoints_dir.as_os_str().as_encoded_bytes(),
@@ -3034,11 +3677,12 @@ impl Trainer {
                 ))
             }),
         )?;
-        self.require_data_parallel_consensus_bytes(
+        Self::require_comm_consensus_bytes(
+            execution_comm,
             "rollout-ledger latest-discovery root/policy",
             &discovery_input,
         )?;
-        let latest_local = if self.comm.rank() == 0 {
+        let latest_local = if is_execution_primary {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let latest = crate::checkpoint::latest_rollout_ledger_continuation(
                     checkpoints_dir,
@@ -3068,7 +3712,7 @@ impl Trainer {
             Ok(None) => ResumeDecision::Fresh,
             Err(_) => ResumeDecision::ScanFailed,
         };
-        let signal = self.comm.all_reduce_scalar_sum(if self.comm.rank() == 0 {
+        let signal = execution_comm.all_reduce_scalar_sum(if is_execution_primary {
             decision.encode()
         } else {
             0.0
@@ -3091,8 +3735,13 @@ impl Trainer {
                     }
                 }
                 let dir = checkpoints_dir.join(format!("step-{step}"));
-                self.restore_rollout_ledger_continuation(dir, policy, policy_sha256)
-                    .map(Some)
+                self.restore_rollout_ledger_continuation_with_execution(
+                    dir,
+                    policy,
+                    policy_sha256,
+                    exec,
+                )
+                .map(Some)
             }
         }
     }
@@ -3118,14 +3767,36 @@ impl Trainer {
         label: &str,
         local: Result<T, TrainerError>,
     ) -> Result<T, TrainerError> {
-        if self.comm.world_size() <= 1 {
+        Self::coordinate_comm_result(self.comm.as_ref(), label, local)
+    }
+
+    fn is_terminal_distributed_error(error: &TrainerError) -> bool {
+        matches!(
+            error,
+            TrainerError::Comm(_)
+                | TrainerError::TensorParallelExecutionTerminal { .. }
+                | TrainerError::PublicationAmbiguousAfterComm { .. }
+                | TrainerError::RolloutLedgerMetricsComm { .. }
+        )
+    }
+
+    fn coordinate_comm_result<T>(
+        comm: &dyn Comm,
+        label: &str,
+        local: Result<T, TrainerError>,
+    ) -> Result<T, TrainerError> {
+        if comm.world_size() <= 1 {
             return local;
         }
-        if matches!(&local, Err(TrainerError::Comm(_))) {
+        if local
+            .as_ref()
+            .err()
+            .is_some_and(Self::is_terminal_distributed_error)
+        {
             return local;
         }
         let failed_local = if local.is_err() { 1.0 } else { 0.0 };
-        let failed = self.comm.all_reduce_scalar_sum(failed_local)?;
+        let failed = comm.all_reduce_scalar_sum(failed_local)?;
         match local {
             Err(error) => Err(error),
             Ok(_) if failed > 0.0 => Err(TrainerError::Contract(format!(
@@ -3135,11 +3806,37 @@ impl Trainer {
         }
     }
 
-    /// Catch one rank-local callback panic and globalize the resulting status
-    /// before any rank can advance into the next data-parallel collective. The
-    /// operation itself must not enter a data-parallel collective.
-    fn coordinate_data_parallel_call<T, F>(
-        &self,
+    fn coordinate_model_parallel_result<T>(
+        model_parallel_world_size: usize,
+        execution_comm: &dyn Comm,
+        label: &str,
+        local: Result<T, TrainerError>,
+    ) -> Result<T, TrainerError> {
+        if model_parallel_world_size > 1 {
+            Self::coordinate_comm_result(execution_comm, label, local)
+        } else {
+            local
+        }
+    }
+
+    fn coordinate_model_parallel_call<T, F>(
+        model_parallel_world_size: usize,
+        execution_comm: &dyn Comm,
+        label: &str,
+        operation: F,
+    ) -> Result<T, TrainerError>
+    where
+        F: FnOnce() -> Result<T, TrainerError>,
+    {
+        if model_parallel_world_size > 1 {
+            Self::coordinate_comm_call(execution_comm, label, operation)
+        } else {
+            operation()
+        }
+    }
+
+    fn coordinate_comm_call<T, F>(
+        comm: &dyn Comm,
         label: &str,
         operation: F,
     ) -> Result<T, TrainerError>
@@ -3153,33 +3850,34 @@ impl Trainer {
                     panic_payload_message(payload.as_ref())
                 )))
             });
-        self.coordinate_data_parallel_result(label, local)
+        Self::coordinate_comm_result(comm, label, local)
     }
 
-    fn require_data_parallel_consensus_bytes(
-        &self,
+    fn require_comm_consensus_bytes(
+        comm: &dyn Comm,
         label: &str,
         value: &[u8],
     ) -> Result<(), TrainerError> {
-        if self.comm.world_size() <= 1 {
+        if comm.world_size() <= 1 {
             return Ok(());
         }
         let digest: [u8; 32] = Sha256::digest(value).into();
         let mut mismatch = false;
         for word in digest.chunks_exact(4) {
             let local = u32::from_le_bytes(word.try_into().expect("four-byte digest word"));
-            let canonical = self.comm.all_reduce_scalar_sum(if self.comm.rank() == 0 {
+            let canonical = comm.all_reduce_scalar_sum(if comm.rank() == 0 {
                 f64::from(local)
             } else {
                 0.0
             })?;
             mismatch |= canonical != f64::from(local);
         }
-        self.coordinate_data_parallel_result(
+        Self::coordinate_comm_result(
+            comm,
             label,
             if mismatch {
                 Err(TrainerError::Contract(format!(
-                    "{label} differs across data-parallel ranks"
+                    "{label} differs across execution ranks"
                 )))
             } else {
                 Ok(())
@@ -3345,6 +4043,82 @@ impl Trainer {
         Ok(commit_local.ok().flatten().unwrap_or(final_dir))
     }
 
+    fn publish_tensor_parallel_rollout_ledger_step(
+        &self,
+        writer: Option<&RolloutLedgerWriter>,
+        root: &Path,
+        payload: &RolloutLedgerStep,
+        execution_comm: &dyn Comm,
+        is_execution_primary: bool,
+    ) -> Result<PathBuf, TrainerError> {
+        let final_dir = root.join(format!("step-{:020}", payload.step));
+        let publish_local = if is_execution_primary {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                writer
+                    .ok_or_else(|| {
+                        TrainerError::Contract(
+                            "tensor-parallel primary has no rollout-ledger writer".into(),
+                        )
+                    })?
+                    .write_step(payload)
+                    .map(Some)
+                    .map_err(TrainerError::from)
+            }))
+            .unwrap_or_else(|panic| {
+                Err(TrainerError::Contract(format!(
+                    "tensor-parallel rollout-ledger publication panicked: {}",
+                    panic_payload_message(panic.as_ref())
+                )))
+            })
+        } else {
+            Ok(None)
+        };
+        let publication_signal = match &publish_local {
+            Ok(_) => 0.0,
+            Err(TrainerError::RolloutLedger(error)) if error.may_be_visible() => 2.0,
+            Err(_) => 1.0,
+        };
+        let publication_signal = execution_comm.all_reduce_scalar_sum(if is_execution_primary {
+            publication_signal
+        } else {
+            0.0
+        });
+        let publication_signal = match publication_signal {
+            Ok(signal) => signal,
+            Err(error) => {
+                return Err(TrainerError::PublicationAmbiguousAfterComm {
+                    artifact: "tensor-parallel rollout ledger",
+                    path: final_dir,
+                    detail: "execution rank 0 entered publication before the status collective"
+                        .into(),
+                    communication: Box::new(error),
+                });
+            }
+        };
+        if publication_signal > 1.5 {
+            return match publish_local {
+                Err(error) => Err(error),
+                Ok(_) => Err(TrainerError::RolloutLedger(
+                    RolloutLedgerError::PublicationAmbiguous {
+                        path: final_dir,
+                        detail: "execution rank 0 reported ambiguous tensor-parallel publication; sampler state was preserved on every rank"
+                            .into(),
+                    },
+                )),
+            };
+        }
+        if publication_signal > 0.5 {
+            return match publish_local {
+                Err(error) => Err(error),
+                Ok(_) => Err(TrainerError::Contract(
+                    "execution rank 0 failed before tensor-parallel rollout-ledger visibility; every rank may rewind and retry"
+                        .into(),
+                )),
+            };
+        }
+        Ok(publish_local.ok().flatten().unwrap_or(final_dir))
+    }
+
     fn require_rollout_ledger_step_in_range(&self, step: u64) -> Result<(), TrainerError> {
         if step >= self.config.steps {
             return Err(TrainerError::Contract(format!(
@@ -3455,7 +4229,7 @@ impl Trainer {
     /// Run recovery after a communication failure without touching the dead
     /// world. Policy callbacks may panic, so every such local-only recovery is
     /// contained here before the caller returns a terminal discard result.
-    fn catch_local_data_parallel_recovery<F>(label: &str, operation: F) -> Result<(), TrainerError>
+    fn catch_local_distributed_recovery<F>(label: &str, operation: F) -> Result<(), TrainerError>
     where
         F: FnOnce() -> Result<(), TrainerError>,
     {
@@ -3478,7 +4252,7 @@ impl Trainer {
         }
     }
 
-    fn terminal_data_parallel_comm_failure(
+    fn terminal_distributed_comm_failure(
         phase: &str,
         comm_error: &crate::comm::CommError,
         local_detail: Option<&str>,
@@ -3491,7 +4265,7 @@ impl Trainer {
             Err(error) => format!("best-effort local rollback failed: {error}"),
         };
         TrainerError::Contract(format!(
-            "{phase} communication failed ({comm_error}){local_detail}; {rollback_detail}; the data-parallel world is dead and no further collectives are safe; discard the {discard} on every rank in this data-parallel world"
+            "{phase} communication failed ({comm_error}){local_detail}; {rollback_detail}; the distributed execution world is dead and no further collectives are safe; discard the {discard} on every rank in this execution world"
         ))
     }
 
@@ -3501,7 +4275,7 @@ impl Trainer {
         adapter_prestate: &[Tensor],
         sampler_prestate: &[u8],
     ) -> Result<(), TrainerError> {
-        Self::catch_local_data_parallel_recovery("best-effort local continuation rollback", || {
+        Self::catch_local_distributed_recovery("best-effort local continuation rollback", || {
             Self::restore_rollout_ledger_checkpoint_prestate(
                 policy,
                 vars,
@@ -3530,7 +4304,7 @@ impl Trainer {
             || "the local restore had completed before communication failed".to_owned(),
             |error| format!("the local restore also failed: {error}"),
         );
-        Self::terminal_data_parallel_comm_failure(
+        Self::terminal_distributed_comm_failure(
             phase,
             comm_error,
             Some(&local_detail),
@@ -3646,8 +4420,8 @@ impl Trainer {
         })
     }
 
-    #[allow(clippy::too_many_arguments)] // verifies the complete live continuation tuple
-    fn require_rollout_ledger_continuation_state<P: Policy>(
+    #[allow(clippy::too_many_arguments)]
+    fn require_rollout_ledger_continuation_state_with_model_parallel<P: Policy>(
         &self,
         step: u64,
         policy: &P,
@@ -3656,6 +4430,7 @@ impl Trainer {
         opt: &FerrlAdamW,
         sampler_state: &[u8],
         continuation: Option<&RolloutLedgerContinuation>,
+        tensor_parallel_world_size: usize,
     ) -> Result<String, TrainerError> {
         let lineage = if let Some(continuation) = continuation {
             let current_world_size = u32::try_from(self.comm.world_size()).map_err(|_| {
@@ -3667,6 +4442,26 @@ impl Trainer {
                 return Err(TrainerError::Contract(format!(
                     "rollout-ledger continuation world size {} cannot run in world {current_world_size}",
                     continuation.world_size
+                )));
+            }
+            let current_tensor_parallel_world_size = u32::try_from(tensor_parallel_world_size)
+                .map_err(|_| {
+                    TrainerError::Contract(
+                        "tensor-parallel world size does not fit continuation u32".into(),
+                    )
+                })?;
+            if continuation.tensor_parallel_world_size != current_tensor_parallel_world_size {
+                return Err(TrainerError::Contract(format!(
+                    "rollout-ledger continuation tensor-parallel world size {} cannot run in world {current_tensor_parallel_world_size}",
+                    continuation.tensor_parallel_world_size
+                )));
+            }
+            if continuation.tensor_parallel_layout
+                != crate::checkpoint::ROLLOUT_LEDGER_CONTINUATION_LAYOUT
+            {
+                return Err(TrainerError::Contract(format!(
+                    "rollout-ledger continuation tensor-parallel layout {:?} is unsupported",
+                    continuation.tensor_parallel_layout
                 )));
             }
             if continuation.completed_step != step {
@@ -3694,7 +4489,7 @@ impl Trainer {
                     "rollout-ledger step {step} requires a chain-bound continuation"
                 )));
             }
-            let provisional = self.rollout_ledger_identity(
+            let provisional = self.rollout_ledger_identity_with_model_parallel(
                 step,
                 policy,
                 policy_sha256,
@@ -3702,13 +4497,14 @@ impl Trainer {
                 opt,
                 sampler_state,
                 &"0".repeat(64),
+                tensor_parallel_world_size,
             )?;
             let bytes = serde_json::to_vec(&provisional).map_err(|error| {
                 TrainerError::Contract(format!("serialize ledger genesis identity: {error}"))
             })?;
             domain_sha256("ferrl.rollout-ledger.genesis.v1", &[&bytes])
         };
-        let actual = self.rollout_ledger_identity(
+        let actual = self.rollout_ledger_identity_with_model_parallel(
             step,
             policy,
             policy_sha256,
@@ -3716,6 +4512,7 @@ impl Trainer {
             opt,
             sampler_state,
             &lineage,
+            tensor_parallel_world_size,
         )?;
         if let Some(continuation) = continuation {
             let mismatches = [
@@ -3754,8 +4551,8 @@ impl Trainer {
         Ok(lineage)
     }
 
-    #[allow(clippy::too_many_arguments)] // every identity component stays explicit at call sites
-    fn rollout_ledger_identity<P: Policy>(
+    #[allow(clippy::too_many_arguments)]
+    fn rollout_ledger_identity_with_model_parallel<P: Policy>(
         &self,
         step: u64,
         policy: &P,
@@ -3764,20 +4561,29 @@ impl Trainer {
         opt: &FerrlAdamW,
         sampler_state: &[u8],
         lineage_sha256: &str,
+        tensor_parallel_world_size: usize,
     ) -> Result<RolloutLedgerIdentity, TrainerError> {
-        let (config, config_domain) = if self.comm.world_size() == 1 {
-            (
+        let (config, config_domain) = match (self.comm.world_size(), tensor_parallel_world_size) {
+            (1, 1) => (
                 serde_json::to_vec(&self.config.rollout_ledger_semantics()),
                 "ferrl.rollout-ledger.trainer-config.v1",
-            )
-        } else {
-            (
+            ),
+            (_, 1) => (
                 serde_json::to_vec(&(
                     self.config.rollout_ledger_semantics(),
                     self.comm.world_size(),
                 )),
                 "ferrl.rollout-ledger.trainer-config.v2",
-            )
+            ),
+            (_, tensor_parallel_world_size) => (
+                serde_json::to_vec(&(
+                    self.config.rollout_ledger_semantics(),
+                    self.comm.world_size(),
+                    tensor_parallel_world_size,
+                    crate::checkpoint::ROLLOUT_LEDGER_CONTINUATION_LAYOUT,
+                )),
+                "ferrl.rollout-ledger.trainer-config.v3",
+            ),
         };
         let config = config.map_err(|error| {
             TrainerError::Contract(format!(
@@ -4148,6 +4954,7 @@ impl Trainer {
         tensor_parallel_comm: &dyn Comm,
     ) -> Result<(Vec<Metrics>, RunStop), TrainerError> {
         self.validate_tensor_parallel_comm(tensor_parallel_comm)?;
+        self.validate_tensor_parallel_policy_execution(policy, tensor_parallel_comm)?;
         self.validate_tensor_parallel_backward(policy, tensor_parallel_comm)?;
         let exec = TensorParallelPolicyExecution {
             comm: tensor_parallel_comm,
@@ -4215,6 +5022,7 @@ impl Trainer {
         tensor_parallel_comm: &dyn Comm,
     ) -> Result<(Vec<Metrics>, RunStop), TrainerError> {
         self.validate_tensor_parallel_comm(tensor_parallel_comm)?;
+        self.validate_tensor_parallel_policy_execution(policy, tensor_parallel_comm)?;
         self.validate_tensor_parallel_backward(policy, tensor_parallel_comm)?;
         let exec = TensorParallelPolicyExecution {
             comm: tensor_parallel_comm,
@@ -4295,6 +5103,7 @@ impl Trainer {
         tensor_parallel_comm: &dyn Comm,
     ) -> Result<(Vec<Metrics>, RunStop), TrainerError> {
         self.validate_tensor_parallel_comm(tensor_parallel_comm)?;
+        self.validate_tensor_parallel_policy_execution(policy, tensor_parallel_comm)?;
         self.validate_tensor_parallel_backward(policy, tensor_parallel_comm)?;
         let exec = TensorParallelPolicyExecution {
             comm: tensor_parallel_comm,
@@ -4422,6 +5231,7 @@ impl Trainer {
         tensor_parallel_comm: &dyn Comm,
     ) -> Result<(Vec<Metrics>, RunStop), TrainerError> {
         self.validate_tensor_parallel_comm(tensor_parallel_comm)?;
+        self.validate_tensor_parallel_policy_execution(policy, tensor_parallel_comm)?;
         self.validate_tensor_parallel_backward(policy, tensor_parallel_comm)?;
         let exec = TensorParallelPolicyExecution {
             comm: tensor_parallel_comm,
@@ -4486,6 +5296,34 @@ impl Trainer {
             ));
         }
         Ok(())
+    }
+
+    fn validate_tensor_parallel_policy_execution<P: TensorParallelPolicy>(
+        &self,
+        policy: &P,
+        comm: &dyn Comm,
+    ) -> Result<(), TrainerError> {
+        let local = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            policy
+                .validate_tensor_parallel_execution(comm)
+                .map_err(TrainerError::from)
+        }))
+        .unwrap_or_else(|payload| {
+            Err(TrainerError::Contract(format!(
+                "tensor-parallel policy execution preflight panicked: {}",
+                panic_payload_message(payload.as_ref())
+            )))
+        });
+        let execution_comm = if comm.world_size() > 1 {
+            comm
+        } else {
+            self.comm.as_ref()
+        };
+        Self::coordinate_comm_result(
+            execution_comm,
+            "tensor-parallel policy execution preflight",
+            local,
+        )
     }
 
     fn validate_tensor_parallel_backward<P: TensorParallelPolicy>(
@@ -4598,7 +5436,11 @@ impl Trainer {
         if exec.execution_world_size(self.comm.as_ref()) <= 1 {
             return local;
         }
-        if matches!(&local, Err(TrainerError::Comm(_))) {
+        if local
+            .as_ref()
+            .err()
+            .is_some_and(Self::is_terminal_distributed_error)
+        {
             return local;
         }
         let failed_local = if local.is_err() { 1.0 } else { 0.0 };
@@ -4774,7 +5616,7 @@ impl Trainer {
         let failed_global = match failed_global {
             Ok(failed) => failed,
             Err(comm_error) => {
-                let rollback = Self::catch_local_data_parallel_recovery(
+                let rollback = Self::catch_local_distributed_recovery(
                     "best-effort local rollout-ledger metrics rollback",
                     || {
                         self.writer.truncate_to(rollback_len)?;
@@ -4791,7 +5633,7 @@ impl Trainer {
             return append_local;
         }
         let rollback_local =
-            Self::catch_local_data_parallel_recovery("rollout-ledger metrics rollback", || {
+            Self::catch_local_distributed_recovery("rollout-ledger metrics rollback", || {
                 self.writer.truncate_to(rollback_len)?;
                 Ok(())
             });
@@ -4811,6 +5653,89 @@ impl Trainer {
             (Err(append_error), Ok(())) => Err(append_error),
             (Ok(()), Ok(())) => Err(TrainerError::Contract(
                 "rollout-ledger metrics append failed on a peer rank; every rank-local stream was rolled back"
+                    .into(),
+            )),
+        }
+    }
+
+    fn append_rollout_ledger_metrics_with_execution(
+        &mut self,
+        metrics: &Metrics,
+        execution_comm: &dyn Comm,
+        is_execution_primary: bool,
+        primary_only: bool,
+    ) -> Result<(), TrainerError> {
+        if !primary_only {
+            return self.append_rollout_ledger_metrics(metrics);
+        }
+
+        let rollback_len_local = if is_execution_primary {
+            self.writer.append_boundary().map_err(TrainerError::from)
+        } else {
+            Ok(0)
+        };
+        let rollback_len = Self::coordinate_comm_result(
+            execution_comm,
+            "tensor-parallel rollout-ledger metrics rollback boundary",
+            rollback_len_local,
+        )?;
+        let append_local = if is_execution_primary {
+            self.writer.append(metrics).map_err(TrainerError::from)
+        } else {
+            Ok(())
+        };
+        let failed_global =
+            execution_comm.all_reduce_scalar_sum(if append_local.is_err() { 1.0 } else { 0.0 });
+        let failed_global = match failed_global {
+            Ok(failed) => failed,
+            Err(comm_error) => {
+                let rollback = Self::catch_local_distributed_recovery(
+                    "best-effort local tensor-parallel metrics rollback",
+                    || {
+                        if is_execution_primary {
+                            self.writer.truncate_to(rollback_len)?;
+                        }
+                        Ok(())
+                    },
+                );
+                return Err(TrainerError::RolloutLedgerMetricsComm {
+                    communication: Box::new(comm_error),
+                    telemetry_rollback: Self::rollout_ledger_metrics_rollback_detail(&rollback),
+                });
+            }
+        };
+        if failed_global == 0.0 {
+            return append_local;
+        }
+
+        let rollback_local = Self::catch_local_distributed_recovery(
+            "tensor-parallel rollout-ledger metrics rollback",
+            || {
+                if is_execution_primary {
+                    self.writer.truncate_to(rollback_len)?;
+                }
+                Ok(())
+            },
+        );
+        let rollback_detail = Self::rollout_ledger_metrics_rollback_detail(&rollback_local);
+        let rollback = Self::coordinate_comm_result(
+            execution_comm,
+            "tensor-parallel rollout-ledger metrics rollback",
+            rollback_local,
+        );
+        match (append_local, rollback) {
+            (_, Err(TrainerError::Comm(comm_error))) => {
+                Err(TrainerError::RolloutLedgerMetricsComm {
+                    communication: Box::new(comm_error),
+                    telemetry_rollback: rollback_detail,
+                })
+            }
+            (_, Err(rollback_error)) => Err(TrainerError::Contract(format!(
+                "tensor-parallel rollout-ledger metrics append failed; coordinated rollback failed: {rollback_error}"
+            ))),
+            (Err(append_error), Ok(())) => Err(append_error),
+            (Ok(()), Ok(())) => Err(TrainerError::Contract(
+                "tensor-parallel rollout-ledger metrics append failed on execution rank 0; its stream was rolled back"
                     .into(),
             )),
         }
@@ -5108,7 +6033,11 @@ impl Trainer {
         if exec.execution_world_size(self.comm.as_ref()) <= 1 {
             return local;
         }
-        if matches!(&local, Err(TrainerError::Comm(_))) {
+        if local
+            .as_ref()
+            .err()
+            .is_some_and(Self::is_terminal_distributed_error)
+        {
             return local;
         }
         let failed_local = if local.is_err() { 1.0 } else { 0.0 };
@@ -5200,20 +6129,24 @@ impl Trainer {
         R: RewardFn,
         E: PolicyExecution<P>,
     {
-        // Everything before distributed reward-stat collectives is rank-local and
-        // fallible. Catch panics and globalize the result before any rank enters
-        // those collectives, otherwise one bad generator/reward strands its peers.
-        let pre_stats = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            policy.set_adapter_enabled(true);
-            let prompt_ids = tokenizer.encode(&selected.sample.prompt);
-            if prompt_ids.is_empty() {
-                return Err(TrainerError::Contract(format!(
-                    "prompt encoded to zero tokens: {:?}",
-                    selected.sample.prompt
-                )));
-            }
-            let gen = GenConfig::from(&self.config);
-            gpu_mem.record("rollout_start");
+        let trainer_comm = Arc::clone(&self.comm);
+        let execution_comm = exec.execution_comm(trainer_comm.as_ref());
+        // No rank may enter an opaque TP policy hook until every rank has
+        // finished local tokenizer/toggle work.
+        let (prompt_ids, gen) =
+            Self::coordinate_comm_call(execution_comm, "rollout generation preflight", || {
+                policy.set_adapter_enabled(true);
+                let prompt_ids = tokenizer.encode(&selected.sample.prompt);
+                if prompt_ids.is_empty() {
+                    return Err(TrainerError::Contract(format!(
+                        "prompt encoded to zero tokens: {:?}",
+                        selected.sample.prompt
+                    )));
+                }
+                Ok((prompt_ids, GenConfig::from(&self.config)))
+            })?;
+        gpu_mem.record("rollout_start");
+        let generated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let rollout = exec.generate_at_instrumented(
                 policy,
                 &prompt_ids,
@@ -5221,7 +6154,6 @@ impl Trainer {
                 selected.selection.rollout_global_row_base,
                 gpu_mem.recorder(),
             )?;
-            gpu_mem.record("rollout_end");
             let (_, comp_len) = completion_dims(&rollout)?;
             if comp_len != self.config.max_new_tokens {
                 return Err(TrainerError::Contract(format!(
@@ -5245,15 +6177,27 @@ impl Trainer {
                 )));
             }
             let completions = decode_completions(&rollout, tokenizer);
-            gpu_mem.record("reward_start");
-            let reward_outcomes = self.coordinate_reward_group(
-                reward_fn,
-                selected.sample,
-                &completions,
-                rollout.len(),
-                exec,
-            )?;
-            gpu_mem.record("reward_end");
+            Ok((rollout, comp_len, completions))
+        }))
+        .unwrap_or_else(|payload| {
+            Err(TrainerError::Contract(format!(
+                "rollout generation/result validation panicked: {}",
+                panic_payload_message(payload.as_ref())
+            )))
+        });
+        let (rollout, comp_len, completions) =
+            Self::coordinate_comm_result(execution_comm, "rollout generation result", generated)?;
+        gpu_mem.record("rollout_end");
+        gpu_mem.record("reward_start");
+        let reward_outcomes = self.coordinate_reward_group(
+            reward_fn,
+            selected.sample,
+            &completions,
+            rollout.len(),
+            exec,
+        )?;
+        gpu_mem.record("reward_end");
+        let rewards = Self::coordinate_comm_call(execution_comm, "rollout reward result", || {
             let rewards: Vec<f32> = reward_outcomes
                 .iter()
                 .map(|outcome| outcome.reward)
@@ -5265,16 +6209,8 @@ impl Trainer {
                     rollout.len()
                 )));
             }
-            Ok((rollout, comp_len, completions, reward_outcomes, rewards))
-        }))
-        .unwrap_or_else(|payload| {
-            Err(TrainerError::Contract(format!(
-                "rollout/reward evaluation panicked: {}",
-                panic_payload_message(payload.as_ref())
-            )))
-        });
-        let (rollout, comp_len, completions, reward_outcomes, rewards) =
-            self.coordinate_data_parallel_result("rollout/reward group preflight", pre_stats)?;
+            Ok(rewards)
+        })?;
         self.write_candidate_records(
             CandidateWriteCtx {
                 step,
@@ -5299,7 +6235,8 @@ impl Trainer {
         let rewards_f64: Vec<f64> = rewards.iter().map(|&reward| f64::from(reward)).collect();
         let (advantages, distributed_reward_stats) =
             self.reward_group_advantages_with_stats(&rewards_f64)?;
-        self.coordinate_data_parallel_result(
+        Self::coordinate_comm_result(
+            execution_comm,
             "rollout-ledger group finalization",
             (|| {
                 let degenerate = advantages.iter().all(|advantage| *advantage == 0.0);
@@ -5357,39 +6294,67 @@ impl Trainer {
         if !surrogate_live && beta <= 0.0 {
             return Ok((stat, None));
         }
-        policy.set_adapter_enabled(true);
+        let execution_comm = exec.execution_comm(self.comm.as_ref());
         // Snapshot the old / reference log-probs once (the window's "old" policy),
         // reused across the mu inner epochs. Value-only, so the detached
         // scoring path: same values, a fraction of the activation footprint
         // on policies that override it (no tape is built or captured).
         gpu_mem.record("logp_old_start");
-        let logp_old = exec.token_logprobs_detached(policy, &rollout)?;
+        let logp_old = Self::coordinate_model_parallel_call(
+            exec.model_parallel_world_size(),
+            execution_comm,
+            "rollout-ledger detached old-policy scoring",
+            || {
+                policy.set_adapter_enabled(true);
+                exec.token_logprobs_detached(policy, &rollout)
+            },
+        )?;
         gpu_mem.record("logp_old_end");
         // Train/rollout off-policy diagnostics + the optional TIS weight, both off
         // the captured behavior log-probs vs the logp_old scoring snapshot.
-        let (ratio_stats, tis_w) = rollout_ratio_and_tis(
-            &rollout,
-            &logp_old,
-            &mask_rows,
-            self.config.tis_imp_ratio_cap,
-            self.config.tis,
+        let (ratio_stats, tis_w, device, mask) = Self::coordinate_model_parallel_call(
+            exec.model_parallel_world_size(),
+            execution_comm,
+            "rollout-ledger old-policy score materialization",
+            || {
+                let (ratio_stats, tis_w) = rollout_ratio_and_tis(
+                    &rollout,
+                    &logp_old,
+                    &mask_rows,
+                    self.config.tis_imp_ratio_cap,
+                    self.config.tis,
+                )?;
+                let device = logp_old.device().clone();
+                let mask = mask_rows_to_tensor(&mask_rows, &device)?;
+                Ok((ratio_stats, tis_w, device, mask))
+            },
         )?;
         stat.ratio_stats = ratio_stats;
-        let device = logp_old.device().clone();
-        let mask = mask_rows_to_tensor(&mask_rows, &device)?;
         gpu_mem.record("logp_ref_start");
-        let logp_ref = self.reference_logprobs(policy, &rollout, beta, exec)?;
+        let logp_ref = Self::coordinate_model_parallel_call(
+            exec.model_parallel_world_size(),
+            execution_comm,
+            "rollout-ledger detached reference-policy scoring",
+            || self.reference_logprobs(policy, &rollout, beta, exec),
+        )?;
         gpu_mem.record("logp_ref_end");
-        let advantages = advantages_tensor(&advantages, &device)?;
-        let item = LiveItem {
-            rollout,
-            advantages,
-            logp_old,
-            logp_ref,
-            mask,
-            tis_w,
-        };
-        Ok((stat, Some(item)))
+        Self::coordinate_model_parallel_call(
+            exec.model_parallel_world_size(),
+            execution_comm,
+            "rollout-ledger learner item materialization",
+            || {
+                let advantages = advantages_tensor(&advantages, &device)?;
+                let item = LiveItem {
+                    rollout,
+                    advantages,
+                    logp_old,
+                    logp_ref,
+                    mask,
+                    tis_w,
+                };
+                Ok((stat, Some(item)))
+            },
+        )
     }
 
     /// Score one TP group's rewards on execution rank 0, then broadcast those
@@ -5421,7 +6386,11 @@ impl Trainer {
         };
 
         if exec.model_parallel_world_size() <= 1 {
-            return score_local();
+            return Self::coordinate_comm_call(
+                exec.execution_comm(self.comm.as_ref()),
+                "rollout/reward evaluation",
+                score_local,
+            );
         }
 
         let is_primary = exec.is_execution_primary(self.comm.as_ref());
@@ -5436,7 +6405,11 @@ impl Trainer {
         } else {
             Ok(Vec::new())
         };
-        if matches!(&local, Err(TrainerError::Comm(_))) {
+        if local
+            .as_ref()
+            .err()
+            .is_some_and(Self::is_terminal_distributed_error)
+        {
             return local;
         }
         let failed_local = if local.is_err() { 1.0 } else { 0.0 };
@@ -5584,25 +6557,41 @@ impl Trainer {
         E: PolicyExecution<P>,
     {
         let vars = ctx.vars;
+        let execution_comm = exec.execution_comm(self.comm.as_ref());
         let local_accumulation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut acc: Vec<Option<Tensor>> = vec![None; vars.len()];
             let mut covered = vec![true; vars.len()];
             let mut sum_kl = 0.0_f32;
             let mut sum_clip = 0.0_f32;
             for item in live {
-                ctx.gpu_mem.record("item_backward_start");
-                let (grads, kl, clip_frac) = self.item_backward_with_execution(
-                    policy,
-                    item,
-                    window_tokens,
-                    vars,
-                    beta,
-                    exec,
+                let local_item = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    ctx.gpu_mem.record("item_backward_start");
+                    let (grads, kl, clip_frac) = self.item_backward_with_execution(
+                        policy,
+                        item,
+                        window_tokens,
+                        vars,
+                        beta,
+                        exec,
+                    )?;
+                    ctx.gpu_mem.record("item_backward_end");
+                    fold_var_grads(vars, &grads, &mut acc, &mut covered)?;
+                    Ok((kl, clip_frac))
+                }))
+                .unwrap_or_else(|payload| {
+                    Err(TrainerError::Contract(format!(
+                        "local backward item panicked: {}",
+                        panic_payload_message(payload.as_ref())
+                    )))
+                });
+                let (kl, clip_frac) = Self::coordinate_model_parallel_result(
+                    exec.model_parallel_world_size(),
+                    execution_comm,
+                    "tensor-parallel backward item",
+                    local_item,
                 )?;
-                ctx.gpu_mem.record("item_backward_end");
                 sum_kl += kl;
                 sum_clip += clip_frac;
-                fold_var_grads(vars, &grads, &mut acc, &mut covered)?;
             }
             // Materialize every zero contribution before any rank enters the
             // gradient collective. A rank-local allocation/device failure is
@@ -5617,8 +6606,11 @@ impl Trainer {
                 panic_payload_message(payload.as_ref())
             )))
         });
-        let (mut acc, covered, sum_kl, sum_clip) = self
-            .coordinate_data_parallel_result("local backward accumulation", local_accumulation)?;
+        let (mut acc, covered, sum_kl, sum_clip) = Self::coordinate_comm_result(
+            execution_comm,
+            "local backward accumulation",
+            local_accumulation,
+        )?;
         let reduced = if self.comm.world_size() > 1 {
             ctx.gpu_mem.record("grad_all_reduce_start");
             self.reduce_epoch(vars, &mut acc, &covered, sum_kl, sum_clip, n_live_global)
@@ -5630,7 +6622,7 @@ impl Trainer {
             ))
         };
         let (kl, clip_frac, mut uncovered_global) =
-            self.coordinate_data_parallel_result("gradient reduction", reduced)?;
+            Self::coordinate_comm_result(execution_comm, "gradient reduction", reduced)?;
         ctx.gpu_mem.record("grad_all_reduce_end");
         let model_parallel = if exec.model_parallel_world_size() > 1 {
             ctx.gpu_mem.record("tp_grad_all_reduce_start");
@@ -5638,8 +6630,11 @@ impl Trainer {
         } else {
             Ok(0.0)
         };
-        uncovered_global += self
-            .coordinate_data_parallel_result("model-parallel gradient reduction", model_parallel)?;
+        uncovered_global += Self::coordinate_comm_result(
+            execution_comm,
+            "model-parallel gradient reduction",
+            model_parallel,
+        )?;
         if exec.model_parallel_world_size() > 1 {
             ctx.gpu_mem.record("tp_grad_all_reduce_end");
         }
@@ -5704,7 +6699,7 @@ impl Trainer {
                 panic_payload_message(payload.as_ref())
             )))
         });
-        self.coordinate_data_parallel_result("post-reduction optimizer work", post_reduce)
+        Self::coordinate_comm_result(execution_comm, "post-reduction optimizer work", post_reduce)
     }
 
     /// The per-epoch DP collective sequence (world > 1 only): all-reduce-sum
@@ -5809,15 +6804,36 @@ impl Trainer {
         P: Policy,
         E: PolicyExecution<P>,
     {
-        let logp_diag = exec.token_logprobs_detached(policy, &item.rollout)?;
-        let (kl, clip_frac) = self.item_diagnostics(&logp_diag, item)?;
+        let execution_comm = exec.execution_comm(self.comm.as_ref());
+        let diagnostics = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let logp_diag = exec.token_logprobs_detached(policy, &item.rollout)?;
+            self.item_diagnostics(&logp_diag, item)
+                .map_err(TrainerError::from)
+        }))
+        .unwrap_or_else(|payload| {
+            Err(TrainerError::Contract(format!(
+                "tensor-parallel item diagnostics panicked: {}",
+                panic_payload_message(payload.as_ref())
+            )))
+        });
+        let (kl, clip_frac) = Self::coordinate_model_parallel_result(
+            exec.model_parallel_world_size(),
+            execution_comm,
+            "tensor-parallel item diagnostics",
+            diagnostics,
+        )?;
 
         let mut acc: Vec<Option<Tensor>> = vec![None; vars.len()];
         let mut covered = vec![true; vars.len()];
         let total_rows = item.rollout.len();
         for start in (0..total_rows).step_by(microbatch_size) {
             let len = microbatch_size.min(total_rows - start);
-            let slice = slice_live_item(item, start, len)?;
+            let slice = Self::coordinate_model_parallel_result(
+                exec.model_parallel_world_size(),
+                execution_comm,
+                "tensor-parallel backward microbatch preflight",
+                slice_live_item(item, start, len).map_err(TrainerError::from),
+            )?;
             let loss_scale = match self.config.loss_type {
                 LossType::Dapo => 1.0,
                 LossType::Grpo | LossType::DrGrpo => len as f64 / total_rows as f64,
@@ -5831,7 +6847,12 @@ impl Trainer {
                 beta,
                 exec,
             )?;
-            fold_var_grads(vars, &grads, &mut acc, &mut covered)?;
+            Self::coordinate_model_parallel_result(
+                exec.model_parallel_world_size(),
+                execution_comm,
+                "tensor-parallel backward microbatch fold",
+                fold_var_grads(vars, &grads, &mut acc, &mut covered).map_err(TrainerError::from),
+            )?;
         }
         let store = empty_grad_store(vars)?;
         let store = combine_into_store(vars, store, &mut acc, &covered);
@@ -5853,38 +6874,59 @@ impl Trainer {
         P: Policy,
         E: PolicyExecution<P>,
     {
-        let logp = exec.token_logprobs(policy, &item.rollout)?;
-        let cfg = LossCfg {
-            clip_eps_low: self.config.clip_eps,
-            clip_eps_high: self.config.clip_eps_high_eff(),
-            beta,
-            loss_type: self.config.loss_type,
-            is_level: self.config.importance_sampling_level,
-            dapo_norm: Some(window_tokens),
-            tis_w: item.tis_w.clone(),
-        };
-        let mut loss = grpo_loss(
-            &logp,
-            &item.logp_old,
-            item.logp_ref.as_ref(),
-            &item.advantages,
-            &item.mask,
-            &cfg,
+        let execution_comm = exec.execution_comm(self.comm.as_ref());
+        let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let logp = exec.token_logprobs(policy, &item.rollout)?;
+            let cfg = LossCfg {
+                clip_eps_low: self.config.clip_eps,
+                clip_eps_high: self.config.clip_eps_high_eff(),
+                beta,
+                loss_type: self.config.loss_type,
+                is_level: self.config.importance_sampling_level,
+                dapo_norm: Some(window_tokens),
+                tis_w: item.tis_w.clone(),
+            };
+            let mut loss = grpo_loss(
+                &logp,
+                &item.logp_old,
+                item.logp_ref.as_ref(),
+                &item.advantages,
+                &item.mask,
+                &cfg,
+            )?;
+            if (loss_scale - 1.0).abs() > f64::EPSILON {
+                loss = loss.affine(loss_scale, 0.0)?;
+            }
+            let global_items = self.config.grad_accum_steps * self.comm.world_size();
+            if global_items > 1 && self.config.loss_type != LossType::Dapo {
+                loss = loss.affine(1.0 / global_items as f64, 0.0)?;
+            }
+            let (kl, clip_frac) = self.item_diagnostics(&logp.detach(), item)?;
+            Ok((loss, kl, clip_frac))
+        }))
+        .unwrap_or_else(|payload| {
+            Err(TrainerError::Contract(format!(
+                "tensor-parallel loss preparation panicked: {}",
+                panic_payload_message(payload.as_ref())
+            )))
+        });
+        let (loss, kl, clip_frac) = Self::coordinate_model_parallel_result(
+            exec.model_parallel_world_size(),
+            execution_comm,
+            "tensor-parallel loss preparation",
+            prepared,
         )?;
-        if (loss_scale - 1.0).abs() > f64::EPSILON {
-            loss = loss.affine(loss_scale, 0.0)?;
-        }
-        let global_items = self.config.grad_accum_steps * self.comm.world_size();
-        if global_items > 1 && self.config.loss_type != LossType::Dapo {
-            loss = loss.affine(1.0 / global_items as f64, 0.0)?;
-        }
-        let (kl, clip_frac) = self.item_diagnostics(&logp.detach(), item)?;
         // Through the active execution seam (default: exactly
         // `Policy::backward`): TP checkpointing can replay layer collectives
         // through its explicit communicator, while the canary downstream holds
         // either way.
         let raw = exec.backward(policy, &loss)?;
-        let grads = compact_trainable_grad_store(vars, raw)?;
+        let grads = Self::coordinate_model_parallel_result(
+            exec.model_parallel_world_size(),
+            execution_comm,
+            "tensor-parallel backward gradient materialization",
+            compact_trainable_grad_store(vars, raw).map_err(TrainerError::from),
+        )?;
         Ok((grads, kl, clip_frac))
     }
 
@@ -8848,6 +9890,47 @@ mod tests {
         }
     }
 
+    impl TensorParallelPolicy for StatefulCandidatePolicy {
+        fn generate_at_tensor_parallel_instrumented(
+            &mut self,
+            prompt: &[u32],
+            cfg: &GenConfig,
+            _global_row_base: u64,
+            _comm: &dyn Comm,
+            _telemetry: Option<&mut dyn ModelTelemetryRecorder>,
+        ) -> CandleResult<Rollout> {
+            self.generate(prompt, cfg)
+        }
+
+        fn token_logprobs_tensor_parallel(
+            &self,
+            rollout: &Rollout,
+            _comm: &dyn Comm,
+        ) -> CandleResult<Tensor> {
+            self.token_logprobs(rollout)
+        }
+
+        fn token_logprobs_tensor_parallel_detached(
+            &self,
+            rollout: &Rollout,
+            _comm: &dyn Comm,
+        ) -> CandleResult<Tensor> {
+            Ok(self.token_logprobs(rollout)?.detach())
+        }
+
+        fn backward_tensor_parallel(
+            &self,
+            loss: &Tensor,
+            _comm: &dyn Comm,
+        ) -> CandleResult<GradStore> {
+            loss.backward()
+        }
+
+        fn supports_sharded_tensor_parallel_backward(&self) -> bool {
+            true
+        }
+    }
+
     #[derive(Debug)]
     struct ArmedCollectiveFailureState {
         remaining_successes: std::sync::atomic::AtomicUsize,
@@ -9182,6 +10265,110 @@ mod tests {
             policy.sampler, 1,
             "collector rewound after crossing the manifest boundary"
         );
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn tensor_parallel_ledger_and_continuation_ambiguity_preserve_visible_state() {
+        let tmp = WireTmp::new("tp-ledger-continuation-ambiguity");
+        let ledger_root = tmp.0.join("ledger");
+        let checkpoint_root = tmp.0.join("continuations");
+        let outcomes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = crate::comm::LocalComm::world_with_timeout(
+                2,
+                std::time::Duration::from_secs(10),
+            )
+            .into_iter()
+            .enumerate()
+            .map(|(rank, comm)| {
+                let base = tmp.0.clone();
+                let ledger_root = ledger_root.clone();
+                let checkpoint_root = checkpoint_root.clone();
+                let outcomes = std::sync::Arc::clone(&outcomes);
+                scope.spawn(move || {
+                    let run = RunDir::create(&base, format!("rank-{rank}")).unwrap();
+                    let mut trainer = Trainer::new(candidate_ledger_config(), &run).unwrap();
+                    let mut collector = stateful_candidate_policy();
+                    if rank == 0 {
+                        crate::rollout_ledger::inject_persistent_post_manifest_sync_failure_once();
+                    }
+                    let collect_error = trainer
+                        .collect_rollout_ledger_step_tensor_parallel(
+                            0,
+                            &mut collector,
+                            &CandidateReward,
+                            &CandidateCodec,
+                            &[Sample::new("p", ())],
+                            &ledger_root,
+                            &"7".repeat(64),
+                            None,
+                            &comm,
+                        )
+                        .unwrap_err();
+                    let mut learner = stateful_candidate_policy();
+                    let (_, continuation) = trainer
+                        .train_rollout_ledger_step_tensor_parallel(
+                            0,
+                            &mut learner,
+                            &ledger_root,
+                            &"7".repeat(64),
+                            None,
+                            &comm,
+                        )
+                        .unwrap();
+                    if rank == 0 {
+                        crate::checkpoint::inject_persistent_continuation_post_manifest_sync_failure_once();
+                    }
+                    let save_error = trainer
+                        .save_rollout_ledger_continuation_to_tensor_parallel(
+                            &checkpoint_root,
+                            &learner,
+                            &continuation,
+                            &comm,
+                        )
+                        .unwrap_err();
+                    outcomes.lock().unwrap().push((
+                        rank,
+                        collect_error,
+                        save_error,
+                        collector.sampler,
+                        learner.sampler,
+                    ));
+                })
+            })
+            .collect();
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
+
+        let mut outcomes = std::mem::take(&mut *outcomes.lock().unwrap());
+        outcomes.sort_by_key(|outcome| outcome.0);
+        for (rank, collect_error, save_error, collector_sampler, learner_sampler) in outcomes {
+            assert!(
+                matches!(
+                    collect_error,
+                    TrainerError::RolloutLedger(RolloutLedgerError::PublicationAmbiguous { .. })
+                ),
+                "rank {rank}: {collect_error:?}"
+            );
+            assert!(
+                matches!(
+                    save_error,
+                    TrainerError::Checkpoint(
+                        crate::checkpoint::CheckpointError::PublicationAmbiguous { .. }
+                    )
+                ),
+                "rank {rank}: {save_error:?}"
+            );
+            assert_eq!(collector_sampler, 1, "rank {rank} collector sampler");
+            assert_eq!(learner_sampler, 1, "rank {rank} learner sampler");
+        }
+        assert!(ledger_root
+            .join("step-00000000000000000000/manifest.json")
+            .is_file());
+        assert!(checkpoint_root.join("step-1/manifest.json").is_file());
     }
 
     #[test]
@@ -9659,7 +10846,7 @@ mod tests {
                 "rank {rank}: {message}"
             );
             assert!(
-                message.contains("data-parallel world is dead"),
+                message.contains("distributed execution world is dead"),
                 "rank {rank}: {message}"
             );
             assert!(
@@ -9794,7 +10981,7 @@ mod tests {
                 "rank {rank}: {message}"
             );
             assert!(
-                message.contains("data-parallel world is dead"),
+                message.contains("distributed execution world is dead"),
                 "rank {rank}: {message}"
             );
             assert!(
@@ -10016,7 +11203,7 @@ mod tests {
 
         for (rank, message) in outcomes {
             assert!(
-                message.contains("data-parallel world is dead"),
+                message.contains("distributed execution world is dead"),
                 "rank {rank}: {message}"
             );
             assert!(message.contains("discard the policy and optimizer state"));
@@ -10096,7 +11283,7 @@ mod tests {
 
         for (rank, message, sampler) in outcomes {
             assert!(
-                message.contains("data-parallel world is dead"),
+                message.contains("distributed execution world is dead"),
                 "rank {rank}: {message}"
             );
             assert_eq!(
@@ -10228,7 +11415,7 @@ mod tests {
             ) in outcomes
             {
                 assert!(
-                    message.contains("data-parallel world is dead"),
+                    message.contains("distributed execution world is dead"),
                     "{fault} rank {rank}: {message}"
                 );
                 assert!(
@@ -10757,6 +11944,127 @@ mod tests {
         )
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum TpSeparatedHookFailure {
+        Generate,
+        DetachedScoring,
+        LiveScoring,
+        Backward,
+    }
+
+    struct TpSeparatedFailingPolicy {
+        inner: TpProbePolicy,
+        arm: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        failure: TpSeparatedHookFailure,
+    }
+
+    impl TpSeparatedFailingPolicy {
+        fn fail_collective(&self, comm: &dyn Comm) -> CandleResult<()> {
+            self.arm.store(true, std::sync::atomic::Ordering::SeqCst);
+            comm.all_reduce_scalar_sum(1.0)
+                .map(|_| ())
+                .map_err(|error| candle_core::Error::Msg(error.to_string()))
+        }
+    }
+
+    impl Policy for TpSeparatedFailingPolicy {
+        fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
+            self.inner.generate(prompt, cfg)
+        }
+
+        fn token_logprobs(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+            self.inner.token_logprobs(rollout)
+        }
+
+        fn token_logprobs_detached(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+            self.inner.token_logprobs_detached(rollout)
+        }
+
+        fn backward(&self, loss: &Tensor) -> CandleResult<GradStore> {
+            self.inner.backward(loss)
+        }
+
+        fn set_adapter_enabled(&mut self, enabled: bool) {
+            self.inner.set_adapter_enabled(enabled);
+        }
+
+        fn adapter_enabled(&self) -> bool {
+            self.inner.adapter_enabled()
+        }
+
+        fn trainable_vars(&self) -> Vec<Var> {
+            self.inner.trainable_vars()
+        }
+
+        fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+            self.inner.sampler_state()
+        }
+
+        fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
+            self.inner.restore_sampler_state(state)
+        }
+    }
+
+    impl TensorParallelPolicy for TpSeparatedFailingPolicy {
+        fn supports_sharded_tensor_parallel_backward(&self) -> bool {
+            true
+        }
+
+        fn generate_at_tensor_parallel_instrumented(
+            &mut self,
+            prompt: &[u32],
+            cfg: &GenConfig,
+            global_row_base: u64,
+            comm: &dyn Comm,
+            telemetry: Option<&mut dyn ModelTelemetryRecorder>,
+        ) -> CandleResult<Rollout> {
+            if self.failure == TpSeparatedHookFailure::Generate {
+                self.fail_collective(comm)?;
+            }
+            self.inner.generate_at_tensor_parallel_instrumented(
+                prompt,
+                cfg,
+                global_row_base,
+                comm,
+                telemetry,
+            )
+        }
+
+        fn token_logprobs_tensor_parallel(
+            &self,
+            rollout: &Rollout,
+            comm: &dyn Comm,
+        ) -> CandleResult<Tensor> {
+            if self.failure == TpSeparatedHookFailure::LiveScoring {
+                self.fail_collective(comm)?;
+            }
+            self.inner.token_logprobs_tensor_parallel(rollout, comm)
+        }
+
+        fn token_logprobs_tensor_parallel_detached(
+            &self,
+            rollout: &Rollout,
+            comm: &dyn Comm,
+        ) -> CandleResult<Tensor> {
+            if self.failure == TpSeparatedHookFailure::DetachedScoring {
+                self.fail_collective(comm)?;
+            }
+            self.inner
+                .token_logprobs_tensor_parallel_detached(rollout, comm)
+        }
+
+        fn backward_tensor_parallel(
+            &self,
+            loss: &Tensor,
+            comm: &dyn Comm,
+        ) -> CandleResult<GradStore> {
+            if self.failure == TpSeparatedHookFailure::Backward {
+                self.fail_collective(comm)?;
+            }
+            self.inner.backward_tensor_parallel(loss, comm)
+        }
+    }
+
     struct TpSyncPolicy {
         replicated: Var,
         sharded: Var,
@@ -10955,6 +12263,418 @@ mod tests {
             "trainer did not pass the explicit TP communicator to every TP hook: {:?}",
             calls.comms
         );
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn tensor_parallel_ledger_collector_comm_failure_is_terminal_without_later_collectives() {
+        let tmp = WireTmp::new("tp-ledger-collector-terminal-comm");
+        let ledger_root = tmp.0.join("ledger");
+        let outcomes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = crate::comm::LocalComm::world_with_timeout(
+                2,
+                std::time::Duration::from_millis(500),
+            )
+            .into_iter()
+            .enumerate()
+            .map(|(rank, inner_comm)| {
+                let root = tmp.0.clone();
+                let ledger_root = ledger_root.clone();
+                let outcomes = std::sync::Arc::clone(&outcomes);
+                scope.spawn(move || {
+                    let run = RunDir::create(&root, format!("rank-{rank}")).unwrap();
+                    let mut trainer = Trainer::new(
+                        TrainerConfig {
+                            steps: 1,
+                            group_size: 2,
+                            max_new_tokens: 1,
+                            ..TrainerConfig::default()
+                        },
+                        &run,
+                    )
+                    .unwrap();
+                    let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let state = std::sync::Arc::new(ArmedCollectiveFailureState::new(0));
+                    let comm = FailAfterArmComm {
+                        inner: inner_comm,
+                        armed: std::sync::Arc::clone(&armed),
+                        state: std::sync::Arc::clone(&state),
+                    };
+                    let (inner, _) = tp_probe_policy();
+                    let mut policy = TpSeparatedFailingPolicy {
+                        inner,
+                        arm: armed,
+                        failure: TpSeparatedHookFailure::Generate,
+                    };
+                    let sampler_before = policy.sampler_state().unwrap();
+                    let error = trainer
+                        .collect_rollout_ledger_step_tensor_parallel(
+                            0,
+                            &mut policy,
+                            &TpProbeReward,
+                            &TpProbeCodec,
+                            &[Sample::new("prompt", ())],
+                            &ledger_root,
+                            &format!("{:064x}", 131),
+                            None,
+                            &comm,
+                        )
+                        .unwrap_err();
+                    outcomes.lock().unwrap().push((
+                        rank,
+                        error,
+                        sampler_before,
+                        policy.sampler_state().unwrap(),
+                        state.failed.load(std::sync::atomic::Ordering::SeqCst),
+                        state
+                            .calls_after_failure
+                            .load(std::sync::atomic::Ordering::SeqCst),
+                    ));
+                })
+            })
+            .collect();
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
+
+        let mut outcomes = std::mem::take(&mut *outcomes.lock().unwrap());
+        outcomes.sort_by_key(|outcome| outcome.0);
+        for (rank, error, sampler_before, sampler_after, fault_consumed, later_calls) in outcomes {
+            assert!(
+                matches!(&error, TrainerError::TensorParallelExecutionTerminal {
+                    operation: "rollout generation",
+                    detail,
+                } if detail.contains("injected terminal collective-chain failure")
+                    && detail.contains("local sampler rollback succeeded")),
+                "rank {rank}: {error:?}"
+            );
+            assert_eq!(sampler_after, sampler_before, "rank {rank} sampler");
+            assert!(fault_consumed, "rank {rank} did not consume the fault");
+            assert_eq!(later_calls, 0, "rank {rank} issued a later collective");
+        }
+        assert!(ledger_root.is_dir());
+        assert!(!ledger_root.join("step-00000000000000000000").exists());
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn tensor_parallel_ledger_scoring_and_backward_comm_failures_rollback_locally() {
+        let tmp = WireTmp::new("tp-ledger-learner-terminal-comm");
+        let ledger_root = tmp.0.join("ledger");
+        let policy_sha256 = format!("{:064x}", 137);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = crate::comm::LocalComm::world(2)
+                .into_iter()
+                .enumerate()
+                .map(|(rank, comm)| {
+                    let root = tmp.0.clone();
+                    let ledger_root = ledger_root.clone();
+                    let policy_sha256 = policy_sha256.clone();
+                    scope.spawn(move || {
+                        let run = RunDir::create(&root, format!("collector-rank-{rank}")).unwrap();
+                        let mut trainer = Trainer::new(
+                            TrainerConfig {
+                                steps: 1,
+                                group_size: 2,
+                                max_new_tokens: 1,
+                                ..TrainerConfig::default()
+                            },
+                            &run,
+                        )
+                        .unwrap();
+                        let (mut policy, _) = tp_probe_policy();
+                        trainer
+                            .collect_rollout_ledger_step_tensor_parallel(
+                                0,
+                                &mut policy,
+                                &TpProbeReward,
+                                &TpProbeCodec,
+                                &[Sample::new("prompt", ())],
+                                ledger_root,
+                                &policy_sha256,
+                                None,
+                                &comm,
+                            )
+                            .unwrap();
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
+
+        for (case, failure, operation) in [
+            (
+                "detached",
+                TpSeparatedHookFailure::DetachedScoring,
+                "detached scoring",
+            ),
+            (
+                "live",
+                TpSeparatedHookFailure::LiveScoring,
+                "differentiable scoring",
+            ),
+            ("backward", TpSeparatedHookFailure::Backward, "backward"),
+        ] {
+            let outcomes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = crate::comm::LocalComm::world_with_timeout(
+                    2,
+                    std::time::Duration::from_millis(500),
+                )
+                .into_iter()
+                .enumerate()
+                .map(|(rank, inner_comm)| {
+                    let root = tmp.0.clone();
+                    let ledger_root = ledger_root.clone();
+                    let policy_sha256 = policy_sha256.clone();
+                    let outcomes = std::sync::Arc::clone(&outcomes);
+                    scope.spawn(move || {
+                        let run =
+                            RunDir::create(&root, format!("{case}-learner-rank-{rank}")).unwrap();
+                        let mut trainer = Trainer::new(
+                            TrainerConfig {
+                                steps: 1,
+                                group_size: 2,
+                                max_new_tokens: 1,
+                                ..TrainerConfig::default()
+                            },
+                            &run,
+                        )
+                        .unwrap();
+                        let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        let state = std::sync::Arc::new(ArmedCollectiveFailureState::new(0));
+                        let comm = FailAfterArmComm {
+                            inner: inner_comm,
+                            armed: std::sync::Arc::clone(&armed),
+                            state: std::sync::Arc::clone(&state),
+                        };
+                        let (inner, _) = tp_probe_policy();
+                        let mut policy = TpSeparatedFailingPolicy {
+                            inner,
+                            arm: armed,
+                            failure,
+                        };
+                        let vars = policy.trainable_vars();
+                        let before = vars[0]
+                            .as_tensor()
+                            .flatten_all()
+                            .unwrap()
+                            .to_vec1::<f32>()
+                            .unwrap();
+                        let error = trainer
+                            .train_rollout_ledger_step_tensor_parallel(
+                                0,
+                                &mut policy,
+                                ledger_root,
+                                &policy_sha256,
+                                None,
+                                &comm,
+                            )
+                            .unwrap_err();
+                        let after = vars[0]
+                            .as_tensor()
+                            .flatten_all()
+                            .unwrap()
+                            .to_vec1::<f32>()
+                            .unwrap();
+                        outcomes.lock().unwrap().push((
+                            rank,
+                            error,
+                            before,
+                            after,
+                            policy.adapter_enabled(),
+                            state.failed.load(std::sync::atomic::Ordering::SeqCst),
+                            state
+                                .calls_after_failure
+                                .load(std::sync::atomic::Ordering::SeqCst),
+                            crate::telemetry::read_metrics(run.metrics_path())
+                                .unwrap()
+                                .len(),
+                        ));
+                    })
+                })
+                .collect();
+                for handle in handles {
+                    handle.join().unwrap();
+                }
+            });
+
+            let mut outcomes = std::mem::take(&mut *outcomes.lock().unwrap());
+            outcomes.sort_by_key(|outcome| outcome.0);
+            for (
+                rank,
+                error,
+                before,
+                after,
+                adapter_enabled,
+                fault_consumed,
+                later_calls,
+                metrics_rows,
+            ) in outcomes
+            {
+                assert!(
+                    matches!(&error, TrainerError::TensorParallelExecutionTerminal {
+                        operation: actual_operation,
+                        detail,
+                    } if *actual_operation == operation
+                        && detail.contains("injected terminal collective-chain failure")
+                        && detail.contains("local adapter/optimizer/sampler rollback succeeded")),
+                    "{case} rank {rank}: {error:?}"
+                );
+                assert_eq!(after, before, "{case} rank {rank} adapter");
+                assert!(adapter_enabled, "{case} rank {rank} adapter flag");
+                assert!(fault_consumed, "{case} rank {rank} did not consume fault");
+                assert_eq!(later_calls, 0, "{case} rank {rank} later collectives");
+                assert_eq!(metrics_rows, 0, "{case} rank {rank} metrics");
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn tensor_parallel_ledger_metrics_failure_rolls_back_every_rank() {
+        let tmp = WireTmp::new("tp-ledger-metrics-rollback");
+        let ledger_root = tmp.0.join("ledger");
+        let policy_sha256 = format!("{:064x}", 139);
+        let config = TrainerConfig {
+            steps: 1,
+            group_size: 2,
+            max_new_tokens: 1,
+            lr: 0.01,
+            max_grad_norm: None,
+            ..TrainerConfig::default()
+        };
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = crate::comm::LocalComm::world(2)
+                .into_iter()
+                .enumerate()
+                .map(|(rank, comm)| {
+                    let root = tmp.0.clone();
+                    let ledger_root = ledger_root.clone();
+                    let policy_sha256 = policy_sha256.clone();
+                    let config = config.clone();
+                    scope.spawn(move || {
+                        let run = RunDir::create(&root, format!("collector-rank-{rank}")).unwrap();
+                        let mut trainer = Trainer::new(config, &run).unwrap();
+                        let (mut policy, _) = tp_probe_policy();
+                        trainer
+                            .collect_rollout_ledger_step_tensor_parallel(
+                                0,
+                                &mut policy,
+                                &TpProbeReward,
+                                &TpProbeCodec,
+                                &[Sample::new("prompt", ())],
+                                ledger_root,
+                                &policy_sha256,
+                                None,
+                                &comm,
+                            )
+                            .unwrap();
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
+
+        let outcomes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = crate::comm::LocalComm::world(2)
+                .into_iter()
+                .enumerate()
+                .map(|(rank, comm)| {
+                    let root = tmp.0.clone();
+                    let ledger_root = ledger_root.clone();
+                    let policy_sha256 = policy_sha256.clone();
+                    let config = config.clone();
+                    let outcomes = std::sync::Arc::clone(&outcomes);
+                    scope.spawn(move || {
+                        let run = RunDir::create(&root, format!("learner-rank-{rank}")).unwrap();
+                        let mut trainer = Trainer::new(config, &run).unwrap();
+                        if rank == 0 {
+                            trainer.writer.inject_append_failure_once();
+                        }
+                        let (mut policy, _) = tp_probe_policy();
+                        let vars = policy.trainable_vars();
+                        let before = vars[0]
+                            .as_tensor()
+                            .flatten_all()
+                            .unwrap()
+                            .to_vec1::<f32>()
+                            .unwrap();
+                        let sampler_before = policy.sampler_state().unwrap();
+                        let error = trainer
+                            .train_rollout_ledger_step_tensor_parallel(
+                                0,
+                                &mut policy,
+                                ledger_root,
+                                &policy_sha256,
+                                None,
+                                &comm,
+                            )
+                            .unwrap_err();
+                        let after = vars[0]
+                            .as_tensor()
+                            .flatten_all()
+                            .unwrap()
+                            .to_vec1::<f32>()
+                            .unwrap();
+                        outcomes.lock().unwrap().push((
+                            rank,
+                            error,
+                            before,
+                            after,
+                            sampler_before,
+                            policy.sampler_state().unwrap(),
+                            policy.adapter_enabled(),
+                            crate::telemetry::read_metrics(run.metrics_path())
+                                .unwrap()
+                                .len(),
+                        ));
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
+
+        let mut outcomes = std::mem::take(&mut *outcomes.lock().unwrap());
+        outcomes.sort_by_key(|outcome| outcome.0);
+        for (
+            rank,
+            error,
+            adapter_before,
+            adapter_after,
+            sampler_before,
+            sampler_after,
+            adapter_enabled,
+            metrics_rows,
+        ) in outcomes
+        {
+            if rank == 0 {
+                assert!(
+                    matches!(&error, TrainerError::Telemetry(detail)
+                        if detail.to_string().contains("injected metrics append failure")),
+                    "rank {rank}: {error:?}"
+                );
+            } else {
+                assert!(
+                    matches!(&error, TrainerError::Contract(detail)
+                        if detail.contains("metrics append failed on execution rank 0")),
+                    "rank {rank}: {error:?}"
+                );
+            }
+            assert_eq!(adapter_after, adapter_before, "rank {rank} adapter");
+            assert_eq!(sampler_after, sampler_before, "rank {rank} sampler");
+            assert!(adapter_enabled, "rank {rank} adapter flag");
+            assert_eq!(metrics_rows, 0, "rank {rank} metrics");
+        }
     }
 
     #[test]

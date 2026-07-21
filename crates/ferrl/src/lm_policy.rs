@@ -821,6 +821,10 @@ impl<M: GradModel> Policy for LmPolicy<M> {
 }
 
 impl<M: GradModel> TensorParallelPolicy for LmPolicy<M> {
+    fn validate_tensor_parallel_execution(&self, comm: &dyn Comm) -> CandleResult<()> {
+        self.model.validate_tensor_parallel_execution(comm)
+    }
+
     fn generate_at_tensor_parallel_instrumented(
         &mut self,
         prompt: &[u32],

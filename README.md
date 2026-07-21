@@ -38,7 +38,9 @@ candle's.
 > adapter gradients are reduced over the NCCL TP communicator. Dense Gemma 4 streams each
 > rank's frozen projection shards
 > directly from single-file or indexed safetensors on Unix; shared weights and LoRA adapters
-> stay replicated. Qwen3 currently retains a fully replicated frozen-base fallback. Combined
+> stay replicated. Qwen3 currently retains a fully replicated frozen-base fallback. The
+> separated rollout-ledger API also supports this sharded TP execution contract, with every
+> TP rank validating one logical window and rank 0 owning its durable side effects. Combined
 > sharded DP x TP remains future work.
 
 ---
@@ -463,22 +465,32 @@ data parallelism, rank 0 owns one hidden stage, every rank writes an immutable
 `rank-<rank>.window.json` shard, and rank 0 publishes one global manifest last
 only after every shard writer is quiescent. The manifest binds the exact rank
 set, byte length, SHA-256, shared controls, topology, and global counts.
+Under sharded tensor parallelism, TP ranks are model shards rather than data
+shards: every rank executes and byte-validates the same logical world-one
+payload, TP rank 0 alone publishes the ordinary `window.json` package, and no
+TP-rank payload files are created.
 `RolloutLedgerReader` checks the manifest version, byte length, SHA-256, expected
 trainer/model/adapter/optimizer/sampler/lineage identity, mandatory structured learner controls,
 and all token, prompt-order, behavior-logprob, reward, advantage, EOS-mask, and
 scoring-requirement invariants before returning a `ValidatedRolloutLedgerStep`.
 Every DP learner validates every shard and the common manifest before receiving
-only its rank-local payload; every rank derives the same consumed-package lineage.
+only its rank-local payload. Every TP learner instead validates and consumes the
+same world-one package; every rank derives the same consumed-package lineage.
 `Trainer::collect_rollout_ledger_step` publishes one complete global window
 without old/reference scoring or an optimizer mutation, and
 `Trainer::train_rollout_ledger_step` recomputes the learner pre-state, validates
 the immutable package, performs the required detached scoring, and feeds the
-existing update path. The trainer derives the learner-semantic configuration
+existing update path. Their `_tensor_parallel` variants route generation,
+detached/live scoring, backward, and replicated LoRA-gradient summation through
+an explicit TP `Comm`; rank 0 alone evaluates rewards and writes candidates,
+metrics, ledgers, and continuations. The trainer derives the learner-semantic configuration
 projection (excluding run horizon and output/telemetry controls), structured
 controls, positional tensor schema plus LoRA recipe, adapter values, optimizer
 moments, sampler prestate, source step, and optimizer counter from live state. The one explicit
-input is a verified SHA-256 digest binding the frozen model content and execution
-recipe, which the generic `Policy` seam cannot enumerate today. Collection
+input is a rank-invariant verified SHA-256 digest binding the complete frozen
+model content and execution recipe—not a local shard digest—which the generic
+`Policy` seam cannot enumerate today. A non-mutating policy preflight separately
+proves each live rank-local shard plan matches its communicator. Collection
 rechecks the live identity before publication so a policy that mutates trainable
 state during generation fails closed.
 
@@ -490,14 +502,18 @@ post-update chain-bound continuation receipt or appending its metrics row. The e
 both roles restore the same state through
 `restore_rollout_ledger_continuation` (or its latest-checkpoint variant) before
 producing or consuming the next ledger. Its versioned continuation manifest binds
-the DP world size, frozen-policy digest, learner-semantic configuration, tensor schema, exact
+the DP world size, TP world size, canonical communicator-rank shard ordering,
+frozen-policy digest, learner-semantic configuration, tensor schema, exact
 adapter/Adam/sampler payload, outer step, parent lineage, and resulting lineage.
-Continuation format v2 is topology-explicit while legacy v1 remains readable as
-world one. DP runs normally keep rank-local telemetry directories, so
+Continuation format v3 carries both topologies. Legacy v1 and v2 remain readable
+only as TP world one; a sharded TP restore rejects them before policy mutation.
+Distributed runs normally keep rank-local telemetry directories, so
 `save_rollout_ledger_continuation_to` and
 `restore_latest_rollout_ledger_continuation_from` accept one explicit shared
 checkpoint root; rank 0 alone publishes or discovers there, and every peer
 receives the result in lockstep.
+The matching `_tensor_parallel` save/restore/latest variants apply the same
+shared-root and rank-0 ownership rule to a TP execution world.
 Continuation-specific latest discovery ignores ordinary checkpoints. Adapter-only
 legacy checkpoints fail closed on this separated path. Any failure after validation restores the adapter,
 Adam state, sampler state, and adapter-enabled flag to their exact pre-call state while the policy
@@ -510,6 +526,11 @@ be visible, it never rewinds the sampler; the writer retries every required dire
 sync and reports success only after durability is established and the visible bytes
 still match. A persistent sync failure or post-link disappearance is reported as
 ambiguous for operator reconciliation.
+Any error or panic returned by an opaque sharded TP policy hook is terminal. The
+public hook result cannot prove whether an implementation crossed a failed
+collective, so the trainer conservatively issues no later status collective,
+performs only panic-contained local rollback, and tells the caller to discard the
+communicator and policy instance.
 Because format v4 does not carry
 composable collector performance measurements, the ordinary
 whole-window timing, throughput, GPU-memory, and decoder-cache fields are written
@@ -520,15 +541,18 @@ fields are rejected. Rank-local metrics append is transactional under DP: if
 any rank fails, successful peers truncate to their exact pre-append boundary
 before model, Adam, and sampler rollback.
 
-Format v4 supports world-one and data-parallel separated execution. With
+Format v4 supports world-one, data-parallel, and tensor-parallel separated
+execution. With
 `RewardGroupScope::Local`, each shard stores rank-local reward normalization;
 with `DistributedSamePrompt`, shards for one accumulation position bind the same
 prompt prefix and the exact all-reduced reward count/sum/sum-of-squares used to
 derive their advantages. Global completion-token/live-item counts, canonical
 rank ordering, global rollout-row bases, and rank-identical sampler state are
 validated before scoring. An empty local shard still joins every global update
-with zero gradients. Tensor-parallel separated execution, combined DP×TP, and
-elastic world-size restore remain deliberately fail-closed follow-up work.
+with zero gradients. TP execution retains those logical world-one counts rather
+than summing replicas, while its replicated LoRA gradients are sum-reduced before
+coverage, clipping, and Adam. Combined DP×TP and elastic world-size restore remain
+deliberately fail-closed follow-up work.
 The continuation optimizer digest binds both Adam moments and its bias-correction
 counter. Checkpoint-parent and ledger-root chains are established one component at a time,
 with every entry synced in its ancestor before publication can succeed; retries re-sync

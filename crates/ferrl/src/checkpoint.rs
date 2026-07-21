@@ -176,9 +176,11 @@ const FORMAT_VERSION: u32 = 3;
 /// checkpoints still load — a resume then falls back to fresh momentum.
 const MIN_FORMAT_VERSION: u32 = 1;
 /// On-disk schema version for separated rollout-ledger continuations.
-pub(crate) const ROLLOUT_LEDGER_CONTINUATION_FORMAT_VERSION: u32 = 2;
+pub(crate) const ROLLOUT_LEDGER_CONTINUATION_FORMAT_VERSION: u32 = 3;
 pub(crate) const MIN_ROLLOUT_LEDGER_CONTINUATION_FORMAT_VERSION: u32 = 1;
 pub(crate) const ROLLOUT_LEDGER_CONTINUATION_KIND: &str = "rollout_ledger";
+pub(crate) const ROLLOUT_LEDGER_CONTINUATION_LAYOUT: &str =
+    "tensor_parallel.communicator_rank_ascending.v1";
 
 /// Provenance that distinguishes a separated rollout-ledger continuation from
 /// an ordinary trainer checkpoint and binds it to one exact ledger chain.
@@ -190,6 +192,12 @@ pub(crate) struct RolloutLedgerContinuationManifest {
     /// Absent only in legacy v1 manifests, which are defined as world one.
     #[serde(default)]
     pub(crate) world_size: Option<u32>,
+    /// Absent in v1/v2 manifests, which are defined as tensor-parallel world one.
+    #[serde(default)]
+    pub(crate) tensor_parallel_world_size: Option<u32>,
+    /// Canonical TP shard/communicator ordering. Absent only in legacy v1/v2.
+    #[serde(default)]
+    pub(crate) tensor_parallel_layout: Option<String>,
     pub(crate) completed_step: u64,
     pub(crate) policy_sha256: String,
     pub(crate) trainer_config_sha256: String,
@@ -1309,10 +1317,28 @@ pub(crate) fn latest_rollout_ledger_continuation(
             continue;
         };
         let supported_topology = match continuation.format_version {
-            1 => continuation.world_size.is_none(),
-            ROLLOUT_LEDGER_CONTINUATION_FORMAT_VERSION => continuation
-                .world_size
-                .is_some_and(|world_size| world_size > 0),
+            1 => {
+                continuation.world_size.is_none()
+                    && continuation.tensor_parallel_world_size.is_none()
+                    && continuation.tensor_parallel_layout.is_none()
+            }
+            2 => {
+                continuation
+                    .world_size
+                    .is_some_and(|world_size| world_size > 0)
+                    && continuation.tensor_parallel_world_size.is_none()
+                    && continuation.tensor_parallel_layout.is_none()
+            }
+            ROLLOUT_LEDGER_CONTINUATION_FORMAT_VERSION => {
+                continuation
+                    .world_size
+                    .is_some_and(|world_size| world_size > 0)
+                    && continuation
+                        .tensor_parallel_world_size
+                        .is_some_and(|world_size| world_size > 0)
+                    && continuation.tensor_parallel_layout.as_deref()
+                        == Some(ROLLOUT_LEDGER_CONTINUATION_LAYOUT)
+            }
             _ => false,
         };
         if continuation.format_version < MIN_ROLLOUT_LEDGER_CONTINUATION_FORMAT_VERSION
@@ -1628,6 +1654,8 @@ mod tests {
             format_version: ROLLOUT_LEDGER_CONTINUATION_FORMAT_VERSION,
             kind: ROLLOUT_LEDGER_CONTINUATION_KIND.to_owned(),
             world_size: Some(1),
+            tensor_parallel_world_size: Some(1),
+            tensor_parallel_layout: Some(ROLLOUT_LEDGER_CONTINUATION_LAYOUT.to_owned()),
             completed_step: step,
             policy_sha256: "a".repeat(64),
             trainer_config_sha256: "b".repeat(64),

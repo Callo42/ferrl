@@ -32,8 +32,8 @@ use crate::remat::{
 };
 use crate::telemetry::DecoderCacheSnapshot;
 use crate::tensor_parallel::{
-    all_reduce_sum_straight_through, all_reduce_sum_value, plan_from_comm, ShardRange,
-    TensorParallelPlan,
+    all_reduce_sum_straight_through, all_reduce_sum_value, comm_to_candle, is_comm_failure,
+    plan_from_comm, ShardRange, TensorParallelPlan,
 };
 
 /// The checkpoint prefix used by public Gemma 4 conditional-generation
@@ -72,9 +72,8 @@ fn validate_activation_checkpointing_consensus(
     if !plan.is_sharded() {
         return Ok(());
     }
-    let checkpointed_count = comm
-        .all_reduce_scalar_sum(if remat { 1.0 } else { 0.0 })
-        .map_err(|err| candle_core::Error::Msg(err.to_string()))?;
+    let checkpointed_count =
+        comm_to_candle(comm.all_reduce_scalar_sum(if remat { 1.0 } else { 0.0 }))?;
     if checkpointed_count != 0.0 && checkpointed_count != plan.world_size() as f64 {
         bail!(
             "Gemma4GradModel::backward_tensor_parallel: activation-checkpointing state differs \
@@ -99,9 +98,11 @@ fn validate_replicated_adapter_values(
         .map(|var| var.as_tensor().clone())
         .collect::<Vec<_>>();
     let local_validity = comm.validate_all_reduce_sum(&summed);
-    let invalid_global = comm
-        .all_reduce_scalar_sum(if local_validity.is_err() { 1.0 } else { 0.0 })
-        .map_err(|err| candle_core::Error::Msg(err.to_string()))?;
+    let invalid_global = comm_to_candle(comm.all_reduce_scalar_sum(if local_validity.is_err() {
+        1.0
+    } else {
+        0.0
+    }))?;
     if invalid_global > 0.0 {
         return match local_validity {
             Err(error) => Err(candle_core::Error::Msg(format!(
@@ -118,16 +119,18 @@ fn validate_replicated_adapter_values(
     let world = plan.world_size() as f64;
     let manifest = Tensor::from_vec(digest.map(f64::from).to_vec(), digest.len(), device)?;
     let mut reduced_manifest = vec![manifest];
-    comm.all_reduce_sum(&mut reduced_manifest)
-        .map_err(|err| candle_core::Error::Msg(err.to_string()))?;
+    comm_to_candle(comm.all_reduce_sum(&mut reduced_manifest))?;
     let sums = reduced_manifest[0].to_vec1::<f64>()?;
     let metadata_mismatch_local = digest
         .iter()
         .zip(&sums)
         .any(|(byte, sum)| *sum != world * f64::from(*byte));
-    let metadata_mismatch_global = comm
-        .all_reduce_scalar_sum(if metadata_mismatch_local { 1.0 } else { 0.0 })
-        .map_err(|err| candle_core::Error::Msg(err.to_string()))?;
+    let metadata_mismatch_global =
+        comm_to_candle(comm.all_reduce_scalar_sum(if metadata_mismatch_local {
+            1.0
+        } else {
+            0.0
+        }))?;
     if metadata_mismatch_global > 0.0 {
         bail!(
             "Gemma4GradModel::backward_tensor_parallel: adapter recipe, tensor count, shapes, or \
@@ -137,8 +140,7 @@ fn validate_replicated_adapter_values(
     if vars.is_empty() {
         return Ok(());
     }
-    comm.all_reduce_sum(&mut summed)
-        .map_err(|err| candle_core::Error::Msg(err.to_string()))?;
+    comm_to_candle(comm.all_reduce_sum(&mut summed))?;
     for (index, (var, sum)) in vars.iter().zip(&summed).enumerate() {
         let expected = (var.as_tensor() * world)?;
         let worst = sum
@@ -1035,6 +1037,21 @@ impl Gemma4Attention {
         reduce_row_parallel_output(&partial, plan, comm)
     }
 
+    fn validate_tensor_parallel_plan(&self, plan: TensorParallelPlan) -> CandleResult<()> {
+        self.q_proj
+            .validate_column_parallel_support(plan, "attention_q_out")?;
+        self.k_proj
+            .validate_column_parallel_support(plan, "attention_k_out")?;
+        if let Some(projection) = &self.v_proj {
+            projection.validate_column_parallel_support(plan, "attention_v_out")?;
+        }
+        self.o_proj
+            .validate_row_parallel_support(plan, "attention_hidden")?;
+        tp_shard(plan, "num_attention_heads", self.num_heads)?;
+        tp_shard(plan, "num_key_value_heads", self.num_kv_heads)?;
+        Ok(())
+    }
+
     fn set_adapter_enabled(&mut self, enabled: bool) {
         self.q_proj.set_enabled(enabled);
         self.k_proj.set_enabled(enabled);
@@ -1128,6 +1145,15 @@ impl Gemma4Mlp {
         reduce_row_parallel_output(&partial, plan, comm)
     }
 
+    fn validate_tensor_parallel_plan(&self, plan: TensorParallelPlan) -> CandleResult<()> {
+        self.gate_proj
+            .validate_column_parallel_support(plan, "intermediate_size")?;
+        self.up_proj
+            .validate_column_parallel_support(plan, "intermediate_size")?;
+        self.down_proj
+            .validate_row_parallel_support(plan, "intermediate_size")
+    }
+
     fn set_adapter_enabled(&mut self, enabled: bool) {
         self.gate_proj.set_enabled(enabled);
         self.up_proj.set_enabled(enabled);
@@ -1190,6 +1216,11 @@ impl Gemma4Layer {
             ),
             layer_scalar: vb.get(1, "layer_scalar")?,
         })
+    }
+
+    fn validate_tensor_parallel_plan(&self, plan: TensorParallelPlan) -> CandleResult<()> {
+        self.attn.validate_tensor_parallel_plan(plan)?;
+        self.mlp.validate_tensor_parallel_plan(plan)
     }
 
     fn forward(&self, x: &Tensor, masks: &Gemma4Masks, rot: &Gemma4Rotary) -> CandleResult<Tensor> {
@@ -1576,6 +1607,13 @@ impl Gemma4GradModel {
         Ok(())
     }
 
+    fn validate_tensor_parallel_plan(&self, plan: TensorParallelPlan) -> CandleResult<()> {
+        for layer in &self.layers {
+            layer.validate_tensor_parallel_plan(plan)?;
+        }
+        Ok(())
+    }
+
     fn validate_ordinary_execution_support(&self) -> CandleResult<()> {
         if self.weight_plan.is_sharded() {
             bail!(
@@ -1813,8 +1851,11 @@ impl Gemma4GradModel {
             return loss.backward();
         }
         let adapters_enabled = if plan.is_sharded() {
-            comm.all_reduce_scalar_sum(if self.adapter_enabled { 1.0 } else { 0.0 })
-                .map_err(|err| candle_core::Error::Msg(err.to_string()))?
+            comm_to_candle(comm.all_reduce_scalar_sum(if self.adapter_enabled {
+                1.0
+            } else {
+                0.0
+            }))?
         } else if self.adapter_enabled {
             1.0
         } else {
@@ -1823,13 +1864,16 @@ impl Gemma4GradModel {
         let adapters_match =
             adapters_enabled == 0.0 || adapters_enabled == plan.world_size() as f64;
         let trainable = self.trainable_vars();
-        let adapter_values_match = validate_replicated_adapter_values(
+        let adapter_values_match = match validate_replicated_adapter_values(
             &trainable,
             &self.targets.canonical(),
             &self.device,
             plan,
             comm,
-        );
+        ) {
+            Err(error) if is_comm_failure(&error) => return Err(error),
+            result => result,
+        };
         let local = (|| {
             self.validate_tensor_parallel_execution_support(plan)?;
             let Some(captured) = self.tape.borrow_mut().take() else {
@@ -1878,19 +1922,16 @@ impl Gemma4GradModel {
         })();
         let (tape, masks, prepared) = if plan.is_sharded() {
             let failed_local = if local.is_err() { 1.0 } else { 0.0 };
-            let failed_global = comm.all_reduce_scalar_sum(failed_local);
-            match (local, failed_global) {
-                (Err(error), _) => return Err(error),
-                (Ok(_), Err(error)) => {
-                    return Err(candle_core::Error::Msg(error.to_string()));
-                }
-                (Ok(_), Ok(failed)) if failed > 0.0 => {
+            let failed_global = comm_to_candle(comm.all_reduce_scalar_sum(failed_local))?;
+            match local {
+                Err(error) => return Err(error),
+                Ok(_) if failed_global > 0.0 => {
                     bail!(
                         "Gemma4GradModel::backward_tensor_parallel: backward readiness failed on \
                          a peer tensor-parallel rank; aborting before rematerialization replay"
                     )
                 }
-                (Ok(ready), Ok(_)) => ready,
+                Ok(ready) => ready,
             }
         } else {
             local?
@@ -1997,6 +2038,12 @@ impl GradModel for Gemma4GradModel {
         len: usize,
     ) -> CandleResult<Tensor> {
         Gemma4GradModel::forward_detached_narrowed(self, input_ids, start, len)
+    }
+
+    fn validate_tensor_parallel_execution(&self, comm: &dyn Comm) -> CandleResult<()> {
+        let plan = plan_from_comm(comm)?;
+        self.validate_tensor_parallel_execution_support(plan)?;
+        self.validate_tensor_parallel_plan(plan)
     }
 
     fn forward_tensor_parallel(&self, input_ids: &Tensor, comm: &dyn Comm) -> CandleResult<Tensor> {
@@ -3807,6 +3854,165 @@ mod tests {
         fn all_reduce_scalar_sum(&self, value: f64) -> Result<f64, CommError> {
             self.inner.all_reduce_scalar_sum(value)
         }
+    }
+
+    #[derive(Debug)]
+    struct FailAfterArmedComm {
+        inner: LocalComm,
+        armed: std::sync::atomic::AtomicBool,
+        remaining_successes: std::sync::atomic::AtomicUsize,
+        failed: std::sync::atomic::AtomicBool,
+        failures_triggered: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        calls_after_failure: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl FailAfterArmedComm {
+        fn new(
+            inner: LocalComm,
+            failures_triggered: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            calls_after_failure: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        ) -> Self {
+            Self {
+                inner,
+                armed: std::sync::atomic::AtomicBool::new(false),
+                remaining_successes: std::sync::atomic::AtomicUsize::new(0),
+                failed: std::sync::atomic::AtomicBool::new(false),
+                failures_triggered,
+                calls_after_failure,
+            }
+        }
+
+        fn arm_after(&self, successful_collectives: usize) {
+            self.remaining_successes
+                .store(successful_collectives, std::sync::atomic::Ordering::SeqCst);
+            self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn enter_collective(&self) -> Result<(), CommError> {
+            if !self.armed.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(());
+            }
+            if self.failed.load(std::sync::atomic::Ordering::SeqCst) {
+                self.calls_after_failure
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return Err(CommError::Poisoned(
+                    "collective issued after injected adapter-validation failure".into(),
+                ));
+            }
+            let remaining = self
+                .remaining_successes
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if remaining > 0 {
+                self.remaining_successes
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                return Ok(());
+            }
+            self.failed.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.failures_triggered
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(CommError::Mismatch(
+                "injected adapter-validation collective failure".into(),
+            ))
+        }
+    }
+
+    impl Comm for FailAfterArmedComm {
+        fn rank(&self) -> usize {
+            self.inner.rank()
+        }
+
+        fn world_size(&self) -> usize {
+            self.inner.world_size()
+        }
+
+        fn validate_all_reduce_sum(&self, tensors: &[Tensor]) -> Result<(), CommError> {
+            self.inner.validate_all_reduce_sum(tensors)
+        }
+
+        fn all_reduce_sum(&self, tensors: &mut Vec<Tensor>) -> Result<(), CommError> {
+            self.enter_collective()?;
+            self.inner.all_reduce_sum(tensors)
+        }
+
+        fn all_reduce_scalar_sum(&self, value: f64) -> Result<f64, CommError> {
+            self.enter_collective()?;
+            self.inner.all_reduce_scalar_sum(value)
+        }
+    }
+
+    #[test]
+    fn gemma4_backward_stops_after_adapter_validation_communication_failure() {
+        let mut cfg = tiny_cfg();
+        cfg.text_config.num_key_value_heads = 2;
+        cfg.text_config.num_global_key_value_heads = 2;
+        cfg.validate().unwrap();
+        let weights = weight_map(&cfg);
+        let input = ids(4);
+        let failures_triggered = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_after_failure = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let errors = std::thread::scope(|scope| {
+            let handles = LocalComm::world_with_timeout(2, Duration::from_secs(2))
+                .into_iter()
+                .map(|inner| {
+                    FailAfterArmedComm::new(
+                        inner,
+                        std::sync::Arc::clone(&failures_triggered),
+                        std::sync::Arc::clone(&calls_after_failure),
+                    )
+                })
+                .map(|comm| {
+                    let cfg = cfg.clone();
+                    let weights = weights.clone();
+                    let input = input.clone();
+                    scope.spawn(move || {
+                        let mut model = Gemma4GradModel::load_with_targets(
+                            &cfg,
+                            &VarBuilder::from_tensors(weights, DType::F32, &dev()),
+                            2,
+                            4.0,
+                            DType::F32,
+                            DenseLoraTargets::industrial(),
+                        )
+                        .unwrap();
+                        arm_adapter_deterministic(&model);
+                        model.set_activation_checkpointing(true);
+                        let loss = model
+                            .forward_tensor_parallel(&input, &comm)
+                            .unwrap()
+                            .sqr()
+                            .unwrap()
+                            .sum_all()
+                            .unwrap();
+                        // Backward performs activation-checkpointing and adapter-enabled
+                        // consensus before adapter payload validation. Fail that validation's
+                        // first collective and prove readiness never performs another one.
+                        comm.arm_after(2);
+                        let error = model.backward_tensor_parallel(&loss, &comm).unwrap_err();
+                        assert!(is_comm_failure(&error), "{error}");
+                        error.to_string()
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        assert!(errors
+            .iter()
+            .all(|error| error.contains("injected adapter-validation collective failure")));
+        assert_eq!(
+            failures_triggered.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the injected failure must be consumed once on every rank"
+        );
+        assert_eq!(
+            calls_after_failure.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "Gemma backward issued a collective after adapter validation killed the world"
+        );
     }
 
     #[test]

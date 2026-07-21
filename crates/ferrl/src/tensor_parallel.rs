@@ -8,7 +8,7 @@
 //! and N contiguous shards must reassemble the same projection/log-prob values
 //! as the unsharded path.
 
-use candle_core::{DType, Result as CandleResult, Tensor};
+use candle_core::{DType, Error as CandleError, Result as CandleResult, Tensor};
 
 use crate::blocks::frozen_linear;
 use crate::comm::Comm;
@@ -17,8 +17,32 @@ fn plan_to_candle<T>(result: Result<T, TensorParallelError>) -> CandleResult<T> 
     result.map_err(|e| candle_core::Error::Msg(e.to_string()))
 }
 
-fn comm_to_candle<T>(result: Result<T, crate::comm::CommError>) -> CandleResult<T> {
-    result.map_err(|e| candle_core::Error::Msg(e.to_string()))
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct TensorParallelCommFailure(String);
+
+pub(crate) fn comm_to_candle<T>(result: Result<T, crate::comm::CommError>) -> CandleResult<T> {
+    result.map_err(|error| CandleError::WrappedContext {
+        wrapped: Box::new(TensorParallelCommFailure(error.to_string())),
+        context: "tensor-parallel collective failed".to_owned(),
+    })
+}
+
+pub(crate) fn is_comm_failure(error: &CandleError) -> bool {
+    fn wrapped_is_comm_failure(error: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+        error.downcast_ref::<TensorParallelCommFailure>().is_some()
+            || error
+                .downcast_ref::<CandleError>()
+                .is_some_and(is_comm_failure)
+    }
+
+    match error {
+        CandleError::WithBacktrace { inner, .. }
+        | CandleError::WithPath { inner, .. }
+        | CandleError::Context { inner, .. } => is_comm_failure(inner),
+        CandleError::WrappedContext { wrapped, .. } => wrapped_is_comm_failure(wrapped.as_ref()),
+        _ => false,
+    }
 }
 
 /// A tensor-parallel rank/world assignment.
