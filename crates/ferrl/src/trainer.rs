@@ -9819,6 +9819,131 @@ mod tests {
 
     #[test]
     #[allow(clippy::cognitive_complexity)] // explicit two-rank fault protocol
+    fn nonce_chain_stops_after_first_failed_reduction() {
+        use std::sync::atomic::Ordering;
+
+        let tmp = WireTmp::new("nonce-chain-first-terminal-comm");
+        let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        // Fail nonce-low immediately. Any eager nonce-high call is therefore a
+        // collective after terminal communication failure and must be observed.
+        let states: Vec<_> = (0..2)
+            .map(|_| std::sync::Arc::new(ArmedCollectiveFailureState::new(0)))
+            .collect();
+        let comms =
+            crate::comm::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(10));
+        let outcomes: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = comms
+                .into_iter()
+                .zip(states.iter().cloned())
+                .map(|(inner, state)| {
+                    let rank = inner.rank();
+                    let base = tmp.0.clone();
+                    let armed = std::sync::Arc::clone(&armed);
+                    scope.spawn(move || {
+                        let comm = FailAfterArmComm {
+                            inner,
+                            armed,
+                            state,
+                        };
+                        let run = RunDir::create(&base, format!("rank-{rank}")).unwrap();
+                        let trainer =
+                            Trainer::with_comm(candidate_ledger_config(), &run, comm).unwrap();
+                        let error = trainer.distributed_rollout_ledger_nonce().unwrap_err();
+                        (rank, error)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        });
+
+        for (rank, error) in outcomes {
+            assert!(
+                matches!(&error, TrainerError::Comm(_)),
+                "rank {rank}: expected nonce-low communication failure, got {error:?}"
+            );
+        }
+        for (rank, state) in states.iter().enumerate() {
+            assert!(
+                state.failed.load(Ordering::SeqCst),
+                "rank {rank}: nonce-low fault not consumed"
+            );
+            assert_eq!(state.remaining_successes.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                state.calls_after_failure.load(Ordering::SeqCst),
+                0,
+                "rank {rank}: nonce-high ran after nonce-low communication failure"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // explicit two-rank fault protocol
+    fn collector_count_chain_stops_after_first_failed_reduction() {
+        use std::sync::atomic::Ordering;
+
+        let tmp = WireTmp::new("collector-count-chain-first-terminal-comm");
+        let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        // Local derivation and exact conversion each coordinate once. Fail the
+        // following token-count reduction; an eager live-count call must trip
+        // the post-failure counter.
+        let states: Vec<_> = (0..2)
+            .map(|_| std::sync::Arc::new(ArmedCollectiveFailureState::new(2)))
+            .collect();
+        let comms =
+            crate::comm::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(10));
+        let outcomes: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = comms
+                .into_iter()
+                .zip(states.iter().cloned())
+                .map(|(inner, state)| {
+                    let rank = inner.rank();
+                    let base = tmp.0.clone();
+                    let armed = std::sync::Arc::clone(&armed);
+                    scope.spawn(move || {
+                        let comm = FailAfterArmComm {
+                            inner,
+                            armed,
+                            state,
+                        };
+                        let run = RunDir::create(&base, format!("rank-{rank}")).unwrap();
+                        let trainer =
+                            Trainer::with_comm(candidate_ledger_config(), &run, comm).unwrap();
+                        let error = trainer.rollout_ledger_global_counts(&[], 0.0).unwrap_err();
+                        (rank, error)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        });
+
+        for (rank, error) in outcomes {
+            assert!(
+                matches!(&error, TrainerError::Comm(_)),
+                "rank {rank}: expected token-count communication failure, got {error:?}"
+            );
+        }
+        for (rank, state) in states.iter().enumerate() {
+            assert!(
+                state.failed.load(Ordering::SeqCst),
+                "rank {rank}: token-count fault not consumed"
+            );
+            assert_eq!(state.remaining_successes.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                state.calls_after_failure.load(Ordering::SeqCst),
+                0,
+                "rank {rank}: live-count ran after token-count communication failure"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // explicit two-rank fault protocol
     fn learner_count_chain_stops_after_first_failed_reduction() {
         use std::sync::atomic::Ordering;
 
@@ -9826,9 +9951,10 @@ mod tests {
         let ledger_root = tmp.0.join("ledger");
         let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         // After detached scoring: scoring status, local-count status, exact
-        // conversion, and token reduction succeed; live-count reduction fails.
+        // conversion succeed; token-count then fails, so live-count must never
+        // be attempted.
         let states: Vec<_> = (0..2)
-            .map(|_| std::sync::Arc::new(ArmedCollectiveFailureState::new(4)))
+            .map(|_| std::sync::Arc::new(ArmedCollectiveFailureState::new(3)))
             .collect();
         let comms =
             crate::comm::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(10));
@@ -9904,7 +10030,7 @@ mod tests {
             assert_eq!(
                 state.calls_after_failure.load(Ordering::SeqCst),
                 0,
-                "rank {rank}: learner issued a reduction after live-count failure"
+                "rank {rank}: learner live-count ran after token-count communication failure"
             );
         }
     }
