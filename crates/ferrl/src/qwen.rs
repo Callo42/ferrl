@@ -1039,10 +1039,20 @@ mod tests {
 
     #[test]
     #[allow(clippy::cognitive_complexity)]
-    fn dense_builtin_forward_and_cached_stages_coordinate_asymmetric_errors_and_panics() {
-        for (cached, stage) in [
-            (false, "dense attention boundary completion"),
-            (true, "dense cached attention boundary completion"),
+    fn dense_builtin_full_detached_and_cached_stages_coordinate_asymmetric_failures() {
+        for (mode, stage, expected_tensor_calls) in [
+            ("full", "dense attention boundary completion", 2),
+            (
+                "detached",
+                "dense detached tensor-parallel layer completion",
+                4,
+            ),
+            (
+                "detached",
+                "dense detached tensor-parallel output staging",
+                8,
+            ),
+            ("cached", "dense cached attention boundary completion", 2),
         ] {
             for panic in [false, true] {
                 let cfg = tiny_tp_gqa_cfg();
@@ -1077,11 +1087,16 @@ mod tests {
                                         stage, panic,
                                     );
                                 }
-                                let result = if cached {
-                                    let mut decoder = model.merged_decoder().unwrap();
-                                    decoder.forward_tensor_parallel(&input, 0, &comm)
-                                } else {
-                                    model.forward_tensor_parallel(&input, &comm)
+                                let result = match mode {
+                                    "full" => model.forward_tensor_parallel(&input, &comm),
+                                    "detached" => {
+                                        model.forward_tensor_parallel_detached(&input, &comm)
+                                    }
+                                    "cached" => {
+                                        let mut decoder = model.merged_decoder().unwrap();
+                                        decoder.forward_tensor_parallel(&input, 0, &comm)
+                                    }
+                                    other => unreachable!("unknown test mode {other}"),
                                 };
                                 (
                                     rank,
@@ -1107,8 +1122,8 @@ mod tests {
                 }
                 assert_eq!(
                     tensor_payload_calls.load(Ordering::SeqCst),
-                    2,
-                    "cached={cached} panic={panic}: a later MLP payload was entered"
+                    expected_tensor_calls,
+                    "mode={mode} stage={stage} panic={panic}: an unexpected tensor payload was entered"
                 );
             }
         }
