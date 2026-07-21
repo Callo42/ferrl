@@ -420,7 +420,32 @@ pub trait Policy {
 /// simultaneous sharded data parallelism: trainable adapter vars are fully
 /// replicated, gradients are sum-reduced before the optimizer step, and TP rank
 /// 0 owns rewards, metrics, candidates, checkpoints, and post-run health.
+///
+/// For a communicator with more than one rank, every hook below is one
+/// **lockstep collective region**. Implementors must coordinate any rank-local
+/// validation or panic before entering the first payload collective, return a
+/// rank-identical success/error decision, and issue no further collective after
+/// a communication error. Because the public candle result cannot prove whether
+/// an opaque implementation crossed a failed collective, the trainer treats
+/// every error or panic returned by a sharded hook as terminal: callers must
+/// discard the communicator and policy instance. The trainer cannot safely add a
+/// status rendezvous after an opaque hook whose communicator may already be dead.
+/// A world-one TP hook has no sharded collective region, so its local failure is
+/// instead coordinated over the trainer's active data-parallel communicator.
 pub trait TensorParallelPolicy: Policy {
+    /// Validate this live policy's non-mutating execution plan before trainer
+    /// state or durable output is touched. This preflight must not issue a
+    /// collective; the trainer globalizes its rank-local result afterward.
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error when the communicator is malformed or the live
+    /// policy's rank-local shard layout cannot execute that exact plan.
+    fn validate_tensor_parallel_execution(&self, comm: &dyn Comm) -> CandleResult<()> {
+        plan_from_comm(comm)?;
+        Ok(())
+    }
+
     /// Generate a rollout through the policy's tensor-parallel rollout path,
     /// using `comm` as the tensor-parallel communicator.
     ///

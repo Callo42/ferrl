@@ -69,7 +69,11 @@
 //!   learner-produced receipt for a versioned adapter + Adam + sampler
 //!   continuation whose policy/config/schema/payload lineage is verified. Under
 //!   data parallelism it publishes immutable rank shards behind one global
-//!   manifest-last commit marker and validates the complete world before replay;
+//!   manifest-last commit marker and validates the complete world before replay.
+//!   Under tensor parallelism every model shard executes and validates the same
+//!   logical world-one package, execution rank 0 alone publishes it, replicated
+//!   `LoRA` gradients are sum-reduced before Adam, and continuation v3 binds both
+//!   DP/TP topology plus canonical communicator-rank shard ordering;
 //! - held-out evaluation ([`eval`]) — the base model vs. the trained adapter,
 //!   mean reward over a held-out set (the P4 gate's comparison);
 //! - activation checkpointing ([`remat`]) — candle ships no checkpoint

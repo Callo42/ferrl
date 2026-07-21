@@ -187,6 +187,7 @@ where
         trainable,
         run_segment,
         transform_cotangent,
+        |_, result| result,
     )
 }
 
@@ -222,28 +223,39 @@ pub(crate) fn prepare_stitched_backward(
 
 /// Replay every checkpointed segment after all ranks have successfully
 /// prepared the loss-tail cotangent.
-pub(crate) fn finish_stitched_backward_with_cotangent<F, C>(
+pub(crate) fn finish_stitched_backward_with_cotangent<F, C, L>(
     prepared: PreparedStitchedBackward,
     tape: &RematTape,
     trainable: &[Var],
     run_segment: F,
     transform_cotangent: C,
+    coordinate_local_vjp: L,
 ) -> CandleResult<GradStore>
 where
     F: Fn(usize, &Tensor) -> CandleResult<Tensor>,
     C: Fn(usize, &Tensor) -> CandleResult<Tensor>,
+    L: Fn(usize, CandleResult<Tensor>) -> CandleResult<Tensor>,
 {
     let segments = tape.inputs.len() - 1;
     let PreparedStitchedBackward { mut store, mut cot } = prepared;
     for i in (0..segments).rev() {
-        cot = stitch_segment(
-            &mut store,
-            &tape.inputs[i],
-            &cot,
-            trainable,
-            &run_segment,
-            i,
-        )?;
+        let y = run_segment(i, tape.inputs[i].as_tensor())?;
+        let local_vjp = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            stitch_segment_vjp(&mut store, &tape.inputs[i], &cot, trainable, &y, i)
+        }))
+        .unwrap_or_else(|payload| {
+            let detail = if let Some(message) = payload.downcast_ref::<&str>() {
+                *message
+            } else if let Some(message) = payload.downcast_ref::<String>() {
+                message.as_str()
+            } else {
+                "panic payload was not a string"
+            };
+            Err(candle_core::Error::Msg(format!(
+                "stitched_backward: segment {i} local VJP panicked: {detail}"
+            )))
+        });
+        cot = coordinate_local_vjp(i, local_vjp)?;
         if i > 0 {
             cot = transform_cotangent(i, &cot)?;
         }
@@ -251,22 +263,22 @@ where
     Ok(store)
 }
 
-/// Re-run segment `i` from its boundary var, back-propagate the incoming
-/// cotangent through it (the VJP surrogate), fold the segment's trainable-var
-/// gradients into `store`, and return the boundary var's own gradient — the
-/// cotangent for segment `i - 1`.
-fn stitch_segment<F>(
+/// Back-propagate the incoming cotangent through an already replayed segment,
+/// fold its trainable-variable gradients into `store`, and return the boundary
+/// variable's own gradient — the cotangent for segment `i - 1`.
+///
+/// This phase is deliberately separate from segment replay: tensor-parallel
+/// callers coordinate this strictly local VJP before entering the next
+/// cotangent payload collective, while replay communication failures return
+/// immediately without touching the dead communicator again.
+fn stitch_segment_vjp(
     store: &mut GradStore,
     input: &Var,
     cot: &Tensor,
     trainable: &[Var],
-    run_segment: &F,
+    y: &Tensor,
     i: usize,
-) -> CandleResult<Tensor>
-where
-    F: Fn(usize, &Tensor) -> CandleResult<Tensor>,
-{
-    let y = run_segment(i, input.as_tensor())?;
+) -> CandleResult<Tensor> {
     if y.dims() != cot.dims() {
         candle_core::bail!(
             "stitched_backward: segment {i} rebuilt shape {:?} but the cotangent is {:?}; \

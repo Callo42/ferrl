@@ -312,6 +312,14 @@ impl Policy for AutoPolicy {
 }
 
 impl TensorParallelPolicy for AutoPolicy {
+    fn validate_tensor_parallel_execution(&self, comm: &dyn crate::Comm) -> CandleResult<()> {
+        match self {
+            Self::Qwen(policy) => policy.validate_tensor_parallel_execution(comm),
+            Self::Qwen3_5(policy) => policy.validate_tensor_parallel_execution(comm),
+            Self::Gemma4(policy) => policy.validate_tensor_parallel_execution(comm),
+        }
+    }
+
     fn generate_at_tensor_parallel_instrumented(
         &mut self,
         prompt: &[u32],

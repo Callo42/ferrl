@@ -97,6 +97,7 @@ use crate::policy::{GenConfig, Policy, Rollout, TensorParallelPolicy};
 use crate::qwen::QwenGradModel;
 use crate::sampler::GrpoSampler;
 use crate::telemetry::ModelTelemetryRecorder;
+use crate::tensor_parallel::coordinate_local_candle_call;
 
 /// Scoring positions processed per chunk by the log-softmax/gather stage —
 /// bounds the F32 upcast + softmax buffers to `[group, SCORING_CHUNK, vocab]`
@@ -213,15 +214,21 @@ impl<M: GradModel> LmPolicy<M> {
         rollout: &Rollout,
         comm: &dyn Comm,
     ) -> CandleResult<Tensor> {
-        let input = self.scoring_input(rollout)?;
-        let (start, len) = Self::scoring_window(rollout);
-        let targets = self.scoring_targets(rollout)?;
+        let (input, start, len, targets) =
+            coordinate_local_candle_call(comm, "tensor-parallel scoring input staging", || {
+                let input = self.scoring_input(rollout)?;
+                let (start, len) = Self::scoring_window(rollout);
+                let targets = self.scoring_targets(rollout)?;
+                Ok((input, start, len, targets))
+            })?;
         let logits = self
             .model
             .forward_tensor_parallel_narrowed(&input, start, len, comm)
             .map_err(crate::cuda_compat::translate_ptx_error)?;
-        chunked_logprobs_from_logits(&logits, &targets, self.temperature, SCORING_CHUNK)
-            .map_err(crate::cuda_compat::translate_ptx_error)
+        coordinate_local_candle_call(comm, "tensor-parallel scoring result staging", || {
+            chunked_logprobs_from_logits(&logits, &targets, self.temperature, SCORING_CHUNK)
+                .map_err(crate::cuda_compat::translate_ptx_error)
+        })
     }
 
     /// Detached/value-only variant of
@@ -235,17 +242,28 @@ impl<M: GradModel> LmPolicy<M> {
         rollout: &Rollout,
         comm: &dyn Comm,
     ) -> CandleResult<Tensor> {
-        let input = self.scoring_input(rollout)?;
-        let (start, len) = Self::scoring_window(rollout);
-        let targets = self.scoring_targets(rollout)?;
+        let (input, start, len, targets) = coordinate_local_candle_call(
+            comm,
+            "tensor-parallel detached-scoring input staging",
+            || {
+                let input = self.scoring_input(rollout)?;
+                let (start, len) = Self::scoring_window(rollout);
+                let targets = self.scoring_targets(rollout)?;
+                Ok((input, start, len, targets))
+            },
+        )?;
         let logits = self
             .model
             .forward_tensor_parallel_detached_narrowed(&input, start, len, comm)
             .map_err(crate::cuda_compat::translate_ptx_error)?;
-        Ok(
-            chunked_logprobs_from_logits(&logits, &targets, self.temperature, SCORING_CHUNK)
-                .map_err(crate::cuda_compat::translate_ptx_error)?
-                .detach(),
+        coordinate_local_candle_call(
+            comm,
+            "tensor-parallel detached-scoring result staging",
+            || {
+                chunked_logprobs_from_logits(&logits, &targets, self.temperature, SCORING_CHUNK)
+                    .map_err(crate::cuda_compat::translate_ptx_error)
+                    .map(|tensor| tensor.detach())
+            },
         )
     }
 
@@ -505,36 +523,45 @@ impl<M: GradModel> LmPolicy<M> {
         tp_comm: Option<&dyn Comm>,
         mut telemetry: Option<&mut dyn ModelTelemetryRecorder>,
     ) -> CandleResult<Rollout> {
-        let (temperature, top_p) = self.resolve_sampling(cfg)?;
-        let device = self.model.device().clone();
-        let prompt_len = prompt.len();
-        // One KV-cached decoder snapshots the CURRENT merged weights (adapter folded
-        // in, toggle respected); the batch dimension carries all group members at
-        // once. The first GPU kernel JIT happens building the merged weights / in the
-        // first forward, so translate a driver-too-old PTX mismatch
-        // (`CUDA_ERROR_UNSUPPORTED_PTX_VERSION`) into an actionable rebuild/upgrade
-        // message — a no-op off the `cuda` build and on the success path.
-        if let Some(recorder) = telemetry.as_deref_mut() {
-            recorder.record_phase("merged_decoder_build_start");
-        }
-        let mut decoder = self
-            .model
-            .merged_decoder()
-            .map_err(crate::cuda_compat::translate_ptx_error)?;
-        if let Some(recorder) = telemetry.as_deref_mut() {
-            recorder.record_phase("merged_decoder_build_end");
-            recorder
-                .record_decoder_cache(decoder.decoder_cache_snapshots("merged_decoder_build_end"));
-        }
-        // Per-row independent RNG substreams seeded by GLOBAL row index
-        // (`global_row_base + row`): each row draws ONLY from its own substream, so
-        // the sampled stream is invariant both to decode order (this batched decode
-        // and the sequential `generate_uncached` oracle produce bit-identical groups)
-        // AND to data-parallel shard layout (a world-W run reproduces the
-        // single-process draws). See `GrpoSampler::fork_substreams_at`.
-        let mut substreams = self
-            .sampler
-            .fork_substreams_at(global_row_base, cfg.group_size);
+        let ((temperature, top_p), device, prompt_len, mut decoder, mut substreams) =
+            coordinate_optional_tensor_parallel_local_call(
+                tp_comm,
+                "tensor-parallel rollout setup",
+                || {
+                    let sampling = self.resolve_sampling(cfg)?;
+                    let device = self.model.device().clone();
+                    let prompt_len = prompt.len();
+                    // One KV-cached decoder snapshots the CURRENT merged weights (adapter folded
+                    // in, toggle respected); the batch dimension carries all group members at
+                    // once. The first GPU kernel JIT happens building the merged weights / in the
+                    // first forward, so translate a driver-too-old PTX mismatch
+                    // (`CUDA_ERROR_UNSUPPORTED_PTX_VERSION`) into an actionable rebuild/upgrade
+                    // message — a no-op off the `cuda` build and on the success path.
+                    if let Some(recorder) = telemetry.as_deref_mut() {
+                        recorder.record_phase("merged_decoder_build_start");
+                    }
+                    let decoder = self
+                        .model
+                        .merged_decoder()
+                        .map_err(crate::cuda_compat::translate_ptx_error)?;
+                    if let Some(recorder) = telemetry.as_deref_mut() {
+                        recorder.record_phase("merged_decoder_build_end");
+                        recorder.record_decoder_cache(
+                            decoder.decoder_cache_snapshots("merged_decoder_build_end"),
+                        );
+                    }
+                    // Per-row independent RNG substreams seeded by GLOBAL row index
+                    // (`global_row_base + row`): each row draws ONLY from its own substream, so
+                    // the sampled stream is invariant both to decode order (this batched decode
+                    // and the sequential `generate_uncached` oracle produce bit-identical groups)
+                    // AND to data-parallel shard layout (a world-W run reproduces the
+                    // single-process draws). See `GrpoSampler::fork_substreams_at`.
+                    let substreams = self
+                        .sampler
+                        .fork_substreams_at(global_row_base, cfg.group_size);
+                    Ok((sampling, device, prompt_len, decoder, substreams))
+                },
+            )?;
         let (token_ids, completion_lens, rollout_logprobs) = batched_group_decode(
             &mut decoder,
             &mut substreams,
@@ -561,6 +588,17 @@ impl<M: GradModel> LmPolicy<M> {
 /// alias so the trait method and helper share one signature (and clippy's
 /// `type_complexity` stays quiet).
 type GroupDecode = (Vec<Vec<u32>>, Vec<usize>, Vec<Vec<f32>>);
+
+fn coordinate_optional_tensor_parallel_local_call<T>(
+    comm: Option<&dyn Comm>,
+    label: &str,
+    call: impl FnOnce() -> CandleResult<T>,
+) -> CandleResult<T> {
+    match comm {
+        Some(comm) => coordinate_local_candle_call(comm, label, call),
+        None => call(),
+    }
+}
 
 fn cached_decoder_forward<D: CachedDecoder>(
     decoder: &mut D,
@@ -598,99 +636,168 @@ fn batched_group_decode<D: CachedDecoder>(
     (device, tp_comm): (&candle_core::Device, Option<&dyn Comm>),
     telemetry: &mut Option<&mut dyn ModelTelemetryRecorder>,
 ) -> CandleResult<GroupDecode> {
-    let g = cfg.group_size;
-    let prompt_len = prompt.len();
-    // The fixed rectangular width every sequence is padded/grown to.
-    let width = prompt_len + cfg.max_new_tokens;
-    // EOS pad: a stopped row is right-padded back to `width` with the EOS it sampled
-    // (== cfg.eos_token_id), and once retired a row is FED this same id each later
-    // step so the batch stays rectangular while the cache advances. Never used when
-    // eos is None (no row stops; every row is full width), so 0 is an inert fallback.
-    let pad = cfg.eos_token_id.unwrap_or(0);
+    let (g, prompt_len, width, pad, prompt_input) = coordinate_optional_tensor_parallel_local_call(
+        tp_comm,
+        "tensor-parallel rollout prefill input staging",
+        || {
+            let g = cfg.group_size;
+            let prompt_len = prompt.len();
+            if prompt_len == 0 {
+                candle_core::bail!("tensor-parallel rollout prompt is empty")
+            }
+            // The fixed rectangular width every sequence is padded/grown to.
+            let width = prompt_len.checked_add(cfg.max_new_tokens).ok_or_else(|| {
+                candle_core::Error::Msg("tensor-parallel rollout width overflows usize".into())
+            })?;
+            // EOS pad: a stopped row is right-padded back to `width` with the EOS it sampled
+            // (== cfg.eos_token_id), and once retired a row is FED this same id each later
+            // step so the batch stays rectangular while the cache advances. Never used when
+            // eos is None (no row stops; every row is full width), so 0 is an inert fallback.
+            let pad = cfg.eos_token_id.unwrap_or(0);
 
-    // Prefill the shared prompt for all `g` rows at offset 0 (the prompt is identical
-    // across the group, so one broadcast prefill serves every row); its last position
-    // predicts each row's first token.
-    let mut prompt_data = Vec::with_capacity(g * prompt_len);
-    for _ in 0..g {
-        prompt_data.extend_from_slice(prompt);
-    }
-    let prompt_input = Tensor::from_vec(prompt_data, (g, prompt_len), device)?;
-    if let Some(recorder) = telemetry.as_mut() {
-        recorder.record_phase("rollout_prefill_start");
-    }
+            // Prefill the shared prompt for all `g` rows at offset 0 (the prompt is identical
+            // across the group, so one broadcast prefill serves every row); its last position
+            // predicts each row's first token.
+            let capacity = g.checked_mul(prompt_len).ok_or_else(|| {
+                candle_core::Error::Msg(
+                    "tensor-parallel rollout prompt batch overflows usize".into(),
+                )
+            })?;
+            let mut prompt_data = Vec::with_capacity(capacity);
+            for _ in 0..g {
+                prompt_data.extend_from_slice(prompt);
+            }
+            let prompt_input = Tensor::from_vec(prompt_data, (g, prompt_len), device)?;
+            if let Some(recorder) = telemetry.as_mut() {
+                recorder.record_phase("rollout_prefill_start");
+            }
+            Ok((g, prompt_len, width, pad, prompt_input))
+        },
+    )?;
     let logits = cached_decoder_forward(decoder, &prompt_input, 0, tp_comm)
         .map_err(crate::cuda_compat::translate_ptx_error)?;
-    if let Some(recorder) = telemetry.as_mut() {
-        recorder.record_phase("rollout_prefill_end");
-        recorder.record_decoder_cache(decoder.decoder_cache_snapshots("rollout_prefill_end"));
-    }
-    let mut last = logits.i((.., prompt_len - 1))?; // [g, vocab]
-
-    let mut token_ids: Vec<Vec<u32>> = (0..g).map(|_| prompt.to_vec()).collect();
-    // Behavior-policy log-probs, one per real draw: the sampler computes the full
-    // sampling distribution anyway, so capturing the drawn token's log-prob is free —
-    // see `Rollout::rollout_logprobs`.
-    let mut rollout_logprobs: Vec<Vec<f32>> = (0..g)
-        .map(|_| Vec::with_capacity(cfg.max_new_tokens))
-        .collect();
-    // Real completion tokens per row, counting up to and INCLUDING the first EOS;
-    // stays `max_new_tokens` unless an EOS early-stop overwrites it below.
-    let mut completion_lens = vec![cfg.max_new_tokens; g];
-    let mut active = vec![true; g];
-    let mut offset = prompt_len;
-
-    if let Some(recorder) = telemetry.as_mut() {
-        recorder.record_phase("rollout_decode_start");
-    }
-    for step in 0..cfg.max_new_tokens {
-        // Sample each still-active row from its OWN substream; a retired row draws
-        // nothing (so its log-prob count stays == completion_lens[r], one per real
-        // token) and is fed the EOS pad to keep the batch rectangular.
-        let mut feed: Vec<u32> = Vec::with_capacity(g);
-        for r in 0..g {
-            if active[r] {
-                let row_logits = last.i(r)?; // [vocab]
-                let (next, logprob) = substreams[r].sample_with(&row_logits, temperature, top_p)?;
-                token_ids[r].push(next);
-                rollout_logprobs[r].push(logprob);
-                // EOS-inclusive early stop: keep the EOS token, record the true
-                // length, retire the row. With `eos_token_id == None` this never
-                // fires, so every row runs the full `max_new_tokens`.
-                if cfg.eos_token_id == Some(next) {
-                    completion_lens[r] = step + 1;
-                    active[r] = false;
-                }
-                feed.push(next);
-            } else {
-                feed.push(pad);
+    let (
+        mut last,
+        mut token_ids,
+        mut rollout_logprobs,
+        mut completion_lens,
+        mut active,
+        mut offset,
+    ) = coordinate_optional_tensor_parallel_local_call(
+        tp_comm,
+        "tensor-parallel rollout prefill result staging",
+        || {
+            if let Some(recorder) = telemetry.as_mut() {
+                recorder.record_phase("rollout_prefill_end");
+                recorder
+                    .record_decoder_cache(decoder.decoder_cache_snapshots("rollout_prefill_end"));
             }
-        }
+            let last = logits.i((.., prompt_len - 1))?; // [g, vocab]
+            let token_ids: Vec<Vec<u32>> = (0..g).map(|_| prompt.to_vec()).collect();
+            // Behavior-policy log-probs, one per real draw: the sampler computes the full
+            // sampling distribution anyway, so capturing the drawn token's log-prob is free —
+            // see `Rollout::rollout_logprobs`.
+            let rollout_logprobs: Vec<Vec<f32>> = (0..g)
+                .map(|_| Vec::with_capacity(cfg.max_new_tokens))
+                .collect();
+            // Real completion tokens per row, counting up to and INCLUDING the first EOS;
+            // stays `max_new_tokens` unless an EOS early-stop overwrites it below.
+            let completion_lens = vec![cfg.max_new_tokens; g];
+            let active = vec![true; g];
+            let offset = prompt_len;
+            if let Some(recorder) = telemetry.as_mut() {
+                recorder.record_phase("rollout_decode_start");
+            }
+            Ok((
+                last,
+                token_ids,
+                rollout_logprobs,
+                completion_lens,
+                active,
+                offset,
+            ))
+        },
+    )?;
+    for step in 0..cfg.max_new_tokens {
+        let (all_retired, next_input) = coordinate_optional_tensor_parallel_local_call(
+            tp_comm,
+            "tensor-parallel rollout decode sampling",
+            || {
+                // Sample each still-active row from its OWN substream; a retired row draws
+                // nothing (so its log-prob count stays == completion_lens[r], one per real
+                // token) and is fed the EOS pad to keep the batch rectangular.
+                let mut feed: Vec<u32> = Vec::with_capacity(g);
+                for r in 0..g {
+                    if active[r] {
+                        let row_logits = last.i(r)?; // [vocab]
+                        let (next, logprob) =
+                            substreams[r].sample_with(&row_logits, temperature, top_p)?;
+                        token_ids[r].push(next);
+                        rollout_logprobs[r].push(logprob);
+                        // EOS-inclusive early stop: keep the EOS token, record the true
+                        // length, retire the row. With `eos_token_id == None` this never
+                        // fires, so every row runs the full `max_new_tokens`.
+                        if cfg.eos_token_id == Some(next) {
+                            completion_lens[r] = step + 1;
+                            active[r] = false;
+                        }
+                        feed.push(next);
+                    } else {
+                        feed.push(pad);
+                    }
+                }
+                let all_retired = active.iter().all(|&is_active| !is_active);
+                // Advance the cache with the just-sampled tokens to get the next step's logits
+                // — unless this was the final step (no further token to predict), which keeps
+                // each substream's draw count exactly completion_lens[r].
+                let next_input = if !all_retired && step + 1 < cfg.max_new_tokens {
+                    Some(Tensor::from_vec(feed, (g, 1), device)?)
+                } else {
+                    None
+                };
+                Ok((all_retired, next_input))
+            },
+        )?;
         // Every row retired (all sampled EOS): nothing left to decode.
-        if active.iter().all(|&a| !a) {
+        if all_retired {
             break;
         }
-        // Advance the cache with the just-sampled tokens to get the next step's logits
-        // — unless this was the final step (no further token to predict), which keeps
-        // each substream's draw count exactly completion_lens[r].
-        if step + 1 < cfg.max_new_tokens {
-            let tok = Tensor::from_vec(feed, (g, 1), device)?;
+        if let Some(tok) = next_input {
             let logits = cached_decoder_forward(decoder, &tok, offset, tp_comm)
                 .map_err(crate::cuda_compat::translate_ptx_error)?;
-            last = logits.i((.., 0))?; // [g, vocab]
-            offset += 1;
+            (last, offset) = coordinate_optional_tensor_parallel_local_call(
+                tp_comm,
+                "tensor-parallel rollout decode result staging",
+                || {
+                    let last = logits.i((.., 0))?; // [g, vocab]
+                    let offset = offset.checked_add(1).ok_or_else(|| {
+                        candle_core::Error::Msg(
+                            "tensor-parallel rollout decode offset overflows usize".into(),
+                        )
+                    })?;
+                    Ok((last, offset))
+                },
+            )?;
         }
     }
-    if let Some(recorder) = telemetry.as_mut() {
-        recorder.record_phase("rollout_decode_end");
-        recorder.record_decoder_cache(decoder.decoder_cache_snapshots("rollout_decode_end"));
-    }
+    coordinate_optional_tensor_parallel_local_call(
+        tp_comm,
+        "tensor-parallel rollout result staging",
+        || {
+            if let Some(recorder) = telemetry.as_mut() {
+                recorder.record_phase("rollout_decode_end");
+                recorder
+                    .record_decoder_cache(decoder.decoder_cache_snapshots("rollout_decode_end"));
+            }
 
-    // Right-pad every retired row back to the fixed width with the EOS pad; full-width
-    // rows (no early stop) are already `width` and unchanged.
-    for row in &mut token_ids {
-        row.resize(width, pad);
-    }
+            // Right-pad every retired row back to the fixed width with the EOS pad; full-width
+            // rows (no early stop) are already `width` and unchanged.
+            for row in &mut token_ids {
+                row.resize(width, pad);
+            }
+            Ok(())
+        },
+    )?;
     Ok((token_ids, completion_lens, rollout_logprobs))
 }
 
@@ -821,6 +928,10 @@ impl<M: GradModel> Policy for LmPolicy<M> {
 }
 
 impl<M: GradModel> TensorParallelPolicy for LmPolicy<M> {
+    fn validate_tensor_parallel_execution(&self, comm: &dyn Comm) -> CandleResult<()> {
+        self.model.validate_tensor_parallel_execution(comm)
+    }
+
     fn generate_at_tensor_parallel_instrumented(
         &mut self,
         prompt: &[u32],
@@ -1033,6 +1144,242 @@ mod tests {
                     c.is_covered() && c.nonzero == c.total && c.nonfinite == 0,
                     "rank {rank} layer {layer} {name} policy TP grads not fully live: {c:?}"
                 );
+            }
+        }
+    }
+
+    struct PanicPhaseTelemetry {
+        phase: &'static str,
+        consumed: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ModelTelemetryRecorder for PanicPhaseTelemetry {
+        fn record_phase(&mut self, phase: &'static str) {
+            if phase == self.phase {
+                self.consumed
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                panic!("injected {phase} telemetry panic");
+            }
+        }
+
+        fn record_decoder_cache(&mut self, _snapshots: Vec<DecoderCacheSnapshot>) {}
+    }
+
+    #[test]
+    fn tensor_parallel_lm_policy_coordinates_asymmetric_rollout_setup_error() {
+        let cfg = tiny_tp_gqa_cfg();
+        let weights = weight_map(&cfg);
+        let errors = std::thread::scope(|scope| {
+            let handles = LocalComm::world_with_timeout(2, std::time::Duration::from_secs(2))
+                .into_iter()
+                .map(|comm| {
+                    let cfg = cfg.clone();
+                    let weights = weights.clone();
+                    scope.spawn(move || {
+                        let mut policy = tiny_tp_policy_from_weights(&cfg, weights);
+                        let gen = GenConfig {
+                            group_size: 2,
+                            max_new_tokens: 2,
+                            temperature: if comm.rank() == 0 { 1.0 } else { 2.0 },
+                            eos_token_id: None,
+                            eval_sampling: None,
+                        };
+                        (
+                            comm.rank(),
+                            policy
+                                .generate_tensor_parallel_at(&[1, 2, 3], &gen, 0, &comm)
+                                .unwrap_err()
+                                .to_string(),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        for (rank, error) in errors {
+            if rank == 1 {
+                assert!(error.contains("rebuild the policy to change it"), "{error}");
+            } else {
+                assert!(
+                    error.contains("rollout setup failed on a peer tensor-parallel rank"),
+                    "{error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tensor_parallel_lm_policy_coordinates_asymmetric_scoring_input_panic() {
+        let cfg = tiny_tp_gqa_cfg();
+        let weights = weight_map(&cfg);
+        let errors = std::thread::scope(|scope| {
+            let handles = LocalComm::world_with_timeout(2, std::time::Duration::from_secs(2))
+                .into_iter()
+                .map(|comm| {
+                    let cfg = cfg.clone();
+                    let weights = weights.clone();
+                    scope.spawn(move || {
+                        let policy = tiny_tp_policy_from_weights(&cfg, weights);
+                        let rollout = if comm.rank() == 0 {
+                            tp_policy_rollout()
+                        } else {
+                            Rollout {
+                                token_ids: Vec::new(),
+                                prompt_len: 0,
+                                completion_lens: Vec::new(),
+                                rollout_logprobs: None,
+                            }
+                        };
+                        (
+                            comm.rank(),
+                            policy
+                                .token_logprobs_tensor_parallel(&rollout, &comm)
+                                .unwrap_err()
+                                .to_string(),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        for (rank, error) in errors {
+            if rank == 1 {
+                assert!(error.contains("scoring input staging panicked"), "{error}");
+            } else {
+                assert!(
+                    error.contains("scoring input staging failed on a peer"),
+                    "{error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tensor_parallel_lm_policy_coordinates_asymmetric_post_forward_scoring_error() {
+        for detached in [false, true] {
+            let cfg = tiny_tp_gqa_cfg();
+            let weights = weight_map(&cfg);
+            let errors = std::thread::scope(|scope| {
+                let handles = LocalComm::world_with_timeout(2, std::time::Duration::from_secs(2))
+                    .into_iter()
+                    .map(|comm| {
+                        let cfg = cfg.clone();
+                        let weights = weights.clone();
+                        scope.spawn(move || {
+                            let policy = tiny_tp_policy_from_weights(&cfg, weights);
+                            let mut rollout = tp_policy_rollout();
+                            if comm.rank() == 1 {
+                                *rollout.token_ids[0].last_mut().unwrap() = 999;
+                            }
+                            let result = if detached {
+                                policy.token_logprobs_tensor_parallel_detached(&rollout, &comm)
+                            } else {
+                                policy.token_logprobs_tensor_parallel(&rollout, &comm)
+                            };
+                            (comm.rank(), result.unwrap_err().to_string())
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+
+            for (rank, error) in errors {
+                if rank == 0 {
+                    assert!(
+                        error.contains("scoring result staging failed on a peer"),
+                        "detached={detached}: {error}"
+                    );
+                } else {
+                    assert!(
+                        !error.contains("failed on a peer"),
+                        "detached={detached}: rank-local fault was not consumed: {error}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tensor_parallel_lm_policy_coordinates_inter_forward_and_finalization_panics() {
+        for (phase, peer_stage) in [
+            ("rollout_prefill_end", "rollout prefill result staging"),
+            ("rollout_decode_end", "rollout result staging"),
+        ] {
+            let cfg = tiny_tp_gqa_cfg();
+            let weights = weight_map(&cfg);
+            let consumed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let errors = std::thread::scope(|scope| {
+                let handles = LocalComm::world_with_timeout(2, std::time::Duration::from_secs(2))
+                    .into_iter()
+                    .map(|comm| {
+                        let cfg = cfg.clone();
+                        let weights = weights.clone();
+                        let consumed = std::sync::Arc::clone(&consumed);
+                        scope.spawn(move || {
+                            let mut policy = tiny_tp_policy_from_weights(&cfg, weights);
+                            let gen = GenConfig {
+                                group_size: 2,
+                                max_new_tokens: 2,
+                                temperature: 1.0,
+                                eos_token_id: None,
+                                eval_sampling: None,
+                            };
+                            let mut telemetry = PanicPhaseTelemetry { phase, consumed };
+                            let result = if comm.rank() == 1 {
+                                policy.generate_tensor_parallel_at_instrumented(
+                                    &[1, 2, 3],
+                                    &gen,
+                                    0,
+                                    &comm,
+                                    Some(&mut telemetry),
+                                )
+                            } else {
+                                policy.generate_tensor_parallel_at_instrumented(
+                                    &[1, 2, 3],
+                                    &gen,
+                                    0,
+                                    &comm,
+                                    None,
+                                )
+                            };
+                            (comm.rank(), result.unwrap_err().to_string())
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+
+            assert_eq!(
+                consumed.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "the {phase} panic injection was not consumed"
+            );
+            for (rank, error) in errors {
+                if rank == 1 {
+                    assert!(
+                        error.contains(&format!("injected {phase} telemetry panic")),
+                        "{error}"
+                    );
+                } else {
+                    assert!(
+                        error.contains(&format!("{peer_stage} failed on a peer")),
+                        "{error}"
+                    );
+                }
             }
         }
     }

@@ -266,6 +266,22 @@ pub trait GradModel {
         self.forward_detached(input_ids)?.narrow(1, start, len)
     }
 
+    /// Validate the caller-supplied tensor-parallel execution plan without
+    /// mutating model, sampler, adapter, cache, or checkpoint-tape state.
+    ///
+    /// The default validates only communicator rank/world coordinates. Models
+    /// that persist rank-local projection shards must also prove that every
+    /// stored shard axis, shape, rank, and world matches the execution plan.
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error when the communicator is malformed or the live
+    /// model cannot execute the requested tensor-parallel plan.
+    fn validate_tensor_parallel_execution(&self, comm: &dyn Comm) -> CandleResult<()> {
+        plan_from_comm(comm)?;
+        Ok(())
+    }
+
     /// Full-sequence logits through an explicitly supplied tensor-parallel
     /// communicator.
     ///

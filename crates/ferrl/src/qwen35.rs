@@ -80,6 +80,7 @@ use serde::Deserialize;
 use crate::blocks::{
     causal_mask, causal_mask_at, frozen_linear, repeat_kv, rope_partial, windowed, RotaryTables,
 };
+use crate::comm::Comm;
 use crate::gdn::{
     causal_depthwise_conv1d, gated_delta_rule_chunked, gated_delta_rule_recurrent, stable_softplus,
 };
@@ -87,6 +88,7 @@ use crate::lora::Proj;
 use crate::model::{chunked_logprobs_from_logits, CachedDecoder, GradModel};
 use crate::nn::{RmsNormGated, RmsNormZeroCentered};
 use crate::remat::{stitched_backward, RematTape};
+use crate::tensor_parallel::plan_from_comm;
 
 /// Delta-rule chunk length for training and multi-token prefill — the
 /// reference kernel default, and what the pinned oracle executes. A pure
@@ -2386,6 +2388,17 @@ impl GradModel for Qwen3_5GradModel {
         len: usize,
     ) -> CandleResult<Tensor> {
         Qwen3_5GradModel::forward_detached_narrowed(self, input_ids, start, len)
+    }
+
+    fn validate_tensor_parallel_execution(&self, comm: &dyn Comm) -> CandleResult<()> {
+        let plan = plan_from_comm(comm)?;
+        if plan.is_sharded() {
+            candle_core::bail!(
+                "Qwen3.5 does not implement tensor-parallel model execution for world_size {}",
+                plan.world_size()
+            );
+        }
+        Ok(())
     }
 
     fn token_logprobs_narrowed(
