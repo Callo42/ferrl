@@ -10043,11 +10043,11 @@ mod tests {
         let tmp = WireTmp::new("reward-stat-chain-terminal-comm");
         let ledger_root = tmp.0.join("ledger");
         let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        // Reward callback arming is followed by rollout/reward status, candidate
-        // write status, and reward-count reduction. Reward-sum then fails, so
-        // sum-of-squares must never be attempted.
+        // Reward callback arming is followed by rollout/reward status and the
+        // reward-count reduction. Reward-sum then fails, so sum-of-squares must
+        // never be attempted.
         let states: Vec<_> = (0..2)
-            .map(|_| std::sync::Arc::new(ArmedCollectiveFailureState::new(3)))
+            .map(|_| std::sync::Arc::new(ArmedCollectiveFailureState::new(2)))
             .collect();
         let comms =
             crate::comm::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(10));
@@ -10069,6 +10069,7 @@ mod tests {
                         let run = RunDir::create(&base, format!("rank-{rank}")).unwrap();
                         let mut config = candidate_ledger_config();
                         config.reward_group_scope = RewardGroupScope::DistributedSamePrompt;
+                        config.candidate_log_top_k = 0;
                         let mut trainer = Trainer::with_comm(config, &run, comm).unwrap();
                         let mut policy = stateful_candidate_policy();
                         let error = trainer
