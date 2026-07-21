@@ -1597,22 +1597,26 @@ fn tensor_parallel_policy_call<T>(
 ) -> Result<T, TrainerError> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(call)) {
         Ok(Ok(value)) => Ok(value),
-        Ok(Err(error))
-            if comm.world_size() > 1 || crate::tensor_parallel::is_comm_failure(&error) =>
-        {
+        Ok(Err(error)) if comm.world_size() > 1 => {
             Err(TrainerError::TensorParallelExecutionTerminal {
                 operation,
                 detail: error.to_string(),
             })
         }
         Ok(Err(error)) => Err(TrainerError::Candle(error)),
-        Err(payload) => Err(TrainerError::TensorParallelExecutionTerminal {
-            operation,
-            detail: format!(
-                "policy hook panicked: {}",
-                panic_payload_message(payload.as_ref())
-            ),
-        }),
+        Err(payload) if comm.world_size() > 1 => {
+            Err(TrainerError::TensorParallelExecutionTerminal {
+                operation,
+                detail: format!(
+                    "policy hook panicked: {}",
+                    panic_payload_message(payload.as_ref())
+                ),
+            })
+        }
+        Err(payload) => Err(TrainerError::Contract(format!(
+            "{operation} policy hook panicked: {}",
+            panic_payload_message(payload.as_ref())
+        ))),
     }
 }
 
@@ -3079,10 +3083,15 @@ impl Trainer {
                 .map_err(TrainerError::from)
             }))
             .unwrap_or_else(|payload| {
-                Err(TrainerError::Contract(format!(
-                    "rollout-ledger continuation publication panicked: {}",
-                    panic_payload_message(payload.as_ref())
-                )))
+                Err(TrainerError::Checkpoint(
+                    crate::checkpoint::CheckpointError::PublicationAmbiguous {
+                        path: dir.clone(),
+                        detail: format!(
+                            "rollout-ledger continuation publication panicked after the publisher was entered: {}",
+                            panic_payload_message(payload.as_ref())
+                        ),
+                    },
+                ))
             })
         } else {
             Ok(())
@@ -4065,10 +4074,15 @@ impl Trainer {
                     .map_err(TrainerError::from)
             }))
             .unwrap_or_else(|panic| {
-                Err(TrainerError::Contract(format!(
-                    "tensor-parallel rollout-ledger publication panicked: {}",
-                    panic_payload_message(panic.as_ref())
-                )))
+                Err(TrainerError::RolloutLedger(
+                    RolloutLedgerError::PublicationAmbiguous {
+                        path: final_dir.clone(),
+                        detail: format!(
+                            "tensor-parallel rollout-ledger publication panicked after the publisher was entered: {}",
+                            panic_payload_message(panic.as_ref())
+                        ),
+                    },
+                ))
             })
         } else {
             Ok(None)
@@ -10372,6 +10386,162 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn tensor_parallel_publication_panics_are_ambiguous_and_loadable() {
+        let tmp = WireTmp::new("tp-ledger-continuation-publication-panic");
+        let ledger_root = tmp.0.join("ledger");
+        let checkpoint_root = tmp.0.join("continuations");
+        let policy_sha256 = "8".repeat(64);
+        let outcomes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        std::thread::scope(|scope| {
+            let handles: Vec<_> =
+                crate::comm::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(10))
+                    .into_iter()
+                    .enumerate()
+                    .map(|(rank, comm)| {
+                        let base = tmp.0.clone();
+                        let ledger_root = ledger_root.clone();
+                        let checkpoint_root = checkpoint_root.clone();
+                        let policy_sha256 = policy_sha256.clone();
+                        let outcomes = std::sync::Arc::clone(&outcomes);
+                        scope.spawn(move || {
+                            let run = RunDir::create(&base, format!("rank-{rank}")).unwrap();
+                            let mut trainer =
+                                Trainer::new(candidate_ledger_config(), &run).unwrap();
+                            let mut collector = stateful_candidate_policy();
+                            if rank == 0 {
+                                crate::rollout_ledger::inject_post_manifest_panic_once();
+                            }
+                            let collect_error = trainer
+                                .collect_rollout_ledger_step_tensor_parallel(
+                                    0,
+                                    &mut collector,
+                                    &CandidateReward,
+                                    &CandidateCodec,
+                                    &[Sample::new("p", ())],
+                                    &ledger_root,
+                                    &policy_sha256,
+                                    None,
+                                    &comm,
+                                )
+                                .unwrap_err();
+
+                            let mut learner = stateful_candidate_policy();
+                            let (_, continuation) = trainer
+                                .train_rollout_ledger_step_tensor_parallel(
+                                    0,
+                                    &mut learner,
+                                    &ledger_root,
+                                    &policy_sha256,
+                                    None,
+                                    &comm,
+                                )
+                                .unwrap();
+                            let learner_adapter = learner
+                                .inner
+                                .logp
+                                .as_tensor()
+                                .flatten_all()
+                                .unwrap()
+                                .to_vec1::<f32>()
+                                .unwrap();
+                            if rank == 0 {
+                                crate::checkpoint::inject_continuation_post_manifest_panic_once();
+                            }
+                            let save_error = trainer
+                                .save_rollout_ledger_continuation_to_tensor_parallel(
+                                    &checkpoint_root,
+                                    &learner,
+                                    &continuation,
+                                    &comm,
+                                )
+                                .unwrap_err();
+
+                            let mut restored_policy = stateful_candidate_policy();
+                            restored_policy.sampler = 99;
+                            let restored = trainer
+                                .restore_latest_rollout_ledger_continuation_from_tensor_parallel(
+                                    &checkpoint_root,
+                                    &mut restored_policy,
+                                    &policy_sha256,
+                                    &comm,
+                                )
+                                .unwrap()
+                                .expect("post-manifest checkpoint must remain discoverable");
+                            let restored_adapter = restored_policy
+                                .inner
+                                .logp
+                                .as_tensor()
+                                .flatten_all()
+                                .unwrap()
+                                .to_vec1::<f32>()
+                                .unwrap();
+                            outcomes.lock().unwrap().push((
+                                rank,
+                                collect_error,
+                                save_error,
+                                collector.sampler,
+                                learner.sampler,
+                                restored_policy.sampler,
+                                restored.completed_step(),
+                                learner_adapter == restored_adapter,
+                                continuation.optimizer_sha256 == restored.optimizer_sha256,
+                                continuation.lineage_sha256 == restored.lineage_sha256,
+                            ));
+                        })
+                    })
+                    .collect();
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
+
+        let mut outcomes = std::mem::take(&mut *outcomes.lock().unwrap());
+        outcomes.sort_by_key(|outcome| outcome.0);
+        for (
+            rank,
+            collect_error,
+            save_error,
+            collector_sampler,
+            learner_sampler,
+            restored_sampler,
+            restored_step,
+            adapter_matches,
+            optimizer_matches,
+            lineage_matches,
+        ) in outcomes
+        {
+            assert!(
+                matches!(
+                    collect_error,
+                    TrainerError::RolloutLedger(RolloutLedgerError::PublicationAmbiguous { .. })
+                ),
+                "rank {rank}: {collect_error:?}"
+            );
+            assert!(
+                matches!(
+                    save_error,
+                    TrainerError::Checkpoint(
+                        crate::checkpoint::CheckpointError::PublicationAmbiguous { .. }
+                    )
+                ),
+                "rank {rank}: {save_error:?}"
+            );
+            assert_eq!(collector_sampler, 1, "rank {rank} collector sampler");
+            assert_eq!(learner_sampler, 1, "rank {rank} learner sampler");
+            assert_eq!(restored_sampler, 1, "rank {rank} restored sampler");
+            assert_eq!(restored_step, 1, "rank {rank} restored step");
+            assert!(adapter_matches, "rank {rank} restored adapter");
+            assert!(optimizer_matches, "rank {rank} restored optimizer");
+            assert!(lineage_matches, "rank {rank} restored lineage");
+        }
+        assert!(ledger_root
+            .join("step-00000000000000000000/manifest.json")
+            .is_file());
+        assert!(checkpoint_root.join("step-1/manifest.json").is_file());
+    }
+
+    #[test]
     fn distributed_collector_propagates_post_manifest_ambiguity_to_every_rank() {
         let tmp = WireTmp::new("distributed-ledger-post-manifest-ambiguity");
         let ledger_root = tmp.0.join("ledger");
@@ -11952,18 +12122,48 @@ mod tests {
         Backward,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum TpSeparatedFailureBehavior {
+        CommunicationError,
+        Error,
+        Panic,
+    }
+
     struct TpSeparatedFailingPolicy {
         inner: TpProbePolicy,
         arm: std::sync::Arc<std::sync::atomic::AtomicBool>,
         failure: TpSeparatedHookFailure,
+        behavior: TpSeparatedFailureBehavior,
+        fail_this_rank: bool,
+        sampler_state: std::cell::RefCell<Vec<u8>>,
     }
 
     impl TpSeparatedFailingPolicy {
-        fn fail_collective(&self, comm: &dyn Comm) -> CandleResult<()> {
-            self.arm.store(true, std::sync::atomic::Ordering::SeqCst);
-            comm.all_reduce_scalar_sum(1.0)
-                .map(|_| ())
-                .map_err(|error| candle_core::Error::Msg(error.to_string()))
+        fn mutate_sampler(&self) {
+            self.sampler_state.borrow_mut()[0] += 1;
+        }
+
+        fn mutate_learner_state(&self) -> CandleResult<()> {
+            self.mutate_sampler();
+            let changed = (self.inner.logp.as_tensor() + 0.75)?;
+            self.inner.logp.set(&changed)
+        }
+
+        fn fail(&self, comm: &dyn Comm) -> CandleResult<()> {
+            match self.behavior {
+                TpSeparatedFailureBehavior::CommunicationError => {
+                    self.arm.store(true, std::sync::atomic::Ordering::SeqCst);
+                    crate::tensor_parallel::comm_to_candle(comm.all_reduce_scalar_sum(1.0))
+                        .map(|_| ())
+                }
+                TpSeparatedFailureBehavior::Error => {
+                    candle_core::bail!("injected opaque tensor-parallel policy error")
+                }
+                TpSeparatedFailureBehavior::Panic => {
+                    self.arm.store(true, std::sync::atomic::Ordering::SeqCst);
+                    panic!("injected opaque tensor-parallel policy panic")
+                }
+            }
         }
     }
 
@@ -11997,11 +12197,15 @@ mod tests {
         }
 
         fn sampler_state(&self) -> CandleResult<Vec<u8>> {
-            self.inner.sampler_state()
+            Ok(self.sampler_state.borrow().clone())
         }
 
         fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
-            self.inner.restore_sampler_state(state)
+            if state.len() != 1 {
+                candle_core::bail!("invalid test sampler state")
+            }
+            *self.sampler_state.borrow_mut() = state.to_vec();
+            Ok(())
         }
     }
 
@@ -12018,16 +12222,18 @@ mod tests {
             comm: &dyn Comm,
             telemetry: Option<&mut dyn ModelTelemetryRecorder>,
         ) -> CandleResult<Rollout> {
-            if self.failure == TpSeparatedHookFailure::Generate {
-                self.fail_collective(comm)?;
-            }
-            self.inner.generate_at_tensor_parallel_instrumented(
+            let rollout = self.inner.generate_at_tensor_parallel_instrumented(
                 prompt,
                 cfg,
                 global_row_base,
                 comm,
                 telemetry,
-            )
+            )?;
+            if self.fail_this_rank && self.failure == TpSeparatedHookFailure::Generate {
+                self.mutate_sampler();
+                self.fail(comm)?;
+            }
+            Ok(rollout)
         }
 
         fn token_logprobs_tensor_parallel(
@@ -12035,10 +12241,12 @@ mod tests {
             rollout: &Rollout,
             comm: &dyn Comm,
         ) -> CandleResult<Tensor> {
-            if self.failure == TpSeparatedHookFailure::LiveScoring {
-                self.fail_collective(comm)?;
+            let logprobs = self.inner.token_logprobs_tensor_parallel(rollout, comm)?;
+            if self.fail_this_rank && self.failure == TpSeparatedHookFailure::LiveScoring {
+                self.mutate_learner_state()?;
+                self.fail(comm)?;
             }
-            self.inner.token_logprobs_tensor_parallel(rollout, comm)
+            Ok(logprobs)
         }
 
         fn token_logprobs_tensor_parallel_detached(
@@ -12046,11 +12254,14 @@ mod tests {
             rollout: &Rollout,
             comm: &dyn Comm,
         ) -> CandleResult<Tensor> {
-            if self.failure == TpSeparatedHookFailure::DetachedScoring {
-                self.fail_collective(comm)?;
+            let logprobs = self
+                .inner
+                .token_logprobs_tensor_parallel_detached(rollout, comm)?;
+            if self.fail_this_rank && self.failure == TpSeparatedHookFailure::DetachedScoring {
+                self.mutate_learner_state()?;
+                self.fail(comm)?;
             }
-            self.inner
-                .token_logprobs_tensor_parallel_detached(rollout, comm)
+            Ok(logprobs)
         }
 
         fn backward_tensor_parallel(
@@ -12058,10 +12269,12 @@ mod tests {
             loss: &Tensor,
             comm: &dyn Comm,
         ) -> CandleResult<GradStore> {
-            if self.failure == TpSeparatedHookFailure::Backward {
-                self.fail_collective(comm)?;
+            let grads = self.inner.backward_tensor_parallel(loss, comm)?;
+            if self.fail_this_rank && self.failure == TpSeparatedHookFailure::Backward {
+                self.mutate_learner_state()?;
+                self.fail(comm)?;
             }
-            self.inner.backward_tensor_parallel(loss, comm)
+            Ok(grads)
         }
     }
 
@@ -12270,89 +12483,120 @@ mod tests {
     fn tensor_parallel_ledger_collector_comm_failure_is_terminal_without_later_collectives() {
         let tmp = WireTmp::new("tp-ledger-collector-terminal-comm");
         let ledger_root = tmp.0.join("ledger");
-        let outcomes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = crate::comm::LocalComm::world_with_timeout(
-                2,
-                std::time::Duration::from_millis(500),
-            )
-            .into_iter()
-            .enumerate()
-            .map(|(rank, inner_comm)| {
-                let root = tmp.0.clone();
-                let ledger_root = ledger_root.clone();
-                let outcomes = std::sync::Arc::clone(&outcomes);
-                scope.spawn(move || {
-                    let run = RunDir::create(&root, format!("rank-{rank}")).unwrap();
-                    let mut trainer = Trainer::new(
-                        TrainerConfig {
-                            steps: 1,
-                            group_size: 2,
-                            max_new_tokens: 1,
-                            ..TrainerConfig::default()
-                        },
-                        &run,
-                    )
-                    .unwrap();
-                    let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                    let state = std::sync::Arc::new(ArmedCollectiveFailureState::new(0));
-                    let comm = FailAfterArmComm {
-                        inner: inner_comm,
-                        armed: std::sync::Arc::clone(&armed),
-                        state: std::sync::Arc::clone(&state),
-                    };
-                    let (inner, _) = tp_probe_policy();
-                    let mut policy = TpSeparatedFailingPolicy {
-                        inner,
-                        arm: armed,
-                        failure: TpSeparatedHookFailure::Generate,
-                    };
-                    let sampler_before = policy.sampler_state().unwrap();
-                    let error = trainer
-                        .collect_rollout_ledger_step_tensor_parallel(
-                            0,
-                            &mut policy,
-                            &TpProbeReward,
-                            &TpProbeCodec,
-                            &[Sample::new("prompt", ())],
-                            &ledger_root,
-                            &format!("{:064x}", 131),
-                            None,
-                            &comm,
+        for (behavior_name, behavior) in [
+            (
+                "communication-error",
+                TpSeparatedFailureBehavior::CommunicationError,
+            ),
+            ("panic", TpSeparatedFailureBehavior::Panic),
+        ] {
+            let outcomes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = crate::comm::LocalComm::world_with_timeout(
+                    2,
+                    std::time::Duration::from_millis(500),
+                )
+                .into_iter()
+                .enumerate()
+                .map(|(rank, inner_comm)| {
+                    let root = tmp.0.clone();
+                    let ledger_root = ledger_root.clone();
+                    let outcomes = std::sync::Arc::clone(&outcomes);
+                    scope.spawn(move || {
+                        let run =
+                            RunDir::create(&root, format!("{behavior_name}-rank-{rank}")).unwrap();
+                        let mut trainer = Trainer::new(
+                            TrainerConfig {
+                                steps: 1,
+                                group_size: 2,
+                                max_new_tokens: 1,
+                                ..TrainerConfig::default()
+                            },
+                            &run,
                         )
-                        .unwrap_err();
-                    outcomes.lock().unwrap().push((
-                        rank,
-                        error,
-                        sampler_before,
-                        policy.sampler_state().unwrap(),
-                        state.failed.load(std::sync::atomic::Ordering::SeqCst),
-                        state
-                            .calls_after_failure
-                            .load(std::sync::atomic::Ordering::SeqCst),
-                    ));
+                        .unwrap();
+                        let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        let state = std::sync::Arc::new(ArmedCollectiveFailureState::new(0));
+                        let comm = FailAfterArmComm {
+                            inner: inner_comm,
+                            armed: std::sync::Arc::clone(&armed),
+                            state: std::sync::Arc::clone(&state),
+                        };
+                        let (inner, _) = tp_probe_policy();
+                        let mut policy = TpSeparatedFailingPolicy {
+                            inner,
+                            arm: armed,
+                            failure: TpSeparatedHookFailure::Generate,
+                            behavior,
+                            fail_this_rank: true,
+                            sampler_state: std::cell::RefCell::new(vec![17]),
+                        };
+                        let sampler_before = policy.sampler_state().unwrap();
+                        let error = trainer
+                            .collect_rollout_ledger_step_tensor_parallel(
+                                0,
+                                &mut policy,
+                                &TpProbeReward,
+                                &TpProbeCodec,
+                                &[Sample::new("prompt", ())],
+                                &ledger_root,
+                                &format!("{:064x}", 131),
+                                None,
+                                &comm,
+                            )
+                            .unwrap_err();
+                        outcomes.lock().unwrap().push((
+                            rank,
+                            error,
+                            sampler_before,
+                            policy.sampler_state().unwrap(),
+                            state.failed.load(std::sync::atomic::Ordering::SeqCst),
+                            state
+                                .calls_after_failure
+                                .load(std::sync::atomic::Ordering::SeqCst),
+                        ));
+                    })
                 })
-            })
-            .collect();
-            for handle in handles {
-                handle.join().unwrap();
-            }
-        });
+                .collect();
+                for handle in handles {
+                    handle.join().unwrap();
+                }
+            });
 
-        let mut outcomes = std::mem::take(&mut *outcomes.lock().unwrap());
-        outcomes.sort_by_key(|outcome| outcome.0);
-        for (rank, error, sampler_before, sampler_after, fault_consumed, later_calls) in outcomes {
-            assert!(
-                matches!(&error, TrainerError::TensorParallelExecutionTerminal {
-                    operation: "rollout generation",
-                    detail,
-                } if detail.contains("injected terminal collective-chain failure")
-                    && detail.contains("local sampler rollback succeeded")),
-                "rank {rank}: {error:?}"
-            );
-            assert_eq!(sampler_after, sampler_before, "rank {rank} sampler");
-            assert!(fault_consumed, "rank {rank} did not consume the fault");
-            assert_eq!(later_calls, 0, "rank {rank} issued a later collective");
+            let mut outcomes = std::mem::take(&mut *outcomes.lock().unwrap());
+            outcomes.sort_by_key(|outcome| outcome.0);
+            for (rank, error, sampler_before, sampler_after, failed_comm, later_calls) in outcomes {
+                let expected_detail = match behavior {
+                    TpSeparatedFailureBehavior::CommunicationError => {
+                        "injected terminal collective-chain failure"
+                    }
+                    TpSeparatedFailureBehavior::Panic => {
+                        "policy hook panicked: injected opaque tensor-parallel policy panic"
+                    }
+                    TpSeparatedFailureBehavior::Error => unreachable!(),
+                };
+                assert!(
+                    matches!(&error, TrainerError::TensorParallelExecutionTerminal {
+                        operation: "rollout generation",
+                        detail,
+                    } if detail.contains(expected_detail)
+                        && detail.contains("local sampler rollback succeeded")),
+                    "{behavior_name} rank {rank}: {error:?}"
+                );
+                assert_eq!(
+                    sampler_after, sampler_before,
+                    "{behavior_name} rank {rank} sampler"
+                );
+                assert_eq!(
+                    failed_comm,
+                    behavior == TpSeparatedFailureBehavior::CommunicationError,
+                    "{behavior_name} rank {rank} communicator failure state"
+                );
+                assert_eq!(
+                    later_calls, 0,
+                    "{behavior_name} rank {rank} issued a later collective"
+                );
+            }
         }
         assert!(ledger_root.is_dir());
         assert!(!ledger_root.join("step-00000000000000000000").exists());
@@ -12384,7 +12628,15 @@ mod tests {
                             &run,
                         )
                         .unwrap();
-                        let (mut policy, _) = tp_probe_policy();
+                        let (inner, _) = tp_probe_policy();
+                        let mut policy = TpSeparatedFailingPolicy {
+                            inner,
+                            arm: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                            failure: TpSeparatedHookFailure::Generate,
+                            behavior: TpSeparatedFailureBehavior::Error,
+                            fail_this_rank: false,
+                            sampler_state: std::cell::RefCell::new(vec![17]),
+                        };
                         trainer
                             .collect_rollout_ledger_step_tensor_parallel(
                                 0,
@@ -12406,130 +12658,176 @@ mod tests {
             }
         });
 
-        for (case, failure, operation) in [
+        for (behavior_name, behavior) in [
             (
-                "detached",
-                TpSeparatedHookFailure::DetachedScoring,
-                "detached scoring",
+                "communication-error",
+                TpSeparatedFailureBehavior::CommunicationError,
             ),
-            (
-                "live",
-                TpSeparatedHookFailure::LiveScoring,
-                "differentiable scoring",
-            ),
-            ("backward", TpSeparatedHookFailure::Backward, "backward"),
+            ("panic", TpSeparatedFailureBehavior::Panic),
         ] {
-            let outcomes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-            std::thread::scope(|scope| {
-                let handles: Vec<_> = crate::comm::LocalComm::world_with_timeout(
-                    2,
-                    std::time::Duration::from_millis(500),
-                )
-                .into_iter()
-                .enumerate()
-                .map(|(rank, inner_comm)| {
-                    let root = tmp.0.clone();
-                    let ledger_root = ledger_root.clone();
-                    let policy_sha256 = policy_sha256.clone();
-                    let outcomes = std::sync::Arc::clone(&outcomes);
-                    scope.spawn(move || {
-                        let run =
-                            RunDir::create(&root, format!("{case}-learner-rank-{rank}")).unwrap();
-                        let mut trainer = Trainer::new(
-                            TrainerConfig {
-                                steps: 1,
-                                group_size: 2,
-                                max_new_tokens: 1,
-                                ..TrainerConfig::default()
-                            },
-                            &run,
-                        )
-                        .unwrap();
-                        let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                        let state = std::sync::Arc::new(ArmedCollectiveFailureState::new(0));
-                        let comm = FailAfterArmComm {
-                            inner: inner_comm,
-                            armed: std::sync::Arc::clone(&armed),
-                            state: std::sync::Arc::clone(&state),
-                        };
-                        let (inner, _) = tp_probe_policy();
-                        let mut policy = TpSeparatedFailingPolicy {
-                            inner,
-                            arm: armed,
-                            failure,
-                        };
-                        let vars = policy.trainable_vars();
-                        let before = vars[0]
-                            .as_tensor()
-                            .flatten_all()
-                            .unwrap()
-                            .to_vec1::<f32>()
-                            .unwrap();
-                        let error = trainer
-                            .train_rollout_ledger_step_tensor_parallel(
-                                0,
-                                &mut policy,
-                                ledger_root,
-                                &policy_sha256,
-                                None,
-                                &comm,
+            for (case, failure, operation) in [
+                (
+                    "detached",
+                    TpSeparatedHookFailure::DetachedScoring,
+                    "detached scoring",
+                ),
+                (
+                    "live",
+                    TpSeparatedHookFailure::LiveScoring,
+                    "differentiable scoring",
+                ),
+                ("backward", TpSeparatedHookFailure::Backward, "backward"),
+            ] {
+                let outcomes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+                std::thread::scope(|scope| {
+                    let handles: Vec<_> = crate::comm::LocalComm::world_with_timeout(
+                        2,
+                        std::time::Duration::from_millis(500),
+                    )
+                    .into_iter()
+                    .enumerate()
+                    .map(|(rank, inner_comm)| {
+                        let root = tmp.0.clone();
+                        let ledger_root = ledger_root.clone();
+                        let policy_sha256 = policy_sha256.clone();
+                        let outcomes = std::sync::Arc::clone(&outcomes);
+                        scope.spawn(move || {
+                            let run = RunDir::create(
+                                &root,
+                                format!("{behavior_name}-{case}-learner-rank-{rank}"),
                             )
-                            .unwrap_err();
-                        let after = vars[0]
-                            .as_tensor()
-                            .flatten_all()
-                            .unwrap()
-                            .to_vec1::<f32>()
                             .unwrap();
-                        outcomes.lock().unwrap().push((
-                            rank,
-                            error,
-                            before,
-                            after,
-                            policy.adapter_enabled(),
-                            state.failed.load(std::sync::atomic::Ordering::SeqCst),
-                            state
-                                .calls_after_failure
-                                .load(std::sync::atomic::Ordering::SeqCst),
-                            crate::telemetry::read_metrics(run.metrics_path())
+                            let mut trainer = Trainer::new(
+                                TrainerConfig {
+                                    steps: 1,
+                                    group_size: 2,
+                                    max_new_tokens: 1,
+                                    ..TrainerConfig::default()
+                                },
+                                &run,
+                            )
+                            .unwrap();
+                            let armed =
+                                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                            let state = std::sync::Arc::new(ArmedCollectiveFailureState::new(0));
+                            let comm = FailAfterArmComm {
+                                inner: inner_comm,
+                                armed: std::sync::Arc::clone(&armed),
+                                state: std::sync::Arc::clone(&state),
+                            };
+                            let (inner, _) = tp_probe_policy();
+                            let mut policy = TpSeparatedFailingPolicy {
+                                inner,
+                                arm: armed,
+                                failure,
+                                behavior,
+                                fail_this_rank: true,
+                                sampler_state: std::cell::RefCell::new(vec![17]),
+                            };
+                            let vars = policy.trainable_vars();
+                            let before = vars[0]
+                                .as_tensor()
+                                .flatten_all()
                                 .unwrap()
-                                .len(),
-                        ));
+                                .to_vec1::<f32>()
+                                .unwrap();
+                            let sampler_before = policy.sampler_state().unwrap();
+                            let error = trainer
+                                .train_rollout_ledger_step_tensor_parallel(
+                                    0,
+                                    &mut policy,
+                                    ledger_root,
+                                    &policy_sha256,
+                                    None,
+                                    &comm,
+                                )
+                                .unwrap_err();
+                            let after = vars[0]
+                                .as_tensor()
+                                .flatten_all()
+                                .unwrap()
+                                .to_vec1::<f32>()
+                                .unwrap();
+                            outcomes.lock().unwrap().push((
+                                rank,
+                                error,
+                                before,
+                                after,
+                                sampler_before,
+                                policy.sampler_state().unwrap(),
+                                policy.adapter_enabled(),
+                                state.failed.load(std::sync::atomic::Ordering::SeqCst),
+                                state
+                                    .calls_after_failure
+                                    .load(std::sync::atomic::Ordering::SeqCst),
+                                crate::telemetry::read_metrics(run.metrics_path())
+                                    .unwrap()
+                                    .len(),
+                            ));
+                        })
                     })
-                })
-                .collect();
-                for handle in handles {
-                    handle.join().unwrap();
-                }
-            });
+                    .collect();
+                    for handle in handles {
+                        handle.join().unwrap();
+                    }
+                });
 
-            let mut outcomes = std::mem::take(&mut *outcomes.lock().unwrap());
-            outcomes.sort_by_key(|outcome| outcome.0);
-            for (
-                rank,
-                error,
-                before,
-                after,
-                adapter_enabled,
-                fault_consumed,
-                later_calls,
-                metrics_rows,
-            ) in outcomes
-            {
-                assert!(
-                    matches!(&error, TrainerError::TensorParallelExecutionTerminal {
+                let mut outcomes = std::mem::take(&mut *outcomes.lock().unwrap());
+                outcomes.sort_by_key(|outcome| outcome.0);
+                for (
+                    rank,
+                    error,
+                    before,
+                    after,
+                    sampler_before,
+                    sampler_after,
+                    adapter_enabled,
+                    failed_comm,
+                    later_calls,
+                    metrics_rows,
+                ) in outcomes
+                {
+                    let expected_detail = match behavior {
+                        TpSeparatedFailureBehavior::CommunicationError => {
+                            "injected terminal collective-chain failure"
+                        }
+                        TpSeparatedFailureBehavior::Panic => {
+                            "policy hook panicked: injected opaque tensor-parallel policy panic"
+                        }
+                        TpSeparatedFailureBehavior::Error => unreachable!(),
+                    };
+                    assert!(
+                        matches!(&error, TrainerError::TensorParallelExecutionTerminal {
                         operation: actual_operation,
                         detail,
                     } if *actual_operation == operation
-                        && detail.contains("injected terminal collective-chain failure")
+                        && detail.contains(expected_detail)
                         && detail.contains("local adapter/optimizer/sampler rollback succeeded")),
-                    "{case} rank {rank}: {error:?}"
-                );
-                assert_eq!(after, before, "{case} rank {rank} adapter");
-                assert!(adapter_enabled, "{case} rank {rank} adapter flag");
-                assert!(fault_consumed, "{case} rank {rank} did not consume fault");
-                assert_eq!(later_calls, 0, "{case} rank {rank} later collectives");
-                assert_eq!(metrics_rows, 0, "{case} rank {rank} metrics");
+                        "{behavior_name} {case} rank {rank}: {error:?}"
+                    );
+                    assert_eq!(after, before, "{behavior_name} {case} rank {rank} adapter");
+                    assert_eq!(
+                        sampler_after, sampler_before,
+                        "{behavior_name} {case} rank {rank} sampler"
+                    );
+                    assert!(
+                        adapter_enabled,
+                        "{behavior_name} {case} rank {rank} adapter flag"
+                    );
+                    assert_eq!(
+                        failed_comm,
+                        behavior == TpSeparatedFailureBehavior::CommunicationError,
+                        "{behavior_name} {case} rank {rank} communicator failure state"
+                    );
+                    assert_eq!(
+                        later_calls, 0,
+                        "{behavior_name} {case} rank {rank} later collectives"
+                    );
+                    assert_eq!(
+                        metrics_rows, 0,
+                        "{behavior_name} {case} rank {rank} metrics"
+                    );
+                }
             }
         }
     }
@@ -12852,6 +13150,104 @@ mod tests {
             assert_eq!(history[0].frac_reward_zero_std, 0.0);
             assert!(result.policy_calls.live_logp > 0);
             assert!(result.policy_calls.detached_logp > 0);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn tensor_parallel_world_one_asymmetric_hook_failures_coordinate_over_data_parallel() {
+        for behavior in [
+            TpSeparatedFailureBehavior::CommunicationError,
+            TpSeparatedFailureBehavior::Error,
+            TpSeparatedFailureBehavior::Panic,
+        ] {
+            let tmp = WireTmp::new(match behavior {
+                TpSeparatedFailureBehavior::CommunicationError => "tp1-dp2-hook-comm-error",
+                TpSeparatedFailureBehavior::Error => "tp1-dp2-hook-error",
+                TpSeparatedFailureBehavior::Panic => "tp1-dp2-hook-panic",
+            });
+            let outcomes = std::thread::scope(|scope| {
+                let handles = crate::comm::LocalComm::world_with_timeout(
+                    2,
+                    std::time::Duration::from_secs(2),
+                )
+                .into_iter()
+                .map(|dp_comm| {
+                    let base = tmp.0.clone();
+                    scope.spawn(move || {
+                        let rank = dp_comm.rank();
+                        let run = RunDir::create(&base, format!("rank-{rank}")).unwrap();
+                        let mut trainer = Trainer::with_comm(
+                            TrainerConfig {
+                                steps: 1,
+                                group_size: 2,
+                                max_new_tokens: 1,
+                                lr: 0.0,
+                                ..TrainerConfig::default()
+                            },
+                            &run,
+                            dp_comm,
+                        )
+                        .unwrap();
+                        let (inner, _) = tp_probe_policy();
+                        let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        let state = std::sync::Arc::new(ArmedCollectiveFailureState::new(0));
+                        let tp_comm = FailAfterArmComm {
+                            inner: SoloComm,
+                            armed: std::sync::Arc::clone(&armed),
+                            state,
+                        };
+                        let mut policy = TpSeparatedFailingPolicy {
+                            inner,
+                            arm: armed,
+                            failure: TpSeparatedHookFailure::Generate,
+                            behavior,
+                            fail_this_rank: rank == 1,
+                            sampler_state: std::cell::RefCell::new(vec![17]),
+                        };
+                        (
+                            rank,
+                            trainer
+                                .train_tensor_parallel(
+                                    &mut policy,
+                                    &TpProbeReward,
+                                    &TpProbeCodec,
+                                    &[Sample::new("prompt", ())],
+                                    &tp_comm,
+                                )
+                                .unwrap_err()
+                                .to_string(),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+
+            for (rank, error) in outcomes {
+                if rank == 0 {
+                    assert!(
+                        error.contains("rollout generation result failed on a peer rank"),
+                        "behavior={behavior:?}: {error}"
+                    );
+                } else {
+                    let expected = match behavior {
+                        TpSeparatedFailureBehavior::CommunicationError => {
+                            "injected terminal collective-chain failure"
+                        }
+                        TpSeparatedFailureBehavior::Error => {
+                            "injected opaque tensor-parallel policy error"
+                        }
+                        TpSeparatedFailureBehavior::Panic => {
+                            "rollout generation policy hook panicked"
+                        }
+                    };
+                    assert!(error.contains(expected), "behavior={behavior:?}: {error}");
+                }
+            }
         }
     }
 

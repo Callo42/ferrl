@@ -53,6 +53,11 @@ fn inject_post_manifest_in_place_mutation_once() {
 }
 
 #[cfg(test)]
+pub(crate) fn inject_post_manifest_panic_once() {
+    POST_MANIFEST_TEST_FAULT.with(|fault| fault.set(5));
+}
+
+#[cfg(test)]
 pub(crate) fn inject_directory_sync_failure_once(path: impl Into<PathBuf>) {
     FAIL_SYNC_DIRECTORY_ONCE.with(|failure| {
         *failure.borrow_mut() = Some(path.into());
@@ -591,6 +596,10 @@ impl RolloutLedgerWriter {
                         std::io::Error::other("injected in-place post-link mutation"),
                     ))
                 }
+                5 => {
+                    fault.set(0);
+                    panic!("injected post-manifest rollout-ledger publication panic")
+                }
                 other => panic!("unknown post-manifest test fault {other}"),
             })?;
             sync_dir(final_dir)?;
@@ -837,6 +846,7 @@ impl RolloutLedgerWriter {
     ///
     /// Returns [`RolloutLedgerError`] for a missing/mismatched shard, conflicting
     /// existing step, failed durability fence, or ambiguous post-manifest state.
+    #[cfg_attr(test, allow(clippy::missing_panics_doc))]
     pub fn commit_distributed_stage(
         &self,
         stage: &DistributedRolloutLedgerStage,
@@ -1019,6 +1029,10 @@ impl RolloutLedgerWriter {
                         &stage.final_dir,
                         std::io::Error::other("injected distributed in-place post-link mutation"),
                     ))
+                }
+                5 => {
+                    fault.set(0);
+                    panic!("injected distributed post-manifest publication panic")
                 }
                 other => Err(RolloutLedgerError::Invalid(format!(
                     "unknown distributed post-manifest test fault {other}"

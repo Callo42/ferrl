@@ -32,9 +32,31 @@ use crate::remat::{
 };
 use crate::telemetry::DecoderCacheSnapshot;
 use crate::tensor_parallel::{
-    all_reduce_sum_straight_through, all_reduce_sum_value, comm_to_candle, is_comm_failure,
-    plan_from_comm, ShardRange, TensorParallelPlan,
+    all_reduce_sum_straight_through, all_reduce_sum_value, comm_to_candle,
+    coordinate_local_candle_call, is_comm_failure, plan_from_comm, ShardRange, TensorParallelPlan,
 };
+
+#[cfg(test)]
+thread_local! {
+    static ADAPTER_VALIDATION_STAGE_FAULT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn inject_adapter_validation_stage_failure_once(stage: u8) {
+    ADAPTER_VALIDATION_STAGE_FAULT.with(|fault| fault.set(stage));
+}
+
+#[cfg(test)]
+fn take_adapter_validation_stage_fault(stage: u8) -> bool {
+    ADAPTER_VALIDATION_STAGE_FAULT.with(|fault| {
+        if fault.get() == stage {
+            fault.set(0);
+            true
+        } else {
+            false
+        }
+    })
+}
 
 /// The checkpoint prefix used by public Gemma 4 conditional-generation
 /// checkpoints for the text decoder.
@@ -93,11 +115,18 @@ fn validate_replicated_adapter_values(
     if !plan.is_sharded() {
         return Ok(());
     }
-    let mut summed = vars
-        .iter()
-        .map(|var| var.as_tensor().clone())
-        .collect::<Vec<_>>();
-    let local_validity = comm.validate_all_reduce_sum(&summed);
+    let (mut summed, local_validity) = coordinate_local_candle_call(
+        comm,
+        "Gemma4 tensor-parallel adapter payload staging",
+        || {
+            let summed = vars
+                .iter()
+                .map(|var| var.as_tensor().clone())
+                .collect::<Vec<_>>();
+            let local_validity = comm.validate_all_reduce_sum(&summed);
+            Ok((summed, local_validity))
+        },
+    )?;
     let invalid_global = comm_to_candle(comm.all_reduce_scalar_sum(if local_validity.is_err() {
         1.0
     } else {
@@ -117,14 +146,34 @@ fn validate_replicated_adapter_values(
     }
     let digest = adapter_manifest_digest(vars, recipe);
     let world = plan.world_size() as f64;
-    let manifest = Tensor::from_vec(digest.map(f64::from).to_vec(), digest.len(), device)?;
-    let mut reduced_manifest = vec![manifest];
+    let mut reduced_manifest = coordinate_local_candle_call(
+        comm,
+        "Gemma4 tensor-parallel adapter manifest staging",
+        || {
+            #[cfg(test)]
+            if take_adapter_validation_stage_fault(1) {
+                bail!("injected adapter manifest staging failure")
+            }
+            let manifest = Tensor::from_vec(digest.map(f64::from).to_vec(), digest.len(), device)?;
+            Ok(vec![manifest])
+        },
+    )?;
     comm_to_candle(comm.all_reduce_sum(&mut reduced_manifest))?;
-    let sums = reduced_manifest[0].to_vec1::<f64>()?;
-    let metadata_mismatch_local = digest
-        .iter()
-        .zip(&sums)
-        .any(|(byte, sum)| *sum != world * f64::from(*byte));
+    let metadata_mismatch_local = coordinate_local_candle_call(
+        comm,
+        "Gemma4 tensor-parallel adapter manifest readback",
+        || {
+            #[cfg(test)]
+            if take_adapter_validation_stage_fault(2) {
+                bail!("injected adapter manifest readback failure")
+            }
+            let sums = reduced_manifest[0].to_vec1::<f64>()?;
+            Ok(digest
+                .iter()
+                .zip(&sums)
+                .any(|(byte, sum)| *sum != world * f64::from(*byte)))
+        },
+    )?;
     let metadata_mismatch_global =
         comm_to_candle(comm.all_reduce_scalar_sum(if metadata_mismatch_local {
             1.0
@@ -141,32 +190,38 @@ fn validate_replicated_adapter_values(
         return Ok(());
     }
     comm_to_candle(comm.all_reduce_sum(&mut summed))?;
-    for (index, (var, sum)) in vars.iter().zip(&summed).enumerate() {
-        let expected = (var.as_tensor() * world)?;
-        let worst = sum
-            .broadcast_sub(&expected)?
-            .abs()?
-            .flatten_all()?
-            .max(0)?
-            .to_dtype(DType::F32)?
-            .to_scalar::<f32>()?;
-        let scale = expected
-            .abs()?
-            .flatten_all()?
-            .max(0)?
-            .to_dtype(DType::F32)?
-            .to_scalar::<f32>()?
-            .max(1.0);
-        let tolerance = 64.0 * f32::EPSILON * plan.world_size() as f32 * scale;
-        if !worst.is_finite() || worst > tolerance {
-            bail!(
-                "Gemma4GradModel::backward_tensor_parallel: replicated adapter tensor {index} \
-                 differs across tensor-parallel ranks (max reduction residual {worst}, \
-                 tolerance {tolerance})"
-            )
-        }
-    }
-    Ok(())
+    coordinate_local_candle_call(
+        comm,
+        "Gemma4 tensor-parallel adapter value readback",
+        || {
+            for (index, (var, sum)) in vars.iter().zip(&summed).enumerate() {
+                let expected = (var.as_tensor() * world)?;
+                let worst = sum
+                    .broadcast_sub(&expected)?
+                    .abs()?
+                    .flatten_all()?
+                    .max(0)?
+                    .to_dtype(DType::F32)?
+                    .to_scalar::<f32>()?;
+                let scale = expected
+                    .abs()?
+                    .flatten_all()?
+                    .max(0)?
+                    .to_dtype(DType::F32)?
+                    .to_scalar::<f32>()?
+                    .max(1.0);
+                let tolerance = 64.0 * f32::EPSILON * plan.world_size() as f32 * scale;
+                if !worst.is_finite() || worst > tolerance {
+                    bail!(
+                        "Gemma4GradModel::backward_tensor_parallel: replicated adapter tensor {index} \
+                         differs across tensor-parallel ranks (max reduction residual {worst}, \
+                         tolerance {tolerance})"
+                    )
+                }
+            }
+            Ok(())
+        },
+    )
 }
 
 fn adapter_manifest_digest(vars: &[Var], recipe: &str) -> [u8; 32] {
@@ -3674,6 +3729,65 @@ mod tests {
                 .map(|handle| handle.join().unwrap())
                 .collect()
         })
+    }
+
+    #[test]
+    fn gemma4_adapter_validation_coordinates_asymmetric_inter_collective_failures() {
+        for (stage, injected, peer) in [
+            (
+                1,
+                "injected adapter manifest staging failure",
+                "adapter manifest staging failed on a peer tensor-parallel rank",
+            ),
+            (
+                2,
+                "injected adapter manifest readback failure",
+                "adapter manifest readback failed on a peer tensor-parallel rank",
+            ),
+        ] {
+            let errors = std::thread::scope(|scope| {
+                let handles = LocalComm::world_with_timeout(2, Duration::from_secs(2))
+                    .into_iter()
+                    .map(|comm| {
+                        scope.spawn(move || {
+                            if comm.rank() == 1 {
+                                inject_adapter_validation_stage_failure_once(stage);
+                            }
+                            let vars = vec![Var::from_tensor(
+                                &Tensor::zeros(2, DType::F32, &Device::Cpu).unwrap(),
+                            )
+                            .unwrap()];
+                            let plan =
+                                TensorParallelPlan::new(comm.rank(), comm.world_size()).unwrap();
+                            (
+                                comm.rank(),
+                                validate_replicated_adapter_values(
+                                    &vars,
+                                    "attn:q",
+                                    &Device::Cpu,
+                                    plan,
+                                    &comm,
+                                )
+                                .unwrap_err()
+                                .to_string(),
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+
+            for (rank, error) in errors {
+                if rank == 1 {
+                    assert!(error.contains(injected), "stage {stage}: {error}");
+                } else {
+                    assert!(error.contains(peer), "stage {stage}: {error}");
+                }
+            }
+        }
     }
 
     #[derive(Debug)]

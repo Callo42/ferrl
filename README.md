@@ -530,7 +530,11 @@ Any error or panic returned by an opaque sharded TP policy hook is terminal. The
 public hook result cannot prove whether an implementation crossed a failed
 collective, so the trainer conservatively issues no later status collective,
 performs only panic-contained local rollback, and tells the caller to discard the
-communicator and policy instance.
+communicator and policy instance. TP-world-one hooks have no sharded collective
+region: their local errors and panics remain coordinatable over the active DP
+world, so an asymmetric DP rank cannot strand its peers at the next status
+rendezvous. The built-in model policies coordinate their local staging,
+sampling, readback, and telemetry work at every TP collective boundary.
 Because format v4 does not carry
 composable collector performance measurements, the ordinary
 whole-window timing, throughput, GPU-memory, and decoder-cache fields are written

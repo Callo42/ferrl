@@ -28,6 +28,38 @@ pub(crate) fn comm_to_candle<T>(result: Result<T, crate::comm::CommError>) -> Ca
     })
 }
 
+pub(crate) fn coordinate_local_candle_call<T>(
+    comm: &dyn Comm,
+    label: &str,
+    call: impl FnOnce() -> CandleResult<T>,
+) -> CandleResult<T> {
+    let local = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(call)) {
+        Ok(result) => result,
+        Err(payload) => {
+            let detail = if let Some(message) = payload.downcast_ref::<&str>() {
+                *message
+            } else if let Some(message) = payload.downcast_ref::<String>() {
+                message.as_str()
+            } else {
+                "panic payload was not a string"
+            };
+            Err(CandleError::Msg(format!("{label} panicked: {detail}")))
+        }
+    };
+    if comm.world_size() <= 1 {
+        return local;
+    }
+    let failed =
+        comm_to_candle(comm.all_reduce_scalar_sum(if local.is_err() { 1.0 } else { 0.0 }))?;
+    match local {
+        Err(error) => Err(error),
+        Ok(_) if failed > 0.0 => Err(CandleError::Msg(format!(
+            "{label} failed on a peer tensor-parallel rank; aborting before the next collective"
+        ))),
+        Ok(value) => Ok(value),
+    }
+}
+
 pub(crate) fn is_comm_failure(error: &CandleError) -> bool {
     fn wrapped_is_comm_failure(error: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
         error.downcast_ref::<TensorParallelCommFailure>().is_some()

@@ -109,6 +109,7 @@ thread_local! {
     static FAIL_SYNC_DIRECTORY_ONCE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
     static FAIL_NO_REPLACE_SYNCS: std::cell::RefCell<Vec<NoReplaceSyncPoint>> = const { std::cell::RefCell::new(Vec::new()) };
     static NO_REPLACE_HOOK: std::cell::RefCell<Option<(NoReplaceHookPoint, NoReplaceHook)>> = const { std::cell::RefCell::new(None) };
+    static PANIC_NO_REPLACE_AFTER_MANIFEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -126,6 +127,11 @@ pub(crate) fn inject_persistent_continuation_post_manifest_sync_failure_once() {
             NoReplaceSyncPoint::ManifestDirectory,
         ];
     });
+}
+
+#[cfg(test)]
+pub(crate) fn inject_continuation_post_manifest_panic_once() {
+    PANIC_NO_REPLACE_AFTER_MANIFEST.with(|panic| panic.set(true));
 }
 
 static CLAIM_TOKEN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -787,6 +793,12 @@ pub(crate) fn save_checkpoint_no_replace(
     {
         return Err(cleanup_uncommitted_claim(dir, parent, &ownership, error));
     }
+    #[cfg(test)]
+    PANIC_NO_REPLACE_AFTER_MANIFEST.with(|panic| {
+        if panic.replace(false) {
+            panic!("injected post-manifest continuation publication panic");
+        }
+    });
     #[cfg(test)]
     run_no_replace_hook(dir, NoReplaceHookPoint::BeforeFirstFence);
     match sync_no_replace_publication(dir, parent) {

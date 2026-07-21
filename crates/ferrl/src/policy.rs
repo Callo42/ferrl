@@ -430,6 +430,8 @@ pub trait Policy {
 /// every error or panic returned by a sharded hook as terminal: callers must
 /// discard the communicator and policy instance. The trainer cannot safely add a
 /// status rendezvous after an opaque hook whose communicator may already be dead.
+/// A world-one TP hook has no sharded collective region, so its local failure is
+/// instead coordinated over the trainer's active data-parallel communicator.
 pub trait TensorParallelPolicy: Policy {
     /// Validate this live policy's non-mutating execution plan before trainer
     /// state or durable output is touched. This preflight must not issue a
