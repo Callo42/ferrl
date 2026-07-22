@@ -149,27 +149,23 @@ fn read_knobs() -> Result<RunKnobs> {
 
 /// Resolve the EOS token id for the run.
 ///
-/// `FERRL_CD35_EOS` overrides the checkpoint default: unset reads the model's
-/// `eos_token_id` from `config.json` via [`ferrl::eos_from_config`] (which checks
-/// the multimodal wrapper's `text_config` first — the real 0.8B file's shape —
-/// then the top level); `none`/`off` (any case) yields `None`, recovering the
-/// legacy full-width rollout for an A/B comparison; any other value is parsed as an
-/// explicit id.
-fn resolve_eos(dir: &Path) -> Result<Option<u32>> {
-    match env::var("FERRL_CD35_EOS") {
-        Err(_) => Ok(ferrl::eos_from_config(dir)?),
+/// `FERRL_CD35_EOS` overrides the checkpoint default: unset requires one scalar
+/// checkpoint EOS; the exact string `none` is the explicit full-width opt-out;
+/// any other value is parsed and validated as an explicit id.
+fn resolve_eos(dir: &Path, tokenizer: &HfTokenizer) -> Result<Option<u32>> {
+    let selection = match env::var("FERRL_CD35_EOS") {
+        Err(env::VarError::NotPresent) => ferrl::CheckpointEosSelection::CheckpointDefault,
+        Err(error) => return Err(anyhow!("read FERRL_CD35_EOS: {error}")),
+        Ok(raw) if raw == "none" => ferrl::CheckpointEosSelection::Disabled,
         Ok(raw) => {
-            let v = raw.trim();
-            if v.eq_ignore_ascii_case("none") || v.eq_ignore_ascii_case("off") {
-                Ok(None)
-            } else {
-                let id = v.parse::<u32>().with_context(|| {
-                    format!("FERRL_CD35_EOS must be an integer id or 'none', got {raw:?}")
-                })?;
-                Ok(Some(id))
-            }
+            ferrl::CheckpointEosSelection::Explicit(raw.parse::<u32>().with_context(|| {
+                format!(
+                    "FERRL_CD35_EOS must be an integer id or the exact string 'none', got {raw:?}"
+                )
+            })?)
         }
-    }
+    };
+    ferrl::resolve_checkpoint_eos(dir, tokenizer, selection).map_err(Into::into)
 }
 
 /// Resolve the `LoRA` recipe from `FERRL_CD35_TARGETS` (the rung-1 GDN-LoRA
@@ -409,9 +405,9 @@ fn open_cuda_device() -> Result<Device> {
 /// unless that was an explicit choice: the modern recipe's truncation masking
 /// is inert without an EOS id, and a ladder run must not silently degrade to
 /// full-width rollouts. `FERRL_CD35_EOS=none` is the sanctioned full-width A/B.
-fn resolve_eos_strict(dir: &Path) -> Result<Option<u32>> {
+fn resolve_eos_strict(dir: &Path, tokenizer: &HfTokenizer) -> Result<Option<u32>> {
     let explicit = env::var("FERRL_CD35_EOS").is_ok();
-    let eos = resolve_eos(dir)?;
+    let eos = resolve_eos(dir, tokenizer)?;
     if eos.is_none() {
         if !explicit {
             bail!(
@@ -526,7 +522,7 @@ fn main() -> Result<()> {
     let reward = CountdownReward::default();
     // The EOS id flows into both the trainer and the eval `gen` below so
     // generation is EOS-aware on both paths.
-    let eos = resolve_eos_strict(&dir)?;
+    let eos = resolve_eos_strict(&dir, &tok)?;
     let tcfg = build_trainer_config(eos, knobs.temperature)?;
     let gen = build_eval_gen(&tcfg)?;
     info!(

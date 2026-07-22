@@ -21,7 +21,7 @@
 //! the reward, and the eval — the padding tail is masked out. The EOS id is read
 //! from the checkpoint's `config.json` (candle's `qwen3::Config` does not carry it),
 //! so it tracks the model rather than a baked-in literal. `FERRL_CD_EOS` overrides:
-//! an integer forces that id, and `none` (or `off`) restores the legacy full-width
+//! an integer forces that id, and the exact string `none` restores the legacy full-width
 //! rollout for an A/B comparison. For `Qwen3-0.6B-Base` the token is `<|endoftext|>`
 //! (id `151643`); the base model emits it to end a document, so a completion that
 //! finishes early is no longer trained on the repeated-garbage tail. The run logs
@@ -81,27 +81,23 @@ fn load_config(dir: &Path) -> Result<Config> {
 
 /// Resolve the EOS token id for the run.
 ///
-/// `FERRL_CD_EOS` overrides the checkpoint default: unset reads the model's
-/// `eos_token_id` from `config.json` via [`ferrl::eos_from_config`] (the actual EOS
-/// run; the helper accepts either a top-level `eos_token_id` — the Qwen3 base shape
-/// here — or a `text_config`-nested one); `none`/`off` (any case) yields `None`,
-/// recovering the legacy full-width rollout for an A/B comparison; any other value
-/// is parsed as an explicit id.
-fn resolve_eos(dir: &Path) -> Result<Option<u32>> {
-    match env::var("FERRL_CD_EOS") {
-        Err(_) => Ok(ferrl::eos_from_config(dir)?),
+/// `FERRL_CD_EOS` overrides the checkpoint default: unset requires one scalar
+/// checkpoint EOS; the exact string `none` is the explicit full-width opt-out;
+/// any other value is parsed and validated as an explicit id.
+fn resolve_eos(dir: &Path, tokenizer: &HfTokenizer) -> Result<Option<u32>> {
+    let selection = match env::var("FERRL_CD_EOS") {
+        Err(env::VarError::NotPresent) => ferrl::CheckpointEosSelection::CheckpointDefault,
+        Err(error) => return Err(anyhow!("read FERRL_CD_EOS: {error}")),
+        Ok(raw) if raw == "none" => ferrl::CheckpointEosSelection::Disabled,
         Ok(raw) => {
-            let v = raw.trim();
-            if v.eq_ignore_ascii_case("none") || v.eq_ignore_ascii_case("off") {
-                Ok(None)
-            } else {
-                let id = v.parse::<u32>().with_context(|| {
-                    format!("FERRL_CD_EOS must be an integer id or 'none', got {raw:?}")
-                })?;
-                Ok(Some(id))
-            }
+            ferrl::CheckpointEosSelection::Explicit(raw.parse::<u32>().with_context(|| {
+                format!(
+                    "FERRL_CD_EOS must be an integer id or the exact string 'none', got {raw:?}"
+                )
+            })?)
         }
-    }
+    };
+    ferrl::resolve_checkpoint_eos(dir, tokenizer, selection).map_err(Into::into)
 }
 
 /// Mean of an iterator of `f32` (0.0 when empty).
@@ -256,7 +252,7 @@ fn main() -> Result<()> {
     let reward = CountdownReward::default();
     // Read the model's EOS from config.json (env-overridable); flows into both the
     // trainer and the eval `gen` below so generation is EOS-aware on both paths.
-    let eos = resolve_eos(&dir)?;
+    let eos = resolve_eos(&dir, &tok)?;
     let tcfg = build_trainer_config(eos);
     // The eval generation config is the trainer's rollout config (single source of
     // truth via `GenConfig::from(&TrainerConfig)`), so the two cannot drift.

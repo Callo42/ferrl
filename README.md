@@ -198,6 +198,22 @@ default):
 }
 ```
 
+EOS handling is fail-closed on the CLI. Omit `trainer.eos_token_id` to resolve
+the checkpoint's single scalar EOS, set it to one integer for a validated
+override, or set it to the exact string `"none"` for a deliberate full-width
+no-EOS run. JSON `null` is not an opt-out. A checkpoint with several declared
+EOS ids requires choosing one of those ids explicitly (or `"none"`). The chosen
+id must exist in both the model and tokenizer vocabularies, and the resolved
+integer/`null` is what the trainer persists and binds into learner semantics.
+
+Run configs also reject unknown fields in the `trainer`, `policy`, and `data`
+blocks. `trainer.steps` and procedural `data.train_n` must be nonzero; local
+reward groups must contain at least two completions (a
+`distributed_same_prompt` group may reach two across live DP ranks); and
+`policy.lora_alpha / policy.lora_rank` must remain finite and nonzero in the
+selected base compute dtype; values that underflow to a no-op or overflow to
+infinity are rejected before device/model setup.
+
 For deterministic trainer-owned scalar control, `trainer.beta_schedule` and
 `trainer.lr_schedule` accept piecewise-linear points:
 
@@ -501,8 +517,12 @@ proves each live rank-local shard plan matches its communicator. Collection
 rechecks the live identity before publication so a policy that mutates trainable
 state during generation fails closed.
 
-Ledger format v5 carries the collector's checksummed opaque post-rollout sampler
-blob. The learner installs and byte-verifies it before returning the exact
+Ledger format v6 carries the collector's checksummed opaque post-rollout sampler
+blob and the exact tokenizer encoding of every selected prompt. Every rollout
+row must begin with that independently captured encoding; `completion_len` must
+end immediately after the first EOS token (inclusive), EOS tails must be
+EOS-filled padding, and no-EOS rows must claim their full generated width. The
+learner installs and byte-verifies the sampler blob before returning the exact
 post-update chain-bound continuation receipt or appending its metrics row. The explicit
 `save_rollout_ledger_continuation` primitive accepts only that receipt and then publishes
 `C_(k+1)`—updated adapter and Adam plus that collector sampler—without replacing an existing step;
@@ -542,7 +562,7 @@ region: their local errors and panics remain coordinatable over the active DP
 world, so an asymmetric DP rank cannot strand its peers at the next status
 rendezvous. The built-in model policies coordinate their local staging,
 sampling, readback, and telemetry work at every TP collective boundary.
-Because format v5 does not carry
+Because format v6 does not carry
 composable collector performance measurements, the ordinary
 whole-window timing, throughput, GPU-memory, and decoder-cache fields are written
 as explicitly unmeasured rather than populated from learner-only work. Non-finite
@@ -556,7 +576,7 @@ Rank-local metrics append is transactional under DP: if
 any rank fails, successful peers truncate to their exact pre-append boundary
 before model, Adam, and sampler rollback.
 
-Format v5 supports world-one, data-parallel, and tensor-parallel separated
+Format v6 supports world-one, data-parallel, and tensor-parallel separated
 execution. With
 `RewardGroupScope::Local`, each shard stores rank-local reward normalization;
 with `DistributedSamePrompt`, shards for one accumulation position bind the same

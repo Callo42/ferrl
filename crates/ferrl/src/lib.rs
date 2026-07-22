@@ -64,7 +64,8 @@
 //!   strict, checksummed, no-replace whole-window package whose reader validates
 //!   learner pre-state identity, mandatory structured controls, and every
 //!   rollout/reward/mask invariant before returning [`ValidatedRolloutLedgerStep`].
-//!   Format v5 also binds sampler prestate and chain lineage, transfers the
+//!   Format v6 also binds sampler prestate and chain lineage, the independently
+//!   encoded selected prompt for every group, transfers the
 //!   collector's exact post-rollout sampler blob, and returns an opaque
 //!   learner-produced receipt for a versioned adapter + Adam + sampler
 //!   continuation whose policy/config/schema/payload lineage is verified. Under
@@ -211,7 +212,11 @@ pub use grpo::{
     ScaleRewards, GROUP_STD_EPS,
 };
 #[doc(inline)]
-pub use hf::{chatml, eos_from_config, HfError};
+pub use hf::{
+    chatml, checkpoint_eos_from_config, eos_from_config, resolve_checkpoint_eos,
+    validate_resolved_eos_consensus, vocab_size_from_config, CheckpointEos, CheckpointEosSelection,
+    HfError,
+};
 #[doc(inline)]
 pub use llama::{LlamaGradModel, LlamaMergedDecoder};
 #[doc(inline)]

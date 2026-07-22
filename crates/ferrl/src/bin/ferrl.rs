@@ -51,7 +51,11 @@ use std::time::Duration;
 
 use candle_core::{DType, Device};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use serde::{Deserialize, Serialize};
+use serde::{
+    de::Error as _,
+    ser::{Error as _, SerializeStruct},
+    Deserialize, Serialize,
+};
 use sha2::{Digest, Sha256};
 use tracing::info;
 
@@ -589,7 +593,7 @@ impl BaseQuantizationSel {
 /// Policy-load knobs (the `LoRA` shape, base dtype, seed). The rollout temperature
 /// is taken from the trainer config so the two cannot disagree.
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct PolicyCfg {
     /// `LoRA` rank.
     lora_rank: usize,
@@ -628,7 +632,7 @@ impl Default for PolicyCfg {
 /// `train_n` for procedural tasks (`countdown`), plus the held-out `eval_n` and the
 /// `seed` for the deterministic dedup-aware split.
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct DataCfg {
     /// JSONL dataset path (required for `math`; ignored by `countdown`).
     path: Option<PathBuf>,
@@ -1092,39 +1096,160 @@ impl TensorParallelCfg {
 /// The wire shape is a flat object: a `task` selector, the `model_dir` checkpoint,
 /// an optional `device` / `out_dir` / `policy` / `data` block, and the full
 /// [`TrainerConfig`] under `trainer`.
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug)]
 struct RunConfig {
     /// Which built-in task to train: `"countdown"` or `"math"`.
     task: String,
     /// Checkpoint directory (`config.json` + `model.safetensors` + `tokenizer.json`).
     model_dir: PathBuf,
     /// Device to run on (default `cpu`).
-    #[serde(default)]
     device: DeviceSel,
     /// Where run directories are written (default `runs/`).
-    #[serde(default = "default_out_dir")]
     out_dir: PathBuf,
     /// Policy-load knobs.
-    #[serde(default)]
     policy: PolicyCfg,
     /// Dataset knobs.
-    #[serde(default)]
     data: DataCfg,
     /// Data-parallel launch knobs.
-    #[serde(default)]
     distributed: DistributedCfg,
     /// Tensor-parallel launch knobs.
-    #[serde(default)]
     tensor_parallel: TensorParallelCfg,
     /// TriMul task knobs (only read when `task == "trimul"`).
-    #[serde(default)]
     trimul: TrimulCfg,
     /// Discovery health policy applied after training and by `runreport --config`.
-    #[serde(default)]
     run_health: RunHealthCfg,
     /// The GRPO trainer config.
     trainer: TrainerConfig,
+    /// CLI-only interpretation of the `trainer.eos_token_id` wire value.
+    eos_selection: EosSelection,
+}
+
+impl Serialize for RunConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut trainer = serde_json::to_value(&self.trainer).map_err(S::Error::custom)?;
+        let trainer_object = trainer
+            .as_object_mut()
+            .ok_or_else(|| S::Error::custom("serialized trainer config is not an object"))?;
+        match self.eos_selection {
+            EosSelection::Checkpoint => {
+                trainer_object.remove("eos_token_id");
+            }
+            EosSelection::Explicit => {
+                if self.trainer.eos_token_id.is_none() {
+                    return Err(S::Error::custom(
+                        "explicit EOS selector lost its numeric token id",
+                    ));
+                }
+            }
+            EosSelection::Disabled => {
+                trainer_object.insert(
+                    "eos_token_id".into(),
+                    serde_json::Value::String("none".into()),
+                );
+            }
+        }
+
+        let mut state = serializer.serialize_struct("RunConfig", 11)?;
+        state.serialize_field("task", &self.task)?;
+        state.serialize_field("model_dir", &self.model_dir)?;
+        state.serialize_field("device", &self.device)?;
+        state.serialize_field("out_dir", &self.out_dir)?;
+        state.serialize_field("policy", &self.policy)?;
+        state.serialize_field("data", &self.data)?;
+        state.serialize_field("distributed", &self.distributed)?;
+        state.serialize_field("tensor_parallel", &self.tensor_parallel)?;
+        state.serialize_field("trimul", &self.trimul)?;
+        state.serialize_field("run_health", &self.run_health)?;
+        state.serialize_field("trainer", &trainer)?;
+        state.end()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum EosSelection {
+    /// The field was omitted: resolve the checkpoint's scalar EOS.
+    #[default]
+    Checkpoint,
+    /// A numeric token id was supplied in the run config.
+    Explicit,
+    /// The exact string `"none"` was supplied in the run config.
+    Disabled,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunConfigWire {
+    task: String,
+    model_dir: PathBuf,
+    #[serde(default)]
+    device: DeviceSel,
+    #[serde(default = "default_out_dir")]
+    out_dir: PathBuf,
+    #[serde(default)]
+    policy: PolicyCfg,
+    #[serde(default)]
+    data: DataCfg,
+    #[serde(default)]
+    distributed: DistributedCfg,
+    #[serde(default)]
+    tensor_parallel: TensorParallelCfg,
+    #[serde(default)]
+    trimul: TrimulCfg,
+    #[serde(default)]
+    run_health: RunHealthCfg,
+    trainer: TrainerConfig,
+}
+
+impl<'de> Deserialize<'de> for RunConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let mut value = serde_json::Value::deserialize(deserializer)?;
+        let eos_selection = value
+            .get_mut("trainer")
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|trainer| trainer.get_mut("eos_token_id"))
+            .map_or(Ok(EosSelection::Checkpoint), |raw| match raw {
+                serde_json::Value::Number(number)
+                    if number
+                        .as_u64()
+                        .and_then(|id| u32::try_from(id).ok())
+                        .is_some() =>
+                {
+                    Ok(EosSelection::Explicit)
+                }
+                serde_json::Value::String(mode) if mode == "none" => {
+                    *raw = serde_json::Value::Null;
+                    Ok(EosSelection::Disabled)
+                }
+                serde_json::Value::Null => Err(D::Error::custom(
+                    "trainer.eos_token_id must be omitted for checkpoint auto-resolution, an \
+                     integer override, or the string \"none\"; null is not an explicit mode",
+                )),
+                _ => Err(D::Error::custom(
+                    "trainer.eos_token_id must be an integer override or the string \"none\"",
+                )),
+            })?;
+        let wire = RunConfigWire::deserialize(value).map_err(D::Error::custom)?;
+        Ok(Self {
+            task: wire.task,
+            model_dir: wire.model_dir,
+            device: wire.device,
+            out_dir: wire.out_dir,
+            policy: wire.policy,
+            data: wire.data,
+            distributed: wire.distributed,
+            tensor_parallel: wire.tensor_parallel,
+            trimul: wire.trimul,
+            run_health: wire.run_health,
+            trainer: wire.trainer,
+            eos_selection,
+        })
+    }
 }
 
 /// `serde` default for [`RunConfig::out_dir`]: `runs/`.
@@ -1153,8 +1278,7 @@ impl RunConfig {
             source,
         })?;
         cfg.validate_current_config_support()?;
-        let mut canonical = serde_json::to_value(&cfg)
-            .map_err(|err| CliError::msg(format!("failed to canonicalize run config: {err}")))?;
+        let mut canonical = cfg.canonical_wire_value()?;
         if let Some(tensor_parallel) = canonical
             .get_mut("tensor_parallel")
             .and_then(serde_json::Value::as_object_mut)
@@ -1171,6 +1295,40 @@ impl RunConfig {
     }
 
     fn validate_current_config_support(&self) -> Result<(), CliError> {
+        self.trainer
+            .validate()
+            .map_err(|err| CliError::msg(err.to_string()))?;
+        if !self.distributed.enabled
+            && self.trainer.reward_group_scope == ferrl::RewardGroupScope::DistributedSamePrompt
+            && self.trainer.group_size < 2
+        {
+            return Err(CliError::msg(
+                "distributed_same_prompt group_size = 1 requires a live data-parallel world of \
+                 at least two ranks",
+            ));
+        }
+        ferrl::lora::validated_lora_scale(
+            self.policy.lora_alpha,
+            self.policy.lora_rank,
+            self.policy.base_dtype.as_dtype(),
+        )
+        .map_err(|error| CliError::msg(format!("invalid policy LoRA scale: {error}")))?;
+        if matches!(self.task.as_str(), "countdown" | "trimul") && self.data.train_n == 0 {
+            return Err(CliError::msg(format!(
+                "task {:?} requires data.train_n >= 1",
+                self.task
+            )));
+        }
+        if self.task == "countdown" {
+            self.data
+                .train_n
+                .checked_add(self.data.eval_n)
+                .ok_or_else(|| {
+                    CliError::msg(
+                        "countdown data.train_n + data.eval_n exceeds the supported dataset size",
+                    )
+                })?;
+        }
         self.trimul.reward.validate().map_err(CliError::msg)?;
         self.run_health.validate_current_support(&self.trainer)?;
         let plan = self.tensor_parallel.validate_current_support()?;
@@ -1212,6 +1370,34 @@ impl RunConfig {
         Ok(())
     }
 
+    fn canonical_wire_value(&self) -> Result<serde_json::Value, CliError> {
+        let mut value = serde_json::to_value(self)
+            .map_err(|err| CliError::msg(format!("failed to canonicalize run config: {err}")))?;
+        let trainer = value
+            .get_mut("trainer")
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or_else(|| CliError::msg("serialized run config has no trainer object"))?;
+        match self.eos_selection {
+            EosSelection::Checkpoint => {
+                trainer.remove("eos_token_id");
+            }
+            EosSelection::Explicit => {
+                if self.trainer.eos_token_id.is_none() {
+                    return Err(CliError::msg(
+                        "explicit EOS selector lost its resolved token id",
+                    ));
+                }
+            }
+            EosSelection::Disabled => {
+                trainer.insert(
+                    "eos_token_id".into(),
+                    serde_json::Value::String("none".into()),
+                );
+            }
+        }
+        Ok(value)
+    }
+
     fn tensor_parallel_plan(&self) -> TensorParallelPlan {
         self.tensor_parallel
             .plan()
@@ -1231,6 +1417,32 @@ impl RunConfig {
             base_quantization: self.policy.base_quantization.as_base_quantization(),
             tensor_parallel: self.tensor_parallel_plan(),
         }
+    }
+
+    fn resolve_eos_token_id(
+        &self,
+        tokenizer: &ferrl::HfTokenizer,
+    ) -> Result<Option<u32>, CliError> {
+        let selection = match self.eos_selection {
+            EosSelection::Checkpoint => ferrl::CheckpointEosSelection::CheckpointDefault,
+            EosSelection::Explicit => {
+                ferrl::CheckpointEosSelection::Explicit(self.trainer.eos_token_id.ok_or_else(
+                    || CliError::msg("explicit EOS selector has no numeric token id"),
+                )?)
+            }
+            EosSelection::Disabled => ferrl::CheckpointEosSelection::Disabled,
+        };
+        ferrl::resolve_checkpoint_eos(&self.model_dir, tokenizer, selection)
+            .map_err(|error| CliError::msg(format!("checkpoint EOS resolution failed: {error}")))
+    }
+
+    fn resolved_trainer_config(
+        &self,
+        tokenizer: &ferrl::HfTokenizer,
+    ) -> Result<TrainerConfig, CliError> {
+        let mut trainer = self.trainer.clone();
+        trainer.eos_token_id = self.resolve_eos_token_id(tokenizer)?;
+        Ok(trainer)
     }
 
     /// A unique run id: `<task>-<unix-seconds>`, rank-suffixed under DP or sharded TP.
@@ -1254,7 +1466,7 @@ impl RunConfig {
     /// and hold out `eval_n` via the dedup-aware [`train_eval_split`].
     fn countdown_splits(&self) -> Splits<CountdownProblem> {
         let cd = CountdownConfig::default();
-        let n = (self.data.train_n + self.data.eval_n).max(1);
+        let n = self.data.train_n + self.data.eval_n;
         let samples: Vec<Sample<CountdownProblem>> = generate_dataset(self.data.seed, n, &cd)
             .into_iter()
             .map(|p| Sample::new(build_prompt(&p), p))
@@ -1310,7 +1522,7 @@ impl RunConfig {
     /// Build the repeated TriMul train/eval splits from the exact model prompt.
     fn trimul_splits_from_prompt(&self, prompt: &str) -> Splits<()> {
         let train = std::iter::repeat_with(|| Sample::new(prompt.to_owned(), ()))
-            .take(self.data.train_n.max(1))
+            .take(self.data.train_n)
             .collect();
         let eval = std::iter::repeat_with(|| Sample::new(prompt.to_owned(), ()))
             .take(self.data.eval_n)
@@ -1498,6 +1710,52 @@ fn run_training<R: RewardFn>(
     rendered_prompt_bytes: Option<&[u8]>,
     launch_runtime: Option<LaunchRuntime>,
 ) -> Result<(), CliError> {
+    run_training_with_loader(
+        cfg,
+        device,
+        reward,
+        train,
+        eval,
+        rendered_prompt_bytes,
+        launch_runtime,
+        |model_dir, device, opts| load_auto_policy(model_dir, device, opts).map_err(CliError::from),
+    )
+}
+
+/// CLI-only policy capabilities that are intentionally inherent on [`ferrl::AutoPolicy`].
+///
+/// Keeping this narrow adapter separate from the public [`Policy`] contract lets the
+/// production loader seam remain mutation-sensitive in tests without widening the library API.
+trait CliTrainingPolicy: Policy + TensorParallelPolicy {
+    fn configure_activation_checkpointing(&mut self, enabled: bool);
+    fn supports_cli_tensor_parallel(&self) -> bool;
+}
+
+impl CliTrainingPolicy for ferrl::AutoPolicy {
+    fn configure_activation_checkpointing(&mut self, enabled: bool) {
+        self.set_activation_checkpointing(enabled);
+    }
+
+    fn supports_cli_tensor_parallel(&self) -> bool {
+        self.supports_tensor_parallel()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_training_with_loader<P, R>(
+    cfg: &RunConfig,
+    device: &Device,
+    reward: &R,
+    train: &[Sample<R::Target>],
+    eval: &[Sample<R::Target>],
+    rendered_prompt_bytes: Option<&[u8]>,
+    launch_runtime: Option<LaunchRuntime>,
+    load_policy: impl FnOnce(&Path, &Device, &LoaderOpts) -> Result<(P, ferrl::HfTokenizer), CliError>,
+) -> Result<(), CliError>
+where
+    P: CliTrainingPolicy,
+    R: RewardFn,
+{
     let tensor_parallel_plan = cfg.tensor_parallel_plan();
     let (tensor_parallel_runtime, distributed_launch_comm, distributed_comm) =
         if cfg.tensor_parallel.enabled {
@@ -1518,12 +1776,10 @@ fn run_training<R: RewardFn>(
             .as_ref()
             .map(|comm| comm as &dyn ferrl::Comm)
     });
-    let tcfg = cfg.trainer.clone();
-    let gen = GenConfig::from(&tcfg);
     info!(
         task = %cfg.task,
-        steps = tcfg.steps,
-        group_size = tcfg.group_size,
+        steps = cfg.trainer.steps,
+        group_size = cfg.trainer.group_size,
         activation_checkpointing = cfg.policy.activation_checkpointing,
         train = train.len(),
         eval = eval.len(),
@@ -1532,10 +1788,11 @@ fn run_training<R: RewardFn>(
         "ferrl train: starting"
     );
 
-    let setup = (|| {
-        let (mut policy, tok) = load_auto_policy(&cfg.model_dir, device, &cfg.loader_opts())?;
-        policy.set_activation_checkpointing(cfg.policy.activation_checkpointing);
-        if cfg.tensor_parallel.enabled && !policy.supports_tensor_parallel() {
+    let model_setup = (|| {
+        let (mut policy, tok) = load_policy(&cfg.model_dir, device, &cfg.loader_opts())?;
+        let tcfg = cfg.resolved_trainer_config(&tok)?;
+        policy.configure_activation_checkpointing(cfg.policy.activation_checkpointing);
+        if cfg.tensor_parallel.enabled && !policy.supports_cli_tensor_parallel() {
             return Err(CliError::msg(
                 "loaded checkpoint family does not support tensor_parallel execution; supported \
                  families are qwen3 (including legacy configs without model_type) and dense \
@@ -1550,6 +1807,14 @@ fn run_training<R: RewardFn>(
                  policy does not provide cross-rank backward semantics",
             ));
         }
+        Ok((policy, tok, tcfg))
+    })();
+    let (mut policy, tok, tcfg) =
+        coordinate_distributed_result(launch_comm, "model and EOS setup", model_setup)?;
+    validate_resolved_eos_consensus(tcfg.eos_token_id, launch_comm)?;
+    let gen = GenConfig::from(&tcfg);
+
+    let publication_setup = (|| {
         let run = RunDir::create(&cfg.out_dir, cfg.run_id())?;
         if let Some(prompt_bytes) = rendered_prompt_bytes {
             write_bytes(&run.root().join("prompt.txt"), prompt_bytes)?;
@@ -1559,10 +1824,13 @@ fn run_training<R: RewardFn>(
             )?;
         }
         let trainer = open_trainer(tcfg, &run, distributed_comm)?;
-        Ok((policy, tok, run, trainer))
+        Ok((run, trainer))
     })();
-    let (mut policy, tok, run, mut trainer) =
-        coordinate_distributed_result(launch_comm, "model and trainer setup", setup)?;
+    let (run, mut trainer) = coordinate_distributed_result(
+        launch_comm,
+        "run directory and trainer setup",
+        publication_setup,
+    )?;
     let (history, _stop) = train_with_optional_tensor_parallel(
         &mut trainer,
         &mut policy,
@@ -1791,6 +2059,17 @@ fn validate_launch_config_consensus(
         Ok(())
     };
     coordinate_distributed_result(Some(comm), "run config consensus", local)
+}
+
+fn validate_resolved_eos_consensus(
+    eos_token_id: Option<u32>,
+    comm: Option<&dyn ferrl::Comm>,
+) -> Result<(), CliError> {
+    let Some(comm) = comm.filter(|comm| comm.world_size() > 1) else {
+        return Ok(());
+    };
+    ferrl::validate_resolved_eos_consensus(eos_token_id, comm)
+        .map_err(|error| CliError::msg(error.to_string()))
 }
 
 fn coordinate_distributed_result<T>(
@@ -4025,6 +4304,49 @@ mod tests {
         .unwrap();
     }
 
+    fn write_generation_metadata_fixture(
+        model_dir: &Path,
+        eos_token_id: Option<serde_json::Value>,
+        vocab_size: &serde_json::Value,
+    ) {
+        std::fs::create_dir_all(model_dir).unwrap();
+        let mut config = serde_json::json!({ "vocab_size": vocab_size });
+        if let Some(eos_token_id) = eos_token_id {
+            config["eos_token_id"] = eos_token_id;
+        }
+        std::fs::write(
+            model_dir.join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        write_tiny_tokenizer(model_dir);
+    }
+
+    fn countdown_run_config_with_eos(
+        model_dir: &Path,
+        eos_wire: Option<serde_json::Value>,
+    ) -> RunConfig {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&countdown_train_config("")).unwrap();
+        value["model_dir"] = serde_json::json!(model_dir);
+        if let Some(eos_wire) = eos_wire {
+            value["trainer"]["eos_token_id"] = eos_wire;
+        }
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn move_tiny_tokenizer_special_id(tokenizer_path: &Path, id: u32) {
+        let mut tokenizer_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(tokenizer_path).unwrap()).unwrap();
+        tokenizer_json["model"]["vocab"]["<|special|>"] = serde_json::json!(id);
+        tokenizer_json["added_tokens"][0]["id"] = serde_json::json!(id);
+        std::fs::write(
+            tokenizer_path,
+            serde_json::to_vec_pretty(&tokenizer_json).unwrap(),
+        )
+        .unwrap();
+    }
+
     fn deterministic_tensor(dims: &[usize], offset: &mut usize) -> Tensor {
         let len = dims.iter().product();
         let values: Vec<f32> = (0..len)
@@ -5147,7 +5469,8 @@ mod tests {
                 "lr": 0.0,
                 "weight_decay": 0.0,
                 "loss_type": "grpo",
-                "scale_rewards": "group"
+                "scale_rewards": "group",
+                "eos_token_id": "none"
             }
         });
         let path = root.join(format!("rank-{rank}.json"));
@@ -5535,6 +5858,691 @@ mod tests {
                           "lr": 1e-5, "weight_decay": 0.0,
                           "loss_type": "grpo", "scale_rewards": "group" } }"#;
         assert!(serde_json::from_str::<RunConfig>(json).is_err());
+    }
+
+    #[test]
+    fn unknown_nested_config_fields_are_rejected() {
+        let cases = [
+            ("trainer", "grad_acum_steps"),
+            ("policy", "lora_aplha"),
+            ("data", "trian_n"),
+        ];
+        for (section, typo) in cases {
+            let mut value: serde_json::Value =
+                serde_json::from_str(&countdown_train_config("")).unwrap();
+            value[section][typo] = serde_json::json!(1);
+
+            let err = serde_json::from_value::<RunConfig>(value).unwrap_err();
+
+            assert!(
+                err.to_string().contains(&format!("unknown field `{typo}`")),
+                "{section}.{typo} was not rejected as an unknown field: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn eos_wire_distinguishes_auto_override_and_explicit_none() {
+        let omitted: RunConfig =
+            serde_json::from_str(&countdown_train_config("")).expect("omitted EOS means auto");
+        assert_eq!(omitted.trainer.eos_token_id, None);
+
+        let mut explicit: serde_json::Value =
+            serde_json::from_str(&countdown_train_config("")).unwrap();
+        explicit["trainer"]["eos_token_id"] = serde_json::json!(3);
+        let explicit: RunConfig = serde_json::from_value(explicit).unwrap();
+        assert_eq!(explicit.trainer.eos_token_id, Some(3));
+
+        let mut disabled: serde_json::Value =
+            serde_json::from_str(&countdown_train_config("")).unwrap();
+        disabled["trainer"]["eos_token_id"] = serde_json::json!("none");
+        let disabled: RunConfig = serde_json::from_value(disabled).unwrap();
+        assert_eq!(disabled.trainer.eos_token_id, None);
+
+        let mut null: serde_json::Value =
+            serde_json::from_str(&countdown_train_config("")).unwrap();
+        null["trainer"]["eos_token_id"] = serde_json::Value::Null;
+        let err = serde_json::from_value::<RunConfig>(null).unwrap_err();
+        assert!(err.to_string().contains("eos_token_id"));
+
+        for invalid in [
+            serde_json::json!("off"),
+            serde_json::json!([2, 3]),
+            serde_json::json!(true),
+            serde_json::json!(-1),
+        ] {
+            let mut value: serde_json::Value =
+                serde_json::from_str(&countdown_train_config("")).unwrap();
+            value["trainer"]["eos_token_id"] = invalid;
+            assert!(serde_json::from_value::<RunConfig>(value).is_err());
+        }
+    }
+
+    #[test]
+    fn eos_wire_round_trips_without_collapsing_auto_or_disabled() {
+        let auto: RunConfig = serde_json::from_str(&countdown_train_config("")).unwrap();
+        let auto_wire = serde_json::to_value(&auto).unwrap();
+        assert!(auto_wire["trainer"].get("eos_token_id").is_none());
+        let auto_round_trip: RunConfig = serde_json::from_value(auto_wire).unwrap();
+        assert_eq!(auto_round_trip.eos_selection, EosSelection::Checkpoint);
+
+        let mut disabled_wire: serde_json::Value =
+            serde_json::from_str(&countdown_train_config("")).unwrap();
+        disabled_wire["trainer"]["eos_token_id"] = serde_json::json!("none");
+        let disabled: RunConfig = serde_json::from_value(disabled_wire).unwrap();
+        let disabled_wire = serde_json::to_value(&disabled).unwrap();
+        assert_eq!(
+            disabled_wire["trainer"]["eos_token_id"],
+            serde_json::json!("none")
+        );
+        let disabled_round_trip: RunConfig = serde_json::from_value(disabled_wire).unwrap();
+        assert_eq!(disabled_round_trip.eos_selection, EosSelection::Disabled);
+    }
+
+    #[test]
+    fn checkpoint_eos_is_resolved_before_generation_config_construction() {
+        let tmp = TestDir::new("checkpoint-eos-resolution");
+        let model_dir = tmp.path().join("model");
+        write_generation_metadata_fixture(
+            &model_dir,
+            Some(serde_json::json!(3)),
+            &serde_json::json!(4),
+        );
+        let mut value: serde_json::Value =
+            serde_json::from_str(&countdown_train_config("")).unwrap();
+        value["model_dir"] = serde_json::json!(model_dir);
+        let cfg: RunConfig = serde_json::from_value(value).unwrap();
+        let tokenizer = ferrl::HfTokenizer::from_file(model_dir.join("tokenizer.json")).unwrap();
+
+        let resolved = cfg.resolved_trainer_config(&tokenizer).unwrap();
+        let gen = GenConfig::from(&resolved);
+
+        assert_eq!(resolved.eos_token_id, Some(3));
+        assert_eq!(gen.eos_token_id, Some(3));
+    }
+
+    struct EosRecordingPolicy {
+        logp: Var,
+        enabled: bool,
+        seen: Arc<Mutex<Vec<Option<u32>>>>,
+    }
+
+    impl EosRecordingPolicy {
+        fn new(seen: Arc<Mutex<Vec<Option<u32>>>>) -> Self {
+            let logp = Var::from_tensor(&Tensor::zeros((2, 2), DType::F32, &Device::Cpu).unwrap())
+                .unwrap();
+            Self {
+                logp,
+                enabled: true,
+                seen,
+            }
+        }
+    }
+
+    impl Policy for EosRecordingPolicy {
+        fn generate(
+            &mut self,
+            prompt: &[u32],
+            cfg: &GenConfig,
+        ) -> CandleResult<ferrl::policy::Rollout> {
+            self.seen.lock().unwrap().push(cfg.eos_token_id);
+            let eos = cfg
+                .eos_token_id
+                .ok_or_else(|| candle_core::Error::msg("production setup lost resolved EOS"))?;
+            let rows = (0..cfg.group_size)
+                .map(|_| {
+                    let mut row = prompt.to_vec();
+                    row.push(0);
+                    row.push(eos);
+                    row.resize(prompt.len() + cfg.max_new_tokens, eos);
+                    row
+                })
+                .collect();
+            Ok(ferrl::policy::Rollout::new(
+                rows,
+                prompt.len(),
+                vec![2; cfg.group_size],
+                None,
+            ))
+        }
+
+        fn token_logprobs(&self, _rollout: &ferrl::policy::Rollout) -> CandleResult<Tensor> {
+            Ok(self.logp.as_tensor().clone())
+        }
+
+        fn set_adapter_enabled(&mut self, enabled: bool) {
+            self.enabled = enabled;
+        }
+
+        fn adapter_enabled(&self) -> bool {
+            self.enabled
+        }
+
+        fn trainable_vars(&self) -> Vec<Var> {
+            vec![self.logp.clone()]
+        }
+
+        fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+            Ok(Vec::new())
+        }
+
+        fn restore_sampler_state(&mut self, _state: &[u8]) -> CandleResult<()> {
+            Ok(())
+        }
+    }
+
+    impl TensorParallelPolicy for EosRecordingPolicy {
+        fn generate_at_tensor_parallel_instrumented(
+            &mut self,
+            prompt: &[u32],
+            cfg: &GenConfig,
+            _global_row_base: u64,
+            _comm: &dyn ferrl::Comm,
+            _telemetry: Option<&mut dyn ferrl::ModelTelemetryRecorder>,
+        ) -> CandleResult<ferrl::policy::Rollout> {
+            self.generate(prompt, cfg)
+        }
+
+        fn token_logprobs_tensor_parallel(
+            &self,
+            rollout: &ferrl::policy::Rollout,
+            _comm: &dyn ferrl::Comm,
+        ) -> CandleResult<Tensor> {
+            self.token_logprobs(rollout)
+        }
+
+        fn token_logprobs_tensor_parallel_detached(
+            &self,
+            rollout: &ferrl::policy::Rollout,
+            _comm: &dyn ferrl::Comm,
+        ) -> CandleResult<Tensor> {
+            self.token_logprobs_detached(rollout)
+        }
+    }
+
+    impl CliTrainingPolicy for EosRecordingPolicy {
+        fn configure_activation_checkpointing(&mut self, _enabled: bool) {}
+
+        fn supports_cli_tensor_parallel(&self) -> bool {
+            false
+        }
+    }
+
+    struct EosSetupReward;
+
+    impl RewardFn for EosSetupReward {
+        type Target = ();
+
+        fn reward(
+            &self,
+            _sample: &Sample<()>,
+            _completion: &str,
+        ) -> Result<f32, ferrl::RewardError> {
+            Ok(0.0)
+        }
+    }
+
+    #[test]
+    fn production_training_setup_threads_resolved_eos_to_trainer_eval_and_persistence() {
+        let tmp = TestDir::new("production-checkpoint-eos-resolution");
+        let model_dir = tmp.path().join("model");
+        let out_dir = tmp.path().join("runs");
+        write_generation_metadata_fixture(
+            &model_dir,
+            Some(serde_json::json!(3)),
+            &serde_json::json!(4),
+        );
+        let mut value: serde_json::Value =
+            serde_json::from_str(&countdown_train_config("")).unwrap();
+        value["model_dir"] = serde_json::json!(model_dir);
+        value["out_dir"] = serde_json::json!(out_dir);
+        value["trainer"]["max_new_tokens"] = serde_json::json!(2);
+        let cfg: RunConfig = serde_json::from_value(value).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let loader_seen = Arc::clone(&seen);
+
+        run_training_with_loader(
+            &cfg,
+            &Device::Cpu,
+            &EosSetupReward,
+            &[Sample::new("hello", ())],
+            &[Sample::new("hello", ())],
+            None,
+            None,
+            move |model_dir, _device, _opts| {
+                let tokenizer = ferrl::HfTokenizer::from_file(model_dir.join("tokenizer.json"))
+                    .map_err(|error| CliError::msg(error.to_string()))?;
+                Ok((EosRecordingPolicy::new(loader_seen), tokenizer))
+            },
+        )
+        .unwrap();
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen.len(),
+            3,
+            "expected train plus base/adapter eval generation"
+        );
+        assert!(seen.iter().all(|value| *value == Some(3)), "{seen:?}");
+        drop(seen);
+
+        let run_root = std::fs::read_dir(&out_dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(run_root.join("config.json")).unwrap()).unwrap();
+        assert_eq!(persisted["eos_token_id"], serde_json::json!(3));
+    }
+
+    #[test]
+    fn distributed_production_setup_rejects_resolved_eos_drift_before_run_publication() {
+        let tmp = TestDir::new("production-resolved-eos-consensus");
+        let model_dir = tmp.path().join("model");
+        write_generation_metadata_fixture(
+            &model_dir,
+            Some(serde_json::json!(0)),
+            &serde_json::json!(4),
+        );
+        let results = std::thread::scope(|scope| {
+            ferrl::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(5))
+                .into_iter()
+                .map(|comm| {
+                    let rank = comm.rank();
+                    let model_dir = model_dir.clone();
+                    let out_dir = tmp.path().join(format!("rank-{rank}-runs"));
+                    std::fs::create_dir_all(&out_dir).unwrap();
+                    let sentinel = out_dir.join("sentinel");
+                    std::fs::write(&sentinel, format!("rank-{rank}")).unwrap();
+                    scope.spawn(move || {
+                        let mut value: serde_json::Value =
+                            serde_json::from_str(&countdown_train_config("")).unwrap();
+                        value["model_dir"] = serde_json::json!(model_dir);
+                        value["out_dir"] = serde_json::json!(out_dir);
+                        value["distributed"] = serde_json::json!({ "enabled": true });
+                        value["trainer"]["max_new_tokens"] = serde_json::json!(2);
+                        if rank == 1 {
+                            value["trainer"]["eos_token_id"] = serde_json::json!("none");
+                        }
+                        let cfg: RunConfig = serde_json::from_value(value).unwrap();
+                        let seen = Arc::new(Mutex::new(Vec::new()));
+                        let loader_seen = Arc::clone(&seen);
+                        let result = run_training_with_loader(
+                            &cfg,
+                            &Device::Cpu,
+                            &EosSetupReward,
+                            &[Sample::new("hello", ())],
+                            &[],
+                            None,
+                            Some(LaunchRuntime {
+                                device: Device::Cpu,
+                                comm: Box::new(comm),
+                            }),
+                            move |model_dir, _device, _opts| {
+                                let tokenizer =
+                                    ferrl::HfTokenizer::from_file(model_dir.join("tokenizer.json"))
+                                        .map_err(|error| CliError::msg(error.to_string()))?;
+                                Ok((EosRecordingPolicy::new(loader_seen), tokenizer))
+                            },
+                        );
+                        let entries = std::fs::read_dir(&cfg.out_dir)
+                            .unwrap()
+                            .map(|entry| entry.unwrap().file_name())
+                            .collect::<Vec<_>>();
+                        (
+                            rank,
+                            result.map_err(|error| error.to_string()),
+                            entries,
+                            sentinel,
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        for (rank, result, entries, sentinel) in results {
+            let error = result.unwrap_err();
+            assert!(
+                error.contains("resolved EOS consensus"),
+                "rank {rank}: {error}"
+            );
+            assert_eq!(entries, vec![sentinel.file_name().unwrap().to_os_string()]);
+        }
+    }
+
+    fn assert_missing_checkpoint_eos_requires_explicit_mode(
+        model_dir: &Path,
+        tokenizer_path: &Path,
+    ) {
+        write_generation_metadata_fixture(model_dir, None, &serde_json::json!(4));
+        let tokenizer = ferrl::HfTokenizer::from_file(tokenizer_path).unwrap();
+        assert!(countdown_run_config_with_eos(model_dir, None)
+            .resolve_eos_token_id(&tokenizer)
+            .is_err());
+        assert_eq!(
+            countdown_run_config_with_eos(model_dir, Some(serde_json::json!("none")))
+                .resolve_eos_token_id(&tokenizer)
+                .unwrap(),
+            None
+        );
+    }
+
+    fn assert_multi_checkpoint_eos_requires_declared_override(
+        model_dir: &Path,
+        tokenizer_path: &Path,
+    ) {
+        write_generation_metadata_fixture(
+            model_dir,
+            Some(serde_json::json!([2, 3])),
+            &serde_json::json!(4),
+        );
+        let tokenizer = ferrl::HfTokenizer::from_file(tokenizer_path).unwrap();
+        assert!(countdown_run_config_with_eos(model_dir, None)
+            .resolve_eos_token_id(&tokenizer)
+            .is_err());
+        assert_eq!(
+            countdown_run_config_with_eos(model_dir, Some(serde_json::json!(3)))
+                .resolve_eos_token_id(&tokenizer)
+                .unwrap(),
+            Some(3)
+        );
+        assert!(
+            countdown_run_config_with_eos(model_dir, Some(serde_json::json!(1)))
+                .resolve_eos_token_id(&tokenizer)
+                .is_err()
+        );
+    }
+
+    fn assert_explicit_eos_respects_model_and_tokenizer_bounds(
+        model_dir: &Path,
+        tokenizer_path: &Path,
+    ) {
+        write_generation_metadata_fixture(
+            model_dir,
+            Some(serde_json::json!(3)),
+            &serde_json::json!(4),
+        );
+        let tokenizer = ferrl::HfTokenizer::from_file(tokenizer_path).unwrap();
+        assert!(
+            countdown_run_config_with_eos(model_dir, Some(serde_json::json!(4)))
+                .resolve_eos_token_id(&tokenizer)
+                .is_err()
+        );
+
+        write_generation_metadata_fixture(
+            model_dir,
+            Some(serde_json::json!(4)),
+            &serde_json::json!(4),
+        );
+        move_tiny_tokenizer_special_id(tokenizer_path, 4);
+        let tokenizer = ferrl::HfTokenizer::from_file(tokenizer_path).unwrap();
+        assert!(tokenizer.contains_id(4));
+        let err = countdown_run_config_with_eos(model_dir, None)
+            .resolve_eos_token_id(&tokenizer)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("outside model vocab_size 4"), "{err}");
+    }
+
+    #[test]
+    fn checkpoint_eos_resolution_fails_closed_and_validates_overrides() {
+        let tmp = TestDir::new("checkpoint-eos-negatives");
+        let model_dir = tmp.path().join("model");
+        let tokenizer_path = model_dir.join("tokenizer.json");
+
+        assert_missing_checkpoint_eos_requires_explicit_mode(&model_dir, &tokenizer_path);
+        assert_multi_checkpoint_eos_requires_declared_override(&model_dir, &tokenizer_path);
+        assert_explicit_eos_respects_model_and_tokenizer_bounds(&model_dir, &tokenizer_path);
+    }
+
+    #[test]
+    fn checkpoint_eos_accepts_a_sparse_but_present_tokenizer_id() {
+        let tmp = TestDir::new("checkpoint-eos-sparse-tokenizer");
+        let model_dir = tmp.path().join("model");
+        write_generation_metadata_fixture(
+            &model_dir,
+            Some(serde_json::json!(4)),
+            &serde_json::json!(5),
+        );
+        let tokenizer_path = model_dir.join("tokenizer.json");
+        move_tiny_tokenizer_special_id(&tokenizer_path, 4);
+
+        let mut value: serde_json::Value =
+            serde_json::from_str(&countdown_train_config("")).unwrap();
+        value["model_dir"] = serde_json::json!(model_dir);
+        let cfg: RunConfig = serde_json::from_value(value).unwrap();
+        let tokenizer = ferrl::HfTokenizer::from_file(tokenizer_path).unwrap();
+
+        assert_eq!(tokenizer.vocab_size(), 4);
+        assert!(tokenizer.contains_id(4));
+        assert_eq!(cfg.resolve_eos_token_id(&tokenizer).unwrap(), Some(4));
+    }
+
+    #[test]
+    fn distributed_config_digest_distinguishes_eos_auto_from_disabled() {
+        let tmp = TestDir::new("eos-selector-consensus");
+        let auto_path = tmp.path().join("auto.json");
+        let disabled_path = tmp.path().join("disabled.json");
+        std::fs::write(&auto_path, countdown_train_config("")).unwrap();
+        let mut disabled: serde_json::Value =
+            serde_json::from_str(&countdown_train_config("")).unwrap();
+        disabled["trainer"]["eos_token_id"] = serde_json::json!("none");
+        std::fs::write(&disabled_path, serde_json::to_vec(&disabled).unwrap()).unwrap();
+
+        let auto = RunConfig::load_for_launch(&auto_path).unwrap();
+        let disabled = RunConfig::load_for_launch(&disabled_path).unwrap();
+
+        assert_ne!(auto.consensus_digest, disabled.consensus_digest);
+    }
+
+    #[test]
+    fn distributed_resolved_eos_consensus_rejects_rank_local_metadata_drift() {
+        let results = std::thread::scope(|scope| {
+            ferrl::LocalComm::world(2)
+                .into_iter()
+                .enumerate()
+                .map(|(rank, comm)| {
+                    scope.spawn(move || {
+                        validate_resolved_eos_consensus(
+                            Some(3 + u32::try_from(rank).unwrap()),
+                            Some(&comm),
+                        )
+                        .map_err(|error| error.to_string())
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        for result in results {
+            assert!(result
+                .unwrap_err()
+                .contains("resolved different EOS token semantics"));
+        }
+    }
+
+    #[test]
+    fn distributed_resolved_eos_consensus_accepts_equal_some_and_none() {
+        for eos in [Some(3), None] {
+            let results = std::thread::scope(|scope| {
+                ferrl::LocalComm::world(2)
+                    .into_iter()
+                    .map(|comm| {
+                        scope.spawn(move || {
+                            validate_resolved_eos_consensus(eos, Some(&comm))
+                                .map_err(|error| error.to_string())
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|handle| handle.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            assert!(results.iter().all(Result::is_ok), "{eos:?}: {results:?}");
+        }
+    }
+
+    fn assert_no_update_configs_rejected() {
+        let cases = [
+            ("zero-steps", "", "steps", serde_json::json!(0)),
+            ("local-group-one", "", "group_size", serde_json::json!(1)),
+        ];
+        for (tag, extra, field, value) in cases {
+            let tmp = TestDir::new(tag);
+            let path = tmp.path().join("run.json");
+            let mut json: serde_json::Value =
+                serde_json::from_str(&countdown_train_config(extra)).unwrap();
+            json["trainer"][field] = value;
+            std::fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+
+            assert!(RunConfig::load(&path).is_err(), "{tag} unexpectedly loaded");
+        }
+    }
+
+    fn assert_f32_lora_scale_configs_rejected() {
+        for (tag, alpha) in [
+            ("zero-alpha", 0.0),
+            ("negative-alpha", -1.0),
+            ("underflow-alpha", f64::MIN_POSITIVE),
+            ("overflow-alpha", f64::MAX),
+        ] {
+            let tmp = TestDir::new(tag);
+            let path = tmp.path().join("run.json");
+            let json = countdown_train_config(&format!(r#""policy": {{ "lora_alpha": {alpha} }}"#));
+            std::fs::write(&path, json).unwrap();
+
+            assert!(RunConfig::load(&path).is_err(), "{tag} unexpectedly loaded");
+        }
+    }
+
+    fn assert_bf16_lora_scale_configs_rejected() {
+        for (tag, alpha) in [
+            ("bf16-underflow-alpha", f64::MIN_POSITIVE),
+            ("bf16-overflow-alpha", f64::MAX),
+        ] {
+            let tmp = TestDir::new(tag);
+            let path = tmp.path().join("run.json");
+            let json = countdown_train_config(&format!(
+                r#""policy": {{ "lora_alpha": {alpha}, "base_dtype": "bf16" }}"#
+            ));
+            std::fs::write(&path, json).unwrap();
+
+            assert!(RunConfig::load(&path).is_err(), "{tag} unexpectedly loaded");
+        }
+    }
+
+    fn assert_lora_scale_validation_uses_base_compute_dtype() {
+        let alpha = 1e-42;
+        let f32 = countdown_train_config(&format!(
+            r#""policy": {{ "lora_rank": 1, "lora_alpha": {alpha}, "base_dtype": "f32" }}"#
+        ));
+        let bf16 = countdown_train_config(&format!(
+            r#""policy": {{ "lora_rank": 1, "lora_alpha": {alpha}, "base_dtype": "bf16" }}"#
+        ));
+        assert!(serde_json::from_str::<RunConfig>(&f32)
+            .unwrap()
+            .validate_current_config_support()
+            .is_ok());
+        assert!(serde_json::from_str::<RunConfig>(&bf16)
+            .unwrap()
+            .validate_current_config_support()
+            .is_err());
+    }
+
+    fn assert_nonfinite_in_memory_lora_alpha_rejected() {
+        let mut cfg: RunConfig = serde_json::from_str(&countdown_train_config("")).unwrap();
+        for alpha in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            cfg.policy.lora_alpha = alpha;
+            assert!(cfg.validate_current_config_support().is_err());
+        }
+    }
+
+    #[test]
+    fn run_config_rejects_no_update_and_invalid_policy_paths() {
+        assert_no_update_configs_rejected();
+        assert_f32_lora_scale_configs_rejected();
+        assert_bf16_lora_scale_configs_rejected();
+        assert_lora_scale_validation_uses_base_compute_dtype();
+        assert_nonfinite_in_memory_lora_alpha_rejected();
+    }
+
+    #[test]
+    fn invalid_no_update_configs_stop_before_device_or_model_setup() {
+        let cases = [
+            ("steps", serde_json::json!(0), None),
+            ("group_size", serde_json::json!(1), None),
+            ("lora_alpha", serde_json::json!(0.0), Some("policy")),
+            ("train_n", serde_json::json!(0), Some("data")),
+        ];
+        for (field, value, section) in cases {
+            let tmp = TestDir::new(&format!("pre-device-{field}"));
+            let path = tmp.path().join("run.json");
+            let mut json: serde_json::Value =
+                serde_json::from_str(&countdown_train_config("")).unwrap();
+            match section {
+                Some(section) => json[section][field] = value,
+                None => json["trainer"][field] = value,
+            }
+            std::fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+            let prepared = std::cell::Cell::new(false);
+
+            let result = train_with_launch_runtime(&TrainArgs { config: path }, None, |_, _| {
+                prepared.set(true);
+                Ok(Device::Cpu)
+            });
+
+            assert!(result.is_err(), "{field} unexpectedly reached training");
+            assert!(!prepared.get(), "{field} reached device/model setup");
+        }
+    }
+
+    #[test]
+    fn procedural_tasks_reject_zero_training_rows() {
+        for task in ["countdown", "trimul"] {
+            let tmp = TestDir::new(&format!("{task}-zero-train-rows"));
+            let path = tmp.path().join("run.json");
+            let mut json: serde_json::Value =
+                serde_json::from_str(&countdown_train_config("")).unwrap();
+            json["task"] = serde_json::json!(task);
+            json["data"] = serde_json::json!({ "train_n": 0, "eval_n": 0 });
+            std::fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+
+            assert!(
+                RunConfig::load(&path).is_err(),
+                "{task} unexpectedly loaded"
+            );
+        }
+
+        let tmp = TestDir::new("math-zero-procedural-count-ignored");
+        let path = tmp.path().join("run.json");
+        let mut json: serde_json::Value =
+            serde_json::from_str(&countdown_train_config("")).unwrap();
+        json["task"] = serde_json::json!("math");
+        json["data"] = serde_json::json!({ "path": "math.jsonl", "train_n": 0 });
+        std::fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(RunConfig::load(&path).is_ok());
+    }
+
+    #[test]
+    fn countdown_rejects_an_unrepresentable_requested_dataset_size() {
+        let tmp = TestDir::new("countdown-dataset-size-overflow");
+        let path = tmp.path().join("run.json");
+        let mut json: serde_json::Value =
+            serde_json::from_str(&countdown_train_config("")).unwrap();
+        json["data"] = serde_json::json!({
+            "train_n": usize::MAX,
+            "eval_n": 1,
+        });
+        std::fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+
+        assert!(RunConfig::load(&path).is_err());
     }
 
     /// `math` without `data.path` is a clear contract error, not a panic.

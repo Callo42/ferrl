@@ -87,32 +87,45 @@ mod dp {
         serde_json::from_slice(&bytes).context("parse config.json into qwen3::Config")
     }
 
-    /// The model's end-of-sequence token id, read from the checkpoint's `config.json`
-    /// (candle's [`Config`] does not deserialize it). `FERRL_CDDP_EOS` overrides:
-    /// `none`/`off` restores full-width rollouts; any other value forces that id.
-    fn resolve_eos(dir: &Path) -> Result<Option<u32>> {
-        match env::var("FERRL_CDDP_EOS") {
-            Err(_) => {
-                let bytes = std::fs::read(dir.join("config.json")).context("read config.json")?;
-                let json: serde_json::Value =
-                    serde_json::from_slice(&bytes).context("parse config.json")?;
-                Ok(json
-                    .get("eos_token_id")
-                    .and_then(serde_json::Value::as_u64)
-                    .and_then(|v| u32::try_from(v).ok()))
-            }
-            Ok(raw) => {
-                let v = raw.trim();
-                if v.eq_ignore_ascii_case("none") || v.eq_ignore_ascii_case("off") {
-                    Ok(None)
-                } else {
-                    let id = v.parse::<u32>().with_context(|| {
-                        format!("FERRL_CDDP_EOS must be an integer id or 'none', got {raw:?}")
-                    })?;
-                    Ok(Some(id))
-                }
-            }
+    /// Resolve the production EOS contract before any durable run publication.
+    ///
+    /// Unset requires one scalar checkpoint EOS; the exact string `none` is the
+    /// explicit full-width opt-out; any integer override is checked against declared
+    /// multi-EOS membership plus the model and tokenizer vocabularies.
+    fn resolve_eos(dir: &Path, tokenizer: &HfTokenizer) -> Result<Option<u32>> {
+        let selection = match env::var("FERRL_CDDP_EOS") {
+            Err(env::VarError::NotPresent) => ferrl::CheckpointEosSelection::CheckpointDefault,
+            Err(error) => return Err(anyhow!("read FERRL_CDDP_EOS: {error}")),
+            Ok(raw) if raw == "none" => ferrl::CheckpointEosSelection::Disabled,
+            Ok(raw) => ferrl::CheckpointEosSelection::Explicit(raw.parse::<u32>().with_context(
+                || {
+                    format!(
+                        "FERRL_CDDP_EOS must be an integer id or the exact string 'none', got {raw:?}"
+                    )
+                },
+            )?),
+        };
+        ferrl::resolve_checkpoint_eos(dir, tokenizer, selection).map_err(Into::into)
+    }
+
+    /// Coordinate rank-local EOS resolution, then require identical resolved semantics.
+    fn coordinate_eos_resolution(
+        comm: &dyn Comm,
+        local: Result<Option<u32>>,
+    ) -> Result<Option<u32>> {
+        let failures = comm
+            .all_reduce_scalar_sum(if local.is_err() { 1.0 } else { 0.0 })
+            .context("coordinate rank-local EOS resolution")?;
+        if failures != 0.0 {
+            return match local {
+                Err(error) => Err(error),
+                Ok(_) => bail!("a peer rank failed checkpoint/tokenizer EOS resolution"),
+            };
         }
+        let eos = local.expect("zero global EOS failures implies local success");
+        ferrl::validate_resolved_eos_consensus(eos, comm)
+            .context("require rank-identical resolved EOS semantics")?;
+        Ok(eos)
     }
 
     /// The base-weight dtype (`FERRL_CDDP_BASE_DTYPE`): `bf16` (default — the
@@ -264,7 +277,7 @@ mod dp {
         Ok((run, shared_ckpts, preempt))
     }
 
-    pub fn run() -> Result<()> {
+    pub(crate) fn run() -> Result<()> {
         let _ = ferrl::init_tracing();
 
         // Build the communicator from the Slurm environment FIRST: it opens this
@@ -295,7 +308,7 @@ mod dp {
         let (mut policy, tok) = build_policy(&dir, &device)?;
         let train_samples = build_train_samples();
         let reward = CountdownReward::default();
-        let eos = resolve_eos(&dir)?;
+        let eos = coordinate_eos_resolution(&comm, resolve_eos(&dir, &tok))?;
         let tcfg = build_trainer_config(eos);
         info!(
             steps = tcfg.steps,

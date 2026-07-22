@@ -327,11 +327,15 @@ impl Policy for BadPromptLenPolicy {
     }
 }
 
-/// Wraps [`EchoPolicy`] and rewrites each completion to be **EOS-padded**: keep the
-/// first `real_lens[i % len]` sampled tokens of sequence `i`, overwrite the rest with
-/// `pad`, and record that length in `completion_lens` — exactly the shape EOS
-/// early-stop produces, with a **variable per-row** length so the trainer's
-/// length-aware mask is genuinely per-sequence (not a uniform column).
+/// Wraps [`EchoPolicy`] and rewrites each completion to be **EOS-padded**. A
+/// `real_lens[i % len]` value below the generated width keeps that many sampled
+/// non-EOS tokens, writes `pad` as EOS in the next slot, fills the tail with the
+/// same token, and records the first-EOS-inclusive length. A value equal to the
+/// width produces a full-width row without EOS. Sampled occurrences of `pad` are
+/// replaced before this rewrite so the declared EOS is always the first one.
+/// This is exactly the shape EOS early-stop produces, with a **variable per-row**
+/// length so the trainer's length-aware mask is genuinely per-sequence (not a
+/// uniform column).
 /// `token_logprobs` delegates to the inner policy (it scores the full rectangular
 /// width; the trainer's length-aware mask is what excludes the padding from the
 /// loss). Lets a test drive the real `Trainer` with `eos_token_id` set and confirm
@@ -343,8 +347,8 @@ struct EosPaddedEchoPolicy {
 }
 
 impl EosPaddedEchoPolicy {
-    /// The real length recorded for sequence `i`, cycling `real_lens` and capped at
-    /// the available completion width.
+    /// The sampled pre-EOS token count for sequence `i`, cycling `real_lens` and
+    /// capped at the available completion width.
     fn real_len(&self, i: usize, max_real: usize) -> usize {
         self.real_lens[i % self.real_lens.len()].min(max_real)
     }
@@ -362,9 +366,19 @@ impl Policy for EosPaddedEchoPolicy {
             .enumerate()
             .map(|(i, mut ids)| {
                 let real = self.real_len(i, max_real);
-                completion_lens.push(real);
-                for slot in ids.iter_mut().skip(prompt_len + real) {
-                    *slot = self.pad;
+                let replacement = (self.pad + 1) % self.inner.vocab as u32;
+                for token in ids.iter_mut().skip(prompt_len) {
+                    if *token == self.pad {
+                        *token = replacement;
+                    }
+                }
+                if real < max_real {
+                    for slot in ids.iter_mut().skip(prompt_len + real) {
+                        *slot = self.pad;
+                    }
+                    completion_lens.push(real + 1);
+                } else {
+                    completion_lens.push(real);
                 }
                 ids
             })
@@ -644,10 +658,11 @@ fn summarize_reduces_a_real_toy_run_with_populated_timing() {
 fn eos_padded_rollout_trains_with_length_aware_mask() {
     // The trainer consumes completion_lens end-to-end with a VARIABLE per-row length:
     // a `Some` eos_token_id no longer errors (the PR3 guard-lift), each sequence keeps a
-    // different number of real tokens (lengths 1 and 2, alternating), and the run steps
-    // cleanly through a genuinely per-sequence masked backward — the EOS padding (scored
-    // by token_logprobs but masked out) stays out of the loss. The completion_len metric
-    // reports the mean real length (1.5), not the padded width (3). The mask's per-token
+    // different number of sampled tokens before EOS (1 and 2, alternating), and the run
+    // steps cleanly through a genuinely per-sequence masked backward — the post-EOS
+    // padding (scored by token_logprobs but masked out) stays out of the loss. The
+    // completion_len metric reports the mean first-EOS-inclusive length (2.5), not just
+    // the sampled pre-EOS tokens. The mask's per-token
     // gradient inertness — including the exp-overflow corner — is pinned unit-side by
     // `padding_columns_are_inert_in_the_grpo_loss` and
     // `padding_with_an_exp_overflowing_logp_gap_stays_grad_finite`; the dedicated
@@ -655,13 +670,13 @@ fn eos_padded_rollout_trains_with_length_aware_mask() {
     let inner = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 7, TEMP).unwrap();
     let mut policy = EosPaddedEchoPolicy {
         inner,
-        real_lens: vec![1, 2], // per-row lengths: rows alternate 1 and 2 real tokens
+        real_lens: vec![1, 2], // sampled tokens before EOS; lengths become 2 and 3
         pad: 0,
     };
     let prompts = echo_prompts(VOCAB);
     let cfg = TrainerConfig {
         steps: 5,
-        group_size: 8, // even -> four rows of length 1, four of length 2 -> mean 1.5
+        group_size: 8,     // four EOS-inclusive length-2 rows and four length-3 rows
         max_new_tokens: 3, // padded width 3
         temperature: TEMP,
         eos_token_id: Some(0), // accepted now; the mask honors completion_lens
@@ -682,28 +697,28 @@ fn eos_padded_rollout_trains_with_length_aware_mask() {
             "non-finite metric at step {}",
             m.step
         );
-        // Mean of the per-row real lengths (1 and 2), not the padded width (3).
+        // Mean of the first-EOS-inclusive lengths (2 and 3).
         assert!(
-            (m.completion_len - 1.5).abs() < 1e-6,
-            "completion_len {} != mean real length 1.5 at step {}",
+            (m.completion_len - 2.5).abs() < 1e-6,
+            "completion_len {} != mean EOS-inclusive length 2.5 at step {}",
             m.completion_len,
             m.step
         );
-        // Lengths 1 and 2 never reach the width-3 boundary, so the default-ON
-        // truncation masking has nothing to mask here.
-        assert_eq!(m.frac_truncated, 0.0, "no row is full-width");
+        // The length-3 rows end in EOS, so reaching the width is not truncation.
+        assert_eq!(m.frac_truncated, 0.0, "every row reaches an EOS");
         assert_eq!(m.dropped_rows, 0);
     }
 }
 
 #[test]
 fn truncation_masking_masks_full_width_rows_end_to_end() {
-    // Rows alternate real lengths 3 (the FULL width) and 2. The EOS id is set
-    // outside the echo policy's vocab, so no full-width row can ever end in EOS:
+    // Rows alternate three sampled tokens (the FULL width, with no EOS) and two
+    // sampled tokens followed by EOS. The fixture replaces accidental sampled EOS
+    // tokens before applying that shape, so no full-width row can end in EOS:
     // with truncation_masking ON (the default), exactly half of every group is
     // deterministically truncated -> masked out of the loss, surfaced via
     // frac_truncated AND dropped_rows, while the run still steps cleanly on the
-    // surviving length-2 rows (the canary tolerates the zeroed rows).
+    // surviving two-sampled-token-plus-EOS rows (the canary tolerates zeroed rows).
     let inner = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 11, TEMP).unwrap();
     let mut policy = EosPaddedEchoPolicy {
         inner,
@@ -716,7 +731,7 @@ fn truncation_masking_masks_full_width_rows_end_to_end() {
         group_size: 8,
         max_new_tokens: 3,
         temperature: TEMP,
-        eos_token_id: Some(VOCAB as u32), // unsampleable -> full-width == truncated
+        eos_token_id: Some(0), // the wrapper's exact first-EOS-inclusive marker
         lr: 0.05,
         ..TrainerConfig::default()
     };
@@ -755,7 +770,7 @@ fn truncation_masking_off_keeps_full_width_rows() {
         group_size: 8,
         max_new_tokens: 3,
         temperature: TEMP,
-        eos_token_id: Some(VOCAB as u32),
+        eos_token_id: Some(0),
         truncation_masking: false,
         lr: 0.05,
         ..TrainerConfig::default()
@@ -1143,7 +1158,7 @@ fn truncation_masking_changes_the_training_signal() {
             group_size: 8,
             max_new_tokens: 3,
             temperature: TEMP,
-            eos_token_id: Some(VOCAB as u32),
+            eos_token_id: Some(0),
             truncation_masking: masking,
             lr: 0.05,
             ..TrainerConfig::default()
