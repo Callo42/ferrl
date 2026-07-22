@@ -85,10 +85,27 @@ impl EvalReport {
     /// This is the difference of two **sampled** Monte-Carlo means (see the module
     /// docs): on a small `group_size` its sign carries sampling noise, so resolve
     /// the gate with a `group_size` large enough for the effect you expect.
+    /// Reports returned by [`evaluate`] guarantee that the difference is
+    /// representable as finite `f32`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a hand-constructed report contains non-finite means or finite
+    /// means whose difference is outside the finite `f32` domain.
     #[must_use]
     pub fn improvement(&self) -> f32 {
-        self.adapter_reward_mean - self.base_reward_mean
+        representable_improvement(self.base_reward_mean, self.adapter_reward_mean).expect(
+            "EvalReport invariant violated: adapter/base reward improvement must be finite f32",
+        )
     }
+}
+
+/// Subtract in a type that covers every pair of finite `f32` rewards, then narrow
+/// only if the result remains representable by the public report API.
+fn representable_improvement(base: f32, adapter: f32) -> Option<f32> {
+    let widened = f64::from(adapter) - f64::from(base);
+    let narrowed = widened as f32;
+    narrowed.is_finite().then_some(narrowed)
 }
 
 /// Errors raised during [`evaluate`].
@@ -134,8 +151,10 @@ pub enum EvalError {
 /// malformed rollout (wrong completion count, no prompt context, a sequence shorter
 /// than the prompt, or a `completion_lens` that does not align with the sequences);
 /// or if a [`RewardFn`] returns a reward count that does not match the number of
-/// completions. Returns [`EvalError::Reward`] if any returned reward is non-finite,
-/// or [`EvalError::Candle`] if generation fails (including a `QwenPolicy` temperature
+/// completions; or if the adapter-minus-base aggregate improvement is outside the
+/// finite `f32` domain exposed by [`EvalReport::improvement`]. Returns
+/// [`EvalError::Reward`] if any returned reward is non-finite, or
+/// [`EvalError::Candle`] if generation fails (including a `QwenPolicy` temperature
 /// mismatch).
 pub fn evaluate<P: Policy, R: RewardFn>(
     policy: &mut P,
@@ -180,6 +199,11 @@ pub fn evaluate<P: Policy, R: RewardFn>(
         .collect();
     let base_reward_mean = validated_mean(&base_means);
     let adapter_reward_mean = validated_mean(&adapter_means);
+    if representable_improvement(base_reward_mean, adapter_reward_mean).is_none() {
+        return Err(EvalError::Contract(format!(
+            "adapter/base reward improvement is outside finite f32: adapter={adapter_reward_mean:e}, base={base_reward_mean:e}"
+        )));
+    }
     Ok(EvalReport {
         n_prompts: n,
         group_size: gen.group_size,
@@ -777,6 +801,52 @@ mod tests {
         .unwrap();
         assert_eq!(report.base_reward_mean, f32::MAX);
         assert_eq!(report.adapter_reward_mean, f32::MAX);
+    }
+
+    struct OppositeExtremeReward {
+        groups: Cell<usize>,
+    }
+
+    impl RewardFn for OppositeExtremeReward {
+        type Target = ();
+
+        fn reward(&self, _sample: &Sample<()>, _completion: &str) -> Result<f32, RewardError> {
+            unreachable!("the opposite-extremes test uses the group seam")
+        }
+
+        fn reward_group(
+            &self,
+            _sample: &Sample<()>,
+            completions: &[String],
+        ) -> Result<Vec<f32>, RewardError> {
+            let group = self.groups.get();
+            self.groups.set(group + 1);
+            let reward = if group == 0 { f32::MIN } else { f32::MAX };
+            Ok(vec![reward; completions.len()])
+        }
+    }
+
+    #[test]
+    fn public_eval_rejects_opposite_extreme_improvement() {
+        let mut policy = ScriptedPolicy::new(0, 1);
+        let reward = OppositeExtremeReward {
+            groups: Cell::new(0),
+        };
+        let error = evaluate(
+            &mut policy,
+            &reward,
+            &DigitCodec,
+            &[Sample::new("5", ())],
+            &gen(2, 2),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(&error, EvalError::Contract(message) if message.contains("outside finite f32")),
+            "got {error:?}"
+        );
+        assert_eq!(reward.groups.get(), 2, "base must score before adapter");
+        assert!(policy.adapter_enabled(), "adapter flag not restored");
     }
 
     struct PermutedHighDynamicReward {

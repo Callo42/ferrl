@@ -85,9 +85,9 @@ use crate::optim::{FerrlAdamW, OptimizerState};
 use crate::policy::{GenConfig, Policy, Rollout, TensorParallelPolicy};
 use crate::reward::{validate_reward_values, RewardError, RewardFn, RewardOutcome};
 use crate::rollout_ledger::{
-    LedgerScoreRequirement, RolloutLedgerControls, RolloutLedgerError, RolloutLedgerExpectations,
-    RolloutLedgerGroup, RolloutLedgerGroupScope, RolloutLedgerIdentity, RolloutLedgerReader,
-    RolloutLedgerRewardStats, RolloutLedgerStep, RolloutLedgerWriter,
+    validate_collected_step, LedgerScoreRequirement, RolloutLedgerControls, RolloutLedgerError,
+    RolloutLedgerExpectations, RolloutLedgerGroup, RolloutLedgerGroupScope, RolloutLedgerIdentity,
+    RolloutLedgerReader, RolloutLedgerRewardStats, RolloutLedgerStep, RolloutLedgerWriter,
 };
 use crate::sample::Sample;
 use crate::telemetry::{
@@ -164,6 +164,19 @@ pub enum TrainerError {
         #[source]
         communication: Box<crate::comm::CommError>,
         /// Exact success/failure detail from panic-contained local truncation.
+        telemetry_rollback: String,
+    },
+    /// Candidate publication lost either its append-status or rollback-status
+    /// collective. The local append/rollback outcome is retained because the
+    /// communicator is dead and candidate telemetry may remain partial.
+    #[error(
+        "candidate publication communication failed ({communication}); {telemetry_rollback}; the distributed execution world is dead and no further collectives are safe; discard the communicator and policy instance"
+    )]
+    CandidateTelemetryComm {
+        /// Terminal collective failure that killed the execution world.
+        #[source]
+        communication: Box<crate::comm::CommError>,
+        /// Exact local append plus panic-contained rollback outcome.
         telemetry_rollback: String,
     },
     /// A separated rollout/learner ledger could not be published or validated.
@@ -2235,10 +2248,12 @@ impl Trainer {
                     &payload_bytes,
                 )?;
             }
-            // The sampler/identity/global-count/payload preflights above prove
-            // the whole collection window before candidate evidence becomes
-            // visible. Publication still precedes the ledger manifest so an I/O
-            // failure cannot coexist with a committed learner artifact.
+            self.validate_rollout_ledger_payload_before_candidates(&payload, execution_comm)?;
+            // The reader-equivalent local and distributed semantic preflight
+            // above proves the whole collection window before candidate evidence
+            // becomes visible. Candidate publication still precedes the ledger
+            // manifest so an I/O failure cannot coexist with a committed learner
+            // artifact.
             self.write_candidate_records(&candidate_records, exec)?;
             if tensor_parallel_world_size > 1 {
                 self.publish_tensor_parallel_rollout_ledger_step(
@@ -2303,6 +2318,22 @@ impl Trainer {
                     )),
                 }
                 Err(TrainerError::TensorParallelExecutionTerminal { operation, detail })
+            }
+            Err(TrainerError::CandidateTelemetryComm {
+                communication,
+                telemetry_rollback,
+            }) => {
+                let rollback = Self::catch_local_distributed_recovery(
+                    "best-effort local rollout-ledger collector rollback",
+                    || Self::restore_rollout_ledger_sampler(policy, &sampler_prestate),
+                );
+                Err(Self::terminal_distributed_comm_failure(
+                    "rollout-ledger candidate publication",
+                    communication.as_ref(),
+                    Some(&telemetry_rollback),
+                    rollback,
+                    "communicator, policy instance, and any partial candidate telemetry",
+                ))
             }
             Err(TrainerError::Comm(comm_error)) => {
                 let rollback = Self::catch_local_distributed_recovery(
@@ -3813,6 +3844,7 @@ impl Trainer {
                 | TrainerError::TensorParallelExecutionTerminal { .. }
                 | TrainerError::PublicationAmbiguousAfterComm { .. }
                 | TrainerError::RolloutLedgerMetricsComm { .. }
+                | TrainerError::CandidateTelemetryComm { .. }
         )
     }
 
@@ -4343,6 +4375,22 @@ impl Trainer {
                     )),
                 }
                 TrainerError::TensorParallelExecutionTerminal { operation, detail }
+            }
+            TrainerError::CandidateTelemetryComm {
+                communication,
+                telemetry_rollback,
+            } => {
+                let rollback = Self::catch_local_distributed_recovery(
+                    "best-effort local direct rollout-group rollback",
+                    restore,
+                );
+                Self::terminal_distributed_comm_failure(
+                    "candidate publication",
+                    communication.as_ref(),
+                    Some(&telemetry_rollback),
+                    rollback,
+                    "communicator, policy instance, and any partial candidate telemetry",
+                )
             }
             error @ (TrainerError::PublicationAmbiguousAfterComm { .. }
             | TrainerError::RolloutLedgerMetricsComm { .. }) => {
@@ -4924,6 +4972,150 @@ impl Trainer {
                 TrainerError::Contract("rollout ledger global live-item count overflows u32".into())
             })?,
         ))
+    }
+
+    /// Re-run the reader's exact local-shard semantics and the distributed
+    /// package checks in memory before candidate evidence becomes visible.
+    /// This deliberately performs no ledger filesystem mutation: a candidate
+    /// communication failure therefore cannot strand a hidden ledger stage.
+    #[allow(clippy::cognitive_complexity)]
+    fn validate_rollout_ledger_payload_before_candidates(
+        &self,
+        payload: &RolloutLedgerStep,
+        execution_comm: &dyn Comm,
+    ) -> Result<(), TrainerError> {
+        let (local_tokens, local_live) = Self::coordinate_comm_result(
+            execution_comm,
+            "rollout-ledger local semantic validation",
+            validate_collected_step(payload).map_err(TrainerError::from),
+        )?;
+        if self.comm.world_size() <= 1 {
+            return Ok(());
+        }
+
+        let (local_tokens, local_live) = self.coordinate_data_parallel_result(
+            "rollout-ledger semantic exact count conversion",
+            (|| {
+                Ok((
+                    exact_u64_as_f64(
+                        "rollout-ledger semantic completion-token count",
+                        local_tokens,
+                    )?,
+                    exact_u64_as_f64(
+                        "rollout-ledger semantic live-item count",
+                        u64::from(local_live),
+                    )?,
+                ))
+            })(),
+        )?;
+        let global_tokens = self.comm.all_reduce_scalar_sum(local_tokens)?;
+        let global_live = self.comm.all_reduce_scalar_sum(local_live)?;
+        let (global_tokens, global_live) = self.coordinate_data_parallel_result(
+            "rollout-ledger distributed semantic counts",
+            (|| {
+                Ok((
+                    exact_reduced_u64(
+                        "rollout-ledger semantic completion-token count",
+                        global_tokens,
+                    )?
+                    .max(1),
+                    exact_reduced_u64("rollout-ledger semantic live-item count", global_live)?,
+                ))
+            })(),
+        )?;
+        self.coordinate_data_parallel_result(
+            "rollout-ledger distributed semantic global counts",
+            if payload.window_tokens == global_tokens
+                && u64::from(payload.live_items) == global_live
+            {
+                Ok(())
+            } else {
+                Err(TrainerError::Contract(format!(
+                    "rollout-ledger global counts {}/{} do not match semantic preflight {global_tokens}/{global_live}",
+                    payload.window_tokens, payload.live_items
+                )))
+            },
+        )?;
+
+        if payload.reward_group_scope != RolloutLedgerGroupScope::DistributedSamePrompt {
+            return Ok(());
+        }
+
+        let prefixes: Vec<(u32, &[u32])> = payload
+            .groups
+            .iter()
+            .map(|group| {
+                let prompt_len = group.prompt_len as usize;
+                (group.prompt_len, &group.token_ids[0][..prompt_len])
+            })
+            .collect();
+        let prefix_bytes = self.coordinate_data_parallel_result(
+            "rollout-ledger distributed same-prompt prefix serialization",
+            serde_json::to_vec(&prefixes).map_err(|error| {
+                TrainerError::Contract(format!(
+                    "serialize distributed same-prompt ledger prefixes: {error}"
+                ))
+            }),
+        )?;
+        Self::require_comm_consensus_bytes(
+            self.comm.as_ref(),
+            "rollout-ledger distributed same-prompt prefixes",
+            &prefix_bytes,
+        )?;
+
+        let rank = self.comm.rank();
+        let world = self.comm.world_size();
+        for (group_index, group) in payload.groups.iter().enumerate() {
+            let global_capacity = world.checked_mul(group.reward_bits.len()).ok_or_else(|| {
+                TrainerError::Contract("distributed reward count overflows usize".into())
+            })?;
+            let mut global_rewards = Vec::with_capacity(global_capacity);
+            for source_rank in 0..world {
+                for &bits in &group.reward_bits {
+                    let contribution = if rank == source_rank {
+                        f64::from(bits)
+                    } else {
+                        0.0
+                    };
+                    let reduced = self.comm.all_reduce_scalar_sum(contribution)?;
+                    let bits = exact_reduced_u64(
+                        "rollout-ledger distributed semantic reward bits",
+                        reduced,
+                    )?;
+                    let bits = u32::try_from(bits).map_err(|_| {
+                        TrainerError::Contract(
+                            "rollout-ledger distributed reward bits exceed u32".into(),
+                        )
+                    })?;
+                    let reward = f32::from_bits(bits);
+                    if !reward.is_finite() {
+                        return Err(TrainerError::Contract(
+                            "rollout-ledger distributed reward must be finite".into(),
+                        ));
+                    }
+                    global_rewards.push(f64::from(reward));
+                }
+            }
+            let moments = finite_moments(&global_rewards);
+            let expected = RolloutLedgerRewardStats {
+                count: u64::try_from(moments.count()).map_err(|_| {
+                    TrainerError::Contract("distributed reward count overflows u64".into())
+                })?,
+                mean_bits: moments.mean().to_bits(),
+                sample_std_bits: moments.sample_std().to_bits(),
+            };
+            self.coordinate_data_parallel_result(
+                "rollout-ledger distributed reward semantics",
+                if group.distributed_reward_stats == Some(expected) {
+                    Ok(())
+                } else {
+                    Err(TrainerError::Contract(format!(
+                        "distributed reward statistics do not match rank-ordered rewards at accumulation group {group_index}"
+                    )))
+                },
+            )?;
+        }
+        Ok(())
     }
 
     #[allow(clippy::cognitive_complexity)]
@@ -6215,6 +6407,23 @@ impl Trainer {
             .collect()
     }
 
+    fn candidate_telemetry_rollback_detail(
+        append: &Result<(), TrainerError>,
+        rollback: &Result<(), TrainerError>,
+    ) -> String {
+        let append = match append {
+            Ok(()) => "local candidate append completed".to_owned(),
+            Err(error) => format!("local candidate append failed ({error})"),
+        };
+        let rollback = match rollback {
+            Ok(()) => "local candidate rollback completed".to_owned(),
+            Err(error) => format!(
+                "local candidate rollback failed ({error}); candidate telemetry may be partial"
+            ),
+        };
+        format!("{append}; {rollback}")
+    }
+
     /// Publish one complete, already-validated accumulation window's candidate
     /// records in accumulation order. TP peers with no local records still join
     /// the side-effect rendezvous when candidate logging is enabled.
@@ -6291,32 +6500,40 @@ impl Trainer {
         let failed_global = match execution_comm.all_reduce_scalar_sum(failed_local) {
             Ok(failed) => failed,
             Err(comm_error) => {
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    self.rollback_candidate_records(boundary)
-                }));
-                return Err(TrainerError::Comm(comm_error));
+                let rollback_local = Self::catch_local_distributed_recovery(
+                    "best-effort local candidate record rollback",
+                    || self.rollback_candidate_records(boundary),
+                );
+                let telemetry_rollback =
+                    Self::candidate_telemetry_rollback_detail(&append_local, &rollback_local);
+                return Err(TrainerError::CandidateTelemetryComm {
+                    communication: Box::new(comm_error),
+                    telemetry_rollback,
+                });
             }
         };
         if failed_global == 0.0 {
             return append_local;
         }
 
-        let rollback_local = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.rollback_candidate_records(boundary)
-        }))
-        .unwrap_or_else(|payload| {
-            Err(TrainerError::Contract(format!(
-                "candidate record rollback panicked: {}",
-                panic_payload_message(payload.as_ref())
-            )))
-        });
+        let rollback_local =
+            Self::catch_local_distributed_recovery("candidate record rollback", || {
+                self.rollback_candidate_records(boundary)
+            });
+        let telemetry_rollback =
+            Self::candidate_telemetry_rollback_detail(&append_local, &rollback_local);
         let rollback = Self::coordinate_comm_result(
             execution_comm,
             "candidate record rollback",
             rollback_local,
         );
         match (append_local, rollback) {
-            (_, Err(TrainerError::Comm(comm_error))) => Err(TrainerError::Comm(comm_error)),
+            (_, Err(TrainerError::Comm(comm_error))) => {
+                Err(TrainerError::CandidateTelemetryComm {
+                    communication: Box::new(comm_error),
+                    telemetry_rollback,
+                })
+            }
             (append, Err(rollback_error)) => Err(TrainerError::Contract(format!(
                 "candidate record write failed on at least one rank (local append: {append:?}); coordinated rollback also failed ({rollback_error}); candidate telemetry may be partial"
             ))),
@@ -10311,9 +10528,14 @@ mod tests {
         logp: Var,
     }
     impl Policy for CandidatePolicy {
-        fn generate(&mut self, _prompt: &[u32], _cfg: &GenConfig) -> CandleResult<Rollout> {
+        fn generate(&mut self, prompt: &[u32], _cfg: &GenConfig) -> CandleResult<Rollout> {
+            let prompt_token = prompt[0];
             Ok(Rollout {
-                token_ids: vec![vec![1, 7, 7], vec![1, 9, 9], vec![1, 2, 2]],
+                token_ids: vec![
+                    vec![prompt_token, 7, 7],
+                    vec![prompt_token, 9, 9],
+                    vec![prompt_token, 2, 2],
+                ],
                 prompt_len: 1,
                 completion_lens: vec![2, 2, 2],
                 rollout_logprobs: None,
@@ -10585,6 +10807,56 @@ mod tests {
         }
     }
 
+    struct MalformedPrefixCandidatePolicy {
+        inner: StatefulCandidatePolicy,
+    }
+
+    impl Policy for MalformedPrefixCandidatePolicy {
+        fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
+            let mut rollout = self.inner.generate(prompt, cfg)?;
+            rollout.token_ids[1][0] ^= 1;
+            Ok(rollout)
+        }
+
+        fn token_logprobs(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+            self.inner.token_logprobs(rollout)
+        }
+
+        fn set_adapter_enabled(&mut self, enabled: bool) {
+            self.inner.set_adapter_enabled(enabled);
+        }
+
+        fn adapter_enabled(&self) -> bool {
+            self.inner.adapter_enabled()
+        }
+
+        fn trainable_vars(&self) -> Vec<Var> {
+            self.inner.trainable_vars()
+        }
+
+        fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+            self.inner.sampler_state()
+        }
+
+        fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
+            self.inner.restore_sampler_state(state)
+        }
+    }
+
+    struct RankedCandidateCodec {
+        prompt_token: u32,
+    }
+
+    impl TokenizerLike for RankedCandidateCodec {
+        fn encode(&self, _text: &str) -> Vec<u32> {
+            vec![self.prompt_token]
+        }
+
+        fn decode(&self, ids: &[u32]) -> String {
+            CandidateCodec.decode(ids)
+        }
+    }
+
     #[derive(Debug)]
     struct ArmedCollectiveFailureState {
         remaining_successes: std::sync::atomic::AtomicUsize,
@@ -10706,6 +10978,166 @@ mod tests {
     }
 
     impl<C: crate::comm::Comm> crate::comm::Comm for FailAtMetricsStatusComm<C> {
+        fn rank(&self) -> usize {
+            self.inner.rank()
+        }
+
+        fn world_size(&self) -> usize {
+            self.inner.world_size()
+        }
+
+        fn validate_all_reduce_sum(
+            &self,
+            tensors: &[Tensor],
+        ) -> Result<(), crate::comm::CommError> {
+            self.inner.validate_all_reduce_sum(tensors)
+        }
+
+        fn all_reduce_sum(&self, tensors: &mut Vec<Tensor>) -> Result<(), crate::comm::CommError> {
+            self.enter()?;
+            self.inner.all_reduce_sum(tensors)
+        }
+
+        fn all_reduce_scalar_sum(&self, value: f64) -> Result<f64, crate::comm::CommError> {
+            self.enter()?;
+            self.inner.all_reduce_scalar_sum(value)
+        }
+    }
+
+    #[derive(Debug)]
+    struct CandidateStatusFailureState {
+        failed: std::sync::atomic::AtomicBool,
+        calls_after_failure: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CandidateStatusFailureState {
+        fn new() -> Self {
+            Self {
+                failed: std::sync::atomic::AtomicBool::new(false),
+                calls_after_failure: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailAtCandidateStatusComm<C> {
+        inner: C,
+        candidates_path: PathBuf,
+        append_boundary: u64,
+        state: std::sync::Arc<CandidateStatusFailureState>,
+    }
+
+    impl<C: crate::comm::Comm> FailAtCandidateStatusComm<C> {
+        fn enter(&self) -> Result<(), crate::comm::CommError> {
+            use std::sync::atomic::Ordering;
+
+            if self.state.failed.load(Ordering::SeqCst) {
+                self.state
+                    .calls_after_failure
+                    .fetch_add(1, Ordering::SeqCst);
+                return Err(crate::comm::CommError::Poisoned(
+                    "collective issued after injected candidate-status failure".into(),
+                ));
+            }
+            if std::fs::metadata(&self.candidates_path)
+                .is_ok_and(|metadata| metadata.len() > self.append_boundary)
+            {
+                self.state.failed.store(true, Ordering::SeqCst);
+                return Err(crate::comm::CommError::Mismatch(
+                    "injected candidate append-status failure".into(),
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    impl<C: crate::comm::Comm> crate::comm::Comm for FailAtCandidateStatusComm<C> {
+        fn rank(&self) -> usize {
+            self.inner.rank()
+        }
+
+        fn world_size(&self) -> usize {
+            self.inner.world_size()
+        }
+
+        fn validate_all_reduce_sum(
+            &self,
+            tensors: &[Tensor],
+        ) -> Result<(), crate::comm::CommError> {
+            self.inner.validate_all_reduce_sum(tensors)
+        }
+
+        fn all_reduce_sum(&self, tensors: &mut Vec<Tensor>) -> Result<(), crate::comm::CommError> {
+            self.enter()?;
+            self.inner.all_reduce_sum(tensors)
+        }
+
+        fn all_reduce_scalar_sum(&self, value: f64) -> Result<f64, crate::comm::CommError> {
+            self.enter()?;
+            self.inner.all_reduce_scalar_sum(value)
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum CandidateRollbackFault {
+        Failure,
+        Panic,
+    }
+
+    #[derive(Debug)]
+    struct CandidateRollbackStatusFailureState {
+        saw_append: std::sync::atomic::AtomicBool,
+        failed: std::sync::atomic::AtomicBool,
+        calls_after_failure: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CandidateRollbackStatusFailureState {
+        fn new() -> Self {
+            Self {
+                saw_append: std::sync::atomic::AtomicBool::new(false),
+                failed: std::sync::atomic::AtomicBool::new(false),
+                calls_after_failure: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailAtCandidateRollbackStatusComm<C> {
+        inner: C,
+        candidates_path: PathBuf,
+        append_boundary: u64,
+        state: std::sync::Arc<CandidateRollbackStatusFailureState>,
+    }
+
+    impl<C: crate::comm::Comm> FailAtCandidateRollbackStatusComm<C> {
+        fn enter(&self) -> Result<(), crate::comm::CommError> {
+            use std::sync::atomic::Ordering;
+
+            if self.state.failed.load(Ordering::SeqCst) {
+                self.state
+                    .calls_after_failure
+                    .fetch_add(1, Ordering::SeqCst);
+                return Err(crate::comm::CommError::Poisoned(
+                    "collective issued after injected candidate-rollback-status failure".into(),
+                ));
+            }
+            let current =
+                std::fs::metadata(&self.candidates_path).map_or(0, |metadata| metadata.len());
+            if current > self.append_boundary {
+                self.state.saw_append.store(true, Ordering::SeqCst);
+                return Ok(());
+            }
+            if current == self.append_boundary && self.state.saw_append.load(Ordering::SeqCst) {
+                self.state.failed.store(true, Ordering::SeqCst);
+                return Err(crate::comm::CommError::Mismatch(
+                    "injected candidate rollback-status failure".into(),
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    impl<C: crate::comm::Comm> crate::comm::Comm for FailAtCandidateRollbackStatusComm<C> {
         fn rank(&self) -> usize {
             self.inner.rank()
         }
@@ -11041,6 +11473,139 @@ mod tests {
     }
 
     #[test]
+    fn separated_malformed_prompt_prefix_is_rejected_before_candidates() {
+        let tmp = WireTmp::new("separated-malformed-prompt-prefix");
+        let run = RunDir::create(&tmp.0, "run").unwrap();
+        let ledger_root = tmp.0.join("ledger");
+        let mut config = candidate_ledger_config();
+        config.candidate_log_top_k = 1;
+        let mut trainer = Trainer::new(config, &run).unwrap();
+        let sentinel = b"preexisting-candidate-bytes\n";
+        std::fs::write(run.candidates_path(), sentinel).unwrap();
+        let mut policy = MalformedPrefixCandidatePolicy {
+            inner: stateful_candidate_policy(),
+        };
+
+        let error = trainer
+            .collect_rollout_ledger_step(
+                0,
+                &mut policy,
+                &CandidateReward,
+                &CandidateCodec,
+                &[Sample::new("prompt", ())],
+                &ledger_root,
+                &"a".repeat(64),
+                None,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            TrainerError::RolloutLedger(RolloutLedgerError::Invalid(message))
+                if message.contains("prompt prefix")
+        ));
+        assert_eq!(policy.inner.sampler, 0);
+        assert_eq!(std::fs::read(run.candidates_path()).unwrap(), sentinel);
+        assert!(!ledger_root.join("step-00000000000000000000").exists());
+    }
+
+    #[test]
+    fn separated_malformed_eos_is_rejected_before_candidates() {
+        let tmp = WireTmp::new("separated-malformed-eos");
+        let run = RunDir::create(&tmp.0, "run").unwrap();
+        let ledger_root = tmp.0.join("ledger");
+        let mut config = candidate_ledger_config();
+        config.candidate_log_top_k = 1;
+        config.eos_token_id = Some(9);
+        let mut trainer = Trainer::new(config, &run).unwrap();
+        let sentinel = b"preexisting-candidate-bytes\n";
+        std::fs::write(run.candidates_path(), sentinel).unwrap();
+        let mut policy = stateful_candidate_policy();
+
+        let error = trainer
+            .collect_rollout_ledger_step(
+                0,
+                &mut policy,
+                &CandidateReward,
+                &CandidateCodec,
+                &[Sample::new("prompt", ())],
+                &ledger_root,
+                &"b".repeat(64),
+                None,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            TrainerError::RolloutLedger(RolloutLedgerError::Invalid(message))
+                if message.contains("first EOS token")
+        ));
+        assert_eq!(policy.sampler, 0);
+        assert_eq!(std::fs::read(run.candidates_path()).unwrap(), sentinel);
+        assert!(!ledger_root.join("step-00000000000000000000").exists());
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn distributed_separated_cross_shard_prefix_mismatch_is_rejected_before_candidates() {
+        let tmp = WireTmp::new("distributed-separated-cross-shard-prefix");
+        let ledger_root = tmp.0.join("ledger");
+        let results = std::thread::scope(|scope| {
+            let handles = crate::comm::LocalComm::world_with_timeout(
+                2,
+                std::time::Duration::from_millis(5_000),
+            )
+            .into_iter()
+            .map(|comm| {
+                let root = tmp.0.clone();
+                let ledger_root = ledger_root.clone();
+                scope.spawn(move || {
+                    let rank = comm.rank();
+                    let run = RunDir::create(&root, format!("rank-{rank}")).unwrap();
+                    let mut config = candidate_ledger_config();
+                    config.candidate_log_top_k = 1;
+                    config.reward_group_scope = RewardGroupScope::DistributedSamePrompt;
+                    let mut trainer = Trainer::with_comm(config, &run, comm).unwrap();
+                    let sentinel = format!("preexisting-rank-{rank}\n").into_bytes();
+                    std::fs::write(run.candidates_path(), &sentinel).unwrap();
+                    let mut policy = stateful_candidate_policy();
+                    let codec = RankedCandidateCodec {
+                        prompt_token: 1 + rank as u32,
+                    };
+                    let result = trainer.collect_rollout_ledger_step(
+                        0,
+                        &mut policy,
+                        &CandidateReward,
+                        &codec,
+                        &[Sample::new("same prompt", ())],
+                        &ledger_root,
+                        &"c".repeat(64),
+                        None,
+                    );
+                    let candidates = std::fs::read(run.candidates_path()).unwrap();
+                    (rank, result, candidates, sentinel, policy.sampler)
+                })
+            })
+            .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        for (rank, result, candidates, sentinel, sampler) in results {
+            let error = result.unwrap_err();
+            assert!(
+                error.to_string().contains("prompt"),
+                "rank {rank} returned {error:?}"
+            );
+            assert_eq!(candidates, sentinel, "rank {rank} changed candidate bytes");
+            assert_eq!(sampler, 0, "rank {rank} sampler was not rolled back");
+        }
+        assert!(!ledger_root.join("step-00000000000000000000").exists());
+    }
+
+    #[test]
     fn candidate_batch_io_failure_rolls_back_partial_world_one_append_before_scoring() {
         let tmp = WireTmp::new("candidate-batch-partial-world-one");
         let run = RunDir::create(&tmp.0, "run").unwrap();
@@ -11127,6 +11692,253 @@ mod tests {
             assert_eq!(candidates, sentinel, "rank {rank} changed candidate bytes");
             assert_eq!(sampler, 0, "rank {rank} sampler was not rolled back");
         }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn direct_candidate_status_comm_failure_preserves_rollback_error_and_panic() {
+        for fault in [
+            CandidateRollbackFault::Failure,
+            CandidateRollbackFault::Panic,
+        ] {
+            let label = match fault {
+                CandidateRollbackFault::Failure => "failure",
+                CandidateRollbackFault::Panic => "panic",
+            };
+            let tmp = WireTmp::new(&format!("candidate-status-{label}"));
+            let results = std::thread::scope(|scope| {
+                crate::comm::LocalComm::world_with_timeout(
+                    2,
+                    std::time::Duration::from_millis(5_000),
+                )
+                .into_iter()
+                .map(|comm| {
+                    let root = tmp.0.clone();
+                    scope.spawn(move || {
+                        let rank = comm.rank();
+                        let run = RunDir::create(&root, format!("rank-{rank}")).unwrap();
+                        let sentinel = format!("candidate-sentinel-{rank}\n").into_bytes();
+                        std::fs::write(run.candidates_path(), &sentinel).unwrap();
+                        let state = std::sync::Arc::new(CandidateStatusFailureState::new());
+                        let wrapped = FailAtCandidateStatusComm {
+                            inner: comm,
+                            candidates_path: run.candidates_path(),
+                            append_boundary: sentinel.len() as u64,
+                            state: std::sync::Arc::clone(&state),
+                        };
+                        let mut config = candidate_ledger_config();
+                        config.candidate_log_top_k = 1;
+                        let mut trainer = Trainer::with_comm(config, &run, wrapped).unwrap();
+                        match fault {
+                            CandidateRollbackFault::Failure => trainer
+                                .candidate_writer
+                                .as_mut()
+                                .unwrap()
+                                .inject_rollback_failure_once(),
+                            CandidateRollbackFault::Panic => trainer
+                                .candidate_writer
+                                .as_mut()
+                                .unwrap()
+                                .inject_rollback_panic_once(),
+                        }
+                        let mut policy = stateful_candidate_policy();
+                        let result = trainer.train(
+                            &mut policy,
+                            &CandidateReward,
+                            &CandidateCodec,
+                            &[Sample::new("prompt", ())],
+                        );
+                        (
+                            rank,
+                            result,
+                            std::fs::read(run.candidates_path()).unwrap(),
+                            sentinel,
+                            policy.sampler,
+                            state
+                                .calls_after_failure
+                                .load(std::sync::atomic::Ordering::SeqCst),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+            });
+
+            for (rank, result, candidates, sentinel, sampler, calls_after_failure) in results {
+                let error = result.unwrap_err();
+                let message = error.to_string();
+                assert!(
+                    message.contains(&format!("injected candidate rollback {label}")),
+                    "rank {rank} lost rollback {label}: {error:?}"
+                );
+                assert!(message.contains("candidate telemetry may be partial"));
+                assert!(message.contains("injected candidate append-status failure"));
+                assert!(candidates.starts_with(&sentinel));
+                assert!(candidates.len() > sentinel.len());
+                assert_eq!(sampler, 0, "rank {rank} sampler was not rolled back");
+                assert_eq!(
+                    calls_after_failure, 0,
+                    "rank {rank} reused a dead communicator"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn candidate_rollback_status_comm_failure_preserves_local_append_and_rollback() {
+        let tmp = WireTmp::new("candidate-rollback-status-failure");
+        let results = std::thread::scope(|scope| {
+            crate::comm::LocalComm::world_with_timeout(2, std::time::Duration::from_millis(5_000))
+                .into_iter()
+                .map(|comm| {
+                    let root = tmp.0.clone();
+                    scope.spawn(move || {
+                        let rank = comm.rank();
+                        let run = RunDir::create(&root, format!("rank-{rank}")).unwrap();
+                        let sentinel = format!("candidate-sentinel-{rank}\n").into_bytes();
+                        std::fs::write(run.candidates_path(), &sentinel).unwrap();
+                        let state = std::sync::Arc::new(CandidateRollbackStatusFailureState::new());
+                        let wrapped = FailAtCandidateRollbackStatusComm {
+                            inner: comm,
+                            candidates_path: run.candidates_path(),
+                            append_boundary: sentinel.len() as u64,
+                            state: std::sync::Arc::clone(&state),
+                        };
+                        let mut config = candidate_ledger_config();
+                        config.candidate_log_top_k = 1;
+                        let mut trainer = Trainer::with_comm(config, &run, wrapped).unwrap();
+                        if rank == 0 {
+                            trainer
+                                .candidate_writer
+                                .as_mut()
+                                .unwrap()
+                                .inject_batch_append_failure_after_bytes_once(11);
+                        }
+                        let mut policy = stateful_candidate_policy();
+                        let result = trainer.train(
+                            &mut policy,
+                            &CandidateReward,
+                            &CandidateCodec,
+                            &[Sample::new("prompt", ())],
+                        );
+                        (
+                            rank,
+                            result,
+                            std::fs::read(run.candidates_path()).unwrap(),
+                            sentinel,
+                            policy.sampler,
+                            state
+                                .calls_after_failure
+                                .load(std::sync::atomic::Ordering::SeqCst),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        for (rank, result, candidates, sentinel, sampler, calls_after_failure) in results {
+            let error = result.unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains("injected candidate rollback-status failure"));
+            assert!(message.contains("local candidate rollback completed"));
+            if rank == 0 {
+                assert!(message.contains("local candidate append failed"));
+            } else {
+                assert!(message.contains("local candidate append completed"));
+            }
+            assert_eq!(candidates, sentinel, "rank {rank} changed candidate bytes");
+            assert_eq!(sampler, 0, "rank {rank} sampler was not rolled back");
+            assert_eq!(
+                calls_after_failure, 0,
+                "rank {rank} reused a dead communicator"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn separated_candidate_status_comm_failure_preserves_rollback_failure() {
+        let tmp = WireTmp::new("separated-candidate-status-failure");
+        let ledger_root = tmp.0.join("ledger");
+        let results = std::thread::scope(|scope| {
+            crate::comm::LocalComm::world_with_timeout(2, std::time::Duration::from_millis(5_000))
+                .into_iter()
+                .map(|comm| {
+                    let root = tmp.0.clone();
+                    let ledger_root = ledger_root.clone();
+                    scope.spawn(move || {
+                        let rank = comm.rank();
+                        let run = RunDir::create(&root, format!("rank-{rank}")).unwrap();
+                        let sentinel = format!("candidate-sentinel-{rank}\n").into_bytes();
+                        std::fs::write(run.candidates_path(), &sentinel).unwrap();
+                        let state = std::sync::Arc::new(CandidateStatusFailureState::new());
+                        let wrapped = FailAtCandidateStatusComm {
+                            inner: comm,
+                            candidates_path: run.candidates_path(),
+                            append_boundary: sentinel.len() as u64,
+                            state: std::sync::Arc::clone(&state),
+                        };
+                        let mut config = candidate_ledger_config();
+                        config.candidate_log_top_k = 1;
+                        let mut trainer = Trainer::with_comm(config, &run, wrapped).unwrap();
+                        trainer
+                            .candidate_writer
+                            .as_mut()
+                            .unwrap()
+                            .inject_rollback_failure_once();
+                        let mut policy = stateful_candidate_policy();
+                        let result = trainer.collect_rollout_ledger_step(
+                            0,
+                            &mut policy,
+                            &CandidateReward,
+                            &CandidateCodec,
+                            &[Sample::new("prompt", ())],
+                            &ledger_root,
+                            &"d".repeat(64),
+                            None,
+                        );
+                        (
+                            rank,
+                            result,
+                            std::fs::read(run.candidates_path()).unwrap(),
+                            sentinel,
+                            policy.sampler,
+                            state
+                                .calls_after_failure
+                                .load(std::sync::atomic::Ordering::SeqCst),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        for (rank, result, candidates, sentinel, sampler, calls_after_failure) in results {
+            let error = result.unwrap_err();
+            let message = error.to_string();
+            assert!(
+                message.contains("injected candidate rollback failure"),
+                "rank {rank} lost rollback failure: {error:?}"
+            );
+            assert!(message.contains("candidate telemetry may be partial"));
+            assert!(message.contains("injected candidate append-status failure"));
+            assert!(candidates.starts_with(&sentinel));
+            assert!(candidates.len() > sentinel.len());
+            assert_eq!(sampler, 0, "rank {rank} sampler was not rolled back");
+            assert_eq!(
+                calls_after_failure, 0,
+                "rank {rank} reused a dead communicator"
+            );
+        }
+        assert!(!ledger_root.join("step-00000000000000000000").exists());
     }
 
     #[test]
@@ -12088,11 +12900,11 @@ mod tests {
         let ledger_root = tmp.0.join("ledger");
         let final_dir = ledger_root.join("step-00000000000000000000");
         let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        // Arming on the collector's second sampler snapshot leaves exactly 21
+        // Arming on the collector's second sampler snapshot leaves exactly 27
         // successful collectives through shard status; the next call is the
         // manifest-publication status reduction and must fail on both ranks.
         let states: Vec<_> = (0..2)
-            .map(|_| std::sync::Arc::new(ArmedCollectiveFailureState::new(21)))
+            .map(|_| std::sync::Arc::new(ArmedCollectiveFailureState::new(27)))
             .collect();
         let comms =
             crate::comm::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(10));

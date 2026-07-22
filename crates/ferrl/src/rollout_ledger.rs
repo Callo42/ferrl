@@ -1405,6 +1405,17 @@ struct StepValidation {
     live_items: u32,
 }
 
+/// Run the exact reader/writer local-shard semantic validator before candidate
+/// telemetry becomes visible during collection. The returned counts let the
+/// distributed collector reproduce the package-level global-count check in
+/// memory, before any ledger or candidate file is published.
+pub(crate) fn validate_collected_step(
+    step: &RolloutLedgerStep,
+) -> Result<(u64, u32), RolloutLedgerError> {
+    let validation = validate_step(step)?;
+    Ok((validation.completion_tokens, validation.live_items))
+}
+
 #[allow(clippy::cognitive_complexity)] // ordered whole-window preflight is clearest in one pass
 fn validate_step(step: &RolloutLedgerStep) -> Result<StepValidation, RolloutLedgerError> {
     if step.world_size == 0 || step.rank >= step.world_size {
@@ -2423,6 +2434,26 @@ mod tests {
         fs::write(manifest_path, manifest_bytes).unwrap();
     }
 
+    fn forge_distributed_reward_stats(root: &Path, stats: RolloutLedgerRewardStats) {
+        for rank in 0..2 {
+            rewrite_distributed_shard(root, rank, |value| {
+                let scale = value.scale_rewards;
+                let group = &mut value.groups[0];
+                let rewards = group
+                    .reward_bits
+                    .iter()
+                    .map(|&bits| f64::from(f32::from_bits(bits)))
+                    .collect::<Vec<_>>();
+                group.distributed_reward_stats = Some(stats);
+                group.advantage_bits = advantages_from_distributed_stats(&rewards, stats, scale)
+                    .unwrap()
+                    .into_iter()
+                    .map(|advantage| (advantage as f32).to_bits())
+                    .collect();
+            });
+        }
+    }
+
     #[test]
     fn atomic_round_trip_preserves_exact_window() {
         let tmp = TempDir::new("roundtrip");
@@ -3037,6 +3068,63 @@ mod tests {
                 .unwrap()
                 .read_distributed_step(7, 0, 2),
                 Err(RolloutLedgerError::Invalid(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn distributed_reader_recomputes_identically_forged_reward_moments() {
+        let canonical = distributed_step(0, RolloutLedgerGroupScope::DistributedSamePrompt).groups
+            [0]
+        .distributed_reward_stats
+        .unwrap();
+        let forgeries = [
+            (
+                "mean",
+                RolloutLedgerRewardStats {
+                    mean_bits: 2.25_f64.to_bits(),
+                    ..canonical
+                },
+            ),
+            (
+                "sample-std",
+                RolloutLedgerRewardStats {
+                    sample_std_bits: 1.0_f64.to_bits(),
+                    ..canonical
+                },
+            ),
+        ];
+        for (index, (label, forged)) in forgeries.into_iter().enumerate() {
+            let tmp = TempDir::new(&format!("distributed-forged-{label}"));
+            let (_, shards) = publish_distributed(
+                &tmp.0,
+                RolloutLedgerGroupScope::DistributedSamePrompt,
+                120 + index as u64,
+            );
+            forge_distributed_reward_stats(&tmp.0, forged);
+
+            let dir = tmp.0.join(step_dir_name(7));
+            for rank in 0..2 {
+                let payload: RolloutLedgerStep = serde_json::from_slice(
+                    &fs::read(dir.join(distributed_payload_name(rank))).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(payload.groups[0].distributed_reward_stats, Some(forged));
+                validate_step(&payload).unwrap();
+            }
+
+            assert!(matches!(
+                RolloutLedgerReader::open(
+                    &tmp.0,
+                    RolloutLedgerExpectations {
+                        identity: identity(),
+                        controls: controls_from_step(&shards[0]),
+                    },
+                )
+                .unwrap()
+                .read_distributed_step(7, 0, 2),
+                Err(RolloutLedgerError::Invalid(message))
+                    if message.contains("reward statistics do not match shard rewards")
             ));
         }
     }

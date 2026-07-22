@@ -724,6 +724,10 @@ pub struct CandidateWriter {
     file: File,
     #[cfg(test)]
     fail_next_batch_after_bytes: Option<usize>,
+    #[cfg(test)]
+    fail_next_rollback: bool,
+    #[cfg(test)]
+    panic_next_rollback: bool,
 }
 
 impl CandidateWriter {
@@ -744,6 +748,10 @@ impl CandidateWriter {
             file,
             #[cfg(test)]
             fail_next_batch_after_bytes: None,
+            #[cfg(test)]
+            fail_next_rollback: false,
+            #[cfg(test)]
+            panic_next_rollback: false,
         })
     }
 
@@ -817,6 +825,17 @@ impl CandidateWriter {
     /// Roll a failed publication back only when this stream grew. Never extend a
     /// stream that was externally shortened while publication was in flight.
     pub(crate) fn rollback_to(&mut self, boundary: u64) -> Result<(), TelemetryError> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.panic_next_rollback) {
+            panic!("injected candidate rollback panic");
+        }
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_rollback) {
+            return Err(TelemetryError::io(
+                &self.path,
+                io::Error::other("injected candidate rollback failure"),
+            ));
+        }
         let current = self.current_len()?;
         match current.cmp(&boundary) {
             std::cmp::Ordering::Less => Err(TelemetryError::io(
@@ -840,6 +859,16 @@ impl CandidateWriter {
     #[cfg(test)]
     pub(crate) fn inject_batch_append_failure_after_bytes_once(&mut self, bytes: usize) {
         self.fail_next_batch_after_bytes = Some(bytes);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_rollback_failure_once(&mut self) {
+        self.fail_next_rollback = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_rollback_panic_once(&mut self) {
+        self.panic_next_rollback = true;
     }
 
     /// The path this writer appends to.
