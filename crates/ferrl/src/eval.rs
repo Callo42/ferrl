@@ -47,8 +47,9 @@
 //! never reaches the [`RewardFn`]; with `eos_token_id == None` every length is the
 //! full width and decoding is the entire post-prompt slice, unchanged.
 
+use crate::grpo::finite_moments;
 use crate::policy::{GenConfig, Policy, Rollout};
-use crate::reward::{RewardError, RewardFn};
+use crate::reward::{validate_reward_values, RewardError, RewardFn};
 use crate::sample::Sample;
 use crate::trainer::TokenizerLike;
 
@@ -84,10 +85,27 @@ impl EvalReport {
     /// This is the difference of two **sampled** Monte-Carlo means (see the module
     /// docs): on a small `group_size` its sign carries sampling noise, so resolve
     /// the gate with a `group_size` large enough for the effect you expect.
+    /// Reports returned by [`evaluate`] guarantee that the difference is
+    /// representable as finite `f32`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a hand-constructed report contains non-finite means or finite
+    /// means whose difference is outside the finite `f32` domain.
     #[must_use]
     pub fn improvement(&self) -> f32 {
-        self.adapter_reward_mean - self.base_reward_mean
+        representable_improvement(self.base_reward_mean, self.adapter_reward_mean).expect(
+            "EvalReport invariant violated: adapter/base reward improvement must be finite f32",
+        )
     }
+}
+
+/// Subtract in a type that covers every pair of finite `f32` rewards, then narrow
+/// only if the result remains representable by the public report API.
+fn representable_improvement(base: f32, adapter: f32) -> Option<f32> {
+    let widened = f64::from(adapter) - f64::from(base);
+    let narrowed = widened as f32;
+    narrowed.is_finite().then_some(narrowed)
 }
 
 /// Errors raised during [`evaluate`].
@@ -96,12 +114,12 @@ pub enum EvalError {
     /// The policy forward or sampling failed.
     #[error("candle error: {0}")]
     Candle(#[from] candle_core::Error),
-    /// The caller passed no prompts, or a prompt encoded to zero tokens (a policy
-    /// reading the last prompt position would underflow).
+    /// The caller passed a zero generation budget or no prompts, a prompt encoded
+    /// to zero tokens, or a policy/reward result violated the evaluation contract.
     #[error("eval contract violation: {0}")]
     Contract(String),
-    /// A [`RewardFn`] could not compute a reward — its (possibly external)
-    /// verifier failed.
+    /// A [`RewardFn`] could not compute a finite reward — its (possibly external)
+    /// verifier failed or returned a non-finite value.
     #[error(transparent)]
     Reward(#[from] RewardError),
 }
@@ -110,13 +128,11 @@ pub enum EvalError {
 /// mean reward of each.
 ///
 /// For each prompt, `group_size` completions are sampled with the adapter
-/// disabled and another `group_size` with it enabled; the mean of the **finite**
-/// rewards of each group is the per-prompt score (a group with no finite reward
-/// scores `0`, so a prompt whose generation wholly failed counts as a `0` rather
-/// than a dropped prompt). The aggregate `*_reward_mean` fields are the unweighted
-/// mean over prompts of those per-prompt scores. The adapter-enabled flag is
-/// restored to its entry value before returning — on success, on a returned error,
-/// and on a panic (an RAII guard).
+/// disabled and another `group_size` with it enabled; every reward must be finite,
+/// and the mean of the complete group is the per-prompt score. The aggregate
+/// `*_reward_mean` fields are the unweighted mean over prompts of those per-prompt
+/// scores. The adapter-enabled flag is restored to its entry value before returning
+/// — on success, on a returned error, and on a panic (an RAII guard).
 ///
 /// `gen` drives [`Policy::generate`]. For a [`crate::QwenPolicy`], `gen.temperature`
 /// **must** equal the temperature the policy was built with — that policy bakes its
@@ -128,14 +144,18 @@ pub enum EvalError {
 ///
 /// # Errors
 ///
-/// Returns [`EvalError::Contract`] if `samples` is empty; if a prompt encodes to zero
-/// tokens; if the policy cannot disable its adapter (a full-fine-tuning policy has no
-/// frozen base to compare against — the comparison would be the policy vs. itself);
-/// if a policy returns a malformed rollout (wrong completion count, no prompt
-/// context, a sequence shorter than the prompt, or a `completion_lens` that does not
-/// align with the sequences); or if a [`RewardFn`] returns a reward count that does
-/// not match the number of completions; or [`EvalError::Candle`] if generation fails
-/// (including a `QwenPolicy` temperature mismatch).
+/// Returns [`EvalError::Contract`] if `group_size` or `max_new_tokens` is zero; if
+/// `samples` is empty; if a prompt encodes to zero tokens; if the policy cannot
+/// disable its adapter (a full-fine-tuning policy has no frozen base to compare
+/// against — the comparison would be the policy vs. itself); if a policy returns a
+/// malformed rollout (wrong completion count, no prompt context, a sequence shorter
+/// than the prompt, or a `completion_lens` that does not align with the sequences);
+/// or if a [`RewardFn`] returns a reward count that does not match the number of
+/// completions; or if the adapter-minus-base aggregate improvement is outside the
+/// finite `f32` domain exposed by [`EvalReport::improvement`]. Returns
+/// [`EvalError::Reward`] if any returned reward is non-finite, or
+/// [`EvalError::Candle`] if generation fails (including a `QwenPolicy` temperature
+/// mismatch).
 pub fn evaluate<P: Policy, R: RewardFn>(
     policy: &mut P,
     reward_fn: &R,
@@ -143,6 +163,12 @@ pub fn evaluate<P: Policy, R: RewardFn>(
     samples: &[Sample<R::Target>],
     gen: &GenConfig,
 ) -> Result<EvalReport, EvalError> {
+    if gen.group_size == 0 {
+        return Err(EvalError::Contract("group_size must be >= 1".into()));
+    }
+    if gen.max_new_tokens == 0 {
+        return Err(EvalError::Contract("max_new_tokens must be >= 1".into()));
+    }
     if samples.is_empty() {
         return Err(EvalError::Contract("no eval samples".into()));
     }
@@ -166,8 +192,18 @@ pub fn evaluate<P: Policy, R: RewardFn>(
     let per_prompt = score_all(guard.policy, reward_fn, tokenizer, samples, gen)?;
 
     let n = per_prompt.len();
-    let base_reward_mean = per_prompt.iter().map(|p| p.base_mean).sum::<f32>() / n as f32;
-    let adapter_reward_mean = per_prompt.iter().map(|p| p.adapter_mean).sum::<f32>() / n as f32;
+    let base_means: Vec<f32> = per_prompt.iter().map(|prompt| prompt.base_mean).collect();
+    let adapter_means: Vec<f32> = per_prompt
+        .iter()
+        .map(|prompt| prompt.adapter_mean)
+        .collect();
+    let base_reward_mean = validated_mean(&base_means);
+    let adapter_reward_mean = validated_mean(&adapter_means);
+    if representable_improvement(base_reward_mean, adapter_reward_mean).is_none() {
+        return Err(EvalError::Contract(format!(
+            "adapter/base reward improvement is outside finite f32: adapter={adapter_reward_mean:e}, base={base_reward_mean:e}"
+        )));
+    }
     Ok(EvalReport {
         n_prompts: n,
         group_size: gen.group_size,
@@ -224,7 +260,7 @@ fn score_all<P: Policy, R: RewardFn>(
     Ok(per_prompt)
 }
 
-/// Sample one group for `sample` and return the mean of its finite rewards.
+/// Sample one group for `sample` and return the mean of all validated rewards.
 fn mean_reward<P: Policy, R: RewardFn>(
     policy: &mut P,
     reward_fn: &R,
@@ -261,7 +297,8 @@ fn mean_reward<P: Policy, R: RewardFn>(
             completions.len()
         )));
     }
-    Ok(finite_mean(&rewards))
+    validate_reward_values(&rewards)?;
+    Ok(validated_mean(&rewards))
 }
 
 /// Reject a malformed rollout the same way the trainer's `completion_dims` does, so
@@ -356,21 +393,18 @@ fn validate_completion_lens(rollout: &Rollout, group_size: usize) -> Result<(), 
     Ok(())
 }
 
-/// Mean of the finite rewards (non-finite rewards are dropped, mirroring the
-/// trainer's group statistics); an all-non-finite group contributes `0`.
-fn finite_mean(rewards: &[f32]) -> f32 {
-    let finite: Vec<f32> = rewards.iter().copied().filter(|r| r.is_finite()).collect();
-    if finite.is_empty() {
-        return 0.0;
-    }
-    finite.iter().sum::<f32>() / finite.len() as f32
+/// Mean of a reward group that has already passed [`validate_reward_values`].
+fn validated_mean(rewards: &[f32]) -> f32 {
+    debug_assert!(rewards.iter().all(|reward| reward.is_finite()));
+    let widened: Vec<f64> = rewards.iter().map(|&reward| f64::from(reward)).collect();
+    finite_moments(&widened).mean() as f32
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use candle_core::{DType, Device, Result as CandleResult, Tensor, Var};
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
 
     /// A deterministic [`Policy`] for testing the harness in isolation (no model,
     /// no sampling): every completion token is `base_tok` when the adapter is off
@@ -628,6 +662,22 @@ mod tests {
         assert!(matches!(err, EvalError::Contract(_)), "got {err:?}");
     }
 
+    #[test]
+    fn rejects_zero_eval_budgets_before_policy_mutation() {
+        let samples = vec![Sample::new("5", ())];
+        for cfg in [gen(0, 2), gen(2, 0)] {
+            let mut policy = ScriptedPolicy::new(0, 1);
+            let err =
+                evaluate(&mut policy, &DigitSumReward, &DigitCodec, &samples, &cfg).unwrap_err();
+            assert!(matches!(err, EvalError::Contract(_)), "got {err:?}");
+            assert!(
+                policy.toggles.borrow().is_empty(),
+                "invalid public eval budgets must fail before adapter mutation"
+            );
+            assert!(policy.adapter_enabled());
+        }
+    }
+
     /// A policy whose adapter cannot be disabled — the full-fine-tuning shape
     /// (`set_adapter_enabled` is a no-op that stays enabled). The harness must
     /// fail loud BEFORE any generation: a base-vs-trained report over such a
@@ -722,11 +772,129 @@ mod tests {
     }
 
     #[test]
-    fn finite_mean_drops_non_finite_rewards() {
-        assert_eq!(finite_mean(&[1.0, 3.0]), 2.0);
-        assert_eq!(finite_mean(&[1.0, f32::NAN, 3.0]), 2.0);
-        assert_eq!(finite_mean(&[f32::INFINITY, f32::NAN]), 0.0);
-        assert_eq!(finite_mean(&[]), 0.0);
+    fn validated_mean_uses_every_reward() {
+        assert_eq!(validated_mean(&[1.0, 3.0]), 2.0);
+        assert_eq!(validated_mean(&[f32::MAX, f32::MAX]), f32::MAX);
+        assert_eq!(validated_mean(&[]), 0.0);
+    }
+
+    struct MaxFiniteReward;
+
+    impl RewardFn for MaxFiniteReward {
+        type Target = ();
+
+        fn reward(&self, _sample: &Sample<()>, _completion: &str) -> Result<f32, RewardError> {
+            Ok(f32::MAX)
+        }
+    }
+
+    #[test]
+    fn public_eval_aggregate_stays_finite_for_extreme_finite_rewards() {
+        let mut policy = ScriptedPolicy::new(0, 1);
+        let report = evaluate(
+            &mut policy,
+            &MaxFiniteReward,
+            &DigitCodec,
+            &[Sample::new("5", ()), Sample::new("6", ())],
+            &gen(2, 2),
+        )
+        .unwrap();
+        assert_eq!(report.base_reward_mean, f32::MAX);
+        assert_eq!(report.adapter_reward_mean, f32::MAX);
+    }
+
+    struct OppositeExtremeReward {
+        groups: Cell<usize>,
+    }
+
+    impl RewardFn for OppositeExtremeReward {
+        type Target = ();
+
+        fn reward(&self, _sample: &Sample<()>, _completion: &str) -> Result<f32, RewardError> {
+            unreachable!("the opposite-extremes test uses the group seam")
+        }
+
+        fn reward_group(
+            &self,
+            _sample: &Sample<()>,
+            completions: &[String],
+        ) -> Result<Vec<f32>, RewardError> {
+            let group = self.groups.get();
+            self.groups.set(group + 1);
+            let reward = if group == 0 { f32::MIN } else { f32::MAX };
+            Ok(vec![reward; completions.len()])
+        }
+    }
+
+    #[test]
+    fn public_eval_rejects_opposite_extreme_improvement() {
+        let mut policy = ScriptedPolicy::new(0, 1);
+        let reward = OppositeExtremeReward {
+            groups: Cell::new(0),
+        };
+        let error = evaluate(
+            &mut policy,
+            &reward,
+            &DigitCodec,
+            &[Sample::new("5", ())],
+            &gen(2, 2),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(&error, EvalError::Contract(message) if message.contains("outside finite f32")),
+            "got {error:?}"
+        );
+        assert_eq!(reward.groups.get(), 2, "base must score before adapter");
+        assert!(policy.adapter_enabled(), "adapter flag not restored");
+    }
+
+    struct PermutedHighDynamicReward {
+        groups: Cell<usize>,
+    }
+
+    impl RewardFn for PermutedHighDynamicReward {
+        type Target = ();
+
+        fn reward(&self, _sample: &Sample<()>, _completion: &str) -> Result<f32, RewardError> {
+            unreachable!("the permutation test uses the group seam")
+        }
+
+        fn reward_group(
+            &self,
+            _sample: &Sample<()>,
+            completions: &[String],
+        ) -> Result<Vec<f32>, RewardError> {
+            assert_eq!(completions.len(), 3);
+            let group = self.groups.get();
+            self.groups.set(group + 1);
+            let magnitude = 2.0_f32.powi(34);
+            Ok(if group == 0 {
+                vec![magnitude, 1.0, -magnitude]
+            } else {
+                vec![magnitude, -magnitude, 1.0]
+            })
+        }
+    }
+
+    #[test]
+    fn public_eval_mean_is_permutation_stable_at_high_dynamic_range() {
+        let mut policy = ScriptedPolicy::new(0, 1);
+        let reward = PermutedHighDynamicReward {
+            groups: Cell::new(0),
+        };
+        let report = evaluate(
+            &mut policy,
+            &reward,
+            &DigitCodec,
+            &[Sample::new("5", ())],
+            &gen(3, 2),
+        )
+        .unwrap();
+
+        assert_eq!(report.base_reward_mean, 1.0 / 3.0);
+        assert_eq!(report.adapter_reward_mean, 1.0 / 3.0);
+        assert_eq!(report.base_reward_mean, report.adapter_reward_mean);
     }
 
     /// The malformed-rollout shapes the harness must reject — one per
@@ -851,6 +1019,87 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, EvalError::Contract(_)), "got {err:?}");
+    }
+
+    struct NonFiniteGroupReward(Vec<f32>);
+    impl RewardFn for NonFiniteGroupReward {
+        type Target = ();
+
+        fn reward(&self, _sample: &Sample<()>, _completion: &str) -> Result<f32, RewardError> {
+            unreachable!("the non-finite reward test uses the group seam")
+        }
+
+        fn reward_group(
+            &self,
+            _sample: &Sample<()>,
+            completions: &[String],
+        ) -> Result<Vec<f32>, RewardError> {
+            assert_eq!(self.0.len(), completions.len());
+            Ok(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn rejects_partial_and_all_nonfinite_eval_rewards() {
+        let samples = vec![Sample::new("5", ())];
+        for rewards in [vec![1.0, f32::NAN], vec![f32::NEG_INFINITY, f32::INFINITY]] {
+            let mut policy = ScriptedPolicy::new(0, 1);
+            let err = evaluate(
+                &mut policy,
+                &NonFiniteGroupReward(rewards),
+                &DigitCodec,
+                &samples,
+                &gen(2, 2),
+            )
+            .unwrap_err();
+            assert!(matches!(err, EvalError::Reward(_)), "got {err:?}");
+            assert!(policy.adapter_enabled(), "adapter flag not restored");
+        }
+    }
+
+    struct AdapterNonFiniteReward {
+        groups: Cell<usize>,
+    }
+
+    impl RewardFn for AdapterNonFiniteReward {
+        type Target = ();
+
+        fn reward(&self, _sample: &Sample<()>, _completion: &str) -> Result<f32, RewardError> {
+            unreachable!("the adapter non-finite test uses the group seam")
+        }
+
+        fn reward_group(
+            &self,
+            _sample: &Sample<()>,
+            completions: &[String],
+        ) -> Result<Vec<f32>, RewardError> {
+            let group = self.groups.get();
+            self.groups.set(group + 1);
+            if group == 0 {
+                Ok(vec![0.0; completions.len()])
+            } else {
+                Ok(vec![f32::NAN, 1.0])
+            }
+        }
+    }
+
+    #[test]
+    fn adapter_nonfinite_reward_cannot_manufacture_eval_improvement() {
+        let mut policy = ScriptedPolicy::new(0, 1);
+        let reward = AdapterNonFiniteReward {
+            groups: Cell::new(0),
+        };
+        let error = evaluate(
+            &mut policy,
+            &reward,
+            &DigitCodec,
+            &[Sample::new("5", ())],
+            &gen(2, 2),
+        )
+        .unwrap_err();
+        assert!(matches!(error, EvalError::Reward(_)), "got {error:?}");
+        assert_eq!(reward.groups.get(), 2, "base must score before adapter");
+        assert!(policy.adapter_enabled(), "adapter flag not restored");
     }
 
     /// A reward whose verifier always fails — to check the error propagates out of

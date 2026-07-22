@@ -26,6 +26,14 @@ use serde_json::Value;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum RewardError {
+    /// A reward function returned `NaN` or infinity instead of a real score.
+    #[error("reward at group index {index} is non-finite: {value:?}")]
+    NonFinite {
+        /// Zero-based reward position inside the scored completion group.
+        index: usize,
+        /// The rejected IEEE-754 value.
+        value: f32,
+    },
     /// The reward could not be computed, described by a message.
     #[error("{0}")]
     Message(String),
@@ -33,6 +41,22 @@ pub enum RewardError {
     /// (sandbox / IO / network / judge).
     #[error("reward verifier failed: {0}")]
     Verifier(#[from] Box<dyn std::error::Error + Send + Sync + 'static>),
+}
+
+/// Reject a scored reward group unless every value is finite.
+///
+/// Training and evaluation call this immediately after checking the one-reward-
+/// per-completion contract, before any value can reach publication, statistics,
+/// advantage construction, metrics, or a distributed continuation decision.
+pub(crate) fn validate_reward_values(rewards: &[f32]) -> Result<(), RewardError> {
+    if let Some((index, &value)) = rewards
+        .iter()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(RewardError::NonFinite { index, value });
+    }
+    Ok(())
 }
 
 impl RewardError {
@@ -80,10 +104,12 @@ impl RewardOutcome {
 
 /// Scores model completions against a typed ground-truth [`Sample`].
 ///
-/// Implementors return one `f32` per completion. Rewards may be any real value
-/// (they need not be normalized or bounded); GRPO normalizes them per group
-/// downstream. A typical implementation reads the typed [`Sample::target`], checks
-/// the completion against it (or a verifier), and returns e.g. `1.0` / `0.0`.
+/// Implementors return one finite `f32` per completion. Rewards may be any real
+/// value (they need not be normalized or bounded), but `NaN` and infinity are
+/// invalid verifier outputs and training/evaluation reject them. GRPO normalizes
+/// valid rewards per group downstream. A typical implementation reads the typed
+/// [`Sample::target`], checks the completion against it (or a verifier), and
+/// returns e.g. `1.0` / `0.0`.
 pub trait RewardFn {
     /// The typed ground-truth target this reward scores against, carried by
     /// [`Sample::target`].
@@ -100,8 +126,8 @@ pub trait RewardFn {
     /// # Errors
     ///
     /// Returns [`RewardError`] if the (possibly external) verifier could not
-    /// produce a score (a sandbox, IO, network, or judge failure) — distinct from
-    /// a merely low reward.
+    /// produce a finite score (a sandbox, IO, network, judge, or non-finite output
+    /// failure) — distinct from a merely low reward.
     fn reward(&self, sample: &Sample<Self::Target>, completion: &str) -> Result<f32, RewardError>;
 
     /// Score a batch of completions sharing one `sample` (a GRPO group).
@@ -114,14 +140,20 @@ pub trait RewardFn {
     ///
     /// # Errors
     ///
-    /// Returns [`RewardError`] if scoring any completion fails; the default
-    /// implementation short-circuits on the first error.
+    /// Returns [`RewardError`] if scoring any completion fails or produces a
+    /// non-finite value; the default implementation short-circuits on the first
+    /// error and validates the completed group.
     fn reward_group(
         &self,
         sample: &Sample<Self::Target>,
         completions: &[String],
     ) -> Result<Vec<f32>, RewardError> {
-        completions.iter().map(|c| self.reward(sample, c)).collect()
+        let rewards = completions
+            .iter()
+            .map(|completion| self.reward(sample, completion))
+            .collect::<Result<Vec<_>, _>>()?;
+        validate_reward_values(&rewards)?;
+        Ok(rewards)
     }
 
     /// Score a batch and optionally explain each score.
@@ -139,11 +171,9 @@ pub trait RewardFn {
         sample: &Sample<Self::Target>,
         completions: &[String],
     ) -> Result<Vec<RewardOutcome>, RewardError> {
-        Ok(self
-            .reward_group(sample, completions)?
-            .into_iter()
-            .map(RewardOutcome::reward)
-            .collect())
+        let rewards = self.reward_group(sample, completions)?;
+        validate_reward_values(&rewards)?;
+        Ok(rewards.into_iter().map(RewardOutcome::reward).collect())
     }
 }
 
@@ -244,5 +274,36 @@ mod tests {
         let err = RewardError::verifier(io);
         assert!(matches!(err, RewardError::Verifier(_)));
         assert!(err.to_string().contains("judge timed out"));
+    }
+
+    struct NonFiniteReward;
+
+    impl RewardFn for NonFiniteReward {
+        type Target = ();
+
+        fn reward(&self, _sample: &Sample<()>, _completion: &str) -> Result<f32, RewardError> {
+            Ok(f32::NAN)
+        }
+    }
+
+    #[test]
+    fn default_group_rejects_nonfinite_single_reward_output() {
+        let error = NonFiniteReward
+            .reward_group(&Sample::new("p", ()), &["x".into()])
+            .unwrap_err();
+        assert!(matches!(error, RewardError::NonFinite { index: 0, .. }));
+    }
+
+    #[test]
+    fn reward_value_validation_rejects_every_nonfinite_class() {
+        validate_reward_values(&[-1.0, 0.0, 2.0]).unwrap();
+        for value in [f32::NAN, f32::NEG_INFINITY, f32::INFINITY] {
+            let error = validate_reward_values(&[1.0, value]).unwrap_err();
+            assert!(matches!(
+                error,
+                RewardError::NonFinite { index: 1, value: rejected }
+                    if rejected.to_bits() == value.to_bits()
+            ));
+        }
     }
 }

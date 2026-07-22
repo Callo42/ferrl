@@ -113,6 +113,13 @@ fn cuda_memory_snapshot_impl() -> Option<GpuMemorySnapshot> {
 /// Errors raised while setting up or writing run telemetry.
 #[derive(Debug, thiserror::Error)]
 pub enum TelemetryError {
+    /// A candidate record carried a non-finite reward and was rejected before
+    /// serialization or file mutation.
+    #[error("candidate reward must be finite, got {value:?}")]
+    NonFiniteCandidateReward {
+        /// Rejected IEEE-754 value.
+        value: f32,
+    },
     /// A filesystem operation (create dir / open / write) failed.
     #[error("telemetry io error at {path}: {source}")]
     Io {
@@ -121,8 +128,8 @@ pub enum TelemetryError {
         /// Underlying I/O error.
         source: io::Error,
     },
-    /// A [`Metrics`] record could not be serialized to JSON.
-    #[error("failed to serialize metrics: {0}")]
+    /// A telemetry record could not be serialized to JSON.
+    #[error("failed to serialize telemetry: {0}")]
     Serialize(#[from] serde_json::Error),
     /// A line of `metrics.jsonl` could not be parsed back into a [`Metrics`]
     /// record (see [`read_metrics`]).
@@ -691,7 +698,9 @@ pub struct CandidateRecord {
 }
 
 impl CandidateRecord {
-    /// A copy with a finite reward so `candidates.jsonl` stays re-readable JSON.
+    /// A copy with a finite reward for callers that explicitly need numerical
+    /// saturation outside [`CandidateWriter`]. The writer itself rejects
+    /// non-finite rewards instead of silently rewriting evidence.
     #[must_use]
     pub fn nan_to_num(&self) -> Self {
         let mut out = self.clone();
@@ -713,6 +722,12 @@ impl CandidateRecord {
 pub struct CandidateWriter {
     path: PathBuf,
     file: File,
+    #[cfg(test)]
+    fail_next_batch_after_bytes: Option<usize>,
+    #[cfg(test)]
+    fail_next_rollback: bool,
+    #[cfg(test)]
+    panic_next_rollback: bool,
 }
 
 impl CandidateWriter {
@@ -728,23 +743,132 @@ impl CandidateWriter {
             .append(true)
             .open(&path)
             .map_err(|e| TelemetryError::io(&path, e))?;
-        Ok(Self { path, file })
+        Ok(Self {
+            path,
+            file,
+            #[cfg(test)]
+            fail_next_batch_after_bytes: None,
+            #[cfg(test)]
+            fail_next_rollback: false,
+            #[cfg(test)]
+            panic_next_rollback: false,
+        })
     }
 
     /// Append one candidate record as a JSON line and flush it.
     ///
     /// # Errors
     ///
-    /// Returns [`TelemetryError`] if serialization or the write/flush fails.
+    /// Returns [`TelemetryError::NonFiniteCandidateReward`] without writing if
+    /// `record.reward` is non-finite, or another [`TelemetryError`] if
+    /// serialization or the write/flush fails.
     pub fn append(&mut self, record: &CandidateRecord) -> Result<(), TelemetryError> {
-        let mut line = serde_json::to_string(&record.nan_to_num())?;
-        line.push('\n');
+        self.append_batch(std::slice::from_ref(record))
+    }
+
+    /// Append one already-validated window as a single serialized byte batch.
+    /// Every record is checked and serialized before the first file write so a
+    /// serialization failure cannot leave a prefix. The caller owns append-
+    /// boundary rollback for I/O failures and distributed peer failures.
+    pub(crate) fn append_batch(
+        &mut self,
+        records: &[CandidateRecord],
+    ) -> Result<(), TelemetryError> {
+        let mut bytes = Vec::new();
+        for record in records {
+            if !record.reward.is_finite() {
+                return Err(TelemetryError::NonFiniteCandidateReward {
+                    value: record.reward,
+                });
+            }
+            serde_json::to_writer(&mut bytes, record)?;
+            bytes.push(b'\n');
+        }
+        #[cfg(test)]
+        if let Some(after_bytes) = self.fail_next_batch_after_bytes.take() {
+            let prefix_len = after_bytes.min(bytes.len());
+            self.file
+                .write_all(&bytes[..prefix_len])
+                .map_err(|error| TelemetryError::io(&self.path, error))?;
+            self.file
+                .flush()
+                .map_err(|error| TelemetryError::io(&self.path, error))?;
+            return Err(TelemetryError::io(
+                &self.path,
+                io::Error::other("injected candidate batch append failure"),
+            ));
+        }
         self.file
-            .write_all(line.as_bytes())
+            .write_all(&bytes)
             .map_err(|e| TelemetryError::io(&self.path, e))?;
         self.file
             .flush()
             .map_err(|e| TelemetryError::io(&self.path, e))
+    }
+
+    /// Return this rank-local stream's exact pre-publication append boundary.
+    pub(crate) fn append_boundary(&mut self) -> Result<u64, TelemetryError> {
+        self.file
+            .flush()
+            .map_err(|error| TelemetryError::io(&self.path, error))?;
+        self.current_len()
+    }
+
+    /// Return the currently visible byte length without mutating the stream.
+    pub(crate) fn current_len(&self) -> Result<u64, TelemetryError> {
+        self.file
+            .metadata()
+            .map(|metadata| metadata.len())
+            .map_err(|error| TelemetryError::io(&self.path, error))
+    }
+
+    /// Roll a failed publication back only when this stream grew. Never extend a
+    /// stream that was externally shortened while publication was in flight.
+    pub(crate) fn rollback_to(&mut self, boundary: u64) -> Result<(), TelemetryError> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.panic_next_rollback) {
+            panic!("injected candidate rollback panic");
+        }
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_rollback) {
+            return Err(TelemetryError::io(
+                &self.path,
+                io::Error::other("injected candidate rollback failure"),
+            ));
+        }
+        let current = self.current_len()?;
+        match current.cmp(&boundary) {
+            std::cmp::Ordering::Less => Err(TelemetryError::io(
+                &self.path,
+                io::Error::other(format!(
+                    "candidate stream shrank from boundary {boundary} to {current} during publication"
+                )),
+            )),
+            std::cmp::Ordering::Equal => Ok(()),
+            std::cmp::Ordering::Greater => {
+                self.file
+                    .set_len(boundary)
+                    .map_err(|error| TelemetryError::io(&self.path, error))?;
+                self.file
+                    .flush()
+                    .map_err(|error| TelemetryError::io(&self.path, error))
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_batch_append_failure_after_bytes_once(&mut self, bytes: usize) {
+        self.fail_next_batch_after_bytes = Some(bytes);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_rollback_failure_once(&mut self) {
+        self.fail_next_rollback = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_rollback_panic_once(&mut self) {
+        self.panic_next_rollback = true;
     }
 
     /// The path this writer appends to.
@@ -2351,7 +2475,7 @@ mod tests {
             world_size: 1,
             prompt_index: 12,
             group_index: 1,
-            reward: f32::NAN,
+            reward: 1.25,
             completion_len_tokens: 42,
             reward_diagnostic: Some("trimul:no_submission".to_string()),
             reward_metadata: Some(serde_json::json!({ "task": "trimul" })),
@@ -2366,7 +2490,7 @@ mod tests {
         let parsed: CandidateRecord = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(parsed.step, 3);
         assert_eq!(parsed.group_index, 1);
-        assert_eq!(parsed.reward, 0.0);
+        assert_eq!(parsed.reward, 1.25);
         assert_eq!(
             parsed.reward_diagnostic.as_deref(),
             Some("trimul:no_submission")
@@ -2376,6 +2500,38 @@ mod tests {
             Some(&serde_json::json!("trimul"))
         );
         assert!(parsed.completion.contains("custom_kernel"));
+    }
+
+    #[test]
+    fn candidate_writer_rejects_nonfinite_rewards_without_writing() {
+        let tmp = TempDir::new("candidates-nonfinite");
+        let rd = RunDir::create(tmp.path(), "run-candidates-nonfinite").unwrap();
+        let mut writer = rd.candidate_writer().unwrap();
+        for reward in [f32::NAN, f32::NEG_INFINITY, f32::INFINITY] {
+            let error = writer
+                .append(&CandidateRecord {
+                    step: 0,
+                    rank: 0,
+                    world_size: 1,
+                    prompt_index: 0,
+                    group_index: 0,
+                    reward,
+                    completion_len_tokens: 1,
+                    reward_diagnostic: None,
+                    reward_metadata: None,
+                    completion: "candidate".into(),
+                })
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                TelemetryError::NonFiniteCandidateReward { value }
+                    if value.to_bits() == reward.to_bits()
+            ));
+        }
+        drop(writer);
+        assert!(std::fs::read_to_string(rd.candidates_path())
+            .unwrap_or_default()
+            .is_empty());
     }
 
     #[test]

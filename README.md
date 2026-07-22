@@ -449,6 +449,13 @@ masked_mean(dapo)   = sum_all(v·m) / max(sum_all(m), 1)        # DAPO active-to
 seq_log_ratio       = sum_t m·(logp-old) / max(sum_t m, 1)     # GSPO sequence-level ratio (log)
 ```
 
+Reward aggregation is widened to `f64` but its supported magnitude remains the
+public reward wire domain, `|reward| <= f32::MAX`. Direct `group_advantages`
+callers that pass non-finite or larger-magnitude `f64` values fail closed before
+moments are computed. Within that explicit domain, compensated canonical sums
+make means, standard deviations, evaluation metrics, and advantages independent
+of completion order.
+
 ---
 
 ## Separated rollout/learner ledger
@@ -494,7 +501,7 @@ proves each live rank-local shard plan matches its communicator. Collection
 rechecks the live identity before publication so a policy that mutates trainable
 state during generation fails closed.
 
-Ledger format v4 carries the collector's checksummed opaque post-rollout sampler
+Ledger format v5 carries the collector's checksummed opaque post-rollout sampler
 blob. The learner installs and byte-verifies it before returning the exact
 post-update chain-bound continuation receipt or appending its metrics row. The explicit
 `save_rollout_ledger_continuation` primitive accepts only that receipt and then publishes
@@ -535,22 +542,26 @@ region: their local errors and panics remain coordinatable over the active DP
 world, so an asymmetric DP rank cannot strand its peers at the next status
 rendezvous. The built-in model policies coordinate their local staging,
 sampling, readback, and telemetry work at every TP collective boundary.
-Because format v4 does not carry
+Because format v5 does not carry
 composable collector performance measurements, the ordinary
 whole-window timing, throughput, GPU-memory, and decoder-cache fields are written
-as explicitly unmeasured rather than populated from learner-only work. Non-finite logprobs,
-advantages, and resolved controls fail closed, while non-finite rewards retain the
-trainer's existing zero-advantage hardening. Unknown ledger manifest and payload
-fields are rejected. Rank-local metrics append is transactional under DP: if
+as explicitly unmeasured rather than populated from learner-only work. Non-finite
+rewards, logprobs, advantages, and resolved controls fail closed; invalid rewards
+are rejected before candidate/ledger publication, statistics, advantages, metrics,
+or learner scoring. Candidate rows are serialized and appended only after the
+complete accumulation window validates; local partial writes and successful peer
+writes are truncated to each rank's exact pre-window boundary if publication
+fails. Unknown ledger manifest and payload fields are rejected.
+Rank-local metrics append is transactional under DP: if
 any rank fails, successful peers truncate to their exact pre-append boundary
 before model, Adam, and sampler rollback.
 
-Format v4 supports world-one, data-parallel, and tensor-parallel separated
+Format v5 supports world-one, data-parallel, and tensor-parallel separated
 execution. With
 `RewardGroupScope::Local`, each shard stores rank-local reward normalization;
 with `DistributedSamePrompt`, shards for one accumulation position bind the same
-prompt prefix and the exact all-reduced reward count/sum/sum-of-squares used to
-derive their advantages. Global completion-token/live-item counts, canonical
+prompt prefix and the exact canonical rank-major reward count/mean/sample-standard-
+deviation used to derive their advantages. Global completion-token/live-item counts, canonical
 rank ordering, global rollout-row bases, and rank-identical sampler state are
 validated before scoring. An empty local shard still joins every global update
 with zero gradients. TP execution retains those logical world-one counts rather

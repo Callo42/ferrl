@@ -8,8 +8,8 @@ formula. The advantage std uses NumPy's ``std(ddof=1)`` (sample / Bessel-
 corrected), which — for the all-finite rewards in this fixture — matches TRL's
 ``nanstd`` and candle's ``Tensor::var``, so a population-vs-sample regression in
 the Rust code would make this fixture disagree (which a same-formula
-reimplementation could not catch). Non-finite rewards are handled by the Rust
-code (``grpo::group_advantages`` skips NaN *and* ±inf), not exercised here.
+reimplementation could not catch). Non-finite rewards are rejected as invalid by
+the Rust code before normalization, not exercised here.
 
 Formulas mirror TRL's ``GRPOTrainer`` / the DeepSeekMath paper:
 

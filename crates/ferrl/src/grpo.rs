@@ -13,8 +13,8 @@
 //! - **Advantages** are group-normalized:
 //!   `A_i = (r_i - mean_g) / (std_g + eps)` with `eps =` [`GROUP_STD_EPS`] and
 //!   `std_g` the *sample* (Bessel-corrected, `ddof = 1`) standard deviation over
-//!   the group — matching TRL's `nanstd` / candle's `Tensor::var` on finite
-//!   rewards (non-finite handling differs; see below). Dividing by the std is the
+//!   the group — matching TRL's `nanstd` / candle's `Tensor::var` for valid
+//!   rewards. Dividing by the std is the
 //!   [`ScaleRewards::Group`] default; [`ScaleRewards::None`] drops it (the
 //!   Dr.GRPO-recommended setting).
 //! - **KL** uses Schulman's k3 estimator `exp(d) - d - 1`, `d = logp_ref - logp`,
@@ -30,16 +30,13 @@
 //!   batch's active-token count. The Dr.GRPO *paper* algorithm is
 //!   `LossType::DrGrpo` **plus** [`ScaleRewards::None`].
 //!
-//! Non-finite inputs are handled defensively — a **deliberate divergence** from
-//! TRL's mainline path (which `nansum`s an all-NaN reward row to `0.0` and then
-//! propagates any remaining `NaN` through the plain `mean`/`std`): here a
-//! `NaN`/`±∞` reward is dropped from its group's mean/std and given a `0`
-//! advantage — note `±∞ → 0`, unlike `torch.nan_to_num`, which maps `±∞` to
-//! finite extremes — so one bad completion cannot poison the group. In [`masked_mean`] a value in a
+//! Non-finite rewards are contract violations and [`group_advantages`] rejects
+//! them instead of manufacturing a zero-advantage or changing the normalization
+//! denominator. Training and evaluation surface those values as typed reward
+//! errors before calling this pure-math boundary. In [`masked_mean`] a value in a
 //! masked-out position is ignored (so `0 · ∞` cannot leak `NaN`) and an all-pad
-//! row contributes `0` to either reduction. Masks must be finite and
-//! non-negative and rows must have width `≥ 1`; violations are caller bugs and
-//! panic.
+//! row contributes `0` to either reduction. Masks must be finite and non-negative
+//! and rows must have width `≥ 1`; violations are caller bugs and panic.
 
 use serde::{Deserialize, Serialize};
 
@@ -167,31 +164,254 @@ pub fn sequence_log_ratio(logp: &[f64], logp_old: &[f64], mask: &[f64]) -> f64 {
     num / denom
 }
 
-/// Sample (Bessel-corrected, `ddof = 1`) mean and standard deviation over the
-/// **finite** entries of a slice.
+/// Canonical, compensated sum of finite values.
 ///
-/// Returns `(mean, std)`. The std divides by `n - 1` where `n` counts only the
-/// finite entries. For **all-finite** input this matches candle's `Tensor::var`
-/// and `numpy.std(ddof=1)`. Non-finite entries (`NaN`, `±∞`) are *all* skipped so
-/// one bad reward cannot poison the group — a deliberate hardening over TRL's
-/// mainline reward path, whose plain `.std()` would propagate them (TRL's
-/// `nanstd` runs only on its non-default multi-reward aggregation path). Fewer
-/// than two finite entries give std `0` (no `0/0`), and none gives `(0, 0)`.
-#[must_use]
-fn mean_std(xs: &[f64]) -> (f64, f64) {
-    let finite: Vec<f64> = xs.iter().copied().filter(|x| x.is_finite()).collect();
-    let n = finite.len();
-    if n == 0 {
-        return (0.0, 0.0);
+/// The partial expansion is the same error-free `hi + lo` construction used by
+/// robust `fsum` implementations. Canonical magnitude/value ordering makes the
+/// result independent of caller order. `None` means the exact sum is outside the
+/// finite `f64` range (or an input was non-finite).
+// The explicit compensated-expansion update is easier to audit in one place
+// than when split across helpers, despite exceeding the default lint budget.
+#[allow(clippy::cognitive_complexity)]
+fn canonical_sum(values: impl IntoIterator<Item = f64>) -> Option<f64> {
+    let mut ordered: Vec<f64> = values.into_iter().collect();
+    if ordered.iter().any(|value| !value.is_finite()) {
+        return None;
     }
-    let mean = finite.iter().sum::<f64>() / n as f64;
-    let std = if n < 2 {
-        0.0
-    } else {
-        let var = finite.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1) as f64;
-        var.sqrt()
+    ordered.sort_by(|left, right| {
+        left.abs()
+            .total_cmp(&right.abs())
+            .then_with(|| left.total_cmp(right))
+    });
+
+    // Remove exact opposite pairs before building the expansion. Besides being
+    // algebraically exact, this prevents equal-magnitude negatives from
+    // overflowing as a prefix before their positive partners are visited. That
+    // matters when the surviving exact sum is only a few subnormal quanta.
+    let mut reduced = Vec::with_capacity(ordered.len());
+    let mut start = 0;
+    while start < ordered.len() {
+        let magnitude_bits = ordered[start].to_bits() & !(1_u64 << 63);
+        let mut end = start;
+        let mut positive = 0_usize;
+        let mut negative = 0_usize;
+        while end < ordered.len() && ordered[end].to_bits() & !(1_u64 << 63) == magnitude_bits {
+            if ordered[end].is_sign_negative() {
+                negative += 1;
+            } else {
+                positive += 1;
+            }
+            end += 1;
+        }
+        let magnitude = f64::from_bits(magnitude_bits);
+        if positive > negative {
+            reduced.extend(std::iter::repeat_n(magnitude, positive - negative));
+        } else if negative > positive {
+            reduced.extend(std::iter::repeat_n(-magnitude, negative - positive));
+        }
+        start = end;
+    }
+
+    let mut partials = Vec::<f64>::with_capacity(reduced.len());
+    for mut value in reduced {
+        let old_len = partials.len();
+        let mut out = 0;
+        for index in 0..old_len {
+            let mut partial = partials[index];
+            if value.abs() < partial.abs() {
+                std::mem::swap(&mut value, &mut partial);
+            }
+            let high = value + partial;
+            if !high.is_finite() {
+                return None;
+            }
+            let low = partial - (high - value);
+            if low != 0.0 {
+                partials[out] = low;
+                out += 1;
+            }
+            value = high;
+        }
+        partials.truncate(out);
+        if value != 0.0 {
+            partials.push(value);
+        }
+    }
+
+    let Some(mut high) = partials.pop() else {
+        return Some(0.0);
     };
-    (mean, std)
+    let mut low = 0.0;
+    while let Some(partial) = partials.pop() {
+        let prior = high;
+        high = prior + partial;
+        if !high.is_finite() {
+            return None;
+        }
+        let rounded_partial = high - prior;
+        low = partial - rounded_partial;
+        if low != 0.0 {
+            break;
+        }
+    }
+    if partials
+        .last()
+        .is_some_and(|next| (low < 0.0 && *next < 0.0) || (low > 0.0 && *next > 0.0))
+    {
+        let doubled = low * 2.0;
+        let rounded = high + doubled;
+        if doubled == rounded - high {
+            high = rounded;
+        }
+    }
+    Some(high)
+}
+
+/// Accurate, permutation-stable moments over a finite reward domain.
+///
+/// The explicit widened-f32 magnitude contract guarantees the canonical sum is
+/// representable in `f64`; the variance second pass operates in maximum-magnitude
+/// units. Identical non-exact values are handled explicitly so they stay exactly
+/// equal to their mean. Empty input is represented as zero moments for
+/// evaluation/metrics aggregation; GRPO itself rejects empty groups before
+/// constructing this value.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FiniteMoments {
+    count: usize,
+    scale: f64,
+    mean: f64,
+    mean_scaled: f64,
+    m2_scaled: f64,
+}
+
+/// Ferrl rewards cross the public task/trainer boundary as `f32`. Arithmetic is
+/// widened to `f64`, but accepting a wider magnitude here would advertise a
+/// domain whose cancellation-safe mean needs an arbitrary-precision accumulator.
+const MAX_REWARD_MAGNITUDE: f64 = f32::MAX as f64;
+
+#[must_use]
+pub(crate) fn finite_moments(values: &[f64]) -> FiniteMoments {
+    assert!(
+        values.iter().all(|value| value.is_finite()),
+        "finite_moments: values must be finite"
+    );
+    assert!(
+        values
+            .iter()
+            .all(|value| value.abs() <= MAX_REWARD_MAGNITUDE),
+        "finite_moments: values must be within the supported finite f32 reward range"
+    );
+    if values.is_empty() {
+        return FiniteMoments {
+            count: 0,
+            scale: 0.0,
+            mean: 0.0,
+            mean_scaled: 0.0,
+            m2_scaled: 0.0,
+        };
+    }
+
+    let count = values.len();
+    let scale = values
+        .iter()
+        .map(|value| value.abs())
+        .fold(0.0_f64, f64::max);
+    if scale == 0.0 {
+        return FiniteMoments {
+            count,
+            scale,
+            mean: 0.0,
+            mean_scaled: 0.0,
+            m2_scaled: 0.0,
+        };
+    }
+
+    if values[1..].iter().all(|value| *value == values[0]) {
+        return FiniteMoments {
+            count,
+            scale,
+            mean: values[0],
+            mean_scaled: values[0] / scale,
+            m2_scaled: 0.0,
+        };
+    }
+
+    let count_f64 = count as f64;
+    // `Vec` length is bounded by `usize`; even on a 64-bit target, summing that
+    // many values no larger than f32::MAX remains far below f64::MAX.
+    let mean = canonical_sum(values.iter().copied())
+        .expect("supported finite reward sum must be representable")
+        / count_f64;
+    let mean_scaled = (mean / scale).clamp(-1.0, 1.0);
+    let m2_scaled = canonical_sum(values.iter().map(|value| {
+        let deviation = value / scale - mean_scaled;
+        deviation * deviation
+    }))
+    .expect("scaled finite reward variance must be representable");
+
+    FiniteMoments {
+        count,
+        scale,
+        mean,
+        mean_scaled,
+        m2_scaled,
+    }
+}
+
+impl FiniteMoments {
+    #[must_use]
+    pub(crate) fn count(self) -> usize {
+        self.count
+    }
+
+    #[must_use]
+    pub(crate) fn mean(self) -> f64 {
+        self.mean
+    }
+
+    #[must_use]
+    pub(crate) fn sample_std(self) -> f64 {
+        if self.count < 2 {
+            0.0
+        } else {
+            (self.m2_scaled / (self.count - 1) as f64).sqrt() * self.scale
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn population_std(self) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else {
+            (self.m2_scaled / self.count as f64).sqrt() * self.scale
+        }
+    }
+
+    #[must_use]
+    fn centered(self, value: f64) -> f64 {
+        let ordinary = value - self.mean;
+        if ordinary.is_finite() || self.scale == 0.0 {
+            ordinary
+        } else {
+            (value / self.scale - self.mean_scaled) * self.scale
+        }
+    }
+
+    #[must_use]
+    fn group_scaled(self, value: f64) -> f64 {
+        let std = self.sample_std();
+        let ordinary = (value - self.mean) / (std + GROUP_STD_EPS);
+        if std.is_finite() && ordinary.is_finite() {
+            return ordinary;
+        }
+        debug_assert!(self.scale > 0.0);
+        let scaled_std = if self.count < 2 {
+            0.0
+        } else {
+            (self.m2_scaled / (self.count - 1) as f64).sqrt()
+        };
+        (value / self.scale - self.mean_scaled) / (scaled_std + GROUP_STD_EPS / self.scale)
+    }
 }
 
 /// Group-normalized advantages for one GRPO group.
@@ -203,36 +423,44 @@ fn mean_std(xs: &[f64]) -> (f64, f64) {
 /// The returned vector has the same length and order as `rewards`. A group of
 /// identical rewards — or a single completion — yields all-zero advantages.
 ///
-/// Non-finite rewards are handled defensively: a `NaN`/`±∞` reward is excluded
-/// from the group mean/std and its own advantage is forced to `0` — note this
-/// maps `±∞ → 0`, *stronger* than `torch.nan_to_num` — so one bad completion
-/// neither crashes the step nor distorts the rest of the group.
-///
 /// # Panics
 ///
-/// Panics if `rewards` is empty: a GRPO group always has at least one
-/// completion, and an empty group is a caller bug, not a runtime condition.
+/// Panics if `rewards` is empty, contains a non-finite value, or contains a value
+/// whose magnitude exceeds `f32::MAX`. Ferrl's public reward wire type is `f32`;
+/// this explicit widened-f32 range keeps aggregation cancellation-safe and
+/// order-stable without advertising unsupported full-range-f64 arithmetic. With
+/// [`ScaleRewards::None`], it also panics if a centered advantage from otherwise
+/// supported values cannot be represented as an `f64`. A GRPO group always has at
+/// least one supported real-valued reward; any input violation is a caller bug.
 #[must_use]
 pub fn group_advantages(rewards: &[f64], scale: ScaleRewards) -> Vec<f64> {
     assert!(!rewards.is_empty(), "group_advantages: empty reward group");
-    let (mean, std) = mean_std(rewards);
-    let denom = match scale {
-        ScaleRewards::None => 1.0,
-        ScaleRewards::Group => std + GROUP_STD_EPS,
+    assert!(
+        rewards.iter().all(|reward| reward.is_finite()),
+        "group_advantages: rewards must be finite"
+    );
+    assert!(
+        rewards
+            .iter()
+            .all(|reward| reward.abs() <= MAX_REWARD_MAGNITUDE),
+        "group_advantages: rewards must be within the supported finite f32 reward range"
+    );
+    let moments = finite_moments(rewards);
+    let advantages: Vec<f64> = match scale {
+        ScaleRewards::None => rewards
+            .iter()
+            .map(|&reward| moments.centered(reward))
+            .collect(),
+        ScaleRewards::Group => rewards
+            .iter()
+            .map(|&reward| moments.group_scaled(reward))
+            .collect(),
     };
-    rewards
-        .iter()
-        .map(|&r| {
-            let a = (r - mean) / denom;
-            // Force any non-finite advantage (NaN or ±inf reward) to 0; this is
-            // stronger than torch.nan_to_num, which maps ±inf to finite extremes.
-            if a.is_finite() {
-                a
-            } else {
-                0.0
-            }
-        })
-        .collect()
+    assert!(
+        advantages.iter().all(|advantage| advantage.is_finite()),
+        "group_advantages: finite rewards produced a non-finite advantage"
+    );
+    advantages
 }
 
 /// Schulman's k3 KL estimator for a single token: `exp(d) - d - 1`, where
@@ -503,6 +731,13 @@ mod tests {
     }
 
     #[test]
+    fn nonexact_identical_rewards_remain_exactly_degenerate() {
+        for scale in [ScaleRewards::Group, ScaleRewards::None] {
+            assert_eq!(group_advantages(&[0.1; 3], scale), vec![0.0; 3]);
+        }
+    }
+
+    #[test]
     fn tis_weight_is_the_truncated_importance_ratio() {
         // On-policy token: ratio exp(0) = 1, untouched by a cap >= 1.
         assert_relative_eq!(tis_weight(-1.5, -1.5, 2.0), 1.0, epsilon = TOL);
@@ -522,32 +757,90 @@ mod tests {
     }
 
     #[test]
-    fn advantages_nan_reward_is_isolated() {
-        // A NaN reward must not poison the group: it gets a 0 advantage, and the
-        // finite rewards are normalized among themselves (mean/std over finite).
-        let adv = group_advantages(&[1.0, f64::NAN, 3.0], ScaleRewards::Group);
-        assert_eq!(adv[1], 0.0, "NaN reward must map to a 0 advantage");
-        assert!(adv[0].is_finite() && adv[2].is_finite());
-        // finite = [1, 3]: mean 2, so advantages are antisymmetric about 0.
-        assert_relative_eq!(adv[0], -adv[2], epsilon = TOL);
-        assert!(adv[0] < 0.0 && adv[2] > 0.0);
+    #[should_panic(expected = "rewards must be finite")]
+    fn advantages_reject_partial_nan_group() {
+        let _ = group_advantages(&[1.0, f64::NAN, 3.0], ScaleRewards::Group);
     }
 
     #[test]
-    fn advantages_all_nan_group_is_all_zero() {
-        // No finite entries -> (mean, std) = (0, 0) -> every advantage is 0.
-        let adv = group_advantages(&[f64::NAN, f64::NAN], ScaleRewards::Group);
-        assert_eq!(adv, vec![0.0, 0.0]);
+    #[should_panic(expected = "rewards must be finite")]
+    fn advantages_reject_all_nan_group() {
+        let _ = group_advantages(&[f64::NAN, f64::NAN], ScaleRewards::Group);
     }
 
     #[test]
-    fn advantages_infinite_reward_maps_to_zero() {
-        // ±inf is excluded from the stats and its own advantage is forced to 0.
-        let adv = group_advantages(&[1.0, f64::INFINITY, 3.0], ScaleRewards::None);
-        assert_eq!(adv[1], 0.0);
-        // finite = [1, 3], mean 2 -> centered advantages -1 and +1.
-        assert_relative_eq!(adv[0], -1.0, epsilon = TOL);
-        assert_relative_eq!(adv[2], 1.0, epsilon = TOL);
+    #[should_panic(expected = "rewards must be finite")]
+    fn advantages_reject_infinite_reward() {
+        let _ = group_advantages(&[1.0, f64::INFINITY, 3.0], ScaleRewards::None);
+    }
+
+    #[test]
+    fn advantages_extreme_identical_finite_group_is_zero() {
+        let magnitude = f64::from(f32::MAX);
+        for scale in [ScaleRewards::Group, ScaleRewards::None] {
+            assert_eq!(
+                group_advantages(&[magnitude, magnitude], scale),
+                vec![0.0; 2]
+            );
+        }
+    }
+
+    #[test]
+    fn advantages_extreme_mixed_finite_group_stay_normalized() {
+        let magnitude = f64::from(f32::MAX);
+        for rewards in [
+            &[magnitude, -magnitude][..],
+            &[magnitude, -magnitude, -magnitude][..],
+        ] {
+            let advantages = group_advantages(rewards, ScaleRewards::Group);
+            assert!(advantages.iter().all(|advantage| advantage.is_finite()));
+            assert!(advantages.iter().any(|advantage| advantage.abs() > 0.5));
+        }
+    }
+
+    #[test]
+    fn advantages_are_permutation_stable_at_high_dynamic_range() {
+        let magnitude = f64::from(f32::MAX);
+        let canonical = [magnitude, 1.0, -magnitude];
+        let permutations = [
+            [magnitude, 1.0, -magnitude],
+            [magnitude, -magnitude, 1.0],
+            [1.0, magnitude, -magnitude],
+            [1.0, -magnitude, magnitude],
+            [-magnitude, magnitude, 1.0],
+            [-magnitude, 1.0, magnitude],
+        ];
+
+        for scale in [ScaleRewards::None, ScaleRewards::Group] {
+            let expected = group_advantages(&canonical, scale);
+            for rewards in permutations {
+                let actual = group_advantages(&rewards, scale);
+                for (reward, advantage) in rewards.into_iter().zip(actual) {
+                    let canonical_index = canonical
+                        .iter()
+                        .position(|candidate| *candidate == reward)
+                        .unwrap();
+                    assert_eq!(advantage, expected[canonical_index]);
+                }
+            }
+        }
+        assert_relative_eq!(
+            group_advantages(&canonical, ScaleRewards::None)[1],
+            2.0 / 3.0,
+            epsilon = 1e-15
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "supported finite f32 reward range")]
+    fn advantages_reject_exactly_cancelling_values_outside_the_supported_range() {
+        let magnitude = f64::MAX;
+        let one_down = f64::from_bits(magnitude.to_bits() - 1);
+        let three_down = f64::from_bits(magnitude.to_bits() - 3);
+        let exact_zero_sum = [
+            magnitude, magnitude, three_down, -one_down, -one_down, -one_down,
+        ];
+        let _ = group_advantages(&exact_zero_sum, ScaleRewards::None);
     }
 
     #[test]
