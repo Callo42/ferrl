@@ -12,10 +12,10 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::grpo::{group_advantages, ScaleRewards, GROUP_STD_EPS};
+use crate::grpo::{finite_moments, group_advantages, ScaleRewards, GROUP_STD_EPS};
 
 /// The only rollout-ledger format this release accepts.
-pub const ROLLOUT_LEDGER_FORMAT_VERSION: u32 = 4;
+pub const ROLLOUT_LEDGER_FORMAT_VERSION: u32 = 5;
 
 const PAYLOAD_FILE: &str = "window.json";
 const MANIFEST_FILE: &str = "manifest.json";
@@ -225,10 +225,10 @@ pub enum RolloutLedgerGroupScope {
 pub struct RolloutLedgerRewardStats {
     /// Number of rewards across the whole same-prompt group.
     pub count: u64,
-    /// Exact f64 bits of the all-reduced reward sum.
-    pub sum_bits: u64,
-    /// Exact f64 bits of the all-reduced squared-reward sum.
-    pub sumsq_bits: u64,
+    /// Exact f64 bits of the canonical rank-major reward mean.
+    pub mean_bits: u64,
+    /// Exact f64 bits of the canonical rank-major sample standard deviation.
+    pub sample_std_bits: u64,
 }
 
 /// Mandatory learner pre-state and structured controls for reading a window.
@@ -1616,35 +1616,17 @@ fn advantages_from_distributed_stats(
     stats: RolloutLedgerRewardStats,
     scale: ScaleRewards,
 ) -> Result<Vec<f64>, RolloutLedgerError> {
-    let sum = f64::from_bits(stats.sum_bits);
-    let sumsq = f64::from_bits(stats.sumsq_bits);
-    if !sum.is_finite() || !sumsq.is_finite() || sumsq < 0.0 {
+    let mean = f64::from_bits(stats.mean_bits);
+    let sample_std = f64::from_bits(stats.sample_std_bits);
+    if stats.count == 0 || !mean.is_finite() || !sample_std.is_finite() || sample_std < 0.0 {
         return Err(RolloutLedgerError::Invalid(
-            "distributed reward statistics must be finite with nonnegative sumsq".into(),
+            "distributed reward moments require a positive count, finite mean, and finite nonnegative sample std"
+                .into(),
         ));
     }
-    if stats.count == 0 && (sum != 0.0 || sumsq != 0.0) {
-        return Err(RolloutLedgerError::Invalid(
-            "empty distributed reward statistics must have zero sums".into(),
-        ));
-    }
-    let count = stats.count as f64;
-    let (mean, std) = if count == 0.0 {
-        (0.0, 0.0)
-    } else {
-        let mean = sum / count;
-        let std = if count < 2.0 {
-            0.0
-        } else {
-            ((sumsq - (sum * sum / count)) / (count - 1.0))
-                .max(0.0)
-                .sqrt()
-        };
-        (mean, std)
-    };
     let denominator = match scale {
         ScaleRewards::None => 1.0,
-        ScaleRewards::Group => std + GROUP_STD_EPS,
+        ScaleRewards::Group => sample_std + GROUP_STD_EPS,
     };
     rewards
         .iter()
@@ -1660,15 +1642,6 @@ fn advantages_from_distributed_stats(
             }
         })
         .collect()
-}
-
-fn local_reward_stats(rewards: &[u32]) -> (u64, f64, f64) {
-    rewards
-        .iter()
-        .map(|&bits| f64::from(f32::from_bits(bits)))
-        .fold((0_u64, 0.0, 0.0), |(count, sum, sumsq), reward| {
-            (count + 1, sum + reward, sumsq + reward * reward)
-        })
 }
 
 fn validate_distributed_packages(
@@ -1731,9 +1704,7 @@ fn validate_distributed_packages(
                         "distributed same-prompt group is missing reward statistics".into(),
                     )
                 })?;
-            let mut count = 0_u64;
-            let mut sums = Vec::with_capacity(packages.len());
-            let mut sumsqs = Vec::with_capacity(packages.len());
+            let mut global_rewards = Vec::new();
             let canonical_prompt_len = packages[0].0.groups[group_index].prompt_len;
             let canonical_prompt = {
                 let group = &packages[0].0.groups[group_index];
@@ -1753,16 +1724,20 @@ fn validate_distributed_packages(
                         "distributed same-prompt prefixes disagree at accumulation group {group_index}"
                     )));
                 }
-                let (local_count, local_sum, local_sumsq) = local_reward_stats(&group.reward_bits);
-                count = count.checked_add(local_count).ok_or_else(|| {
-                    RolloutLedgerError::Invalid("distributed reward count overflow".into())
-                })?;
-                sums.push(local_sum);
-                sumsqs.push(local_sumsq);
+                global_rewards.extend(
+                    group
+                        .reward_bits
+                        .iter()
+                        .map(|&bits| f64::from(f32::from_bits(bits))),
+                );
             }
-            if canonical.count != count
-                || !plausible_reduced_sum(f64::from_bits(canonical.sum_bits), &sums)
-                || !plausible_reduced_sum(f64::from_bits(canonical.sumsq_bits), &sumsqs)
+            let moments = finite_moments(&global_rewards);
+            let expected_count = u64::try_from(moments.count()).map_err(|_| {
+                RolloutLedgerError::Invalid("distributed reward count overflows u64".into())
+            })?;
+            if canonical.count != expected_count
+                || canonical.mean_bits != moments.mean().to_bits()
+                || canonical.sample_std_bits != moments.sample_std().to_bits()
             {
                 return Err(RolloutLedgerError::Invalid(format!(
                     "distributed reward statistics do not match shard rewards at accumulation group {group_index}"
@@ -1771,23 +1746,6 @@ fn validate_distributed_packages(
         }
     }
     Ok(())
-}
-
-fn plausible_reduced_sum(actual: f64, contributions: &[f64]) -> bool {
-    if !actual.is_finite() || contributions.iter().any(|value| !value.is_finite()) {
-        return false;
-    }
-    let expected = contributions
-        .iter()
-        .copied()
-        .fold(0.0, |sum, value| sum + value);
-    if actual.to_bits() == expected.to_bits() {
-        return true;
-    }
-    let magnitude = contributions.iter().map(|value| value.abs()).sum::<f64>();
-    let tolerance =
-        (contributions.len().max(1) as f64 * f64::EPSILON * magnitude * 8.0).max(f64::MIN_POSITIVE);
-    (actual - expected).abs() <= tolerance
 }
 
 #[allow(clippy::too_many_arguments)] // the row contract is clearer with named source fields
@@ -1815,8 +1773,17 @@ fn validate_group_row(
         )));
     }
     validate_completion_tokens(step, row, &tokens[prompt_len..], real)?;
+    let expected_narrowed = expected_advantage as f32;
+    if !expected_advantage.is_finite()
+        || !expected_narrowed.is_finite()
+        || (expected_advantage != 0.0 && expected_narrowed == 0.0)
+    {
+        return Err(RolloutLedgerError::Invalid(format!(
+            "derived advantage row {row} is not representable as a finite nonzero-preserving f32"
+        )));
+    }
     let advantage = finite_f32(group.advantage_bits[row], &format!("advantage row {row}"))?;
-    if advantage.to_bits() != (expected_advantage as f32).to_bits() {
+    if advantage.to_bits() != expected_narrowed.to_bits() {
         return Err(RolloutLedgerError::Invalid(format!(
             "advantage row {row} does not match rewards"
         )));
@@ -2378,10 +2345,12 @@ mod tests {
             } else {
                 vec![3.0_f32, 4.0]
             };
+            let global_rewards = [1.0_f64, 2.0, 3.0, 4.0];
+            let moments = finite_moments(&global_rewards);
             let stats = RolloutLedgerRewardStats {
                 count: 4,
-                sum_bits: 10.0_f64.to_bits(),
-                sumsq_bits: 30.0_f64.to_bits(),
+                mean_bits: moments.mean().to_bits(),
+                sample_std_bits: moments.sample_std().to_bits(),
             };
             value.groups[0].reward_bits = rewards.iter().copied().map(f32::to_bits).collect();
             value.groups[0].distributed_reward_stats = Some(stats);
@@ -2822,6 +2791,60 @@ mod tests {
     }
 
     #[test]
+    fn distributed_high_dynamic_moments_roundtrip_in_rank_major_order() {
+        let tmp = TempDir::new("distributed-high-dynamic-moments");
+        let magnitude = f32::MAX;
+        let reward_shards = [[magnitude, 1.0_f32], [-magnitude, 0.0_f32]];
+        let global_rewards: Vec<f64> = reward_shards
+            .iter()
+            .flatten()
+            .copied()
+            .map(f64::from)
+            .collect();
+        let moments = finite_moments(&global_rewards);
+        assert_eq!(moments.mean(), 0.25);
+        let stats = RolloutLedgerRewardStats {
+            count: 4,
+            mean_bits: moments.mean().to_bits(),
+            sample_std_bits: moments.sample_std().to_bits(),
+        };
+        let mut shards = [
+            distributed_step(0, RolloutLedgerGroupScope::DistributedSamePrompt),
+            distributed_step(1, RolloutLedgerGroupScope::DistributedSamePrompt),
+        ];
+        for (shard, rewards) in shards.iter_mut().zip(reward_shards) {
+            shard.scale_rewards = ScaleRewards::None;
+            shard.groups[0].reward_bits = rewards.into_iter().map(f32::to_bits).collect();
+            shard.groups[0].distributed_reward_stats = Some(stats);
+            shard.groups[0].advantage_bits = rewards
+                .into_iter()
+                .map(|reward| (f64::from(reward) - moments.mean()) as f32)
+                .map(f32::to_bits)
+                .collect();
+        }
+        let writer = RolloutLedgerWriter::create(&tmp.0, identity()).unwrap();
+        let stage = writer.create_distributed_stage(7, 2, 120).unwrap();
+        for shard in &shards {
+            writer.write_distributed_shard(stage.path(), shard).unwrap();
+        }
+        writer
+            .commit_distributed_stage(&stage, 7, 2, &controls_from_step(&shards[0]))
+            .unwrap();
+        for rank in 0..2 {
+            RolloutLedgerReader::open(
+                &tmp.0,
+                RolloutLedgerExpectations {
+                    identity: identity(),
+                    controls: controls_from_step(&shards[0]),
+                },
+            )
+            .unwrap()
+            .read_distributed_step(7, rank, 2)
+            .unwrap();
+        }
+    }
+
+    #[test]
     fn distributed_staged_manifest_fence_failure_cleans_and_retries() {
         let tmp = TempDir::new("distributed-staged-manifest-fence");
         let writer = RolloutLedgerWriter::create(&tmp.0, identity()).unwrap();
@@ -2987,6 +3010,13 @@ mod tests {
             |value| value.window_tokens += 1,
             |value| value.world_size = 3,
             |value| value.rank = 0,
+            |value| {
+                value.groups[0]
+                    .distributed_reward_stats
+                    .as_mut()
+                    .unwrap()
+                    .mean_bits ^= 1;
+            },
         ];
         for (index, mutate) in cases.into_iter().enumerate() {
             let tmp = TempDir::new(&format!("distributed-semantic-{index}"));
@@ -3073,7 +3103,7 @@ mod tests {
     }
 
     #[test]
-    fn f64_nonzero_advantage_keeps_group_live_after_f32_rounding() {
+    fn f64_nonzero_advantage_rejects_f32_zero_rounding() {
         let mut value = step();
         value.scale_rewards = ScaleRewards::None;
         value.effective_beta_bits = 0.0_f64.to_bits();
@@ -3092,13 +3122,9 @@ mod tests {
             .all(|&bits| f32::from_bits(bits) == 0.0));
         value.live_items = 1;
         value.old_logprobs = LedgerScoreRequirement::AdapterEnabledDetached;
-        validate_step(&value).unwrap();
-
-        value.live_items = 0;
-        value.old_logprobs = LedgerScoreRequirement::NotRequired;
         assert!(matches!(
             validate_step(&value),
-            Err(RolloutLedgerError::Invalid(message)) if message.contains("live_items")
+            Err(RolloutLedgerError::Invalid(message)) if message.contains("nonzero-preserving f32")
         ));
     }
 

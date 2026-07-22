@@ -64,7 +64,7 @@
 //!   strict, checksummed, no-replace whole-window package whose reader validates
 //!   learner pre-state identity, mandatory structured controls, and every
 //!   rollout/reward/mask invariant before returning [`ValidatedRolloutLedgerStep`].
-//!   Format v4 also binds sampler prestate and chain lineage, transfers the
+//!   Format v5 also binds sampler prestate and chain lineage, transfers the
 //!   collector's exact post-rollout sampler blob, and returns an opaque
 //!   learner-produced receipt for a versioned adapter + Adam + sampler
 //!   continuation whose policy/config/schema/payload lineage is verified. Under

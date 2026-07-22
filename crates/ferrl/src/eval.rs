@@ -47,6 +47,7 @@
 //! never reaches the [`RewardFn`]; with `eos_token_id == None` every length is the
 //! full width and decoding is the entire post-prompt slice, unchanged.
 
+use crate::grpo::finite_moments;
 use crate::policy::{GenConfig, Policy, Rollout};
 use crate::reward::{validate_reward_values, RewardError, RewardFn};
 use crate::sample::Sample;
@@ -371,17 +372,8 @@ fn validate_completion_lens(rollout: &Rollout, group_size: usize) -> Result<(), 
 /// Mean of a reward group that has already passed [`validate_reward_values`].
 fn validated_mean(rewards: &[f32]) -> f32 {
     debug_assert!(rewards.iter().all(|reward| reward.is_finite()));
-    if rewards.is_empty() {
-        return 0.0;
-    }
-    let sum = rewards.iter().sum::<f32>();
-    if sum.is_finite() {
-        return sum / rewards.len() as f32;
-    }
-
-    // A mean of finite f32 values is representable as f32 even when their f32
-    // sum is not. Preserve the ordinary path above and widen only on overflow.
-    (rewards.iter().map(|&reward| f64::from(reward)).sum::<f64>() / rewards.len() as f64) as f32
+    let widened: Vec<f64> = rewards.iter().map(|&reward| f64::from(reward)).collect();
+    finite_moments(&widened).mean() as f32
 }
 
 #[cfg(test)]
@@ -785,6 +777,54 @@ mod tests {
         .unwrap();
         assert_eq!(report.base_reward_mean, f32::MAX);
         assert_eq!(report.adapter_reward_mean, f32::MAX);
+    }
+
+    struct PermutedHighDynamicReward {
+        groups: Cell<usize>,
+    }
+
+    impl RewardFn for PermutedHighDynamicReward {
+        type Target = ();
+
+        fn reward(&self, _sample: &Sample<()>, _completion: &str) -> Result<f32, RewardError> {
+            unreachable!("the permutation test uses the group seam")
+        }
+
+        fn reward_group(
+            &self,
+            _sample: &Sample<()>,
+            completions: &[String],
+        ) -> Result<Vec<f32>, RewardError> {
+            assert_eq!(completions.len(), 3);
+            let group = self.groups.get();
+            self.groups.set(group + 1);
+            let magnitude = 2.0_f32.powi(34);
+            Ok(if group == 0 {
+                vec![magnitude, 1.0, -magnitude]
+            } else {
+                vec![magnitude, -magnitude, 1.0]
+            })
+        }
+    }
+
+    #[test]
+    fn public_eval_mean_is_permutation_stable_at_high_dynamic_range() {
+        let mut policy = ScriptedPolicy::new(0, 1);
+        let reward = PermutedHighDynamicReward {
+            groups: Cell::new(0),
+        };
+        let report = evaluate(
+            &mut policy,
+            &reward,
+            &DigitCodec,
+            &[Sample::new("5", ())],
+            &gen(3, 2),
+        )
+        .unwrap();
+
+        assert_eq!(report.base_reward_mean, 1.0 / 3.0);
+        assert_eq!(report.adapter_reward_mean, 1.0 / 3.0);
+        assert_eq!(report.base_reward_mean, report.adapter_reward_mean);
     }
 
     /// The malformed-rollout shapes the harness must reject — one per

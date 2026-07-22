@@ -77,8 +77,8 @@ use sha2::{Digest, Sha256};
 
 use crate::comm::{Comm, SoloComm};
 use crate::grpo::{
-    group_advantages, zero_mask_rows, ImportanceSamplingLevel, LossType, ScaleRewards,
-    GROUP_STD_EPS,
+    finite_moments, group_advantages, zero_mask_rows, ImportanceSamplingLevel, LossType,
+    ScaleRewards, GROUP_STD_EPS,
 };
 use crate::nn::grad_coverage;
 use crate::optim::{FerrlAdamW, OptimizerState};
@@ -1316,13 +1316,6 @@ struct RatioStats {
     tokens: usize,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct RewardStatsAcc {
-    count: f64,
-    sum: f64,
-    sumsq: f64,
-}
-
 struct PromptSelection {
     sample_idx: usize,
     prompt_index: u64,
@@ -1937,7 +1930,7 @@ impl Trainer {
     /// `policy_sha256` must be a verified lowercase SHA-256 digest binding the
     /// frozen model content and its execution recipe. It is the sole identity
     /// datum the generic [`Policy`] seam cannot derive from live state today.
-    /// Format v4 does not publish collector performance telemetry; a future
+    /// Format v5 does not publish collector performance telemetry; a future
     /// phase-specific schema can do so without mislabelling asynchronous work as
     /// an ordinary whole trainer step.
     ///
@@ -1984,7 +1977,7 @@ impl Trainer {
     ///
     /// As [`collect_rollout_ledger_step`](Self::collect_rollout_ledger_step),
     /// plus invalid or simultaneous sharded DP×TP execution.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
     pub fn collect_rollout_ledger_step_tensor_parallel<P, R>(
         &mut self,
         step: u64,
@@ -2151,11 +2144,12 @@ impl Trainer {
             })?;
         let outcome: Result<PathBuf, TrainerError> = (|| {
             let mut gpu_mem = StepGpuMemory::new(false);
-            let collected = Self::coordinate_comm_call(
+            let (collected, candidate_records) = Self::coordinate_comm_call(
                 execution_comm,
                 "rollout-ledger group collection",
                 || {
                     let mut collected = Vec::with_capacity(self.config.grad_accum_steps);
+                    let mut candidate_records = Vec::new();
                     for j in 0..self.config.grad_accum_steps {
                         let sel = self.select_prompt(step, j, samples.len());
                         self.record_prompt_selection(&sel);
@@ -2164,7 +2158,7 @@ impl Trainer {
                             selection: &sel,
                             accum_index: j,
                         };
-                        collected.push(self.collect_group(
+                        let (group, mut records) = self.collect_group(
                             step,
                             step_beta,
                             policy,
@@ -2174,9 +2168,11 @@ impl Trainer {
                             &mut gpu_mem,
                             exec,
                             None,
-                        )?);
+                        )?;
+                        collected.push(group);
+                        candidate_records.append(&mut records);
                     }
-                    Ok(collected)
+                    Ok((collected, candidate_records))
                 },
             )?;
             let sampler_poststate = Self::coordinate_comm_call(
@@ -2238,6 +2234,13 @@ impl Trainer {
                     "tensor-parallel rollout-ledger logical payload",
                     &payload_bytes,
                 )?;
+            }
+            // The sampler/identity/global-count/payload preflights above prove
+            // the whole collection window before candidate evidence becomes
+            // visible. Publication still precedes the ledger manifest so an I/O
+            // failure cannot coexist with a committed learner artifact.
+            self.write_candidate_records(&candidate_records, exec)?;
+            if tensor_parallel_world_size > 1 {
                 self.publish_tensor_parallel_rollout_ledger_step(
                     writer.as_ref(),
                     root,
@@ -2335,7 +2338,7 @@ impl Trainer {
     /// continuation receipt carrying the exact post-update Adam state.
     /// This separated learner installs and verifies the collector's exact
     /// post-rollout sampler state before it returns, making its continuation
-    /// checkpoint-faithful. Rollout-ledger v4 carries no collector timing or
+    /// checkpoint-faithful. Rollout-ledger v5 carries no collector timing or
     /// device-memory telemetry, so
     /// the returned/persisted whole-window performance fields remain explicitly
     /// unmeasured rather than relabelling learner-only work as a complete step.
@@ -2915,7 +2918,7 @@ impl Trainer {
     ///
     /// The checkpoint `C_(k+1)` combines the learner's updated adapter and Adam
     /// state with the collector's post-rollout sampler state installed by ledger
-    /// v4. Both the next collector and learner restore this same checkpoint before
+    /// v5. Both the next collector and learner restore this same checkpoint before
     /// processing step `k + 1`. Unlike ordinary cadence checkpointing, this role-
     /// handoff primitive is explicit and never replaces an existing completed-step
     /// path: a second writer would be a continuation fork, so it fails closed.
@@ -4937,6 +4940,7 @@ impl Trainer {
         let mut local_live_items = 0_u32;
         let beta = f64::from_bits(controls.effective_beta_bits);
         for item in collected {
+            validate_advantage_narrowing(&item.advantages)?;
             let completion_lens: Vec<u32> = item
                 .rollout
                 .completion_lens
@@ -5970,24 +5974,108 @@ impl Trainer {
         gpu_mem.record("window_start");
         let accum = self.config.grad_accum_steps;
         let world = self.comm.world_size();
-        let mut stats = Vec::with_capacity(accum);
-        let mut live = Vec::with_capacity(accum);
-        for j in 0..accum {
-            let sel = self.select_prompt(step, j, samples.len());
-            self.record_prompt_selection(&sel);
-            let selected = SelectedSample {
-                sample: &samples[sel.sample_idx],
-                selection: &sel,
-                accum_index: j,
-            };
-            let (stat, item) = self.collect_sample(
-                step, beta, policy, reward_fn, tokenizer, &selected, gpu_mem, exec,
-            )?;
-            stats.push(stat);
-            if let Some(item) = item {
-                live.push(item);
+        let (stats, live) = if self.config.candidate_log_top_k == 0 {
+            // Preserve the legacy default callback/memory order when candidate
+            // publication is disabled: collect and materialize each group before
+            // generating the next one.
+            let mut stats = Vec::with_capacity(accum);
+            let mut live = Vec::with_capacity(accum);
+            for j in 0..accum {
+                let sel = self.select_prompt(step, j, samples.len());
+                self.record_prompt_selection(&sel);
+                let selected = SelectedSample {
+                    sample: &samples[sel.sample_idx],
+                    selection: &sel,
+                    accum_index: j,
+                };
+                let (stat, item) = self.collect_sample(
+                    step, beta, policy, reward_fn, tokenizer, &selected, gpu_mem, exec,
+                )?;
+                stats.push(stat);
+                if let Some(item) = item {
+                    live.push(item);
+                }
             }
-        }
+            (stats, live)
+        } else {
+            let trainer_comm = Arc::clone(&self.comm);
+            let execution_comm = exec.execution_comm(trainer_comm.as_ref());
+            let coordinate_over_data_parallel =
+                exec.model_parallel_world_size() <= 1 && execution_comm.world_size() > 1;
+            let mut prestate = None;
+            let collection: Result<(Vec<PromptStat>, Vec<LiveItem>), TrainerError> = (|| {
+                let mut collected = Vec::with_capacity(accum);
+                let mut candidate_records = Vec::new();
+                for j in 0..accum {
+                    let sel = self.select_prompt(step, j, samples.len());
+                    self.record_prompt_selection(&sel);
+                    let selected = SelectedSample {
+                        sample: &samples[sel.sample_idx],
+                        selection: &sel,
+                        accum_index: j,
+                    };
+                    let rollback_prestate = if coordinate_over_data_parallel && prestate.is_none() {
+                        Some(&mut prestate)
+                    } else {
+                        None
+                    };
+                    let (group, mut records) = self.collect_group(
+                        step,
+                        beta,
+                        policy,
+                        reward_fn,
+                        tokenizer,
+                        &selected,
+                        gpu_mem,
+                        exec,
+                        rollback_prestate,
+                    )?;
+                    collected.push(group);
+                    candidate_records.append(&mut records);
+                }
+
+                // Candidate evidence becomes visible only after every group in the
+                // accumulation window has passed reward and advantage validation,
+                // but still before detached learner scoring (the established I/O
+                // failure boundary).
+                self.write_candidate_records(&candidate_records, exec)?;
+
+                let mut stats = Vec::with_capacity(accum);
+                let mut live = Vec::with_capacity(accum);
+                for group in collected {
+                    let materialized = if coordinate_over_data_parallel {
+                        Self::coordinate_comm_call(
+                            execution_comm,
+                            "rollout group learner materialization",
+                            || self.materialize_collected_group(policy, group, beta, gpu_mem, exec),
+                        )
+                    } else {
+                        self.materialize_collected_group(policy, group, beta, gpu_mem, exec)
+                    }?;
+                    let (stat, item) = materialized;
+                    stats.push(stat);
+                    if let Some(item) = item {
+                        live.push(item);
+                    }
+                }
+                Ok((stats, live))
+            })(
+            );
+            let collection = match collection {
+                Ok(collection) => collection,
+                Err(error) if coordinate_over_data_parallel => {
+                    return Err(Self::rollback_rollout_group_failure(
+                        policy,
+                        prestate.as_ref(),
+                        execution_comm,
+                        error,
+                    ));
+                }
+                Err(error) => return Err(error),
+            };
+            drop(prestate);
+            collection
+        };
         // The DAPO loss normalizer: the window's total completion tokens (true
         // EOS-inclusive lengths) over EVERY prompt — degenerate groups and
         // truncation-masked completions included, exactly TRL's
@@ -6090,54 +6178,167 @@ impl Trainer {
         );
     }
 
-    /// Persist this prompt group's top-K decoded completions when the candidate
-    /// ledger is enabled. The ledger is written immediately after rewards are known,
-    /// before any later degenerate-group skip, so a no-update run still preserves the
-    /// evidence needed for artifact extraction or debugging.
-    fn write_candidate_records<P, E>(
-        &mut self,
+    /// Select this prompt group's top-K decoded completions without publishing
+    /// them. A complete accumulation window owns the returned records until every
+    /// group has passed reward/advantage validation.
+    fn select_candidate_records(
+        &self,
         ctx: CandidateWriteCtx,
         completions: &[String],
         rewards: &[f32],
         reward_outcomes: &[RewardOutcome],
         rollout: &Rollout,
+    ) -> Vec<CandidateRecord> {
+        let k = self.config.candidate_log_top_k.min(completions.len());
+        if k == 0 || !ctx.enabled {
+            return Vec::new();
+        }
+        let mut order: Vec<usize> = (0..completions.len()).collect();
+        order.sort_by(|&a, &b| {
+            candidate_reward_order(rewards[a], rewards[b]).then_with(|| a.cmp(&b))
+        });
+        order
+            .into_iter()
+            .take(k)
+            .map(|group_index| CandidateRecord {
+                step: ctx.step,
+                rank: ctx.rank,
+                world_size: ctx.world_size,
+                prompt_index: ctx.prompt_index,
+                group_index,
+                reward: rewards[group_index],
+                completion_len_tokens: rollout.completion_lens[group_index],
+                reward_diagnostic: reward_outcomes[group_index].diagnostic.clone(),
+                reward_metadata: reward_outcomes[group_index].metadata.clone(),
+                completion: completions[group_index].clone(),
+            })
+            .collect()
+    }
+
+    /// Publish one complete, already-validated accumulation window's candidate
+    /// records in accumulation order. TP peers with no local records still join
+    /// the side-effect rendezvous when candidate logging is enabled.
+    #[allow(clippy::cognitive_complexity)]
+    fn write_candidate_records<P, E>(
+        &mut self,
+        records: &[CandidateRecord],
         exec: &E,
     ) -> Result<(), TrainerError>
     where
         P: Policy,
         E: PolicyExecution<P>,
     {
-        let k = self.config.candidate_log_top_k.min(completions.len());
-        if k == 0 {
+        if self.config.candidate_log_top_k == 0 {
             return Ok(());
         }
-        self.coordinate_side_effect(exec, "candidate record write", |trainer| {
-            if !ctx.enabled {
-                return Ok(());
-            }
-            let Some(writer) = trainer.candidate_writer.as_mut() else {
-                return Ok(());
-            };
-            let mut order: Vec<usize> = (0..completions.len()).collect();
-            order.sort_by(|&a, &b| {
-                candidate_reward_order(rewards[a], rewards[b]).then_with(|| a.cmp(&b))
-            });
-            for &group_index in order.iter().take(k) {
-                writer.append(&CandidateRecord {
-                    step: ctx.step,
-                    rank: ctx.rank,
-                    world_size: ctx.world_size,
-                    prompt_index: ctx.prompt_index,
-                    group_index,
-                    reward: rewards[group_index],
-                    completion_len_tokens: rollout.completion_lens[group_index],
-                    reward_diagnostic: reward_outcomes[group_index].diagnostic.clone(),
-                    reward_metadata: reward_outcomes[group_index].metadata.clone(),
-                    completion: completions[group_index].clone(),
+        let trainer_comm = Arc::clone(&self.comm);
+        let execution_comm = exec.execution_comm(trainer_comm.as_ref());
+        let boundary_local: Result<Option<u64>, TrainerError> =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if records.is_empty() {
+                    return Ok(None);
+                }
+                let writer = self.candidate_writer.as_mut().ok_or_else(|| {
+                    TrainerError::Contract(
+                        "candidate records exist but no candidate writer is configured".into(),
+                    )
                 })?;
+                Ok(Some(writer.append_boundary()?))
+            }))
+            .unwrap_or_else(|payload| {
+                Err(TrainerError::Contract(format!(
+                    "candidate record boundary panicked: {}",
+                    panic_payload_message(payload.as_ref())
+                )))
+            });
+        let boundary = Self::coordinate_comm_result(
+            execution_comm,
+            "candidate record boundary",
+            boundary_local,
+        )?;
+
+        let append_local: Result<(), TrainerError> =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if let Some(writer) = self
+                    .candidate_writer
+                    .as_mut()
+                    .filter(|_| boundary.is_some())
+                {
+                    writer.append_batch(records)?;
+                }
+                Ok(())
+            }))
+            .unwrap_or_else(|payload| {
+                Err(TrainerError::Contract(format!(
+                    "candidate record write panicked: {}",
+                    panic_payload_message(payload.as_ref())
+                )))
+            });
+
+        if execution_comm.world_size() <= 1 {
+            return match append_local {
+                Ok(()) => Ok(()),
+                Err(append_error) => match self.rollback_candidate_records(boundary) {
+                    Ok(()) => Err(append_error),
+                    Err(rollback_error) => Err(TrainerError::Contract(format!(
+                        "candidate record write failed ({append_error}); rollback to the pre-window boundary also failed ({rollback_error}); candidate telemetry may be partial"
+                    ))),
+                },
+            };
+        }
+
+        let failed_local = if append_local.is_err() { 1.0 } else { 0.0 };
+        let failed_global = match execution_comm.all_reduce_scalar_sum(failed_local) {
+            Ok(failed) => failed,
+            Err(comm_error) => {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.rollback_candidate_records(boundary)
+                }));
+                return Err(TrainerError::Comm(comm_error));
             }
-            Ok(())
-        })
+        };
+        if failed_global == 0.0 {
+            return append_local;
+        }
+
+        let rollback_local = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.rollback_candidate_records(boundary)
+        }))
+        .unwrap_or_else(|payload| {
+            Err(TrainerError::Contract(format!(
+                "candidate record rollback panicked: {}",
+                panic_payload_message(payload.as_ref())
+            )))
+        });
+        let rollback = Self::coordinate_comm_result(
+            execution_comm,
+            "candidate record rollback",
+            rollback_local,
+        );
+        match (append_local, rollback) {
+            (_, Err(TrainerError::Comm(comm_error))) => Err(TrainerError::Comm(comm_error)),
+            (append, Err(rollback_error)) => Err(TrainerError::Contract(format!(
+                "candidate record write failed on at least one rank (local append: {append:?}); coordinated rollback also failed ({rollback_error}); candidate telemetry may be partial"
+            ))),
+            (Err(append_error), Ok(())) => Err(append_error),
+            (Ok(()), Ok(())) => Err(TrainerError::Contract(
+                "candidate record write failed on a peer rank; this rank's stream was rolled back"
+                    .into(),
+            )),
+        }
+    }
+
+    fn rollback_candidate_records(&mut self, boundary: Option<u64>) -> Result<(), TrainerError> {
+        let Some(boundary) = boundary else {
+            return Ok(());
+        };
+        let writer = self.candidate_writer.as_mut().ok_or_else(|| {
+            TrainerError::Contract(
+                "candidate writer disappeared before publication rollback".into(),
+            )
+        })?;
+        writer.rollback_to(boundary)?;
+        Ok(())
     }
 
     /// After completing step `step` (0-based), write a momentum-faithful (v2)
@@ -6288,6 +6489,9 @@ impl Trainer {
         }
     }
 
+    /// Legacy candidate-disabled group cadence: collect and immediately
+    /// materialize one group before the next rollout. Candidate-enabled windows
+    /// use the collect-all transaction in [`Self::run_window`] instead.
     #[allow(clippy::too_many_arguments)]
     fn collect_sample<P, R, E>(
         &mut self,
@@ -6322,7 +6526,10 @@ impl Trainer {
                 exec,
                 Some(&mut prestate),
             ) {
-                Ok(collected) => collected,
+                Ok((collected, records)) => {
+                    debug_assert!(records.is_empty());
+                    collected
+                }
                 Err(error) => {
                     return Err(Self::rollback_rollout_group_failure(
                         policy,
@@ -6347,9 +6554,10 @@ impl Trainer {
                 )),
             }
         } else {
-            let collected = self.collect_group(
+            let (collected, records) = self.collect_group(
                 step, beta, policy, reward_fn, tokenizer, selected, gpu_mem, exec, None,
             )?;
+            debug_assert!(records.is_empty());
             self.materialize_collected_group(policy, collected, beta, gpu_mem, exec)
         }
     }
@@ -6368,7 +6576,7 @@ impl Trainer {
         gpu_mem: &mut StepGpuMemory,
         exec: &E,
         rollback_prestate: Option<&mut Option<RolloutGroupPrestate>>,
-    ) -> Result<CollectedGroup, TrainerError>
+    ) -> Result<(CollectedGroup, Vec<CandidateRecord>), TrainerError>
     where
         P: Policy,
         R: RewardFn,
@@ -6459,20 +6667,6 @@ impl Trainer {
             }
             Ok(rewards)
         })?;
-        self.write_candidate_records(
-            CandidateWriteCtx {
-                step,
-                prompt_index: selected.selection.prompt_index,
-                rank: exec.execution_rank(self.comm.as_ref()),
-                world_size: exec.execution_world_size(self.comm.as_ref()),
-                enabled: exec.writes_rank_local_telemetry(self.comm.as_ref()),
-            },
-            &completions,
-            &rewards,
-            &reward_outcomes,
-            &rollout,
-            exec,
-        )?;
         let mut mask_rows = length_mask_rows(&rollout, comp_len);
         let truncated = if self.config.truncation_masking {
             mask_truncated_rows(&rollout, comp_len, self.config.eos_token_id, &mut mask_rows)
@@ -6483,10 +6677,11 @@ impl Trainer {
         let rewards_f64: Vec<f64> = rewards.iter().map(|&reward| f64::from(reward)).collect();
         let (advantages, distributed_reward_stats) =
             self.reward_group_advantages_with_stats(&rewards_f64)?;
-        Self::coordinate_comm_result(
+        let collected = Self::coordinate_comm_result(
             execution_comm,
             "rollout-ledger group finalization",
             (|| {
+                validate_advantage_narrowing(&advantages)?;
                 let degenerate = advantages.iter().all(|advantage| *advantage == 0.0);
                 let stat = PromptStat {
                     completion_len: mean_completion_len(&rollout),
@@ -6514,7 +6709,21 @@ impl Trainer {
                     surrogate_live: !degenerate,
                 })
             })(),
-        )
+        )?;
+        let candidate_records = self.select_candidate_records(
+            CandidateWriteCtx {
+                step,
+                prompt_index: selected.selection.prompt_index,
+                rank: exec.execution_rank(self.comm.as_ref()),
+                world_size: exec.execution_world_size(self.comm.as_ref()),
+                enabled: exec.writes_rank_local_telemetry(self.comm.as_ref()),
+            },
+            &completions,
+            &collected.rewards,
+            &reward_outcomes,
+            &collected.rollout,
+        );
+        Ok((collected, candidate_records))
     }
 
     /// Learner half of one collected group: enforce the production F64 liveness
@@ -6727,28 +6936,62 @@ impl Trainer {
                 Ok((group_advantages(rewards, self.config.scale_rewards), None))
             }
             RewardGroupScope::DistributedSamePrompt => {
-                let local = RewardStatsAcc::from_rewards(rewards);
-                let count = self.comm.all_reduce_scalar_sum(local.count)?;
-                let sum = self.comm.all_reduce_scalar_sum(local.sum)?;
-                let sumsq = self.comm.all_reduce_scalar_sum(local.sumsq)?;
-                let global = self.coordinate_data_parallel_result(
-                    "distributed reward-statistics reduction",
-                    if count.is_finite() && sum.is_finite() && sumsq.is_finite() && sumsq >= 0.0 {
-                        Ok(RewardStatsAcc { count, sum, sumsq })
-                    } else {
-                        Err(TrainerError::Contract(
-                            "distributed reward statistics must be finite with nonnegative sumsq"
-                                .into(),
-                        ))
-                    },
+                let local_rewards: Vec<f32> = self.coordinate_data_parallel_result(
+                    "distributed reward-bit preflight",
+                    rewards
+                        .iter()
+                        .enumerate()
+                        .map(|(row, &reward)| {
+                            let narrowed = reward as f32;
+                            if narrowed.is_finite() && f64::from(narrowed) == reward {
+                                Ok(narrowed)
+                            } else {
+                                Err(TrainerError::Contract(format!(
+                                    "distributed reward row {row} is not exactly representable as finite f32"
+                                )))
+                            }
+                        })
+                        .collect(),
                 )?;
-                let count = exact_reduced_u64("distributed reward count", global.count)?;
+                let rank = self.comm.rank();
+                let world = self.comm.world_size();
+                let global_capacity = world.checked_mul(local_rewards.len()).ok_or_else(|| {
+                    TrainerError::Contract("distributed reward count overflows usize".into())
+                })?;
+                let mut global_rewards = Vec::with_capacity(global_capacity);
+                for source_rank in 0..world {
+                    for &reward in &local_rewards {
+                        let contribution = if rank == source_rank {
+                            f64::from(reward.to_bits())
+                        } else {
+                            0.0
+                        };
+                        let reduced = self.comm.all_reduce_scalar_sum(contribution)?;
+                        let bits = exact_reduced_u64("distributed reward bit pattern", reduced)?;
+                        let bits = u32::try_from(bits).map_err(|_| {
+                            TrainerError::Contract(
+                                "distributed reward bit pattern overflows u32".into(),
+                            )
+                        })?;
+                        let canonical = f32::from_bits(bits);
+                        if !canonical.is_finite() {
+                            return Err(TrainerError::Contract(
+                                "distributed canonical reward must be finite".into(),
+                            ));
+                        }
+                        global_rewards.push(f64::from(canonical));
+                    }
+                }
+                let moments = finite_moments(&global_rewards);
+                let count = u64::try_from(moments.count()).map_err(|_| {
+                    TrainerError::Contract("distributed reward count overflows u64".into())
+                })?;
                 Ok((
-                    advantages_from_stats(rewards, global, self.config.scale_rewards),
+                    advantages_from_moments(rewards, moments, self.config.scale_rewards),
                     Some(RolloutLedgerRewardStats {
                         count,
-                        sum_bits: global.sum.to_bits(),
-                        sumsq_bits: global.sumsq.to_bits(),
+                        mean_bits: moments.mean().to_bits(),
+                        sample_std_bits: moments.sample_std().to_bits(),
                     }),
                 ))
             }
@@ -7730,8 +7973,26 @@ fn empty_grad_store(vars: &[Var]) -> CandleResult<GradStore> {
 /// The scalar group advantages as a detached `[G, 1]` tensor (broadcast over the
 /// completion length in the surrogate).
 fn advantages_tensor(advantages: &[f64], device: &Device) -> CandleResult<Tensor> {
+    debug_assert!(validate_advantage_narrowing(advantages).is_ok());
     let adv: Vec<f32> = advantages.iter().map(|&a| a as f32).collect();
     Tensor::from_vec(adv, (advantages.len(), 1), device)
+}
+
+/// Reject learner constants that cannot cross the persisted/tensorized f32
+/// boundary without becoming non-finite or losing a nonzero signal to underflow.
+/// Keep the host-side f64 values for the validation and liveness decision so a
+/// tiny advantage is rejected rather than silently reclassified as degenerate.
+fn validate_advantage_narrowing(advantages: &[f64]) -> Result<(), TrainerError> {
+    for (row, &advantage) in advantages.iter().enumerate() {
+        let narrowed = advantage as f32;
+        if !advantage.is_finite() || !narrowed.is_finite() || (advantage != 0.0 && narrowed == 0.0)
+        {
+            return Err(TrainerError::Contract(format!(
+                "advantage row {row} value {advantage} is not representable as a finite nonzero-preserving f32"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Validate that the rollout is rectangular with non-empty completions and a
@@ -7841,67 +8102,18 @@ fn mean_completion_len(rollout: &Rollout) -> f32 {
 /// Reward `(mean, population-std)` over an already validated reward group.
 fn reward_stats(rewards: &[f32]) -> (f32, f32) {
     debug_assert!(rewards.iter().all(|reward| reward.is_finite()));
-    if rewards.is_empty() {
-        return (0.0, 0.0);
-    }
-    let n = rewards.len() as f32;
-    let mean = rewards.iter().sum::<f32>() / n;
-    let var = rewards
-        .iter()
-        .map(|&reward| (reward - mean).powi(2))
-        .sum::<f32>()
-        / n;
-    if mean.is_finite() && var.is_finite() {
-        return (mean, var.sqrt());
-    }
-
-    // Keep existing f32 arithmetic for ordinary groups and widen only when a
-    // finite reward set overflowed an intermediate sum or square.
-    let n = rewards.len() as f64;
-    let mean = rewards.iter().map(|&reward| f64::from(reward)).sum::<f64>() / n;
-    let var = rewards
-        .iter()
-        .map(|&reward| (f64::from(reward) - mean).powi(2))
-        .sum::<f64>()
-        / n;
-    (mean as f32, var.sqrt() as f32)
+    let widened: Vec<f64> = rewards.iter().map(|&reward| f64::from(reward)).collect();
+    let moments = finite_moments(&widened);
+    (moments.mean() as f32, moments.population_std() as f32)
 }
 
-impl RewardStatsAcc {
-    fn from_rewards(rewards: &[f64]) -> Self {
-        debug_assert!(rewards.iter().all(|reward| reward.is_finite()));
-        rewards.iter().copied().fold(
-            Self {
-                count: 0.0,
-                sum: 0.0,
-                sumsq: 0.0,
-            },
-            |acc, r| Self {
-                count: acc.count + 1.0,
-                sum: acc.sum + r,
-                sumsq: acc.sumsq + r * r,
-            },
-        )
-    }
-
-    fn mean_std(self) -> (f64, f64) {
-        if self.count <= 0.0 {
-            return (0.0, 0.0);
-        }
-        let mean = self.sum / self.count;
-        let std = if self.count < 2.0 {
-            0.0
-        } else {
-            ((self.sumsq - (self.sum * self.sum / self.count)) / (self.count - 1.0))
-                .max(0.0)
-                .sqrt()
-        };
-        (mean, std)
-    }
-}
-
-fn advantages_from_stats(rewards: &[f64], stats: RewardStatsAcc, scale: ScaleRewards) -> Vec<f64> {
-    let (mean, std) = stats.mean_std();
+fn advantages_from_moments(
+    rewards: &[f64],
+    moments: crate::grpo::FiniteMoments,
+    scale: ScaleRewards,
+) -> Vec<f64> {
+    let mean = moments.mean();
+    let std = moments.sample_std();
     let denom = match scale {
         ScaleRewards::None => 1.0,
         ScaleRewards::Group => std + GROUP_STD_EPS,
@@ -9793,11 +10005,8 @@ mod tests {
     fn distributed_reward_group_stats_match_local_for_one_rank() {
         let rewards = [1.0, 2.0, 3.0];
         let local = group_advantages(&rewards, ScaleRewards::Group);
-        let via_stats = advantages_from_stats(
-            &rewards,
-            RewardStatsAcc::from_rewards(&rewards),
-            ScaleRewards::Group,
-        );
+        let via_stats =
+            advantages_from_moments(&rewards, finite_moments(&rewards), ScaleRewards::Group);
         assert_eq!(via_stats.len(), local.len());
         for (a, b) in via_stats.iter().zip(local.iter()) {
             assert_relative_eq!(*a, *b, epsilon = 1e-12);
@@ -9833,6 +10042,51 @@ mod tests {
             assert_eq!(got[0], vec![-1.0]);
             assert_eq!(got[1], vec![1.0]);
         });
+    }
+
+    #[test]
+    fn distributed_reward_group_is_stable_across_rank_split_high_dynamic_values() {
+        let results = std::thread::scope(|scope| {
+            crate::comm::LocalComm::world(2)
+                .into_iter()
+                .enumerate()
+                .map(|(rank, comm)| {
+                    scope.spawn(move || {
+                        let tmp = WireTmp::new(&format!("dist-high-dynamic-adv-{rank}"));
+                        let run = RunDir::create(&tmp.0, format!("rank-{rank}")).unwrap();
+                        let cfg = TrainerConfig {
+                            group_size: 2,
+                            reward_group_scope: RewardGroupScope::DistributedSamePrompt,
+                            scale_rewards: ScaleRewards::None,
+                            ..TrainerConfig::default()
+                        };
+                        let trainer = Trainer::with_comm(cfg, &run, comm).unwrap();
+                        let magnitude = f64::from(f32::MAX);
+                        let rewards = if rank == 0 {
+                            vec![magnitude, 1.0]
+                        } else {
+                            vec![-magnitude, 0.0]
+                        };
+                        trainer
+                            .reward_group_advantages_with_stats(&rewards)
+                            .unwrap()
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        let expected_mean = 0.25_f64;
+        for (_, stats) in &results {
+            let stats = stats.unwrap();
+            assert_eq!(stats.count, 4);
+            assert_eq!(f64::from_bits(stats.mean_bits), expected_mean);
+            assert!(f64::from_bits(stats.sample_std_bits).is_finite());
+        }
+        assert_eq!(results[0].0[1], 0.75);
+        assert_eq!(results[1].0[1], -0.25);
     }
 
     #[test]
@@ -10029,6 +10283,20 @@ mod tests {
         assert_eq!(std, 0.0);
     }
 
+    #[test]
+    fn reward_stats_are_permutation_stable_at_high_dynamic_range() {
+        let magnitude = 2.0_f32.powi(34);
+        let first = reward_stats(&[magnitude, 1.0, -magnitude]);
+        let permuted = reward_stats(&[magnitude, -magnitude, 1.0]);
+        assert_eq!(first.0, 1.0 / 3.0);
+        assert_eq!(first, permuted);
+    }
+
+    #[test]
+    fn reward_stats_keep_nonexact_identical_values_degenerate() {
+        assert_eq!(reward_stats(&[0.1; 3]), (0.1, 0.0));
+    }
+
     struct CandidateCodec;
     impl TokenizerLike for CandidateCodec {
         fn encode(&self, _text: &str) -> Vec<u32> {
@@ -10129,6 +10397,109 @@ mod tests {
                     })
                 })
                 .collect())
+        }
+    }
+
+    struct LateNonFiniteReward {
+        calls: std::cell::Cell<usize>,
+        invalid_call: Option<usize>,
+    }
+
+    impl LateNonFiniteReward {
+        fn invalid_on_second_group() -> Self {
+            Self {
+                calls: std::cell::Cell::new(0),
+                invalid_call: Some(1),
+            }
+        }
+
+        fn always_finite() -> Self {
+            Self {
+                calls: std::cell::Cell::new(0),
+                invalid_call: None,
+            }
+        }
+    }
+
+    impl RewardFn for LateNonFiniteReward {
+        type Target = ();
+
+        fn reward(&self, sample: &Sample<()>, completion: &str) -> Result<f32, RewardError> {
+            CandidateReward.reward(sample, completion)
+        }
+
+        fn reward_group_detailed(
+            &self,
+            sample: &Sample<()>,
+            completions: &[String],
+        ) -> Result<Vec<RewardOutcome>, RewardError> {
+            let call = self.calls.get();
+            self.calls.set(call + 1);
+            let mut outcomes = CandidateReward.reward_group_detailed(sample, completions)?;
+            if self.invalid_call == Some(call) {
+                outcomes[1].reward = f32::NAN;
+            }
+            Ok(outcomes)
+        }
+    }
+
+    struct FixedDetailedReward([f32; 3]);
+
+    impl RewardFn for FixedDetailedReward {
+        type Target = ();
+
+        fn reward(&self, _sample: &Sample<()>, _completion: &str) -> Result<f32, RewardError> {
+            unreachable!("the fixed reward test uses the detailed group seam")
+        }
+
+        fn reward_group_detailed(
+            &self,
+            _sample: &Sample<()>,
+            completions: &[String],
+        ) -> Result<Vec<RewardOutcome>, RewardError> {
+            assert_eq!(completions.len(), self.0.len());
+            Ok(self.0.into_iter().map(RewardOutcome::reward).collect())
+        }
+    }
+
+    struct ScoringCountPolicy {
+        inner: CandidatePolicy,
+        scoring_calls: std::cell::Cell<usize>,
+    }
+
+    impl Policy for ScoringCountPolicy {
+        fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
+            self.inner.generate(prompt, cfg)
+        }
+
+        fn token_logprobs(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+            self.scoring_calls.set(self.scoring_calls.get() + 1);
+            self.inner.token_logprobs(rollout)
+        }
+
+        fn token_logprobs_detached(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+            self.scoring_calls.set(self.scoring_calls.get() + 1);
+            Ok(self.inner.token_logprobs(rollout)?.detach())
+        }
+
+        fn set_adapter_enabled(&mut self, enabled: bool) {
+            self.inner.set_adapter_enabled(enabled);
+        }
+
+        fn adapter_enabled(&self) -> bool {
+            self.inner.adapter_enabled()
+        }
+
+        fn trainable_vars(&self) -> Vec<Var> {
+            self.inner.trainable_vars()
+        }
+
+        fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+            self.inner.sampler_state()
+        }
+
+        fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
+            self.inner.restore_sampler_state(state)
         }
     }
 
@@ -10505,6 +10876,363 @@ mod tests {
         assert!(std::fs::read_to_string(run.candidates_path())
             .unwrap_or_default()
             .is_empty());
+        assert!(!ledger_root.join("step-00000000000000000000").exists());
+    }
+
+    #[test]
+    fn scale_none_rejects_unrepresentable_f32_advantage_before_scoring_or_publication() {
+        let tmp = WireTmp::new("scale-none-unrepresentable-advantage");
+        let run = RunDir::create(&tmp.0, "run").unwrap();
+        let mut config = candidate_ledger_config();
+        config.scale_rewards = ScaleRewards::None;
+        config.candidate_log_top_k = 1;
+        let mut trainer = Trainer::new(config, &run).unwrap();
+        let sentinel = b"preexisting-candidate-bytes\n";
+        std::fs::write(run.candidates_path(), sentinel).unwrap();
+        let logp =
+            Var::from_tensor(&Tensor::zeros((3, 2), DType::F32, &Device::Cpu).unwrap()).unwrap();
+        let mut policy = ScoringCountPolicy {
+            inner: CandidatePolicy { logp },
+            scoring_calls: std::cell::Cell::new(0),
+        };
+
+        let error = trainer
+            .train(
+                &mut policy,
+                &FixedDetailedReward([f32::MAX, -f32::MAX, -f32::MAX]),
+                &CandidateCodec,
+                &[Sample::new("prompt", ())],
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            TrainerError::Contract(message)
+                if message.contains("advantage") && message.contains("f32")
+        ));
+        assert_eq!(policy.scoring_calls.get(), 0);
+        assert_eq!(std::fs::read(run.candidates_path()).unwrap(), sentinel);
+    }
+
+    #[test]
+    fn direct_scale_none_rejects_advantage_underflow_before_scoring_or_publication() {
+        let tmp = WireTmp::new("scale-none-underflow-advantage-direct");
+        let run = RunDir::create(&tmp.0, "run").unwrap();
+        let mut config = candidate_ledger_config();
+        config.scale_rewards = ScaleRewards::None;
+        config.candidate_log_top_k = 1;
+        let mut trainer = Trainer::new(config, &run).unwrap();
+        let sentinel = b"preexisting-candidate-bytes\n";
+        std::fs::write(run.candidates_path(), sentinel).unwrap();
+        let logp =
+            Var::from_tensor(&Tensor::zeros((3, 2), DType::F32, &Device::Cpu).unwrap()).unwrap();
+        let mut policy = ScoringCountPolicy {
+            inner: CandidatePolicy { logp },
+            scoring_calls: std::cell::Cell::new(0),
+        };
+        let min_subnormal = f32::from_bits(1);
+
+        let error = trainer
+            .train(
+                &mut policy,
+                &FixedDetailedReward([0.0, min_subnormal, 0.0]),
+                &CandidateCodec,
+                &[Sample::new("prompt", ())],
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            TrainerError::Contract(message) if message.contains("nonzero-preserving f32")
+        ));
+        assert_eq!(policy.scoring_calls.get(), 0);
+        assert_eq!(std::fs::read(run.candidates_path()).unwrap(), sentinel);
+    }
+
+    #[test]
+    fn separated_scale_none_rejects_advantage_underflow_before_ledger_or_publication() {
+        let tmp = WireTmp::new("scale-none-underflow-advantage-separated");
+        let run = RunDir::create(&tmp.0, "run").unwrap();
+        let ledger_root = tmp.0.join("ledger");
+        let mut config = candidate_ledger_config();
+        config.scale_rewards = ScaleRewards::None;
+        config.candidate_log_top_k = 1;
+        let mut trainer = Trainer::new(config, &run).unwrap();
+        let sentinel = b"preexisting-candidate-bytes\n";
+        std::fs::write(run.candidates_path(), sentinel).unwrap();
+        let mut policy = stateful_candidate_policy();
+        let min_subnormal = f32::from_bits(1);
+
+        let error = trainer
+            .collect_rollout_ledger_step(
+                0,
+                &mut policy,
+                &FixedDetailedReward([0.0, min_subnormal, 0.0]),
+                &CandidateCodec,
+                &[Sample::new("prompt", ())],
+                &ledger_root,
+                &"5".repeat(64),
+                None,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            TrainerError::Contract(message) if message.contains("nonzero-preserving f32")
+        ));
+        assert_eq!(policy.sampler, 0);
+        assert_eq!(std::fs::read(run.candidates_path()).unwrap(), sentinel);
+        assert!(!ledger_root.join("step-00000000000000000000").exists());
+    }
+
+    #[test]
+    fn direct_window_does_not_publish_finite_prefix_before_late_invalid_reward() {
+        let tmp = WireTmp::new("direct-late-invalid-reward");
+        let run = RunDir::create(&tmp.0, "run").unwrap();
+        let mut config = candidate_ledger_config();
+        config.grad_accum_steps = 2;
+        config.candidate_log_top_k = 1;
+        let mut trainer = Trainer::new(config, &run).unwrap();
+        let sentinel = b"preexisting-candidate-bytes\n";
+        std::fs::write(run.candidates_path(), sentinel).unwrap();
+        let mut policy = stateful_candidate_policy();
+
+        let error = trainer
+            .train(
+                &mut policy,
+                &LateNonFiniteReward::invalid_on_second_group(),
+                &CandidateCodec,
+                &[Sample::new("first", ()), Sample::new("second", ())],
+            )
+            .unwrap_err();
+        assert!(matches!(error, TrainerError::Reward(_)));
+        assert_eq!(std::fs::read(run.candidates_path()).unwrap(), sentinel);
+    }
+
+    #[test]
+    fn separated_window_does_not_publish_finite_prefix_before_late_invalid_reward() {
+        let tmp = WireTmp::new("separated-late-invalid-reward");
+        let run = RunDir::create(&tmp.0, "run").unwrap();
+        let ledger_root = tmp.0.join("ledger");
+        let mut config = candidate_ledger_config();
+        config.grad_accum_steps = 2;
+        config.candidate_log_top_k = 1;
+        let mut trainer = Trainer::new(config, &run).unwrap();
+        let sentinel = b"preexisting-candidate-bytes\n";
+        std::fs::write(run.candidates_path(), sentinel).unwrap();
+        let mut policy = stateful_candidate_policy();
+
+        let error = trainer
+            .collect_rollout_ledger_step(
+                0,
+                &mut policy,
+                &LateNonFiniteReward::invalid_on_second_group(),
+                &CandidateCodec,
+                &[Sample::new("first", ()), Sample::new("second", ())],
+                &ledger_root,
+                &"3".repeat(64),
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(error, TrainerError::Reward(_)));
+        assert_eq!(policy.sampler, 0);
+        assert_eq!(std::fs::read(run.candidates_path()).unwrap(), sentinel);
+        assert!(!ledger_root.join("step-00000000000000000000").exists());
+    }
+
+    #[test]
+    fn candidate_batch_io_failure_rolls_back_partial_world_one_append_before_scoring() {
+        let tmp = WireTmp::new("candidate-batch-partial-world-one");
+        let run = RunDir::create(&tmp.0, "run").unwrap();
+        let mut config = candidate_ledger_config();
+        config.candidate_log_top_k = 2;
+        let mut trainer = Trainer::new(config, &run).unwrap();
+        let sentinel = b"preexisting-candidate-bytes\n";
+        std::fs::write(run.candidates_path(), sentinel).unwrap();
+        trainer
+            .candidate_writer
+            .as_mut()
+            .unwrap()
+            .inject_batch_append_failure_after_bytes_once(17);
+        let logp =
+            Var::from_tensor(&Tensor::zeros((3, 2), DType::F32, &Device::Cpu).unwrap()).unwrap();
+        let mut policy = ScoringCountPolicy {
+            inner: CandidatePolicy { logp },
+            scoring_calls: std::cell::Cell::new(0),
+        };
+
+        let error = trainer
+            .train(
+                &mut policy,
+                &CandidateReward,
+                &CandidateCodec,
+                &[Sample::new("prompt", ())],
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, TrainerError::Telemetry(_)));
+        assert_eq!(policy.scoring_calls.get(), 0);
+        assert_eq!(std::fs::read(run.candidates_path()).unwrap(), sentinel);
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn distributed_candidate_peer_failure_rolls_every_stream_back_to_its_own_boundary() {
+        let tmp = WireTmp::new("candidate-batch-peer-rollback");
+        let results = std::thread::scope(|scope| {
+            crate::comm::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(5))
+                .into_iter()
+                .map(|comm| {
+                    let root = tmp.0.clone();
+                    scope.spawn(move || {
+                        let rank = comm.rank();
+                        let run = RunDir::create(&root, format!("rank-{rank}")).unwrap();
+                        let mut config = candidate_ledger_config();
+                        config.candidate_log_top_k = 1;
+                        let mut trainer = Trainer::with_comm(config, &run, comm).unwrap();
+                        let sentinel =
+                            format!("rank-{rank}-{}\n", "x".repeat(rank * 7 + 1)).into_bytes();
+                        std::fs::write(run.candidates_path(), &sentinel).unwrap();
+                        if rank == 0 {
+                            trainer
+                                .candidate_writer
+                                .as_mut()
+                                .unwrap()
+                                .inject_batch_append_failure_after_bytes_once(11);
+                        }
+                        let mut policy = stateful_candidate_policy();
+                        let result = trainer.train(
+                            &mut policy,
+                            &CandidateReward,
+                            &CandidateCodec,
+                            &[Sample::new("prompt", ())],
+                        );
+                        let candidates = std::fs::read(run.candidates_path()).unwrap();
+                        (rank, result, candidates, sentinel, policy.sampler)
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        for (rank, result, candidates, sentinel, sampler) in results {
+            let error = result.unwrap_err();
+            assert_primary_telemetry_peer_contract(
+                rank,
+                &error,
+                "candidate record write failed on a peer rank",
+            );
+            assert_eq!(candidates, sentinel, "rank {rank} changed candidate bytes");
+            assert_eq!(sampler, 0, "rank {rank} sampler was not rolled back");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn distributed_direct_window_does_not_publish_prefix_before_peer_invalid_reward() {
+        let tmp = WireTmp::new("distributed-direct-late-invalid");
+        let results = std::thread::scope(|scope| {
+            let handles = crate::comm::LocalComm::world_with_timeout(
+                2,
+                std::time::Duration::from_millis(5_000),
+            )
+            .into_iter()
+            .map(|comm| {
+                let root = tmp.0.clone();
+                scope.spawn(move || {
+                    let rank = comm.rank();
+                    let run = RunDir::create(&root, format!("rank-{rank}")).unwrap();
+                    let mut config = candidate_ledger_config();
+                    config.grad_accum_steps = 2;
+                    config.candidate_log_top_k = 1;
+                    let mut trainer = Trainer::with_comm(config, &run, comm).unwrap();
+                    let sentinel = format!("preexisting-rank-{rank}\n").into_bytes();
+                    std::fs::write(run.candidates_path(), &sentinel).unwrap();
+                    let mut policy = stateful_candidate_policy();
+                    let reward = if rank == 0 {
+                        LateNonFiniteReward::invalid_on_second_group()
+                    } else {
+                        LateNonFiniteReward::always_finite()
+                    };
+                    let result = trainer.train(
+                        &mut policy,
+                        &reward,
+                        &CandidateCodec,
+                        &[Sample::new("first", ()), Sample::new("second", ())],
+                    );
+                    let candidates = std::fs::read(run.candidates_path()).unwrap_or_default();
+                    (rank, result, candidates, sentinel)
+                })
+            })
+            .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        for (rank, result, candidates, sentinel) in results {
+            assert!(result.is_err(), "rank {rank} unexpectedly succeeded");
+            assert_eq!(candidates, sentinel, "rank {rank} changed candidate bytes");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn distributed_separated_window_does_not_publish_prefix_before_peer_invalid_reward() {
+        let tmp = WireTmp::new("distributed-separated-late-invalid");
+        let ledger_root = tmp.0.join("ledger");
+        let results = std::thread::scope(|scope| {
+            let handles =
+                crate::comm::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(5))
+                    .into_iter()
+                    .map(|comm| {
+                        let root = tmp.0.clone();
+                        let ledger_root = ledger_root.clone();
+                        scope.spawn(move || {
+                            let rank = comm.rank();
+                            let run = RunDir::create(&root, format!("rank-{rank}")).unwrap();
+                            let mut config = candidate_ledger_config();
+                            config.grad_accum_steps = 2;
+                            config.candidate_log_top_k = 1;
+                            let mut trainer = Trainer::with_comm(config, &run, comm).unwrap();
+                            let sentinel = format!("preexisting-rank-{rank}\n").into_bytes();
+                            std::fs::write(run.candidates_path(), &sentinel).unwrap();
+                            let mut policy = stateful_candidate_policy();
+                            let reward = if rank == 0 {
+                                LateNonFiniteReward::invalid_on_second_group()
+                            } else {
+                                LateNonFiniteReward::always_finite()
+                            };
+                            let result = trainer.collect_rollout_ledger_step(
+                                0,
+                                &mut policy,
+                                &reward,
+                                &CandidateCodec,
+                                &[Sample::new("first", ()), Sample::new("second", ())],
+                                &ledger_root,
+                                &"4".repeat(64),
+                                None,
+                            );
+                            let candidates =
+                                std::fs::read(run.candidates_path()).unwrap_or_default();
+                            (rank, result, candidates, sentinel, policy.sampler)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        for (rank, result, candidates, sentinel, sampler) in results {
+            assert!(result.is_err(), "rank {rank} unexpectedly succeeded");
+            assert_eq!(candidates, sentinel, "rank {rank} changed candidate bytes");
+            assert_eq!(sampler, 0, "rank {rank} sampler was not rolled back");
+        }
         assert!(!ledger_root.join("step-00000000000000000000").exists());
     }
 
@@ -14163,7 +14891,7 @@ mod tests {
         std::thread::scope(|scope| {
             let handles: Vec<_> = crate::comm::LocalComm::world_with_timeout(
                 2,
-                std::time::Duration::from_millis(250),
+                std::time::Duration::from_millis(5_000),
             )
             .into_iter()
             .enumerate()
@@ -15632,7 +16360,7 @@ mod tests {
 
     /// Shared driver for a ragged-mask gradcheck. Builds the `[G, T]` loss mask from
     /// `completion_lens` via the production [`length_mask_rows`] (so the gradcheck pins
-    /// the same `j < completion_lens[i]` predicate `collect_sample` uses, at `f64` for
+    /// the same `j < completion_lens[i]` predicate collection uses, at `f64` for
     /// accurate central differences), hard-asserts the mask is ragged exactly as
     /// specified (premise guard — else the check could silently degrade to a
     /// uniform/all-ones mask and stop exercising variable lengths), then runs the

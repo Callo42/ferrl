@@ -128,8 +128,8 @@ pub enum TelemetryError {
         /// Underlying I/O error.
         source: io::Error,
     },
-    /// A [`Metrics`] record could not be serialized to JSON.
-    #[error("failed to serialize metrics: {0}")]
+    /// A telemetry record could not be serialized to JSON.
+    #[error("failed to serialize telemetry: {0}")]
     Serialize(#[from] serde_json::Error),
     /// A line of `metrics.jsonl` could not be parsed back into a [`Metrics`]
     /// record (see [`read_metrics`]).
@@ -722,6 +722,8 @@ impl CandidateRecord {
 pub struct CandidateWriter {
     path: PathBuf,
     file: File,
+    #[cfg(test)]
+    fail_next_batch_after_bytes: Option<usize>,
 }
 
 impl CandidateWriter {
@@ -737,7 +739,12 @@ impl CandidateWriter {
             .append(true)
             .open(&path)
             .map_err(|e| TelemetryError::io(&path, e))?;
-        Ok(Self { path, file })
+        Ok(Self {
+            path,
+            file,
+            #[cfg(test)]
+            fail_next_batch_after_bytes: None,
+        })
     }
 
     /// Append one candidate record as a JSON line and flush it.
@@ -748,19 +755,91 @@ impl CandidateWriter {
     /// `record.reward` is non-finite, or another [`TelemetryError`] if
     /// serialization or the write/flush fails.
     pub fn append(&mut self, record: &CandidateRecord) -> Result<(), TelemetryError> {
-        if !record.reward.is_finite() {
-            return Err(TelemetryError::NonFiniteCandidateReward {
-                value: record.reward,
-            });
+        self.append_batch(std::slice::from_ref(record))
+    }
+
+    /// Append one already-validated window as a single serialized byte batch.
+    /// Every record is checked and serialized before the first file write so a
+    /// serialization failure cannot leave a prefix. The caller owns append-
+    /// boundary rollback for I/O failures and distributed peer failures.
+    pub(crate) fn append_batch(
+        &mut self,
+        records: &[CandidateRecord],
+    ) -> Result<(), TelemetryError> {
+        let mut bytes = Vec::new();
+        for record in records {
+            if !record.reward.is_finite() {
+                return Err(TelemetryError::NonFiniteCandidateReward {
+                    value: record.reward,
+                });
+            }
+            serde_json::to_writer(&mut bytes, record)?;
+            bytes.push(b'\n');
         }
-        let mut line = serde_json::to_string(record)?;
-        line.push('\n');
+        #[cfg(test)]
+        if let Some(after_bytes) = self.fail_next_batch_after_bytes.take() {
+            let prefix_len = after_bytes.min(bytes.len());
+            self.file
+                .write_all(&bytes[..prefix_len])
+                .map_err(|error| TelemetryError::io(&self.path, error))?;
+            self.file
+                .flush()
+                .map_err(|error| TelemetryError::io(&self.path, error))?;
+            return Err(TelemetryError::io(
+                &self.path,
+                io::Error::other("injected candidate batch append failure"),
+            ));
+        }
         self.file
-            .write_all(line.as_bytes())
+            .write_all(&bytes)
             .map_err(|e| TelemetryError::io(&self.path, e))?;
         self.file
             .flush()
             .map_err(|e| TelemetryError::io(&self.path, e))
+    }
+
+    /// Return this rank-local stream's exact pre-publication append boundary.
+    pub(crate) fn append_boundary(&mut self) -> Result<u64, TelemetryError> {
+        self.file
+            .flush()
+            .map_err(|error| TelemetryError::io(&self.path, error))?;
+        self.current_len()
+    }
+
+    /// Return the currently visible byte length without mutating the stream.
+    pub(crate) fn current_len(&self) -> Result<u64, TelemetryError> {
+        self.file
+            .metadata()
+            .map(|metadata| metadata.len())
+            .map_err(|error| TelemetryError::io(&self.path, error))
+    }
+
+    /// Roll a failed publication back only when this stream grew. Never extend a
+    /// stream that was externally shortened while publication was in flight.
+    pub(crate) fn rollback_to(&mut self, boundary: u64) -> Result<(), TelemetryError> {
+        let current = self.current_len()?;
+        match current.cmp(&boundary) {
+            std::cmp::Ordering::Less => Err(TelemetryError::io(
+                &self.path,
+                io::Error::other(format!(
+                    "candidate stream shrank from boundary {boundary} to {current} during publication"
+                )),
+            )),
+            std::cmp::Ordering::Equal => Ok(()),
+            std::cmp::Ordering::Greater => {
+                self.file
+                    .set_len(boundary)
+                    .map_err(|error| TelemetryError::io(&self.path, error))?;
+                self.file
+                    .flush()
+                    .map_err(|error| TelemetryError::io(&self.path, error))
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_batch_append_failure_after_bytes_once(&mut self, bytes: usize) {
+        self.fail_next_batch_after_bytes = Some(bytes);
     }
 
     /// The path this writer appends to.
