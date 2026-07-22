@@ -1225,6 +1225,26 @@ pub struct Trainer {
     preempt: Option<Arc<AtomicBool>>,
     /// Optional top-candidate ledger for discovery runs.
     candidate_writer: Option<CandidateWriter>,
+    #[cfg(test)]
+    rollout_ledger_payload_forgery: Option<RolloutLedgerPayloadForgery>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+enum RolloutLedgerPayloadForgeryKind {
+    Mean,
+    SampleStd,
+}
+
+#[cfg(test)]
+type RolloutLedgerPayloadForgeryWitness =
+    Arc<std::sync::Mutex<Vec<(u32, Vec<(RolloutLedgerRewardStats, Vec<u32>)>)>>>;
+
+#[cfg(test)]
+#[derive(Debug)]
+struct RolloutLedgerPayloadForgery {
+    kind: RolloutLedgerPayloadForgeryKind,
+    locally_validated: RolloutLedgerPayloadForgeryWitness,
 }
 
 /// Per-inner-step quantities folded into the step's [`Metrics`].
@@ -1893,7 +1913,21 @@ impl Trainer {
             comm: Arc::new(comm),
             preempt: None,
             candidate_writer,
+            #[cfg(test)]
+            rollout_ledger_payload_forgery: None,
         })
+    }
+
+    #[cfg(test)]
+    fn inject_rollout_ledger_payload_forgery(
+        &mut self,
+        kind: RolloutLedgerPayloadForgeryKind,
+        locally_validated: RolloutLedgerPayloadForgeryWitness,
+    ) {
+        self.rollout_ledger_payload_forgery = Some(RolloutLedgerPayloadForgery {
+            kind,
+            locally_validated,
+        });
     }
 
     /// Install a cooperative **preemption flag**. When the flag flips to `true`
@@ -2236,6 +2270,12 @@ impl Trainer {
                     live_items,
                 ),
             )?;
+            #[cfg(test)]
+            let payload = {
+                let mut payload = payload;
+                self.apply_rollout_ledger_payload_forgery(&mut payload)?;
+                payload
+            };
             if tensor_parallel_world_size > 1 {
                 let payload_bytes = serde_json::to_vec(&payload).map_err(|error| {
                     TrainerError::Contract(format!(
@@ -5115,6 +5155,87 @@ impl Trainer {
                 },
             )?;
         }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn apply_rollout_ledger_payload_forgery(
+        &mut self,
+        payload: &mut RolloutLedgerStep,
+    ) -> Result<(), TrainerError> {
+        let Some(forgery) = self.rollout_ledger_payload_forgery.take() else {
+            return Ok(());
+        };
+        if payload.world_size <= 1
+            || payload.reward_group_scope != RolloutLedgerGroupScope::DistributedSamePrompt
+        {
+            return Err(TrainerError::Contract(
+                "test reward-moment forgery requires distributed same-prompt collection".into(),
+            ));
+        }
+
+        for group in &mut payload.groups {
+            let canonical = group.distributed_reward_stats.ok_or_else(|| {
+                TrainerError::Contract(
+                    "test reward-moment forgery requires distributed statistics".into(),
+                )
+            })?;
+            let forged = match forgery.kind {
+                RolloutLedgerPayloadForgeryKind::Mean => RolloutLedgerRewardStats {
+                    mean_bits: 0.5_f64.to_bits(),
+                    ..canonical
+                },
+                RolloutLedgerPayloadForgeryKind::SampleStd => RolloutLedgerRewardStats {
+                    sample_std_bits: 1.5_f64.to_bits(),
+                    ..canonical
+                },
+            };
+            if forged == canonical {
+                return Err(TrainerError::Contract(
+                    "test reward-moment forgery did not change canonical statistics".into(),
+                ));
+            }
+            let mean = f64::from_bits(forged.mean_bits);
+            let sample_std = f64::from_bits(forged.sample_std_bits);
+            let denominator = match payload.scale_rewards {
+                ScaleRewards::None => 1.0,
+                ScaleRewards::Group => sample_std + GROUP_STD_EPS,
+            };
+            group.distributed_reward_stats = Some(forged);
+            group.advantage_bits = group
+                .reward_bits
+                .iter()
+                .map(|&bits| {
+                    let reward = f64::from(f32::from_bits(bits));
+                    (((reward - mean) / denominator) as f32).to_bits()
+                })
+                .collect();
+        }
+
+        // The witness is recorded only after the reader-equivalent local
+        // validator accepts the forged statistics and their matching local
+        // advantages. The subsequent collector preflight must therefore reject
+        // solely by recomputing the rank-major reward moments.
+        validate_collected_step(payload).map_err(TrainerError::from)?;
+        let groups = payload
+            .groups
+            .iter()
+            .map(|group| {
+                Ok((
+                    group.distributed_reward_stats.ok_or_else(|| {
+                        TrainerError::Contract(
+                            "test reward-moment forgery lost distributed statistics".into(),
+                        )
+                    })?,
+                    group.advantage_bits.clone(),
+                ))
+            })
+            .collect::<Result<Vec<_>, TrainerError>>()?;
+        forgery
+            .locally_validated
+            .lock()
+            .map_err(|_| TrainerError::Contract("test forgery witness lock poisoned".into()))?
+            .push((payload.rank, groups));
         Ok(())
     }
 
@@ -11603,6 +11724,113 @@ mod tests {
             assert_eq!(sampler, 0, "rank {rank} sampler was not rolled back");
         }
         assert!(!ledger_root.join("step-00000000000000000000").exists());
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn distributed_collector_recomputes_forged_reward_moments_before_candidates() {
+        let cases = [
+            ("mean", RolloutLedgerPayloadForgeryKind::Mean),
+            ("sample-std", RolloutLedgerPayloadForgeryKind::SampleStd),
+        ];
+        for (label, kind) in cases {
+            let tmp = WireTmp::new(&format!("distributed-collector-forged-{label}"));
+            let ledger_root = tmp.0.join("ledger");
+            let locally_validated: RolloutLedgerPayloadForgeryWitness =
+                Arc::new(std::sync::Mutex::new(Vec::new()));
+            let results = std::thread::scope(|scope| {
+                let handles = crate::comm::LocalComm::world_with_timeout(
+                    2,
+                    std::time::Duration::from_millis(5_000),
+                )
+                .into_iter()
+                .map(|comm| {
+                    let root = tmp.0.clone();
+                    let ledger_root = ledger_root.clone();
+                    let locally_validated = Arc::clone(&locally_validated);
+                    scope.spawn(move || {
+                        let rank = comm.rank();
+                        let run = RunDir::create(&root, format!("{label}-rank-{rank}")).unwrap();
+                        let mut config = candidate_ledger_config();
+                        config.candidate_log_top_k = 1;
+                        config.reward_group_scope = RewardGroupScope::DistributedSamePrompt;
+                        let mut trainer = Trainer::with_comm(config, &run, comm).unwrap();
+                        trainer.inject_rollout_ledger_payload_forgery(kind, locally_validated);
+                        let sentinel = format!("preexisting-{label}-rank-{rank}\n").into_bytes();
+                        std::fs::write(run.candidates_path(), &sentinel).unwrap();
+                        let mut policy = stateful_candidate_policy();
+                        let sampler_before = 41;
+                        policy.sampler = sampler_before;
+                        let result = trainer.collect_rollout_ledger_step(
+                            0,
+                            &mut policy,
+                            &CandidateReward,
+                            &CandidateCodec,
+                            &[Sample::new("same prompt", ())],
+                            &ledger_root,
+                            &"d".repeat(64),
+                            None,
+                        );
+                        (
+                            rank,
+                            result,
+                            std::fs::read(run.candidates_path()).unwrap(),
+                            sentinel,
+                            policy.sampler,
+                            sampler_before,
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+
+            for (rank, result, candidates, sentinel, sampler, sampler_before) in results {
+                let error = result.unwrap_err();
+                assert_eq!(
+                    candidates, sentinel,
+                    "rank {rank} changed candidate bytes for {label} forgery"
+                );
+                assert_eq!(
+                    sampler, sampler_before,
+                    "rank {rank} did not restore the exact sampler for {label} forgery"
+                );
+                assert!(
+                    error.to_string().contains(
+                        "distributed reward statistics do not match rank-ordered rewards"
+                    ),
+                    "rank {rank} returned {error:?} for {label} forgery"
+                );
+            }
+
+            let mut witnessed = locally_validated.lock().unwrap();
+            witnessed.sort_by_key(|(rank, _)| *rank);
+            assert_eq!(witnessed.len(), 2, "both local shards must validate");
+            assert_eq!(witnessed[0].0, 0);
+            assert_eq!(witnessed[1].0, 1);
+            assert_eq!(
+                witnessed[0].1, witnessed[1].1,
+                "every rank must carry identical forged statistics and matching advantages"
+            );
+            let forged = witnessed[0].1[0].0;
+            match kind {
+                RolloutLedgerPayloadForgeryKind::Mean => {
+                    assert_eq!(f64::from_bits(forged.mean_bits), 0.5);
+                    assert_ne!(f64::from_bits(forged.sample_std_bits), 1.5);
+                }
+                RolloutLedgerPayloadForgeryKind::SampleStd => {
+                    assert_ne!(f64::from_bits(forged.mean_bits), 0.5);
+                    assert_eq!(f64::from_bits(forged.sample_std_bits), 1.5);
+                }
+            }
+            assert!(
+                std::fs::read_dir(&ledger_root).unwrap().next().is_none(),
+                "{label} forgery must not publish or stage a ledger payload"
+            );
+        }
     }
 
     #[test]
