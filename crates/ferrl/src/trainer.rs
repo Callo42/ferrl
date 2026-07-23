@@ -1177,7 +1177,20 @@ impl TrainerConfig {
         Ok(())
     }
 
-    fn validate_reward_group_world(&self, world_size: usize) -> Result<(), TrainerError> {
+    /// Validate the effective reward-group size against a live data-parallel
+    /// communicator world size.
+    ///
+    /// Launchers call this after distributed config consensus but before
+    /// device, model, or run-directory creation, because the configured local
+    /// group can become either valid or overflowing only once the live world is
+    /// known.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrainerError::InvalidConfig`] when `world_size` is zero, the
+    /// distributed effective group-size multiplication overflows, or the
+    /// effective reward group contains fewer than two rows.
+    pub fn validate_reward_group_world(&self, world_size: usize) -> Result<(), TrainerError> {
         require(world_size >= 1, "communicator world_size must be >= 1")?;
         let effective = match self.reward_group_scope {
             RewardGroupScope::Local => self.group_size,
@@ -1260,6 +1273,8 @@ pub struct Trainer {
     candidate_writer: Option<CandidateWriter>,
     #[cfg(test)]
     rollout_ledger_payload_forgery: Option<RolloutLedgerPayloadForgery>,
+    #[cfg(test)]
+    tensor_parallel_request_row_base_override: Option<u64>,
 }
 
 #[cfg(test)]
@@ -1329,7 +1344,7 @@ struct CollectedGroup {
 /// tensors mutated while its peers return from the status rendezvous.
 struct RolloutGroupPrestate {
     vars: Vec<Var>,
-    adapter: Vec<Tensor>,
+    adapter: Option<Vec<Tensor>>,
     adapter_enabled: bool,
     sampler: Vec<u8>,
 }
@@ -1950,6 +1965,8 @@ impl Trainer {
             candidate_writer,
             #[cfg(test)]
             rollout_ledger_payload_forgery: None,
+            #[cfg(test)]
+            tensor_parallel_request_row_base_override: None,
         })
     }
 
@@ -1963,6 +1980,11 @@ impl Trainer {
             kind,
             locally_validated,
         });
+    }
+
+    #[cfg(test)]
+    fn inject_tensor_parallel_request_row_base_override(&mut self, row_base: u64) {
+        self.tensor_parallel_request_row_base_override = Some(row_base);
     }
 
     /// Install a cooperative **preemption flag**. When the flag flips to `true`
@@ -2213,6 +2235,26 @@ impl Trainer {
             "rollout-ledger collector sampler prestate",
             &sampler_prestate,
         )?;
+        let collection_prestate = Self::coordinate_comm_call(
+            execution_comm,
+            "rollout-ledger collector policy prestate snapshot",
+            || {
+                let prestate = Self::snapshot_rollout_group_prestate(policy)?;
+                if !Self::same_rollout_ledger_vars(&vars, &prestate.vars) {
+                    return Err(TrainerError::Contract(
+                        "policy trainable-variable set changed while snapshotting rollout-ledger collector prestate"
+                            .into(),
+                    ));
+                }
+                if prestate.sampler != sampler_prestate {
+                    return Err(TrainerError::Contract(
+                        "policy sampler state changed while snapshotting rollout-ledger collector prestate"
+                            .into(),
+                    ));
+                }
+                Ok(prestate)
+            },
+        )?;
         let is_execution_primary = exec.is_execution_primary(self.comm.as_ref());
         let writer =
             Self::coordinate_comm_call(execution_comm, "rollout-ledger writer creation", || {
@@ -2384,12 +2426,12 @@ impl Trainer {
             }) => {
                 let rollback = Self::catch_local_distributed_recovery(
                     "best-effort local tensor-parallel rollout-ledger collector rollback",
-                    || Self::restore_rollout_ledger_sampler(policy, &sampler_prestate),
+                    || Self::restore_rollout_group_prestate(policy, &collection_prestate),
                 );
                 match rollback {
-                    Ok(()) => detail.push_str("; local sampler rollback succeeded"),
+                    Ok(()) => detail.push_str("; local policy rollback succeeded"),
                     Err(error) => detail.push_str(&format!(
-                        "; local sampler rollback failed ({error}); policy state is partial"
+                        "; local policy rollback failed ({error}); policy state is partial"
                     )),
                 }
                 Err(TrainerError::TensorParallelExecutionTerminal { operation, detail })
@@ -2400,7 +2442,7 @@ impl Trainer {
             }) => {
                 let rollback = Self::catch_local_distributed_recovery(
                     "best-effort local rollout-ledger collector rollback",
-                    || Self::restore_rollout_ledger_sampler(policy, &sampler_prestate),
+                    || Self::restore_rollout_group_prestate(policy, &collection_prestate),
                 );
                 Err(Self::terminal_distributed_comm_failure(
                     "rollout-ledger candidate publication",
@@ -2413,7 +2455,7 @@ impl Trainer {
             Err(TrainerError::Comm(comm_error)) => {
                 let rollback = Self::catch_local_distributed_recovery(
                     "best-effort local rollout-ledger collector rollback",
-                    || Self::restore_rollout_ledger_sampler(policy, &sampler_prestate),
+                    || Self::restore_rollout_group_prestate(policy, &collection_prestate),
                 );
                 Err(Self::terminal_distributed_comm_failure(
                     "rollout-ledger collector",
@@ -2427,11 +2469,11 @@ impl Trainer {
                 let rollback = Self::coordinate_comm_call(
                     execution_comm,
                     "rollout-ledger collector rollback",
-                    || Self::restore_rollout_ledger_sampler(policy, &sampler_prestate),
+                    || Self::restore_rollout_group_prestate(policy, &collection_prestate),
                 );
                 if let Err(rollback) = rollback {
                     return Err(TrainerError::Contract(format!(
-                        "rollout-ledger collector failed ({error}); coordinated sampler rollback also failed ({rollback}); discard the policy instance on every rank in this execution world"
+                        "rollout-ledger collector failed ({error}); coordinated adapter/sampler/adapter-mode rollback also failed ({rollback}); discard the policy instance on every rank in this execution world"
                     )));
                 }
                 Err(error)
@@ -4353,7 +4395,11 @@ impl Trainer {
     ) -> Result<RolloutGroupPrestate, TrainerError> {
         let adapter_enabled = policy.adapter_enabled();
         let vars = policy.trainable_vars();
-        let adapter = Self::snapshot_rollout_ledger_vars(&vars)?;
+        let adapter = if policy.requires_rollout_tensor_snapshot() {
+            Some(Self::snapshot_rollout_ledger_vars(&vars)?)
+        } else {
+            None
+        };
         let sampler = policy.sampler_state()?;
         Ok(RolloutGroupPrestate {
             vars,
@@ -4382,17 +4428,18 @@ impl Trainer {
                     .into(),
             );
         }
-        if prestate.vars.len() != prestate.adapter.len() {
-            failures.push(format!(
-                "adapter snapshot has {} tensors for {} live variables",
-                prestate.adapter.len(),
-                prestate.vars.len()
-            ));
-        } else {
-            for (index, (var, snapshot)) in prestate.vars.iter().zip(&prestate.adapter).enumerate()
-            {
-                if let Err(error) = var.set(snapshot) {
-                    failures.push(format!("restore adapter tensor {index}: {error}"));
+        if let Some(adapter) = &prestate.adapter {
+            if prestate.vars.len() != adapter.len() {
+                failures.push(format!(
+                    "adapter snapshot has {} tensors for {} live variables",
+                    adapter.len(),
+                    prestate.vars.len()
+                ));
+            } else {
+                for (index, (var, snapshot)) in prestate.vars.iter().zip(adapter).enumerate() {
+                    if let Err(error) = var.set(snapshot) {
+                        failures.push(format!("restore adapter tensor {index}: {error}"));
+                    }
                 }
             }
         }
@@ -6026,6 +6073,31 @@ impl Trainer {
         R: RewardFn,
         E: PolicyExecution<P>,
     {
+        if exec.model_parallel_world_size() > 1 {
+            let trainer_comm = Arc::clone(&self.comm);
+            let execution_comm = exec.execution_comm(trainer_comm.as_ref());
+            let contract = Self::coordinate_model_parallel_result(
+                exec.model_parallel_world_size(),
+                execution_comm,
+                "tensor-parallel direct run control-flow contract serialization",
+                serde_json::to_vec(&(
+                    &self.config,
+                    start_step,
+                    samples.len(),
+                    resume_opt_state.is_some(),
+                ))
+                .map_err(|error| {
+                    TrainerError::Contract(format!(
+                        "serialize tensor-parallel direct run control-flow contract: {error}"
+                    ))
+                }),
+            )?;
+            Self::require_comm_consensus_bytes(
+                execution_comm,
+                "tensor-parallel direct run control-flow contract",
+                &contract,
+            )?;
+        }
         assert!(!samples.is_empty(), "train: no samples");
         // Stamp every event this run emits — the per-step events below, plus anything
         // the policy/reward logs — with this rank's rank/world. Under DP all ranks share
@@ -6330,16 +6402,11 @@ impl Trainer {
             // adapter mode to the state before either group ran.
             let trainer_comm = Arc::clone(&self.comm);
             let execution_comm = exec.execution_comm(trainer_comm.as_ref());
-            let recoverable_collection = exec.model_parallel_world_size() <= 1;
-            let prestate = if recoverable_collection {
-                Some(Self::coordinate_comm_call(
-                    execution_comm,
-                    "direct rollout window prestate snapshot",
-                    || Self::snapshot_rollout_group_prestate(policy),
-                )?)
-            } else {
-                None
-            };
+            let prestate = Some(Self::coordinate_comm_call(
+                execution_comm,
+                "direct rollout window prestate snapshot",
+                || Self::snapshot_rollout_group_prestate(policy),
+            )?);
             let collection: Result<(Vec<PromptStat>, Vec<LiveItem>), TrainerError> = (|| {
                 let mut stats = Vec::with_capacity(accum);
                 let mut live = Vec::with_capacity(accum);
@@ -6364,7 +6431,7 @@ impl Trainer {
             );
             match collection {
                 Ok(collection) => collection,
-                Err(error) if recoverable_collection => {
+                Err(error) => {
                     return Err(Self::rollback_rollout_group_failure(
                         policy,
                         prestate.as_ref(),
@@ -6372,14 +6439,12 @@ impl Trainer {
                         error,
                     ));
                 }
-                Err(error) => return Err(error),
             }
         } else {
             let trainer_comm = Arc::clone(&self.comm);
             let execution_comm = exec.execution_comm(trainer_comm.as_ref());
             let coordinate_over_data_parallel =
                 exec.model_parallel_world_size() <= 1 && execution_comm.world_size() > 1;
-            let recoverable_collection = exec.model_parallel_world_size() <= 1;
             let mut prestate = None;
             let collection: Result<(Vec<PromptStat>, Vec<LiveItem>), TrainerError> = (|| {
                 let mut collected = Vec::with_capacity(accum);
@@ -6392,7 +6457,7 @@ impl Trainer {
                         selection: &sel,
                         accum_index: j,
                     };
-                    let rollback_prestate = if recoverable_collection && prestate.is_none() {
+                    let rollback_prestate = if prestate.is_none() {
                         Some(&mut prestate)
                     } else {
                         None
@@ -6441,7 +6506,7 @@ impl Trainer {
             );
             let collection = match collection {
                 Ok(collection) => collection,
-                Err(error) if recoverable_collection => {
+                Err(error) => {
                     return Err(Self::rollback_rollout_group_failure(
                         policy,
                         prestate.as_ref(),
@@ -6449,7 +6514,6 @@ impl Trainer {
                         error,
                     ));
                 }
-                Err(error) => return Err(error),
             };
             drop(prestate);
             collection
@@ -6510,7 +6574,7 @@ impl Trainer {
         let accum = self.config.grad_accum_steps;
         let world = self.comm.world_size();
         let rank = self.comm.rank();
-        match self.config.reward_group_scope {
+        let selection = match self.config.reward_group_scope {
             RewardGroupScope::Local => {
                 // Continuous prompt cycling across windows: window `step` consumes
                 // the `accum × world` prompts starting at `step*accum*world` (mod
@@ -6540,7 +6604,16 @@ impl Trainer {
                         .wrapping_mul(self.config.group_size as u64),
                 }
             }
-        }
+        };
+        #[cfg(test)]
+        let selection = {
+            let mut selection = selection;
+            if let Some(row_base) = self.tensor_parallel_request_row_base_override {
+                selection.rollout_global_row_base = row_base;
+            }
+            selection
+        };
+        selection
     }
 
     fn record_prompt_selection(&self, sel: &PromptSelection) {
@@ -6989,6 +7062,37 @@ impl Trainer {
                 &prompt_bytes,
             )?;
         }
+        if exec.model_parallel_world_size() > 1 {
+            let request_bytes = Self::coordinate_model_parallel_result(
+                exec.model_parallel_world_size(),
+                execution_comm,
+                "tensor-parallel rollout generation request serialization",
+                serde_json::to_vec(&(
+                    &prompt_ids,
+                    gen.group_size,
+                    gen.max_new_tokens,
+                    gen.temperature.to_bits(),
+                    gen.eos_token_id,
+                    gen.eval_sampling.map(|sampling| {
+                        (
+                            sampling.temperature.to_bits(),
+                            sampling.top_p.map(f64::to_bits),
+                        )
+                    }),
+                    selected.selection.rollout_global_row_base,
+                ))
+                .map_err(|error| {
+                    TrainerError::Contract(format!(
+                        "serialize tensor-parallel rollout generation request: {error}"
+                    ))
+                }),
+            )?;
+            Self::require_comm_consensus_bytes(
+                execution_comm,
+                "tensor-parallel rollout generation request",
+                &request_bytes,
+            )?;
+        }
         gpu_mem.record("rollout_start");
         let generated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let rollout = exec.generate_at_instrumented(
@@ -7022,8 +7126,7 @@ impl Trainer {
                     self.config.group_size
                 )));
             }
-            let completions = decode_completions(&rollout, tokenizer);
-            Ok((rollout, comp_len, completions))
+            Ok((rollout, comp_len))
         }))
         .unwrap_or_else(|payload| {
             Err(TrainerError::Contract(format!(
@@ -7031,8 +7134,40 @@ impl Trainer {
                 panic_payload_message(payload.as_ref())
             )))
         });
-        let (rollout, comp_len, completions) =
+        let (rollout, comp_len) =
             Self::coordinate_comm_result(execution_comm, "rollout generation result", generated)?;
+        if exec.model_parallel_world_size() > 1 {
+            let rollout_logprob_bits = rollout.rollout_logprobs.as_ref().map(|rows| {
+                rows.iter()
+                    .map(|row| row.iter().map(|value| value.to_bits()).collect::<Vec<_>>())
+                    .collect::<Vec<_>>()
+            });
+            let rollout_bytes = Self::coordinate_model_parallel_result(
+                exec.model_parallel_world_size(),
+                execution_comm,
+                "tensor-parallel logical rollout serialization",
+                serde_json::to_vec(&(
+                    &rollout.token_ids,
+                    rollout.prompt_len,
+                    &rollout.completion_lens,
+                    &rollout_logprob_bits,
+                ))
+                .map_err(|error| {
+                    TrainerError::Contract(format!(
+                        "serialize tensor-parallel logical rollout: {error}"
+                    ))
+                }),
+            )?;
+            Self::require_comm_consensus_bytes(
+                execution_comm,
+                "tensor-parallel logical rollout",
+                &rollout_bytes,
+            )?;
+        }
+        let completions =
+            Self::coordinate_comm_call(execution_comm, "rollout completion decoding", || {
+                Ok(decode_completions(&rollout, tokenizer))
+            })?;
         gpu_mem.record("rollout_end");
         gpu_mem.record("reward_start");
         let reward_outcomes = self.coordinate_reward_group(
@@ -13838,8 +13973,10 @@ mod tests {
         let ledger_root = tmp.0.join("ledger");
         let final_dir = ledger_root.join("step-00000000000000000000");
         let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        // Arming on the collector's second sampler snapshot leaves exactly 27
-        // successful collectives through shard status; the next call is the
+        // The whole-window rollback snapshot added another sampler read before
+        // collection. Arm on the third read, which is still the collector
+        // poststate boundary exercised by this regression. Exactly 27
+        // successful collectives then reach shard status; the next call is the
         // manifest-publication status reduction and must fail on both ranks.
         let states: Vec<_> = (0..2)
             .map(|_| std::sync::Arc::new(ArmedCollectiveFailureState::new(27)))
@@ -13868,7 +14005,7 @@ mod tests {
                         let mut policy = ArmedCandidatePolicy {
                             inner: stateful_candidate_policy(),
                             armed,
-                            arm_point: CandidatePolicyArmPoint::SamplerState(2),
+                            arm_point: CandidatePolicyArmPoint::SamplerState(3),
                             sampler_state_calls: std::cell::Cell::new(0),
                         };
                         if rank == 0 {
@@ -15054,6 +15191,446 @@ mod tests {
         )
     }
 
+    #[derive(Debug, Clone, Copy)]
+    enum TpRolloutIdentityCase {
+        Canonical,
+        DivergentTokenIdsOnly,
+        DivergentTokensAndLengths,
+        DivergentBehaviorLogprobBits,
+        LateMalformedSecondGroup,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum TpRequestMutation {
+        None,
+        Temperature(f64),
+        Eos(Option<u32>),
+        Steps(u64),
+        GradAccum(usize),
+        GlobalRowBase(u64),
+    }
+
+    struct TpRolloutIdentityPolicy {
+        logp: Var,
+        enabled: bool,
+        sampler_state: Vec<u8>,
+        rank: usize,
+        case: TpRolloutIdentityCase,
+        calls: std::sync::Arc<std::sync::Mutex<TpProbeCalls>>,
+    }
+
+    impl TpRolloutIdentityPolicy {
+        fn new(rank: usize, completion_width: usize, case: TpRolloutIdentityCase) -> Self {
+            let values = (0..2 * completion_width)
+                .map(|index| if index < completion_width { -0.4 } else { -0.6 })
+                .collect::<Vec<f32>>();
+            let logp =
+                Var::from_tensor(&Tensor::from_vec(values, (2, completion_width), &cpu()).unwrap())
+                    .unwrap();
+            Self {
+                logp,
+                enabled: true,
+                sampler_state: vec![17_u8.wrapping_add(rank as u8)],
+                rank,
+                case,
+                calls: std::sync::Arc::new(std::sync::Mutex::new(TpProbeCalls::default())),
+            }
+        }
+
+        fn mutate_generation_state(&mut self) -> CandleResult<()> {
+            self.sampler_state[0] = self.sampler_state[0].wrapping_add(1);
+            let changed = self.logp.as_tensor().affine(1.0, 0.75)?;
+            self.logp.set(&changed)?;
+            self.enabled = false;
+            Ok(())
+        }
+
+        fn canonical_rollout(&self, prompt: &[u32], cfg: &GenConfig) -> Rollout {
+            let mut token_ids = Vec::with_capacity(2);
+            let mut completion_lens = Vec::with_capacity(2);
+            let mut rollout_logprobs = Vec::with_capacity(2);
+            for row in 0..2 {
+                let mut tokens = prompt.to_vec();
+                let mut completion = vec![(row + 1) as u32; cfg.max_new_tokens];
+                if cfg.max_new_tokens > 1 {
+                    if let Some(eos) = cfg.eos_token_id {
+                        completion[cfg.max_new_tokens - 1] = eos;
+                    }
+                }
+                tokens.extend_from_slice(&completion);
+                token_ids.push(tokens);
+                completion_lens.push(cfg.max_new_tokens);
+                rollout_logprobs.push(vec![-0.5; cfg.max_new_tokens]);
+            }
+            Rollout::new(
+                token_ids,
+                prompt.len(),
+                completion_lens,
+                Some(rollout_logprobs),
+            )
+        }
+
+        fn divergent_locally_valid_rollout(&self, prompt: &[u32], cfg: &GenConfig) -> Rollout {
+            if self.rank == 0 {
+                return self.canonical_rollout(prompt, cfg);
+            }
+            assert_eq!(cfg.max_new_tokens, 2);
+            let eos = cfg
+                .eos_token_id
+                .expect("divergent TP rollout control uses EOS");
+            let next_after_half = f32::from_bits((-0.5_f32).to_bits() + 1);
+            Rollout::new(
+                vec![
+                    prompt.iter().copied().chain([eos, eos]).collect(),
+                    prompt.iter().copied().chain([3, eos]).collect(),
+                ],
+                prompt.len(),
+                vec![1, 2],
+                Some(vec![vec![next_after_half], vec![-0.25, -0.75]]),
+            )
+        }
+
+        fn divergent_token_ids_only_rollout(&self, prompt: &[u32], cfg: &GenConfig) -> Rollout {
+            let mut rollout = self.canonical_rollout(prompt, cfg);
+            if self.rank == 1 {
+                // Change one live completion token while preserving prompt_len,
+                // every completion_len, and every behavior-logprob bit exactly.
+                // The row stays locally valid because the terminal EOS remains
+                // in the same position.
+                rollout.token_ids[0][prompt.len()] = 7;
+            }
+            rollout
+        }
+
+        fn divergent_behavior_logprob_rollout(&self, prompt: &[u32], cfg: &GenConfig) -> Rollout {
+            let mut rollout = self.canonical_rollout(prompt, cfg);
+            if self.rank == 1 {
+                let captured = rollout
+                    .rollout_logprobs
+                    .as_mut()
+                    .expect("canonical identity rollout captures behavior log-probs");
+                captured[0][0] = f32::from_bits(captured[0][0].to_bits() + 1);
+            }
+            rollout
+        }
+
+        fn adapter_values(&self) -> Vec<Vec<f32>> {
+            self.logp.as_tensor().to_vec2::<f32>().unwrap()
+        }
+    }
+
+    impl Policy for TpRolloutIdentityPolicy {
+        fn generate(&mut self, _prompt: &[u32], _cfg: &GenConfig) -> CandleResult<Rollout> {
+            panic!("true TP identity controls must not call Policy::generate")
+        }
+
+        fn token_logprobs(&self, _rollout: &Rollout) -> CandleResult<Tensor> {
+            panic!("true TP identity controls must not call Policy::token_logprobs")
+        }
+
+        fn token_logprobs_detached(&self, _rollout: &Rollout) -> CandleResult<Tensor> {
+            panic!("true TP identity controls must not call Policy::token_logprobs_detached")
+        }
+
+        fn backward(&self, _loss: &Tensor) -> CandleResult<GradStore> {
+            panic!("true TP identity controls must not call Policy::backward")
+        }
+
+        fn set_adapter_enabled(&mut self, enabled: bool) {
+            self.enabled = enabled;
+        }
+
+        fn adapter_enabled(&self) -> bool {
+            self.enabled
+        }
+
+        fn trainable_vars(&self) -> Vec<Var> {
+            vec![self.logp.clone()]
+        }
+
+        fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+            Ok(self.sampler_state.clone())
+        }
+
+        fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
+            if state.len() != 1 {
+                candle_core::bail!("invalid TP identity-control sampler state")
+            }
+            self.sampler_state = state.to_vec();
+            Ok(())
+        }
+    }
+
+    impl TensorParallelPolicy for TpRolloutIdentityPolicy {
+        fn supports_sharded_tensor_parallel_backward(&self) -> bool {
+            true
+        }
+
+        fn generate_at_tensor_parallel_instrumented(
+            &mut self,
+            prompt: &[u32],
+            cfg: &GenConfig,
+            _global_row_base: u64,
+            _comm: &dyn Comm,
+            _telemetry: Option<&mut dyn ModelTelemetryRecorder>,
+        ) -> CandleResult<Rollout> {
+            let generation_index = {
+                let mut calls = self.calls.lock().unwrap();
+                let generation_index = calls.generate;
+                calls.generate += 1;
+                generation_index
+            };
+            self.mutate_generation_state()?;
+            let mut rollout = match self.case {
+                TpRolloutIdentityCase::Canonical
+                | TpRolloutIdentityCase::LateMalformedSecondGroup => {
+                    self.canonical_rollout(prompt, cfg)
+                }
+                TpRolloutIdentityCase::DivergentTokenIdsOnly => {
+                    self.divergent_token_ids_only_rollout(prompt, cfg)
+                }
+                TpRolloutIdentityCase::DivergentTokensAndLengths => {
+                    self.divergent_locally_valid_rollout(prompt, cfg)
+                }
+                TpRolloutIdentityCase::DivergentBehaviorLogprobBits => {
+                    self.divergent_behavior_logprob_rollout(prompt, cfg)
+                }
+            };
+            if matches!(self.case, TpRolloutIdentityCase::LateMalformedSecondGroup)
+                && generation_index == 1
+                && self.rank == 1
+            {
+                for tokens in &mut rollout.token_ids {
+                    tokens[0] = tokens[0].wrapping_add(100);
+                }
+            }
+            Ok(rollout)
+        }
+
+        fn token_logprobs_tensor_parallel(
+            &self,
+            _rollout: &Rollout,
+            _comm: &dyn Comm,
+        ) -> CandleResult<Tensor> {
+            self.calls.lock().unwrap().live_logp += 1;
+            Ok(self.logp.as_tensor().clone())
+        }
+
+        fn token_logprobs_tensor_parallel_detached(
+            &self,
+            _rollout: &Rollout,
+            _comm: &dyn Comm,
+        ) -> CandleResult<Tensor> {
+            self.calls.lock().unwrap().detached_logp += 1;
+            Ok(self.logp.as_tensor().detach())
+        }
+
+        fn backward_tensor_parallel(
+            &self,
+            loss: &Tensor,
+            _comm: &dyn Comm,
+        ) -> CandleResult<GradStore> {
+            self.calls.lock().unwrap().backward += 1;
+            loss.backward()
+        }
+    }
+
+    struct TpRolloutIdentityCodec {
+        prompt_id: u32,
+        panic_on_decode: bool,
+    }
+
+    impl TokenizerLike for TpRolloutIdentityCodec {
+        fn encode(&self, _text: &str) -> Vec<u32> {
+            vec![self.prompt_id]
+        }
+
+        fn decode(&self, ids: &[u32]) -> String {
+            if self.panic_on_decode {
+                panic!("injected TP completion decode panic");
+            }
+            ids.iter().map(u32::to_string).collect::<Vec<_>>().join(",")
+        }
+    }
+
+    struct TpRolloutIdentityReward {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl RewardFn for TpRolloutIdentityReward {
+        type Target = ();
+
+        fn reward(&self, _sample: &Sample<()>, _completion: &str) -> Result<f32, RewardError> {
+            panic!("TP identity controls use the detailed reward seam")
+        }
+
+        fn reward_group_detailed(
+            &self,
+            _sample: &Sample<()>,
+            completions: &[String],
+        ) -> Result<Vec<RewardOutcome>, RewardError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(completions
+                .iter()
+                .enumerate()
+                .map(|(index, _)| RewardOutcome::reward((index * 2) as f32))
+                .collect())
+        }
+    }
+
+    struct TpRolloutIdentityOutcome {
+        rank: usize,
+        result: Result<(Vec<Metrics>, RunStop), TrainerError>,
+        calls: TpProbeCalls,
+        reward_calls: usize,
+        adapter_before: Vec<Vec<f32>>,
+        adapter_after: Vec<Vec<f32>>,
+        mode_before: bool,
+        mode_after: bool,
+        sampler_before: Vec<u8>,
+        sampler_after: Vec<u8>,
+        candidate_sentinel: Vec<u8>,
+        candidate_after: Vec<u8>,
+        metrics_sentinel: Vec<u8>,
+        metrics_after: Vec<u8>,
+    }
+
+    fn run_tp_rollout_identity_case(
+        label: &str,
+        config: &TrainerConfig,
+        prompt_ids: [u32; 2],
+        cases: [TpRolloutIdentityCase; 2],
+        decode_panics: [bool; 2],
+        request_mutations: [TpRequestMutation; 2],
+    ) -> Vec<TpRolloutIdentityOutcome> {
+        let tmp = WireTmp::new(label);
+        let outcomes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        std::thread::scope(|scope| {
+            let handles =
+                crate::comm::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(5))
+                    .into_iter()
+                    .enumerate()
+                    .map(|(rank, tp_comm)| {
+                        let root = tmp.0.clone();
+                        let outcomes = std::sync::Arc::clone(&outcomes);
+                        let mut rank_config = config.clone();
+                        scope.spawn(move || {
+                            match request_mutations[rank] {
+                                TpRequestMutation::None | TpRequestMutation::GlobalRowBase(_) => {}
+                                TpRequestMutation::Temperature(temperature) => {
+                                    rank_config.temperature = temperature;
+                                }
+                                TpRequestMutation::Eos(eos) => {
+                                    rank_config.eos_token_id = eos;
+                                }
+                                TpRequestMutation::Steps(steps) => {
+                                    rank_config.steps = steps;
+                                }
+                                TpRequestMutation::GradAccum(grad_accum_steps) => {
+                                    rank_config.grad_accum_steps = grad_accum_steps;
+                                }
+                            }
+                            let run = RunDir::create(&root, format!("rank-{rank}")).unwrap();
+                            let mut trainer = Trainer::new(rank_config.clone(), &run).unwrap();
+                            if let TpRequestMutation::GlobalRowBase(row_base) =
+                                request_mutations[rank]
+                            {
+                                trainer.inject_tensor_parallel_request_row_base_override(row_base);
+                            }
+                            let candidate_sentinel =
+                                format!("candidate-sentinel-{label}-rank-{rank}\n").into_bytes();
+                            let metrics_sentinel =
+                                format!("metrics-sentinel-{label}-rank-{rank}\n").into_bytes();
+                            std::fs::write(run.candidates_path(), &candidate_sentinel).unwrap();
+                            std::fs::write(run.metrics_path(), &metrics_sentinel).unwrap();
+                            let reward_calls =
+                                std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                            let reward = TpRolloutIdentityReward {
+                                calls: std::sync::Arc::clone(&reward_calls),
+                            };
+                            let mut policy = TpRolloutIdentityPolicy::new(
+                                rank,
+                                rank_config.max_new_tokens,
+                                cases[rank],
+                            );
+                            let calls = std::sync::Arc::clone(&policy.calls);
+                            let adapter_before = policy.adapter_values();
+                            let mode_before = policy.adapter_enabled();
+                            let sampler_before = policy.sampler_state().unwrap();
+                            let result = trainer.train_tensor_parallel(
+                                &mut policy,
+                                &reward,
+                                &TpRolloutIdentityCodec {
+                                    prompt_id: prompt_ids[rank],
+                                    panic_on_decode: decode_panics[rank],
+                                },
+                                &[Sample::new("logical TP prompt", ())],
+                                &tp_comm,
+                            );
+                            let outcome = TpRolloutIdentityOutcome {
+                                rank,
+                                result,
+                                calls: calls.lock().unwrap().clone(),
+                                reward_calls: reward_calls.load(Ordering::SeqCst),
+                                adapter_before,
+                                adapter_after: policy.adapter_values(),
+                                mode_before,
+                                mode_after: policy.adapter_enabled(),
+                                sampler_before,
+                                sampler_after: policy.sampler_state().unwrap(),
+                                candidate_sentinel,
+                                candidate_after: std::fs::read(run.candidates_path()).unwrap(),
+                                metrics_sentinel,
+                                metrics_after: std::fs::read(run.metrics_path()).unwrap(),
+                            };
+                            outcomes.lock().unwrap().push(outcome);
+                        })
+                    })
+                    .collect::<Vec<_>>();
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
+        let mut outcomes = std::sync::Arc::try_unwrap(outcomes)
+            .ok()
+            .unwrap()
+            .into_inner()
+            .unwrap();
+        outcomes.sort_by_key(|outcome| outcome.rank);
+        outcomes
+    }
+
+    fn assert_tp_identity_policy_prestate_restored(outcome: &TpRolloutIdentityOutcome) {
+        assert_eq!(
+            outcome.adapter_after, outcome.adapter_before,
+            "rank {} adapter tensors were not restored",
+            outcome.rank
+        );
+        assert_eq!(
+            outcome.mode_after, outcome.mode_before,
+            "rank {} adapter mode was not restored",
+            outcome.rank
+        );
+        assert_eq!(
+            outcome.sampler_after, outcome.sampler_before,
+            "rank {} sampler was not restored",
+            outcome.rank
+        );
+    }
+
+    fn assert_tp_identity_telemetry_sentinels(outcome: &TpRolloutIdentityOutcome) {
+        assert_eq!(
+            outcome.candidate_after, outcome.candidate_sentinel,
+            "rank {} changed candidate sentinel bytes",
+            outcome.rank
+        );
+        assert_eq!(
+            outcome.metrics_after, outcome.metrics_sentinel,
+            "rank {} changed metrics sentinel bytes",
+            outcome.rank
+        );
+    }
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum TpSeparatedHookFailure {
         Generate,
@@ -15524,7 +16101,7 @@ mod tests {
                         operation: "rollout generation",
                         detail,
                     } if detail.contains(expected_detail)
-                        && detail.contains("local sampler rollback succeeded")),
+                        && detail.contains("local policy rollback succeeded")),
                     "{behavior_name} rank {rank}: {error:?}"
                 );
                 assert_eq!(
@@ -15781,6 +16358,145 @@ mod tests {
 
     #[test]
     #[allow(clippy::cognitive_complexity)]
+    fn tensor_parallel_ledger_collector_semantic_failure_restores_exact_policy_prestate() {
+        let tmp = WireTmp::new("tp-ledger-collector-semantic-rollback");
+        let ledger_root = tmp.0.join("ledger");
+        let outcomes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        std::thread::scope(|scope| {
+            let handles =
+                crate::comm::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(5))
+                    .into_iter()
+                    .enumerate()
+                    .map(|(rank, tp_comm)| {
+                        let root = tmp.0.clone();
+                        let ledger_root = ledger_root.clone();
+                        let outcomes = std::sync::Arc::clone(&outcomes);
+                        scope.spawn(move || {
+                            let run =
+                                RunDir::create(&root, format!("semantic-rank-{rank}")).unwrap();
+                            let mut trainer = Trainer::new(
+                                TrainerConfig {
+                                    steps: 1,
+                                    group_size: 2,
+                                    max_new_tokens: 1,
+                                    grad_accum_steps: 2,
+                                    candidate_log_top_k: 1,
+                                    lr: 0.0,
+                                    max_grad_norm: None,
+                                    ..TrainerConfig::default()
+                                },
+                                &run,
+                            )
+                            .unwrap();
+                            let candidate_sentinel =
+                                format!("separated-candidate-sentinel-rank-{rank}\n").into_bytes();
+                            let metrics_sentinel =
+                                format!("separated-metrics-sentinel-rank-{rank}\n").into_bytes();
+                            std::fs::write(run.candidates_path(), &candidate_sentinel).unwrap();
+                            std::fs::write(run.metrics_path(), &metrics_sentinel).unwrap();
+                            let reward_calls =
+                                std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                            let reward = TpRolloutIdentityReward {
+                                calls: std::sync::Arc::clone(&reward_calls),
+                            };
+                            let mut policy = TpRolloutIdentityPolicy::new(
+                                rank,
+                                1,
+                                TpRolloutIdentityCase::LateMalformedSecondGroup,
+                            );
+                            // One logical TP rollout owns one sampler stream.
+                            policy.sampler_state = vec![17];
+                            let calls = std::sync::Arc::clone(&policy.calls);
+                            let adapter_before = policy.adapter_values();
+                            let mode_before = policy.adapter_enabled();
+                            let sampler_before = policy.sampler_state().unwrap();
+                            let result = trainer.collect_rollout_ledger_step_tensor_parallel(
+                                0,
+                                &mut policy,
+                                &reward,
+                                &TpRolloutIdentityCodec {
+                                    prompt_id: 42,
+                                    panic_on_decode: false,
+                                },
+                                &[Sample::new("logical TP prompt", ())],
+                                &ledger_root,
+                                &format!("{:064x}", 132),
+                                None,
+                                &tp_comm,
+                            );
+                            outcomes.lock().unwrap().push((
+                                rank,
+                                result,
+                                calls.lock().unwrap().clone(),
+                                reward_calls.load(Ordering::SeqCst),
+                                adapter_before,
+                                policy.adapter_values(),
+                                mode_before,
+                                policy.adapter_enabled(),
+                                sampler_before,
+                                policy.sampler_state().unwrap(),
+                                candidate_sentinel,
+                                std::fs::read(run.candidates_path()).unwrap(),
+                                metrics_sentinel,
+                                std::fs::read(run.metrics_path()).unwrap(),
+                            ));
+                        })
+                    })
+                    .collect::<Vec<_>>();
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
+
+        let mut outcomes = std::mem::take(&mut *outcomes.lock().unwrap());
+        outcomes.sort_by_key(|outcome| outcome.0);
+        for (
+            rank,
+            result,
+            calls,
+            reward_calls,
+            adapter_before,
+            adapter_after,
+            mode_before,
+            mode_after,
+            sampler_before,
+            sampler_after,
+            candidate_sentinel,
+            candidate_after,
+            metrics_sentinel,
+            metrics_after,
+        ) in outcomes
+        {
+            assert!(
+                result.is_err(),
+                "rank {rank} accepted malformed TP ledger window"
+            );
+            assert_eq!(calls.generate, 2, "rank {rank} generation count");
+            assert_eq!(
+                reward_calls,
+                usize::from(rank == 0),
+                "rank {rank} reward count"
+            );
+            assert_eq!(calls.detached_logp, 0, "rank {rank} detached scoring");
+            assert_eq!(calls.live_logp, 0, "rank {rank} live scoring");
+            assert_eq!(calls.backward, 0, "rank {rank} backward");
+            assert_eq!(adapter_after, adapter_before, "rank {rank} adapter tensors");
+            assert_eq!(mode_after, mode_before, "rank {rank} adapter mode");
+            assert_eq!(sampler_after, sampler_before, "rank {rank} sampler");
+            assert_eq!(
+                candidate_after, candidate_sentinel,
+                "rank {rank} candidates"
+            );
+            assert_eq!(metrics_after, metrics_sentinel, "rank {rank} metrics");
+        }
+        assert!(
+            !ledger_root.join(format!("step-{:020}", 0)).exists(),
+            "malformed TP collection published a ledger step"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
     fn tensor_parallel_ledger_metrics_failure_rolls_back_every_rank() {
         let tmp = WireTmp::new("tp-ledger-metrics-rollback");
         let ledger_root = tmp.0.join("ledger");
@@ -16031,6 +16747,363 @@ mod tests {
             2,
             "the unsupported-count reduction ran after capability panic"
         );
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn tensor_parallel_rejects_divergent_encoded_prompt_before_generation() {
+        let outcomes = run_tp_rollout_identity_case(
+            "tp-divergent-encoded-prompt",
+            &TrainerConfig {
+                steps: 1,
+                group_size: 2,
+                max_new_tokens: 1,
+                lr: 0.0,
+                max_grad_norm: None,
+                candidate_log_top_k: 1,
+                ..TrainerConfig::default()
+            },
+            [42, 43],
+            [
+                TpRolloutIdentityCase::Canonical,
+                TpRolloutIdentityCase::Canonical,
+            ],
+            [false, false],
+            [TpRequestMutation::None, TpRequestMutation::None],
+        );
+
+        for outcome in &outcomes {
+            let error = outcome.result.as_ref().expect_err(&format!(
+                "rank {} accepted a TP request with divergent encoded prompt IDs",
+                outcome.rank
+            ));
+            assert!(
+                error
+                    .to_string()
+                    .contains("tensor-parallel rollout generation request"),
+                "rank {} returned the wrong failure boundary: {error:?}",
+                outcome.rank
+            );
+            assert_eq!(
+                outcome.calls.generate, 0,
+                "rank {} entered TP generation before request consensus",
+                outcome.rank
+            );
+            assert_eq!(
+                outcome.reward_calls, 0,
+                "rank {} reached reward",
+                outcome.rank
+            );
+            assert_eq!(
+                outcome.calls.detached_logp, 0,
+                "rank {} reached detached scoring",
+                outcome.rank
+            );
+            assert_eq!(
+                outcome.calls.live_logp, 0,
+                "rank {} reached live scoring",
+                outcome.rank
+            );
+            assert_eq!(
+                outcome.calls.backward, 0,
+                "rank {} reached backward",
+                outcome.rank
+            );
+            assert_tp_identity_telemetry_sentinels(outcome);
+            assert_tp_identity_policy_prestate_restored(outcome);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn tensor_parallel_rejects_divergent_controls_cadence_and_global_row_base() {
+        for (label, mutation, expected_boundary) in [
+            (
+                "tp-divergent-temperature",
+                TpRequestMutation::Temperature(0.9),
+                "tensor-parallel direct run control-flow contract",
+            ),
+            (
+                "tp-divergent-eos",
+                TpRequestMutation::Eos(Some(9)),
+                "tensor-parallel direct run control-flow contract",
+            ),
+            (
+                "tp-divergent-steps",
+                TpRequestMutation::Steps(2),
+                "tensor-parallel direct run control-flow contract",
+            ),
+            (
+                "tp-divergent-grad-accum",
+                TpRequestMutation::GradAccum(2),
+                "tensor-parallel direct run control-flow contract",
+            ),
+            (
+                "tp-divergent-global-row-base",
+                TpRequestMutation::GlobalRowBase(77),
+                "tensor-parallel rollout generation request",
+            ),
+        ] {
+            let outcomes = run_tp_rollout_identity_case(
+                label,
+                &TrainerConfig {
+                    steps: 1,
+                    group_size: 2,
+                    max_new_tokens: 1,
+                    lr: 0.0,
+                    max_grad_norm: None,
+                    candidate_log_top_k: 1,
+                    ..TrainerConfig::default()
+                },
+                [42, 42],
+                [
+                    TpRolloutIdentityCase::Canonical,
+                    TpRolloutIdentityCase::Canonical,
+                ],
+                [false, false],
+                [TpRequestMutation::None, mutation],
+            );
+
+            for outcome in &outcomes {
+                let error = outcome.result.as_ref().expect_err(&format!(
+                    "rank {} accepted divergent TP control {label}",
+                    outcome.rank
+                ));
+                assert!(
+                    error.to_string().contains(expected_boundary),
+                    "rank {} returned the wrong {label} boundary: {error:?}",
+                    outcome.rank
+                );
+                assert_eq!(
+                    outcome.calls.generate, 0,
+                    "rank {} generated before rejecting {label}",
+                    outcome.rank
+                );
+                assert_eq!(
+                    outcome.reward_calls, 0,
+                    "rank {} reached reward for {label}",
+                    outcome.rank
+                );
+                assert_eq!(outcome.calls.detached_logp, 0);
+                assert_eq!(outcome.calls.live_logp, 0);
+                assert_eq!(outcome.calls.backward, 0);
+                assert_tp_identity_telemetry_sentinels(outcome);
+                assert_tp_identity_policy_prestate_restored(outcome);
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn tensor_parallel_rejects_divergent_locally_valid_rollout_before_reward() {
+        for (label, case, divergence) in [
+            (
+                "tp-divergent-locally-valid-token-only-rollout",
+                TpRolloutIdentityCase::DivergentTokenIdsOnly,
+                "token IDs only",
+            ),
+            (
+                "tp-divergent-locally-valid-token-length-rollout",
+                TpRolloutIdentityCase::DivergentTokensAndLengths,
+                "token IDs and completion lengths",
+            ),
+            (
+                "tp-divergent-locally-valid-behavior-bits-rollout",
+                TpRolloutIdentityCase::DivergentBehaviorLogprobBits,
+                "behavior-logprob bits",
+            ),
+        ] {
+            let outcomes = run_tp_rollout_identity_case(
+                label,
+                &TrainerConfig {
+                    steps: 1,
+                    group_size: 2,
+                    max_new_tokens: 2,
+                    lr: 0.0,
+                    max_grad_norm: None,
+                    candidate_log_top_k: 1,
+                    eos_token_id: Some(9),
+                    ..TrainerConfig::default()
+                },
+                [42, 42],
+                [case, case],
+                [false, false],
+                [TpRequestMutation::None, TpRequestMutation::None],
+            );
+
+            for outcome in &outcomes {
+                let error = outcome.result.as_ref().expect_err(&format!(
+                    "rank {} accepted a TP rollout with divergent {divergence}",
+                    outcome.rank
+                ));
+                assert!(
+                    error
+                        .to_string()
+                        .contains("tensor-parallel logical rollout"),
+                    "rank {} returned the wrong failure boundary: {error:?}",
+                    outcome.rank
+                );
+                assert_eq!(
+                    outcome.calls.generate, 1,
+                    "rank {} generation",
+                    outcome.rank
+                );
+                assert_eq!(
+                    outcome.reward_calls, 0,
+                    "rank {} reached reward before rollout consensus",
+                    outcome.rank
+                );
+                assert_eq!(
+                    outcome.calls.detached_logp, 0,
+                    "rank {} reached detached scoring",
+                    outcome.rank
+                );
+                assert_eq!(
+                    outcome.calls.live_logp, 0,
+                    "rank {} reached live scoring",
+                    outcome.rank
+                );
+                assert_eq!(
+                    outcome.calls.backward, 0,
+                    "rank {} reached backward",
+                    outcome.rank
+                );
+                assert_tp_identity_telemetry_sentinels(outcome);
+                assert_tp_identity_policy_prestate_restored(outcome);
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn tensor_parallel_coordinates_completion_decode_panic_before_reward_and_rolls_back() {
+        let outcomes = run_tp_rollout_identity_case(
+            "tp-rank-local-completion-decode-panic",
+            &TrainerConfig {
+                steps: 1,
+                group_size: 2,
+                max_new_tokens: 1,
+                lr: 0.0,
+                max_grad_norm: None,
+                candidate_log_top_k: 1,
+                ..TrainerConfig::default()
+            },
+            [42, 42],
+            [
+                TpRolloutIdentityCase::Canonical,
+                TpRolloutIdentityCase::Canonical,
+            ],
+            [false, true],
+            [TpRequestMutation::None, TpRequestMutation::None],
+        );
+
+        for outcome in &outcomes {
+            let error = outcome.result.as_ref().expect_err(&format!(
+                "rank {} accepted a rank-local TP completion decode panic",
+                outcome.rank
+            ));
+            assert!(
+                error.to_string().contains("rollout completion decoding"),
+                "rank {} returned the wrong failure boundary: {error:?}",
+                outcome.rank
+            );
+            assert_eq!(
+                outcome.calls.generate, 1,
+                "rank {} generation",
+                outcome.rank
+            );
+            assert_eq!(
+                outcome.reward_calls, 0,
+                "rank {} reached reward",
+                outcome.rank
+            );
+            assert_eq!(
+                outcome.calls.detached_logp, 0,
+                "rank {} reached detached scoring",
+                outcome.rank
+            );
+            assert_eq!(
+                outcome.calls.live_logp, 0,
+                "rank {} reached live scoring",
+                outcome.rank
+            );
+            assert_eq!(
+                outcome.calls.backward, 0,
+                "rank {} reached backward",
+                outcome.rank
+            );
+            assert_tp_identity_telemetry_sentinels(outcome);
+            assert_tp_identity_policy_prestate_restored(outcome);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn tensor_parallel_late_malformed_window_restores_exact_policy_prestate() {
+        for candidate_log_top_k in [0, 1] {
+            let label = if candidate_log_top_k == 0 {
+                "tp-late-malformed-candidates-disabled"
+            } else {
+                "tp-late-malformed-candidates-enabled"
+            };
+            let outcomes = run_tp_rollout_identity_case(
+                label,
+                &TrainerConfig {
+                    steps: 1,
+                    group_size: 2,
+                    max_new_tokens: 1,
+                    grad_accum_steps: 2,
+                    lr: 0.0,
+                    max_grad_norm: None,
+                    candidate_log_top_k,
+                    ..TrainerConfig::default()
+                },
+                [42, 42],
+                [
+                    TpRolloutIdentityCase::LateMalformedSecondGroup,
+                    TpRolloutIdentityCase::LateMalformedSecondGroup,
+                ],
+                [false, false],
+                [TpRequestMutation::None, TpRequestMutation::None],
+            );
+
+            for outcome in &outcomes {
+                assert!(
+                    outcome.result.is_err(),
+                    "rank {} accepted the late malformed TP window with candidate_log_top_k={candidate_log_top_k}",
+                    outcome.rank
+                );
+                assert_eq!(
+                    outcome.calls.generate, 2,
+                    "rank {} did not reach the malformed second group",
+                    outcome.rank
+                );
+                assert_eq!(
+                    outcome.reward_calls,
+                    usize::from(outcome.rank == 0),
+                    "rank {} reward count crossed the malformed group boundary",
+                    outcome.rank
+                );
+                assert_eq!(
+                    outcome.calls.detached_logp,
+                    usize::from(candidate_log_top_k == 0),
+                    "rank {} detached-scoring count crossed the malformed group boundary",
+                    outcome.rank
+                );
+                assert_eq!(
+                    outcome.calls.live_logp, 0,
+                    "rank {} reached live scoring after a failed collection window",
+                    outcome.rank
+                );
+                assert_eq!(
+                    outcome.calls.backward, 0,
+                    "rank {} reached backward after a failed collection window",
+                    outcome.rank
+                );
+                assert_tp_identity_telemetry_sentinels(outcome);
+                assert_tp_identity_policy_prestate_restored(outcome);
+            }
+        }
     }
 
     #[test]

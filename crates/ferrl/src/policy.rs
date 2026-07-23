@@ -465,6 +465,29 @@ pub trait Policy {
     /// `trainable_vars()`.
     fn trainable_vars(&self) -> Vec<Var>;
 
+    /// Whether a rollback-capable direct rollout window must retain value copies
+    /// of every [`trainable_vars`](Self::trainable_vars) tensor.
+    ///
+    /// The default is deliberately `true`: an opaque policy may use interior
+    /// mutability (including [`Var::set`]) from its generation, adapter-toggle,
+    /// or detached-scoring hooks. If a later group in the same accumulation
+    /// window fails semantic validation, the trainer therefore needs the tensor
+    /// values from before the first hook in order to restore the policy exactly.
+    ///
+    /// Returning `false` is a strict capability assertion. It is sound only when
+    /// every pre-update rollout hook preserves both the values and bindings of
+    /// all trainable variables. The sampler state and adapter-enabled flag may
+    /// still change; the trainer snapshots and restores those separately. A
+    /// policy that violates this assertion can leave trainable state partially
+    /// mutated after a failed window.
+    ///
+    /// Wrapper policies should delegate this method when they delegate the
+    /// relevant hooks. Inheriting the conservative `true` default remains safe,
+    /// but may retain a model-sized device copy for the complete window.
+    fn requires_rollout_tensor_snapshot(&self) -> bool {
+        true
+    }
+
     /// Serialize the policy's rollout-sampler RNG state to an opaque byte blob, for
     /// momentum-faithful checkpoint persistence.
     ///
@@ -694,6 +717,12 @@ mod tests {
         let e = Rollout::rectangular(vec![], 0);
         assert_eq!(e.len(), 0);
         assert!(e.is_empty());
+    }
+
+    #[test]
+    fn opaque_policy_requires_rollout_tensor_snapshot_by_default() {
+        let policy = DefaultTensorParallelPolicy;
+        assert!(policy.requires_rollout_tensor_snapshot());
     }
 
     #[test]

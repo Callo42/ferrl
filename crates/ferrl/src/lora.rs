@@ -1608,6 +1608,20 @@ mod tests {
     }
 
     #[test]
+    fn effective_scale_f16_accepts_valid_boundaries_and_rejects_underflow_and_overflow() {
+        const MIN_POSITIVE_SUBNORMAL: f64 = 5.960_464_477_539_063e-8;
+        const MAX_FINITE: f64 = 65_504.0;
+
+        for scale in [MIN_POSITIVE_SUBNORMAL, 1.0, MAX_FINITE] {
+            assert_eq!(validated_lora_scale(scale, 1, DType::F16).unwrap(), scale);
+        }
+        for scale in [MIN_POSITIVE_SUBNORMAL / 2.0, 65_536.0] {
+            let error = validated_lora_scale(scale, 1, DType::F16).unwrap_err();
+            assert!(error.to_string().contains("compute dtype F16"), "{error}");
+        }
+    }
+
+    #[test]
     fn mixed_dtype_constructor_validates_scale_in_base_compute_dtype() {
         let alpha = 1e-42;
         assert!(LoraLinear::with_adapter_dtype(base(4, 3), None, 1, alpha, DType::F32).is_ok());

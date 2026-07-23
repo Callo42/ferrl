@@ -96,7 +96,7 @@ pub enum CheckpointEos {
 pub enum CheckpointEosSelection {
     /// Resolve the checkpoint's one declared scalar EOS id.
     CheckpointDefault,
-    /// Select one explicit id, validating multi-EOS membership when applicable.
+    /// Supply or override one explicit id, validating multi-EOS membership when applicable.
     Explicit(u32),
     /// Deliberately generate full-width continuations without EOS retirement.
     Disabled,
@@ -158,18 +158,20 @@ pub fn vocab_size_from_config<P: AsRef<Path>>(dir: P) -> Result<usize, HfError> 
 
 /// Resolve one generation EOS mode against checkpoint, model, and tokenizer metadata.
 ///
-/// Checkpoint-default mode requires exactly one declared EOS id. Explicit ids may
-/// select a member of a multi-EOS declaration, but cannot select an undeclared member.
-/// Every enabled id must fit the model vocabulary and exist in the loaded tokenizer;
-/// sparse tokenizer ids are accepted. [`CheckpointEosSelection::Disabled`] is the
-/// only mode that returns `None`.
+/// Checkpoint-default mode requires exactly one declared EOS id. An explicit id may
+/// supply EOS when the checkpoint declaration is missing or override one scalar
+/// declaration. For a multi-EOS declaration, the explicit id must be a declared
+/// member. Every enabled id must fit the model vocabulary and exist in the loaded
+/// tokenizer; sparse tokenizer ids are accepted.
+/// [`CheckpointEosSelection::Disabled`] is the only mode that returns `None`.
 ///
 /// # Errors
 ///
 /// Returns the checkpoint parsing errors documented by
-/// [`checkpoint_eos_from_config`], or [`HfError::InvalidEosSelection`] when the
-/// requested mode is missing, ambiguous, undeclared, or outside the effective
-/// model/tokenizer vocabularies.
+/// [`checkpoint_eos_from_config`], or [`HfError::InvalidEosSelection`] when
+/// checkpoint-default mode is missing or ambiguous, an explicit multi-EOS selection
+/// is not a declared member, or the selected id is outside the effective model or
+/// tokenizer vocabulary.
 pub fn resolve_checkpoint_eos<P: AsRef<Path>>(
     dir: P,
     tokenizer: &crate::HfTokenizer,
@@ -555,6 +557,59 @@ mod tests {
             CheckpointEosSelection::Explicit(1),
         )
         .is_err());
+    }
+
+    #[test]
+    fn explicit_checkpoint_eos_can_supply_missing_or_override_scalar_declaration() {
+        let missing = TestCheckpoint::new(
+            "missing-eos-explicit-override",
+            &serde_json::json!({ "vocab_size": 4 }),
+        );
+        assert_eq!(
+            resolve_checkpoint_eos(
+                &missing.0,
+                &missing.tokenizer(),
+                CheckpointEosSelection::Explicit(3),
+            )
+            .unwrap(),
+            Some(3)
+        );
+
+        let scalar = TestCheckpoint::new(
+            "scalar-eos-explicit-override",
+            &serde_json::json!({ "vocab_size": 4, "eos_token_id": 2 }),
+        );
+        assert_eq!(
+            resolve_checkpoint_eos(
+                &scalar.0,
+                &scalar.tokenizer(),
+                CheckpointEosSelection::Explicit(3),
+            )
+            .unwrap(),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn checkpoint_eos_rejects_model_valid_tokenizer_absent_id() {
+        let checkpoint = TestCheckpoint::new(
+            "tokenizer-membership",
+            &serde_json::json!({ "vocab_size": 5, "eos_token_id": 4 }),
+        );
+        let tokenizer = checkpoint.tokenizer();
+        assert!(!tokenizer.contains_id(4));
+
+        let error = resolve_checkpoint_eos(
+            &checkpoint.0,
+            &tokenizer,
+            CheckpointEosSelection::CheckpointDefault,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("EOS id 4 is not present in the loaded tokenizer vocabulary"),
+            "{error}"
+        );
     }
 
     #[test]

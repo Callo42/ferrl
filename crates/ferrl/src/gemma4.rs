@@ -2305,6 +2305,10 @@ impl GradModel for Gemma4GradModel {
         Gemma4GradModel::trainable_vars(self)
     }
 
+    fn requires_rollout_tensor_snapshot(&self) -> bool {
+        false
+    }
+
     fn set_adapter_enabled(&mut self, enabled: bool) {
         Gemma4GradModel::set_adapter_enabled(self, enabled);
     }
@@ -5330,6 +5334,7 @@ mod tests {
     #[test]
     fn industrial_recipe_var_order_omits_full_attention_v_proj() {
         let model = tiny_model();
+        assert!(!GradModel::requires_rollout_tensor_snapshot(&model));
         assert_eq!(model.lora_recipe().as_deref(), Some("attn:qkvo|mlp:gud"));
         assert_eq!(
             model.trainable_vars().len(),

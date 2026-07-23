@@ -898,6 +898,14 @@ impl<M: GradModel> Policy for LmPolicy<M> {
         self.model.trainable_vars()
     }
 
+    fn requires_rollout_tensor_snapshot(&self) -> bool {
+        // GradModel is a public extension seam, so only the concrete model can
+        // assert that merged-decoder construction, detached scoring, and adapter
+        // toggles preserve its trainable values and bindings. In-crate models do;
+        // an opaque external model inherits the conservative `true` default.
+        self.model.requires_rollout_tensor_snapshot()
+    }
+
     fn sampler_state(&self) -> CandleResult<Vec<u8>> {
         self.sampler.to_state_bytes()
     }
@@ -1055,6 +1063,11 @@ mod tests {
         let vb = VarBuilder::from_tensors(weight_map(&cfg), DType::F32, &Device::Cpu);
         let model = QwenGradModel::load(&cfg, &vb, 2, 4.0).unwrap();
         QwenPolicy::new(model, 7, temperature)
+    }
+
+    #[test]
+    fn model_policy_rollout_hooks_do_not_require_trainable_tensor_snapshots() {
+        assert!(!tiny_policy().requires_rollout_tensor_snapshot());
     }
 
     fn tiny_tp_gqa_cfg() -> Config {

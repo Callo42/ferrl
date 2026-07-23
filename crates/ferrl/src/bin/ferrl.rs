@@ -1638,6 +1638,20 @@ fn train_with_launch_runtime(
     let cfg = loaded.config;
     validate_launch_runtime(&cfg, launch_runtime.as_ref())?;
     validate_launch_config_consensus(&loaded.consensus_digest, launch_comm)?;
+    let data_parallel_world = if cfg.distributed.enabled {
+        launch_comm
+            .ok_or_else(|| {
+                CliError::msg(
+                    "distributed execution has no live communicator after launch validation",
+                )
+            })?
+            .world_size()
+    } else {
+        1
+    };
+    cfg.trainer
+        .validate_reward_group_world(data_parallel_world)
+        .map_err(|error| CliError::msg(error.to_string()))?;
     let local_device = prepare_device(&cfg, launch_runtime.as_ref());
     let device = coordinate_distributed_result(launch_comm, "device setup", local_device)?;
     match cfg.task.as_str() {
@@ -6501,6 +6515,102 @@ mod tests {
             assert!(result.is_err(), "{field} unexpectedly reached training");
             assert!(!prepared.get(), "{field} reached device/model setup");
         }
+    }
+
+    #[test]
+    fn live_dp_world_one_group_one_rejects_before_device_model_or_run_creation() {
+        let tmp = TestDir::new("live-dp-world-one-group-one");
+        let config_path = tmp.path().join("run.json");
+        let out_dir = tmp.path().join("runs-must-not-exist");
+        let mut json: serde_json::Value =
+            serde_json::from_str(&countdown_train_config("")).unwrap();
+        json["out_dir"] = serde_json::json!(&out_dir);
+        json["distributed"] = serde_json::json!({ "enabled": true });
+        json["trainer"]["group_size"] = serde_json::json!(1);
+        json["trainer"]["reward_group_scope"] = serde_json::json!("distributed_same_prompt");
+        std::fs::write(&config_path, serde_json::to_vec(&json).unwrap()).unwrap();
+
+        let prepared = std::cell::Cell::new(false);
+        let result = train_with_launch_runtime(
+            &TrainArgs {
+                config: config_path,
+            },
+            Some(LaunchRuntime {
+                device: Device::Cpu,
+                comm: Box::new(ferrl::SoloComm),
+            }),
+            |_, _| {
+                prepared.set(true);
+                Err(CliError::msg(
+                    "prepare-device sentinel: ineffective live DP group reached device setup",
+                ))
+            },
+        );
+
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("effective reward-group size"), "{error}");
+        assert!(!prepared.get(), "ineffective group reached device setup");
+        assert!(!out_dir.exists(), "ineffective group created its run root");
+    }
+
+    #[test]
+    fn live_dp_reward_group_overflow_rejects_before_device_model_or_run_creation() {
+        let tmp = TestDir::new("live-dp-reward-group-overflow");
+        let config_path = tmp.path().join("run.json");
+        let out_dir = tmp.path().join("runs-must-not-exist");
+        let mut json: serde_json::Value =
+            serde_json::from_str(&countdown_train_config("")).unwrap();
+        json["out_dir"] = serde_json::json!(&out_dir);
+        json["distributed"] = serde_json::json!({ "enabled": true });
+        json["trainer"]["group_size"] = serde_json::json!(usize::MAX);
+        json["trainer"]["reward_group_scope"] = serde_json::json!("distributed_same_prompt");
+        std::fs::write(&config_path, serde_json::to_vec(&json).unwrap()).unwrap();
+
+        let prepared = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let results = std::thread::scope(|scope| {
+            ferrl::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(5))
+                .into_iter()
+                .map(|comm| {
+                    let config_path = config_path.clone();
+                    let prepared = Arc::clone(&prepared);
+                    scope.spawn(move || {
+                        train_with_launch_runtime(
+                            &TrainArgs {
+                                config: config_path,
+                            },
+                            Some(LaunchRuntime {
+                                device: Device::Cpu,
+                                comm: Box::new(comm),
+                            }),
+                            move |_, _| {
+                                prepared.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                Err(CliError::msg(
+                                    "prepare-device sentinel: overflowing live DP group reached device setup",
+                                ))
+                            },
+                        )
+                        .map_err(|error| error.to_string())
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        for result in results {
+            let error = result.unwrap_err();
+            assert!(
+                error.contains("effective distributed reward-group size overflows usize"),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            prepared.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "overflowing group reached device setup"
+        );
+        assert!(!out_dir.exists(), "overflowing group created its run root");
     }
 
     #[test]

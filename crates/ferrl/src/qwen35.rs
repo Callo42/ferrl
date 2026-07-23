@@ -2449,6 +2449,10 @@ impl GradModel for Qwen3_5GradModel {
         Qwen3_5GradModel::trainable_vars(self)
     }
 
+    fn requires_rollout_tensor_snapshot(&self) -> bool {
+        false
+    }
+
     fn set_adapter_enabled(&mut self, enabled: bool) {
         Qwen3_5GradModel::set_adapter_enabled(self, enabled);
     }
@@ -4846,6 +4850,7 @@ mod tests {
     #[test]
     fn full_ft_recipe_reports_the_mode() {
         let model = tiny_full_ft_model();
+        assert!(!GradModel::requires_rollout_tensor_snapshot(&model));
         assert_eq!(
             GradModel::lora_recipe(&model).as_deref(),
             Some("full-ft"),

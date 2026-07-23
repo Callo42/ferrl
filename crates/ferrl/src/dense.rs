@@ -1258,6 +1258,10 @@ impl<A: DenseArch> GradModel for DenseGradModel<A> {
         DenseGradModel::trainable_vars(self)
     }
 
+    fn requires_rollout_tensor_snapshot(&self) -> bool {
+        false
+    }
+
     fn set_adapter_enabled(&mut self, enabled: bool) {
         DenseGradModel::set_adapter_enabled(self, enabled);
     }
