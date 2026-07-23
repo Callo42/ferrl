@@ -194,6 +194,7 @@ struct ResumePreflightCalls {
 /// faulting hook.
 struct ResumePreflightPanicPolicy {
     inner: ScriptedPolicy,
+    sampler_state: Vec<u8>,
     rank: usize,
     fault: ResumePreflightPanic,
     armed: bool,
@@ -204,6 +205,7 @@ impl ResumePreflightPanicPolicy {
     fn new(rank: usize, fault: ResumePreflightPanic) -> Self {
         Self {
             inner: ScriptedPolicy::new(SEED).unwrap(),
+            sampler_state: vec![0xa5, rank as u8],
             rank,
             fault,
             armed: false,
@@ -272,7 +274,7 @@ impl Policy for ResumePreflightPanicPolicy {
     }
 
     fn sampler_state(&self) -> CandleResult<Vec<u8>> {
-        self.inner.sampler_state()
+        Ok(self.sampler_state.clone())
     }
 
     fn validate_sampler_state(&self, state: &[u8]) -> CandleResult<()> {
@@ -283,12 +285,14 @@ impl Policy for ResumePreflightPanicPolicy {
             !self.fault_here(ResumePreflightPanic::SamplerValidation),
             "injected ordinary-resume sampler-validation panic"
         );
-        self.inner.validate_sampler_state(state)
+        let _ = state;
+        Ok(())
     }
 
     fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
         self.calls.sampler_restore += 1;
-        self.inner.restore_sampler_state(state)
+        self.sampler_state = state.to_vec();
+        Ok(())
     }
 
     fn lora_recipe(&self) -> Option<String> {
@@ -3317,6 +3321,97 @@ fn copy_checkpoint_package(source: &Path, destination: &Path) {
         assert!(entry.file_type().unwrap().is_file());
         std::fs::copy(entry.path(), destination.join(entry.file_name())).unwrap();
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum OrdinaryDiscoveryFailureCase {
+    LegacyOnly,
+    OlderLegacyBeforeV4,
+    NewerLegacyAfterV4,
+    NewerDirectoryOlderManifest,
+    OlderDirectoryNewerManifest,
+}
+
+impl OrdinaryDiscoveryFailureCase {
+    fn tag(self) -> &'static str {
+        match self {
+            Self::LegacyOnly => "legacy-only",
+            Self::OlderLegacyBeforeV4 => "older-legacy-before-v4",
+            Self::NewerLegacyAfterV4 => "newer-legacy-after-v4",
+            Self::NewerDirectoryOlderManifest => "newer-dir-older-manifest",
+            Self::OlderDirectoryNewerManifest => "older-dir-newer-manifest",
+        }
+    }
+}
+
+fn rewrite_as_legacy_v3(checkpoint: &Path, step: u64) {
+    let manifest_path = checkpoint.join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["format_version"] = serde_json::json!(3);
+    manifest["step"] = serde_json::json!(step);
+    manifest
+        .as_object_mut()
+        .unwrap()
+        .remove("ordinary_checkpoint");
+    std::fs::write(manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+}
+
+fn prepare_ordinary_discovery_failure_case(
+    base: &Path,
+    seed: &Path,
+    case: OrdinaryDiscoveryFailureCase,
+) -> PathBuf {
+    let root = base.join(case.tag());
+    match case {
+        OrdinaryDiscoveryFailureCase::LegacyOnly => {
+            let legacy = root.join("step-4");
+            copy_checkpoint_package(&seed.join("step-3"), &legacy);
+            rewrite_as_legacy_v3(&legacy, 4);
+        }
+        OrdinaryDiscoveryFailureCase::OlderLegacyBeforeV4 => {
+            let legacy = root.join("step-1");
+            copy_checkpoint_package(&seed.join("step-1"), &legacy);
+            rewrite_as_legacy_v3(&legacy, 1);
+            copy_checkpoint_package(&seed.join("step-3"), &root.join("step-3"));
+        }
+        OrdinaryDiscoveryFailureCase::NewerLegacyAfterV4 => {
+            copy_checkpoint_package(&seed.join("step-1"), &root.join("step-1"));
+            let legacy = root.join("step-4");
+            copy_checkpoint_package(&seed.join("step-3"), &legacy);
+            rewrite_as_legacy_v3(&legacy, 4);
+        }
+        OrdinaryDiscoveryFailureCase::NewerDirectoryOlderManifest => {
+            copy_checkpoint_package(&seed.join("step-1"), &root.join("step-1"));
+            // The package remains a valid v4 step-2 envelope; only its exact
+            // final directory claims a different completed step.
+            copy_checkpoint_package(&seed.join("step-2"), &root.join("step-4"));
+        }
+        OrdinaryDiscoveryFailureCase::OlderDirectoryNewerManifest => {
+            // The valid step-3 package would be selected if discovery silently
+            // ignored the older exact directory whose manifest claims step 3.
+            copy_checkpoint_package(&seed.join("step-3"), &root.join("step-3"));
+            copy_checkpoint_package(&seed.join("step-3"), &root.join("step-2"));
+        }
+    }
+    root
+}
+
+#[allow(clippy::cognitive_complexity)] // explicit zero-call contract across every preflight hook
+fn assert_no_discovery_policy_work(calls: &ResumePreflightCalls, context: &str) {
+    assert_eq!(calls.generate, 0, "{context}: generated");
+    assert_eq!(calls.token_logprobs.get(), 0, "{context}: live scoring");
+    assert_eq!(calls.detached.get(), 0, "{context}: detached scoring");
+    assert_eq!(calls.backward.get(), 0, "{context}: backward");
+    assert_eq!(calls.adapter_toggles, 0, "{context}: adapter toggle");
+    assert_eq!(calls.trainable_vars.get(), 0, "{context}: trainable vars");
+    assert_eq!(
+        calls.sampler_validation.get(),
+        0,
+        "{context}: sampler validation"
+    );
+    assert_eq!(calls.sampler_restore, 0, "{context}: sampler restore");
+    assert_eq!(calls.lora_recipe.get(), 0, "{context}: recipe derivation");
 }
 
 fn rewrite_continuation_topology(
@@ -6525,6 +6620,242 @@ fn resume_latest_under_dp_broadcasts_a_rank0_scan_failure_instead_of_hanging() {
     );
 }
 
+#[test]
+#[allow(clippy::cognitive_complexity)] // complete one-rank discovery corruption matrix
+fn world_one_resume_latest_rejects_legacy_and_step_mismatch_before_policy_work() {
+    let tmp = TempDir::new("world1-ordinary-discovery-failures");
+    let seed_root = tmp.path().join("seed-checkpoints");
+    let seed_cfg = TrainerConfig {
+        steps: 3,
+        checkpoint_every: Some(1),
+        ..scripted_cfg()
+    };
+    let seed = run_dp_world_resume_latest(tmp.path(), &seed_root, 70, &seed_cfg);
+    assert_lockstep(&seed, "world-one discovery fixture seed");
+
+    for case in [
+        OrdinaryDiscoveryFailureCase::LegacyOnly,
+        OrdinaryDiscoveryFailureCase::OlderLegacyBeforeV4,
+        OrdinaryDiscoveryFailureCase::NewerLegacyAfterV4,
+        OrdinaryDiscoveryFailureCase::NewerDirectoryOlderManifest,
+        OrdinaryDiscoveryFailureCase::OlderDirectoryNewerManifest,
+    ] {
+        let tag = case.tag();
+        let checkpoint_root = prepare_ordinary_discovery_failure_case(tmp.path(), &seed_root, case);
+        let collective_calls = Arc::new(AtomicUsize::new(0));
+        let run = RunDir::create(tmp.path(), format!("world1-{tag}")).unwrap();
+        let mut trainer = Trainer::with_comm(
+            TrainerConfig {
+                steps: 4,
+                checkpoint_every: Some(1),
+                ..scripted_cfg()
+            },
+            &run,
+            SpyComm {
+                calls: Arc::clone(&collective_calls),
+            },
+        )
+        .unwrap()
+        .with_checkpoint_policy_sha256(checkpoint_policy_sha256())
+        .with_checkpoints_dir(checkpoint_root);
+        let metrics_sentinel = format!("metrics-{tag}\n").into_bytes();
+        let candidates_sentinel = format!("candidates-{tag}\n").into_bytes();
+        std::fs::write(run.metrics_path(), &metrics_sentinel).unwrap();
+        std::fs::write(run.candidates_path(), &candidates_sentinel).unwrap();
+
+        let reward_calls = Arc::new(AtomicUsize::new(0));
+        let mut policy = ResumePreflightPanicPolicy::new(0, ResumePreflightPanic::LoraRecipe);
+        let values_before = policy.raw_var_bits();
+        let ids_before = policy.raw_var_ids();
+        let mode_before = policy.inner.adapter_enabled();
+        let sampler_before = policy.sampler_state().unwrap();
+        let error = trainer
+            .resume_latest(
+                &mut policy,
+                &PreflightCountingReward {
+                    calls: Arc::clone(&reward_calls),
+                },
+                &CharTokenizer,
+                &live_samples(),
+            )
+            .map(|_| ())
+            .unwrap_err();
+
+        assert!(
+            matches!(error, TrainerError::Checkpoint(_)),
+            "{tag}: discovery did not fail closed: {error:?}"
+        );
+        assert_eq!(collective_calls.load(Ordering::SeqCst), 0, "{tag}");
+        assert_eq!(reward_calls.load(Ordering::SeqCst), 0, "{tag}: reward");
+        assert_eq!(policy.raw_var_bits(), values_before, "{tag}: values");
+        assert_eq!(policy.raw_var_ids(), ids_before, "{tag}: identities");
+        assert_eq!(policy.inner.adapter_enabled(), mode_before, "{tag}: mode");
+        assert_eq!(
+            policy.sampler_state().unwrap(),
+            sampler_before,
+            "{tag}: sampler"
+        );
+        assert_no_discovery_policy_work(&policy.calls, tag);
+        assert_eq!(std::fs::read(run.metrics_path()).unwrap(), metrics_sentinel);
+        assert_eq!(
+            std::fs::read(run.candidates_path()).unwrap(),
+            candidates_sentinel
+        );
+    }
+}
+
+#[test]
+#[allow(clippy::cognitive_complexity)] // complete two-rank discovery corruption matrix
+fn dp_resume_latest_coordinates_legacy_and_step_mismatch_as_scan_failed() {
+    let tmp = TempDir::new("dp-ordinary-discovery-failures");
+    let seed_root = tmp.path().join("seed-checkpoints");
+    let seed_cfg = TrainerConfig {
+        steps: 3,
+        checkpoint_every: Some(1),
+        ..scripted_cfg()
+    };
+    let seed = run_dp_world_resume_latest(tmp.path(), &seed_root, 71, &seed_cfg);
+    assert_lockstep(&seed, "DP discovery fixture seed");
+
+    for case in [
+        OrdinaryDiscoveryFailureCase::LegacyOnly,
+        OrdinaryDiscoveryFailureCase::OlderLegacyBeforeV4,
+        OrdinaryDiscoveryFailureCase::NewerLegacyAfterV4,
+        OrdinaryDiscoveryFailureCase::NewerDirectoryOlderManifest,
+        OrdinaryDiscoveryFailureCase::OlderDirectoryNewerManifest,
+    ] {
+        let tag = case.tag();
+        let checkpoint_root = prepare_ordinary_discovery_failure_case(tmp.path(), &seed_root, case);
+        let reward_calls = Arc::new(AtomicUsize::new(0));
+        let outcomes = std::thread::scope(|scope| {
+            let handles: Vec<_> =
+                LocalComm::world_with_timeout(2, std::time::Duration::from_secs(15))
+                    .into_iter()
+                    .enumerate()
+                    .map(|(rank, inner)| {
+                        let checkpoint_root = checkpoint_root.clone();
+                        let reward_calls = Arc::clone(&reward_calls);
+                        let base = tmp.path();
+                        scope.spawn(move || {
+                            let scalar_calls = Arc::new(AtomicUsize::new(0));
+                            let tensor_calls = Arc::new(AtomicUsize::new(0));
+                            let comm = ResumePreflightCountingComm {
+                                inner,
+                                scalar_calls: Arc::clone(&scalar_calls),
+                                tensor_calls: Arc::clone(&tensor_calls),
+                            };
+                            let run = RunDir::create(base, format!("dp-{tag}-rank{rank}")).unwrap();
+                            let mut trainer = Trainer::with_comm(
+                                TrainerConfig {
+                                    steps: 4,
+                                    checkpoint_every: Some(1),
+                                    ..scripted_cfg()
+                                },
+                                &run,
+                                comm,
+                            )
+                            .unwrap()
+                            .with_checkpoint_policy_sha256(checkpoint_policy_sha256())
+                            .with_checkpoints_dir(checkpoint_root);
+                            scalar_calls.store(0, Ordering::SeqCst);
+                            tensor_calls.store(0, Ordering::SeqCst);
+                            let metrics_sentinel =
+                                format!("metrics-{tag}-rank{rank}\n").into_bytes();
+                            let candidates_sentinel =
+                                format!("candidates-{tag}-rank{rank}\n").into_bytes();
+                            std::fs::write(run.metrics_path(), &metrics_sentinel).unwrap();
+                            std::fs::write(run.candidates_path(), &candidates_sentinel).unwrap();
+
+                            let mut policy = ResumePreflightPanicPolicy::new(
+                                rank,
+                                ResumePreflightPanic::LoraRecipe,
+                            );
+                            let values_before = policy.raw_var_bits();
+                            let ids_before = policy.raw_var_ids();
+                            let mode_before = policy.inner.adapter_enabled();
+                            let sampler_before = policy.sampler_state().unwrap();
+                            let error = trainer
+                                .resume_latest(
+                                    &mut policy,
+                                    &PreflightCountingReward {
+                                        calls: reward_calls,
+                                    },
+                                    &CharTokenizer,
+                                    &live_samples(),
+                                )
+                                .map(|_| ())
+                                .unwrap_err();
+
+                            assert_eq!(
+                                scalar_calls.load(Ordering::SeqCst),
+                                1,
+                                "{tag} rank {rank}: later scalar collective"
+                            );
+                            assert_eq!(
+                                tensor_calls.load(Ordering::SeqCst),
+                                0,
+                                "{tag} rank {rank}: tensor collective"
+                            );
+                            assert_eq!(
+                                policy.raw_var_bits(),
+                                values_before,
+                                "{tag} rank {rank}: values"
+                            );
+                            assert_eq!(
+                                policy.raw_var_ids(),
+                                ids_before,
+                                "{tag} rank {rank}: identities"
+                            );
+                            assert_eq!(
+                                policy.inner.adapter_enabled(),
+                                mode_before,
+                                "{tag} rank {rank}: mode"
+                            );
+                            assert_eq!(
+                                policy.sampler_state().unwrap(),
+                                sampler_before,
+                                "{tag} rank {rank}: sampler"
+                            );
+                            assert_no_discovery_policy_work(
+                                &policy.calls,
+                                &format!("{tag} rank {rank}"),
+                            );
+                            assert_eq!(
+                                std::fs::read(run.metrics_path()).unwrap(),
+                                metrics_sentinel
+                            );
+                            assert_eq!(
+                                std::fs::read(run.candidates_path()).unwrap(),
+                                candidates_sentinel
+                            );
+                            (rank, error)
+                        })
+                    })
+                    .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        assert_eq!(reward_calls.load(Ordering::SeqCst), 0, "{tag}: reward");
+        for (rank, error) in outcomes {
+            if rank == 0 {
+                assert!(
+                    matches!(error, TrainerError::Checkpoint(_)),
+                    "{tag} rank 0: {error:?}"
+                );
+            } else {
+                assert!(
+                    matches!(error, TrainerError::Contract(ref message)
+                        if message.contains("checkpoint discovery failed")),
+                    "{tag} rank {rank}: {error:?}"
+                );
+            }
+        }
+    }
+}
+
 /// A newer canonical final directory with a malformed manifest is not a crash
 /// staging artifact: ordinary publication exposes only complete `step-N`
 /// directories. Rank 0 must therefore broadcast scan failure instead of
@@ -6698,7 +7029,7 @@ fn ordinary_dp_resume_panic_contains_the_complete_preflight_before_any_mutation(
                             let values_before = policy.raw_var_bits();
                             let ids_before = policy.raw_var_ids();
                             let mode_before = policy.inner.adapter_enabled();
-                            let sampler_before = policy.inner.sampler_state().unwrap();
+                            let sampler_before = policy.sampler_state().unwrap();
                             policy.armed = true;
                             let error = trainer
                                 .resume(
@@ -6728,7 +7059,7 @@ fn ordinary_dp_resume_panic_contains_the_complete_preflight_before_any_mutation(
                                 "{case} rank {rank} mode"
                             );
                             assert_eq!(
-                                policy.inner.sampler_state().unwrap(),
+                                policy.sampler_state().unwrap(),
                                 sampler_before,
                                 "{case} rank {rank} sampler"
                             );

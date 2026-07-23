@@ -1866,9 +1866,13 @@ pub struct LatestCheckpoint {
 /// A malformed exact `step-<digits>` final name newer than every readable ordinary
 /// package is fail-closed: a non-directory entry, numeric suffix overflow, or
 /// missing/unreadable/malformed manifest is ambiguous published-state corruption
-/// and cannot silently fall back to an older step. A readable legacy ordinary
-/// package or a deliberately different continuation kind remains ineligible but is
-/// not corruption; a malformed older sibling cannot cause replay and is ignored.
+/// and cannot silently fall back to an older step. Any readable v2/v3 ordinary
+/// package is also rejected because it lacks v4 identity/integrity, and every
+/// otherwise-valid v4 directory/manifest step disagreement is rejected regardless
+/// of its ordering relative to another checkpoint. An explicit v1 adapter package
+/// or deliberately different continuation kind remains ineligible but is not
+/// ordinary-resume corruption; a malformed older sibling cannot cause replay and is
+/// ignored.
 /// Crash-leftover `.tmp-*` / `.old-*` siblings do not match the exact final-name
 /// shape and are ignored, as is any unrelated entry.
 ///
@@ -1933,21 +1937,23 @@ pub fn latest_checkpoint(
                 continue;
             }
         };
-        if manifest.format_version != FORMAT_VERSION
-            || manifest.ordinary_checkpoint.is_none()
-            || manifest.rollout_ledger_continuation.is_some()
-        {
+        if manifest.rollout_ledger_continuation.is_some() {
+            continue;
+        }
+        if matches!(manifest.format_version, 2 | LEGACY_MOMENTUM_FORMAT_VERSION) {
+            return Err(CheckpointError::Mismatch(format!(
+                "ordinary checkpoint discovery found untrusted legacy format-v{} package at step-{directory_step}; trainer resume requires identity-bound format-v{FORMAT_VERSION}",
+                manifest.format_version
+            )));
+        }
+        if manifest.format_version != FORMAT_VERSION || manifest.ordinary_checkpoint.is_none() {
             continue;
         }
         if manifest.step != directory_step {
-            malformed.push((
-                directory_step,
-                CheckpointError::Mismatch(format!(
-                    "ordinary checkpoint directory step-{directory_step} contains manifest step {}",
-                    manifest.step
-                )),
-            ));
-            continue;
+            return Err(CheckpointError::Mismatch(format!(
+                "ordinary checkpoint directory step-{directory_step} contains manifest step {}",
+                manifest.step
+            )));
         }
         let candidate = LatestCheckpoint {
             dir: path,
@@ -3767,6 +3773,35 @@ mod tests {
         .unwrap();
     }
 
+    fn write_legacy_ordinary_step(root: &Path, n: u64, format_version: u32) {
+        assert!(matches!(format_version, 2 | LEGACY_MOMENTUM_FORMAT_VERSION));
+        let dir = root.join(format!("step-{n}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_checkpoint_contents(
+            &dir,
+            &dir.join(MANIFEST_FILE),
+            &make_vars(),
+            &make_opt_state(),
+            &[1, 2, 3],
+            n,
+            format_version,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    }
+
+    fn write_step_with_manifest_mismatch(root: &Path, directory_step: u64, manifest_step: u64) {
+        write_step(root, directory_step);
+        let dir = root.join(format!("step-{directory_step}"));
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join(MANIFEST_FILE)).unwrap()).unwrap();
+        manifest["step"] = serde_json::json!(manifest_step);
+        refresh_v4_state_envelope(&mut manifest);
+        write_manifest_value(&dir, &manifest);
+    }
+
     #[test]
     fn latest_checkpoint_is_none_when_missing_or_empty() {
         let tmp = TempDir::new("latest-none");
@@ -3794,6 +3829,52 @@ mod tests {
                 .step,
             10
         );
+    }
+
+    #[test]
+    fn latest_checkpoint_rejects_any_readable_legacy_momentum_package() {
+        for (label, format_version, valid_step, legacy_step) in [
+            ("v2-alone", 2, None, 2),
+            ("v2-older", 2, Some(5), 1),
+            ("v2-newer", 2, Some(5), 9),
+            ("v3-alone", LEGACY_MOMENTUM_FORMAT_VERSION, None, 2),
+            ("v3-older", LEGACY_MOMENTUM_FORMAT_VERSION, Some(5), 1),
+            ("v3-newer", LEGACY_MOMENTUM_FORMAT_VERSION, Some(5), 9),
+        ] {
+            let tmp = TempDir::new(label);
+            if let Some(step) = valid_step {
+                write_step(tmp.path(), step);
+            }
+            write_legacy_ordinary_step(tmp.path(), legacy_step, format_version);
+            let error = latest_checkpoint(tmp.path()).unwrap_err();
+            assert!(
+                error.to_string().contains("untrusted legacy")
+                    && error
+                        .to_string()
+                        .contains(&format!("format-v{format_version}")),
+                "{label}: wrong rejection: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn latest_checkpoint_rejects_every_valid_v4_step_disagreement() {
+        for (label, directory_step, manifest_step) in [
+            ("older-directory-newer-manifest", 4, 6),
+            ("newer-directory-older-manifest", 6, 4),
+            ("older-in-both-coordinates", 1, 2),
+        ] {
+            let tmp = TempDir::new(label);
+            write_step(tmp.path(), 5);
+            write_step_with_manifest_mismatch(tmp.path(), directory_step, manifest_step);
+            let error = latest_checkpoint(tmp.path()).unwrap_err();
+            let message = error.to_string();
+            assert!(
+                message.contains(&format!("directory step-{directory_step}"))
+                    && message.contains(&format!("manifest step {manifest_step}")),
+                "{label}: wrong rejection: {error}"
+            );
+        }
     }
 
     #[test]
@@ -3873,6 +3954,13 @@ mod tests {
     fn ordinary_and_continuation_discovery_keep_checkpoint_kinds_disjoint() {
         let tmp = TempDir::new("discovery-kinds");
         write_step(tmp.path(), 3);
+        save_adapter(
+            tmp.path().join("step-1"),
+            &make_vars(),
+            1,
+            Some("explicit-eval-adapter"),
+        )
+        .unwrap();
         let continuation = tmp.path().join("step-9");
         save_checkpoint_no_replace(
             &continuation,

@@ -1868,6 +1868,56 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn tiny_gemma_streaming_bound_load_rejects_in_place_mutation_after_identity() {
+        use std::io::{Seek as _, Write as _};
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = TempDir::new("loader-gemma4-streaming-in-place-mutation");
+        let fixture_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        copy_dir_contents(&fixture_root.join("tiny_gemma4"), tmp.path());
+        std::fs::copy(
+            fixture_root.join("tiny_tokenizer.json"),
+            tmp.path().join("tokenizer.json"),
+        )
+        .unwrap();
+        let opts = LoaderOpts {
+            lora_rank: 2,
+            lora_alpha: 4.0,
+            activation_checkpointing: true,
+            tensor_parallel: TensorParallelPlan::new(0, 2).unwrap(),
+            ..LoaderOpts::default()
+        };
+        let weights = tmp.path().join("model.safetensors");
+        let before = std::fs::metadata(&weights).unwrap();
+        let mut mutated = std::fs::read(&weights).unwrap();
+        *mutated.last_mut().unwrap() ^= 1;
+        let result = load_auto_policy_bound_inner(tmp.path(), &Device::Cpu, &opts, || {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&weights)
+                .unwrap();
+            file.seek(std::io::SeekFrom::Start(0)).unwrap();
+            file.write_all(&mutated).unwrap();
+            file.flush().unwrap();
+        });
+        let error = match result {
+            Err(LoaderError::Model(error)) => error.to_string(),
+            Err(other) => panic!("expected authenticated model-load failure, got {other:?}"),
+            Ok(_) => panic!("streaming Gemma load accepted post-identity source mutation"),
+        };
+        assert!(
+            error.contains("changed after its bound identity was captured"),
+            "unexpected streaming authentication error: {error}"
+        );
+        let after = std::fs::metadata(&weights).unwrap();
+        assert_eq!(after.dev(), before.dev());
+        assert_eq!(after.ino(), before.ino());
+        assert_eq!(after.len(), before.len());
+        assert_eq!(std::fs::read(&weights).unwrap(), mutated);
+    }
+
     struct TempDir(PathBuf);
 
     impl TempDir {
