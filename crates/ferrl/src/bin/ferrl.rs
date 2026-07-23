@@ -63,10 +63,10 @@ use ferrl::countdown::{build_prompt, generate_dataset, CountdownConfig, Countdow
 use ferrl::policy::{GenConfig, Policy, TensorParallelPolicy};
 use ferrl::telemetry::{CandidateRecord, RegressionFailure};
 use ferrl::{
-    compare_distributed_metrics, compare_metrics, evaluate, load_auto_policy, read_jsonl,
-    summarize, train_eval_split, BaseQuantization, CountdownReward, LoaderOpts, MathProblem,
-    MathReward, RegressionBudget, RegressionReport, RewardFn, RunDir, RunStop, Sample,
-    TensorParallelPlan, TokenizerLike, Trainer, TrainerConfig, TrimulReward,
+    compare_distributed_metrics, compare_metrics, evaluate, read_jsonl, summarize,
+    train_eval_split, BaseQuantization, CountdownReward, LoaderOpts, MathProblem, MathReward,
+    RegressionBudget, RegressionReport, RewardFn, RunDir, RunStop, Sample, TensorParallelPlan,
+    TokenizerLike, Trainer, TrainerConfig, TrimulReward,
 };
 
 /// A task's train/eval split: `(train, eval)` samples of the task's target type.
@@ -1415,6 +1415,7 @@ impl RunConfig {
             temperature: self.trainer.temperature,
             memory_efficient_cached_gqa: self.policy.memory_efficient_cached_gqa,
             base_quantization: self.policy.base_quantization.as_base_quantization(),
+            activation_checkpointing: self.policy.activation_checkpointing,
             tensor_parallel: self.tensor_parallel_plan(),
         }
     }
@@ -1732,7 +1733,9 @@ fn run_training<R: RewardFn>(
         eval,
         rendered_prompt_bytes,
         launch_runtime,
-        |model_dir, device, opts| load_auto_policy(model_dir, device, opts).map_err(CliError::from),
+        |model_dir, device, opts| {
+            ferrl::load_auto_policy_bound(model_dir, device, opts).map_err(CliError::from)
+        },
     )
 }
 
@@ -1741,15 +1744,10 @@ fn run_training<R: RewardFn>(
 /// Keeping this narrow adapter separate from the public [`Policy`] contract lets the
 /// production loader seam remain mutation-sensitive in tests without widening the library API.
 trait CliTrainingPolicy: Policy + TensorParallelPolicy {
-    fn configure_activation_checkpointing(&mut self, enabled: bool);
     fn supports_cli_tensor_parallel(&self) -> bool;
 }
 
 impl CliTrainingPolicy for ferrl::AutoPolicy {
-    fn configure_activation_checkpointing(&mut self, enabled: bool) {
-        self.set_activation_checkpointing(enabled);
-    }
-
     fn supports_cli_tensor_parallel(&self) -> bool {
         self.supports_tensor_parallel()
     }
@@ -1764,7 +1762,11 @@ fn run_training_with_loader<P, R>(
     eval: &[Sample<R::Target>],
     rendered_prompt_bytes: Option<&[u8]>,
     launch_runtime: Option<LaunchRuntime>,
-    load_policy: impl FnOnce(&Path, &Device, &LoaderOpts) -> Result<(P, ferrl::HfTokenizer), CliError>,
+    load_policy: impl FnOnce(
+        &Path,
+        &Device,
+        &LoaderOpts,
+    ) -> Result<(P, ferrl::HfTokenizer, String), CliError>,
 ) -> Result<(), CliError>
 where
     P: CliTrainingPolicy,
@@ -1804,14 +1806,9 @@ where
 
     let model_setup = (|| {
         let loader_opts = cfg.loader_opts();
-        let checkpoint_policy_sha256 = cfg
-            .trainer
-            .checkpoint_every
-            .map(|_| ferrl::checkpoint_policy_sha256(&cfg.model_dir, &loader_opts))
-            .transpose()?;
-        let (mut policy, tok) = load_policy(&cfg.model_dir, device, &loader_opts)?;
+        let (policy, tok, bound_policy_sha256) = load_policy(&cfg.model_dir, device, &loader_opts)?;
+        let checkpoint_policy_sha256 = cfg.trainer.checkpoint_every.map(|_| bound_policy_sha256);
         let tcfg = cfg.resolved_trainer_config(&tok)?;
-        policy.configure_activation_checkpointing(cfg.policy.activation_checkpointing);
         if cfg.tensor_parallel.enabled && !policy.supports_cli_tensor_parallel() {
             return Err(CliError::msg(
                 "loaded checkpoint family does not support tensor_parallel execution; supported \
@@ -6097,8 +6094,6 @@ mod tests {
     }
 
     impl CliTrainingPolicy for EosRecordingPolicy {
-        fn configure_activation_checkpointing(&mut self, _enabled: bool) {}
-
         fn supports_cli_tensor_parallel(&self) -> bool {
             false
         }
@@ -6148,7 +6143,11 @@ mod tests {
             move |model_dir, _device, _opts| {
                 let tokenizer = ferrl::HfTokenizer::from_file(model_dir.join("tokenizer.json"))
                     .map_err(|error| CliError::msg(error.to_string()))?;
-                Ok((EosRecordingPolicy::new(loader_seen), tokenizer))
+                Ok((
+                    EosRecordingPolicy::new(loader_seen),
+                    tokenizer,
+                    "00".repeat(32),
+                ))
             },
         )
         .unwrap();
@@ -6220,7 +6219,11 @@ mod tests {
                                 let tokenizer =
                                     ferrl::HfTokenizer::from_file(model_dir.join("tokenizer.json"))
                                         .map_err(|error| CliError::msg(error.to_string()))?;
-                                Ok((EosRecordingPolicy::new(loader_seen), tokenizer))
+                                Ok((
+                                    EosRecordingPolicy::new(loader_seen),
+                                    tokenizer,
+                                    "00".repeat(32),
+                                ))
                             },
                         );
                         let entries = std::fs::read_dir(&cfg.out_dir)

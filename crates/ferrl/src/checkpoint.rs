@@ -27,9 +27,11 @@
 //!   **momentum-faithful format-v4** checkpoint: adapter/trainable weights, Adam
 //!   `m`/`v`/`step_t`, sampler state, exact recipe, immutable frozen-policy digest,
 //!   canonical learner semantics, ordered tensor schema, and exact payload hashes.
-//!   [`load_checkpoint`] validates the complete binding and every payload before its
-//!   first live [`Var::set`]. This is the only ordinary format accepted by
-//!   [`crate::Trainer::resume`].
+//!   One domain-separated state-envelope root binds those leaves to the completed
+//!   step and optimizer/schema relationship. Raw typed decoding rejects duplicate
+//!   manifest keys before generic JSON inspection. [`load_checkpoint`] validates the
+//!   complete binding and every payload before its first live [`Var::set`]. This is
+//!   the only ordinary format accepted by [`crate::Trainer::resume`].
 //!
 //! Legacy v1 remains explicitly readable through [`load_adapter`]. Structurally
 //! complete v2/v3 manifests are parsed with a strict version-specific field matrix,
@@ -291,6 +293,10 @@ pub struct OrdinaryCheckpointIdentity {
     pub optimizer_sha256: String,
     /// Exact opaque sampler-state payload digest.
     pub sampler_sha256: String,
+    /// Canonical root binding the complete ordinary training-state envelope:
+    /// version/kind, completed step, tensor/optimizer counts, exact recipe,
+    /// immutable identities, and every mutable payload digest.
+    pub state_envelope_sha256: String,
 }
 
 /// Errors raised while saving or loading an adapter checkpoint.
@@ -461,6 +467,109 @@ fn optimizer_payload_sha256(step_t: usize, bytes: &[u8]) -> Result<String, Check
 
 fn sampler_payload_sha256(bytes: &[u8]) -> String {
     domain_sha256("ferrl.ordinary-checkpoint.sampler.v1", &[bytes])
+}
+
+#[derive(Serialize)]
+struct OrdinaryCheckpointEnvelope<'a> {
+    format_version: u32,
+    kind: &'a str,
+    step: u64,
+    num_vars: u64,
+    lora_recipe: Option<&'a str>,
+    optimizer_step_t: u64,
+    optimizer_num_vars: u64,
+    frozen_policy_sha256: &'a str,
+    trainer_config_sha256: &'a str,
+    tensor_schema_sha256: &'a str,
+    adapter_sha256: &'a str,
+    optimizer_sha256: &'a str,
+    sampler_sha256: &'a str,
+}
+
+#[allow(clippy::too_many_arguments)] // fixed canonical checkpoint-state envelope
+fn state_envelope_sha256(
+    format_version: u32,
+    kind: &str,
+    step: u64,
+    num_vars: usize,
+    lora_recipe: Option<&str>,
+    optimizer_step_t: usize,
+    optimizer_num_vars: usize,
+    frozen_policy_sha256: &str,
+    trainer_config_sha256: &str,
+    tensor_schema_sha256: &str,
+    adapter_sha256: &str,
+    optimizer_sha256: &str,
+    sampler_sha256: &str,
+) -> Result<String, CheckpointError> {
+    let num_vars = u64::try_from(num_vars).map_err(|_| {
+        CheckpointError::Mismatch(
+            "trainable tensor count does not fit the ordinary checkpoint u64 envelope".into(),
+        )
+    })?;
+    let optimizer_step_t = u64::try_from(optimizer_step_t).map_err(|_| {
+        CheckpointError::Mismatch(
+            "optimizer step_t does not fit the ordinary checkpoint u64 envelope".into(),
+        )
+    })?;
+    let optimizer_num_vars = u64::try_from(optimizer_num_vars).map_err(|_| {
+        CheckpointError::Mismatch(
+            "optimizer tensor count does not fit the ordinary checkpoint u64 envelope".into(),
+        )
+    })?;
+    let envelope = OrdinaryCheckpointEnvelope {
+        format_version,
+        kind,
+        step,
+        num_vars,
+        lora_recipe,
+        optimizer_step_t,
+        optimizer_num_vars,
+        frozen_policy_sha256,
+        trainer_config_sha256,
+        tensor_schema_sha256,
+        adapter_sha256,
+        optimizer_sha256,
+        sampler_sha256,
+    };
+    let encoded = serde_json::to_vec(&envelope)?;
+    Ok(domain_sha256(
+        "ferrl.ordinary-checkpoint.state-envelope.v1",
+        &[&encoded],
+    ))
+}
+
+fn validate_state_envelope(
+    manifest: &CheckpointManifest,
+    identity: &OrdinaryCheckpointIdentity,
+) -> Result<(), CheckpointError> {
+    let optimizer_step_t = manifest.optimizer_step_t.ok_or_else(|| {
+        CheckpointError::Mismatch("ordinary checkpoint is missing optimizer_step_t".into())
+    })?;
+    let optimizer_num_vars = manifest.optimizer_num_vars.ok_or_else(|| {
+        CheckpointError::Mismatch("ordinary checkpoint is missing optimizer_num_vars".into())
+    })?;
+    let expected = state_envelope_sha256(
+        manifest.format_version,
+        &identity.kind,
+        manifest.step,
+        manifest.num_vars,
+        manifest.lora_recipe.as_deref(),
+        optimizer_step_t,
+        optimizer_num_vars,
+        &identity.frozen_policy_sha256,
+        &identity.trainer_config_sha256,
+        &identity.tensor_schema_sha256,
+        &identity.adapter_sha256,
+        &identity.optimizer_sha256,
+        &identity.sampler_sha256,
+    )?;
+    if identity.state_envelope_sha256 != expected {
+        return Err(CheckpointError::Mismatch(
+            "ordinary checkpoint state-envelope digest mismatch".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn sibling_path_with_suffix(dir: &Path, suffix: &str) -> PathBuf {
@@ -729,8 +838,11 @@ pub fn load_adapter(
 pub(crate) fn read_manifest(dir: &Path) -> Result<CheckpointManifest, CheckpointError> {
     let manifest_path = dir.join(MANIFEST_FILE);
     let raw = std::fs::read_to_string(&manifest_path).map_err(|e| io(&manifest_path, e))?;
+    // Parse the typed structures directly from the raw object first. Serde's
+    // derived map visitors reject duplicate known fields at every nested level;
+    // parsing through `Value` first would silently retain only the last value.
+    let manifest: CheckpointManifest = serde_json::from_str(&raw)?;
     let value: serde_json::Value = serde_json::from_str(&raw)?;
-    let manifest: CheckpointManifest = serde_json::from_value(value.clone())?;
     if manifest.format_version < MIN_FORMAT_VERSION || manifest.format_version > FORMAT_VERSION {
         return Err(CheckpointError::Mismatch(format!(
             "unsupported checkpoint format_version {} (this build reads {MIN_FORMAT_VERSION}..={FORMAT_VERSION})",
@@ -829,9 +941,14 @@ fn validate_manifest_field_matrix(
                 ("adapter_sha256", identity.adapter_sha256.as_str()),
                 ("optimizer_sha256", identity.optimizer_sha256.as_str()),
                 ("sampler_sha256", identity.sampler_sha256.as_str()),
+                (
+                    "state_envelope_sha256",
+                    identity.state_envelope_sha256.as_str(),
+                ),
             ] {
                 validate_sha256(label, digest)?;
             }
+            validate_state_envelope(manifest, identity)?;
         }
         _ => unreachable!("version range was checked before the field matrix"),
     }
@@ -1317,14 +1434,34 @@ fn write_checkpoint_contents(
             std::fs::read(&adapter_path).map_err(|error| io(&adapter_path, error))?;
         let optimizer_bytes =
             std::fs::read(&optimizer_path).map_err(|error| io(&optimizer_path, error))?;
+        let tensor_schema_sha256 = tensor_schema_sha256(vars, binding.lora_recipe())?;
+        let adapter_sha256 = adapter_payload_sha256(&adapter_bytes);
+        let optimizer_sha256 = optimizer_payload_sha256(opt_state.step_t, &optimizer_bytes)?;
+        let sampler_sha256 = sampler_payload_sha256(sampler_state);
+        let state_envelope_sha256 = state_envelope_sha256(
+            format_version,
+            ORDINARY_CHECKPOINT_KIND,
+            step,
+            vars.len(),
+            binding.lora_recipe(),
+            opt_state.step_t,
+            n,
+            &binding.frozen_policy_sha256,
+            &binding.trainer_config_sha256,
+            &tensor_schema_sha256,
+            &adapter_sha256,
+            &optimizer_sha256,
+            &sampler_sha256,
+        )?;
         Some(OrdinaryCheckpointIdentity {
             kind: ORDINARY_CHECKPOINT_KIND.into(),
             frozen_policy_sha256: binding.frozen_policy_sha256.clone(),
             trainer_config_sha256: binding.trainer_config_sha256.clone(),
-            tensor_schema_sha256: tensor_schema_sha256(vars, binding.lora_recipe())?,
-            adapter_sha256: adapter_payload_sha256(&adapter_bytes),
-            optimizer_sha256: optimizer_payload_sha256(opt_state.step_t, &optimizer_bytes)?,
-            sampler_sha256: sampler_payload_sha256(sampler_state),
+            tensor_schema_sha256,
+            adapter_sha256,
+            optimizer_sha256,
+            sampler_sha256,
+            state_envelope_sha256,
         })
     } else {
         if format_version == FORMAT_VERSION {
@@ -1602,20 +1739,21 @@ pub(crate) fn prepare_checkpoint(
             "ordinary checkpoint ordered tensor-schema or recipe identity mismatch".into(),
         ));
     }
-
-    let adapter_path = dir.join(ADAPTER_FILE);
-    let optimizer_path = dir.join(OPTIMIZER_FILE);
-    let adapter_bytes = read_payload(&adapter_path)?;
-    let optimizer_bytes = read_payload(&optimizer_path)?;
     let step_t = manifest.optimizer_step_t.ok_or_else(|| {
         CheckpointError::Mismatch("ordinary checkpoint is missing optimizer_step_t".into())
     })?;
     let optimizer_num_vars = manifest.optimizer_num_vars.ok_or_else(|| {
         CheckpointError::Mismatch("ordinary checkpoint is missing optimizer_num_vars".into())
     })?;
-    let sampler_state = manifest.sampler_state.ok_or_else(|| {
+    let sampler_state = manifest.sampler_state.clone().ok_or_else(|| {
         CheckpointError::Mismatch("ordinary checkpoint is missing sampler_state".into())
     })?;
+    validate_state_envelope(&manifest, identity)?;
+
+    let adapter_path = dir.join(ADAPTER_FILE);
+    let optimizer_path = dir.join(OPTIMIZER_FILE);
+    let adapter_bytes = read_payload(&adapter_path)?;
+    let optimizer_bytes = read_payload(&optimizer_path)?;
     if identity.adapter_sha256 != adapter_payload_sha256(&adapter_bytes) {
         return Err(CheckpointError::Mismatch(
             "ordinary checkpoint adapter payload digest mismatch".into(),
@@ -1725,22 +1863,22 @@ pub struct LatestCheckpoint {
 /// are eligible; legacy formats and separated continuations are excluded. A readable
 /// eligible manifest must agree exactly with its `step-<n>` directory.
 ///
-/// A subdirectory whose manifest is missing, unreadable, or an unsupported
-/// format version is **skipped, not an error**: the writer publishes a checkpoint
-/// only once its manifest is committed by an atomic rename (see the module docs),
-/// so a `step-<n>` directory without a readable manifest is an interrupted or
-/// foreign write, never a usable checkpoint. A present, readable manifest is a
-/// sufficient completeness marker: either every sibling landed in the same
-/// directory rename, or the no-replace writer committed the manifest only after
-/// every sibling. Crash-leftover `.tmp-*` / `.old-*` siblings do not match the
-/// `step-<n>` shape and are ignored, as is any unrelated entry.
+/// A malformed exact `step-<digits>` final name newer than every readable ordinary
+/// package is fail-closed: a non-directory entry, numeric suffix overflow, or
+/// missing/unreadable/malformed manifest is ambiguous published-state corruption
+/// and cannot silently fall back to an older step. A readable legacy ordinary
+/// package or a deliberately different continuation kind remains ineligible but is
+/// not corruption; a malformed older sibling cannot cause replay and is ignored.
+/// Crash-leftover `.tmp-*` / `.old-*` siblings do not match the exact final-name
+/// shape and are ignored, as is any unrelated entry.
 ///
 /// # Errors
 ///
-/// Returns [`CheckpointError::Io`] only if `checkpoints_dir` exists but its
-/// listing cannot be read (a permissions / IO fault on the directory itself). A
-/// **missing** `checkpoints_dir` is not an error — it returns `None` (a run that
-/// has not checkpointed yet).
+/// Returns [`CheckpointError`] if the directory listing fails, a numeric suffix
+/// overflows, or the newest exact final-name candidate cannot be validated. A
+/// **missing** `checkpoints_dir` is not an error — it returns `None` (a run that has
+/// not checkpointed yet).
+#[allow(clippy::cognitive_complexity)] // fail-closed classification of every exact final-name state
 pub fn latest_checkpoint(
     checkpoints_dir: impl AsRef<Path>,
 ) -> Result<Option<LatestCheckpoint>, CheckpointError> {
@@ -1749,34 +1887,51 @@ pub fn latest_checkpoint(
         return Ok(None);
     }
     let mut best: Option<LatestCheckpoint> = None;
+    let mut malformed = Vec::<(u64, CheckpointError)>::new();
     for entry in std::fs::read_dir(dir).map_err(|e| io(dir, e))? {
         let entry = entry.map_err(|e| io(dir, e))?;
-        // A per-entry file-type fault (e.g. a sibling being swept right now) is
-        // not a candidate, not a reason to fail the whole discovery.
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if !file_type.is_dir() {
-            continue;
-        }
         let path = entry.path();
         // Match exactly `step-<digits>`: this excludes `.tmp-*` / `.old-*`
         // crash siblings (their names carry a dot-suffix after the digits) and
         // any foreign directory.
-        let directory_step = path
+        let Some(step_digits) = path
             .file_name()
             .and_then(|n| n.to_str())
             .and_then(|n| n.strip_prefix("step-"))
             .filter(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
-            .and_then(|rest| rest.parse::<u64>().ok());
-        let Some(directory_step) = directory_step else {
+        else {
             continue;
         };
-        // The manifest is both the completeness marker and the source of truth
-        // for `step`. A partial / foreign / future-version directory simply is
-        // not a candidate (skip, do not fail).
-        let Ok(manifest) = read_manifest(&path) else {
+        let directory_step = step_digits.parse::<u64>().map_err(|_| {
+            CheckpointError::Mismatch(format!(
+                "ordinary checkpoint directory name step-{step_digits} exceeds the u64 step range"
+            ))
+        })?;
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) => {
+                malformed.push((directory_step, io(&path, error)));
+                continue;
+            }
+        };
+        if !file_type.is_dir() {
+            malformed.push((
+                directory_step,
+                CheckpointError::Mismatch(format!(
+                    "ordinary checkpoint final name step-{directory_step} is not a directory"
+                )),
+            ));
             continue;
+        }
+        // Atomic ordinary publication exposes only complete final directories.
+        // Any unreadable or malformed exact final name is therefore ambiguous
+        // corruption, never a valid partial-write stage.
+        let manifest = match read_manifest(&path) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                malformed.push((directory_step, error));
+                continue;
+            }
         };
         if manifest.format_version != FORMAT_VERSION
             || manifest.ordinary_checkpoint.is_none()
@@ -1785,10 +1940,14 @@ pub fn latest_checkpoint(
             continue;
         }
         if manifest.step != directory_step {
-            return Err(CheckpointError::Mismatch(format!(
-                "ordinary checkpoint directory step-{directory_step} contains manifest step {}",
-                manifest.step
-            )));
+            malformed.push((
+                directory_step,
+                CheckpointError::Mismatch(format!(
+                    "ordinary checkpoint directory step-{directory_step} contains manifest step {}",
+                    manifest.step
+                )),
+            ));
+            continue;
         }
         let candidate = LatestCheckpoint {
             dir: path,
@@ -1796,6 +1955,17 @@ pub fn latest_checkpoint(
         };
         if best.as_ref().is_none_or(|b| candidate.step > b.step) {
             best = Some(candidate);
+        }
+    }
+    if let Some((malformed_step, error)) = malformed
+        .into_iter()
+        .max_by_key(|(directory_step, _)| *directory_step)
+    {
+        if best
+            .as_ref()
+            .is_none_or(|checkpoint| malformed_step > checkpoint.step)
+        {
+            return Err(error);
         }
     }
     Ok(best)
@@ -2122,6 +2292,7 @@ mod tests {
                 adapter_sha256: "4".repeat(64),
                 optimizer_sha256: "5".repeat(64),
                 sampler_sha256: "6".repeat(64),
+                state_envelope_sha256: "7".repeat(64),
             }),
         };
         let j = serde_json::to_string(&m).unwrap();
@@ -2730,7 +2901,11 @@ mod tests {
             Err(CheckpointError::PublicationAmbiguous { path, detail })
                 if path == destination && detail.contains("visible package verification failed")
         ));
-        assert_eq!(latest_checkpoint(&checkpoints).unwrap(), None);
+        assert!(matches!(
+            latest_checkpoint(&checkpoints),
+            Err(CheckpointError::Io { path, .. })
+                if path == destination.join(MANIFEST_FILE)
+        ));
         assert_eq!(
             latest_rollout_ledger_continuation(&checkpoints).unwrap(),
             None
@@ -2811,7 +2986,11 @@ mod tests {
             Err(CheckpointError::PublicationAmbiguous { path, detail })
                 if path == destination && detail.contains("visible package verification failed")
         ));
-        assert_eq!(latest_checkpoint(&checkpoints).unwrap(), None);
+        assert!(matches!(
+            latest_checkpoint(&checkpoints),
+            Err(CheckpointError::Io { path, .. })
+                if path == destination.join(MANIFEST_FILE)
+        ));
         assert_eq!(
             latest_rollout_ledger_continuation(&checkpoints).unwrap(),
             None
@@ -3053,6 +3232,32 @@ mod tests {
         .unwrap();
     }
 
+    fn write_manifest_raw(dir: &Path, raw: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(MANIFEST_FILE), raw).unwrap();
+    }
+
+    fn refresh_v4_state_envelope(manifest: &mut serde_json::Value) {
+        let identity = &manifest["ordinary_checkpoint"];
+        let root = state_envelope_sha256(
+            u32::try_from(manifest["format_version"].as_u64().unwrap()).unwrap(),
+            identity["kind"].as_str().unwrap(),
+            manifest["step"].as_u64().unwrap(),
+            usize::try_from(manifest["num_vars"].as_u64().unwrap()).unwrap(),
+            manifest["lora_recipe"].as_str(),
+            usize::try_from(manifest["optimizer_step_t"].as_u64().unwrap()).unwrap(),
+            usize::try_from(manifest["optimizer_num_vars"].as_u64().unwrap()).unwrap(),
+            identity["frozen_policy_sha256"].as_str().unwrap(),
+            identity["trainer_config_sha256"].as_str().unwrap(),
+            identity["tensor_schema_sha256"].as_str().unwrap(),
+            identity["adapter_sha256"].as_str().unwrap(),
+            identity["optimizer_sha256"].as_str().unwrap(),
+            identity["sampler_sha256"].as_str().unwrap(),
+        )
+        .unwrap();
+        manifest["ordinary_checkpoint"]["state_envelope_sha256"] = serde_json::json!(root);
+    }
+
     fn assert_manifest_rejected(dir: &Path, value: &serde_json::Value, label: &str) {
         write_manifest_value(dir, value);
         assert!(
@@ -3139,6 +3344,7 @@ mod tests {
             "adapter_sha256",
             "optimizer_sha256",
             "sampler_sha256",
+            "state_envelope_sha256",
         ] {
             let mut missing = v4.clone();
             missing["ordinary_checkpoint"]
@@ -3218,6 +3424,72 @@ mod tests {
         assert_cross_version_identity_smuggling_rejected(&dir, &v1, &v4);
     }
 
+    #[test]
+    fn ordinary_manifest_rejects_raw_duplicate_security_fields() {
+        let tmp = TempDir::new("duplicate-manifest-fields");
+        let dir = tmp.path().join("case");
+        let manifest = save_v4_manifest_fixture(&dir);
+        let raw = serde_json::to_string_pretty(&manifest).unwrap();
+        let zero_digest = "0".repeat(64);
+        let mut cases = vec![
+            (
+                "top-level format_version".to_string(),
+                raw.replacen(
+                    "\"format_version\": 4,",
+                    "\"format_version\": 4,\n  \"format_version\": 4,",
+                    1,
+                ),
+            ),
+            (
+                "top-level step".to_string(),
+                raw.replacen("\"step\": 1\n", "\"step\": 1,\n  \"step\": 1\n", 1),
+            ),
+            (
+                "top-level identity".to_string(),
+                raw.replacen(
+                    "\"ordinary_checkpoint\": {",
+                    "\"ordinary_checkpoint\": null,\n  \"ordinary_checkpoint\": {",
+                    1,
+                ),
+            ),
+            (
+                "nested kind".to_string(),
+                raw.replacen(
+                    "\"kind\": \"ordinary\",",
+                    "\"kind\": \"ordinary\",\n    \"kind\": \"ordinary\",",
+                    1,
+                ),
+            ),
+        ];
+        for field in [
+            "frozen_policy_sha256",
+            "trainer_config_sha256",
+            "tensor_schema_sha256",
+            "adapter_sha256",
+            "optimizer_sha256",
+            "sampler_sha256",
+            "state_envelope_sha256",
+        ] {
+            cases.push((
+                format!("nested digest {field}"),
+                raw.replacen(
+                    &format!("\"{field}\":"),
+                    &format!("\"{field}\": \"{zero_digest}\",\n    \"{field}\":"),
+                    1,
+                ),
+            ));
+        }
+        for (label, duplicate) in cases {
+            assert_ne!(duplicate, raw, "duplicate control did not alter {label}");
+            write_manifest_raw(&dir, &duplicate);
+            let error = read_manifest(&dir).unwrap_err();
+            assert!(
+                error.to_string().contains("duplicate field"),
+                "{label}: wrong rejection: {error}"
+            );
+        }
+    }
+
     fn save_integrity_fixture(dir: &Path) {
         save_checkpoint(
             dir,
@@ -3250,6 +3522,83 @@ mod tests {
         let changed = tensors.get(key).unwrap().affine(1.0, 1.0).unwrap();
         tensors.insert(key.to_owned(), changed);
         candle_core::safetensors::save(&tensors, path).unwrap();
+    }
+
+    #[test]
+    fn ordinary_checkpoint_state_envelope_rejects_step_relabelling_before_mutation() {
+        let tmp = TempDir::new("step-relabel");
+        save_integrity_fixture(tmp.path());
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(tmp.path().join(MANIFEST_FILE)).unwrap())
+                .unwrap();
+        manifest["step"] = serde_json::json!(14);
+        write_manifest_value(tmp.path(), &manifest);
+
+        let destination = sentinel_vars();
+        let before = snapshot(&destination);
+        let error = load_checkpoint(tmp.path(), &destination, &ordinary_binding(Some("recipe")))
+            .unwrap_err();
+        assert!(error.to_string().contains("state-envelope"), "{error}");
+        assert_eq!(snapshot(&destination), before);
+    }
+
+    #[test]
+    fn ordinary_checkpoint_state_envelope_rejects_coherent_leaf_transplant() {
+        let tmp = TempDir::new("coherent-leaf-transplant");
+        let recipient = tmp.path().join("recipient");
+        let donor = tmp.path().join("donor");
+        save_integrity_fixture(&recipient);
+
+        let donor_vars = make_vars();
+        donor_vars[0]
+            .set(&donor_vars[0].as_tensor().affine(1.0, 11.0).unwrap())
+            .unwrap();
+        let mut donor_optimizer = make_opt_state();
+        donor_optimizer.first_moments[0] =
+            donor_optimizer.first_moments[0].affine(1.0, 5.0).unwrap();
+        save_checkpoint(
+            &donor,
+            &donor_vars,
+            &donor_optimizer,
+            &[4, 3, 2, 1],
+            13,
+            &ordinary_binding(Some("recipe")),
+        )
+        .unwrap();
+
+        std::fs::copy(donor.join(ADAPTER_FILE), recipient.join(ADAPTER_FILE)).unwrap();
+        let donor_manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(donor.join(MANIFEST_FILE)).unwrap()).unwrap();
+        let mut recipient_manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(recipient.join(MANIFEST_FILE)).unwrap()).unwrap();
+        assert_ne!(
+            recipient_manifest["ordinary_checkpoint"]["optimizer_sha256"],
+            donor_manifest["ordinary_checkpoint"]["optimizer_sha256"],
+            "the transplant control requires the recipient Adam state to remain distinct"
+        );
+        assert_ne!(
+            recipient_manifest["ordinary_checkpoint"]["sampler_sha256"],
+            donor_manifest["ordinary_checkpoint"]["sampler_sha256"],
+            "the transplant control requires the recipient sampler state to remain distinct"
+        );
+        recipient_manifest["ordinary_checkpoint"]["adapter_sha256"] =
+            donor_manifest["ordinary_checkpoint"]["adapter_sha256"].clone();
+        let transplanted_bytes = std::fs::read(recipient.join(ADAPTER_FILE)).unwrap();
+        assert_eq!(
+            recipient_manifest["ordinary_checkpoint"]["adapter_sha256"]
+                .as_str()
+                .unwrap(),
+            adapter_payload_sha256(&transplanted_bytes),
+            "the transplanted payload and its leaf digest must be internally coherent"
+        );
+        write_manifest_value(&recipient, &recipient_manifest);
+
+        let destination = sentinel_vars();
+        let before = snapshot(&destination);
+        let error = load_checkpoint(&recipient, &destination, &ordinary_binding(Some("recipe")))
+            .unwrap_err();
+        assert!(error.to_string().contains("state-envelope"), "{error}");
+        assert_eq!(snapshot(&destination), before);
     }
 
     #[test]
@@ -3359,6 +3708,7 @@ mod tests {
                 .unwrap()
             };
             manifest["ordinary_checkpoint"][identity_field] = serde_json::json!(digest);
+            refresh_v4_state_envelope(&mut manifest);
             write_manifest_value(&dir, &manifest);
 
             let destination = sentinel_vars();
@@ -3447,14 +3797,56 @@ mod tests {
     }
 
     #[test]
-    fn latest_checkpoint_skips_dirs_without_a_committed_manifest() {
-        // A higher-numbered directory with no manifest (an interrupted write)
-        // is not a candidate — discovery falls back to the newest complete one.
+    fn latest_checkpoint_rejects_newer_exact_dir_without_a_manifest() {
+        // Ordinary publication exposes only atomically renamed final directories;
+        // silently falling back here would replay step 5 despite visible step 99.
         let tmp = TempDir::new("latest-partial");
         write_step(tmp.path(), 5);
-        std::fs::create_dir_all(tmp.path().join("step-99")).unwrap(); // no manifest
-        let got = latest_checkpoint(tmp.path()).unwrap().unwrap();
-        assert_eq!(got.step, 5, "the manifest-less step-99 must be skipped");
+        std::fs::create_dir_all(tmp.path().join("step-99")).unwrap();
+        assert!(matches!(
+            latest_checkpoint(tmp.path()).unwrap_err(),
+            CheckpointError::Io { .. }
+        ));
+    }
+
+    #[test]
+    fn latest_checkpoint_ignores_malformed_older_exact_dir_without_replay() {
+        let tmp = TempDir::new("latest-older-malformed");
+        std::fs::create_dir_all(tmp.path().join("step-1")).unwrap();
+        write_step(tmp.path(), 5);
+        assert_eq!(latest_checkpoint(tmp.path()).unwrap().unwrap().step, 5);
+    }
+
+    #[test]
+    fn latest_checkpoint_rejects_newer_malformed_manifest_and_suffix_overflow() {
+        let malformed = TempDir::new("latest-malformed");
+        write_step(malformed.path(), 5);
+        let bad_dir = malformed.path().join("step-99");
+        std::fs::create_dir_all(&bad_dir).unwrap();
+        std::fs::write(bad_dir.join(MANIFEST_FILE), b"{not-json").unwrap();
+        assert!(matches!(
+            latest_checkpoint(malformed.path()).unwrap_err(),
+            CheckpointError::Manifest(_)
+        ));
+
+        let overflow = TempDir::new("latest-overflow");
+        write_step(overflow.path(), 5);
+        std::fs::create_dir_all(overflow.path().join("step-18446744073709551616")).unwrap();
+        let error = latest_checkpoint(overflow.path()).unwrap_err();
+        assert!(error.to_string().contains("u64 step range"), "{error}");
+    }
+
+    #[test]
+    fn latest_checkpoint_rejects_newer_exact_final_name_that_is_not_a_directory() {
+        let tmp = TempDir::new("latest-final-file");
+        write_step(tmp.path(), 5);
+        std::fs::write(
+            tmp.path().join("step-99"),
+            b"not an atomic checkpoint directory",
+        )
+        .unwrap();
+        let error = latest_checkpoint(tmp.path()).unwrap_err();
+        assert!(error.to_string().contains("is not a directory"), "{error}");
     }
 
     #[test]
@@ -3468,7 +3860,7 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("step-abc")).unwrap();
         std::fs::create_dir_all(tmp.path().join("step-")).unwrap();
         std::fs::create_dir_all(tmp.path().join("latest")).unwrap();
-        std::fs::write(tmp.path().join("step-100"), b"a file, not a dir").unwrap();
+        std::fs::write(tmp.path().join("step-100.foreign"), b"a foreign file").unwrap();
         let got = latest_checkpoint(tmp.path()).unwrap().unwrap();
         assert_eq!(
             got.step, 3,

@@ -60,7 +60,8 @@
 //!   eval ([`save_adapter`]), and an identity/integrity-bound, momentum-faithful
 //!   ordinary format-v4 checkpoint ([`save_checkpoint`]) that binds immutable policy
 //!   content, canonical learner semantics/topology, exact recipe/schema, adapter and
-//!   Adam payloads, and sampler state before [`Trainer::resume`] mutates live state;
+//!   Adam payloads, sampler state, and the completed-step relationship under one
+//!   state-envelope root before [`Trainer::resume`] mutates live state;
 //! - the separated rollout/learner artifact contract ([`rollout_ledger`]) — a
 //!   strict, checksummed, no-replace whole-window package whose reader validates
 //!   learner pre-state identity, mandatory structured controls, and every
@@ -225,8 +226,9 @@ pub use llama::{LlamaGradModel, LlamaMergedDecoder};
 pub use lm_policy::{Gemma4Policy, LlamaPolicy, LmPolicy, Qwen3_5Policy, QwenPolicy};
 #[doc(inline)]
 pub use loader::{
-    checkpoint_policy_sha256, load_auto_policy, load_gemma4_policy, load_qwen_policy, AutoPolicy,
-    LoaderError, LoaderOpts,
+    checkpoint_policy_sha256, load_auto_policy, load_auto_policy_bound, load_gemma4_policy,
+    load_gemma4_policy_bound, load_qwen35_policy_with_targets_bound, load_qwen_policy,
+    load_qwen_policy_bound, AutoPolicy, LoaderError, LoaderOpts,
 };
 #[doc(inline)]
 pub use lora::{BaseQuantization, DenseLoraTargets};

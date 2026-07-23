@@ -168,6 +168,139 @@ impl Policy for ScriptedPolicy {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumePreflightPanic {
+    LoraRecipe,
+    TrainableVars,
+    SamplerValidation,
+}
+
+#[derive(Debug, Default)]
+struct ResumePreflightCalls {
+    generate: usize,
+    token_logprobs: Cell<usize>,
+    detached: Cell<usize>,
+    backward: Cell<usize>,
+    adapter_toggles: usize,
+    trainable_vars: Cell<usize>,
+    sampler_validation: Cell<usize>,
+    sampler_restore: usize,
+    lora_recipe: Cell<usize>,
+}
+
+/// A public-entry-point resume oracle whose fault is armed only after the test
+/// captures the live prestate. Raw state inspection deliberately reaches the
+/// inner policy so post-error assertions cannot accidentally retrigger the
+/// faulting hook.
+struct ResumePreflightPanicPolicy {
+    inner: ScriptedPolicy,
+    rank: usize,
+    fault: ResumePreflightPanic,
+    armed: bool,
+    calls: ResumePreflightCalls,
+}
+
+impl ResumePreflightPanicPolicy {
+    fn new(rank: usize, fault: ResumePreflightPanic) -> Self {
+        Self {
+            inner: ScriptedPolicy::new(SEED).unwrap(),
+            rank,
+            fault,
+            armed: false,
+            calls: ResumePreflightCalls::default(),
+        }
+    }
+
+    fn fault_here(&self, fault: ResumePreflightPanic) -> bool {
+        self.armed && self.rank == 1 && self.fault == fault
+    }
+
+    fn raw_var_bits(&self) -> Vec<Vec<u32>> {
+        var_bits(&self.inner)
+    }
+
+    fn raw_var_ids(&self) -> Vec<candle_core::TensorId> {
+        self.inner
+            .trainable_vars()
+            .iter()
+            .map(|var| var.as_tensor().id())
+            .collect()
+    }
+}
+
+impl Policy for ResumePreflightPanicPolicy {
+    fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
+        self.calls.generate += 1;
+        self.inner.generate(prompt, cfg)
+    }
+
+    fn token_logprobs(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+        self.calls
+            .token_logprobs
+            .set(self.calls.token_logprobs.get() + 1);
+        self.inner.token_logprobs(rollout)
+    }
+
+    fn token_logprobs_detached(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+        self.calls.detached.set(self.calls.detached.get() + 1);
+        self.inner.token_logprobs_detached(rollout)
+    }
+
+    fn backward(&self, loss: &Tensor) -> CandleResult<candle_core::backprop::GradStore> {
+        self.calls.backward.set(self.calls.backward.get() + 1);
+        self.inner.backward(loss)
+    }
+
+    fn set_adapter_enabled(&mut self, enabled: bool) {
+        self.calls.adapter_toggles += 1;
+        self.inner.set_adapter_enabled(enabled);
+    }
+
+    fn adapter_enabled(&self) -> bool {
+        self.inner.adapter_enabled()
+    }
+
+    fn trainable_vars(&self) -> Vec<Var> {
+        self.calls
+            .trainable_vars
+            .set(self.calls.trainable_vars.get() + 1);
+        assert!(
+            !self.fault_here(ResumePreflightPanic::TrainableVars),
+            "injected ordinary-resume trainable-vars panic"
+        );
+        self.inner.trainable_vars()
+    }
+
+    fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+        self.inner.sampler_state()
+    }
+
+    fn validate_sampler_state(&self, state: &[u8]) -> CandleResult<()> {
+        self.calls
+            .sampler_validation
+            .set(self.calls.sampler_validation.get() + 1);
+        assert!(
+            !self.fault_here(ResumePreflightPanic::SamplerValidation),
+            "injected ordinary-resume sampler-validation panic"
+        );
+        self.inner.validate_sampler_state(state)
+    }
+
+    fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
+        self.calls.sampler_restore += 1;
+        self.inner.restore_sampler_state(state)
+    }
+
+    fn lora_recipe(&self) -> Option<String> {
+        self.calls.lora_recipe.set(self.calls.lora_recipe.get() + 1);
+        assert!(
+            !self.fault_here(ResumePreflightPanic::LoraRecipe),
+            "injected ordinary-resume lora-recipe panic"
+        );
+        self.inner.lora_recipe()
+    }
+}
+
 /// A deterministic but genuinely stateful rollout stream over the same real
 /// LoRA/autograd scoring path as [`ScriptedPolicy`]. Each prompt group advances
 /// an opaque epoch and changes how many rows echo the prompt, so sampler handoff
@@ -574,6 +707,19 @@ impl RewardFn for EchoOrFlatReward {
             (Some(p), Some(c)) if p == c => 1.0,
             _ => 0.0,
         })
+    }
+}
+
+struct PreflightCountingReward {
+    calls: Arc<AtomicUsize>,
+}
+
+impl RewardFn for PreflightCountingReward {
+    type Target = ();
+
+    fn reward(&self, _sample: &Sample<()>, _completion: &str) -> Result<f32, RewardError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        panic!("ordinary resume preflight failure reached reward evaluation")
     }
 }
 
@@ -1299,6 +1445,37 @@ impl Comm for SpyComm {
     fn all_reduce_scalar_sum(&self, value: f64) -> Result<f64, CommError> {
         self.calls.fetch_add(1, Ordering::Relaxed);
         Ok(value)
+    }
+}
+
+#[derive(Debug)]
+struct ResumePreflightCountingComm<C> {
+    inner: C,
+    scalar_calls: Arc<AtomicUsize>,
+    tensor_calls: Arc<AtomicUsize>,
+}
+
+impl<C: Comm> Comm for ResumePreflightCountingComm<C> {
+    fn rank(&self) -> usize {
+        self.inner.rank()
+    }
+
+    fn world_size(&self) -> usize {
+        self.inner.world_size()
+    }
+
+    fn validate_all_reduce_sum(&self, tensors: &[Tensor]) -> Result<(), CommError> {
+        self.inner.validate_all_reduce_sum(tensors)
+    }
+
+    fn all_reduce_sum(&self, tensors: &mut Vec<Tensor>) -> Result<(), CommError> {
+        self.tensor_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.all_reduce_sum(tensors)
+    }
+
+    fn all_reduce_scalar_sum(&self, value: f64) -> Result<f64, CommError> {
+        self.scalar_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.all_reduce_scalar_sum(value)
     }
 }
 
@@ -6346,6 +6523,307 @@ fn resume_latest_under_dp_broadcasts_a_rank0_scan_failure_instead_of_hanging() {
         errs.iter().any(|e| matches!(e, TrainerError::Contract(_))),
         "the peer must surface the synthesized lockstep-abort error: {errs:?}"
     );
+}
+
+/// A newer canonical final directory with a malformed manifest is not a crash
+/// staging artifact: ordinary publication exposes only complete `step-N`
+/// directories. Rank 0 must therefore broadcast scan failure instead of
+/// silently replaying the older valid package while its peers wait or follow.
+#[test]
+#[allow(clippy::cognitive_complexity)] // coordinated failure plus state/telemetry sentinels
+fn resume_latest_under_dp_rejects_newer_malformed_final_without_fallback() {
+    let tmp = TempDir::new("rl-dp-malformed-latest");
+    let shared_ckpts = tmp.path().join("shared-checkpoints");
+    let seed_cfg = TrainerConfig {
+        steps: 1,
+        checkpoint_every: Some(1),
+        ..scripted_cfg()
+    };
+    let seed = run_dp_world_resume_latest(tmp.path(), &shared_ckpts, 1, &seed_cfg);
+    assert_lockstep(&seed, "malformed-latest seed");
+    assert!(shared_ckpts.join("step-1").is_dir());
+
+    let malformed = shared_ckpts.join("step-2");
+    std::fs::create_dir_all(&malformed).unwrap();
+    std::fs::write(malformed.join("manifest.json"), b"{not-json").unwrap();
+
+    let reward_calls = Arc::new(AtomicUsize::new(0));
+    let cfg = TrainerConfig {
+        steps: 2,
+        checkpoint_every: Some(1),
+        ..scripted_cfg()
+    };
+    let outcomes: Vec<(usize, TrainerError)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = LocalComm::world_with_timeout(2, std::time::Duration::from_secs(15))
+            .into_iter()
+            .map(|comm| {
+                let cfg = cfg.clone();
+                let shared_ckpts = shared_ckpts.clone();
+                let reward_calls = Arc::clone(&reward_calls);
+                let base = tmp.path();
+                scope.spawn(move || {
+                    let rank = comm.rank();
+                    let run = RunDir::create(base, format!("malformed-latest-rank{rank}")).unwrap();
+                    let metrics_sentinel = format!("metrics-rank-{rank}\n").into_bytes();
+                    let candidates_sentinel = format!("candidates-rank-{rank}\n").into_bytes();
+                    std::fs::write(run.metrics_path(), &metrics_sentinel).unwrap();
+                    std::fs::write(run.candidates_path(), &candidates_sentinel).unwrap();
+
+                    let mut policy = ScriptedPolicy::new(SEED).unwrap();
+                    let values_before = var_bits(&policy);
+                    let sampler_before = policy.sampler_state().unwrap();
+                    let mode_before = policy.adapter_enabled();
+                    let mut trainer = Trainer::with_comm(cfg, &run, comm)
+                        .unwrap()
+                        .with_checkpoint_policy_sha256(checkpoint_policy_sha256())
+                        .with_checkpoints_dir(shared_ckpts);
+                    let error = trainer
+                        .resume_latest(
+                            &mut policy,
+                            &PreflightCountingReward {
+                                calls: reward_calls,
+                            },
+                            &CharTokenizer,
+                            &live_samples(),
+                        )
+                        .map(|_| ())
+                        .unwrap_err();
+
+                    assert_eq!(var_bits(&policy), values_before, "rank {rank} values");
+                    assert_eq!(
+                        policy.sampler_state().unwrap(),
+                        sampler_before,
+                        "rank {rank} sampler"
+                    );
+                    assert_eq!(
+                        policy.adapter_enabled(),
+                        mode_before,
+                        "rank {rank} adapter mode"
+                    );
+                    assert_eq!(std::fs::read(run.metrics_path()).unwrap(), metrics_sentinel);
+                    assert_eq!(
+                        std::fs::read(run.candidates_path()).unwrap(),
+                        candidates_sentinel
+                    );
+                    (rank, error)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect()
+    });
+
+    assert_eq!(reward_calls.load(Ordering::SeqCst), 0);
+    for (rank, error) in outcomes {
+        assert!(
+            !matches!(error, TrainerError::Comm(_)),
+            "rank {rank}: {error:?}"
+        );
+        if rank == 0 {
+            assert!(
+                matches!(error, TrainerError::Checkpoint(_)),
+                "rank 0: {error:?}"
+            );
+        } else {
+            assert!(
+                matches!(error, TrainerError::Contract(ref message)
+                    if message.contains("checkpoint discovery failed")),
+                "rank {rank}: {error:?}"
+            );
+        }
+    }
+}
+
+#[test]
+#[allow(clippy::cognitive_complexity)] // one matrix pins three asymmetric policy-hook panics
+fn ordinary_dp_resume_panic_contains_the_complete_preflight_before_any_mutation() {
+    let tmp = TempDir::new("ordinary-resume-preflight-panics");
+    let cfg = TrainerConfig {
+        steps: 1,
+        checkpoint_every: Some(1),
+        ..scripted_cfg()
+    };
+    let seed = run_scripted_world(tmp.path(), 2, &cfg, &live_samples());
+    assert_lockstep(&seed, "ordinary resume panic seed");
+    let checkpoint = tmp.path().join("rank0/checkpoints/step-1");
+    assert!(checkpoint.is_dir(), "seed checkpoint was not published");
+
+    for (case, fault, expected_scalars) in [
+        ("lora-recipe", ResumePreflightPanic::LoraRecipe, 1),
+        ("trainable-vars", ResumePreflightPanic::TrainableVars, 11),
+        (
+            "sampler-validation",
+            ResumePreflightPanic::SamplerValidation,
+            11,
+        ),
+    ] {
+        let reward_calls = Arc::new(AtomicUsize::new(0));
+        let base = tmp.path();
+        let mut outcomes = std::thread::scope(|scope| {
+            let handles: Vec<_> =
+                LocalComm::world_with_timeout(2, std::time::Duration::from_secs(15))
+                    .into_iter()
+                    .enumerate()
+                    .map(|(rank, inner)| {
+                        let checkpoint = checkpoint.clone();
+                        let reward_calls = Arc::clone(&reward_calls);
+                        let cfg = cfg.clone();
+                        scope.spawn(move || {
+                            let scalar_calls = Arc::new(AtomicUsize::new(0));
+                            let tensor_calls = Arc::new(AtomicUsize::new(0));
+                            let comm = ResumePreflightCountingComm {
+                                inner,
+                                scalar_calls: Arc::clone(&scalar_calls),
+                                tensor_calls: Arc::clone(&tensor_calls),
+                            };
+                            let run = RunDir::create(base, format!("{case}-rank{rank}")).unwrap();
+                            let mut trainer = Trainer::with_comm(cfg, &run, comm)
+                                .unwrap()
+                                .with_checkpoint_policy_sha256(checkpoint_policy_sha256());
+                            // Exclude constructor config-consensus collectives from the
+                            // resume-preflight oracle.
+                            scalar_calls.store(0, Ordering::SeqCst);
+                            tensor_calls.store(0, Ordering::SeqCst);
+
+                            let metrics_sentinel =
+                                format!("metrics-{case}-rank{rank}\n").into_bytes();
+                            let candidates_sentinel =
+                                format!("candidates-{case}-rank{rank}\n").into_bytes();
+                            std::fs::write(run.metrics_path(), &metrics_sentinel).unwrap();
+                            std::fs::write(run.candidates_path(), &candidates_sentinel).unwrap();
+
+                            let mut policy = ResumePreflightPanicPolicy::new(rank, fault);
+                            let values_before = policy.raw_var_bits();
+                            let ids_before = policy.raw_var_ids();
+                            let mode_before = policy.inner.adapter_enabled();
+                            let sampler_before = policy.inner.sampler_state().unwrap();
+                            policy.armed = true;
+                            let error = trainer
+                                .resume(
+                                    &checkpoint,
+                                    &mut policy,
+                                    &PreflightCountingReward {
+                                        calls: reward_calls,
+                                    },
+                                    &CharTokenizer,
+                                    &live_samples(),
+                                )
+                                .unwrap_err();
+
+                            assert_eq!(
+                                policy.raw_var_bits(),
+                                values_before,
+                                "{case} rank {rank} values"
+                            );
+                            assert_eq!(
+                                policy.raw_var_ids(),
+                                ids_before,
+                                "{case} rank {rank} identities"
+                            );
+                            assert_eq!(
+                                policy.inner.adapter_enabled(),
+                                mode_before,
+                                "{case} rank {rank} mode"
+                            );
+                            assert_eq!(
+                                policy.inner.sampler_state().unwrap(),
+                                sampler_before,
+                                "{case} rank {rank} sampler"
+                            );
+                            assert_eq!(
+                                std::fs::read(run.metrics_path()).unwrap(),
+                                metrics_sentinel
+                            );
+                            assert_eq!(
+                                std::fs::read(run.candidates_path()).unwrap(),
+                                candidates_sentinel
+                            );
+                            assert_eq!(policy.calls.generate, 0, "{case} rank {rank} generated");
+                            assert_eq!(
+                                policy.calls.token_logprobs.get(),
+                                0,
+                                "{case} rank {rank} scored live"
+                            );
+                            assert_eq!(
+                                policy.calls.detached.get(),
+                                0,
+                                "{case} rank {rank} scored detached"
+                            );
+                            assert_eq!(
+                                policy.calls.backward.get(),
+                                0,
+                                "{case} rank {rank} ran backward"
+                            );
+                            assert_eq!(
+                                policy.calls.adapter_toggles, 0,
+                                "{case} rank {rank} toggled adapter"
+                            );
+                            assert_eq!(
+                                policy.calls.sampler_restore, 0,
+                                "{case} rank {rank} restored sampler"
+                            );
+                            assert_eq!(
+                                tensor_calls.load(Ordering::SeqCst),
+                                0,
+                                "{case} rank {rank} entered a tensor collective"
+                            );
+                            assert_eq!(
+                                scalar_calls.load(Ordering::SeqCst),
+                                expected_scalars,
+                                "{case} rank {rank} ran a later scalar collective"
+                            );
+                            (rank, error, policy.calls)
+                        })
+                    })
+                    .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        outcomes.sort_by_key(|(rank, _, _)| *rank);
+        assert_eq!(
+            reward_calls.load(Ordering::SeqCst),
+            0,
+            "{case} reached reward"
+        );
+        for (rank, error, calls) in outcomes {
+            assert!(
+                matches!(error, TrainerError::Contract(ref message)
+                    if if rank == 1 {
+                        message.contains("panicked: injected ordinary-resume")
+                    } else {
+                        message.contains("failed on a peer rank; aborting in lockstep")
+                    }),
+                "{case} rank {rank} did not return promptly through the coordinated panic boundary: {error:?}"
+            );
+            assert_eq!(
+                calls.lora_recipe.get(),
+                1,
+                "{case} rank {rank} recipe calls"
+            );
+            match fault {
+                ResumePreflightPanic::LoraRecipe => {
+                    assert_eq!(calls.trainable_vars.get(), 0);
+                    assert_eq!(calls.sampler_validation.get(), 0);
+                }
+                ResumePreflightPanic::TrainableVars => {
+                    assert_eq!(calls.trainable_vars.get(), 1);
+                    assert_eq!(
+                        calls.sampler_validation.get(),
+                        usize::from(rank == 0),
+                        "the panicking rank must stop inside trainable_vars"
+                    );
+                }
+                ResumePreflightPanic::SamplerValidation => {
+                    assert_eq!(calls.trainable_vars.get(), 1);
+                    assert_eq!(calls.sampler_validation.get(), 1);
+                }
+            }
+        }
+    }
 }
 
 // ---- gate 2: real tiny qwen3.5, bitwise rank lockstep, both modes -------------

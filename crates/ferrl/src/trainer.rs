@@ -1857,12 +1857,25 @@ enum ResumeDecision {
     ScanFailed,
 }
 
+/// Largest completed-step index whose `step + 1` resume sentinel is exactly
+/// representable on the scalar `f64` discovery wire.
+const MAX_EXACT_RESUME_STEP: u64 = (1_u64 << 53) - 1;
+
 impl ResumeDecision {
+    fn checked_resume(step: u64) -> Result<Self, crate::checkpoint::CheckpointError> {
+        if step > MAX_EXACT_RESUME_STEP {
+            return Err(crate::checkpoint::CheckpointError::Mismatch(format!(
+                "checkpoint step {step} exceeds the exact scalar discovery range {MAX_EXACT_RESUME_STEP}"
+            )));
+        }
+        Ok(Self::Resume(step))
+    }
+
     /// Encode for the broadcast sum: `Fresh → 0.0` (also the additive identity the
     /// peers contribute), `Resume(s) → s + 1.0` (always `≥ 1.0`, distinct from the
-    /// `Fresh` sentinel even for `s = 0`), `ScanFailed → -1.0`. Every value is an exact
-    /// integer far below 2^53, so summing rank 0's value against zero-contributing peers
-    /// returns it bit-exactly.
+    /// `Fresh` sentinel even for `s = 0`), `ScanFailed → -1.0`. Checked construction
+    /// caps `s` so every wire value is an exact integer at or below 2^53; summing rank
+    /// 0's value against zero-contributing peers therefore returns it bit-exactly.
     fn encode(self) -> f64 {
         match self {
             ResumeDecision::Fresh => 0.0,
@@ -3946,7 +3959,7 @@ impl Trainer {
                 )?;
                 if latest
                     .as_ref()
-                    .is_some_and(|latest| latest.step > 9_007_199_254_740_991)
+                    .is_some_and(|latest| latest.step > MAX_EXACT_RESUME_STEP)
                 {
                     return Err(TrainerError::Contract(
                         "latest continuation step cannot be represented exactly by the data-parallel discovery signal"
@@ -3965,7 +3978,9 @@ impl Trainer {
             Ok(None)
         };
         let decision = match &latest_local {
-            Ok(Some(latest)) => ResumeDecision::Resume(latest.step),
+            Ok(Some(latest)) => {
+                ResumeDecision::checked_resume(latest.step).unwrap_or(ResumeDecision::ScanFailed)
+            }
             Ok(None) => ResumeDecision::Fresh,
             Err(_) => ResumeDecision::ScanFailed,
         };
@@ -4037,16 +4052,19 @@ impl Trainer {
         E: PolicyExecution<P>,
     {
         let execution_comm = exec.execution_comm(self.comm.as_ref());
-        let binding = Self::coordinate_comm_result(
+        let (binding, encoded) = Self::coordinate_comm_call(
             execution_comm,
-            "ordinary checkpoint identity derivation",
-            self.checkpoint_binding(policy, exec.model_parallel_world_size()),
+            "ordinary checkpoint identity derivation/serialization",
+            || {
+                let binding = self.checkpoint_binding(policy, exec.model_parallel_world_size())?;
+                let encoded = serde_json::to_vec(&binding).map_err(|error| {
+                    TrainerError::Contract(format!(
+                        "serialize ordinary checkpoint identity consensus: {error}"
+                    ))
+                })?;
+                Ok((binding, encoded))
+            },
         )?;
-        let encoded = serde_json::to_vec(&binding).map_err(|error| {
-            TrainerError::Contract(format!(
-                "serialize ordinary checkpoint identity consensus: {error}"
-            ))
-        })?;
         Self::require_comm_consensus_bytes(
             execution_comm,
             "ordinary checkpoint identity",
@@ -5862,27 +5880,27 @@ impl Trainer {
         E: PolicyExecution<P>,
     {
         let binding = self.coordinate_checkpoint_binding(policy, exec)?;
-        let vars = policy.trainable_vars();
-        let prepared = (|| {
-            let prepared = crate::checkpoint::prepare_checkpoint(checkpoint_dir, &vars, &binding)?;
-            if prepared.step() > self.config.steps {
-                return Err(TrainerError::Contract(format!(
-                    "checkpoint step {} exceeds configured training horizon {}",
-                    prepared.step(),
-                    self.config.steps
-                )));
-            }
-            policy.validate_sampler_state(prepared.sampler_state())?;
-            // Validate Adam against an isolated optimizer before any live policy
-            // mutation. The temporary moment writes do not alias trainable vars.
-            let mut preflight_opt = self.new_optimizer(vars.clone())?;
-            preflight_opt.load_state(prepared.optimizer_state())?;
-            Ok(prepared)
-        })();
-        let prepared = self.coordinate_resume_result::<P, E, _>(
-            exec,
+        let (vars, prepared) = Self::coordinate_comm_call(
+            exec.execution_comm(self.comm.as_ref()),
             "checkpoint identity/payload preflight",
-            prepared,
+            || {
+                let vars = policy.trainable_vars();
+                let prepared =
+                    crate::checkpoint::prepare_checkpoint(checkpoint_dir, &vars, &binding)?;
+                if prepared.step() > self.config.steps {
+                    return Err(TrainerError::Contract(format!(
+                        "checkpoint step {} exceeds configured training horizon {}",
+                        prepared.step(),
+                        self.config.steps
+                    )));
+                }
+                policy.validate_sampler_state(prepared.sampler_state())?;
+                // Validate Adam against an isolated optimizer before any live policy
+                // mutation. The temporary moment writes do not alias trainable vars.
+                let mut preflight_opt = self.new_optimizer(vars.clone())?;
+                preflight_opt.load_state(prepared.optimizer_state())?;
+                Ok((vars, prepared))
+            },
         )?;
         Self::require_comm_consensus_bytes(
             exec.execution_comm(self.comm.as_ref()),
@@ -6164,12 +6182,11 @@ impl Trainer {
             return (ResumeDecision::Fresh, None);
         }
         match crate::checkpoint::latest_checkpoint(&self.checkpoints_dir) {
-            Ok(found) => (
-                found.map_or(ResumeDecision::Fresh, |latest| {
-                    ResumeDecision::Resume(latest.step)
-                }),
-                None,
-            ),
+            Ok(Some(latest)) => match ResumeDecision::checked_resume(latest.step) {
+                Ok(decision) => (decision, None),
+                Err(error) => (ResumeDecision::ScanFailed, Some(error)),
+            },
+            Ok(None) => (ResumeDecision::Fresh, None),
             Err(e) => (ResumeDecision::ScanFailed, Some(e)),
         }
     }
@@ -9824,6 +9841,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cognitive_complexity)] // pins every scalar-wire outcome and exact boundary
     fn resume_decision_round_trips_and_keeps_outcomes_disjoint() {
         use ResumeDecision::{Fresh, Resume, ScanFailed};
         // The DP `resume_latest` broadcast encodes rank 0's three-way decision in one
@@ -9837,9 +9855,23 @@ mod tests {
             Resume(1),
             Resume(49),
             Resume(1_000_000),
+            Resume(MAX_EXACT_RESUME_STEP),
         ] {
             assert_eq!(ResumeDecision::decode(d.encode()), d, "round-trip {d:?}");
         }
+        assert_eq!(
+            ResumeDecision::checked_resume(MAX_EXACT_RESUME_STEP).unwrap(),
+            Resume(MAX_EXACT_RESUME_STEP),
+            "the exact scalar-wire boundary must remain resumable"
+        );
+        assert!(
+            matches!(
+                ResumeDecision::checked_resume(MAX_EXACT_RESUME_STEP + 1),
+                Err(crate::checkpoint::CheckpointError::Mismatch(message))
+                    if message.contains("exact scalar discovery range")
+            ),
+            "the first step whose resume sentinel is not exact must fail before f64 encoding"
+        );
         // Fresh is the additive identity peers contribute, and the three outcome kinds
         // must occupy three DISTINCT wire values (so the broadcast sum is unambiguous).
         assert_eq!(Fresh.encode(), 0.0);

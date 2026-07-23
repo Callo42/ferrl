@@ -26,6 +26,7 @@ use candle_nn::{Init, VarBuilder};
 use safetensors::tensor::{Metadata, TensorInfo};
 use serde::de::{Error as _, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
+use sha2::{Digest, Sha256};
 
 use crate::tensor_parallel::TensorParallelPlan;
 
@@ -65,7 +66,20 @@ struct ShardedSafetensorsBackend {
     plan: TensorParallelPlan,
 }
 
+/// Rank-invariant description of the exact, pre-opened checkpoint sources that
+/// back a streaming [`VarBuilder`].
+///
+/// `weight_map` contains only the model-family-selected tensors. `shards` is in
+/// filename order and hashes each complete retained shard through the same file
+/// handle the backend subsequently uses for rank-local reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BoundSafetensorsIdentity {
+    pub(crate) weight_map: Vec<(String, String)>,
+    pub(crate) shards: Vec<(String, u64, [u8; 32])>,
+}
+
 impl ShardedSafetensorsBackend {
+    #[cfg(test)]
     fn from_dir(dir: &Path, plan: TensorParallelPlan) -> CandleResult<Self> {
         ensure_supported_platform()?;
         let index_path = dir.join("model.safetensors.index.json");
@@ -211,6 +225,7 @@ impl SimpleBackend for ShardedSafetensorsBackend {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn varbuilder_from_rank_local_safetensors(
     dir: &Path,
     dtype: DType,
@@ -223,6 +238,147 @@ pub(crate) fn varbuilder_from_rank_local_safetensors(
         dtype,
         device.clone(),
     ))
+}
+
+/// Build a rank-local streaming backend and bind its identity to the same open
+/// handles retained for all later tensor reads.
+///
+/// The selector is applied before shards are opened. This keeps a text-only
+/// policy independent of vision-only shard assignments while ensuring every
+/// rank hashes the same logical source set regardless of its local TP slice.
+pub(crate) fn varbuilder_from_rank_local_safetensors_bound(
+    dir: &Path,
+    dtype: DType,
+    device: &Device,
+    plan: TensorParallelPlan,
+    selected: impl Fn(&str) -> bool,
+) -> CandleResult<(VarBuilder<'static>, BoundSafetensorsIdentity)> {
+    ensure_supported_platform()?;
+    let index_path = dir.join("model.safetensors.index.json");
+    let single_path = dir.join("model.safetensors");
+    let (layout, identity) = if index_path.is_file() {
+        let assignments = read_index(&index_path)?
+            .into_iter()
+            .filter(|(tensor, _)| selected(tensor))
+            .collect::<HashMap<_, _>>();
+        if assignments.is_empty() {
+            return Err(msg(format!(
+                "no selected tensors found in {}",
+                index_path.display()
+            )));
+        }
+        let mut weight_map = assignments
+            .iter()
+            .map(|(tensor, shard)| (tensor.clone(), shard.to_string_lossy().into_owned()))
+            .collect::<Vec<_>>();
+        weight_map.sort();
+        let shard_names = weight_map
+            .iter()
+            .map(|(_, shard)| shard.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut open_shards = HashMap::new();
+        let mut shards = Vec::with_capacity(shard_names.len());
+        for name in shard_names {
+            let relative = PathBuf::from(&name);
+            let shard = open_shard(&dir.join(&relative))?;
+            let digest = hash_open_shard(&shard)?;
+            shards.push((name, shard.file_len, digest));
+            open_shards.insert(relative, shard);
+        }
+        (
+            CheckpointLayout::Indexed {
+                dir: dir.to_path_buf(),
+                assignments,
+                open_shards: Mutex::new(open_shards),
+            },
+            BoundSafetensorsIdentity { weight_map, shards },
+        )
+    } else if single_path.is_file() {
+        let shard = open_shard(&single_path)?;
+        let mut weight_map = shard
+            .metadata
+            .tensors()
+            .into_iter()
+            .filter(|(name, _)| selected(name))
+            .map(|(name, _)| (name, "model.safetensors".to_string()))
+            .collect::<Vec<_>>();
+        weight_map.sort();
+        if weight_map.is_empty() {
+            return Err(msg(format!(
+                "no selected tensors found in {}",
+                single_path.display()
+            )));
+        }
+        let tensors = weight_map
+            .iter()
+            .map(|(name, _)| {
+                let info = shard.metadata.info(name).cloned().ok_or_else(|| {
+                    msg(format!(
+                        "selected tensor {name:?} disappeared from metadata"
+                    ))
+                })?;
+                Ok((
+                    name.clone(),
+                    TensorSource {
+                        shard: Arc::clone(&shard),
+                        info,
+                    },
+                ))
+            })
+            .collect::<CandleResult<HashMap<_, _>>>()?;
+        let digest = hash_open_shard(&shard)?;
+        (
+            CheckpointLayout::Single { tensors },
+            BoundSafetensorsIdentity {
+                weight_map,
+                shards: vec![("model.safetensors".to_string(), shard.file_len, digest)],
+            },
+        )
+    } else {
+        return Err(msg(format!(
+            "neither model.safetensors.index.json nor model.safetensors found in {}",
+            dir.display()
+        )));
+    };
+    let backend = ShardedSafetensorsBackend { layout, plan };
+    Ok((
+        VarBuilder::from_backend(Box::new(backend), dtype, device.clone()),
+        identity,
+    ))
+}
+
+fn hash_open_shard(shard: &OpenShard) -> CandleResult<[u8; 32]> {
+    let mut file = shard.file.lock().map_err(|_| {
+        msg(format!(
+            "safetensors shard {} is poisoned",
+            shard.path.display()
+        ))
+    })?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| msg(format!("seek {}: {error}", shard.path.display())))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut read_total = 0_u64;
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| msg(format!("read {}: {error}", shard.path.display())))?;
+        if read == 0 {
+            break;
+        }
+        read_total = read_total
+            .checked_add(read as u64)
+            .ok_or_else(|| msg("safetensors shard hash length overflows u64".into()))?;
+        hasher.update(&buffer[..read]);
+    }
+    if read_total != shard.file_len {
+        return Err(msg(format!(
+            "safetensors shard {} changed length while being hashed: expected {}, read {read_total}",
+            shard.path.display(),
+            shard.file_len
+        )));
+    }
+    Ok(hasher.finalize().into())
 }
 
 fn read_index(index_path: &Path) -> CandleResult<HashMap<String, PathBuf>> {
@@ -951,6 +1107,42 @@ mod tests {
         assert_eq!(
             got.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
             original.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
+    }
+
+    #[test]
+    fn bound_backend_identity_and_reads_survive_replacement_between_hash_and_load() {
+        let dir = TestDir::new("bound-replacement");
+        let path = dir.0.join("model.safetensors");
+        let original = matrix(2, 3);
+        safetensors::save(&HashMap::from([("weight", original.clone())]), &path).unwrap();
+        let (vb, original_identity) = varbuilder_from_rank_local_safetensors_bound(
+            &dir.0,
+            DType::F32,
+            &Device::Cpu,
+            TensorParallelPlan::new(0, 2).unwrap(),
+            |_| true,
+        )
+        .unwrap();
+
+        std::fs::rename(&path, dir.0.join("original.safetensors")).unwrap();
+        let replacement = Tensor::zeros((2, 3), DType::F32, &Device::Cpu).unwrap();
+        safetensors::save(&HashMap::from([("weight", replacement)]), &path).unwrap();
+        let (_replacement_vb, replacement_identity) = varbuilder_from_rank_local_safetensors_bound(
+            &dir.0,
+            DType::F32,
+            &Device::Cpu,
+            TensorParallelPlan::new(0, 2).unwrap(),
+            |_| true,
+        )
+        .unwrap();
+        assert_ne!(original_identity, replacement_identity);
+
+        let got = vb.get((2, 3), "weight").unwrap();
+        assert_eq!(
+            got.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            original.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            "the bound backend must load through the exact handle it hashed"
         );
     }
 }

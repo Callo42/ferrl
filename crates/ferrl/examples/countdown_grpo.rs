@@ -53,15 +53,13 @@ use std::str::FromStr;
 
 use anyhow::{anyhow, Context, Result};
 use candle_core::{DType, Device};
-use candle_nn::VarBuilder;
-use candle_transformers::models::qwen3::Config;
 use ferrl::countdown::{
     build_prompt, generate_dataset, CountdownConfig, CountdownProblem, CountdownReward,
 };
 use ferrl::policy::GenConfig;
 use ferrl::{
-    checkpoint_policy_sha256, evaluate, HfTokenizer, LoaderOpts, Metrics, QwenGradModel,
-    QwenPolicy, RunDir, Sample, Trainer, TrainerConfig,
+    evaluate, load_qwen_policy_bound, HfTokenizer, LoaderOpts, Metrics, QwenPolicy, RunDir, Sample,
+    Trainer, TrainerConfig,
 };
 use tracing::{info, warn};
 
@@ -71,12 +69,6 @@ fn env_parse<T: FromStr>(key: &str, default: T) -> T {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
-}
-
-/// Load the Qwen3 config from `dir/config.json`.
-fn load_config(dir: &Path) -> Result<Config> {
-    let bytes = std::fs::read(dir.join("config.json")).context("read config.json")?;
-    serde_json::from_slice(&bytes).context("parse config.json into qwen3::Config")
 }
 
 /// Resolve the EOS token id for the run.
@@ -126,27 +118,12 @@ fn reward_trend(history: &[Metrics]) -> (f32, f32) {
 
 /// Build the policy over the real `Qwen3-0.6B-Base` checkpoint on CUDA (bf16 base
 /// / F32 `LoRA` adapter).
-fn build_policy(dir: &Path, device: &Device) -> Result<(QwenPolicy, HfTokenizer)> {
-    let cfg = load_config(dir)?;
-    let buf = std::fs::read(dir.join("model.safetensors")).context("read model.safetensors")?;
-    // bf16-base / F32-adapter split: load the frozen base in BF16 (halving the base
-    // weights AND the retained activations that dominate the GRPO grad forward, so a
-    // useful group size fits a 40GB GPU) while the trainable adapter stays F32.
-    let vb = VarBuilder::from_buffered_safetensors(buf, DType::BF16, device)
-        .context("load model.safetensors onto the GPU")?;
-    let rank = env_parse("FERRL_CD_RANK", 16usize);
-    let alpha = env_parse("FERRL_CD_ALPHA", 32.0f64);
-    // Deliberately the LEGACY q/v-only LoRA recipe (`load_with_adapter_dtype`
-    // delegates to `DenseLoraTargets::legacy()`): the P4 gate margins below were
-    // calibrated against it. Switching to `load_with_targets(industrial)` is a
-    // re-calibration, not a drop-in swap.
-    let model = QwenGradModel::load_with_adapter_dtype(&cfg, &vb, rank, alpha, DType::F32)
-        .context("build QwenGradModel")?;
-    let seed = env_parse("FERRL_CD_SEED", 1234u64);
-    let temperature = env_parse("FERRL_CD_TEMP", 1.0f64);
-    let policy = QwenPolicy::new(model, seed, temperature);
-    let tok = HfTokenizer::from_file(dir.join("tokenizer.json")).context("load tokenizer")?;
-    Ok((policy, tok))
+fn build_policy(
+    dir: &Path,
+    device: &Device,
+    opts: &LoaderOpts,
+) -> Result<(QwenPolicy, HfTokenizer, String)> {
+    load_qwen_policy_bound(dir, device, opts).context("load bound Qwen3 policy")
 }
 
 /// The Countdown train / held-out splits, as ready-to-use samples (each prompt
@@ -247,19 +224,16 @@ fn main() -> Result<()> {
         .map_err(|_| anyhow!("set FERRL_QWEN_WEIGHTS to the Qwen3-0.6B-Base asset directory"))?;
     let dir = PathBuf::from(weights);
     let device = open_cuda_device()?;
-    let checkpoint_policy_sha256 = checkpoint_policy_sha256(
-        &dir,
-        &LoaderOpts {
-            lora_rank: env_parse("FERRL_CD_RANK", 16usize),
-            lora_alpha: env_parse("FERRL_CD_ALPHA", 32.0f64),
-            base_dtype: DType::BF16,
-            adapter_dtype: DType::F32,
-            seed: env_parse("FERRL_CD_SEED", 1234u64),
-            temperature: env_parse("FERRL_CD_TEMP", 1.0f64),
-            ..LoaderOpts::default()
-        },
-    )?;
-    let (mut policy, tok) = build_policy(&dir, &device)?;
+    let loader_opts = LoaderOpts {
+        lora_rank: env_parse("FERRL_CD_RANK", 16usize),
+        lora_alpha: env_parse("FERRL_CD_ALPHA", 32.0f64),
+        base_dtype: DType::BF16,
+        adapter_dtype: DType::F32,
+        seed: env_parse("FERRL_CD_SEED", 1234u64),
+        temperature: env_parse("FERRL_CD_TEMP", 1.0f64),
+        ..LoaderOpts::default()
+    };
+    let (mut policy, tok, checkpoint_policy_sha256) = build_policy(&dir, &device, &loader_opts)?;
     let (train_samples, eval_samples) = build_splits();
     let reward = CountdownReward::default();
     // Read the model's EOS from config.json (env-overridable); flows into both the

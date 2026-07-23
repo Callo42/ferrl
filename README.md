@@ -480,18 +480,32 @@ Trainer checkpoints use ordinary format v4. Each package binds the exact frozen
 checkpoint content and execution recipe, canonical learner-update semantics plus
 DP/TP topology, the exact adapter/full-FT recipe and ordered trainable schema, and
 the serialized adapter, Adam (including its bias-correction counter), and sampler
-payloads. Resume reads each payload once, verifies its digest and exact tensor-key /
-shape / dtype contract, preflights the sampler and an isolated Adam instance, and
-coordinates distributed success plus exact prepared-manifest consensus before
+payloads. A domain-separated state-envelope root binds those identities and payload
+digests to one completed step and one optimizer/schema relationship, so a valid leaf
+cannot be transplanted or relabelled independently. Raw manifest decoding rejects
+duplicate security fields before any generic JSON projection. Resume reads each
+payload once, verifies its digest and exact tensor-key / shape / dtype contract,
+preflights policy callbacks, the sampler, and an isolated Adam instance inside a
+coordinated panic boundary, and requires exact prepared-manifest consensus before
 applying state to the live policy.
 
-`ferrl train` derives the immutable policy digest from `config.json`, the single
-weight file or canonical referenced shard set, and execution-affecting loader options;
-filesystem paths and sampler position are not identities. Rust callers that enable
-checkpoint cadence, preemption checkpointing, or resume must install an equivalently
-verified digest with `Trainer::with_checkpoint_policy_sha256`. Low-level
+`ferrl train` derives the immutable policy digest from the exact captured bytes or
+retained file handles used to construct the loaded policy—not from a separate
+hash-then-reopen pass. It covers `config.json`, the model-family-selected canonical
+weight map and shards (Gemma binds its text-policy selection, not unrelated vision-only
+shards), activation checkpointing/rematerialization, and the other execution-affecting
+loader options; filesystem paths, TP rank, and sampler position are not identities.
+The standalone `checkpoint_policy_sha256` helper is for offline inspection only;
+production callers use a `*_bound` loader. Rust callers that enable checkpoint cadence,
+preemption checkpointing, or resume must install the returned digest with
+`Trainer::with_checkpoint_policy_sha256`. Low-level
 `save_checkpoint` / `load_checkpoint` callers pass a `CheckpointBinding` containing
 that digest, the trainer-semantic digest, and exact recipe.
+
+Latest-checkpoint discovery treats a newer malformed canonical `step-N` final name as
+ambiguous corruption and fails the distributed resume in lockstep instead of replaying
+an older package. Completed steps above the exact `f64` discovery-wire range (`2^53-1`)
+are rejected before scalar encoding.
 
 Legacy format v1 remains explicitly available through `load_adapter` for adapter-only
 evaluation or deliberate migration. Structurally complete v2/v3 manifests are parsed
