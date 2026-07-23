@@ -1803,7 +1803,13 @@ where
     );
 
     let model_setup = (|| {
-        let (mut policy, tok) = load_policy(&cfg.model_dir, device, &cfg.loader_opts())?;
+        let loader_opts = cfg.loader_opts();
+        let checkpoint_policy_sha256 = cfg
+            .trainer
+            .checkpoint_every
+            .map(|_| ferrl::checkpoint_policy_sha256(&cfg.model_dir, &loader_opts))
+            .transpose()?;
+        let (mut policy, tok) = load_policy(&cfg.model_dir, device, &loader_opts)?;
         let tcfg = cfg.resolved_trainer_config(&tok)?;
         policy.configure_activation_checkpointing(cfg.policy.activation_checkpointing);
         if cfg.tensor_parallel.enabled && !policy.supports_cli_tensor_parallel() {
@@ -1821,9 +1827,9 @@ where
                  policy does not provide cross-rank backward semantics",
             ));
         }
-        Ok((policy, tok, tcfg))
+        Ok((policy, tok, tcfg, checkpoint_policy_sha256))
     })();
-    let (mut policy, tok, tcfg) =
+    let (mut policy, tok, tcfg, checkpoint_policy_sha256) =
         coordinate_distributed_result(launch_comm, "model and EOS setup", model_setup)?;
     validate_resolved_eos_consensus(tcfg.eos_token_id, launch_comm)?;
     let gen = GenConfig::from(&tcfg);
@@ -1837,7 +1843,12 @@ where
                 &format!("{}\n", sha256_hex(prompt_bytes)),
             )?;
         }
-        let trainer = open_trainer(tcfg, &run, distributed_comm)?;
+        let trainer = open_trainer(
+            tcfg,
+            &run,
+            distributed_comm,
+            checkpoint_policy_sha256.as_deref(),
+        )?;
         Ok((run, trainer))
     })();
     let (run, mut trainer) = coordinate_distributed_result(
@@ -1925,12 +1936,18 @@ fn open_trainer(
     config: TrainerConfig,
     run: &RunDir,
     distributed_comm: Option<SharedComm>,
+    checkpoint_policy_sha256: Option<&str>,
 ) -> Result<Trainer, CliError> {
-    if let Some(comm) = distributed_comm {
-        Ok(Trainer::with_comm(config, run, comm)?)
+    let trainer = if let Some(comm) = distributed_comm {
+        Trainer::with_comm(config, run, comm)?
     } else {
-        Ok(Trainer::new(config, run)?)
-    }
+        Trainer::new(config, run)?
+    };
+    Ok(if let Some(digest) = checkpoint_policy_sha256 {
+        trainer.with_checkpoint_policy_sha256(digest)
+    } else {
+        trainer
+    })
 }
 
 #[derive(Clone)]
@@ -5016,7 +5033,12 @@ mod tests {
                                 (|| {
                                     let run =
                                         RunDir::create(&root, format!("dp-setup-rank-{rank}"))?;
-                                    open_trainer(TrainerConfig::default(), &run, Some(trainer_comm))
+                                    open_trainer(
+                                        TrainerConfig::default(),
+                                        &run,
+                                        Some(trainer_comm),
+                                        None,
+                                    )
                                 })()
                             };
                             coordinate_distributed_result(

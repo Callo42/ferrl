@@ -32,6 +32,10 @@ fn moe_fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny_qwen35_moe")
 }
 
+fn checkpoint_policy_sha256() -> String {
+    format!("{:064x}", 0xf011_u64)
+}
+
 /// A char-level codec over the fixture's 64-token vocabulary.
 struct ByteCodec;
 impl TokenizerLike for ByteCodec {
@@ -144,7 +148,9 @@ fn full_ft_training_moves_the_base_weights_and_resume_guards_the_recipe() {
 
     let tmp = TempDir::new("train");
     let run = RunDir::create(&tmp.0, "full-ft").unwrap();
-    let mut trainer = Trainer::new(train_cfg(), &run).unwrap();
+    let mut trainer = Trainer::new(train_cfg(), &run)
+        .unwrap()
+        .with_checkpoint_policy_sha256(checkpoint_policy_sha256());
     let samples = vec![Sample::new("abc", ()), Sample::new("bcd", ())];
     let (history, _stop) = trainer
         .train(&mut policy, &SpreadReward, &ByteCodec, &samples)
@@ -175,7 +181,9 @@ fn full_ft_training_moves_the_base_weights_and_resume_guards_the_recipe() {
 fn resume_continues(tmp: &TempDir, step1: &std::path::Path, samples: &[Sample<()>]) {
     let mut policy = full_ft_policy(7);
     let run = RunDir::create(&tmp.0, "full-ft-resume").unwrap();
-    let mut trainer = Trainer::new(train_cfg(), &run).unwrap();
+    let mut trainer = Trainer::new(train_cfg(), &run)
+        .unwrap()
+        .with_checkpoint_policy_sha256(checkpoint_policy_sha256());
     let (resumed, _stop) = trainer
         .resume(step1, &mut policy, &SpreadReward, &ByteCodec, samples)
         .unwrap();
@@ -191,7 +199,9 @@ fn resume_continues(tmp: &TempDir, step1: &std::path::Path, samples: &[Sample<()
 fn lora_resume_is_rejected(tmp: &TempDir, step1: &std::path::Path, samples: &[Sample<()>]) {
     let mut wrong = lora_policy(7);
     let run = RunDir::create(&tmp.0, "full-ft-mismatch").unwrap();
-    let mut trainer = Trainer::new(train_cfg(), &run).unwrap();
+    let mut trainer = Trainer::new(train_cfg(), &run)
+        .unwrap()
+        .with_checkpoint_policy_sha256(checkpoint_policy_sha256());
     let err = trainer
         .resume(step1, &mut wrong, &SpreadReward, &ByteCodec, samples)
         .unwrap_err();
@@ -219,7 +229,9 @@ fn full_ft_with_kl_beta_is_a_loud_contract_error() {
         beta: 0.02,
         ..train_cfg()
     };
-    let mut trainer = Trainer::new(cfg, &run).unwrap();
+    let mut trainer = Trainer::new(cfg, &run)
+        .unwrap()
+        .with_checkpoint_policy_sha256(checkpoint_policy_sha256());
     let err = trainer
         .train(
             &mut policy,
@@ -253,7 +265,9 @@ fn full_ft_gspo_moe_training_runs_and_resumes() {
 
     let tmp = TempDir::new("gspo-moe");
     let run = RunDir::create(&tmp.0, "full-ft-gspo-moe").unwrap();
-    let mut trainer = Trainer::new(cfg.clone(), &run).unwrap();
+    let mut trainer = Trainer::new(cfg.clone(), &run)
+        .unwrap()
+        .with_checkpoint_policy_sha256(checkpoint_policy_sha256());
     let (history, _stop) = trainer
         .train(&mut policy, &SpreadReward, &ByteCodec, &samples)
         .unwrap();
@@ -268,7 +282,9 @@ fn full_ft_gspo_moe_training_runs_and_resumes() {
     assert!(step1.is_dir(), "expected the step-1 checkpoint");
     let mut resumed_policy = full_ft_policy_from(&dir, 7);
     let run2 = RunDir::create(&tmp.0, "full-ft-gspo-moe-resume").unwrap();
-    let mut trainer2 = Trainer::new(cfg, &run2).unwrap();
+    let mut trainer2 = Trainer::new(cfg, &run2)
+        .unwrap()
+        .with_checkpoint_policy_sha256(checkpoint_policy_sha256());
     let (resumed, _stop) = trainer2
         .resume(
             &step1,

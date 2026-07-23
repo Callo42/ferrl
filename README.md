@@ -474,6 +474,31 @@ of completion order.
 
 ---
 
+## Ordinary checkpoint identity and integrity
+
+Trainer checkpoints use ordinary format v4. Each package binds the exact frozen
+checkpoint content and execution recipe, canonical learner-update semantics plus
+DP/TP topology, the exact adapter/full-FT recipe and ordered trainable schema, and
+the serialized adapter, Adam (including its bias-correction counter), and sampler
+payloads. Resume reads each payload once, verifies its digest and exact tensor-key /
+shape / dtype contract, preflights the sampler and an isolated Adam instance, and
+coordinates distributed success plus exact prepared-manifest consensus before
+applying state to the live policy.
+
+`ferrl train` derives the immutable policy digest from `config.json`, the single
+weight file or canonical referenced shard set, and execution-affecting loader options;
+filesystem paths and sampler position are not identities. Rust callers that enable
+checkpoint cadence, preemption checkpointing, or resume must install an equivalently
+verified digest with `Trainer::with_checkpoint_policy_sha256`. Low-level
+`save_checkpoint` / `load_checkpoint` callers pass a `CheckpointBinding` containing
+that digest, the trainer-semantic digest, and exact recipe.
+
+Legacy format v1 remains explicitly available through `load_adapter` for adapter-only
+evaluation or deliberate migration. Structurally complete v2/v3 manifests are parsed
+strictly, but normal `Trainer::resume` rejects them because they do not bind immutable
+policy/config identity or exact payload integrity. Separated continuations retain
+their independently identity-bound v3 envelope described below.
+
 ## Separated rollout/learner ledger
 
 `ferrl::rollout_ledger` defines the first Phase 1.5C boundary between rollout
@@ -610,7 +635,7 @@ runs/<run_id>/
 │                     #   rollout_capture_tokens, dropped_rows, grad_norm, lr, beta,
 │                     #   step_secs, tokens_per_sec, cuda_mem_* when enabled,
 │                     #   cuda_mem_probe_events and decoder_cache_snapshots when present
-├── checkpoints/      # LoRA checkpoints
+├── checkpoints/      # identity-bound adapter or full-FT trainer checkpoints
 └── run.log           # human-readable log
 ```
 

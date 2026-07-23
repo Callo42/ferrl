@@ -1269,6 +1269,9 @@ pub struct Trainer {
     /// the loop writes a final checkpoint and stops at the next step boundary. Safe
     /// to install unevenly across DP ranks — the per-step poll is install-invariant.
     preempt: Option<Arc<AtomicBool>>,
+    /// Verified immutable frozen-policy/execution digest used to bind ordinary
+    /// v4 checkpoints. Required before any cadence/preemption write or resume.
+    checkpoint_policy_sha256: Option<String>,
     /// Optional top-candidate ledger for discovery runs.
     candidate_writer: Option<CandidateWriter>,
     #[cfg(test)]
@@ -1962,6 +1965,7 @@ impl Trainer {
             checkpoints_dir: run.checkpoints_dir(),
             comm: Arc::new(comm),
             preempt: None,
+            checkpoint_policy_sha256: None,
             candidate_writer,
             #[cfg(test)]
             rollout_ledger_payload_forgery: None,
@@ -2005,6 +2009,19 @@ impl Trainer {
         self
     }
 
+    /// Install the verified frozen-policy and execution-recipe SHA-256 used by
+    /// ordinary checkpoint v4.
+    ///
+    /// The digest must bind immutable model content and every loader option that
+    /// changes policy semantics (including `LoRA` scale, dtypes/quantization, and TP
+    /// recipe). It is validated before training or resume; malformed or absent
+    /// identity fails before rollout, scoring, telemetry, or checkpoint mutation.
+    #[must_use]
+    pub fn with_checkpoint_policy_sha256(mut self, digest: impl Into<String>) -> Self {
+        self.checkpoint_policy_sha256 = Some(digest.into());
+        self
+    }
+
     /// Redirect checkpoint reads **and** writes to `dir` instead of this run's
     /// own `checkpoints/` subdirectory.
     ///
@@ -2026,6 +2043,61 @@ impl Trainer {
     pub fn with_checkpoints_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.checkpoints_dir = dir.into();
         self
+    }
+
+    /// Derive the exact ordinary-checkpoint binding for `policy` under the live
+    /// data-parallel world and the supplied tensor-parallel world.
+    ///
+    /// This is public so callers that use the low-level [`crate::load_checkpoint`]
+    /// API can validate against the same canonical identity the trainer writes.
+    /// Ordinary train/resume paths call it internally.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrainerError::Contract`] if no verified policy digest was
+    /// installed, the digest is malformed, topology cannot be represented, or the
+    /// semantic projection cannot be serialized.
+    pub fn checkpoint_binding<P: Policy>(
+        &self,
+        policy: &P,
+        tensor_parallel_world_size: usize,
+    ) -> Result<crate::checkpoint::CheckpointBinding, TrainerError> {
+        let policy_sha256 = self.checkpoint_policy_sha256.as_deref().ok_or_else(|| {
+            TrainerError::Contract(
+                "ordinary checkpointing requires a verified frozen-policy SHA-256; install it with Trainer::with_checkpoint_policy_sha256 before training or resume"
+                    .into(),
+            )
+        })?;
+        validate_external_policy_sha256(policy_sha256)?;
+        let dp_world_size = u64::try_from(self.comm.world_size()).map_err(|_| {
+            TrainerError::Contract(
+                "data-parallel world size does not fit ordinary checkpoint identity u64".into(),
+            )
+        })?;
+        let tp_world_size = u64::try_from(tensor_parallel_world_size).map_err(|_| {
+            TrainerError::Contract(
+                "tensor-parallel world size does not fit ordinary checkpoint identity u64".into(),
+            )
+        })?;
+        let semantics = serde_json::to_vec(&(
+            self.config.rollout_ledger_semantics(),
+            dp_world_size,
+            tp_world_size,
+            crate::checkpoint::ROLLOUT_LEDGER_CONTINUATION_LAYOUT,
+        ))
+        .map_err(|error| {
+            TrainerError::Contract(format!(
+                "serialize learner-semantic ordinary checkpoint config: {error}"
+            ))
+        })?;
+        let trainer_config_sha256 =
+            domain_sha256("ferrl.ordinary-checkpoint.trainer-config.v1", &[&semantics]);
+        crate::checkpoint::CheckpointBinding::new(
+            policy_sha256,
+            trainer_config_sha256,
+            policy.lora_recipe(),
+        )
+        .map_err(TrainerError::Checkpoint)
     }
 
     /// Collect and atomically publish one global rollout window without scoring
@@ -3569,7 +3641,8 @@ impl Trainer {
                         .into(),
                 ));
             }
-            let loaded = crate::checkpoint::load_checkpoint(checkpoint_dir, &vars)?;
+            let loaded =
+                crate::checkpoint::load_rollout_ledger_checkpoint(checkpoint_dir, &vars)?;
             if loaded.step == 0 || loaded.step > self.config.steps {
                 return Err(TrainerError::Contract(format!(
                     "rollout-ledger continuation step {} is outside 1..={}",
@@ -3952,6 +4025,65 @@ impl Trainer {
         local: Result<T, TrainerError>,
     ) -> Result<T, TrainerError> {
         Self::coordinate_comm_result(self.comm.as_ref(), label, local)
+    }
+
+    fn coordinate_checkpoint_binding<P, E>(
+        &self,
+        policy: &P,
+        exec: &E,
+    ) -> Result<crate::checkpoint::CheckpointBinding, TrainerError>
+    where
+        P: Policy,
+        E: PolicyExecution<P>,
+    {
+        let execution_comm = exec.execution_comm(self.comm.as_ref());
+        let binding = Self::coordinate_comm_result(
+            execution_comm,
+            "ordinary checkpoint identity derivation",
+            self.checkpoint_binding(policy, exec.model_parallel_world_size()),
+        )?;
+        let encoded = serde_json::to_vec(&binding).map_err(|error| {
+            TrainerError::Contract(format!(
+                "serialize ordinary checkpoint identity consensus: {error}"
+            ))
+        })?;
+        Self::require_comm_consensus_bytes(
+            execution_comm,
+            "ordinary checkpoint identity",
+            &encoded,
+        )?;
+        Ok(binding)
+    }
+
+    fn preflight_checkpoint_publication<P, E>(
+        &self,
+        policy: &P,
+        exec: &E,
+    ) -> Result<(), TrainerError>
+    where
+        P: Policy,
+        E: PolicyExecution<P>,
+    {
+        let requires_local = self.config.checkpoint_every.is_some() || self.preempt.is_some();
+        let requires_global = if exec.execution_world_size(self.comm.as_ref()) > 1 {
+            // A preemption flag may deliberately be installed on only one rank.
+            // Every rank must nevertheless enter the same identity preflight
+            // before rollout; otherwise the flagged rank would wait in the
+            // checkpoint-binding collective while its peer enters generation.
+            exec.execution_all_reduce_scalar_sum(
+                self.comm.as_ref(),
+                if requires_local { 1.0 } else { 0.0 },
+            )? > 0.0
+        } else {
+            requires_local
+        };
+        if requires_global {
+            // A run that can publish an ordinary checkpoint must prove the
+            // immutable policy/config binding before the first rollout hook can
+            // advance sampler or policy state.
+            self.coordinate_checkpoint_binding(policy, exec)?;
+        }
+        Ok(())
     }
 
     fn is_terminal_distributed_error(error: &TrainerError) -> bool {
@@ -5580,7 +5712,7 @@ impl Trainer {
     /// have loaded only the adapter (e.g. via [`crate::checkpoint::load_adapter`]). The
     /// reloaded *adapter weights* are exact; the post-resume trajectory is a faithful
     /// continuation, not a bit-exact replay. For a **bit-exact** resume that also
-    /// restores the optimizer moments and the sampler RNG from a momentum-faithful (v2)
+    /// restores the optimizer moments and the sampler RNG from an identity-bound v4
     /// checkpoint, use [`resume`](Self::resume) instead.
     ///
     /// # Errors
@@ -5636,10 +5768,10 @@ impl Trainer {
     /// Loads the checkpoint's adapter into `policy`, restores the optimizer moments and
     /// the rollout-sampler RNG, and continues from the recorded step — so on the same
     /// machine the post-resume trajectory is **bit-identical** to an uninterrupted run
-    /// (pinned by the toy gate `interrupted_run_resumes_bit_identically`). For a v1
-    /// (adapter-only) checkpoint there is no optimizer/sampler state to restore, so this
-    /// falls back to a fresh [`FerrlAdamW`] and the policy's current sampler (a faithful
-    /// continuation, not a bit-exact replay — exactly like [`train_from`](Self::train_from)).
+    /// (pinned by the toy gate `interrupted_run_resumes_bit_identically`). Normal
+    /// trainer resume accepts only integrity-bound ordinary format v4; use the explicit
+    /// [`crate::load_adapter`] + [`train_from`](Self::train_from) path when deliberately
+    /// migrating a legacy adapter-only checkpoint.
     ///
     /// Returns the per-step metrics **and a [`RunStop`]** (as [`train`](Self::train)).
     /// This is the **explicit-path** data-parallel resume — every rank calls it with
@@ -5650,21 +5782,19 @@ impl Trainer {
     /// coordinates rank 0's discovery across the world for you, given a shared
     /// checkpoint directory ([`with_checkpoints_dir`](Self::with_checkpoints_dir)).
     ///
-    /// `policy` must be the same architecture AND adapter recipe the checkpoint was
-    /// written from: the adapter load and the optimizer-moment load each validate
-    /// count/shape/dtype, the manifest's `lora_recipe` string is cross-checked against
-    /// [`Policy::lora_recipe`] **before** any model state is touched (count/shape/dtype
-    /// cannot distinguish shape-aliased recipes — e.g. `attn:qk` vs `attn:qv`, whose
-    /// k/v projections are shape-identical — so a recipe swap would otherwise restore
-    /// adapters onto the wrong projections silently), and a malformed sampler blob
-    /// fails loud too. A checkpoint or policy without a recorded recipe skips the
-    /// recipe check (pre-recipe checkpoints stay loadable).
+    /// The trainer must have a verified immutable policy digest installed through
+    /// [`with_checkpoint_policy_sha256`](Self::with_checkpoint_policy_sha256). Before
+    /// the first live mutation, every execution rank verifies that digest, canonical
+    /// learner semantics/topology, exact recipe presence/value, ordered tensor schema,
+    /// adapter/Adam/sampler payload hashes, exact tensor keys, shapes and dtypes, and
+    /// non-mutating sampler/temporary-Adam restoration. Distributed ranks coordinate
+    /// that full preflight and exact prepared-manifest consensus before applying state.
     ///
     /// # Errors
     ///
     /// Returns [`TrainerError`] if the checkpoint cannot be read or does not match
-    /// `policy` (count/shape/dtype or adapter recipe), or if a training step fails
-    /// (as [`train`](Self::train)).
+    /// `policy` or the configured learner semantics, if any payload fails integrity or
+    /// schema validation, or if a training step fails (as [`train`](Self::train)).
     ///
     /// # Panics
     ///
@@ -5678,8 +5808,8 @@ impl Trainer {
         samples: &[Sample<R::Target>],
     ) -> Result<(Vec<Metrics>, RunStop), TrainerError> {
         let exec = UnshardedPolicyExecution;
-        let loaded = self.load_resume_point(checkpoint_dir.as_ref(), policy);
-        let (start_step, opt_state) = self.coordinate_resume_load::<P, _>(&exec, loaded)?;
+        let (start_step, opt_state) =
+            self.load_resume_point(checkpoint_dir.as_ref(), policy, &exec)?;
         self.run(
             start_step, opt_state, policy, reward_fn, tokenizer, samples, &exec,
         )
@@ -5707,8 +5837,8 @@ impl Trainer {
         let exec = TensorParallelPolicyExecution {
             comm: tensor_parallel_comm,
         };
-        let loaded = self.load_resume_point(checkpoint_dir.as_ref(), policy);
-        let (start_step, opt_state) = self.coordinate_resume_load::<P, _>(&exec, loaded)?;
+        let (start_step, opt_state) =
+            self.load_resume_point(checkpoint_dir.as_ref(), policy, &exec)?;
         self.run(
             start_step, opt_state, policy, reward_fn, tokenizer, samples, &exec,
         )
@@ -5718,36 +5848,62 @@ impl Trainer {
     /// `(start_step, optimizer_state)` — the momentum-faithful prelude shared by
     /// [`resume`](Self::resume) and [`resume_latest`](Self::resume_latest).
     ///
-    /// Recipe pre-flight BEFORE the positional load mutates the live vars:
-    /// count/shape/dtype validation cannot distinguish shape-aliased recipes
-    /// (k/v and gate/up projections are shape-identical), so a mismatch here
-    /// would land trained adapters on the wrong projections silently. Then the
-    /// positional adapter + optimizer-moment load, then the rollout-sampler RNG
-    /// restore (a v1 checkpoint carries none → keep the policy's current sampler,
-    /// the documented fresh-momentum fallback).
-    fn load_resume_point<P: Policy>(
+    /// The format-v4 identity, exact payloads, tensor schemas/keys, sampler blob,
+    /// and temporary optimizer state are all prepared and coordinated before the
+    /// first live adapter or sampler mutation.
+    fn load_resume_point<P, E>(
         &self,
         checkpoint_dir: &Path,
         policy: &mut P,
-    ) -> Result<(u64, Option<OptimizerState>), TrainerError> {
-        let manifest = crate::checkpoint::read_manifest(checkpoint_dir)?;
-        if let (Some(saved), Some(current)) = (&manifest.lora_recipe, policy.lora_recipe()) {
-            if *saved != current {
-                return Err(TrainerError::Checkpoint(
-                    crate::checkpoint::CheckpointError::Mismatch(format!(
-                        "checkpoint adapter recipe {saved:?} does not match the policy's \
-                         {current:?} (the positional load cannot catch a shape-aliased \
-                         recipe swap — load with the recipe the checkpoint records)"
-                    )),
-                ));
-            }
-        }
+        exec: &E,
+    ) -> Result<(u64, Option<OptimizerState>), TrainerError>
+    where
+        P: Policy,
+        E: PolicyExecution<P>,
+    {
+        let binding = self.coordinate_checkpoint_binding(policy, exec)?;
         let vars = policy.trainable_vars();
-        let loaded = crate::checkpoint::load_checkpoint(checkpoint_dir, &vars)?;
-        if let Some(blob) = &loaded.sampler_state {
+        let prepared = (|| {
+            let prepared = crate::checkpoint::prepare_checkpoint(checkpoint_dir, &vars, &binding)?;
+            if prepared.step() > self.config.steps {
+                return Err(TrainerError::Contract(format!(
+                    "checkpoint step {} exceeds configured training horizon {}",
+                    prepared.step(),
+                    self.config.steps
+                )));
+            }
+            policy.validate_sampler_state(prepared.sampler_state())?;
+            // Validate Adam against an isolated optimizer before any live policy
+            // mutation. The temporary moment writes do not alias trainable vars.
+            let mut preflight_opt = self.new_optimizer(vars.clone())?;
+            preflight_opt.load_state(prepared.optimizer_state())?;
+            Ok(prepared)
+        })();
+        let prepared = self.coordinate_resume_result::<P, E, _>(
+            exec,
+            "checkpoint identity/payload preflight",
+            prepared,
+        )?;
+        Self::require_comm_consensus_bytes(
+            exec.execution_comm(self.comm.as_ref()),
+            "ordinary checkpoint prepared manifest",
+            prepared.manifest_consensus_sha256().as_bytes(),
+        )?;
+        let applied = (|| {
+            let loaded = prepared.apply(&vars)?;
+            let blob = loaded.sampler_state.as_deref().ok_or_else(|| {
+                TrainerError::Contract(
+                    "validated ordinary checkpoint lost its sampler state before apply".into(),
+                )
+            })?;
             policy.restore_sampler_state(blob)?;
-        }
-        Ok((loaded.step, loaded.optimizer_state))
+            Ok((loaded.step, loaded.optimizer_state))
+        })();
+        self.coordinate_resume_result::<P, E, _>(
+            exec,
+            "checkpoint validated-state application",
+            applied,
+        )
     }
 
     /// Resume the **newest complete checkpoint** under this run's `checkpoints/`
@@ -5867,8 +6023,7 @@ impl Trainer {
                     world_size = exec.execution_world_size(self.comm.as_ref()),
                     "resume_latest: continuing from the newest checkpoint"
                 );
-                let loaded = self.load_resume_point(&dir, policy);
-                let (start_step, opt_state) = self.coordinate_resume_load::<P, _>(exec, loaded)?;
+                let (start_step, opt_state) = self.load_resume_point(&dir, policy, exec)?;
                 self.run(
                     start_step, opt_state, policy, reward_fn, tokenizer, samples, exec,
                 )
@@ -6023,11 +6178,12 @@ impl Trainer {
     /// that the local checkpoint load/restore prelude succeeded before any rank
     /// enters the next training collective. Rank-local filesystem, tensor, or
     /// sampler-restore failures are therefore reduced into one lockstep abort.
-    fn coordinate_resume_load<P, E>(
+    fn coordinate_resume_result<P, E, T>(
         &self,
         exec: &E,
-        local: Result<(u64, Option<OptimizerState>), TrainerError>,
-    ) -> Result<(u64, Option<OptimizerState>), TrainerError>
+        label: &str,
+        local: Result<T, TrainerError>,
+    ) -> Result<T, TrainerError>
     where
         P: Policy,
         E: PolicyExecution<P>,
@@ -6047,9 +6203,9 @@ impl Trainer {
             exec.execution_all_reduce_scalar_sum(self.comm.as_ref(), failed_local)?;
         match local {
             Err(error) => Err(error),
-            Ok(_) if failed_global > 0.0 => Err(TrainerError::Contract(
-                "checkpoint load/restore failed on a peer rank; aborting in lockstep".into(),
-            )),
+            Ok(_) if failed_global > 0.0 => Err(TrainerError::Contract(format!(
+                "{label} failed on a peer rank; aborting in lockstep"
+            ))),
             Ok(loaded) => Ok(loaded),
         }
     }
@@ -6098,6 +6254,7 @@ impl Trainer {
                 &contract,
             )?;
         }
+        self.preflight_checkpoint_publication(policy, exec)?;
         assert!(!samples.is_empty(), "train: no samples");
         // Stamp every event this run emits — the per-step events below, plus anything
         // the policy/reward logs — with this rank's rank/world. Under DP all ranks share
@@ -6817,7 +6974,7 @@ impl Trainer {
         Ok(())
     }
 
-    /// After completing step `step` (0-based), write a momentum-faithful (v2)
+    /// After completing step `step` (0-based), write an identity-bound format-v4
     /// `checkpoints/step-<n>/` when the configured cadence divides the completed-step
     /// count `n = step + 1`, **or** `n` is the final step of the run. The final-step
     /// write guarantees a completed run always persists its final state even when
@@ -6849,7 +7006,7 @@ impl Trainer {
         self.write_checkpoint(completed, vars, opt, policy, exec)
     }
 
-    /// Write a momentum-faithful (v3) checkpoint to `checkpoints/step-<completed>/`
+    /// Write an identity-bound format-v4 checkpoint to `checkpoints/step-<completed>/`
     /// unconditionally — the caller decides *when*: the periodic cadence
     /// ([`maybe_checkpoint`](Self::maybe_checkpoint)) or the preemption stop in
     /// [`run`](Self::run), which saves a final checkpoint before a requeue.
@@ -6870,6 +7027,7 @@ impl Trainer {
         P: Policy,
         E: PolicyExecution<P>,
     {
+        let binding = self.coordinate_checkpoint_binding(policy, exec)?;
         self.coordinate_side_effect(exec, "checkpoint write", |trainer| {
             if !exec.is_execution_primary(trainer.comm.as_ref()) {
                 return Ok(());
@@ -6877,14 +7035,13 @@ impl Trainer {
             let dir = trainer.checkpoints_dir.join(format!("step-{completed}"));
             let opt_state = opt.state()?;
             let sampler_state = policy.sampler_state()?;
-            let recipe = policy.lora_recipe();
             crate::checkpoint::save_checkpoint(
                 &dir,
                 vars,
                 &opt_state,
                 &sampler_state,
                 completed,
-                recipe.as_deref(),
+                &binding,
             )?;
             Ok(())
         })
@@ -8964,6 +9121,10 @@ mod tests {
 
     const TOL: f32 = 1e-6;
 
+    fn checkpoint_policy_sha256() -> String {
+        format!("{:064x}", 0x7a11_u64)
+    }
+
     fn cpu() -> Device {
         Device::Cpu
     }
@@ -9062,6 +9223,74 @@ mod tests {
             serde_json::to_value(&built).unwrap(),
             serde_json::to_value(&literal).unwrap()
         );
+    }
+
+    fn ordinary_trainer_semantics_sha256(config: &TrainerConfig) -> String {
+        let encoded = serde_json::to_vec(&(
+            config.rollout_ledger_semantics(),
+            1_u64,
+            1_u64,
+            crate::checkpoint::ROLLOUT_LEDGER_CONTINUATION_LAYOUT,
+        ))
+        .unwrap();
+        domain_sha256("ferrl.ordinary-checkpoint.trainer-config.v1", &[&encoded])
+    }
+
+    #[test]
+    fn ordinary_checkpoint_semantics_digest_is_exhaustive_and_operationally_stable() {
+        let base = TrainerConfig::default();
+        let expected = ordinary_trainer_semantics_sha256(&base);
+        let semantic_mutations: &[fn(&mut TrainerConfig)] = &[
+            |c| c.group_size += 1,
+            |c| c.max_new_tokens += 1,
+            |c| c.temperature = 0.7,
+            |c| c.mu += 1,
+            |c| c.beta = 0.1,
+            |c| c.beta_schedule = Some(ScalarSchedule::constant(0.1)),
+            |c| c.clip_eps = 0.1,
+            |c| c.clip_eps_high = Some(0.25),
+            |c| c.importance_sampling_level = ImportanceSamplingLevel::Sequence,
+            |c| c.lr *= 2.0,
+            |c| c.lr_schedule = Some(ScalarSchedule::constant(1e-5)),
+            |c| c.weight_decay = 0.1,
+            |c| c.adam_beta1 = 0.8,
+            |c| c.adam_beta2 = 0.99,
+            |c| c.warmup_steps = 1,
+            |c| c.max_grad_norm = None,
+            |c| c.truncation_masking = !c.truncation_masking,
+            |c| c.tis = !c.tis,
+            |c| c.tis_imp_ratio_cap = 1.5,
+            |c| c.loss_type = LossType::Grpo,
+            |c| c.scale_rewards = ScaleRewards::None,
+            |c| c.reward_group_scope = RewardGroupScope::DistributedSamePrompt,
+            |c| c.grad_accum_steps += 1,
+            |c| c.backward_microbatch_size = 1,
+            |c| c.eos_token_id = Some(9),
+        ];
+        for (index, mutation) in semantic_mutations.iter().enumerate() {
+            let mut changed = base.clone();
+            mutation(&mut changed);
+            assert_ne!(
+                ordinary_trainer_semantics_sha256(&changed),
+                expected,
+                "semantic mutation {index} did not change the identity"
+            );
+        }
+
+        for mutation in [
+            (|c: &mut TrainerConfig| c.steps += 1) as fn(&mut TrainerConfig),
+            |c| c.checkpoint_every = Some(1),
+            |c| c.candidate_log_top_k = 2,
+            |c| c.gpu_memory_probe = true,
+        ] {
+            let mut operational = base.clone();
+            mutation(&mut operational);
+            assert_eq!(
+                ordinary_trainer_semantics_sha256(&operational),
+                expected,
+                "operational-only config changed learner identity"
+            );
+        }
     }
 
     fn gpu_memory_snapshot_for_test(used_bytes: u64) -> GpuMemorySnapshot {
@@ -9854,6 +10083,55 @@ mod tests {
         fn restore_sampler_state(&mut self, _s: &[u8]) -> CandleResult<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn checkpoint_enabled_run_requires_verified_policy_identity_before_rollout() {
+        let tmp = WireTmp::new("checkpoint-identity-required");
+        let run = RunDir::create(&tmp.0, "run").unwrap();
+        let mut trainer = Trainer::new(
+            TrainerConfig {
+                steps: 1,
+                group_size: 2,
+                max_new_tokens: 1,
+                checkpoint_every: Some(1),
+                ..TrainerConfig::default()
+            },
+            &run,
+        )
+        .unwrap();
+        let mut policy = StubPolicy {
+            logp: Var::zeros((2, 1), DType::F32, &cpu()).unwrap(),
+        };
+        let before = policy
+            .logp
+            .as_tensor()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let error = trainer
+            .train(
+                &mut policy,
+                &TpProbeReward,
+                &TpProbeCodec,
+                &[Sample::new("prompt", ())],
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("verified frozen-policy SHA-256"));
+        assert_eq!(
+            policy
+                .logp
+                .as_tensor()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            before
+        );
+        assert!(crate::telemetry::read_metrics(run.metrics_path())
+            .unwrap()
+            .is_empty());
     }
 
     /// A policy backed by a full `[G, T]` trainable log-prob table, selecting
@@ -15692,6 +15970,13 @@ mod tests {
             Ok(self.sampler_state.clone())
         }
 
+        fn validate_sampler_state(&self, state: &[u8]) -> CandleResult<()> {
+            if state.len() != 1 {
+                candle_core::bail!("invalid TP identity-control sampler state");
+            }
+            Ok(())
+        }
+
         fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
             if state.len() != 1 {
                 candle_core::bail!("invalid TP identity-control sampler state")
@@ -16232,6 +16517,16 @@ mod tests {
 
         fn sampler_state(&self) -> CandleResult<Vec<u8>> {
             Ok(self.sampler_state.clone())
+        }
+
+        fn validate_sampler_state(&self, state: &[u8]) -> CandleResult<()> {
+            if self.fail_restore {
+                candle_core::bail!("rank-local sampler restore failure");
+            }
+            if state.len() != 1 {
+                candle_core::bail!("invalid TP sync sampler state");
+            }
+            Ok(())
         }
 
         fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
@@ -17911,6 +18206,7 @@ mod tests {
                         };
                         let mut trainer = Trainer::new(cfg, &run)
                             .unwrap()
+                            .with_checkpoint_policy_sha256(checkpoint_policy_sha256())
                             .with_checkpoints_dir(shared_checkpoints);
                         let mut policy = TpSyncPolicy::new(rank);
                         let (history, stop) = trainer
@@ -17975,11 +18271,18 @@ mod tests {
             Var::zeros((2, 1), DType::F32, &cpu()).unwrap(),
             Var::zeros((2, 1), DType::F32, &cpu()).unwrap(),
         ];
-        let loaded = crate::checkpoint::load_checkpoint(
-            tmp.0.join("shared-checkpoints/step-1"),
-            &checkpoint_vars,
+        let checkpoint_dir = tmp.0.join("shared-checkpoints/step-1");
+        let manifest = crate::checkpoint::read_manifest(&checkpoint_dir).unwrap();
+        let identity = manifest.ordinary_checkpoint.as_ref().unwrap();
+        let binding = crate::checkpoint::CheckpointBinding::new(
+            identity.frozen_policy_sha256.clone(),
+            identity.trainer_config_sha256.clone(),
+            manifest.lora_recipe.clone(),
         )
         .unwrap();
+        let loaded =
+            crate::checkpoint::load_checkpoint(&checkpoint_dir, &checkpoint_vars, &binding)
+                .unwrap();
         assert_eq!(loaded.step, 1);
         assert_eq!(
             loaded.sampler_state.as_deref(),
@@ -18026,13 +18329,148 @@ mod tests {
 
     #[test]
     #[allow(clippy::cognitive_complexity)]
-    fn resume_latest_tensor_parallel_load_failure_aborts_world_before_training() {
+    fn tensor_parallel_resume_rejects_divergent_valid_packages_before_mutation() {
         struct PanicReward;
         impl RewardFn for PanicReward {
             type Target = ();
 
             fn reward(&self, _sample: &Sample<()>, _completion: &str) -> Result<f32, RewardError> {
-                panic!("resume load failure must abort before rollout reward")
+                panic!("divergent checkpoint packages must abort before rollout reward")
+            }
+        }
+
+        let tmp = WireTmp::new("tp-divergent-valid-checkpoints");
+        let cfg = TrainerConfig {
+            steps: 2,
+            group_size: 2,
+            max_new_tokens: 1,
+            lr: 0.01,
+            ..TrainerConfig::default()
+        };
+        let seed_run = RunDir::create(&tmp.0, "tp-divergent-seed").unwrap();
+        let seed_trainer = Trainer::new(cfg.clone(), &seed_run)
+            .unwrap()
+            .with_checkpoint_policy_sha256(checkpoint_policy_sha256());
+        let seed_a = TpSyncPolicy::new(0);
+        let vars_a = seed_a.trainable_vars();
+        let binding = seed_trainer.checkpoint_binding(&seed_a, 2).unwrap();
+        let checkpoint_a = tmp.0.join("checkpoint-a");
+        crate::checkpoint::save_checkpoint(
+            &checkpoint_a,
+            &vars_a,
+            &zero_optimizer_state(&vars_a),
+            &[7_u8],
+            1,
+            &binding,
+        )
+        .unwrap();
+
+        let seed_b = TpSyncPolicy::new(0);
+        seed_b
+            .replicated
+            .set(&Tensor::ones((2, 1), DType::F32, &cpu()).unwrap())
+            .unwrap();
+        let vars_b = seed_b.trainable_vars();
+        let checkpoint_b = tmp.0.join("checkpoint-b");
+        crate::checkpoint::save_checkpoint(
+            &checkpoint_b,
+            &vars_b,
+            &zero_optimizer_state(&vars_b),
+            &[8_u8],
+            1,
+            &binding,
+        )
+        .unwrap();
+
+        let mut results = Vec::new();
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = crate::comm::LocalComm::world_with_timeout(
+                2,
+                std::time::Duration::from_millis(5_000),
+            )
+            .into_iter()
+            .enumerate()
+            .map(|(rank, tp_comm)| {
+                let root = tmp.0.clone();
+                let checkpoint = if rank == 0 {
+                    checkpoint_a.clone()
+                } else {
+                    checkpoint_b.clone()
+                };
+                let cfg = cfg.clone();
+                scope.spawn(move || {
+                    let run = RunDir::create(&root, format!("tp-divergent-rank-{rank}")).unwrap();
+                    let metrics_sentinel = b"metrics-sentinel\n";
+                    let candidates_sentinel = b"candidates-sentinel\n";
+                    std::fs::write(run.metrics_path(), metrics_sentinel).unwrap();
+                    std::fs::write(run.candidates_path(), candidates_sentinel).unwrap();
+                    let mut trainer = Trainer::new(cfg, &run)
+                        .unwrap()
+                        .with_checkpoint_policy_sha256(checkpoint_policy_sha256());
+                    let mut policy = TpSyncPolicy::new(rank);
+                    let values_before = policy.snapshot();
+                    let ids_before = policy
+                        .trainable_vars()
+                        .iter()
+                        .map(|var| var.as_tensor().id())
+                        .collect::<Vec<_>>();
+                    let sampler_before = policy.sampler_state().unwrap();
+                    let mode_before = policy.adapter_enabled();
+                    let err = trainer
+                        .resume_tensor_parallel(
+                            &checkpoint,
+                            &mut policy,
+                            &PanicReward,
+                            &TpProbeCodec,
+                            &[Sample::new("prompt", ())],
+                            &tp_comm,
+                        )
+                        .unwrap_err();
+                    assert_eq!(policy.snapshot(), values_before);
+                    assert_eq!(
+                        policy
+                            .trainable_vars()
+                            .iter()
+                            .map(|var| var.as_tensor().id())
+                            .collect::<Vec<_>>(),
+                        ids_before
+                    );
+                    assert_eq!(policy.sampler_state().unwrap(), sampler_before);
+                    assert_eq!(policy.adapter_enabled(), mode_before);
+                    assert_eq!(std::fs::read(run.metrics_path()).unwrap(), metrics_sentinel);
+                    assert_eq!(
+                        std::fs::read(run.candidates_path()).unwrap(),
+                        candidates_sentinel
+                    );
+                    (rank, err)
+                })
+            })
+            .collect();
+            for handle in handles {
+                results.push(handle.join().unwrap());
+            }
+        });
+
+        results.sort_by_key(|(rank, _)| *rank);
+        for (rank, err) in results {
+            assert!(
+                matches!(err, TrainerError::Contract(ref message)
+                    if message.contains("ordinary checkpoint prepared manifest")
+                        && (message.contains("execution ranks") || message.contains("peer rank"))),
+                "rank {rank} should reject divergent valid checkpoint packages before apply, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn resume_latest_tensor_parallel_preflight_failure_aborts_world_before_training() {
+        struct PanicReward;
+        impl RewardFn for PanicReward {
+            type Target = ();
+
+            fn reward(&self, _sample: &Sample<()>, _completion: &str) -> Result<f32, RewardError> {
+                panic!("resume preflight failure must abort before rollout reward")
             }
         }
 
@@ -18040,13 +18478,25 @@ mod tests {
         let shared_checkpoints = tmp.0.join("shared-checkpoints");
         let seed_policy = TpSyncPolicy::new(0);
         let seed_vars = seed_policy.trainable_vars();
+        let resume_cfg = TrainerConfig {
+            steps: 2,
+            group_size: 2,
+            max_new_tokens: 1,
+            lr: 0.01,
+            ..TrainerConfig::default()
+        };
+        let seed_run = RunDir::create(&tmp.0, "tp-resume-load-seed").unwrap();
+        let seed_trainer = Trainer::new(resume_cfg.clone(), &seed_run)
+            .unwrap()
+            .with_checkpoint_policy_sha256(checkpoint_policy_sha256());
+        let seed_binding = seed_trainer.checkpoint_binding(&seed_policy, 2).unwrap();
         crate::checkpoint::save_checkpoint(
             shared_checkpoints.join("step-1"),
             &seed_vars,
             &zero_optimizer_state(&seed_vars),
             &[7_u8],
             1,
-            None,
+            &seed_binding,
         )
         .unwrap();
         let mut results = Vec::new();
@@ -18061,18 +18511,13 @@ mod tests {
             .map(|(rank, tp_comm)| {
                 let root = tmp.0.clone();
                 let shared_checkpoints = shared_checkpoints.clone();
+                let cfg = resume_cfg.clone();
                 scope.spawn(move || {
                     let run =
                         RunDir::create(&root, format!("tp-resume-load-fail-rank-{rank}")).unwrap();
-                    let cfg = TrainerConfig {
-                        steps: 2,
-                        group_size: 2,
-                        max_new_tokens: 1,
-                        lr: 0.01,
-                        ..TrainerConfig::default()
-                    };
                     let mut trainer = Trainer::new(cfg, &run)
                         .unwrap()
+                        .with_checkpoint_policy_sha256(checkpoint_policy_sha256())
                         .with_checkpoints_dir(shared_checkpoints);
                     let mut policy = if rank == 0 {
                         TpSyncPolicy::fail_sampler_restore_on_resume(rank)
@@ -18108,7 +18553,7 @@ mod tests {
             } else {
                 assert!(
                     matches!(err, TrainerError::Contract(msg)
-                        if msg.contains("checkpoint load/restore failed on a peer rank")),
+                        if msg.contains("checkpoint identity/payload preflight failed on a peer rank")),
                     "peer rank should abort in lockstep, got {err:?}"
                 );
             }
@@ -18305,6 +18750,7 @@ mod tests {
                     };
                     let mut trainer = Trainer::new(cfg, &run)
                         .unwrap()
+                        .with_checkpoint_policy_sha256(checkpoint_policy_sha256())
                         .with_checkpoints_dir(bad_checkpoints);
                     let mut policy = TpSyncPolicy::new(rank);
                     let err = trainer

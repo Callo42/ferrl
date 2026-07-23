@@ -84,8 +84,9 @@ use ferrl::countdown::{
 };
 use ferrl::policy::GenConfig;
 use ferrl::{
-    evaluate, EvalReport, EvalSampling, HfTokenizer, LoraTargets, Metrics, Qwen3_5Config,
-    Qwen3_5GradModel, Qwen3_5Policy, RunDir, RunStop, Sample, Trainer, TrainerConfig,
+    checkpoint_policy_sha256, evaluate, EvalReport, EvalSampling, HfTokenizer, LoaderOpts,
+    LoraTargets, Metrics, Qwen3_5Config, Qwen3_5GradModel, Qwen3_5Policy, RunDir, RunStop, Sample,
+    Trainer, TrainerConfig,
 };
 use tracing::{info, warn};
 
@@ -481,8 +482,10 @@ fn report_and_gate(history: &[Metrics], post: &EvalReport, gen: &GenConfig) -> R
 /// boundary (the library itself never touches signals). A stable
 /// `FERRL_CD35_RUN_ID` makes a requeued job **continue** the same run directory
 /// (resuming from its latest checkpoint via [`Trainer::resume_latest`]); unset gives
-/// a fresh, unique run per invocation. Returns the run dir plus the flag to hand the
-/// trainer.
+/// a fresh, unique run per invocation. The caller also derives an immutable digest
+/// from the exact checkpoint files and loader recipe; a requeue whose frozen model,
+/// `LoRA` scale/dtypes, or execution recipe drifted is rejected before restore. Returns
+/// the run dir plus the flag to hand the trainer.
 fn open_run_with_preemption(out: &str) -> Result<(RunDir, Arc<AtomicBool>)> {
     let preempt = Arc::new(AtomicBool::new(false));
     for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGUSR1] {
@@ -516,6 +519,18 @@ fn main() -> Result<()> {
     })?;
     let dir = PathBuf::from(weights);
     let knobs = read_knobs()?;
+    let checkpoint_policy_sha256 = checkpoint_policy_sha256(
+        &dir,
+        &LoaderOpts {
+            lora_rank: knobs.rank,
+            lora_alpha: knobs.alpha,
+            base_dtype: DType::BF16,
+            adapter_dtype: DType::F32,
+            seed: knobs.seed,
+            temperature: knobs.temperature,
+            ..LoaderOpts::default()
+        },
+    )?;
     let device = open_cuda_device()?;
     let (mut policy, tok) = build_policy(&dir, &device, &knobs)?;
     let (train_samples, eval_samples) = build_splits(knobs.data_seed)?;
@@ -548,7 +563,9 @@ fn main() -> Result<()> {
 
     let out = env_parse("FERRL_CD35_OUT", "/tmp/ferrl-runs".to_string())?;
     let (run, preempt) = open_run_with_preemption(&out)?;
-    let mut trainer = Trainer::new(tcfg, &run)?.with_preemption_flag(preempt);
+    let mut trainer = Trainer::new(tcfg, &run)?
+        .with_checkpoint_policy_sha256(checkpoint_policy_sha256)
+        .with_preemption_flag(preempt);
     // resume_latest continues from the newest checkpoint if one exists (a requeue),
     // else trains from scratch — paired with the preemption flag above, the run
     // survives a Slurm preempt/timeout: it checkpoints on the signal and resumes here.

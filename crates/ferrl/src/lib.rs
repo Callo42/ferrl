@@ -56,10 +56,11 @@
 //!   clone of candle's optimizer that ferrl owns so it can persist and restore the
 //!   moment state ([`OptimizerState`]) for momentum-faithful resume, pinned to candle
 //!   by a permanent equivalence canary;
-//! - checkpointing ([`checkpoint`]) — adapter-only save/load for eval
-//!   ([`save_adapter`]), and a **momentum-faithful** v2 checkpoint
-//!   ([`save_checkpoint`]) that also persists the optimizer moments and the rollout
-//!   sampler RNG, so [`Trainer::resume`] continues an interrupted run **bit-exactly**;
+//! - checkpointing ([`checkpoint`]) — explicit legacy-v1 adapter-only save/load for
+//!   eval ([`save_adapter`]), and an identity/integrity-bound, momentum-faithful
+//!   ordinary format-v4 checkpoint ([`save_checkpoint`]) that binds immutable policy
+//!   content, canonical learner semantics/topology, exact recipe/schema, adapter and
+//!   Adam payloads, and sampler state before [`Trainer::resume`] mutates live state;
 //! - the separated rollout/learner artifact contract ([`rollout_ledger`]) — a
 //!   strict, checksummed, no-replace whole-window package whose reader validates
 //!   learner pre-state identity, mandatory structured controls, and every
@@ -179,7 +180,8 @@ pub mod trimul;
 #[doc(inline)]
 pub use checkpoint::{
     latest_checkpoint, load_adapter, load_checkpoint, save_adapter, save_checkpoint,
-    CheckpointError, CheckpointManifest, LatestCheckpoint, LoadedCheckpoint,
+    CheckpointBinding, CheckpointError, CheckpointManifest, LatestCheckpoint, LoadedCheckpoint,
+    OrdinaryCheckpointIdentity,
 };
 #[cfg(feature = "nccl")]
 pub use comm::RealNccl;
@@ -223,7 +225,8 @@ pub use llama::{LlamaGradModel, LlamaMergedDecoder};
 pub use lm_policy::{Gemma4Policy, LlamaPolicy, LmPolicy, Qwen3_5Policy, QwenPolicy};
 #[doc(inline)]
 pub use loader::{
-    load_auto_policy, load_gemma4_policy, load_qwen_policy, AutoPolicy, LoaderError, LoaderOpts,
+    checkpoint_policy_sha256, load_auto_policy, load_gemma4_policy, load_qwen_policy, AutoPolicy,
+    LoaderError, LoaderOpts,
 };
 #[doc(inline)]
 pub use lora::{BaseQuantization, DenseLoraTargets};

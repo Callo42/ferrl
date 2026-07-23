@@ -59,6 +59,10 @@ use ferrl::{
 const VOCAB: usize = 5;
 const SEED: u64 = 11;
 
+fn checkpoint_policy_sha256() -> String {
+    format!("{:064x}", 0xfeed_u64)
+}
+
 // ---- the deterministic policy ----------------------------------------------
 
 /// A one-layer `LoRA` LM (the toy-echo scaffold) whose `generate` is
@@ -253,6 +257,13 @@ impl Policy for StatefulScriptedPolicy {
         let mut state = Self::STATE_MAGIC.to_vec();
         state.extend_from_slice(&self.sampler_epoch.to_le_bytes());
         Ok(state)
+    }
+
+    fn validate_sampler_state(&self, state: &[u8]) -> CandleResult<()> {
+        if state.len() != 12 || state[..4] != Self::STATE_MAGIC {
+            candle_core::bail!("invalid stateful scripted sampler state")
+        }
+        Ok(())
     }
 
     fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
@@ -1465,7 +1476,9 @@ fn run_scripted_world(
                     let rank = comm.rank();
                     let mut policy = ScriptedPolicy::new(SEED).unwrap();
                     let run = RunDir::create(base, format!("rank{rank}")).unwrap();
-                    let mut trainer = Trainer::with_comm(cfg.clone(), &run, comm).unwrap();
+                    let mut trainer = Trainer::with_comm(cfg.clone(), &run, comm)
+                        .unwrap()
+                        .with_checkpoint_policy_sha256(checkpoint_policy_sha256());
                     let history = trainer
                         .train(&mut policy, &EchoOrFlatReward, &CharTokenizer, samples)
                         .unwrap();
@@ -1482,7 +1495,9 @@ fn run_scripted_world(
 fn run_scripted_single(base: &Path, cfg: &TrainerConfig, samples: &[Sample<()>]) -> RankRun {
     let mut policy = ScriptedPolicy::new(SEED).unwrap();
     let run = RunDir::create(base, "single").unwrap();
-    let mut trainer = Trainer::new(cfg.clone(), &run).unwrap();
+    let mut trainer = Trainer::new(cfg.clone(), &run)
+        .unwrap()
+        .with_checkpoint_policy_sha256(checkpoint_policy_sha256());
     let history = trainer
         .train(&mut policy, &EchoOrFlatReward, &CharTokenizer, samples)
         .unwrap();
@@ -1527,15 +1542,19 @@ fn run_stateful_direct_dp(
                     let mut policy = StatefulScriptedPolicy::new(SEED, 0).unwrap();
                     let initial_adapter = var_bits(&policy);
                     let run = RunDir::create(&base, format!("{tag}-direct-rank{rank}")).unwrap();
-                    let mut trainer = Trainer::with_comm(cfg.clone(), &run, comm).unwrap();
+                    let mut trainer = Trainer::with_comm(cfg.clone(), &run, comm)
+                        .unwrap()
+                        .with_checkpoint_policy_sha256(checkpoint_policy_sha256());
                     let metrics = trainer
                         .train(&mut policy, &EchoOrFlatReward, &CharTokenizer, &samples)
                         .unwrap()
                         .0;
                     let optimizer = if rank == 0 {
+                        let binding = trainer.checkpoint_binding(&policy, 1).unwrap();
                         let loaded = ferrl::load_checkpoint(
                             run.checkpoints_dir().join(format!("step-{}", cfg.steps)),
                             &policy.trainable_vars(),
+                            &binding,
                         )
                         .unwrap();
                         Some(optimizer_bits(&loaded.optimizer_state.unwrap()))
@@ -1784,7 +1803,9 @@ fn preemption_flag_stops_the_whole_dp_world_in_lockstep() {
                     let rank = comm.rank();
                     let mut policy = ScriptedPolicy::new(SEED).unwrap();
                     let run = RunDir::create(&base, format!("rank{rank}")).unwrap();
-                    let mut trainer = Trainer::with_comm(cfg, &run, comm).unwrap();
+                    let mut trainer = Trainer::with_comm(cfg, &run, comm)
+                        .unwrap()
+                        .with_checkpoint_policy_sha256(checkpoint_policy_sha256());
                     if rank == 0 {
                         trainer = trainer.with_preemption_flag(flag0);
                     }
@@ -1985,7 +2006,9 @@ fn world_one_rollout_ledger_update_is_bit_identical_to_direct_training() {
     let mut direct_policy = ScriptedPolicy::new(SEED).unwrap();
     let initial_adapter = var_bits(&direct_policy);
     let direct_run = RunDir::create(tmp.path(), "direct").unwrap();
-    let mut direct_trainer = Trainer::new(cfg.clone(), &direct_run).unwrap();
+    let mut direct_trainer = Trainer::new(cfg.clone(), &direct_run)
+        .unwrap()
+        .with_checkpoint_policy_sha256(policy_sha256.clone());
     let (direct_history, _) = direct_trainer
         .train(
             &mut direct_policy,
@@ -2017,6 +2040,7 @@ fn world_one_rollout_ledger_update_is_bit_identical_to_direct_training() {
     let direct_checkpoint = ferrl::checkpoint::load_checkpoint(
         direct_run.checkpoints_dir().join("step-1"),
         &direct_probe.trainable_vars(),
+        &direct_trainer.checkpoint_binding(&direct_probe, 1).unwrap(),
     )
     .unwrap();
     let direct_optimizer = direct_checkpoint
@@ -2481,7 +2505,9 @@ fn world_one_rollout_ledger_sampler_handoff_and_resume_are_bit_exact() {
 
     let mut direct_policy = StatefulScriptedPolicy::new(SEED, 0).unwrap();
     let direct_run = RunDir::create(tmp.path(), "stateful-direct").unwrap();
-    let mut direct_trainer = Trainer::new(cfg.clone(), &direct_run).unwrap();
+    let mut direct_trainer = Trainer::new(cfg.clone(), &direct_run)
+        .unwrap()
+        .with_checkpoint_policy_sha256(policy_sha256.clone());
     let (direct_metrics, direct_stop) = direct_trainer
         .train(
             &mut direct_policy,
@@ -2506,6 +2532,7 @@ fn world_one_rollout_ledger_sampler_handoff_and_resume_are_bit_exact() {
     let direct_checkpoint = ferrl::load_checkpoint(
         direct_run.checkpoints_dir().join("step-3"),
         &direct_probe.trainable_vars(),
+        &direct_trainer.checkpoint_binding(&direct_probe, 1).unwrap(),
     )
     .unwrap();
     let direct_optimizer = direct_checkpoint.optimizer_state.unwrap();
@@ -2774,7 +2801,12 @@ fn world_one_rollout_ledger_sampler_handoff_and_resume_are_bit_exact() {
         first_continuation_state.optimizer_state(),
         &learner_policy.sampler_state().unwrap(),
         999,
-        learner_policy.lora_recipe().as_deref(),
+        &ferrl::CheckpointBinding::new(
+            policy_sha256.clone(),
+            "b".repeat(64),
+            learner_policy.lora_recipe(),
+        )
+        .unwrap(),
     )
     .unwrap();
     let mut ordinary_discovery_probe = StatefulScriptedPolicy::new(SEED, 0).unwrap();
@@ -3172,6 +3204,7 @@ fn run_stateful_world_one_reference(
     let metrics_path = run.metrics_path().to_path_buf();
     let mut trainer = Trainer::new(cfg.clone(), &run)
         .unwrap()
+        .with_checkpoint_policy_sha256(checkpoint_policy_sha256())
         .with_checkpoints_dir(&checkpoint_root);
     let metrics = trainer
         .train(&mut policy, &EchoOrFlatReward, &CharTokenizer, samples)
@@ -3180,6 +3213,7 @@ fn run_stateful_world_one_reference(
     let loaded = ferrl::load_checkpoint(
         checkpoint_root.join(format!("step-{}", cfg.steps)),
         &policy.trainable_vars(),
+        &trainer.checkpoint_binding(&policy, 1).unwrap(),
     )
     .unwrap();
     StatefulTpRank {
@@ -3231,6 +3265,7 @@ fn run_stateful_direct_tp_scaled(
                     let metrics_path = run.metrics_path().to_path_buf();
                     let mut trainer = Trainer::new(cfg.clone(), &run)
                         .unwrap()
+                        .with_checkpoint_policy_sha256(checkpoint_policy_sha256())
                         .with_checkpoints_dir(&checkpoint_root);
                     let metrics = trainer
                         .train_tensor_parallel(
@@ -3245,6 +3280,7 @@ fn run_stateful_direct_tp_scaled(
                     let loaded = ferrl::load_checkpoint(
                         checkpoint_root.join(format!("step-{}", cfg.steps)),
                         &policy.trainable_vars(),
+                        &trainer.checkpoint_binding(&policy, 2).unwrap(),
                     )
                     .unwrap();
                     StatefulTpRank {
@@ -4176,7 +4212,9 @@ fn distributed_continuation_save_preflight_panic_aborts_every_rank() {
                 let policy_sha256 = policy_sha256.clone();
                 scope.spawn(move || {
                     let run = RunDir::create(&base, format!("save-panic-rank{rank}")).unwrap();
-                    let mut trainer = Trainer::with_comm(cfg, &run, comm).unwrap();
+                    let mut trainer = Trainer::with_comm(cfg, &run, comm)
+                        .unwrap()
+                        .with_checkpoint_policy_sha256(checkpoint_policy_sha256());
                     let mut collector = StatefulScriptedPolicy::new(SEED, 0).unwrap();
                     let mut learner = StatefulScriptedPolicy::new(SEED, 0).unwrap();
                     trainer
@@ -4577,7 +4615,9 @@ fn distributed_collector_and_learner_comm_failures_never_coordinate_recovery() {
                 let policy_sha256 = policy_sha256.clone();
                 scope.spawn(move || {
                     let run = RunDir::create(&base, format!("terminal-source-rank{rank}")).unwrap();
-                    let mut trainer = Trainer::with_comm(cfg, &run, comm).unwrap();
+                    let mut trainer = Trainer::with_comm(cfg, &run, comm)
+                        .unwrap()
+                        .with_checkpoint_policy_sha256(checkpoint_policy_sha256());
                     let mut policy = StatefulScriptedPolicy::new(SEED, 0).unwrap();
                     trainer
                         .collect_rollout_ledger_step(
@@ -5989,7 +6029,9 @@ fn rank_zero_writes_the_only_checkpoint_and_a_dp_resume_continues_bit_exactly() 
                     let rank = comm.rank();
                     let mut policy = ScriptedPolicy::new(SEED).unwrap();
                     let run = RunDir::create(base, format!("resume-rank{rank}")).unwrap();
-                    let mut trainer = Trainer::with_comm(cfg, &run, comm).unwrap();
+                    let mut trainer = Trainer::with_comm(cfg, &run, comm)
+                        .unwrap()
+                        .with_checkpoint_policy_sha256(checkpoint_policy_sha256());
                     let history = trainer
                         .resume(
                             &ckpt,
@@ -6038,6 +6080,7 @@ fn run_dp_world_resume_latest(
                     let run = RunDir::create(base, format!("rl{tag}-rank{rank}")).unwrap();
                     let mut trainer = Trainer::with_comm(cfg, &run, comm)
                         .unwrap()
+                        .with_checkpoint_policy_sha256(checkpoint_policy_sha256())
                         .with_checkpoints_dir(shared);
                     let history = trainer
                         .resume_latest(
@@ -6207,7 +6250,9 @@ fn resume_latest_under_dp_without_a_shared_dir_aborts_load_in_lockstep_not_fresh
                     let rank = comm.rank();
                     let mut policy = ScriptedPolicy::new(SEED).unwrap();
                     let run = RunDir::open(basep, format!("rank{rank}")).unwrap();
-                    let mut trainer = Trainer::with_comm(cfg, &run, comm).unwrap();
+                    let mut trainer = Trainer::with_comm(cfg, &run, comm)
+                        .unwrap()
+                        .with_checkpoint_policy_sha256(checkpoint_policy_sha256());
                     trainer
                         .resume_latest(
                             &mut policy,
@@ -6227,7 +6272,7 @@ fn resume_latest_under_dp_without_a_shared_dir_aborts_load_in_lockstep_not_fresh
     let err0 = outcomes[0].as_ref().unwrap_err();
     assert!(
         matches!(err0, TrainerError::Contract(msg)
-            if msg.contains("checkpoint load/restore failed on a peer rank")),
+            if msg.contains("checkpoint identity/payload preflight failed on a peer rank")),
         "rank 0 must abort when a peer cannot load the broadcast checkpoint: got {err0:?}"
     );
     // rank 1 received rank 0's broadcast step and tried to resume from its OWN (empty)

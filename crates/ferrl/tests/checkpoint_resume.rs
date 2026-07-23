@@ -29,6 +29,10 @@ const RANK: usize = 2;
 const ALPHA: f64 = 4.0;
 const SEED: u64 = 7;
 
+fn checkpoint_policy_sha256() -> String {
+    format!("{:064x}", 0xc0ffee_u64)
+}
+
 /// A tiny Qwen3 config (2 layers, 2 Q / 1 KV head, `head_dim` 4) — runnable on CPU.
 fn tiny_cfg() -> Config {
     Config {
@@ -141,6 +145,15 @@ impl RewardFn for SpreadReward {
             .map(|(i, b)| (i as f32 + 1.0) * f32::from(b))
             .sum::<f32>()
             / 1000.0)
+    }
+}
+
+struct UnreachableReward;
+impl RewardFn for UnreachableReward {
+    type Target = ();
+
+    fn reward(&self, _sample: &Sample<()>, _completion: &str) -> Result<f32, RewardError> {
+        panic!("checkpoint preflight failure reached reward evaluation")
     }
 }
 
@@ -376,7 +389,9 @@ fn trainer_checkpoint_captures_final_adapter() {
     let tmp = TempDir::new("run");
     let run = RunDir::create(tmp.path(), "qwen-ckpt").unwrap();
     let ckpt_root = run.checkpoints_dir();
-    let mut trainer = Trainer::new(ckpt_train_cfg(Some(2)), &run).unwrap();
+    let mut trainer = Trainer::new(ckpt_train_cfg(Some(2)), &run)
+        .unwrap()
+        .with_checkpoint_policy_sha256(checkpoint_policy_sha256());
     let (history, _stop) = trainer
         .train(&mut policy, &SpreadReward, &CharCodec, &samples)
         .unwrap();
@@ -400,7 +415,12 @@ fn trainer_checkpoint_captures_final_adapter() {
     // model's aliasing vars).
     let final_adapter = snapshot(&policy);
     let probe = policy_from(&vb, &cfg);
-    let m4 = load_adapter(ckpt_root.join("step-4"), &probe.trainable_vars()).unwrap();
+    let m4 = ferrl::load_checkpoint(
+        ckpt_root.join("step-4"),
+        &probe.trainable_vars(),
+        &trainer.checkpoint_binding(&probe, 1).unwrap(),
+    )
+    .unwrap();
     assert_eq!(m4.step, 4);
     assert_eq!(
         snapshot(&probe),
@@ -420,7 +440,9 @@ fn trainer_resumes_from_a_checkpoint() {
     let tmp = TempDir::new("resume");
     let run = RunDir::create(tmp.path(), "qwen-ckpt").unwrap();
     let ckpt_root = run.checkpoints_dir();
-    let mut trainer = Trainer::new(ckpt_train_cfg(Some(2)), &run).unwrap();
+    let mut trainer = Trainer::new(ckpt_train_cfg(Some(2)), &run)
+        .unwrap()
+        .with_checkpoint_policy_sha256(checkpoint_policy_sha256());
     trainer
         .train(&mut policy, &SpreadReward, &CharCodec, &samples)
         .unwrap();
@@ -430,7 +452,12 @@ fn trainer_resumes_from_a_checkpoint() {
     // NOT that it matches the uninterrupted run (Adam momentum + sampler RNG
     // re-warm; see the checkpoint module docs).
     let mut resume_policy = policy_from(&vb, &cfg);
-    let m2 = load_adapter(ckpt_root.join("step-2"), &resume_policy.trainable_vars()).unwrap();
+    let m2 = ferrl::load_checkpoint(
+        ckpt_root.join("step-2"),
+        &resume_policy.trainable_vars(),
+        &trainer.checkpoint_binding(&resume_policy, 1).unwrap(),
+    )
+    .unwrap();
     assert_eq!(m2.step, 2);
 
     let run2 = RunDir::create(tmp.path(), "qwen-resume").unwrap();
@@ -513,7 +540,9 @@ fn industrial_recipe_round_trips_through_a_trainer_checkpoint() {
     let tmp = TempDir::new("industrial");
     let run = RunDir::create(tmp.path(), "qwen-industrial").unwrap();
     let ckpt_root = run.checkpoints_dir();
-    let mut trainer = Trainer::new(ckpt_train_cfg(Some(2)), &run).unwrap();
+    let mut trainer = Trainer::new(ckpt_train_cfg(Some(2)), &run)
+        .unwrap()
+        .with_checkpoint_policy_sha256(checkpoint_policy_sha256());
     trainer
         .train(&mut policy, &SpreadReward, &CharCodec, &samples)
         .unwrap();
@@ -526,7 +555,9 @@ fn industrial_recipe_round_trips_through_a_trainer_checkpoint() {
     // A fresh industrial policy passes the recipe pre-flight and resumes.
     let mut resumed = policy_with_targets(&vb, &cfg, DenseLoraTargets::industrial());
     let run2 = RunDir::create(tmp.path(), "qwen-industrial-resume").unwrap();
-    let mut trainer2 = Trainer::new(ckpt_train_cfg(None), &run2).unwrap();
+    let mut trainer2 = Trainer::new(ckpt_train_cfg(None), &run2)
+        .unwrap()
+        .with_checkpoint_policy_sha256(checkpoint_policy_sha256());
     let (history, _stop) = trainer2
         .resume(
             ckpt_root.join("step-2"),
@@ -569,7 +600,9 @@ fn resume_rejects_a_shape_aliased_recipe_swap() {
     let tmp = TempDir::new("alias");
     let run = RunDir::create(tmp.path(), "qwen-alias").unwrap();
     let ckpt_root = run.checkpoints_dir();
-    let mut trainer = Trainer::new(ckpt_train_cfg(Some(2)), &run).unwrap();
+    let mut trainer = Trainer::new(ckpt_train_cfg(Some(2)), &run)
+        .unwrap()
+        .with_checkpoint_policy_sha256(checkpoint_policy_sha256());
     trainer
         .train(&mut policy, &SpreadReward, &CharCodec, &samples)
         .unwrap();
@@ -577,7 +610,9 @@ fn resume_rejects_a_shape_aliased_recipe_swap() {
     let mut wrong = policy_with_targets(&vb, &cfg, qv);
     let before = snapshot(&wrong);
     let run2 = RunDir::create(tmp.path(), "qwen-alias-resume").unwrap();
-    let mut trainer2 = Trainer::new(ckpt_train_cfg(None), &run2).unwrap();
+    let mut trainer2 = Trainer::new(ckpt_train_cfg(None), &run2)
+        .unwrap()
+        .with_checkpoint_policy_sha256(checkpoint_policy_sha256());
     let err = trainer2
         .resume(
             ckpt_root.join("step-2"),
@@ -596,5 +631,61 @@ fn resume_rejects_a_shape_aliased_recipe_swap() {
         snapshot(&wrong),
         before,
         "a rejected resume must leave the policy untouched"
+    );
+}
+
+#[test]
+fn resume_rejects_different_frozen_policy_identity_before_any_mutation() {
+    let cfg = tiny_cfg();
+    let vb = tiny_vb(&cfg);
+    let samples = vec![Sample::new("abc", ()), Sample::new("bcd", ())];
+    let tmp = TempDir::new("frozen-policy-identity");
+
+    let mut source = policy_from(&vb, &cfg);
+    let source_run = RunDir::create(tmp.path(), "source").unwrap();
+    let mut source_trainer = Trainer::new(ckpt_train_cfg(Some(2)), &source_run)
+        .unwrap()
+        .with_checkpoint_policy_sha256(checkpoint_policy_sha256());
+    source_trainer
+        .train(&mut source, &SpreadReward, &CharCodec, &samples)
+        .unwrap();
+
+    // A separately initialized frozen model keeps the trainable schema/recipe
+    // identical while changing base-policy content.
+    let destination_vb = tiny_vb(&cfg);
+    let mut destination = policy_from(&destination_vb, &cfg);
+    let adapter_before = snapshot(&destination);
+    let sampler_before = destination.sampler_state().unwrap();
+    let mode_before = destination.adapter_enabled();
+    let destination_run = RunDir::create(tmp.path(), "destination").unwrap();
+    let metrics_before = std::fs::read(destination_run.metrics_path()).unwrap_or_default();
+    let candidates_before = std::fs::read(destination_run.candidates_path()).unwrap_or_default();
+    let mut destination_trainer = Trainer::new(ckpt_train_cfg(None), &destination_run)
+        .unwrap()
+        .with_checkpoint_policy_sha256("d".repeat(64));
+
+    let error = destination_trainer
+        .resume(
+            source_run.checkpoints_dir().join("step-2"),
+            &mut destination,
+            &UnreachableReward,
+            &CharCodec,
+            &samples,
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("frozen-policy"),
+        "wrong preflight rejection: {error}"
+    );
+    assert_eq!(snapshot(&destination), adapter_before);
+    assert_eq!(destination.sampler_state().unwrap(), sampler_before);
+    assert_eq!(destination.adapter_enabled(), mode_before);
+    assert_eq!(
+        std::fs::read(destination_run.metrics_path()).unwrap_or_default(),
+        metrics_before
+    );
+    assert_eq!(
+        std::fs::read(destination_run.candidates_path()).unwrap_or_default(),
+        candidates_before
     );
 }

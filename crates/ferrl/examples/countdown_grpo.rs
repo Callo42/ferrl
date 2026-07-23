@@ -60,8 +60,8 @@ use ferrl::countdown::{
 };
 use ferrl::policy::GenConfig;
 use ferrl::{
-    evaluate, HfTokenizer, Metrics, QwenGradModel, QwenPolicy, RunDir, Sample, Trainer,
-    TrainerConfig,
+    checkpoint_policy_sha256, evaluate, HfTokenizer, LoaderOpts, Metrics, QwenGradModel,
+    QwenPolicy, RunDir, Sample, Trainer, TrainerConfig,
 };
 use tracing::{info, warn};
 
@@ -247,6 +247,18 @@ fn main() -> Result<()> {
         .map_err(|_| anyhow!("set FERRL_QWEN_WEIGHTS to the Qwen3-0.6B-Base asset directory"))?;
     let dir = PathBuf::from(weights);
     let device = open_cuda_device()?;
+    let checkpoint_policy_sha256 = checkpoint_policy_sha256(
+        &dir,
+        &LoaderOpts {
+            lora_rank: env_parse("FERRL_CD_RANK", 16usize),
+            lora_alpha: env_parse("FERRL_CD_ALPHA", 32.0f64),
+            base_dtype: DType::BF16,
+            adapter_dtype: DType::F32,
+            seed: env_parse("FERRL_CD_SEED", 1234u64),
+            temperature: env_parse("FERRL_CD_TEMP", 1.0f64),
+            ..LoaderOpts::default()
+        },
+    )?;
     let (mut policy, tok) = build_policy(&dir, &device)?;
     let (train_samples, eval_samples) = build_splits();
     let reward = CountdownReward::default();
@@ -277,7 +289,8 @@ fn main() -> Result<()> {
         .map_or(0, |d| d.as_secs());
     let run_id = format!("countdown-grpo-{stamp}");
     let run = RunDir::create(Path::new(&out), &run_id).context("create run dir")?;
-    let mut trainer = Trainer::new(tcfg, &run)?;
+    let mut trainer =
+        Trainer::new(tcfg, &run)?.with_checkpoint_policy_sha256(checkpoint_policy_sha256);
     // No preemption flag installed → this run always completes; ignore the stop.
     let (history, _stop) = trainer.train(&mut policy, &reward, &tok, &train_samples)?;
 

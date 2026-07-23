@@ -28,8 +28,9 @@ use candle_nn::VarBuilder;
 use candle_transformers::models::qwen3::Config;
 use ferrl::policy::{GenConfig, Rollout};
 use ferrl::{
-    evaluate, load_adapter, save_adapter, HfTokenizer, Policy, QwenGradModel, QwenPolicy,
-    RewardError, RewardFn, RunDir, Sample, TokenizerLike, Trainer, TrainerConfig,
+    checkpoint_policy_sha256, evaluate, load_adapter, save_adapter, HfTokenizer, LoaderOpts,
+    Policy, QwenGradModel, QwenPolicy, RewardError, RewardFn, RunDir, Sample, TokenizerLike,
+    Trainer, TrainerConfig,
 };
 
 /// `LoRA` rank / alpha for the smoke — a typical small adapter.
@@ -143,8 +144,8 @@ fn qwen_policy_grpo_smoke_on_gpu() {
 
 #[test]
 #[ignore = "needs the real Qwen3-0.6B-Base checkpoint (FERRL_QWEN_WEIGHTS) + a CUDA build/GPU"]
-fn qwen_v2_resume_smoke_on_gpu() {
-    // P6-B PR3 on CUDA: the momentum-faithful (v2) checkpoint save (CUDA optimizer
+fn qwen_v4_resume_smoke_on_gpu() {
+    // CUDA gate for the integrity-bound, momentum-faithful v4 checkpoint save (CUDA optimizer
     // moments -> CPU safetensors) + `Trainer::resume` (load_checkpoint -> restore the
     // moments back onto the GPU via `FerrlAdamW::load_state` + restore the sampler RNG
     // -> continue). The CPU toy gate proves bit-identity; this proves the CUDA
@@ -152,6 +153,17 @@ fn qwen_v2_resume_smoke_on_gpu() {
     // errors (GPU float determinism is not asserted here — that is the CPU gate's job).
     let dir = weights_dir();
     let cfg = load_config(&dir);
+    let checkpoint_policy_sha256 = checkpoint_policy_sha256(
+        &dir,
+        &LoaderOpts {
+            lora_rank: RANK,
+            lora_alpha: ALPHA,
+            base_dtype: DType::F32,
+            adapter_dtype: DType::F32,
+            ..LoaderOpts::default()
+        },
+    )
+    .expect("derive immutable checkpoint policy identity");
     let device = Device::new_cuda(0)
         .expect("CUDA device 0 — build with --features cuda and run on a GPU node");
     let buf = std::fs::read(dir.join("model.safetensors")).expect("read model.safetensors");
@@ -165,25 +177,27 @@ fn qwen_v2_resume_smoke_on_gpu() {
         max_new_tokens: 8,
         temperature: 1.0,
         lr: 1e-4,
-        checkpoint_every: Some(1), // a v2 checkpoint at step 1 (and the final step)
+        checkpoint_every: Some(1), // a v4 checkpoint at step 1 (and the final step)
         ..TrainerConfig::default()
     };
 
-    // Train 2 steps, checkpointing a v2 checkpoint at step 1.
+    // Train 2 steps, checkpointing a v4 checkpoint at step 1.
     let model = QwenGradModel::load(&cfg, &vb, RANK, ALPHA).expect("build QwenGradModel");
     let mut policy = QwenPolicy::new(model, 1234, 1.0);
     let tmp = TempDir::new();
-    let run = RunDir::create(&tmp.0, "qwen-gpu-v2").unwrap();
-    let mut trainer = Trainer::new(make_cfg(), &run).unwrap();
+    let run = RunDir::create(&tmp.0, "qwen-gpu-v4").unwrap();
+    let mut trainer = Trainer::new(make_cfg(), &run)
+        .unwrap()
+        .with_checkpoint_policy_sha256(checkpoint_policy_sha256.clone());
     trainer
         .train(&mut policy, &SpreadReward, &tok, &samples)
-        .expect("GPU train with v2 checkpointing failed");
+        .expect("GPU train with v4 checkpointing failed");
 
-    // The step-1 v2 checkpoint must carry the optimizer moments (the new CUDA save path).
+    // The step-1 v4 checkpoint must carry the optimizer moments (the CUDA save path).
     let ckpt = run.checkpoints_dir().join("step-1");
     assert!(
         ckpt.join("optimizer.safetensors").exists(),
-        "a v2 checkpoint must persist optimizer.safetensors"
+        "a v4 checkpoint must persist optimizer.safetensors"
     );
 
     // Resume from it on the GPU into a FRESH model with a DIFFERENT sampler seed (so the
@@ -191,11 +205,13 @@ fn qwen_v2_resume_smoke_on_gpu() {
     let model2 = QwenGradModel::load(&cfg, &vb, RANK, ALPHA).expect("build resume model");
     let mut policy2 = QwenPolicy::new(model2, 9999, 1.0);
     let tmp2 = TempDir::new();
-    let run2 = RunDir::create(&tmp2.0, "qwen-gpu-v2-resume").unwrap();
-    let mut trainer2 = Trainer::new(make_cfg(), &run2).unwrap();
+    let run2 = RunDir::create(&tmp2.0, "qwen-gpu-v4-resume").unwrap();
+    let mut trainer2 = Trainer::new(make_cfg(), &run2)
+        .unwrap()
+        .with_checkpoint_policy_sha256(checkpoint_policy_sha256);
     let (resumed, _stop) = trainer2
         .resume(&ckpt, &mut policy2, &SpreadReward, &tok, &samples)
-        .expect("GPU resume from a v2 checkpoint failed");
+        .expect("GPU resume from a v4 checkpoint failed");
     assert_eq!(
         resumed.len(),
         1,

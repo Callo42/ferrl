@@ -49,6 +49,10 @@ const GAMMA: f64 = 3.0;
 /// Rollout sampling temperature.
 const TEMP: f64 = 1.0;
 
+fn checkpoint_policy_sha256() -> String {
+    format!("{:064x}", 0xec40_u64)
+}
+
 // ---- the toy policy --------------------------------------------------------
 
 /// A one-layer `LoRA` LM over a `vocab`-symbol alphabet. The forward is
@@ -169,6 +173,14 @@ impl Policy for EchoPolicy {
         self.sampler.to_state_bytes()
     }
 
+    fn validate_sampler_state(&self, state: &[u8]) -> CandleResult<()> {
+        let restored = GrpoSampler::from_state_bytes(state)?;
+        if (restored.temperature() - self.sampler.temperature()).abs() > f64::EPSILON {
+            candle_core::bail!("checkpoint sampler temperature mismatch")
+        }
+        Ok(())
+    }
+
     fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
         self.sampler = GrpoSampler::from_state_bytes(state)?;
         Ok(())
@@ -278,6 +290,9 @@ impl Policy for UncoveredPolicy {
 
     fn sampler_state(&self) -> CandleResult<Vec<u8>> {
         self.inner.sampler_state()
+    }
+    fn validate_sampler_state(&self, state: &[u8]) -> CandleResult<()> {
+        self.inner.validate_sampler_state(state)
     }
 
     fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
@@ -592,7 +607,9 @@ fn gate_reward_trends_up() {
     };
     let tmp = TempDir::new("reward-up");
     let run = RunDir::create(tmp.path(), "echo").unwrap();
-    let mut trainer = Trainer::new(cfg, &run).unwrap();
+    let mut trainer = Trainer::new(cfg, &run)
+        .unwrap()
+        .with_checkpoint_policy_sha256(checkpoint_policy_sha256());
     let (history, _stop) = trainer
         .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
         .unwrap();
@@ -631,7 +648,9 @@ fn summarize_reduces_a_real_toy_run_with_populated_timing() {
     };
     let tmp = TempDir::new("summarize-real");
     let run = RunDir::create(tmp.path(), "echo").unwrap();
-    let mut trainer = Trainer::new(cfg, &run).unwrap();
+    let mut trainer = Trainer::new(cfg, &run)
+        .unwrap()
+        .with_checkpoint_policy_sha256(checkpoint_policy_sha256());
     let (history, _stop) = trainer
         .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
         .unwrap();
@@ -1225,7 +1244,9 @@ fn trainer_records_the_policy_recipe_in_the_checkpoint_manifest() {
     };
     let tmp = TempDir::new("recipe-manifest");
     let run = RunDir::create(tmp.path(), "echo").unwrap();
-    let mut trainer = Trainer::new(cfg, &run).unwrap();
+    let mut trainer = Trainer::new(cfg, &run)
+        .unwrap()
+        .with_checkpoint_policy_sha256(checkpoint_policy_sha256());
     trainer
         .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)
         .unwrap();
@@ -1437,7 +1458,7 @@ fn gate_grad_accum_two_prompt_window() {
 #[test]
 fn interrupted_run_resumes_bit_identically() {
     // THE P6-B capstone gate: a run interrupted at INTERRUPT_AT and resumed from a
-    // momentum-faithful (v2) checkpoint reproduces the uninterrupted run's post-resume
+    // momentum-faithful format-v4 checkpoint reproduces the uninterrupted run's post-resume
     // trajectory BIT-FOR-BIT. `Trainer::resume` restores the adapter weights, the
     // optimizer moments + step counter, AND the sampler RNG, so every post-resume window
     // samples the same tokens, takes the same gradient, and applies the same AdamW step.
@@ -1470,7 +1491,7 @@ fn interrupted_run_resumes_bit_identically() {
         // lr schedule at the same effective lr the uninterrupted arm used
         // (lr_at is a pure function of the outer step), or bit-exactness breaks.
         warmup_steps: INTERRUPT_AT + 2,
-        checkpoint_every: Some(INTERRUPT_AT), // a v2 checkpoint lands at INTERRUPT_AT (and the final step)
+        checkpoint_every: Some(INTERRUPT_AT), // a v4 checkpoint lands at INTERRUPT_AT (and the final step)
         ..TrainerConfig::default()
     };
 
@@ -1478,7 +1499,9 @@ fn interrupted_run_resumes_bit_identically() {
     let tmp = TempDir::new("resume-faithful");
     let mut policy_full = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 29, TEMP).unwrap();
     let run_full = RunDir::create(tmp.path().join("full"), "echo").unwrap();
-    let mut trainer_full = Trainer::new(make_cfg(), &run_full).unwrap();
+    let mut trainer_full = Trainer::new(make_cfg(), &run_full)
+        .unwrap()
+        .with_checkpoint_policy_sha256(checkpoint_policy_sha256());
     let (hist_full, _stop) = trainer_full
         .train(&mut policy_full, &EchoReward, &CharTokenizer, &prompts)
         .unwrap();
@@ -1496,13 +1519,15 @@ fn interrupted_run_resumes_bit_identically() {
     );
 
     // FAITHFUL RESUME: a FRESH policy (seeded DIFFERENTLY — 999 — so the match is the
-    // restore's doing, not a shared seed) resumes from the step-INTERRUPT_AT v2 checkpoint.
+    // restore's doing, not a shared seed) resumes from the step-INTERRUPT_AT v4 checkpoint.
     let ckpt = run_full
         .checkpoints_dir()
         .join(format!("step-{INTERRUPT_AT}"));
     let mut policy_f = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 999, TEMP).unwrap();
     let run_f = RunDir::create(tmp.path().join("faithful"), "echo").unwrap();
-    let mut trainer_f = Trainer::new(make_cfg(), &run_f).unwrap();
+    let mut trainer_f = Trainer::new(make_cfg(), &run_f)
+        .unwrap()
+        .with_checkpoint_policy_sha256(checkpoint_policy_sha256());
     let (hist_f, _stop) = trainer_f
         .resume(&ckpt, &mut policy_f, &EchoReward, &CharTokenizer, &prompts)
         .unwrap();
@@ -1523,12 +1548,19 @@ fn interrupted_run_resumes_bit_identically() {
     // resume, so any divergence is PURELY the missing momentum — proving the moment
     // restore is load-bearing, not an artifact masked by a re-seeded RNG.
     let mut policy_m = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 999, TEMP).unwrap();
-    let loaded = ferrl::checkpoint::load_checkpoint(&ckpt, &policy_m.trainable_vars()).unwrap();
+    let loaded = ferrl::checkpoint::load_checkpoint(
+        &ckpt,
+        &policy_m.trainable_vars(),
+        &trainer_f.checkpoint_binding(&policy_m, 1).unwrap(),
+    )
+    .unwrap();
     policy_m
         .restore_sampler_state(loaded.sampler_state.as_ref().unwrap())
         .unwrap();
     let run_m = RunDir::create(tmp.path().join("moments-fresh"), "echo").unwrap();
-    let mut trainer_m = Trainer::new(make_cfg(), &run_m).unwrap();
+    let mut trainer_m = Trainer::new(make_cfg(), &run_m)
+        .unwrap()
+        .with_checkpoint_policy_sha256(checkpoint_policy_sha256());
     trainer_m
         .train_from(
             loaded.step,
@@ -1559,7 +1591,7 @@ fn preemption_stop_then_resume_latest_matches_uninterrupted() {
     //
     // `checkpoint_every` is None, so the ONLY checkpoint is the one the preemption
     // stop itself writes — this proves that path emits a resumable momentum-faithful
-    // v3 checkpoint, independent of the periodic cadence.
+    // v4 checkpoint, independent of the periodic cadence.
     const TOTAL: u64 = 6;
     let prompts = echo_prompts(VOCAB);
     let make_cfg = || TrainerConfig {
@@ -1580,7 +1612,9 @@ fn preemption_stop_then_resume_latest_matches_uninterrupted() {
     let tmp = TempDir::new("preempt-resume");
     let mut policy_full = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 29, TEMP).unwrap();
     let run_full = RunDir::create(tmp.path().join("full"), "echo").unwrap();
-    let mut trainer_full = Trainer::new(make_cfg(), &run_full).unwrap();
+    let mut trainer_full = Trainer::new(make_cfg(), &run_full)
+        .unwrap()
+        .with_checkpoint_policy_sha256(checkpoint_policy_sha256());
     let (hist_full, _stop) = trainer_full
         .train(&mut policy_full, &EchoReward, &CharTokenizer, &prompts)
         .unwrap();
@@ -1606,6 +1640,7 @@ fn preemption_stop_then_resume_latest_matches_uninterrupted() {
     let run_a = RunDir::create(&base, "echo").unwrap();
     let mut trainer_a = Trainer::new(make_cfg(), &run_a)
         .unwrap()
+        .with_checkpoint_policy_sha256(checkpoint_policy_sha256())
         .with_preemption_flag(Arc::clone(&flag));
     let (hist_a, stop_a) = trainer_a
         .train(&mut policy_a, &EchoReward, &CharTokenizer, &prompts)
@@ -1636,7 +1671,9 @@ fn preemption_stop_then_resume_latest_matches_uninterrupted() {
     // discovers step-1 and runs the remaining steps 1..6.
     let mut policy_b = EchoPolicy::new(VOCAB, VOCAB, GAMMA, 777, TEMP).unwrap();
     let run_b = RunDir::open(&base, "echo").unwrap();
-    let mut trainer_b = Trainer::new(make_cfg(), &run_b).unwrap();
+    let mut trainer_b = Trainer::new(make_cfg(), &run_b)
+        .unwrap()
+        .with_checkpoint_policy_sha256(checkpoint_policy_sha256());
     let (hist_b, stop_b) = trainer_b
         .resume_latest(&mut policy_b, &EchoReward, &CharTokenizer, &prompts)
         .unwrap();
@@ -1720,6 +1757,7 @@ fn resume_latest_surfaces_preemption_stop() {
     let run = RunDir::create(tmp.path(), "echo").unwrap();
     let mut trainer = Trainer::new(cfg, &run)
         .unwrap()
+        .with_checkpoint_policy_sha256(checkpoint_policy_sha256())
         .with_preemption_flag(Arc::clone(&flag));
     let (hist, stop) = trainer
         .resume_latest(&mut policy, &EchoReward, &CharTokenizer, &prompts)
@@ -1763,6 +1801,7 @@ fn preemption_after_the_final_step_reports_completed() {
     let run = RunDir::create(tmp.path(), "echo").unwrap();
     let mut trainer = Trainer::new(cfg, &run)
         .unwrap()
+        .with_checkpoint_policy_sha256(checkpoint_policy_sha256())
         .with_preemption_flag(Arc::clone(&flag));
     let (hist, stop) = trainer
         .train(&mut policy, &EchoReward, &CharTokenizer, &prompts)

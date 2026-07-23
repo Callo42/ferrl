@@ -13,12 +13,15 @@
 //! unit tests — this file is therefore excluded from the coverage denominator
 //! alongside the binaries and examples (see `justfile` / `.github/workflows/ci.yml`).
 
-use std::path::{Path, PathBuf};
+use std::collections::BTreeSet;
+use std::io::Read;
+use std::path::{Component, Path, PathBuf};
 
 use candle_core::backprop::GradStore;
 use candle_core::{DType, Device, Result as CandleResult, Tensor, Var};
 use candle_nn::VarBuilder;
 use candle_transformers::models::qwen3::Config;
+use sha2::{Digest, Sha256};
 
 use crate::gemma4::{
     varbuilder_from_pretrained as gemma4_varbuilder_from_pretrained, Gemma4Config, Gemma4GradModel,
@@ -86,6 +89,162 @@ impl Default for LoaderOpts {
             tensor_parallel: TensorParallelPlan::single(),
         }
     }
+}
+
+/// Compute the rank-invariant immutable policy identity used by ordinary
+/// checkpoints.
+///
+/// The digest binds exact `config.json` bytes, the exact single-file weights or
+/// indexed weight map plus every referenced shard in canonical filename order,
+/// and all loader options that alter model/adapter execution. Paths and TP rank
+/// are deliberately excluded: copying the same checkpoint to another directory
+/// or loading another rank of the same TP world preserves identity. Sampler seed
+/// and temperature are bound separately by the sampler payload and canonical
+/// trainer semantics.
+///
+/// # Errors
+///
+/// Returns [`LoaderError`] when a required source file is missing, unreadable,
+/// changes length while being hashed, or an indexed shard name is unsafe.
+pub fn checkpoint_policy_sha256(dir: &Path, opts: &LoaderOpts) -> Result<String, LoaderError> {
+    let model_type = read_model_type(dir)?;
+    let config_path = dir.join("config.json");
+    let index_path = dir.join("model.safetensors.index.json");
+    let single_path = dir.join("model.safetensors");
+    let uses_index = !matches!(model_type, None | Some(ModelType::Qwen3)) && index_path.is_file();
+
+    let mut files = vec![("config.json".to_string(), config_path)];
+    if uses_index {
+        let index_bytes = std::fs::read(&index_path).map_err(|source| LoaderError::Io {
+            path: index_path.clone(),
+            source,
+        })?;
+        let index: serde_json::Value =
+            serde_json::from_slice(&index_bytes).map_err(|source| LoaderError::Config {
+                path: index_path.clone(),
+                source,
+            })?;
+        let weight_map = index
+            .get("weight_map")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| LoaderError::Config {
+                path: index_path.clone(),
+                source: serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "safetensors index requires an object weight_map",
+                )),
+            })?;
+        let mut shards = BTreeSet::new();
+        for value in weight_map.values() {
+            let shard = value.as_str().ok_or_else(|| LoaderError::Config {
+                path: index_path.clone(),
+                source: serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "safetensors weight_map values must be strings",
+                )),
+            })?;
+            let path = Path::new(shard);
+            let safe = path.components().count() == 1
+                && matches!(path.components().next(), Some(Component::Normal(_)))
+                && path.extension().and_then(|ext| ext.to_str()) == Some("safetensors");
+            if !safe {
+                return Err(LoaderError::Io {
+                    path: index_path.clone(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("unsafe safetensors shard name {shard:?}"),
+                    ),
+                });
+            }
+            shards.insert(shard.to_owned());
+        }
+        if shards.is_empty() {
+            return Err(LoaderError::Io {
+                path: index_path,
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "safetensors index weight_map is empty",
+                ),
+            });
+        }
+        files.push((
+            "model.safetensors.index.json".to_string(),
+            dir.join("model.safetensors.index.json"),
+        ));
+        files.extend(shards.into_iter().map(|name| {
+            let path = dir.join(&name);
+            (format!("shard:{name}"), path)
+        }));
+    } else {
+        files.push(("model.safetensors".to_string(), single_path));
+    }
+
+    let recipe = serde_json::to_vec(&serde_json::json!({
+        "lora_rank": opts.lora_rank,
+        "lora_alpha_bits": opts.lora_alpha.to_bits(),
+        "base_dtype": opts.base_dtype.as_str(),
+        "adapter_dtype": opts.adapter_dtype.as_str(),
+        "memory_efficient_cached_gqa": opts.memory_efficient_cached_gqa,
+        "base_quantization": opts.base_quantization.as_str(),
+        "tensor_parallel_world_size": opts.tensor_parallel.world_size(),
+        "tensor_parallel_layout": crate::checkpoint::ROLLOUT_LEDGER_CONTINUATION_LAYOUT,
+    }))
+    .map_err(|source| LoaderError::Config {
+        path: dir.join("config.json"),
+        source,
+    })?;
+    let mut hasher = Sha256::new();
+    identity_field(&mut hasher, b"ferrl.checkpoint-policy.v1");
+    identity_field(&mut hasher, &recipe);
+    for (label, path) in files {
+        let metadata = std::fs::symlink_metadata(&path).map_err(|source| LoaderError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        if !metadata.file_type().is_file() {
+            return Err(LoaderError::Io {
+                path,
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "checkpoint identity source is not a regular file",
+                ),
+            });
+        }
+        identity_field(&mut hasher, label.as_bytes());
+        hasher.update(metadata.len().to_le_bytes());
+        let mut file = std::fs::File::open(&path).map_err(|source| LoaderError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let mut buffer = [0_u8; 64 * 1024];
+        let mut read_total = 0_u64;
+        loop {
+            let read = file.read(&mut buffer).map_err(|source| LoaderError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            if read == 0 {
+                break;
+            }
+            read_total = read_total.saturating_add(read as u64);
+            hasher.update(&buffer[..read]);
+        }
+        if read_total != metadata.len() {
+            return Err(LoaderError::Io {
+                path,
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "checkpoint identity source changed length while being hashed",
+                ),
+            });
+        }
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn identity_field(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
 }
 
 /// Errors from [`load_qwen_policy`].
@@ -299,6 +458,14 @@ impl Policy for AutoPolicy {
             Self::Qwen(policy) => policy.sampler_state(),
             Self::Qwen3_5(policy) => policy.sampler_state(),
             Self::Gemma4(policy) => policy.sampler_state(),
+        }
+    }
+
+    fn validate_sampler_state(&self, state: &[u8]) -> CandleResult<()> {
+        match self {
+            Self::Qwen(policy) => policy.validate_sampler_state(state),
+            Self::Qwen3_5(policy) => policy.validate_sampler_state(state),
+            Self::Gemma4(policy) => policy.validate_sampler_state(state),
         }
     }
 
@@ -689,6 +856,183 @@ mod tests {
         assert!(!o.memory_efficient_cached_gqa);
         assert_eq!(o.base_quantization, BaseQuantization::None);
         assert_eq!(o.tensor_parallel, TensorParallelPlan::single());
+    }
+
+    fn write_identity_fixture(dir: &Path, model_bytes: &[u8]) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("config.json"), br#"{"model_type":"qwen3"}"#).unwrap();
+        std::fs::write(dir.join("model.safetensors"), model_bytes).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_policy_identity_is_path_independent_and_content_sensitive() {
+        let tmp = TempDir::new("checkpoint-policy-identity");
+        let first = tmp.path().join("first");
+        let copied = tmp.path().join("copied");
+        write_identity_fixture(&first, b"same immutable model bytes");
+        write_identity_fixture(&copied, b"same immutable model bytes");
+        let opts = LoaderOpts::default();
+        let expected = checkpoint_policy_sha256(&first, &opts).unwrap();
+        assert_eq!(checkpoint_policy_sha256(&copied, &opts).unwrap(), expected);
+
+        std::fs::write(
+            copied.join("model.safetensors"),
+            b"changed immutable model bytes",
+        )
+        .unwrap();
+        assert_ne!(checkpoint_policy_sha256(&copied, &opts).unwrap(), expected);
+        write_identity_fixture(&copied, b"same immutable model bytes");
+        std::fs::write(
+            copied.join("config.json"),
+            br#"{"model_type":"qwen3","changed":true}"#,
+        )
+        .unwrap();
+        assert_ne!(checkpoint_policy_sha256(&copied, &opts).unwrap(), expected);
+    }
+
+    #[test]
+    fn checkpoint_policy_identity_binds_execution_recipe_but_not_sampler_position() {
+        let tmp = TempDir::new("checkpoint-policy-options");
+        write_identity_fixture(tmp.path(), b"model");
+        let base = LoaderOpts::default();
+        let expected = checkpoint_policy_sha256(tmp.path(), &base).unwrap();
+
+        let execution_mutations = [
+            (
+                "LoRA rank",
+                LoaderOpts {
+                    lora_rank: base.lora_rank + 1,
+                    ..base.clone()
+                },
+            ),
+            (
+                "LoRA alpha",
+                LoaderOpts {
+                    lora_alpha: base.lora_alpha + 1.0,
+                    ..base.clone()
+                },
+            ),
+            (
+                "base dtype",
+                LoaderOpts {
+                    base_dtype: DType::BF16,
+                    ..base.clone()
+                },
+            ),
+            (
+                "adapter dtype",
+                LoaderOpts {
+                    adapter_dtype: DType::BF16,
+                    ..base.clone()
+                },
+            ),
+            (
+                "cached GQA recipe",
+                LoaderOpts {
+                    memory_efficient_cached_gqa: true,
+                    ..base.clone()
+                },
+            ),
+            (
+                "base quantization",
+                LoaderOpts {
+                    base_quantization: BaseQuantization::Q8_0,
+                    ..base.clone()
+                },
+            ),
+            (
+                "tensor-parallel world",
+                LoaderOpts {
+                    tensor_parallel: TensorParallelPlan::new(0, 2).unwrap(),
+                    ..base.clone()
+                },
+            ),
+        ];
+        for (label, changed) in execution_mutations {
+            assert_ne!(
+                checkpoint_policy_sha256(tmp.path(), &changed).unwrap(),
+                expected,
+                "{label} was omitted from the checkpoint policy identity"
+            );
+        }
+        let sampler_only = LoaderOpts {
+            seed: base.seed.wrapping_add(1),
+            temperature: 0.7,
+            ..base.clone()
+        };
+        assert_eq!(
+            checkpoint_policy_sha256(tmp.path(), &sampler_only).unwrap(),
+            expected
+        );
+        let rank_zero = LoaderOpts {
+            tensor_parallel: TensorParallelPlan::new(0, 2).unwrap(),
+            ..base
+        };
+        let other_tp_rank = LoaderOpts {
+            tensor_parallel: TensorParallelPlan::new(1, 2).unwrap(),
+            ..rank_zero.clone()
+        };
+        assert_eq!(
+            checkpoint_policy_sha256(tmp.path(), &other_tp_rank).unwrap(),
+            checkpoint_policy_sha256(tmp.path(), &rank_zero).unwrap(),
+            "TP rank must not split one logical policy identity"
+        );
+    }
+
+    #[test]
+    fn checkpoint_policy_identity_binds_every_indexed_shard_and_rejects_unsafe_names() {
+        let tmp = TempDir::new("checkpoint-policy-indexed");
+        std::fs::write(
+            tmp.path().join("config.json"),
+            br#"{"model_type":"qwen3_5"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("model.safetensors.index.json"),
+            br#"{"weight_map":{"layer.0":"model-00001-of-00002.safetensors","layer.1":"model-00002-of-00002.safetensors"}}"#,
+        )
+        .unwrap();
+        let first = tmp.path().join("model-00001-of-00002.safetensors");
+        let second = tmp.path().join("model-00002-of-00002.safetensors");
+        std::fs::write(&first, b"first shard").unwrap();
+        std::fs::write(&second, b"second shard").unwrap();
+        let expected = checkpoint_policy_sha256(tmp.path(), &LoaderOpts::default()).unwrap();
+        for (label, path, original) in [
+            ("first", &first, &b"first shard"[..]),
+            ("second", &second, &b"second shard"[..]),
+        ] {
+            std::fs::write(path, format!("changed {label} shard")).unwrap();
+            assert_ne!(
+                checkpoint_policy_sha256(tmp.path(), &LoaderOpts::default()).unwrap(),
+                expected,
+                "{label} indexed shard was omitted from the identity"
+            );
+            std::fs::write(path, original).unwrap();
+        }
+
+        // The same referenced shard set with different tensor-to-shard coordinates
+        // is a different checkpoint layout and must not collide.
+        std::fs::write(
+            tmp.path().join("model.safetensors.index.json"),
+            br#"{"weight_map":{"layer.0":"model-00002-of-00002.safetensors","layer.1":"model-00001-of-00002.safetensors"}}"#,
+        )
+        .unwrap();
+        assert_ne!(
+            checkpoint_policy_sha256(tmp.path(), &LoaderOpts::default()).unwrap(),
+            expected,
+            "indexed weight-map coordinates were omitted from the identity"
+        );
+
+        std::fs::write(
+            tmp.path().join("model.safetensors.index.json"),
+            br#"{"weight_map":{"layer.0":"../outside.safetensors"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            checkpoint_policy_sha256(tmp.path(), &LoaderOpts::default()),
+            Err(LoaderError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::InvalidData
+        ));
     }
 
     fn sharded_tensor_parallel_opts() -> LoaderOpts {

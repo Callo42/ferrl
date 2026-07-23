@@ -500,12 +500,10 @@ pub trait GradModel {
     /// adapter is self-describing about which projections its positional
     /// tensor list covers (see
     /// [`crate::checkpoint::CheckpointManifest::lora_recipe`]). Defaults to
-    /// `None` (a model that predates recipes, or has none to report). The
-    /// positional checkpoint contract does not depend on it, but
-    /// [`crate::Trainer::resume`] cross-checks it against the manifest and
-    /// fails loud on a mismatch (a shape-aliased recipe swap is invisible to
-    /// the positional count/shape/dtype validation); a `None` on either side
-    /// skips that check.
+    /// `None` for a model with no adapter recipe. Ordinary v4 checkpoints bind
+    /// exact presence/value into the policy/config binding and ordered schema;
+    /// [`crate::Trainer::resume`] therefore rejects shape-aliased recipes and
+    /// `Some`/`None` drift before live state mutation.
     fn lora_recipe(&self) -> Option<String> {
         None
     }

@@ -37,7 +37,9 @@
 //! lockstep. Paired with the cooperative preemption flag (`SIGTERM`/`SIGUSR1`),
 //! the DP run survives a Slurm preempt/timeout: it checkpoints on the signal,
 //! exits before eval/gate, and the requeue continues. A `DP_PREEMPTED rank=R` line
-//! marks that path.
+//! marks that path. Every rank derives the same immutable checkpoint-content and
+//! loader-recipe digest before model construction; frozen-model or execution-recipe
+//! drift makes ordinary resume fail before live policy mutation.
 //!
 //! Requires `--features nccl` (a multi-GPU build); the default build prints a
 //! usage note and exits non-zero. Every knob has an `FERRL_CDDP_*` override.
@@ -68,8 +70,8 @@ mod dp {
         build_prompt, generate_dataset, CountdownConfig, CountdownProblem, CountdownReward,
     };
     use ferrl::{
-        read_metrics, Comm, HfTokenizer, Metrics, NcclComm, Policy, QwenGradModel, QwenPolicy,
-        RunDir, RunStop, Sample, Trainer, TrainerConfig,
+        checkpoint_policy_sha256, read_metrics, Comm, HfTokenizer, LoaderOpts, Metrics, NcclComm,
+        Policy, QwenGradModel, QwenPolicy, RunDir, RunStop, Sample, Trainer, TrainerConfig,
     };
     use tracing::{info, warn};
 
@@ -305,6 +307,18 @@ mod dp {
             anyhow!("set FERRL_QWEN_WEIGHTS to the Qwen3-0.6B-Base asset directory")
         })?;
         let dir = PathBuf::from(weights);
+        let checkpoint_policy_sha256 = checkpoint_policy_sha256(
+            &dir,
+            &LoaderOpts {
+                lora_rank: env_parse("FERRL_CDDP_RANK", 16usize),
+                lora_alpha: env_parse("FERRL_CDDP_ALPHA", 32.0f64),
+                base_dtype: resolve_base_dtype()?,
+                adapter_dtype: DType::F32,
+                seed: env_parse("FERRL_CDDP_SEED", 1234u64),
+                temperature: env_parse("FERRL_CDDP_TEMP", 1.0f64),
+                ..LoaderOpts::default()
+            },
+        )?;
         let (mut policy, tok) = build_policy(&dir, &device)?;
         let train_samples = build_train_samples();
         let reward = CountdownReward::default();
@@ -322,6 +336,7 @@ mod dp {
         let (run, shared_ckpts, preempt) = open_dp_run(rank)?;
         let metrics_path = run.metrics_path();
         let mut trainer = Trainer::with_comm(tcfg, &run, comm)?
+            .with_checkpoint_policy_sha256(checkpoint_policy_sha256)
             .with_preemption_flag(preempt)
             .with_checkpoints_dir(shared_ckpts);
         // resume_latest auto-discovers rank 0's newest checkpoint and broadcasts it
