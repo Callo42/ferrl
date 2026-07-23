@@ -13,9 +13,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::grpo::{finite_moments, group_advantages, ScaleRewards, GROUP_STD_EPS};
+use crate::policy::validate_completion_semantics;
 
 /// The only rollout-ledger format this release accepts.
-pub const ROLLOUT_LEDGER_FORMAT_VERSION: u32 = 5;
+pub const ROLLOUT_LEDGER_FORMAT_VERSION: u32 = 6;
 
 const PAYLOAD_FILE: &str = "window.json";
 const MANIFEST_FILE: &str = "manifest.json";
@@ -266,6 +267,9 @@ pub struct RolloutLedgerGroup {
     pub prompt_index: u64,
     /// Global first rollout-row ordinal used to derive this shard's RNG substreams.
     pub rollout_global_row_base: u64,
+    /// Exact tokenizer encoding of the selected sample prompt, captured before
+    /// policy generation and independently bound to every rollout-row prefix.
+    pub prompt_token_ids: Vec<u32>,
     /// Rectangular rows: prompt tokens followed by padded completion tokens.
     pub token_ids: Vec<Vec<u32>>,
     /// Number of leading prompt tokens shared by this group's rows.
@@ -1580,7 +1584,18 @@ fn validate_group(
             )));
         }
     }
-    let prompt_prefix = &group.token_ids[0][..prompt_len];
+    if group.prompt_token_ids.is_empty() {
+        return Err(RolloutLedgerError::Invalid(
+            "selected prompt token ids must be nonempty".into(),
+        ));
+    }
+    if group.prompt_token_ids.len() != prompt_len {
+        return Err(RolloutLedgerError::Invalid(format!(
+            "prompt_len {prompt_len} does not match {} persisted selected prompt tokens",
+            group.prompt_token_ids.len()
+        )));
+    }
+    let prompt_prefix = group.prompt_token_ids.as_slice();
     let rewards: Vec<f64> = group
         .reward_bits
         .iter()
@@ -1716,11 +1731,7 @@ fn validate_distributed_packages(
                     )
                 })?;
             let mut global_rewards = Vec::new();
-            let canonical_prompt_len = packages[0].0.groups[group_index].prompt_len;
-            let canonical_prompt = {
-                let group = &packages[0].0.groups[group_index];
-                &group.token_ids[0][..canonical_prompt_len as usize]
-            };
+            let canonical_prompt = &packages[0].0.groups[group_index].prompt_token_ids;
             for (payload, _, _) in packages {
                 let group = &payload.groups[group_index];
                 if group.distributed_reward_stats != Some(canonical) {
@@ -1728,9 +1739,7 @@ fn validate_distributed_packages(
                         "distributed reward statistics disagree at accumulation group {group_index}"
                     )));
                 }
-                if group.prompt_len != canonical_prompt_len
-                    || &group.token_ids[0][..group.prompt_len as usize] != canonical_prompt
-                {
+                if &group.prompt_token_ids != canonical_prompt {
                     return Err(RolloutLedgerError::Invalid(format!(
                         "distributed same-prompt prefixes disagree at accumulation group {group_index}"
                     )));
@@ -1827,37 +1836,8 @@ fn validate_completion_tokens(
     completion: &[u32],
     real: usize,
 ) -> Result<(), RolloutLedgerError> {
-    let Some(eos) = step.eos_token_id else {
-        if real != completion.len() {
-            return Err(RolloutLedgerError::Invalid(format!(
-                "completion row {row} is shortened without an EOS token"
-            )));
-        }
-        return Ok(());
-    };
-    if real == 0 {
-        if completion.iter().any(|&token| token != eos) {
-            return Err(RolloutLedgerError::Invalid(format!(
-                "zero-length completion row {row} is not entirely EOS padding"
-            )));
-        }
-        return Ok(());
-    }
-    let first_eos = completion.iter().position(|&token| token == eos);
-    match first_eos {
-        Some(index) if index + 1 != real => Err(RolloutLedgerError::Invalid(format!(
-            "completion row {row} length does not end at its first EOS token"
-        ))),
-        Some(_) if completion[real..].iter().any(|&token| token != eos) => {
-            Err(RolloutLedgerError::Invalid(format!(
-                "completion row {row} padding after EOS is not EOS-filled"
-            )))
-        }
-        None if real != completion.len() => Err(RolloutLedgerError::Invalid(format!(
-            "completion row {row} is shortened without sampling EOS"
-        ))),
-        Some(_) | None => Ok(()),
-    }
+    validate_completion_semantics(completion, real, step.eos_token_id)
+        .map_err(|detail| RolloutLedgerError::Invalid(format!("completion row {row} {detail}")))
 }
 
 fn validate_behavior_capture(
@@ -2277,6 +2257,7 @@ mod tests {
             accum_index: 0,
             prompt_index: 7,
             rollout_global_row_base: 14,
+            prompt_token_ids: vec![5],
             token_ids: vec![vec![5, 6, 9, 9], vec![5, 7, 8, 3]],
             prompt_len: 1,
             completion_lens: vec![2, 3],
@@ -3171,22 +3152,11 @@ mod tests {
     }
 
     #[test]
-    fn zero_token_degenerate_window_uses_clamped_denominator_and_no_scoring() {
+    fn zero_length_eos_filled_window_is_not_first_eos_inclusive() {
         let value = degenerate_zero_token_step();
-        validate_step(&value).unwrap();
-
-        let mut raw_zero = value.clone();
-        raw_zero.window_tokens = 0;
         assert!(matches!(
-            validate_step(&raw_zero),
-            Err(RolloutLedgerError::Invalid(message)) if message.contains("clamped")
-        ));
-
-        let mut unnecessary_old = value;
-        unnecessary_old.old_logprobs = LedgerScoreRequirement::AdapterEnabledDetached;
-        assert!(matches!(
-            validate_step(&unnecessary_old),
-            Err(RolloutLedgerError::Invalid(message)) if message.contains("old scoring")
+            validate_step(&value),
+            Err(RolloutLedgerError::Invalid(message)) if message.contains("first EOS token")
         ));
     }
 
@@ -3354,6 +3324,54 @@ mod tests {
                 Err(RolloutLedgerError::Invalid(_))
             ));
         }
+    }
+
+    #[test]
+    fn reader_rejects_uniformly_wrong_prefixes_against_persisted_selected_prompt() {
+        let tmp = TempDir::new("uniform-wrong-persisted-prompt");
+        RolloutLedgerWriter::create(&tmp.0, identity())
+            .unwrap()
+            .write_step(&step())
+            .unwrap();
+        rewrite_payload(&tmp.0, |value| {
+            for row in &mut value.groups[0].token_ids {
+                row[0] = 6;
+            }
+        });
+
+        assert!(matches!(
+            RolloutLedgerReader::open(&tmp.0, expectations())
+                .unwrap()
+                .read_step(7),
+            Err(RolloutLedgerError::Invalid(message)) if message.contains("prompt prefix")
+        ));
+    }
+
+    #[test]
+    fn distributed_reader_rejects_identically_forged_prefixes_on_every_shard() {
+        let tmp = TempDir::new("distributed-uniform-wrong-persisted-prompt");
+        let (_, shards) =
+            publish_distributed(&tmp.0, RolloutLedgerGroupScope::DistributedSamePrompt, 86);
+        for rank in 0..2 {
+            rewrite_distributed_shard(&tmp.0, rank, |value| {
+                for row in &mut value.groups[0].token_ids {
+                    row[0] = 6;
+                }
+            });
+        }
+
+        assert!(matches!(
+            RolloutLedgerReader::open(
+                &tmp.0,
+                RolloutLedgerExpectations {
+                    identity: identity(),
+                    controls: controls_from_step(&shards[0]),
+                },
+            )
+            .unwrap()
+            .read_distributed_step(7, 0, 2),
+            Err(RolloutLedgerError::Invalid(message)) if message.contains("prompt prefix")
+        ));
     }
 
     #[test]

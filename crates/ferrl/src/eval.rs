@@ -48,7 +48,7 @@
 //! full width and decoding is the entire post-prompt slice, unchanged.
 
 use crate::grpo::finite_moments;
-use crate::policy::{GenConfig, Policy, Rollout};
+use crate::policy::{validate_generated_rollout_semantics, GenConfig, Policy, Rollout};
 use crate::reward::{validate_reward_values, RewardError, RewardFn};
 use crate::sample::Sample;
 use crate::trainer::TokenizerLike;
@@ -271,7 +271,7 @@ fn mean_reward<P: Policy, R: RewardFn>(
     global_row_base: u64,
 ) -> Result<f32, EvalError> {
     let rollout = policy.generate_at(prompt_ids, gen, global_row_base)?;
-    validate_rollout(&rollout, gen.group_size)?;
+    validate_rollout(&rollout, prompt_ids, gen)?;
     let completions: Vec<String> = rollout
         .token_ids
         .iter()
@@ -306,11 +306,17 @@ fn mean_reward<P: Policy, R: RewardFn>(
 /// `group_size` completions, a non-empty prompt context, every sequence at least as
 /// long as the prompt (so the completion slice is well-defined), a
 /// `completion_lens` that aligns with the sequences and stays within each one's
-/// completion span (it drives the length-aware decode), and — when present — a
-/// behavior-log-prob capture aligned with those lengths. It does **not** require
-/// rectangular completions — eval scores each sequence independently, so the length
-/// bound is per-sequence rather than a shared width.
-fn validate_rollout(rollout: &Rollout, group_size: usize) -> Result<(), EvalError> {
+/// completion span (it drives the length-aware decode), exact selected-prompt
+/// prefixes, the configured physical generation width and EOS semantics, and —
+/// when present — a behavior-log-prob capture aligned with those lengths. Public
+/// generation is rectangular at `max_new_tokens`, matching the policy contract
+/// and the trainer even though eval decodes each row independently.
+fn validate_rollout(
+    rollout: &Rollout,
+    prompt_ids: &[u32],
+    gen: &GenConfig,
+) -> Result<(), EvalError> {
+    let group_size = gen.group_size;
     if rollout.len() != group_size {
         return Err(EvalError::Contract(format!(
             "Policy::generate returned {} completions for group_size {group_size}",
@@ -334,6 +340,7 @@ fn validate_rollout(rollout: &Rollout, group_size: usize) -> Result<(), EvalErro
         )));
     }
     validate_completion_lens(rollout, group_size)?;
+    validate_generated_rollout_semantics(rollout, prompt_ids, gen).map_err(EvalError::Contract)?;
     validate_rollout_logprobs(rollout)?;
     Ok(())
 }
@@ -367,10 +374,11 @@ fn validate_rollout_logprobs(rollout: &Rollout) -> Result<(), EvalError> {
 }
 
 /// Validate `completion_lens` for length-aware decoding: one length per sequence,
-/// each within its sequence's completion span (`ids.len() - prompt_len`). Eval does
-/// not require rectangular rows, so the bound is per-sequence; a length past the
-/// available tokens would over-read the decode slice / score nonexistent tokens.
-/// Split out of [`validate_rollout`] to keep it under the cognitive-complexity bound.
+/// each within its sequence's completion span (`ids.len() - prompt_len`). The
+/// shared semantic validator separately requires the configured rectangular
+/// width and exact EOS/no-EOS meaning; this local bound keeps malformed input from
+/// ever reaching a decode slice. Split out of [`validate_rollout`] to keep it
+/// under the cognitive-complexity bound.
 fn validate_completion_lens(rollout: &Rollout, group_size: usize) -> Result<(), EvalError> {
     if rollout.completion_lens.len() != group_size {
         return Err(EvalError::Contract(format!(
@@ -596,12 +604,12 @@ mod tests {
 
     #[test]
     fn eos_aware_eval_scores_only_the_real_completion() {
-        // Real completion "1" (digit-sum reward 1) padded with "9"s to width 3. A
-        // full-slice decode would score "199" (reward 19); the length-aware decode
-        // scores only "1". evaluate now accepts a `Some` eos_token_id (the PR3
-        // guard-lift) and the decode honors completion_lens.
+        // Real completion "19" includes EOS (digit-sum reward 10) and is padded
+        // with another "9" to width 3. A full-slice decode would score "199"
+        // (reward 19); the length-aware decode scores exactly through the first
+        // EOS. The artificial digit EOS pins first-EOS-inclusive semantics.
         let mut policy = EosPaddedPolicy {
-            real: vec![1],
+            real: vec![1, 9],
             pad: 9,
             enabled: true,
         };
@@ -611,8 +619,8 @@ mod tests {
             ..gen(4, 3)
         };
         let report = evaluate(&mut policy, &DigitSumReward, &DigitCodec, &samples, &cfg).unwrap();
-        assert_eq!(report.base_reward_mean, 1.0);
-        assert_eq!(report.adapter_reward_mean, 1.0);
+        assert_eq!(report.base_reward_mean, 10.0);
+        assert_eq!(report.adapter_reward_mean, 10.0);
     }
 
     #[test]
@@ -754,19 +762,19 @@ mod tests {
         // agreeing on what a valid Policy::generate returns.
         let mut ok = Rollout::rectangular(vec![vec![5, 1, 2], vec![5, 3, 4]], 1);
         ok.rollout_logprobs = Some(vec![vec![-0.1, -0.2], vec![-0.3, -0.4]]);
-        assert!(validate_rollout(&ok, 2).is_ok());
+        assert!(validate_rollout(&ok, &[5], &gen(2, 2)).is_ok());
         // Row 1 has one entry for completion_len 2.
         let mut bad_row = ok.clone();
         bad_row.rollout_logprobs = Some(vec![vec![-0.1, -0.2], vec![-0.3]]);
         assert!(matches!(
-            validate_rollout(&bad_row, 2),
+            validate_rollout(&bad_row, &[5], &gen(2, 2)),
             Err(EvalError::Contract(_))
         ));
         // One capture row for two sequences.
         let mut bad_count = ok.clone();
         bad_count.rollout_logprobs = Some(vec![vec![-0.1, -0.2]]);
         assert!(matches!(
-            validate_rollout(&bad_count, 2),
+            validate_rollout(&bad_count, &[5], &gen(2, 2)),
             Err(EvalError::Contract(_))
         ));
     }
@@ -909,10 +917,19 @@ mod tests {
         ZeroPromptLen,
         /// `completion_lens` has fewer entries than sequences (misaligned).
         BadLens,
+        /// Every row agrees on a prefix that is not the selected prompt.
+        UniformWrongPrefix,
+        /// EOS is followed by a live non-EOS token inside the generated width.
+        PostEosLiveToken,
+        /// A no-EOS rollout claims a length shorter than its generated width.
+        ShortenedWithoutEos,
     }
 
     /// A policy that emits a chosen malformed rollout.
-    struct MalformedPolicy(Malformed);
+    struct MalformedPolicy {
+        mode: Malformed,
+        enabled: bool,
+    }
     impl Policy for MalformedPolicy {
         fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
             let body = |extra: u32| {
@@ -920,7 +937,7 @@ mod tests {
                 ids.push(extra);
                 ids
             };
-            let (token_ids, prompt_len) = match self.0 {
+            let (token_ids, prompt_len) = match self.mode {
                 Malformed::Overfill => {
                     let v = (0..cfg.group_size + 1).map(|_| body(0)).collect();
                     (v, prompt.len())
@@ -938,20 +955,42 @@ mod tests {
                     let v = (0..cfg.group_size).map(|_| body(0)).collect();
                     (v, prompt.len())
                 }
+                Malformed::UniformWrongPrefix => {
+                    let v = (0..cfg.group_size)
+                        .map(|_| vec![prompt[0] ^ 1, 1, 2])
+                        .collect();
+                    (v, prompt.len())
+                }
+                Malformed::PostEosLiveToken => {
+                    let v = (0..cfg.group_size).map(|_| vec![prompt[0], 9, 7]).collect();
+                    (v, prompt.len())
+                }
+                Malformed::ShortenedWithoutEos => {
+                    let v = (0..cfg.group_size).map(|_| vec![prompt[0], 1, 2]).collect();
+                    (v, prompt.len())
+                }
             };
             let mut rollout = Rollout::rectangular(token_ids, prompt_len);
-            if let Malformed::BadLens = self.0 {
-                // Drop one length so completion_lens no longer aligns with the rows.
-                rollout.completion_lens.pop();
+            match self.mode {
+                Malformed::BadLens => {
+                    // Drop one length so completion_lens no longer aligns with the rows.
+                    rollout.completion_lens.pop();
+                }
+                Malformed::PostEosLiveToken | Malformed::ShortenedWithoutEos => {
+                    rollout.completion_lens.fill(1);
+                }
+                _ => {}
             }
             Ok(rollout)
         }
         fn token_logprobs(&self, _rollout: &Rollout) -> CandleResult<Tensor> {
             Tensor::zeros((1, 1), DType::F32, &Device::Cpu)
         }
-        fn set_adapter_enabled(&mut self, _enabled: bool) {}
+        fn set_adapter_enabled(&mut self, enabled: bool) {
+            self.enabled = enabled;
+        }
         fn adapter_enabled(&self) -> bool {
-            true
+            self.enabled
         }
         fn trainable_vars(&self) -> Vec<Var> {
             vec![]
@@ -973,7 +1012,10 @@ mod tests {
             Malformed::ZeroPromptLen,
             Malformed::BadLens,
         ] {
-            let mut policy = MalformedPolicy(mode);
+            let mut policy = MalformedPolicy {
+                mode,
+                enabled: true,
+            };
             let err = evaluate(
                 &mut policy,
                 &DigitSumReward,
@@ -986,6 +1028,52 @@ mod tests {
                 matches!(err, EvalError::Contract(_)),
                 "{mode:?}: got {err:?}"
             );
+        }
+    }
+
+    struct CountingEvalReward<'a>(&'a Cell<usize>);
+
+    impl RewardFn for CountingEvalReward<'_> {
+        type Target = ();
+
+        fn reward(&self, sample: &Sample<()>, completion: &str) -> Result<f32, RewardError> {
+            self.0.set(self.0.get() + 1);
+            DigitSumReward.reward(sample, completion)
+        }
+    }
+
+    #[test]
+    fn public_eval_rejects_prompt_and_completion_semantic_violations_before_reward() {
+        for (mode, eos_token_id) in [
+            (Malformed::UniformWrongPrefix, None),
+            (Malformed::PostEosLiveToken, Some(9)),
+            (Malformed::ShortenedWithoutEos, None),
+        ] {
+            let mut policy = MalformedPolicy {
+                mode,
+                enabled: true,
+            };
+            let calls = Cell::new(0);
+            let cfg = GenConfig {
+                eos_token_id,
+                ..gen(2, 2)
+            };
+
+            let error = evaluate(
+                &mut policy,
+                &CountingEvalReward(&calls),
+                &DigitCodec,
+                &[Sample::new("5", ())],
+                &cfg,
+            )
+            .unwrap_err();
+
+            assert!(
+                matches!(error, EvalError::Contract(_)),
+                "{mode:?}: {error:?}"
+            );
+            assert_eq!(calls.get(), 0, "{mode:?} reached reward execution");
+            assert!(policy.adapter_enabled(), "{mode:?} did not restore adapter");
         }
     }
 

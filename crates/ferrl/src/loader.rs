@@ -286,6 +286,14 @@ impl Policy for AutoPolicy {
         }
     }
 
+    fn requires_rollout_tensor_snapshot(&self) -> bool {
+        match self {
+            Self::Qwen(policy) => policy.requires_rollout_tensor_snapshot(),
+            Self::Qwen3_5(policy) => policy.requires_rollout_tensor_snapshot(),
+            Self::Gemma4(policy) => policy.requires_rollout_tensor_snapshot(),
+        }
+    }
+
     fn sampler_state(&self) -> CandleResult<Vec<u8>> {
         match self {
             Self::Qwen(policy) => policy.sampler_state(),
@@ -1005,6 +1013,7 @@ mod tests {
         )
         .unwrap();
         assert!(!policy.supports_tensor_parallel());
+        assert!(!policy.requires_rollout_tensor_snapshot());
         let AutoPolicy::Qwen3_5(policy) = policy else {
             panic!("expected Qwen3.5 auto-loader branch");
         };

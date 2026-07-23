@@ -150,6 +150,18 @@ pub trait GradModel {
     /// writes through to the model.
     fn trainable_vars(&self) -> Vec<Var>;
 
+    /// Whether [`crate::LmPolicy`] must retain value copies of every trainable
+    /// tensor while a rollback-capable rollout window is in flight.
+    ///
+    /// The default is conservative because `GradModel` is a public extension
+    /// seam: an external implementation may use interior mutability from
+    /// merged-decoder construction or detached forwards. Returning `false` is
+    /// a strict assertion that every pre-update rollout hook preserves both
+    /// trainable tensor values and their [`Var`] bindings.
+    fn requires_rollout_tensor_snapshot(&self) -> bool {
+        true
+    }
+
     /// Enable/disable the `LoRA` adapter everywhere.
     ///
     /// CONTRACT: disabled == the frozen base model == the GRPO reference
@@ -619,6 +631,15 @@ mod tests {
             "default backward lost the var grad"
         );
         assert!(m.lora_recipe().is_none());
+        assert!(
+            m.requires_rollout_tensor_snapshot(),
+            "external GradModel implementations must default fail-safe"
+        );
+        let policy = crate::LmPolicy::new(m, 7, 1.0);
+        assert!(
+            crate::Policy::requires_rollout_tensor_snapshot(&policy),
+            "LmPolicy must preserve its wrapped GradModel's conservative default"
+        );
     }
 
     #[test]

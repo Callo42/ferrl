@@ -1056,6 +1056,49 @@ pub struct LoraLinear {
     enabled: bool,
 }
 
+/// Validate and return the effective `LoRA` scale (`alpha / rank`) for a compute
+/// dtype.
+///
+/// Candle applies the scalar after casting it to the frozen base's compute dtype.
+/// A finite positive `alpha` is therefore not sufficient: the derived scale must
+/// remain finite and nonzero in that dtype, or the adapter becomes a guaranteed
+/// no-op (underflow) or injects infinity (overflow).
+///
+/// # Errors
+///
+/// Returns a candle error when `rank == 0`, `alpha` is not finite and positive,
+/// the derived scale is outside the finite nonzero range of `compute_dtype`, or
+/// the dtype is not floating point.
+pub fn validated_lora_scale(alpha: f64, rank: usize, compute_dtype: DType) -> CandleResult<f64> {
+    if rank == 0 {
+        return Err(candle_core::Error::Msg("lora rank must be > 0".into()));
+    }
+    if !alpha.is_finite() || alpha <= 0.0 {
+        return Err(candle_core::Error::Msg(
+            "lora alpha must be finite and > 0".into(),
+        ));
+    }
+    let scale = alpha / rank as f64;
+    let representable = match compute_dtype {
+        DType::F64 => scale.is_finite() && scale > 0.0,
+        DType::F32 => {
+            let narrowed = scale as f32;
+            narrowed.is_finite() && narrowed > 0.0
+        }
+        // Conservative explicit contracts: accept only the closed range of
+        // finite, positive values representable by each 16-bit compute dtype.
+        DType::F16 => (5.960_464_477_539_063e-8..=65_504.0).contains(&scale),
+        DType::BF16 => (9.183_549_615_799_121e-41..=3.389_531_389_251_535_5e38).contains(&scale),
+        _ => false,
+    };
+    if !representable {
+        return Err(candle_core::Error::Msg(format!(
+            "lora scale alpha/rank = {scale} must be finite and nonzero in compute dtype {compute_dtype:?}"
+        )));
+    }
+    Ok(scale)
+}
+
 impl LoraLinear {
     /// Build a `LoRA` layer with adapter factors in the **base weight's** dtype.
     ///
@@ -1096,8 +1139,9 @@ impl LoraLinear {
     ///
     /// # Errors
     ///
-    /// Returns a candle error if `rank == 0` or if the adapter factors cannot be
-    /// allocated on the base weight's device.
+    /// Returns a candle error if `rank == 0`, if `alpha` is not finite and
+    /// strictly positive, or if the adapter factors cannot be allocated on the
+    /// base weight's device.
     pub fn with_adapter_dtype(
         base_weight: Tensor,
         base_bias: Option<Tensor>,
@@ -1135,14 +1179,11 @@ impl LoraLinear {
         adapter_dtype: DType,
     ) -> CandleResult<Self> {
         let (out, in_) = base_weight.dims2()?;
-        if rank == 0 {
-            return Err(candle_core::Error::Msg("lora rank must be > 0".into()));
-        }
+        let scale = validated_lora_scale(alpha, rank, base_weight.dtype())?;
         let device = base_weight.device();
         let a = Var::randn(0.0, 0.02, (rank, in_), device)?.to_dtype(adapter_dtype)?;
         let a = Var::from_tensor(&a)?;
         let b = Var::zeros((out, rank), adapter_dtype, device)?;
-        let scale = alpha / rank as f64;
         Ok(Self {
             base_weight,
             base_bias,
@@ -1530,6 +1571,64 @@ mod tests {
         let w = base(4, 3);
         let l = LoraLinear::new(w, None, 2, 8.0).unwrap();
         assert_eq!(l.scale(), 4.0);
+    }
+
+    #[test]
+    fn lora_rejects_nonfinite_or_nonpositive_alpha() {
+        for alpha in [
+            0.0,
+            -1.0,
+            f64::MIN_POSITIVE,
+            f64::MAX,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            let err = LoraLinear::new(base(4, 3), None, 2, alpha).unwrap_err();
+            assert!(
+                err.to_string().contains("scale") || err.to_string().contains("alpha"),
+                "alpha {alpha:?} produced unexpected error: {err}"
+            );
+        }
+        assert!(LoraLinear::new(base(4, 3), None, 2, 8.0).is_ok());
+    }
+
+    #[test]
+    fn effective_scale_must_remain_finite_and_nonzero_in_f32_and_bf16() {
+        for dtype in [DType::F32, DType::BF16] {
+            assert!(validated_lora_scale(8.0, 2, dtype).is_ok());
+            for alpha in [f64::MIN_POSITIVE, f64::MAX] {
+                let error = validated_lora_scale(alpha, 2, dtype).unwrap_err();
+                assert!(
+                    error.to_string().contains("lora scale"),
+                    "{dtype:?}: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn effective_scale_f16_accepts_valid_boundaries_and_rejects_underflow_and_overflow() {
+        const MIN_POSITIVE_SUBNORMAL: f64 = 5.960_464_477_539_063e-8;
+        const MAX_FINITE: f64 = 65_504.0;
+
+        for scale in [MIN_POSITIVE_SUBNORMAL, 1.0, MAX_FINITE] {
+            assert_eq!(validated_lora_scale(scale, 1, DType::F16).unwrap(), scale);
+        }
+        for scale in [MIN_POSITIVE_SUBNORMAL / 2.0, 65_536.0] {
+            let error = validated_lora_scale(scale, 1, DType::F16).unwrap_err();
+            assert!(error.to_string().contains("compute dtype F16"), "{error}");
+        }
+    }
+
+    #[test]
+    fn mixed_dtype_constructor_validates_scale_in_base_compute_dtype() {
+        let alpha = 1e-42;
+        assert!(LoraLinear::with_adapter_dtype(base(4, 3), None, 1, alpha, DType::F32).is_ok());
+        let bf16_base = Tensor::zeros((4, 3), DType::BF16, &Device::Cpu).unwrap();
+        let error =
+            LoraLinear::with_adapter_dtype(bf16_base, None, 1, alpha, DType::F32).unwrap_err();
+        assert!(error.to_string().contains("compute dtype BF16"), "{error}");
     }
 
     #[test]

@@ -33,7 +33,9 @@ pub struct Rollout {
     /// index within the (rectangular) completion are padding and are masked out of
     /// the GRPO loss. For a fixed-length, no-early-stop rollout this equals the
     /// full completion width for every sequence (see [`Rollout::rectangular`]); a
-    /// per-element value is in `0..=comp_len`.
+    /// per-element value is structurally in `0..=comp_len`; production generation
+    /// with a positive token budget rejects zero because the first generated EOS
+    /// itself counts as one real token.
     pub completion_lens: Vec<usize>,
     /// Per-token **behavior-policy** log-probabilities of the sampled completion
     /// tokens — the probability each token was *actually drawn with* (the rollout
@@ -115,6 +117,99 @@ impl Rollout {
     pub fn is_empty(&self) -> bool {
         self.token_ids.is_empty()
     }
+}
+
+/// Validate one physical completion row against the configured EOS contract.
+///
+/// `real` must end immediately after the first EOS token (inclusive), or equal
+/// the full generated width when no EOS is configured or sampled. A rectangular
+/// tail after EOS must be EOS-filled padding; a live token after EOS is invalid.
+pub(crate) fn validate_completion_semantics(
+    completion: &[u32],
+    real: usize,
+    eos_token_id: Option<u32>,
+) -> Result<(), String> {
+    if real > completion.len() {
+        return Err(format!(
+            "completion_len {real} exceeds generated width {}",
+            completion.len()
+        ));
+    }
+    let Some(eos) = eos_token_id else {
+        if real != completion.len() {
+            return Err(format!(
+                "completion_len {real} is shortened without EOS; expected full generated width {}",
+                completion.len()
+            ));
+        }
+        return Ok(());
+    };
+
+    let first_eos = completion.iter().position(|&token| token == eos);
+    let expected = first_eos.map_or(completion.len(), |index| index + 1);
+    if real != expected {
+        return Err(format!(
+            "completion_len {real} does not end immediately after the first EOS token; expected {expected}"
+        ));
+    }
+    if first_eos.is_some() && completion[expected..].iter().any(|&token| token != eos) {
+        return Err("completion contains a live non-EOS token after its first EOS".into());
+    }
+    Ok(())
+}
+
+/// Validate a policy rollout against the exact encoded selected prompt and the
+/// generation contract that produced it.
+///
+/// Every row must contain that prompt verbatim, carry exactly
+/// `max_new_tokens` physical completion positions, and satisfy
+/// [`validate_completion_semantics`]. Shape/count checks that are specific to a
+/// caller (for example trainer rectangular scoring or eval group size) remain at
+/// those caller seams.
+pub(crate) fn validate_generated_rollout_semantics(
+    rollout: &Rollout,
+    prompt_ids: &[u32],
+    gen: &GenConfig,
+) -> Result<(), String> {
+    if rollout.prompt_len != prompt_ids.len() {
+        return Err(format!(
+            "rollout prompt_len {} does not match encoded selected prompt length {}",
+            rollout.prompt_len,
+            prompt_ids.len()
+        ));
+    }
+    if rollout.completion_lens.len() != rollout.token_ids.len() {
+        return Err(format!(
+            "rollout has {} completion_lens for {} token rows",
+            rollout.completion_lens.len(),
+            rollout.token_ids.len()
+        ));
+    }
+    let expected_row_len = prompt_ids
+        .len()
+        .checked_add(gen.max_new_tokens)
+        .ok_or_else(|| "prompt plus generation width overflows usize".to_owned())?;
+    for (row, (tokens, &real)) in rollout
+        .token_ids
+        .iter()
+        .zip(&rollout.completion_lens)
+        .enumerate()
+    {
+        if tokens.len() != expected_row_len {
+            return Err(format!(
+                "rollout row {row} has length {}, expected {expected_row_len} from the encoded prompt and max_new_tokens",
+                tokens.len()
+            ));
+        }
+        if &tokens[..prompt_ids.len()] != prompt_ids {
+            return Err(format!(
+                "rollout row {row} prefix does not match the encoded selected prompt"
+            ));
+        }
+        validate_completion_semantics(&tokens[prompt_ids.len()..], real, gen.eos_token_id)
+            .map_err(|detail| format!("rollout row {row} {detail}"))?;
+    }
+    Ok(())
 }
 
 /// **Eval-only** sampling parameters, the deliberate override channel for
@@ -370,6 +465,29 @@ pub trait Policy {
     /// `trainable_vars()`.
     fn trainable_vars(&self) -> Vec<Var>;
 
+    /// Whether a rollback-capable direct rollout window must retain value copies
+    /// of every [`trainable_vars`](Self::trainable_vars) tensor.
+    ///
+    /// The default is deliberately `true`: an opaque policy may use interior
+    /// mutability (including [`Var::set`]) from its generation, adapter-toggle,
+    /// or detached-scoring hooks. If a later group in the same accumulation
+    /// window fails semantic validation, the trainer therefore needs the tensor
+    /// values from before the first hook in order to restore the policy exactly.
+    ///
+    /// Returning `false` is a strict capability assertion. It is sound only when
+    /// every pre-update rollout hook preserves both the values and bindings of
+    /// all trainable variables. The sampler state and adapter-enabled flag may
+    /// still change; the trainer snapshots and restores those separately. A
+    /// policy that violates this assertion can leave trainable state partially
+    /// mutated after a failed window.
+    ///
+    /// Wrapper policies should delegate this method when they delegate the
+    /// relevant hooks. Inheriting the conservative `true` default remains safe,
+    /// but may retain a model-sized device copy for the complete window.
+    fn requires_rollout_tensor_snapshot(&self) -> bool {
+        true
+    }
+
     /// Serialize the policy's rollout-sampler RNG state to an opaque byte blob, for
     /// momentum-faithful checkpoint persistence.
     ///
@@ -599,6 +717,12 @@ mod tests {
         let e = Rollout::rectangular(vec![], 0);
         assert_eq!(e.len(), 0);
         assert!(e.is_empty());
+    }
+
+    #[test]
+    fn opaque_policy_requires_rollout_tensor_snapshot_by_default() {
+        let policy = DefaultTensorParallelPolicy;
+        assert!(policy.requires_rollout_tensor_snapshot());
     }
 
     #[test]

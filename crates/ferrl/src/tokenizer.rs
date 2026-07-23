@@ -79,6 +79,18 @@ impl HfTokenizer {
         })?;
         Ok(Self { inner })
     }
+
+    /// Number of base plus added tokens addressable by this tokenizer.
+    #[must_use]
+    pub fn vocab_size(&self) -> usize {
+        self.inner.get_vocab_size(true)
+    }
+
+    /// Whether `id` names a token in the loaded tokenizer vocabulary.
+    #[must_use]
+    pub fn contains_id(&self, id: u32) -> bool {
+        self.inner.id_to_token(id).is_some()
+    }
 }
 
 impl TokenizerLike for HfTokenizer {
@@ -160,6 +172,14 @@ mod tests {
         // error), so the wrapper returns an empty string via the Ok path.
         let tok = HfTokenizer::from_file(fixture()).unwrap();
         assert_eq!(tok.decode(&[999]), "");
+    }
+
+    #[test]
+    fn exposes_vocab_bounds_for_generation_config_validation() {
+        let tok = HfTokenizer::from_file(fixture()).unwrap();
+        assert_eq!(tok.vocab_size(), 4);
+        assert!(tok.contains_id(3));
+        assert!(!tok.contains_id(4));
     }
 
     #[test]
