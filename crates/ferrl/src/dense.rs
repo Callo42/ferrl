@@ -1848,3 +1848,253 @@ impl CachedDecoder for DenseCachedDecoder {
         DenseCachedDecoder::reset_cache(self);
     }
 }
+
+#[cfg(test)]
+mod rollout_state_tests {
+    use super::*;
+    use candle_core::TensorId;
+    use std::collections::HashMap;
+
+    /// A production-shaped one-layer instantiation of the shared dense backbone.
+    /// Keeping the marker local makes this gate pin the generic Dense implementation
+    /// directly instead of inheriting an architecture module's test fixtures.
+    #[derive(Debug, Clone, Copy)]
+    struct TinyDenseArch;
+
+    impl DenseArch for TinyDenseArch {
+        type Config = ();
+
+        const LABEL: &'static str = "TinyDenseGradModel";
+
+        fn spec(_: &(), dtype: DType, device: &Device) -> CandleResult<DenseSpec> {
+            Ok(DenseSpec {
+                vocab_size: 8,
+                hidden_size: 4,
+                num_hidden_layers: 1,
+                num_attention_heads: 1,
+                num_key_value_heads: 1,
+                head_dim: 4,
+                intermediate_size: 8,
+                rms_norm_eps: 1e-6,
+                tie_word_embeddings: true,
+                qk_norm: false,
+                sdpa_f32: false,
+                activation: Activation::Silu,
+                rot: RotaryTables::new(4, 10_000.0, 16, dtype, device)?,
+            })
+        }
+    }
+
+    fn test_device() -> Device {
+        Device::Cpu
+    }
+
+    fn filled_tensor(dims: &[usize], value: f32, device: &Device) -> Tensor {
+        Tensor::from_vec(vec![value; dims.iter().product()], dims.to_vec(), device).unwrap()
+    }
+
+    fn tiny_dense_model() -> DenseGradModel<TinyDenseArch> {
+        let device = test_device();
+        let mut weights = HashMap::new();
+        let mut put = |name: &str, dims: &[usize], value: f32| {
+            weights.insert(name.to_string(), filled_tensor(dims, value, &device));
+        };
+
+        put("model.embed_tokens.weight", &[8, 4], 0.02);
+        put("model.norm.weight", &[4], 1.0);
+        put("model.layers.0.input_layernorm.weight", &[4], 1.0);
+        put("model.layers.0.post_attention_layernorm.weight", &[4], 1.0);
+        put("model.layers.0.self_attn.q_proj.weight", &[4, 4], 0.03);
+        put("model.layers.0.self_attn.k_proj.weight", &[4, 4], 0.04);
+        put("model.layers.0.self_attn.v_proj.weight", &[4, 4], 0.05);
+        put("model.layers.0.self_attn.o_proj.weight", &[4, 4], 0.06);
+        put("model.layers.0.mlp.gate_proj.weight", &[8, 4], 0.07);
+        put("model.layers.0.mlp.up_proj.weight", &[8, 4], 0.08);
+        put("model.layers.0.mlp.down_proj.weight", &[4, 8], 0.09);
+
+        let vb = VarBuilder::from_tensors(weights, DType::F32, &device);
+        let model = DenseGradModel::<TinyDenseArch>::load_with_targets(
+            &(),
+            &vb,
+            2,
+            4.0,
+            DType::F32,
+            DenseLoraTargets::industrial(),
+        )
+        .unwrap();
+
+        // Standard LoRA initializes every B factor to zero. Give every factor a
+        // distinct, non-zero value so merged generation must actually read all
+        // trainable tensors and the preservation gate is mutation-sensitive.
+        for (var_index, var) in model.trainable_vars().iter().enumerate() {
+            let dims = var.as_tensor().dims().to_vec();
+            let values = (0..dims.iter().product())
+                .map(|element_index| {
+                    ((var_index + 1) as f32 * 0.01) + (element_index as f32 * 0.0001)
+                })
+                .collect::<Vec<_>>();
+            var.set(&Tensor::from_vec(values, dims, &device).unwrap())
+                .unwrap();
+        }
+        model
+    }
+
+    #[derive(Debug)]
+    struct TrainableWitness {
+        id: TensorId,
+        dims: Vec<usize>,
+        value_bits: Vec<u32>,
+    }
+
+    fn capture_trainable_witness(vars: &[Var]) -> Vec<TrainableWitness> {
+        vars.iter()
+            .map(|var| TrainableWitness {
+                id: var.as_tensor().id(),
+                dims: var.as_tensor().dims().to_vec(),
+                value_bits: var
+                    .as_tensor()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+                    .into_iter()
+                    .map(f32::to_bits)
+                    .collect(),
+            })
+            .collect()
+    }
+
+    fn verify_trainable_witness(
+        expected: &[TrainableWitness],
+        actual: &[Var],
+    ) -> Result<(), String> {
+        if expected.len() != actual.len() {
+            return Err(format!(
+                "trainable count changed: expected {}, got {}",
+                expected.len(),
+                actual.len()
+            ));
+        }
+        for (index, (expected, actual)) in expected.iter().zip(actual).enumerate() {
+            if expected.id != actual.as_tensor().id() {
+                return Err(format!("trainable Var {index} was rebound"));
+            }
+            if expected.dims != actual.as_tensor().dims() {
+                return Err(format!("trainable Var {index} shape changed"));
+            }
+            let actual_bits = actual
+                .as_tensor()
+                .flatten_all()
+                .map_err(|error| error.to_string())?
+                .to_vec1::<f32>()
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>();
+            if expected.value_bits != actual_bits {
+                return Err(format!("trainable Var {index} value changed"));
+            }
+        }
+        Ok(())
+    }
+
+    fn assert_trainable_witness(
+        label: &str,
+        model: &DenseGradModel<TinyDenseArch>,
+        witness: &[TrainableWitness],
+    ) {
+        verify_trainable_witness(witness, &model.trainable_vars())
+            .unwrap_or_else(|error| panic!("{label}: {error}"));
+    }
+
+    #[derive(Clone, Copy)]
+    enum InjectedRolloutHookFault {
+        MutateValue,
+        RebindVar,
+    }
+
+    fn run_faulting_merged_generation_hook(
+        fault: InjectedRolloutHookFault,
+    ) -> (Vec<TrainableWitness>, DenseGradModel<TinyDenseArch>) {
+        let mut model = tiny_dense_model();
+        let witness = capture_trainable_witness(&model.trainable_vars());
+        let prompt = Tensor::from_vec(vec![1u32, 2, 3], (1, 3), &test_device()).unwrap();
+        let mut decoder = model.merged_decoder().unwrap();
+        decoder.forward(&prompt, 0).unwrap();
+        match fault {
+            InjectedRolloutHookFault::MutateValue => {
+                let actual = model.trainable_vars();
+                let dims = actual[0].as_tensor().dims().to_vec();
+                actual[0]
+                    .set(&filled_tensor(&dims, 99.0, &test_device()))
+                    .unwrap();
+            }
+            InjectedRolloutHookFault::RebindVar => {
+                // Replace the live q-projection, not a copied registry entry.
+                // The fresh adapter has the same trainable shapes but different
+                // storage, exactly the optimizer/checkpoint hazard this witness
+                // is required to detect after a rollout hook.
+                let replacement = crate::lora::LoraLinear::new(
+                    filled_tensor(&[4, 4], 0.03, &test_device()),
+                    None,
+                    2,
+                    4.0,
+                )
+                .unwrap();
+                model.layers[0].attn.q_proj = Proj::Lora(replacement);
+            }
+        }
+        (witness, model)
+    }
+
+    #[test]
+    fn snapshot_elided_rollout_hooks_preserve_exact_trainable_state() {
+        let mut model = tiny_dense_model();
+        assert!(!model.requires_rollout_tensor_snapshot());
+        let witness = capture_trainable_witness(&model.trainable_vars());
+
+        model.set_adapter_enabled(false);
+        assert!(!model.adapter_enabled);
+        assert_trainable_witness("adapter disable", &model, &witness);
+
+        let mut base_decoder = model.merged_decoder().unwrap();
+        assert_trainable_witness("base merged-decoder construction", &model, &witness);
+        let prompt = Tensor::from_vec(vec![1u32, 2, 3], (1, 3), &test_device()).unwrap();
+        let next = Tensor::from_vec(vec![4u32], (1, 1), &test_device()).unwrap();
+        base_decoder.forward(&prompt, 0).unwrap();
+        base_decoder.forward(&next, 3).unwrap();
+        assert_trainable_witness("base cached generation", &model, &witness);
+
+        model.set_adapter_enabled(true);
+        assert!(model.adapter_enabled);
+        assert_trainable_witness("adapter enable", &model, &witness);
+
+        let mut adapter_decoder = model.merged_decoder().unwrap();
+        assert_trainable_witness("adapter merged-decoder construction", &model, &witness);
+        adapter_decoder.forward(&prompt, 0).unwrap();
+        adapter_decoder.forward(&next, 3).unwrap();
+        assert_trainable_witness("adapter cached generation", &model, &witness);
+
+        model.forward_detached(&prompt).unwrap();
+        assert_trainable_witness("detached scoring", &model, &witness);
+    }
+
+    #[test]
+    fn trainable_witness_rejects_mutating_or_rebinding_rollout_hook() {
+        let (witness, model) =
+            run_faulting_merged_generation_hook(InjectedRolloutHookFault::MutateValue);
+        let mutation = verify_trainable_witness(&witness, &model.trainable_vars()).unwrap_err();
+        assert!(
+            mutation.contains("value changed"),
+            "value mutation must trip the witness, got: {mutation}"
+        );
+
+        let (witness, model) =
+            run_faulting_merged_generation_hook(InjectedRolloutHookFault::RebindVar);
+        let rebinding = verify_trainable_witness(&witness, &model.trainable_vars()).unwrap_err();
+        assert!(
+            rebinding.contains("was rebound"),
+            "Var rebinding must trip the witness, got: {rebinding}"
+        );
+    }
+}

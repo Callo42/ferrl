@@ -3468,6 +3468,58 @@ mod tests {
         }
     }
 
+    fn snapshot_trainable_state(model: &Gemma4GradModel) -> (Vec<Var>, Vec<Vec<f32>>) {
+        let vars = model.trainable_vars();
+        let values = vars
+            .iter()
+            .map(|var| {
+                var.as_tensor()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+            })
+            .collect();
+        (vars, values)
+    }
+
+    fn assert_trainable_state_unchanged(
+        model: &Gemma4GradModel,
+        expected_vars: &[Var],
+        expected_values: &[Vec<f32>],
+        phase: &str,
+    ) {
+        let actual_vars = model.trainable_vars();
+        assert_eq!(actual_vars.len(), expected_vars.len(), "{phase}: Var count");
+        assert_eq!(
+            actual_vars.len(),
+            expected_values.len(),
+            "{phase}: value count"
+        );
+        for (index, ((actual, expected), expected_value)) in actual_vars
+            .iter()
+            .zip(expected_vars)
+            .zip(expected_values)
+            .enumerate()
+        {
+            assert_eq!(
+                actual.as_tensor().id(),
+                expected.as_tensor().id(),
+                "{phase}: trainable Var {index} was rebound"
+            );
+            let actual_value = actual
+                .as_tensor()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            assert_eq!(
+                &actual_value, expected_value,
+                "{phase}: trainable Var {index} changed value"
+            );
+        }
+    }
+
     fn all_tp_plans(world_size: usize) -> Vec<TensorParallelPlan> {
         (0..world_size)
             .map(|rank| TensorParallelPlan::new(rank, world_size).unwrap())
@@ -5340,6 +5392,58 @@ mod tests {
             model.trainable_vars().len(),
             14 + 12,
             "sliding layer has q/k/v/o + mlp, full layer has q/k/o + mlp"
+        );
+    }
+
+    #[test]
+    fn snapshot_elided_rollout_hooks_preserve_exact_trainable_state() {
+        let mut model = tiny_model();
+        arm_adapter_deterministic(&model);
+        assert!(!GradModel::requires_rollout_tensor_snapshot(&model));
+        let (expected_vars, expected_values) = snapshot_trainable_state(&model);
+        let input = ids(5);
+
+        model.set_adapter_enabled(false);
+        assert!(!model.adapter_enabled);
+        assert_trainable_state_unchanged(
+            &model,
+            &expected_vars,
+            &expected_values,
+            "adapter disable",
+        );
+
+        model.set_adapter_enabled(true);
+        assert!(model.adapter_enabled);
+        assert_trainable_state_unchanged(
+            &model,
+            &expected_vars,
+            &expected_values,
+            "adapter enable",
+        );
+
+        let mut decoder = model.merged_decoder().unwrap();
+        assert_trainable_state_unchanged(
+            &model,
+            &expected_vars,
+            &expected_values,
+            "merged decoder construction",
+        );
+        let logits = decoder.forward(&input, 0).unwrap();
+        assert_eq!(logits.dims(), &[1, 5, tiny_cfg().text_config.vocab_size]);
+        assert_trainable_state_unchanged(
+            &model,
+            &expected_vars,
+            &expected_values,
+            "merged generation",
+        );
+
+        let scored = model.forward_detached_narrowed(&input, 1, 3).unwrap();
+        assert_eq!(scored.dims(), &[1, 3, tiny_cfg().text_config.vocab_size]);
+        assert_trainable_state_unchanged(
+            &model,
+            &expected_vars,
+            &expected_values,
+            "detached scoring",
         );
     }
 

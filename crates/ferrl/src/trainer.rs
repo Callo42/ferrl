@@ -8955,7 +8955,12 @@ fn scalar_f32(t: &Tensor) -> CandleResult<f32> {
 mod tests {
     use super::*;
     use crate::grpo::{clipped_surrogate, k3_kl, masked_mean};
+    use crate::lm_policy::QwenPolicy;
+    use crate::qwen::QwenGradModel;
     use approx::assert_relative_eq;
+    use candle_nn::{Activation, VarBuilder};
+    use candle_transformers::models::qwen3::Config as QwenConfig;
+    use std::collections::HashMap;
 
     const TOL: f32 = 1e-6;
 
@@ -11361,6 +11366,120 @@ mod tests {
         }
     }
 
+    struct SnapshotElidedBuiltInFailurePolicy {
+        inner: QwenPolicy,
+        generation_calls: usize,
+        detached_scoring_calls: std::cell::Cell<usize>,
+        live_scoring_calls: std::cell::Cell<usize>,
+        backward_calls: std::cell::Cell<usize>,
+    }
+
+    impl SnapshotElidedBuiltInFailurePolicy {
+        fn corrupt_second_rollout_prefix(&self, rollout: &mut Rollout) {
+            if self.generation_calls == 2 {
+                for row in &mut rollout.token_ids {
+                    row[0] ^= 1;
+                }
+            }
+        }
+    }
+
+    impl Policy for SnapshotElidedBuiltInFailurePolicy {
+        fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
+            self.generate_at(prompt, cfg, 0)
+        }
+
+        fn generate_at(
+            &mut self,
+            prompt: &[u32],
+            cfg: &GenConfig,
+            global_row_base: u64,
+        ) -> CandleResult<Rollout> {
+            self.generate_at_instrumented(prompt, cfg, global_row_base, None)
+        }
+
+        fn generate_at_instrumented(
+            &mut self,
+            prompt: &[u32],
+            cfg: &GenConfig,
+            global_row_base: u64,
+            telemetry: Option<&mut dyn ModelTelemetryRecorder>,
+        ) -> CandleResult<Rollout> {
+            self.generation_calls += 1;
+            let mut rollout =
+                self.inner
+                    .generate_at_instrumented(prompt, cfg, global_row_base, telemetry)?;
+            self.corrupt_second_rollout_prefix(&mut rollout);
+            Ok(rollout)
+        }
+
+        fn token_logprobs(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+            self.live_scoring_calls
+                .set(self.live_scoring_calls.get() + 1);
+            self.inner.token_logprobs(rollout)
+        }
+
+        fn token_logprobs_detached(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+            self.detached_scoring_calls
+                .set(self.detached_scoring_calls.get() + 1);
+            self.inner.token_logprobs_detached(rollout)
+        }
+
+        fn backward(&self, loss: &Tensor) -> CandleResult<GradStore> {
+            self.backward_calls.set(self.backward_calls.get() + 1);
+            self.inner.backward(loss)
+        }
+
+        fn set_adapter_enabled(&mut self, enabled: bool) {
+            self.inner.set_adapter_enabled(enabled);
+        }
+
+        fn adapter_enabled(&self) -> bool {
+            self.inner.adapter_enabled()
+        }
+
+        fn trainable_vars(&self) -> Vec<Var> {
+            self.inner.trainable_vars()
+        }
+
+        fn requires_rollout_tensor_snapshot(&self) -> bool {
+            self.inner.requires_rollout_tensor_snapshot()
+        }
+
+        fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+            self.inner.sampler_state()
+        }
+
+        fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
+            self.inner.restore_sampler_state(state)
+        }
+    }
+
+    struct SnapshotElidedBuiltInReward {
+        calls: std::cell::Cell<usize>,
+    }
+
+    impl RewardFn for SnapshotElidedBuiltInReward {
+        type Target = ();
+
+        fn reward(&self, _sample: &Sample<()>, _completion: &str) -> Result<f32, RewardError> {
+            unreachable!("the snapshot-elision test uses the detailed reward seam")
+        }
+
+        fn reward_group_detailed(
+            &self,
+            _sample: &Sample<()>,
+            completions: &[String],
+        ) -> Result<Vec<RewardOutcome>, RewardError> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(completions
+                .iter()
+                .enumerate()
+                .map(|(index, _)| RewardOutcome::reward(index as f32))
+                .collect())
+        }
+    }
+
     struct CountingCandidateReward<'a> {
         calls: &'a std::cell::Cell<usize>,
     }
@@ -11798,6 +11917,141 @@ mod tests {
             inner: CandidatePolicy { logp },
             sampler: 0,
         }
+    }
+
+    fn tiny_snapshot_elided_qwen_config() -> QwenConfig {
+        QwenConfig {
+            vocab_size: 16,
+            hidden_size: 8,
+            intermediate_size: 16,
+            num_hidden_layers: 2,
+            num_attention_heads: 2,
+            head_dim: 4,
+            attention_bias: false,
+            num_key_value_heads: 1,
+            max_position_embeddings: 32,
+            sliding_window: None,
+            max_window_layers: 0,
+            tie_word_embeddings: true,
+            rope_theta: 10_000.0,
+            rms_norm_eps: 1e-6,
+            use_sliding_window: false,
+            hidden_act: Activation::Silu,
+        }
+    }
+
+    fn tiny_snapshot_elided_qwen_weights(cfg: &QwenConfig) -> HashMap<String, Tensor> {
+        let mut tensors = HashMap::new();
+        let mut put = |name: &str, dims: &[usize]| {
+            tensors.insert(
+                name.to_owned(),
+                Tensor::randn(0f32, 0.2f32, dims.to_vec(), &Device::Cpu).unwrap(),
+            );
+        };
+        let hidden = cfg.hidden_size;
+        let intermediate = cfg.intermediate_size;
+        let query = cfg.num_attention_heads * cfg.head_dim;
+        let key_value = cfg.num_key_value_heads * cfg.head_dim;
+        put("model.embed_tokens.weight", &[cfg.vocab_size, hidden]);
+        put("model.norm.weight", &[hidden]);
+        for layer in 0..cfg.num_hidden_layers {
+            let prefix = format!("model.layers.{layer}");
+            put(&format!("{prefix}.input_layernorm.weight"), &[hidden]);
+            put(
+                &format!("{prefix}.post_attention_layernorm.weight"),
+                &[hidden],
+            );
+            put(
+                &format!("{prefix}.self_attn.q_proj.weight"),
+                &[query, hidden],
+            );
+            put(
+                &format!("{prefix}.self_attn.k_proj.weight"),
+                &[key_value, hidden],
+            );
+            put(
+                &format!("{prefix}.self_attn.v_proj.weight"),
+                &[key_value, hidden],
+            );
+            put(
+                &format!("{prefix}.self_attn.o_proj.weight"),
+                &[hidden, query],
+            );
+            put(
+                &format!("{prefix}.self_attn.q_norm.weight"),
+                &[cfg.head_dim],
+            );
+            put(
+                &format!("{prefix}.self_attn.k_norm.weight"),
+                &[cfg.head_dim],
+            );
+            put(
+                &format!("{prefix}.mlp.gate_proj.weight"),
+                &[intermediate, hidden],
+            );
+            put(
+                &format!("{prefix}.mlp.up_proj.weight"),
+                &[intermediate, hidden],
+            );
+            put(
+                &format!("{prefix}.mlp.down_proj.weight"),
+                &[hidden, intermediate],
+            );
+        }
+        tensors
+    }
+
+    fn snapshot_elided_built_in_failure_policy() -> SnapshotElidedBuiltInFailurePolicy {
+        let cfg = tiny_snapshot_elided_qwen_config();
+        let tensors = tiny_snapshot_elided_qwen_weights(&cfg);
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &Device::Cpu);
+        let model = QwenGradModel::load(&cfg, &vb, 2, 4.0).unwrap();
+        let mut inner = QwenPolicy::new(model, 7, 1.0);
+        inner.set_adapter_enabled(false);
+        SnapshotElidedBuiltInFailurePolicy {
+            inner,
+            generation_calls: 0,
+            detached_scoring_calls: std::cell::Cell::new(0),
+            live_scoring_calls: std::cell::Cell::new(0),
+            backward_calls: std::cell::Cell::new(0),
+        }
+    }
+
+    fn snapshot_trainable_values(vars: &[Var]) -> Vec<Vec<f32>> {
+        vars.iter()
+            .map(|var| {
+                var.as_tensor()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    fn assert_snapshot_elided_built_in_state(
+        policy: &SnapshotElidedBuiltInFailurePolicy,
+        vars_before: &[Var],
+        values_before: &[Vec<f32>],
+        sampler_before: &[u8],
+        mode_before: bool,
+    ) {
+        let vars_after = policy.trainable_vars();
+        assert_eq!(vars_after.len(), vars_before.len());
+        for (index, (before, after)) in vars_before.iter().zip(&vars_after).enumerate() {
+            assert_eq!(
+                before.as_tensor().id(),
+                after.as_tensor().id(),
+                "trainable Var {index} was rebound"
+            );
+        }
+        assert_eq!(
+            snapshot_trainable_values(&vars_after),
+            values_before,
+            "snapshot-elided rollout changed a trainable tensor"
+        );
+        assert_eq!(policy.adapter_enabled(), mode_before);
+        assert_eq!(policy.sampler_state().unwrap(), sampler_before);
     }
 
     fn candidate_ledger_config() -> TrainerConfig {
@@ -12268,6 +12522,92 @@ mod tests {
             &run,
             &metrics_before,
         );
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn snapshot_elided_built_in_late_failure_restores_exact_window_prestate() {
+        for candidate_log_top_k in [0, 1] {
+            let label = format!(
+                "snapshot-elided-built-in-candidates-{}",
+                if candidate_log_top_k == 0 {
+                    "disabled"
+                } else {
+                    "enabled"
+                }
+            );
+            let tmp = WireTmp::new(&label);
+            let run = RunDir::create(&tmp.0, "run").unwrap();
+            let config = TrainerConfig {
+                steps: 1,
+                group_size: 2,
+                max_new_tokens: 2,
+                grad_accum_steps: 2,
+                beta: 0.0,
+                candidate_log_top_k,
+                checkpoint_every: None,
+                ..TrainerConfig::default()
+            };
+            let mut trainer = Trainer::new(config, &run).unwrap();
+            let candidate_sentinel = format!("candidate-sentinel-{candidate_log_top_k}\n");
+            let metrics_sentinel = format!("metrics-sentinel-{candidate_log_top_k}\n");
+            std::fs::write(run.candidates_path(), candidate_sentinel.as_bytes()).unwrap();
+            std::fs::write(run.metrics_path(), metrics_sentinel.as_bytes()).unwrap();
+
+            let mut policy = snapshot_elided_built_in_failure_policy();
+            assert!(
+                !policy.requires_rollout_tensor_snapshot(),
+                "the production built-in unexpectedly retained tensor snapshots"
+            );
+            let vars_before = policy.trainable_vars();
+            let values_before = snapshot_trainable_values(&vars_before);
+            let sampler_before = policy.sampler_state().unwrap();
+            let mode_before = policy.adapter_enabled();
+            assert!(
+                !mode_before,
+                "the rollback mode witness must be non-default"
+            );
+            let reward = SnapshotElidedBuiltInReward {
+                calls: std::cell::Cell::new(0),
+            };
+
+            let error = trainer
+                .train(
+                    &mut policy,
+                    &reward,
+                    &CandidateCodec,
+                    &[Sample::new("prompt", ())],
+                )
+                .unwrap_err();
+
+            assert!(matches!(error, TrainerError::Contract(_)), "{error:?}");
+            assert_eq!(policy.generation_calls, 2);
+            assert_eq!(reward.calls.get(), 1, "malformed group reached reward");
+            assert_eq!(
+                policy.detached_scoring_calls.get(),
+                usize::from(candidate_log_top_k == 0),
+                "detached scoring crossed the expected collection cadence"
+            );
+            assert_eq!(policy.live_scoring_calls.get(), 0);
+            assert_eq!(policy.backward_calls.get(), 0);
+            assert_snapshot_elided_built_in_state(
+                &policy,
+                &vars_before,
+                &values_before,
+                &sampler_before,
+                mode_before,
+            );
+            assert_eq!(
+                std::fs::read(run.candidates_path()).unwrap(),
+                candidate_sentinel.as_bytes(),
+                "failed snapshot-elided window changed candidates"
+            );
+            assert_eq!(
+                std::fs::read(run.metrics_path()).unwrap(),
+                metrics_sentinel.as_bytes(),
+                "failed snapshot-elided window changed metrics"
+            );
+        }
     }
 
     #[test]

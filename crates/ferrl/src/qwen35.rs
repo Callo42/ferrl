@@ -3276,6 +3276,66 @@ mod tests {
             .unwrap()
     }
 
+    /// The exact trainable state behind the rollout tensor-snapshot opt-out.
+    /// Retaining the original `Var`s makes a later `trainable_vars()` call
+    /// observable by storage identity as well as by value: a hook that
+    /// rebinds a model field can preserve every shape/value while still
+    /// violating the optimizer/checkpoint contract.
+    struct TrainableState {
+        bindings: Vec<Var>,
+        values: Vec<Tensor>,
+    }
+
+    fn snapshot_trainable_state(model: &Qwen3_5GradModel) -> TrainableState {
+        let bindings = model.trainable_vars();
+        let values = bindings
+            .iter()
+            .map(|var| var.as_tensor().copy().unwrap())
+            .collect();
+        TrainableState { bindings, values }
+    }
+
+    fn assert_trainable_state_unchanged(
+        model: &Qwen3_5GradModel,
+        expected: &TrainableState,
+        stage: &str,
+    ) {
+        let actual = model.trainable_vars();
+        assert_eq!(
+            actual.len(),
+            expected.bindings.len(),
+            "{stage}: trainable-var count changed"
+        );
+        for (i, ((actual, expected_binding), expected_value)) in actual
+            .iter()
+            .zip(&expected.bindings)
+            .zip(&expected.values)
+            .enumerate()
+        {
+            assert_eq!(
+                actual.as_tensor().id(),
+                expected_binding.as_tensor().id(),
+                "{stage}: trainable Var {i} was rebound or reordered"
+            );
+            assert_eq!(
+                max_abs_diff(actual.as_tensor(), expected_value),
+                0.0,
+                "{stage}: trainable Var {i} changed value"
+            );
+        }
+    }
+
+    /// Exercise the actual value-only scoring hook used by `LmPolicy`, not
+    /// merely the detached-logits convenience wrapper.
+    fn detached_score(model: &Qwen3_5GradModel, input: &Tensor) -> Tensor {
+        let targets = input.narrow(1, 4, 2).unwrap();
+        let score =
+            GradModel::token_logprobs_detached_narrowed(model, input, &targets, 3, 2, 1.0, 2)
+                .unwrap();
+        assert_eq!(score.dims(), &[1, 2]);
+        score
+    }
+
     // ---- gate envelopes ----------------------------------------------------
     //
     // Measured under the seeded WEIGHT_SEED/WEIGHT_STD weights (worst measured
@@ -3742,6 +3802,44 @@ mod tests {
             max_abs_diff(&on2, &off) > 1e-4,
             "armed adapter must change the logits"
         );
+    }
+
+    /// Qwen3.5 `LoRA` opts out of the trainer's per-window tensor copies, so
+    /// every rollout-time hook must preserve the exact ordered Var bindings
+    /// and their values. This follows the real rollout sequence with an
+    /// armed adapter: merged generation, detached old-policy scoring,
+    /// adapter-off detached reference scoring, and restoration to adapter-on.
+    #[test]
+    fn lora_snapshot_elided_rollout_hooks_preserve_trainable_state() {
+        let mut model = armed_model();
+        assert!(!GradModel::requires_rollout_tensor_snapshot(&model));
+        assert!(model.adapter_enabled);
+        let expected = snapshot_trainable_state(&model);
+        let input = ids(7);
+
+        let mut decoder = model.merged_decoder().unwrap();
+        assert_trainable_state_unchanged(&model, &expected, "merged-decoder construction");
+        let prefix = input.narrow(1, 0, 5).unwrap();
+        let continuation = input.narrow(1, 5, 2).unwrap();
+        assert_eq!(decoder.forward(&prefix, 0).unwrap().dims(), &[1, 5, 24]);
+        assert_eq!(
+            decoder.forward(&continuation, 5).unwrap().dims(),
+            &[1, 2, 24]
+        );
+        assert_trainable_state_unchanged(&model, &expected, "merged generation");
+
+        let _old = detached_score(&model, &input);
+        assert_trainable_state_unchanged(&model, &expected, "detached old-policy scoring");
+
+        model.set_adapter_enabled(false);
+        assert!(!model.adapter_enabled);
+        assert_trainable_state_unchanged(&model, &expected, "adapter disable");
+        let _reference = detached_score(&model, &input);
+        assert_trainable_state_unchanged(&model, &expected, "detached reference scoring");
+
+        model.set_adapter_enabled(true);
+        assert!(model.adapter_enabled);
+        assert_trainable_state_unchanged(&model, &expected, "adapter restoration");
     }
 
     // ---- GVA repeat ----------------------------------------------------------
@@ -5136,6 +5234,42 @@ mod tests {
         );
         let after = model.forward(&input).unwrap();
         assert_eq!(max_abs_diff(&before, &after), 0.0);
+    }
+
+    /// Full-FT shares the snapshot-elision assertion but has no adapter
+    /// factors: toggling must remain an enabled no-op, while merged generation
+    /// (which deep-copies every trainable weight) and detached scoring must
+    /// leave every live Var binding and value untouched.
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn full_ft_snapshot_elided_rollout_hooks_preserve_trainable_state() {
+        let mut model = tiny_full_ft_model();
+        assert!(!GradModel::requires_rollout_tensor_snapshot(&model));
+        assert!(!GradModel::has_adapters(&model));
+        assert!(model.adapter_enabled);
+        let expected = snapshot_trainable_state(&model);
+        let input = ids(7);
+
+        model.set_adapter_enabled(false);
+        assert!(model.adapter_enabled, "full-FT toggle must remain enabled");
+        assert_trainable_state_unchanged(&model, &expected, "full-FT adapter-disable no-op");
+        model.set_adapter_enabled(true);
+        assert!(model.adapter_enabled);
+        assert_trainable_state_unchanged(&model, &expected, "full-FT adapter-enable no-op");
+
+        let mut decoder = model.merged_decoder().unwrap();
+        assert_trainable_state_unchanged(&model, &expected, "full-FT merged-decoder construction");
+        let prefix = input.narrow(1, 0, 5).unwrap();
+        let continuation = input.narrow(1, 5, 2).unwrap();
+        assert_eq!(decoder.forward(&prefix, 0).unwrap().dims(), &[1, 5, 24]);
+        assert_eq!(
+            decoder.forward(&continuation, 5).unwrap().dims(),
+            &[1, 2, 24]
+        );
+        assert_trainable_state_unchanged(&model, &expected, "full-FT merged generation");
+
+        let _old = detached_score(&model, &input);
+        assert_trainable_state_unchanged(&model, &expected, "full-FT detached scoring");
     }
 
     /// Full-FT × activation checkpointing fails loud at the grad forward (the
