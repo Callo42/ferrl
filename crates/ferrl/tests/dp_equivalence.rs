@@ -3328,6 +3328,8 @@ enum OrdinaryDiscoveryFailureCase {
     LegacyOnly,
     OlderLegacyBeforeV4,
     NewerLegacyAfterV4,
+    WrongContinuationKindOnly,
+    WrongContinuationKindAfterV4,
     NewerDirectoryOlderManifest,
     OlderDirectoryNewerManifest,
 }
@@ -3338,6 +3340,8 @@ impl OrdinaryDiscoveryFailureCase {
             Self::LegacyOnly => "legacy-only",
             Self::OlderLegacyBeforeV4 => "older-legacy-before-v4",
             Self::NewerLegacyAfterV4 => "newer-legacy-after-v4",
+            Self::WrongContinuationKindOnly => "wrong-continuation-kind-only",
+            Self::WrongContinuationKindAfterV4 => "wrong-continuation-kind-after-v4",
             Self::NewerDirectoryOlderManifest => "newer-dir-older-manifest",
             Self::OlderDirectoryNewerManifest => "older-dir-newer-manifest",
         }
@@ -3354,6 +3358,30 @@ fn rewrite_as_legacy_v3(checkpoint: &Path, step: u64) {
         .as_object_mut()
         .unwrap()
         .remove("ordinary_checkpoint");
+    std::fs::write(manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+}
+
+fn add_fully_typed_wrong_continuation_kind(checkpoint: &Path, step: u64) {
+    let manifest_path = checkpoint.join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["rollout_ledger_continuation"] = serde_json::json!({
+        "format_version": 3,
+        "kind": "ordinary",
+        "world_size": 1,
+        "tensor_parallel_world_size": 1,
+        "tensor_parallel_layout": "tensor_parallel.communicator_rank_ascending.v1",
+        "completed_step": step,
+        "policy_sha256": "a".repeat(64),
+        "trainer_config_sha256": "b".repeat(64),
+        "tensor_schema_sha256": "c".repeat(64),
+        "adapter_sha256": "d".repeat(64),
+        "optimizer_sha256": "e".repeat(64),
+        "sampler_sha256": "f".repeat(64),
+        "parent_lineage_sha256": "1".repeat(64),
+        "consumed_ledger_sha256": "2".repeat(64),
+        "lineage_sha256": "3".repeat(64),
+    });
     std::fs::write(manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
 }
 
@@ -3380,6 +3408,19 @@ fn prepare_ordinary_discovery_failure_case(
             let legacy = root.join("step-4");
             copy_checkpoint_package(&seed.join("step-3"), &legacy);
             rewrite_as_legacy_v3(&legacy, 4);
+        }
+        OrdinaryDiscoveryFailureCase::WrongContinuationKindOnly => {
+            let legacy = root.join("step-4");
+            copy_checkpoint_package(&seed.join("step-3"), &legacy);
+            rewrite_as_legacy_v3(&legacy, 4);
+            add_fully_typed_wrong_continuation_kind(&legacy, 4);
+        }
+        OrdinaryDiscoveryFailureCase::WrongContinuationKindAfterV4 => {
+            copy_checkpoint_package(&seed.join("step-1"), &root.join("step-1"));
+            let legacy = root.join("step-4");
+            copy_checkpoint_package(&seed.join("step-3"), &legacy);
+            rewrite_as_legacy_v3(&legacy, 4);
+            add_fully_typed_wrong_continuation_kind(&legacy, 4);
         }
         OrdinaryDiscoveryFailureCase::NewerDirectoryOlderManifest => {
             copy_checkpoint_package(&seed.join("step-1"), &root.join("step-1"));
@@ -6637,6 +6678,8 @@ fn world_one_resume_latest_rejects_legacy_and_step_mismatch_before_policy_work()
         OrdinaryDiscoveryFailureCase::LegacyOnly,
         OrdinaryDiscoveryFailureCase::OlderLegacyBeforeV4,
         OrdinaryDiscoveryFailureCase::NewerLegacyAfterV4,
+        OrdinaryDiscoveryFailureCase::WrongContinuationKindOnly,
+        OrdinaryDiscoveryFailureCase::WrongContinuationKindAfterV4,
         OrdinaryDiscoveryFailureCase::NewerDirectoryOlderManifest,
         OrdinaryDiscoveryFailureCase::OlderDirectoryNewerManifest,
     ] {
@@ -6721,6 +6764,8 @@ fn dp_resume_latest_coordinates_legacy_and_step_mismatch_as_scan_failed() {
         OrdinaryDiscoveryFailureCase::LegacyOnly,
         OrdinaryDiscoveryFailureCase::OlderLegacyBeforeV4,
         OrdinaryDiscoveryFailureCase::NewerLegacyAfterV4,
+        OrdinaryDiscoveryFailureCase::WrongContinuationKindOnly,
+        OrdinaryDiscoveryFailureCase::WrongContinuationKindAfterV4,
         OrdinaryDiscoveryFailureCase::NewerDirectoryOlderManifest,
         OrdinaryDiscoveryFailureCase::OlderDirectoryNewerManifest,
     ] {

@@ -1870,9 +1870,10 @@ pub struct LatestCheckpoint {
 /// package is also rejected because it lacks v4 identity/integrity, and every
 /// otherwise-valid v4 directory/manifest step disagreement is rejected regardless
 /// of its ordering relative to another checkpoint. An explicit v1 adapter package
-/// or deliberately different continuation kind remains ineligible but is not
-/// ordinary-resume corruption; a malformed older sibling cannot cause replay and is
-/// ignored.
+/// or v3 package carrying the exact separated-continuation discriminator remains
+/// ineligible but is not ordinary-resume corruption; a typed continuation block
+/// with any other discriminator fails closed. A malformed older sibling cannot
+/// cause replay and is ignored.
 /// Crash-leftover `.tmp-*` / `.old-*` siblings do not match the exact final-name
 /// shape and are ignored, as is any unrelated entry.
 ///
@@ -1937,8 +1938,14 @@ pub fn latest_checkpoint(
                 continue;
             }
         };
-        if manifest.rollout_ledger_continuation.is_some() {
-            continue;
+        if let Some(continuation) = manifest.rollout_ledger_continuation.as_ref() {
+            if continuation.kind == ROLLOUT_LEDGER_CONTINUATION_KIND {
+                continue;
+            }
+            return Err(CheckpointError::Mismatch(format!(
+                "ordinary checkpoint discovery found format-v{} package at step-{directory_step} with continuation discriminator {:?}; only {ROLLOUT_LEDGER_CONTINUATION_KIND:?} is disjoint from ordinary resume",
+                manifest.format_version, continuation.kind
+            )));
         }
         if matches!(manifest.format_version, 2 | LEGACY_MOMENTUM_FORMAT_VERSION) {
             return Err(CheckpointError::Mismatch(format!(
@@ -3802,6 +3809,17 @@ mod tests {
         write_manifest_value(&dir, &manifest);
     }
 
+    fn write_legacy_with_wrong_continuation_kind(root: &Path, n: u64) {
+        write_legacy_ordinary_step(root, n, LEGACY_MOMENTUM_FORMAT_VERSION);
+        let dir = root.join(format!("step-{n}"));
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join(MANIFEST_FILE)).unwrap()).unwrap();
+        let mut continuation = continuation_manifest(n);
+        continuation.kind = "ordinary".into();
+        manifest["rollout_ledger_continuation"] = serde_json::to_value(continuation).unwrap();
+        write_manifest_value(&dir, &manifest);
+    }
+
     #[test]
     fn latest_checkpoint_is_none_when_missing_or_empty() {
         let tmp = TempDir::new("latest-none");
@@ -3852,6 +3870,27 @@ mod tests {
                     && error
                         .to_string()
                         .contains(&format!("format-v{format_version}")),
+                "{label}: wrong rejection: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn latest_checkpoint_rejects_wrong_continuation_kind_instead_of_fresh_or_fallback() {
+        for (label, valid_step, legacy_step) in [
+            ("wrong-continuation-kind-only", None, 4),
+            ("wrong-continuation-kind-above-v4", Some(1), 4),
+        ] {
+            let tmp = TempDir::new(label);
+            if let Some(step) = valid_step {
+                write_step(tmp.path(), step);
+            }
+            write_legacy_with_wrong_continuation_kind(tmp.path(), legacy_step);
+            let error = latest_checkpoint(tmp.path()).unwrap_err();
+            let message = error.to_string();
+            assert!(
+                message.contains("continuation discriminator \"ordinary\"")
+                    && message.contains("only \"rollout_ledger\" is disjoint"),
                 "{label}: wrong rejection: {error}"
             );
         }
