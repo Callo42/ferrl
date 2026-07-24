@@ -453,6 +453,46 @@ fn adapter_payload_sha256(bytes: &[u8]) -> String {
     domain_sha256("ferrl.ordinary-checkpoint.adapter.v1", &[bytes])
 }
 
+fn tensor_value_sha256(index: usize, bytes: &[u8]) -> String {
+    let key = var_key(index);
+    domain_sha256(
+        "ferrl.ordinary-checkpoint.tensor-value.v1",
+        &[key.as_bytes(), bytes],
+    )
+}
+
+fn adapter_tensor_value_sha256(
+    bytes: &[u8],
+    num_vars: usize,
+) -> Result<Vec<String>, CheckpointError> {
+    let loaded = safetensors::SafeTensors::deserialize(bytes).map_err(|error| {
+        CheckpointError::Mismatch(format!(
+            "decode ordinary checkpoint adapter values for live-state sealing: {error}"
+        ))
+    })?;
+    (0..num_vars)
+        .map(|index| {
+            let key = var_key(index);
+            let tensor = loaded.tensor(&key).map_err(|error| {
+                CheckpointError::Mismatch(format!(
+                    "read ordinary checkpoint tensor {key} for live-state sealing: {error}"
+                ))
+            })?;
+            Ok(tensor_value_sha256(index, tensor.data()))
+        })
+        .collect()
+}
+
+pub(crate) fn trainable_var_value_sha256(vars: &[Var]) -> Vec<String> {
+    vars.iter()
+        .enumerate()
+        .map(|(index, var)| {
+            let bytes = safetensors::tensor::View::data(var.as_tensor());
+            tensor_value_sha256(index, bytes.as_ref())
+        })
+        .collect()
+}
+
 fn optimizer_payload_sha256(step_t: usize, bytes: &[u8]) -> Result<String, CheckpointError> {
     let step_t = u64::try_from(step_t).map_err(|_| {
         CheckpointError::Mismatch(
@@ -1589,6 +1629,7 @@ pub(crate) struct PreparedCheckpoint {
     sampler_state: Vec<u8>,
     lora_recipe: Option<String>,
     adapter_tensors: Vec<Tensor>,
+    adapter_value_sha256: Vec<String>,
     manifest_consensus_sha256: String,
 }
 
@@ -1603,6 +1644,10 @@ impl PreparedCheckpoint {
 
     pub(crate) fn sampler_state(&self) -> &[u8] {
         &self.sampler_state
+    }
+
+    pub(crate) fn adapter_value_sha256(&self) -> &[String] {
+        &self.adapter_value_sha256
     }
 
     pub(crate) fn manifest_consensus_sha256(&self) -> &str {
@@ -1771,6 +1816,7 @@ pub(crate) fn prepare_checkpoint(
     }
 
     let adapter_tensors = prepare_adapter_tensors(&adapter_bytes, vars)?;
+    let adapter_value_sha256 = adapter_tensor_value_sha256(&adapter_bytes, vars.len())?;
     let optimizer_state =
         prepare_optimizer_state(&optimizer_bytes, step_t, optimizer_num_vars, vars)?;
     Ok(PreparedCheckpoint {
@@ -1779,6 +1825,7 @@ pub(crate) fn prepare_checkpoint(
         sampler_state,
         lora_recipe: manifest.lora_recipe,
         adapter_tensors,
+        adapter_value_sha256,
         manifest_consensus_sha256,
     })
 }

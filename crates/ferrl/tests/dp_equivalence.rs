@@ -310,18 +310,24 @@ enum ResumePostconditionFault {
     NoOpSamplerRestore,
     ReplaceVarsDuringValidation,
     ReplaceVarsDuringRestore,
+    MutateVarsDuringRestore,
     ReplaceVarsBeforeOptimizer,
+    MutateVarsBeforeOptimizer,
+    ResetSamplerBeforeOptimizer,
     PanicSamplerRestore,
     PanicSamplerReadback,
     PanicVarsDuringRestore,
 }
 
 impl ResumePostconditionFault {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 10] = [
         Self::NoOpSamplerRestore,
         Self::ReplaceVarsDuringValidation,
         Self::ReplaceVarsDuringRestore,
+        Self::MutateVarsDuringRestore,
         Self::ReplaceVarsBeforeOptimizer,
+        Self::MutateVarsBeforeOptimizer,
+        Self::ResetSamplerBeforeOptimizer,
         Self::PanicSamplerRestore,
         Self::PanicSamplerReadback,
         Self::PanicVarsDuringRestore,
@@ -332,7 +338,10 @@ impl ResumePostconditionFault {
             Self::NoOpSamplerRestore => "no-op-sampler-restore",
             Self::ReplaceVarsDuringValidation => "replace-vars-during-validation",
             Self::ReplaceVarsDuringRestore => "replace-vars-during-restore",
+            Self::MutateVarsDuringRestore => "mutate-vars-during-restore",
             Self::ReplaceVarsBeforeOptimizer => "replace-vars-before-optimizer",
+            Self::MutateVarsBeforeOptimizer => "mutate-vars-before-optimizer",
+            Self::ResetSamplerBeforeOptimizer => "reset-sampler-before-optimizer",
             Self::PanicSamplerRestore => "panic-sampler-restore",
             Self::PanicSamplerReadback => "panic-sampler-readback",
             Self::PanicVarsDuringRestore => "panic-vars-during-restore",
@@ -351,7 +360,13 @@ impl ResumePostconditionFault {
                 "policy trainable-variable set changed during ordinary checkpoint restore"
             }
             Self::ReplaceVarsBeforeOptimizer => {
-                "policy trainable-variable set changed during ordinary checkpoint pre-optimizer handoff"
+                "policy trainable-variable set changed during ordinary checkpoint final pre-optimizer live-state seal"
+            }
+            Self::MutateVarsDuringRestore | Self::MutateVarsBeforeOptimizer => {
+                "policy trainable-variable value at ordered index 0 differs from the ordinary checkpoint at the final pre-optimizer live-state seal"
+            }
+            Self::ResetSamplerBeforeOptimizer => {
+                "policy sampler state differs from the ordinary checkpoint at the final pre-optimizer live-state seal"
             }
             Self::PanicSamplerRestore => {
                 "checkpoint validated-state application panicked: injected ordinary-resume sampler-restore panic"
@@ -377,8 +392,11 @@ impl ResumePostconditionFault {
             | Self::PanicVarsDuringRestore => {
                 "checkpoint validated-state application failed on a peer rank"
             }
-            Self::ReplaceVarsBeforeOptimizer => {
-                "ordinary checkpoint pre-optimizer variable handoff failed on a peer rank"
+            Self::ReplaceVarsBeforeOptimizer
+            | Self::MutateVarsDuringRestore
+            | Self::MutateVarsBeforeOptimizer
+            | Self::ResetSamplerBeforeOptimizer => {
+                "ordinary checkpoint pre-optimizer live-state seal failed on a peer rank"
             }
         }
     }
@@ -395,6 +413,17 @@ impl ResumePostconditionFault {
     fn preserves_sampler(self) -> bool {
         matches!(self, Self::NoOpSamplerRestore | Self::PanicSamplerRestore)
     }
+
+    fn mutates_var_values(self) -> bool {
+        matches!(
+            self,
+            Self::MutateVarsDuringRestore | Self::MutateVarsBeforeOptimizer
+        )
+    }
+
+    fn resets_sampler(self) -> bool {
+        self == Self::ResetSamplerBeforeOptimizer
+    }
 }
 
 #[derive(Debug, Default)]
@@ -405,9 +434,9 @@ struct ResumePostconditionCalls {
     backward: Cell<usize>,
 }
 
-/// Adversarial public-`Policy` oracle for ordinary resume. Each replacement
-/// installs a newly allocated but schema-identical policy so shape-only checks
-/// pass while tensor identities change.
+/// Adversarial public-`Policy` oracle for ordinary resume. Replacements install
+/// newly allocated but schema-identical policies, while the value and sampler
+/// faults mutate existing live state after the checkpoint's immediate checks.
 struct ResumePostconditionPolicy {
     inner: RefCell<ScriptedPolicy>,
     sampler_state: Vec<u8>,
@@ -416,6 +445,8 @@ struct ResumePostconditionPolicy {
     fault: ResumePostconditionFault,
     fault_fired: Cell<bool>,
     restore_completed: Cell<bool>,
+    value_mutation_prestate: RefCell<Option<Vec<u32>>>,
+    sampler_reset_prestate: RefCell<Option<Vec<u8>>>,
     calls: ResumePostconditionCalls,
 }
 
@@ -429,6 +460,8 @@ impl ResumePostconditionPolicy {
             fault,
             fault_fired: Cell::new(false),
             restore_completed: Cell::new(false),
+            value_mutation_prestate: RefCell::new(None),
+            sampler_reset_prestate: RefCell::new(None),
             calls: ResumePostconditionCalls::default(),
         }
     }
@@ -463,6 +496,25 @@ impl ResumePostconditionPolicy {
             .map(|var| var.as_tensor().dims().to_vec())
             .collect()
     }
+
+    fn first_var_bits(&self) -> Vec<u32> {
+        let var = self.inner.borrow().trainable_vars().remove(0);
+        var.as_tensor()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    fn mutate_first_var(&self) -> CandleResult<()> {
+        let var = self.inner.borrow().trainable_vars().remove(0);
+        *self.value_mutation_prestate.borrow_mut() = Some(self.first_var_bits());
+        let mutated = var.as_tensor().affine(1.0, 1.0)?;
+        var.set(&mutated)
+    }
 }
 
 impl Policy for ResumePostconditionPolicy {
@@ -492,6 +544,13 @@ impl Policy for ResumePostconditionPolicy {
         if self.take_fault(ResumePostconditionFault::ReplaceVarsBeforeOptimizer) {
             let replacement = self.replacement().unwrap();
             *self.inner.get_mut() = replacement;
+        }
+        if self.take_fault(ResumePostconditionFault::MutateVarsBeforeOptimizer) {
+            self.mutate_first_var().unwrap();
+        }
+        if self.take_fault(ResumePostconditionFault::ResetSamplerBeforeOptimizer) {
+            *self.sampler_reset_prestate.borrow_mut() = Some(self.sampler_state.clone());
+            self.sampler_state = vec![0x5a, self.rank as u8];
         }
         self.inner.get_mut().set_adapter_enabled(enabled);
     }
@@ -542,6 +601,9 @@ impl Policy for ResumePostconditionPolicy {
             *self.inner.get_mut() = replacement;
         }
         self.sampler_state = state.to_vec();
+        if self.take_fault(ResumePostconditionFault::MutateVarsDuringRestore) {
+            self.mutate_first_var()?;
+        }
         self.restore_completed.set(true);
         Ok(())
     }
@@ -7522,6 +7584,27 @@ fn ordinary_world_one_resume_enforces_exact_policy_postconditions_before_rollout
         } else {
             assert_eq!(policy.raw_var_ids(), ids_before);
         }
+        if fault.mutates_var_values() {
+            let mutation_prestate = policy.value_mutation_prestate.borrow();
+            let mutation_prestate = mutation_prestate
+                .as_ref()
+                .expect("value mutation did not capture its prestate");
+            assert_ne!(
+                policy.first_var_bits(),
+                *mutation_prestate,
+                "{} did not mutate the existing Var's value",
+                fault.tag()
+            );
+        }
+        if fault.resets_sampler() {
+            assert_eq!(
+                policy.sampler_reset_prestate.borrow().as_deref(),
+                Some(&[][..]),
+                "{} did not reset the sampler after exact checkpoint restoration",
+                fault.tag()
+            );
+            assert_eq!(policy.sampler_state().unwrap(), vec![0x5a, 0]);
+        }
         if fault.preserves_sampler() {
             assert_eq!(policy.sampler_state().unwrap(), sampler_before);
         }
@@ -7632,6 +7715,30 @@ fn ordinary_distributed_resume_globalizes_exact_policy_postcondition_failures() 
                             );
                         } else {
                             assert_eq!(policy.raw_var_ids(), ids_before);
+                        }
+                        if rank == 1 && fault.mutates_var_values() {
+                            let mutation_prestate = policy.value_mutation_prestate.borrow();
+                            let mutation_prestate = mutation_prestate
+                                .as_ref()
+                                .expect("value mutation did not capture its prestate");
+                            assert_ne!(
+                                policy.first_var_bits(),
+                                *mutation_prestate,
+                                "{} rank {rank} did not mutate the existing Var's value",
+                                fault.tag()
+                            );
+                        }
+                        if rank == 1 && fault.resets_sampler() {
+                            assert_eq!(
+                                policy.sampler_reset_prestate.borrow().as_deref(),
+                                Some(&[][..]),
+                                "{} rank {rank} did not reset the sampler after exact checkpoint restoration",
+                                fault.tag()
+                            );
+                            assert_eq!(
+                                policy.sampler_state().unwrap(),
+                                vec![0x5a, rank as u8]
+                            );
                         }
                         assert_eq!(
                             policy.fault_fired.get(),

@@ -1254,6 +1254,13 @@ fn require(cond: bool, msg: &str) -> Result<(), TrainerError> {
     }
 }
 
+#[derive(Debug)]
+struct OrdinaryResumeState {
+    vars: Vec<Var>,
+    adapter_value_sha256: Vec<String>,
+    sampler_state: Vec<u8>,
+}
+
 /// Drives the GRPO training loop over a [`Policy`] and a [`RewardFn`].
 #[derive(Debug)]
 pub struct Trainer {
@@ -4505,16 +4512,16 @@ impl Trainer {
         &self,
         policy: &mut P,
         exec: &E,
-        resume_vars: Option<&[Var]>,
+        resume_state: Option<&OrdinaryResumeState>,
     ) -> Result<Vec<Var>, TrainerError>
     where
         P: Policy,
         E: PolicyExecution<P>,
     {
-        if let Some(expected) = resume_vars {
+        if let Some(expected) = resume_state {
             return Self::coordinate_comm_call(
                 exec.execution_comm(self.comm.as_ref()),
-                "ordinary checkpoint pre-optimizer variable handoff",
+                "ordinary checkpoint pre-optimizer live-state seal",
                 || {
                     self.require_toggleable_reference_policy(
                         policy,
@@ -4522,10 +4529,43 @@ impl Trainer {
                     )?;
                     let vars = policy.trainable_vars();
                     self.require_same_rollout_ledger_vars(
-                        expected,
+                        &expected.vars,
                         &vars,
-                        "ordinary checkpoint pre-optimizer handoff",
+                        "ordinary checkpoint final pre-optimizer live-state seal",
                     )?;
+                    let sampler_state = policy.sampler_state()?;
+                    if sampler_state != expected.sampler_state {
+                        return Err(TrainerError::Contract(
+                            "policy sampler state differs from the ordinary checkpoint at the final pre-optimizer live-state seal"
+                                .into(),
+                        ));
+                    }
+                    // `sampler_state` is an opaque public hook too. Re-read the
+                    // active bindings after it, then seal the values on exactly
+                    // the handles handed to Adam.
+                    let vars = policy.trainable_vars();
+                    self.require_same_rollout_ledger_vars(
+                        &expected.vars,
+                        &vars,
+                        "ordinary checkpoint final pre-optimizer live-state seal",
+                    )?;
+                    let actual_value_sha256 = crate::checkpoint::trainable_var_value_sha256(&vars);
+                    if let Some(index) = expected
+                        .adapter_value_sha256
+                        .iter()
+                        .zip(actual_value_sha256.iter())
+                        .position(|(expected, actual)| expected != actual)
+                    {
+                        return Err(TrainerError::Contract(format!(
+                            "policy trainable-variable value at ordered index {index} differs from the ordinary checkpoint at the final pre-optimizer live-state seal"
+                        )));
+                    }
+                    if actual_value_sha256.len() != expected.adapter_value_sha256.len() {
+                        return Err(TrainerError::Contract(
+                            "policy trainable-variable value count differs from the ordinary checkpoint at the final pre-optimizer live-state seal"
+                                .into(),
+                        ));
+                    }
                     Ok(vars)
                 },
             );
@@ -5873,12 +5913,12 @@ impl Trainer {
         samples: &[Sample<R::Target>],
     ) -> Result<(Vec<Metrics>, RunStop), TrainerError> {
         let exec = UnshardedPolicyExecution;
-        let (start_step, opt_state, resume_vars) =
+        let (start_step, opt_state, resume_state) =
             self.load_resume_point(checkpoint_dir.as_ref(), policy, &exec)?;
         self.run(
             start_step,
             opt_state,
-            Some(&resume_vars),
+            Some(&resume_state),
             policy,
             reward_fn,
             tokenizer,
@@ -5909,12 +5949,12 @@ impl Trainer {
         let exec = TensorParallelPolicyExecution {
             comm: tensor_parallel_comm,
         };
-        let (start_step, opt_state, resume_vars) =
+        let (start_step, opt_state, resume_state) =
             self.load_resume_point(checkpoint_dir.as_ref(), policy, &exec)?;
         self.run(
             start_step,
             opt_state,
-            Some(&resume_vars),
+            Some(&resume_state),
             policy,
             reward_fn,
             tokenizer,
@@ -5924,10 +5964,11 @@ impl Trainer {
     }
 
     /// Load `checkpoint_dir` into `policy` and return the resumed loop's
-    /// `(start_step, optimizer_state, trainable_variables)` — the momentum-faithful
+    /// `(start_step, optimizer_state, live_resume_state)` — the momentum-faithful
     /// prelude shared by [`resume`](Self::resume) and
-    /// [`resume_latest`](Self::resume_latest). The returned variable handles remain
-    /// the authority through the resumed loop's pre-optimizer handoff.
+    /// [`resume_latest`](Self::resume_latest). The returned state seals the ordered
+    /// variable handles, exact checkpoint tensor values, and sampler bytes through
+    /// the resumed loop's final pre-optimizer handoff.
     ///
     /// The format-v4 identity, exact payloads, tensor schemas/keys, sampler blob,
     /// and temporary optimizer state are all prepared and coordinated before the
@@ -5937,7 +5978,7 @@ impl Trainer {
         checkpoint_dir: &Path,
         policy: &mut P,
         exec: &E,
-    ) -> Result<(u64, Option<OptimizerState>, Vec<Var>), TrainerError>
+    ) -> Result<(u64, Option<OptimizerState>, OrdinaryResumeState), TrainerError>
     where
         P: Policy,
         E: PolicyExecution<P>,
@@ -5977,6 +6018,7 @@ impl Trainer {
             prepared.manifest_consensus_sha256().as_bytes(),
         )?;
         let applied = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let adapter_value_sha256 = prepared.adapter_value_sha256().to_vec();
             let loaded = prepared.apply(&vars)?;
             let blob = loaded.sampler_state.as_deref().ok_or_else(|| {
                 TrainerError::Contract(
@@ -5990,7 +6032,16 @@ impl Trainer {
                 &active_vars,
                 "ordinary checkpoint restore",
             )?;
-            Ok((loaded.step, loaded.optimizer_state, vars))
+            let sampler_state = blob.to_vec();
+            Ok((
+                loaded.step,
+                loaded.optimizer_state,
+                OrdinaryResumeState {
+                    vars,
+                    adapter_value_sha256,
+                    sampler_state,
+                },
+            ))
         }))
         .unwrap_or_else(|payload| {
             Err(TrainerError::Contract(format!(
@@ -6122,12 +6173,12 @@ impl Trainer {
                     world_size = exec.execution_world_size(self.comm.as_ref()),
                     "resume_latest: continuing from the newest checkpoint"
                 );
-                let (start_step, opt_state, resume_vars) =
+                let (start_step, opt_state, resume_state) =
                     self.load_resume_point(&dir, policy, exec)?;
                 self.run(
                     start_step,
                     opt_state,
-                    Some(&resume_vars),
+                    Some(&resume_state),
                     policy,
                     reward_fn,
                     tokenizer,
@@ -6324,7 +6375,7 @@ impl Trainer {
         &mut self,
         start_step: u64,
         resume_opt_state: Option<OptimizerState>,
-        resume_vars: Option<&[Var]>,
+        resume_state: Option<&OrdinaryResumeState>,
         policy: &mut P,
         reward_fn: &R,
         tokenizer: &dyn TokenizerLike,
@@ -6383,7 +6434,7 @@ impl Trainer {
         // full-FT runs take `beta = 0` (no frozen reference exists to pull
         // toward; a base-anchored KL needs a separately loaded base policy,
         // which this trainer does not model).
-        let vars = self.prepare_run_optimizer_vars(policy, exec, resume_vars)?;
+        let vars = self.prepare_run_optimizer_vars(policy, exec, resume_state)?;
         let params = ParamsAdamW {
             lr: self.config.lr,
             weight_decay: self.config.weight_decay,
