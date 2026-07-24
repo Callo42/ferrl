@@ -308,26 +308,32 @@ impl Policy for ResumePreflightPanicPolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResumePostconditionFault {
     NoOpSamplerRestore,
+    ReplaceVarsDuringRecipe,
     ReplaceVarsDuringValidation,
     ReplaceVarsDuringRestore,
     MutateVarsDuringRestore,
+    DisableAdapterDuringRestore,
     ReplaceVarsBeforeOptimizer,
     MutateVarsBeforeOptimizer,
     ResetSamplerBeforeOptimizer,
+    ResetSamplerAndRejectRollback,
     PanicSamplerRestore,
     PanicSamplerReadback,
     PanicVarsDuringRestore,
 }
 
 impl ResumePostconditionFault {
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 13] = [
         Self::NoOpSamplerRestore,
+        Self::ReplaceVarsDuringRecipe,
         Self::ReplaceVarsDuringValidation,
         Self::ReplaceVarsDuringRestore,
         Self::MutateVarsDuringRestore,
+        Self::DisableAdapterDuringRestore,
         Self::ReplaceVarsBeforeOptimizer,
         Self::MutateVarsBeforeOptimizer,
         Self::ResetSamplerBeforeOptimizer,
+        Self::ResetSamplerAndRejectRollback,
         Self::PanicSamplerRestore,
         Self::PanicSamplerReadback,
         Self::PanicVarsDuringRestore,
@@ -336,12 +342,15 @@ impl ResumePostconditionFault {
     fn tag(self) -> &'static str {
         match self {
             Self::NoOpSamplerRestore => "no-op-sampler-restore",
+            Self::ReplaceVarsDuringRecipe => "replace-vars-during-recipe",
             Self::ReplaceVarsDuringValidation => "replace-vars-during-validation",
             Self::ReplaceVarsDuringRestore => "replace-vars-during-restore",
             Self::MutateVarsDuringRestore => "mutate-vars-during-restore",
+            Self::DisableAdapterDuringRestore => "disable-adapter-during-restore",
             Self::ReplaceVarsBeforeOptimizer => "replace-vars-before-optimizer",
             Self::MutateVarsBeforeOptimizer => "mutate-vars-before-optimizer",
             Self::ResetSamplerBeforeOptimizer => "reset-sampler-before-optimizer",
+            Self::ResetSamplerAndRejectRollback => "reset-sampler-reject-rollback",
             Self::PanicSamplerRestore => "panic-sampler-restore",
             Self::PanicSamplerReadback => "panic-sampler-readback",
             Self::PanicVarsDuringRestore => "panic-vars-during-restore",
@@ -353,11 +362,17 @@ impl ResumePostconditionFault {
             Self::NoOpSamplerRestore => {
                 "policy did not install the exact ordinary checkpoint sampler state"
             }
+            Self::ReplaceVarsDuringRecipe => {
+                "policy trainable-variable set changed during ordinary checkpoint identity binding"
+            }
             Self::ReplaceVarsDuringValidation => {
                 "policy trainable-variable set changed during ordinary checkpoint sampler validation"
             }
             Self::ReplaceVarsDuringRestore => {
                 "policy trainable-variable set changed during ordinary checkpoint restore"
+            }
+            Self::DisableAdapterDuringRestore => {
+                "policy adapter-enabled state differs from the expected training mode at the final pre-optimizer live-state seal"
             }
             Self::ReplaceVarsBeforeOptimizer => {
                 "policy trainable-variable set changed during ordinary checkpoint final pre-optimizer live-state seal"
@@ -365,7 +380,7 @@ impl ResumePostconditionFault {
             Self::MutateVarsDuringRestore | Self::MutateVarsBeforeOptimizer => {
                 "policy trainable-variable value at ordered index 0 differs from the ordinary checkpoint at the final pre-optimizer live-state seal"
             }
-            Self::ResetSamplerBeforeOptimizer => {
+            Self::ResetSamplerBeforeOptimizer | Self::ResetSamplerAndRejectRollback => {
                 "policy sampler state differs from the ordinary checkpoint at the final pre-optimizer live-state seal"
             }
             Self::PanicSamplerRestore => {
@@ -382,6 +397,9 @@ impl ResumePostconditionFault {
 
     fn peer_error(self) -> &'static str {
         match self {
+            Self::ReplaceVarsDuringRecipe => {
+                "ordinary checkpoint identity prestate seal failed on a peer rank"
+            }
             Self::ReplaceVarsDuringValidation => {
                 "checkpoint identity/payload preflight failed on a peer rank"
             }
@@ -393,9 +411,11 @@ impl ResumePostconditionFault {
                 "checkpoint validated-state application failed on a peer rank"
             }
             Self::ReplaceVarsBeforeOptimizer
+            | Self::DisableAdapterDuringRestore
             | Self::MutateVarsDuringRestore
             | Self::MutateVarsBeforeOptimizer
-            | Self::ResetSamplerBeforeOptimizer => {
+            | Self::ResetSamplerBeforeOptimizer
+            | Self::ResetSamplerAndRejectRollback => {
                 "ordinary checkpoint pre-optimizer live-state seal failed on a peer rank"
             }
         }
@@ -404,14 +424,11 @@ impl ResumePostconditionFault {
     fn replaces_vars(self) -> bool {
         matches!(
             self,
-            Self::ReplaceVarsDuringValidation
+            Self::ReplaceVarsDuringRecipe
+                | Self::ReplaceVarsDuringValidation
                 | Self::ReplaceVarsDuringRestore
                 | Self::ReplaceVarsBeforeOptimizer
         )
-    }
-
-    fn preserves_sampler(self) -> bool {
-        matches!(self, Self::NoOpSamplerRestore | Self::PanicSamplerRestore)
     }
 
     fn mutates_var_values(self) -> bool {
@@ -422,7 +439,14 @@ impl ResumePostconditionFault {
     }
 
     fn resets_sampler(self) -> bool {
-        self == Self::ResetSamplerBeforeOptimizer
+        matches!(
+            self,
+            Self::ResetSamplerBeforeOptimizer | Self::ResetSamplerAndRejectRollback
+        )
+    }
+
+    fn rollback_fails(self) -> bool {
+        self == Self::ResetSamplerAndRejectRollback
     }
 }
 
@@ -509,6 +533,24 @@ impl ResumePostconditionPolicy {
             .collect()
     }
 
+    fn raw_var_bits(&self) -> Vec<Vec<u32>> {
+        self.inner
+            .borrow()
+            .trainable_vars()
+            .iter()
+            .map(|var| {
+                var.as_tensor()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+                    .into_iter()
+                    .map(f32::to_bits)
+                    .collect()
+            })
+            .collect()
+    }
+
     fn mutate_first_var(&self) -> CandleResult<()> {
         let var = self.inner.borrow().trainable_vars().remove(0);
         *self.value_mutation_prestate.borrow_mut() = Some(self.first_var_bits());
@@ -548,7 +590,9 @@ impl Policy for ResumePostconditionPolicy {
         if self.take_fault(ResumePostconditionFault::MutateVarsBeforeOptimizer) {
             self.mutate_first_var().unwrap();
         }
-        if self.take_fault(ResumePostconditionFault::ResetSamplerBeforeOptimizer) {
+        if self.take_fault(ResumePostconditionFault::ResetSamplerBeforeOptimizer)
+            || self.take_fault(ResumePostconditionFault::ResetSamplerAndRejectRollback)
+        {
             *self.sampler_reset_prestate.borrow_mut() = Some(self.sampler_state.clone());
             self.sampler_state = vec![0x5a, self.rank as u8];
         }
@@ -589,6 +633,12 @@ impl Policy for ResumePostconditionPolicy {
     }
 
     fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
+        if self.fault == ResumePostconditionFault::ResetSamplerAndRejectRollback
+            && self.fault_fired.get()
+            && state == [0xa5, self.rank as u8]
+        {
+            candle_core::bail!("injected ordinary-resume rollback sampler failure")
+        }
         assert!(
             !self.take_fault(ResumePostconditionFault::PanicSamplerRestore),
             "injected ordinary-resume sampler-restore panic"
@@ -604,8 +654,19 @@ impl Policy for ResumePostconditionPolicy {
         if self.take_fault(ResumePostconditionFault::MutateVarsDuringRestore) {
             self.mutate_first_var()?;
         }
+        if self.take_fault(ResumePostconditionFault::DisableAdapterDuringRestore) {
+            self.inner.get_mut().set_adapter_enabled(false);
+        }
         self.restore_completed.set(true);
         Ok(())
+    }
+
+    fn lora_recipe(&self) -> Option<String> {
+        if self.take_fault(ResumePostconditionFault::ReplaceVarsDuringRecipe) {
+            let replacement = self.replacement().unwrap();
+            *self.inner.borrow_mut() = replacement;
+        }
+        self.inner.borrow().lora_recipe()
     }
 }
 
@@ -1522,27 +1583,23 @@ struct InjectedFailureComm {
     state: Arc<InjectedCollectiveFailureState>,
 }
 
-impl InjectedFailureComm {
+impl InjectedCollectiveFailureState {
     fn enter_collective(&self) -> Result<(), CommError> {
-        if self.state.failed.load(Ordering::SeqCst) {
-            self.state
-                .calls_after_failure
-                .fetch_add(1, Ordering::SeqCst);
+        if self.failed.load(Ordering::SeqCst) {
+            self.calls_after_failure.fetch_add(1, Ordering::SeqCst);
             return Err(CommError::Poisoned(
                 "collective issued after injected terminal failure".into(),
             ));
         }
-        if !self.state.armed.load(Ordering::SeqCst) {
+        if !self.armed.load(Ordering::SeqCst) {
             return Ok(());
         }
-        let remaining = self.state.remaining_successes.load(Ordering::SeqCst);
+        let remaining = self.remaining_successes.load(Ordering::SeqCst);
         if remaining > 0 {
-            self.state
-                .remaining_successes
-                .fetch_sub(1, Ordering::SeqCst);
+            self.remaining_successes.fetch_sub(1, Ordering::SeqCst);
             return Ok(());
         }
-        self.state.failed.store(true, Ordering::SeqCst);
+        self.failed.store(true, Ordering::SeqCst);
         Err(CommError::Mismatch(
             "injected terminal data-parallel failure".into(),
         ))
@@ -1559,12 +1616,152 @@ impl Comm for InjectedFailureComm {
     }
 
     fn all_reduce_sum(&self, _tensors: &mut Vec<Tensor>) -> Result<(), CommError> {
-        self.enter_collective()
+        self.state.enter_collective()
     }
 
     fn all_reduce_scalar_sum(&self, value: f64) -> Result<f64, CommError> {
-        self.enter_collective()?;
+        self.state.enter_collective()?;
         Ok(value)
+    }
+}
+
+#[derive(Debug)]
+struct InjectedFailurePassthroughComm<C> {
+    inner: C,
+    state: Arc<InjectedCollectiveFailureState>,
+}
+
+impl<C: Comm> Comm for InjectedFailurePassthroughComm<C> {
+    fn rank(&self) -> usize {
+        self.inner.rank()
+    }
+
+    fn world_size(&self) -> usize {
+        self.inner.world_size()
+    }
+
+    fn validate_all_reduce_sum(&self, tensors: &[Tensor]) -> Result<(), CommError> {
+        self.inner.validate_all_reduce_sum(tensors)
+    }
+
+    fn all_reduce_sum(&self, tensors: &mut Vec<Tensor>) -> Result<(), CommError> {
+        self.state.enter_collective()?;
+        self.inner.all_reduce_sum(tensors)
+    }
+
+    fn all_reduce_scalar_sum(&self, value: f64) -> Result<f64, CommError> {
+        self.state.enter_collective()?;
+        self.inner.all_reduce_scalar_sum(value)
+    }
+}
+
+struct ResumeTerminalCommPolicy {
+    inner: ScriptedPolicy,
+    sampler_state: Vec<u8>,
+    failure: Arc<InjectedCollectiveFailureState>,
+    no_op_checkpoint_restore: bool,
+    arm_on_checkpoint_restore: bool,
+    arm_on_rollback_restore: bool,
+    arm_on_final_seal: bool,
+    checkpoint_restored: bool,
+    final_seal_armed: Cell<bool>,
+    restore_calls: usize,
+    calls: ResumePostconditionCalls,
+}
+
+impl ResumeTerminalCommPolicy {
+    fn new(
+        rank: usize,
+        failure: Arc<InjectedCollectiveFailureState>,
+        no_op_checkpoint_restore: bool,
+        arm_on_checkpoint_restore: bool,
+        arm_on_rollback_restore: bool,
+        arm_on_final_seal: bool,
+    ) -> Self {
+        Self {
+            inner: ScriptedPolicy::new(SEED.wrapping_add(20_000 + rank as u64)).unwrap(),
+            sampler_state: vec![0xc3, rank as u8],
+            failure,
+            no_op_checkpoint_restore,
+            arm_on_checkpoint_restore,
+            arm_on_rollback_restore,
+            arm_on_final_seal,
+            checkpoint_restored: false,
+            final_seal_armed: Cell::new(false),
+            restore_calls: 0,
+            calls: ResumePostconditionCalls::default(),
+        }
+    }
+}
+
+impl Policy for ResumeTerminalCommPolicy {
+    fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
+        self.calls.generate += 1;
+        self.inner.generate(prompt, cfg)
+    }
+
+    fn token_logprobs(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+        self.calls
+            .token_logprobs
+            .set(self.calls.token_logprobs.get() + 1);
+        self.inner.token_logprobs(rollout)
+    }
+
+    fn token_logprobs_detached(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+        self.calls.detached.set(self.calls.detached.get() + 1);
+        self.inner.token_logprobs_detached(rollout)
+    }
+
+    fn backward(&self, loss: &Tensor) -> CandleResult<candle_core::backprop::GradStore> {
+        self.calls.backward.set(self.calls.backward.get() + 1);
+        loss.backward()
+    }
+
+    fn set_adapter_enabled(&mut self, enabled: bool) {
+        self.inner.set_adapter_enabled(enabled);
+    }
+
+    fn adapter_enabled(&self) -> bool {
+        if self.arm_on_final_seal
+            && self.checkpoint_restored
+            && !self.final_seal_armed.replace(true)
+        {
+            self.failure.armed.store(true, Ordering::SeqCst);
+        }
+        self.inner.adapter_enabled()
+    }
+
+    fn trainable_vars(&self) -> Vec<Var> {
+        self.inner.trainable_vars()
+    }
+
+    fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+        Ok(self.sampler_state.clone())
+    }
+
+    fn validate_sampler_state(&self, state: &[u8]) -> CandleResult<()> {
+        if !state.is_empty() {
+            candle_core::bail!("terminal ordinary-resume fixture expects an empty sampler")
+        }
+        Ok(())
+    }
+
+    fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
+        self.restore_calls += 1;
+        let checkpoint_restore = state.is_empty();
+        if checkpoint_restore && self.no_op_checkpoint_restore {
+            return Ok(());
+        }
+        self.sampler_state = state.to_vec();
+        if checkpoint_restore {
+            self.checkpoint_restored = true;
+        }
+        if (checkpoint_restore && self.arm_on_checkpoint_restore)
+            || (!checkpoint_restore && self.arm_on_rollback_restore)
+        {
+            self.failure.armed.store(true, Ordering::SeqCst);
+        }
+        Ok(())
     }
 }
 
@@ -7331,12 +7528,12 @@ fn ordinary_dp_resume_panic_contains_the_complete_preflight_before_any_mutation(
     assert!(checkpoint.is_dir(), "seed checkpoint was not published");
 
     for (case, fault, expected_scalars) in [
-        ("lora-recipe", ResumePreflightPanic::LoraRecipe, 1),
-        ("trainable-vars", ResumePreflightPanic::TrainableVars, 11),
+        ("lora-recipe", ResumePreflightPanic::LoraRecipe, 3),
+        ("trainable-vars", ResumePreflightPanic::TrainableVars, 1),
         (
             "sampler-validation",
             ResumePreflightPanic::SamplerValidation,
-            11,
+            14,
         ),
     ] {
         let reward_calls = Arc::new(AtomicUsize::new(0));
@@ -7436,13 +7633,15 @@ fn ordinary_dp_resume_panic_contains_the_complete_preflight_before_any_mutation(
                                 0,
                                 "{case} rank {rank} ran backward"
                             );
+                            let rollback_hooks =
+                                usize::from(fault != ResumePreflightPanic::TrainableVars);
                             assert_eq!(
-                                policy.calls.adapter_toggles, 0,
-                                "{case} rank {rank} toggled adapter"
+                                policy.calls.adapter_toggles, rollback_hooks,
+                                "{case} rank {rank} adapter rollback calls"
                             );
                             assert_eq!(
-                                policy.calls.sampler_restore, 0,
-                                "{case} rank {rank} restored sampler"
+                                policy.calls.sampler_restore, rollback_hooks,
+                                "{case} rank {rank} sampler rollback calls"
                             );
                             assert_eq!(
                                 tensor_calls.load(Ordering::SeqCst),
@@ -7479,33 +7678,27 @@ fn ordinary_dp_resume_panic_contains_the_complete_preflight_before_any_mutation(
                     }),
                 "{case} rank {rank} did not return promptly through the coordinated panic boundary: {error:?}"
             );
-            assert_eq!(
-                calls.lora_recipe.get(),
-                1,
-                "{case} rank {rank} recipe calls"
-            );
             match fault {
                 ResumePreflightPanic::LoraRecipe => {
-                    assert_eq!(calls.trainable_vars.get(), 0);
+                    assert_eq!(calls.lora_recipe.get(), 1);
+                    assert_eq!(calls.trainable_vars.get(), 4);
                     assert_eq!(calls.sampler_validation.get(), 0);
                 }
                 ResumePreflightPanic::TrainableVars => {
+                    assert_eq!(calls.lora_recipe.get(), 0);
                     assert_eq!(
                         calls.trainable_vars.get(),
                         1 + usize::from(rank == 0),
-                        "the successful peer checks the binding again after sampler validation"
+                        "the successful peer completes the prestate binding check"
                     );
-                    assert_eq!(
-                        calls.sampler_validation.get(),
-                        usize::from(rank == 0),
-                        "the panicking rank must stop inside trainable_vars"
-                    );
+                    assert_eq!(calls.sampler_validation.get(), 0);
                 }
                 ResumePreflightPanic::SamplerValidation => {
+                    assert_eq!(calls.lora_recipe.get(), 1);
                     assert_eq!(
                         calls.trainable_vars.get(),
-                        1 + usize::from(rank == 0),
-                        "the successful peer checks the binding again after sampler validation"
+                        5 + usize::from(rank == 0),
+                        "snapshot, preflight, and rollback binding checks"
                     );
                     assert_eq!(calls.sampler_validation.get(), 1);
                 }
@@ -7522,6 +7715,11 @@ fn ordinary_world_one_resume_enforces_exact_policy_postconditions_before_rollout
         let seed_cfg = TrainerConfig {
             steps: 1,
             checkpoint_every: Some(1),
+            beta: if fault == ResumePostconditionFault::DisableAdapterDuringRestore {
+                0.0
+            } else {
+                scripted_cfg().beta
+            },
             ..scripted_cfg()
         };
         let seed = run_scripted_world(tmp.path(), 1, &seed_cfg, &live_samples());
@@ -7539,6 +7737,7 @@ fn ordinary_world_one_resume_enforces_exact_policy_postconditions_before_rollout
             TrainerConfig {
                 steps: 2,
                 checkpoint_every: Some(1),
+                beta: seed_cfg.beta,
                 ..scripted_cfg()
             },
             &run,
@@ -7548,6 +7747,8 @@ fn ordinary_world_one_resume_enforces_exact_policy_postconditions_before_rollout
         let mut policy = ResumePostconditionPolicy::new(0, 0, fault);
         let ids_before = policy.raw_var_ids();
         let shapes_before = policy.raw_var_shapes();
+        let values_before = policy.raw_var_bits();
+        let mode_before = policy.adapter_enabled();
         let sampler_before = policy.sampler_state().unwrap();
 
         let error = trainer
@@ -7581,20 +7782,25 @@ fn ordinary_world_one_resume_enforces_exact_policy_postconditions_before_rollout
                 "{} did not replace the live same-shaped Vars",
                 fault.tag()
             );
+            assert!(
+                error.to_string().contains("discard the policy instance"),
+                "{} did not classify irrecoverable binding replacement as discard-required: {error:?}",
+                fault.tag()
+            );
         } else {
             assert_eq!(policy.raw_var_ids(), ids_before);
+            assert_eq!(
+                policy.raw_var_bits(),
+                values_before,
+                "{} did not restore exact pre-resume tensor values",
+                fault.tag()
+            );
         }
         if fault.mutates_var_values() {
             let mutation_prestate = policy.value_mutation_prestate.borrow();
-            let mutation_prestate = mutation_prestate
+            mutation_prestate
                 .as_ref()
                 .expect("value mutation did not capture its prestate");
-            assert_ne!(
-                policy.first_var_bits(),
-                *mutation_prestate,
-                "{} did not mutate the existing Var's value",
-                fault.tag()
-            );
         }
         if fault.resets_sampler() {
             assert_eq!(
@@ -7603,11 +7809,33 @@ fn ordinary_world_one_resume_enforces_exact_policy_postconditions_before_rollout
                 "{} did not reset the sampler after exact checkpoint restoration",
                 fault.tag()
             );
-            assert_eq!(policy.sampler_state().unwrap(), vec![0x5a, 0]);
         }
-        if fault.preserves_sampler() {
-            assert_eq!(policy.sampler_state().unwrap(), sampler_before);
+        if fault.rollback_fails() {
+            assert_ne!(
+                policy.sampler_state().unwrap(),
+                sampler_before,
+                "{} did not leave a mutation-sensitive rollback failure",
+                fault.tag()
+            );
+            assert!(
+                error.to_string().contains("discard the policy instance"),
+                "{} did not classify rollback failure as discard-required: {error:?}",
+                fault.tag()
+            );
+        } else {
+            assert_eq!(
+                policy.sampler_state().unwrap(),
+                sampler_before,
+                "{} did not restore exact pre-resume sampler bytes",
+                fault.tag()
+            );
         }
+        assert_eq!(
+            policy.adapter_enabled(),
+            mode_before,
+            "{} did not restore adapter mode",
+            fault.tag()
+        );
         assert_eq!(policy.calls.generate, 0, "{} generated", fault.tag());
         assert_eq!(
             policy.calls.token_logprobs.get(),
@@ -7649,6 +7877,11 @@ fn ordinary_distributed_resume_globalizes_exact_policy_postcondition_failures() 
         let seed_cfg = TrainerConfig {
             steps: 1,
             checkpoint_every: Some(1),
+            beta: if fault == ResumePostconditionFault::DisableAdapterDuringRestore {
+                0.0
+            } else {
+                scripted_cfg().beta
+            },
             ..scripted_cfg()
         };
         let seed = run_scripted_world(tmp.path(), 2, &seed_cfg, &live_samples());
@@ -7658,6 +7891,7 @@ fn ordinary_distributed_resume_globalizes_exact_policy_postcondition_failures() 
         let resume_cfg = TrainerConfig {
             steps: 2,
             checkpoint_every: Some(1),
+            beta: seed_cfg.beta,
             ..scripted_cfg()
         };
         let reward_calls = Arc::new(AtomicUsize::new(0));
@@ -7687,6 +7921,9 @@ fn ordinary_distributed_resume_globalizes_exact_policy_postcondition_failures() 
                         let mut policy = ResumePostconditionPolicy::new(rank, 1, fault);
                         let ids_before = policy.raw_var_ids();
                         let shapes_before = policy.raw_var_shapes();
+                        let values_before = policy.raw_var_bits();
+                        let mode_before = policy.adapter_enabled();
+                        let sampler_before = policy.sampler_state().unwrap();
 
                         let error = trainer
                             .resume(
@@ -7715,18 +7952,18 @@ fn ordinary_distributed_resume_globalizes_exact_policy_postcondition_failures() 
                             );
                         } else {
                             assert_eq!(policy.raw_var_ids(), ids_before);
+                            assert_eq!(
+                                policy.raw_var_bits(),
+                                values_before,
+                                "{} rank {rank} did not restore exact pre-resume tensor values",
+                                fault.tag()
+                            );
                         }
                         if rank == 1 && fault.mutates_var_values() {
                             let mutation_prestate = policy.value_mutation_prestate.borrow();
-                            let mutation_prestate = mutation_prestate
+                            mutation_prestate
                                 .as_ref()
                                 .expect("value mutation did not capture its prestate");
-                            assert_ne!(
-                                policy.first_var_bits(),
-                                *mutation_prestate,
-                                "{} rank {rank} did not mutate the existing Var's value",
-                                fault.tag()
-                            );
                         }
                         if rank == 1 && fault.resets_sampler() {
                             assert_eq!(
@@ -7735,11 +7972,28 @@ fn ordinary_distributed_resume_globalizes_exact_policy_postcondition_failures() 
                                 "{} rank {rank} did not reset the sampler after exact checkpoint restoration",
                                 fault.tag()
                             );
+                        }
+                        if rank == 1 && fault.rollback_fails() {
+                            assert_ne!(
+                                policy.sampler_state().unwrap(),
+                                sampler_before,
+                                "{} rank {rank} did not leave a mutation-sensitive rollback failure",
+                                fault.tag()
+                            );
+                        } else {
                             assert_eq!(
                                 policy.sampler_state().unwrap(),
-                                vec![0x5a, rank as u8]
+                                sampler_before,
+                                "{} rank {rank} did not restore exact pre-resume sampler bytes",
+                                fault.tag()
                             );
                         }
+                        assert_eq!(
+                            policy.adapter_enabled(),
+                            mode_before,
+                            "{} rank {rank} did not restore adapter mode",
+                            fault.tag()
+                        );
                         assert_eq!(
                             policy.fault_fired.get(),
                             rank == 1,
@@ -7801,6 +8055,150 @@ fn ordinary_distributed_resume_globalizes_exact_policy_postcondition_failures() 
                 error.to_string().contains(expected),
                 "{} rank {rank} returned the wrong error: {error:?}",
                 fault.tag()
+            );
+            if fault.replaces_vars() || fault.rollback_fails() {
+                assert!(
+                    error.to_string().contains("discard the policy instance"),
+                    "{} rank {rank} did not globalize discard-required binding replacement: {error:?}",
+                    fault.tag()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[allow(clippy::cognitive_complexity)]
+fn ordinary_resume_terminal_comm_failures_rollback_locally_without_later_collectives() {
+    for (phase, successes_after_arm) in [
+        ("apply-status", 0),
+        ("rollback-status", 0),
+        ("optimizer-handoff-status", 1),
+    ] {
+        let tmp = TempDir::new(&format!("ordinary-resume-terminal-{phase}"));
+        let seed_cfg = TrainerConfig {
+            steps: 1,
+            checkpoint_every: Some(1),
+            ..scripted_cfg()
+        };
+        let seed = run_scripted_world(tmp.path(), 2, &seed_cfg, &live_samples());
+        assert_lockstep(&seed, "ordinary terminal-comm seed");
+        let checkpoint = tmp.path().join("rank0/checkpoints/step-1");
+        let reward_calls = Arc::new(AtomicUsize::new(0));
+        let states = (0..2)
+            .map(|_| Arc::new(InjectedCollectiveFailureState::new(successes_after_arm)))
+            .collect::<Vec<_>>();
+
+        let mut outcomes = std::thread::scope(|scope| {
+            let handles = LocalComm::world_with_timeout(2, std::time::Duration::from_secs(15))
+                .into_iter()
+                .zip(states.iter().cloned())
+                .map(|(inner, state)| {
+                    let rank = inner.rank();
+                    let base = tmp.path();
+                    let checkpoint = checkpoint.clone();
+                    let reward_calls = Arc::clone(&reward_calls);
+                    scope.spawn(move || {
+                        let comm = InjectedFailurePassthroughComm {
+                            inner,
+                            state: Arc::clone(&state),
+                        };
+                        let run = RunDir::create(base, format!("{phase}-rank{rank}")).unwrap();
+                        let mut trainer = Trainer::with_comm(
+                            TrainerConfig {
+                                steps: 2,
+                                checkpoint_every: Some(1),
+                                ..scripted_cfg()
+                            },
+                            &run,
+                            comm,
+                        )
+                        .unwrap()
+                        .with_checkpoint_policy_sha256(checkpoint_policy_sha256());
+                        let mut policy = ResumeTerminalCommPolicy::new(
+                            rank,
+                            Arc::clone(&state),
+                            phase == "rollback-status" && rank == 1,
+                            phase == "apply-status",
+                            phase == "rollback-status",
+                            phase == "optimizer-handoff-status",
+                        );
+                        let ids_before = policy
+                            .trainable_vars()
+                            .iter()
+                            .map(|var| var.as_tensor().id())
+                            .collect::<Vec<_>>();
+                        let values_before = var_bits(&policy);
+                        let mode_before = policy.adapter_enabled();
+                        let sampler_before = policy.sampler_state().unwrap();
+
+                        let error = trainer
+                            .resume(
+                                &checkpoint,
+                                &mut policy,
+                                &PreflightCountingReward {
+                                    calls: reward_calls,
+                                },
+                                &CharTokenizer,
+                                &live_samples(),
+                            )
+                            .unwrap_err();
+
+                        assert_eq!(
+                            policy
+                                .trainable_vars()
+                                .iter()
+                                .map(|var| var.as_tensor().id())
+                                .collect::<Vec<_>>(),
+                            ids_before,
+                            "{phase} rank {rank}: binding rollback"
+                        );
+                        assert_eq!(var_bits(&policy), values_before, "{phase} rank {rank}");
+                        assert_eq!(policy.adapter_enabled(), mode_before, "{phase} rank {rank}");
+                        assert_eq!(
+                            policy.sampler_state().unwrap(),
+                            sampler_before,
+                            "{phase} rank {rank}: sampler rollback"
+                        );
+                        assert_eq!(policy.restore_calls, 2, "{phase} rank {rank}");
+                        assert_eq!(policy.calls.generate, 0, "{phase} rank {rank}");
+                        assert_eq!(policy.calls.token_logprobs.get(), 0, "{phase} rank {rank}");
+                        assert_eq!(policy.calls.detached.get(), 0, "{phase} rank {rank}");
+                        assert_eq!(policy.calls.backward.get(), 0, "{phase} rank {rank}");
+                        assert!(state.failed.load(Ordering::SeqCst), "{phase} rank {rank}");
+                        assert_eq!(
+                            state.remaining_successes.load(Ordering::SeqCst),
+                            0,
+                            "{phase} rank {rank}: failure boundary"
+                        );
+                        assert_eq!(
+                            state.calls_after_failure.load(Ordering::SeqCst),
+                            0,
+                            "{phase} rank {rank}: later collective"
+                        );
+                        (rank, error.to_string())
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        outcomes.sort_by_key(|(rank, _)| *rank);
+        assert_eq!(reward_calls.load(Ordering::SeqCst), 0, "{phase}: reward");
+        for (rank, message) in outcomes {
+            assert!(
+                message.contains("the distributed execution world is dead"),
+                "{phase} rank {rank}: {message}"
+            );
+            assert!(
+                message.contains("no further collectives are safe"),
+                "{phase} rank {rank}: {message}"
+            );
+            assert!(
+                message.contains("discard the policy instance"),
+                "{phase} rank {rank}: {message}"
             );
         }
     }

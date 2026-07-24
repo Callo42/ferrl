@@ -452,6 +452,8 @@ pub trait Policy {
     fn set_adapter_enabled(&mut self, enabled: bool);
 
     /// Whether the `LoRA` adapter is currently contributing to the forward pass.
+    /// This is an observational getter: it must not change adapter mode, sampler
+    /// state, or any trainable-variable binding or value.
     fn adapter_enabled(&self) -> bool;
 
     /// The trainable parameters the optimizer updates and the grad-coverage
@@ -463,6 +465,11 @@ pub trait Policy {
     /// these with the optimizer and looks them up in the grad store after
     /// `backward`. Implementors typically forward to their adapter's
     /// `trainable_vars()`.
+    ///
+    /// This is an observational getter. Calling it must not change adapter mode,
+    /// sampler state, or any trainable-variable binding or value. The trainer may
+    /// use it as the final identity observation after all mutation-capable policy
+    /// hooks and hand the returned handles directly to the optimizer.
     fn trainable_vars(&self) -> Vec<Var>;
 
     /// Whether a rollback-capable direct rollout window must retain value copies
@@ -502,6 +509,9 @@ pub trait Policy {
     /// This is a **required** method (not defaulted) so that giving a policy a sampler
     /// can never silently skip RNG capture — the resume footgun a faithful checkpoint
     /// must avoid.
+    ///
+    /// This is an observational getter. Serialization must not advance/reset the
+    /// sampler or mutate adapter mode, trainable-variable bindings, or values.
     ///
     /// # Errors
     ///
@@ -546,6 +556,7 @@ pub trait Policy {
     /// identity and ordered tensor schema, preventing shape-aliased recipe swaps.
     /// Defaulted (`None`) so policies with no adapter recipe remain explicit;
     /// model-backed policies forward their [`crate::GradModel::lora_recipe`].
+    /// This is an observational getter and must not mutate any live policy state.
     fn lora_recipe(&self) -> Option<String> {
         None
     }

@@ -146,7 +146,7 @@ pub enum TrainerError {
         "{artifact} publication may be visible at {path}; {detail}; communication failed ({communication}); the distributed execution world is dead and no further collectives are safe; discard the communicator"
     )]
     PublicationAmbiguousAfterComm {
-        /// Human-readable artifact kind (continuation or rollout ledger).
+        /// Human-readable artifact kind (ordinary checkpoint, continuation, or rollout ledger).
         artifact: &'static str,
         /// Reader-visible destination whose publication is uncertain.
         path: PathBuf,
@@ -1259,6 +1259,16 @@ struct OrdinaryResumeState {
     vars: Vec<Var>,
     adapter_value_sha256: Vec<String>,
     sampler_state: Vec<u8>,
+    prestate: OrdinaryResumePrestate,
+}
+
+#[derive(Debug)]
+struct OrdinaryResumePrestate {
+    vars: Vec<Var>,
+    adapter: Vec<Tensor>,
+    adapter_value_sha256: Vec<String>,
+    adapter_enabled: bool,
+    sampler: Vec<u8>,
 }
 
 /// Drives the GRPO training loop over a [`Policy`] and a [`RewardFn`].
@@ -4527,6 +4537,17 @@ impl Trainer {
                         policy,
                         self.config.requires_reference_policy(),
                     )?;
+                    let expected_adapter_enabled = if self.config.requires_reference_policy() {
+                        true
+                    } else {
+                        expected.prestate.adapter_enabled
+                    };
+                    if policy.adapter_enabled() != expected_adapter_enabled {
+                        return Err(TrainerError::Contract(
+                            "policy adapter-enabled state differs from the expected training mode at the final pre-optimizer live-state seal"
+                                .into(),
+                        ));
+                    }
                     let vars = policy.trainable_vars();
                     self.require_same_rollout_ledger_vars(
                         &expected.vars,
@@ -4540,9 +4561,10 @@ impl Trainer {
                                 .into(),
                         ));
                     }
-                    // `sampler_state` is an opaque public hook too. Re-read the
-                    // active bindings after it, then seal the values on exactly
-                    // the handles handed to Adam.
+                    // `sampler_state` and `trainable_vars` are contractually
+                    // observational getters. Re-read the active bindings after
+                    // sampler serialization, then seal the values on exactly the
+                    // handles handed to Adam.
                     let vars = policy.trainable_vars();
                     self.require_same_rollout_ledger_vars(
                         &expected.vars,
@@ -4611,6 +4633,274 @@ impl Trainer {
         vars.iter()
             .map(|var| Ok(var.as_tensor().copy()?.contiguous()?))
             .collect()
+    }
+
+    fn snapshot_ordinary_resume_prestate<P: Policy>(
+        policy: &P,
+    ) -> Result<OrdinaryResumePrestate, TrainerError> {
+        let adapter_enabled = policy.adapter_enabled();
+        let vars = policy.trainable_vars();
+        // Ordinary resume can overwrite every trainable tensor before the next
+        // fallible public policy hook. Keep an unconditional host copy until
+        // Adam is loaded and every rank commits the handoff; unlike direct
+        // rollout snapshots, no opaque-policy elision is sound here.
+        let adapter = vars
+            .iter()
+            .map(|var| {
+                Ok(var
+                    .as_tensor()
+                    .to_device(&Device::Cpu)?
+                    .copy()?
+                    .contiguous()?)
+            })
+            .collect::<Result<Vec<_>, TrainerError>>()?;
+        let adapter_value_sha256 = crate::checkpoint::trainable_var_value_sha256(&vars);
+        let sampler = policy.sampler_state()?;
+
+        // Seal the complete snapshot after the final observational sampler
+        // serialization so a contract violation cannot silently mix state.
+        if policy.adapter_enabled() != adapter_enabled {
+            return Err(TrainerError::Contract(
+                "policy adapter-enabled state changed during ordinary checkpoint prestate snapshot"
+                    .into(),
+            ));
+        }
+        let active_vars = policy.trainable_vars();
+        if !Self::same_rollout_ledger_vars(&vars, &active_vars) {
+            return Err(TrainerError::Contract(
+                "policy trainable-variable set changed during ordinary checkpoint prestate snapshot"
+                    .into(),
+            ));
+        }
+        if crate::checkpoint::trainable_var_value_sha256(&active_vars) != adapter_value_sha256 {
+            return Err(TrainerError::Contract(
+                "policy trainable-variable values changed during ordinary checkpoint prestate snapshot"
+                    .into(),
+            ));
+        }
+
+        Ok(OrdinaryResumePrestate {
+            vars,
+            adapter,
+            adapter_value_sha256,
+            adapter_enabled,
+            sampler,
+        })
+    }
+
+    fn capture_ordinary_resume_prestate<P, E>(
+        &self,
+        policy: &P,
+        exec: &E,
+    ) -> Result<OrdinaryResumePrestate, TrainerError>
+    where
+        P: Policy,
+        E: PolicyExecution<P>,
+    {
+        let execution_comm = exec.execution_comm(self.comm.as_ref());
+        match Self::coordinate_comm_call(
+            execution_comm,
+            "ordinary checkpoint prestate snapshot",
+            || Self::snapshot_ordinary_resume_prestate(policy),
+        ) {
+            Ok(prestate) => Ok(prestate),
+            Err(TrainerError::Comm(comm_error)) => Err(Self::terminal_distributed_comm_failure(
+                "ordinary checkpoint prestate snapshot",
+                &comm_error,
+                Some("the complete local prestate was not returned"),
+                Err(TrainerError::Contract(
+                    "ordinary checkpoint prestate snapshot did not complete".into(),
+                )),
+                "policy instance",
+            )),
+            Err(error) => Err(TrainerError::Contract(format!(
+                "ordinary checkpoint prestate snapshot failed ({error}); exact recovery cannot be proven, so discard the policy instance on every rank in this execution world"
+            ))),
+        }
+    }
+
+    fn require_ordinary_resume_prestate_unchanged<P: Policy>(
+        policy: &P,
+        prestate: &OrdinaryResumePrestate,
+        phase: &str,
+    ) -> Result<(), TrainerError> {
+        if policy.adapter_enabled() != prestate.adapter_enabled {
+            return Err(TrainerError::Contract(format!(
+                "policy adapter-enabled state changed during {phase}"
+            )));
+        }
+        if policy.sampler_state()? != prestate.sampler {
+            return Err(TrainerError::Contract(format!(
+                "policy sampler state changed during {phase}"
+            )));
+        }
+        let vars = policy.trainable_vars();
+        if !Self::same_rollout_ledger_vars(&prestate.vars, &vars) {
+            return Err(TrainerError::Contract(format!(
+                "policy trainable-variable set changed during {phase}"
+            )));
+        }
+        if crate::checkpoint::trainable_var_value_sha256(&vars) != prestate.adapter_value_sha256 {
+            return Err(TrainerError::Contract(format!(
+                "policy trainable-variable values changed during {phase}"
+            )));
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::cognitive_complexity)]
+    fn restore_ordinary_resume_prestate<P: Policy>(
+        policy: &mut P,
+        prestate: &OrdinaryResumePrestate,
+    ) -> Result<(), TrainerError> {
+        let mut failures = Vec::new();
+        // Restore the mode first because an opaque policy may select its active
+        // trainable-variable binding from this flag.
+        policy.set_adapter_enabled(prestate.adapter_enabled);
+        if let Err(error) = Self::restore_ordinary_checkpoint_sampler(policy, &prestate.sampler) {
+            failures.push(format!("restore sampler state: {error}"));
+        }
+        let active_vars = policy.trainable_vars();
+        if !Self::same_rollout_ledger_vars(&prestate.vars, &active_vars) {
+            failures.push(
+                "policy trainable-variable binding changed and cannot be restored through the Policy seam"
+                    .into(),
+            );
+        }
+        if prestate.vars.len() != prestate.adapter.len() {
+            failures.push(format!(
+                "adapter snapshot has {} tensors for {} live variables",
+                prestate.adapter.len(),
+                prestate.vars.len()
+            ));
+        } else {
+            for (index, (var, snapshot)) in prestate.vars.iter().zip(&prestate.adapter).enumerate()
+            {
+                let restored = snapshot
+                    .to_device(var.as_tensor().device())
+                    .and_then(|snapshot| var.set(&snapshot));
+                if let Err(error) = restored {
+                    failures.push(format!("restore adapter tensor {index}: {error}"));
+                }
+            }
+        }
+
+        // Seal the exact state after the last restoration hook. Re-read the
+        // binding after sampler readback so the hashes describe the handles the
+        // caller would actually hand to a later optimizer.
+        if policy.adapter_enabled() != prestate.adapter_enabled {
+            failures.push("policy did not restore the exact adapter-enabled state".into());
+        }
+        match policy.sampler_state() {
+            Ok(actual) if actual == prestate.sampler => {}
+            Ok(_) => failures.push("policy did not restore the exact sampler state".into()),
+            Err(error) => failures.push(format!("read restored sampler state: {error}")),
+        }
+        let restored_vars = policy.trainable_vars();
+        if !Self::same_rollout_ledger_vars(&prestate.vars, &restored_vars) {
+            failures.push(
+                "policy trainable-variable binding differs after ordinary checkpoint rollback"
+                    .into(),
+            );
+        }
+        let restored_value_sha256 = crate::checkpoint::trainable_var_value_sha256(&restored_vars);
+        if restored_value_sha256 != prestate.adapter_value_sha256 {
+            failures.push(
+                "policy trainable-variable values differ after ordinary checkpoint rollback".into(),
+            );
+        }
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(TrainerError::Contract(failures.join("; ")))
+        }
+    }
+
+    fn rollback_ordinary_resume_failure<P: Policy>(
+        policy: &mut P,
+        prestate: &OrdinaryResumePrestate,
+        execution_comm: &dyn Comm,
+        error: TrainerError,
+    ) -> TrainerError {
+        let restore = || Self::restore_ordinary_resume_prestate(policy, prestate);
+        match error {
+            TrainerError::Comm(comm_error) => {
+                let rollback = Self::catch_local_distributed_recovery(
+                    "best-effort local ordinary checkpoint rollback",
+                    restore,
+                );
+                Self::terminal_distributed_comm_failure(
+                    "ordinary checkpoint resume",
+                    &comm_error,
+                    None,
+                    rollback,
+                    "policy instance",
+                )
+            }
+            TrainerError::TensorParallelExecutionTerminal {
+                operation,
+                mut detail,
+            } => {
+                let rollback = Self::catch_local_distributed_recovery(
+                    "best-effort local ordinary checkpoint rollback",
+                    restore,
+                );
+                match rollback {
+                    Ok(()) => detail.push_str("; local ordinary checkpoint rollback succeeded"),
+                    Err(rollback) => detail.push_str(&format!(
+                        "; local ordinary checkpoint rollback failed ({rollback}); discard the policy instance on every rank in this execution world"
+                    )),
+                }
+                TrainerError::TensorParallelExecutionTerminal { operation, detail }
+            }
+            error @ (TrainerError::PublicationAmbiguousAfterComm { .. }
+            | TrainerError::RolloutLedgerMetricsComm { .. }
+            | TrainerError::CandidateTelemetryComm { .. }) => {
+                // These structured variants already declare the communicator
+                // unusable. Never attempt another rendezvous through a dead
+                // world; contain one local rollback and preserve the cause.
+                let _ = Self::catch_local_distributed_recovery(
+                    "best-effort local ordinary checkpoint rollback",
+                    restore,
+                );
+                error
+            }
+            error => {
+                let rollback_local =
+                    Self::catch_local_distributed_recovery("ordinary checkpoint rollback", restore);
+                let local_rollback_error = rollback_local.as_ref().err().map(ToString::to_string);
+                match Self::coordinate_comm_result(
+                    execution_comm,
+                    "ordinary checkpoint rollback",
+                    rollback_local,
+                ) {
+                    Ok(()) => error,
+                    Err(TrainerError::Comm(comm_error)) => {
+                        let local_detail = format!(
+                            "ordinary checkpoint resume failed ({error}); {}",
+                            local_rollback_error.as_ref().map_or(
+                                "the local policy rollback completed".to_owned(),
+                                |rollback| format!("the local policy rollback failed: {rollback}")
+                            )
+                        );
+                        let rollback = local_rollback_error.map_or(Ok(()), |rollback| {
+                            Err(TrainerError::Contract(rollback))
+                        });
+                        Self::terminal_distributed_comm_failure(
+                            "ordinary checkpoint rollback status",
+                            &comm_error,
+                            Some(&local_detail),
+                            rollback,
+                            "policy instance",
+                        )
+                    }
+                    Err(rollback) => TrainerError::Contract(format!(
+                        "ordinary checkpoint resume failed ({error}); coordinated policy rollback also failed ({rollback}); discard the policy instance on every rank in this execution world"
+                    )),
+                }
+            }
+        }
     }
 
     fn snapshot_rollout_group_prestate<P: Policy>(
@@ -5894,6 +6184,12 @@ impl Trainer {
     /// adapter/Adam/sampler payload hashes, exact tensor keys, shapes and dtypes, and
     /// non-mutating sampler/temporary-Adam restoration. Distributed ranks coordinate
     /// that full preflight and exact prepared-manifest consensus before applying state.
+    /// A host-side snapshot taken before the first policy identity hook remains live
+    /// through the coordinated Adam handoff. Any local or peer failure restores and
+    /// verifies the exact prior tensor values, sampler bytes, adapter mode, and live
+    /// variable identities. If the public policy seam replaced its bindings or exact
+    /// rollback cannot be proved, the error explicitly requires discarding that policy
+    /// instance on every execution rank.
     ///
     /// # Errors
     ///
@@ -5912,13 +6208,14 @@ impl Trainer {
         tokenizer: &dyn TokenizerLike,
         samples: &[Sample<R::Target>],
     ) -> Result<(Vec<Metrics>, RunStop), TrainerError> {
+        assert!(!samples.is_empty(), "train: no samples");
         let exec = UnshardedPolicyExecution;
         let (start_step, opt_state, resume_state) =
-            self.load_resume_point(checkpoint_dir.as_ref(), policy, &exec)?;
+            self.load_resume_point(checkpoint_dir.as_ref(), policy, &exec, None)?;
         self.run(
             start_step,
-            opt_state,
-            Some(&resume_state),
+            opt_state.as_ref(),
+            Some(resume_state),
             policy,
             reward_fn,
             tokenizer,
@@ -5934,6 +6231,10 @@ impl Trainer {
     ///
     /// As [`resume`](Self::resume), plus the tensor-parallel validation
     /// described on [`train_tensor_parallel`](Self::train_tensor_parallel).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `samples` is empty.
     pub fn resume_tensor_parallel<P: TensorParallelPolicy, R: RewardFn>(
         &mut self,
         checkpoint_dir: impl AsRef<Path>,
@@ -5943,18 +6244,46 @@ impl Trainer {
         samples: &[Sample<R::Target>],
         tensor_parallel_comm: &dyn Comm,
     ) -> Result<(Vec<Metrics>, RunStop), TrainerError> {
+        assert!(!samples.is_empty(), "train: no samples");
         self.validate_tensor_parallel_comm(tensor_parallel_comm)?;
-        self.validate_tensor_parallel_policy_execution(policy, tensor_parallel_comm)?;
-        self.validate_tensor_parallel_backward(policy, tensor_parallel_comm)?;
         let exec = TensorParallelPolicyExecution {
             comm: tensor_parallel_comm,
         };
+        let execution_comm =
+            <TensorParallelPolicyExecution<'_> as PolicyExecution<P>>::execution_comm(
+                &exec,
+                self.comm.as_ref(),
+            );
+        let prestate = self.capture_ordinary_resume_prestate(policy, &exec)?;
+        let validation = (|| {
+            self.validate_tensor_parallel_policy_execution(policy, tensor_parallel_comm)?;
+            self.validate_tensor_parallel_backward(policy, tensor_parallel_comm)?;
+            Self::coordinate_comm_call(
+                execution_comm,
+                "ordinary checkpoint tensor-parallel preflight live-state seal",
+                || {
+                    Self::require_ordinary_resume_prestate_unchanged(
+                        policy,
+                        &prestate,
+                        "ordinary checkpoint tensor-parallel preflight",
+                    )
+                },
+            )
+        })();
+        if let Err(error) = validation {
+            return Err(Self::rollback_ordinary_resume_failure(
+                policy,
+                &prestate,
+                execution_comm,
+                error,
+            ));
+        }
         let (start_step, opt_state, resume_state) =
-            self.load_resume_point(checkpoint_dir.as_ref(), policy, &exec)?;
+            self.load_resume_point(checkpoint_dir.as_ref(), policy, &exec, Some(prestate))?;
         self.run(
             start_step,
-            opt_state,
-            Some(&resume_state),
+            opt_state.as_ref(),
+            Some(resume_state),
             policy,
             reward_fn,
             tokenizer,
@@ -5972,88 +6301,131 @@ impl Trainer {
     ///
     /// The format-v4 identity, exact payloads, tensor schemas/keys, sampler blob,
     /// and temporary optimizer state are all prepared and coordinated before the
-    /// first live adapter or sampler mutation.
+    /// first live adapter or sampler mutation. The returned state owns the exact
+    /// pre-resume rollback snapshot until [`run`](Self::run) globally commits the
+    /// optimizer handoff.
     fn load_resume_point<P, E>(
         &self,
         checkpoint_dir: &Path,
         policy: &mut P,
         exec: &E,
+        prestate: Option<OrdinaryResumePrestate>,
     ) -> Result<(u64, Option<OptimizerState>, OrdinaryResumeState), TrainerError>
     where
         P: Policy,
         E: PolicyExecution<P>,
     {
-        let binding = self.coordinate_checkpoint_binding(policy, exec)?;
-        let (vars, prepared) = Self::coordinate_comm_call(
-            exec.execution_comm(self.comm.as_ref()),
-            "checkpoint identity/payload preflight",
-            || {
-                let vars = policy.trainable_vars();
-                let prepared =
-                    crate::checkpoint::prepare_checkpoint(checkpoint_dir, &vars, &binding)?;
-                if prepared.step() > self.config.steps {
-                    return Err(TrainerError::Contract(format!(
-                        "checkpoint step {} exceeds configured training horizon {}",
-                        prepared.step(),
-                        self.config.steps
-                    )));
-                }
-                policy.validate_sampler_state(prepared.sampler_state())?;
-                let validated_vars = policy.trainable_vars();
+        let execution_comm = exec.execution_comm(self.comm.as_ref());
+        let prestate = match prestate {
+            Some(prestate) => prestate,
+            None => self.capture_ordinary_resume_prestate(policy, exec)?,
+        };
+
+        let outcome = (|| {
+            let binding = self.coordinate_checkpoint_binding(policy, exec)?;
+            Self::coordinate_comm_call(
+                execution_comm,
+                "ordinary checkpoint identity prestate seal",
+                || {
+                    Self::require_ordinary_resume_prestate_unchanged(
+                        policy,
+                        &prestate,
+                        "ordinary checkpoint identity binding",
+                    )
+                },
+            )?;
+            let (vars, prepared) = Self::coordinate_comm_call(
+                execution_comm,
+                "checkpoint identity/payload preflight",
+                || {
+                    // The transaction's original handles, rather than a fresh
+                    // post-identity query, are the only valid restore target.
+                    // A public identity hook that replaced A with same-shaped B
+                    // was rejected by the exact prestate seal above.
+                    let vars = prestate.vars.clone();
+                    let prepared =
+                        crate::checkpoint::prepare_checkpoint(checkpoint_dir, &vars, &binding)?;
+                    if prepared.step() > self.config.steps {
+                        return Err(TrainerError::Contract(format!(
+                            "checkpoint step {} exceeds configured training horizon {}",
+                            prepared.step(),
+                            self.config.steps
+                        )));
+                    }
+                    policy.validate_sampler_state(prepared.sampler_state())?;
+                    let validated_vars = policy.trainable_vars();
+                    self.require_same_rollout_ledger_vars(
+                        &vars,
+                        &validated_vars,
+                        "ordinary checkpoint sampler validation",
+                    )?;
+                    // Validate Adam against an isolated optimizer before any live policy
+                    // mutation. The temporary moment writes do not alias trainable vars.
+                    let mut preflight_opt = self.new_optimizer(vars.clone())?;
+                    preflight_opt.load_state(prepared.optimizer_state())?;
+                    Ok((vars, prepared))
+                },
+            )?;
+            Self::require_comm_consensus_bytes(
+                execution_comm,
+                "ordinary checkpoint prepared manifest",
+                prepared.manifest_consensus_sha256().as_bytes(),
+            )?;
+            let applied = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let adapter_value_sha256 = prepared.adapter_value_sha256().to_vec();
+                let loaded = prepared.apply(&vars)?;
+                let blob = loaded.sampler_state.as_deref().ok_or_else(|| {
+                    TrainerError::Contract(
+                        "validated ordinary checkpoint lost its sampler state before apply".into(),
+                    )
+                })?;
+                Self::restore_ordinary_checkpoint_sampler(policy, blob)?;
+                let active_vars = policy.trainable_vars();
                 self.require_same_rollout_ledger_vars(
                     &vars,
-                    &validated_vars,
-                    "ordinary checkpoint sampler validation",
+                    &active_vars,
+                    "ordinary checkpoint restore",
                 )?;
-                // Validate Adam against an isolated optimizer before any live policy
-                // mutation. The temporary moment writes do not alias trainable vars.
-                let mut preflight_opt = self.new_optimizer(vars.clone())?;
-                preflight_opt.load_state(prepared.optimizer_state())?;
-                Ok((vars, prepared))
-            },
-        )?;
-        Self::require_comm_consensus_bytes(
-            exec.execution_comm(self.comm.as_ref()),
-            "ordinary checkpoint prepared manifest",
-            prepared.manifest_consensus_sha256().as_bytes(),
-        )?;
-        let applied = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let adapter_value_sha256 = prepared.adapter_value_sha256().to_vec();
-            let loaded = prepared.apply(&vars)?;
-            let blob = loaded.sampler_state.as_deref().ok_or_else(|| {
-                TrainerError::Contract(
-                    "validated ordinary checkpoint lost its sampler state before apply".into(),
-                )
-            })?;
-            Self::restore_ordinary_checkpoint_sampler(policy, blob)?;
-            let active_vars = policy.trainable_vars();
-            self.require_same_rollout_ledger_vars(
-                &vars,
-                &active_vars,
-                "ordinary checkpoint restore",
-            )?;
-            let sampler_state = blob.to_vec();
-            Ok((
-                loaded.step,
-                loaded.optimizer_state,
+                let sampler_state = blob.to_vec();
+                Ok((
+                    loaded.step,
+                    loaded.optimizer_state,
+                    vars,
+                    adapter_value_sha256,
+                    sampler_state,
+                ))
+            }))
+            .unwrap_or_else(|payload| {
+                Err(TrainerError::Contract(format!(
+                    "checkpoint validated-state application panicked: {}",
+                    panic_payload_message(payload.as_ref())
+                )))
+            });
+            self.coordinate_resume_result::<P, E, _>(
+                exec,
+                "checkpoint validated-state application",
+                applied,
+            )
+        })();
+
+        match outcome {
+            Ok((step, optimizer_state, vars, adapter_value_sha256, sampler_state)) => Ok((
+                step,
+                optimizer_state,
                 OrdinaryResumeState {
                     vars,
                     adapter_value_sha256,
                     sampler_state,
+                    prestate,
                 },
-            ))
-        }))
-        .unwrap_or_else(|payload| {
-            Err(TrainerError::Contract(format!(
-                "checkpoint validated-state application panicked: {}",
-                panic_payload_message(payload.as_ref())
-            )))
-        });
-        self.coordinate_resume_result::<P, E, _>(
-            exec,
-            "checkpoint validated-state application",
-            applied,
-        )
+            )),
+            Err(error) => Err(Self::rollback_ordinary_resume_failure(
+                policy,
+                &prestate,
+                execution_comm,
+                error,
+            )),
+        }
     }
 
     /// Resume the **newest complete checkpoint** under this run's `checkpoints/`
@@ -6115,8 +6487,9 @@ impl Trainer {
         tokenizer: &dyn TokenizerLike,
         samples: &[Sample<R::Target>],
     ) -> Result<(Vec<Metrics>, RunStop), TrainerError> {
+        assert!(!samples.is_empty(), "train: no samples");
         let exec = UnshardedPolicyExecution;
-        self.resume_latest_with_execution(policy, reward_fn, tokenizer, samples, &exec)
+        self.resume_latest_with_execution(policy, reward_fn, tokenizer, samples, &exec, None)
     }
 
     /// Auto-resume the newest checkpoint while routing rollout and scoring
@@ -6127,6 +6500,10 @@ impl Trainer {
     /// As [`resume_latest`](Self::resume_latest), plus the tensor-parallel
     /// validation described on
     /// [`train_tensor_parallel`](Self::train_tensor_parallel).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `samples` is empty.
     pub fn resume_latest_tensor_parallel<P: TensorParallelPolicy, R: RewardFn>(
         &mut self,
         policy: &mut P,
@@ -6135,13 +6512,48 @@ impl Trainer {
         samples: &[Sample<R::Target>],
         tensor_parallel_comm: &dyn Comm,
     ) -> Result<(Vec<Metrics>, RunStop), TrainerError> {
+        assert!(!samples.is_empty(), "train: no samples");
         self.validate_tensor_parallel_comm(tensor_parallel_comm)?;
-        self.validate_tensor_parallel_policy_execution(policy, tensor_parallel_comm)?;
-        self.validate_tensor_parallel_backward(policy, tensor_parallel_comm)?;
         let exec = TensorParallelPolicyExecution {
             comm: tensor_parallel_comm,
         };
-        self.resume_latest_with_execution(policy, reward_fn, tokenizer, samples, &exec)
+        let execution_comm =
+            <TensorParallelPolicyExecution<'_> as PolicyExecution<P>>::execution_comm(
+                &exec,
+                self.comm.as_ref(),
+            );
+        let prestate = self.capture_ordinary_resume_prestate(policy, &exec)?;
+        let validation = (|| {
+            self.validate_tensor_parallel_policy_execution(policy, tensor_parallel_comm)?;
+            self.validate_tensor_parallel_backward(policy, tensor_parallel_comm)?;
+            Self::coordinate_comm_call(
+                execution_comm,
+                "ordinary checkpoint tensor-parallel preflight live-state seal",
+                || {
+                    Self::require_ordinary_resume_prestate_unchanged(
+                        policy,
+                        &prestate,
+                        "ordinary checkpoint tensor-parallel preflight",
+                    )
+                },
+            )
+        })();
+        if let Err(error) = validation {
+            return Err(Self::rollback_ordinary_resume_failure(
+                policy,
+                &prestate,
+                execution_comm,
+                error,
+            ));
+        }
+        self.resume_latest_with_execution(
+            policy,
+            reward_fn,
+            tokenizer,
+            samples,
+            &exec,
+            Some(prestate),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6152,6 +6564,7 @@ impl Trainer {
         tokenizer: &dyn TokenizerLike,
         samples: &[Sample<R::Target>],
         exec: &E,
+        prestate: Option<OrdinaryResumePrestate>,
     ) -> Result<(Vec<Metrics>, RunStop), TrainerError>
     where
         P: Policy,
@@ -6160,7 +6573,21 @@ impl Trainer {
     {
         // Discover the resume point through rank 0 and broadcast it so the whole world
         // branches identically in lockstep (see `coordinate_resume_step`).
-        match self.coordinate_resume_step(exec)? {
+        let decision = match self.coordinate_resume_step(exec) {
+            Ok(decision) => decision,
+            Err(error) => {
+                return Err(match prestate.as_ref() {
+                    Some(prestate) => Self::rollback_ordinary_resume_failure(
+                        policy,
+                        prestate,
+                        exec.execution_comm(self.comm.as_ref()),
+                        error,
+                    ),
+                    None => error,
+                });
+            }
+        };
+        match decision {
             Some(step) => {
                 // The canonical on-disk layout is `checkpoints_dir/step-<n>` (see
                 // `write_checkpoint`), so every rank reconstructs the identical
@@ -6174,11 +6601,11 @@ impl Trainer {
                     "resume_latest: continuing from the newest checkpoint"
                 );
                 let (start_step, opt_state, resume_state) =
-                    self.load_resume_point(&dir, policy, exec)?;
+                    self.load_resume_point(&dir, policy, exec, prestate)?;
                 self.run(
                     start_step,
-                    opt_state,
-                    Some(&resume_state),
+                    opt_state.as_ref(),
+                    Some(resume_state),
                     policy,
                     reward_fn,
                     tokenizer,
@@ -6187,6 +6614,7 @@ impl Trainer {
                 )
             }
             None => {
+                drop(prestate);
                 tracing::info!(
                     rank = exec.execution_rank(self.comm.as_ref()),
                     world_size = exec.execution_world_size(self.comm.as_ref()),
@@ -6374,8 +6802,8 @@ impl Trainer {
     fn run<P, R, E>(
         &mut self,
         start_step: u64,
-        resume_opt_state: Option<OptimizerState>,
-        resume_state: Option<&OrdinaryResumeState>,
+        resume_opt_state: Option<&OptimizerState>,
+        resume_state: Option<OrdinaryResumeState>,
         policy: &mut P,
         reward_fn: &R,
         tokenizer: &dyn TokenizerLike,
@@ -6387,33 +6815,75 @@ impl Trainer {
         R: RewardFn,
         E: PolicyExecution<P>,
     {
-        if exec.model_parallel_world_size() > 1 {
-            let trainer_comm = Arc::clone(&self.comm);
-            let execution_comm = exec.execution_comm(trainer_comm.as_ref());
-            let contract = Self::coordinate_model_parallel_result(
-                exec.model_parallel_world_size(),
-                execution_comm,
-                "tensor-parallel direct run control-flow contract serialization",
-                serde_json::to_vec(&(
-                    &self.config,
-                    start_step,
-                    samples.len(),
-                    resume_opt_state.is_some(),
-                ))
-                .map_err(|error| {
-                    TrainerError::Contract(format!(
-                        "serialize tensor-parallel direct run control-flow contract: {error}"
-                    ))
-                }),
-            )?;
-            Self::require_comm_consensus_bytes(
-                execution_comm,
-                "tensor-parallel direct run control-flow contract",
-                &contract,
-            )?;
-        }
-        self.preflight_checkpoint_publication(policy, exec)?;
         assert!(!samples.is_empty(), "train: no samples");
+        let trainer_comm = Arc::clone(&self.comm);
+        let execution_comm = exec.execution_comm(trainer_comm.as_ref());
+        let prepare = (|| {
+            if exec.model_parallel_world_size() > 1 {
+                let contract = Self::coordinate_model_parallel_result(
+                    exec.model_parallel_world_size(),
+                    execution_comm,
+                    "tensor-parallel direct run control-flow contract serialization",
+                    serde_json::to_vec(&(
+                        &self.config,
+                        start_step,
+                        samples.len(),
+                        resume_opt_state.is_some(),
+                    ))
+                    .map_err(|error| {
+                        TrainerError::Contract(format!(
+                            "serialize tensor-parallel direct run control-flow contract: {error}"
+                        ))
+                    }),
+                )?;
+                Self::require_comm_consensus_bytes(
+                    execution_comm,
+                    "tensor-parallel direct run control-flow contract",
+                    &contract,
+                )?;
+            }
+            self.preflight_checkpoint_publication(policy, exec)?;
+            // The KL reference (`beta > 0`) is the adapter-disabled policy. A
+            // policy that cannot toggle must fail before optimizer construction
+            // or rollout rather than silently regularizing against itself.
+            let vars = self.prepare_run_optimizer_vars(policy, exec, resume_state.as_ref())?;
+            let build_optimizer = || {
+                let mut opt = self.new_optimizer(vars.clone())?;
+                // Momentum-faithful resume: restore the optimizer moments + step
+                // counter before any rank commits the live policy handoff.
+                if let Some(state) = resume_opt_state {
+                    opt.load_state(state)?;
+                }
+                Ok(opt)
+            };
+            let opt = if resume_state.is_some() {
+                Self::coordinate_comm_call(
+                    execution_comm,
+                    "ordinary checkpoint optimizer handoff",
+                    build_optimizer,
+                )?
+            } else {
+                build_optimizer()?
+            };
+            Ok((vars, opt))
+        })();
+        let (vars, mut opt) = match prepare {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return Err(match resume_state.as_ref() {
+                    Some(state) => Self::rollback_ordinary_resume_failure(
+                        policy,
+                        &state.prestate,
+                        execution_comm,
+                        error,
+                    ),
+                    None => error,
+                });
+            }
+        };
+        // The host-side transaction snapshot is intentionally retained through
+        // the coordinated optimizer handoff, but never through rollout/training.
+        drop(resume_state);
         // Stamp every event this run emits — the per-step events below, plus anything
         // the policy/reward logs — with this rank's rank/world. Under DP all ranks share
         // one stdout, so an unstamped line is unattributable; a nested per-step `step`
@@ -6424,31 +6894,6 @@ impl Trainer {
             exec.execution_world_size(self.comm.as_ref()),
         )
         .entered();
-        // The KL reference (`beta > 0`) IS the adapter-disabled policy
-        // (`reference_logprobs` toggles the adapter off to score it). A policy
-        // that cannot disable its adapter — full fine-tuning: the base weights
-        // ARE the trained weights — would silently make `logp_ref` the live
-        // policy itself: bit-identical to `logp_old`, the KL-to-base penalty
-        // degenerating to a window-anchored proximal term that reports a
-        // near-zero `kl` metric and pulls toward nothing. Fail loud instead:
-        // full-FT runs take `beta = 0` (no frozen reference exists to pull
-        // toward; a base-anchored KL needs a separately loaded base policy,
-        // which this trainer does not model).
-        let vars = self.prepare_run_optimizer_vars(policy, exec, resume_state)?;
-        let params = ParamsAdamW {
-            lr: self.config.lr,
-            weight_decay: self.config.weight_decay,
-            beta1: self.config.adam_beta1,
-            beta2: self.config.adam_beta2,
-            ..Default::default()
-        };
-        let mut opt = FerrlAdamW::new(vars.clone(), params)?;
-        // Momentum-faithful resume: restore the optimizer moments + step counter before
-        // the first step, so the bias correction and Adam state continue exactly where
-        // the interrupted run left off (validated against `vars` inside `load_state`).
-        if let Some(state) = resume_opt_state {
-            opt.load_state(&state)?;
-        }
         let total = self.config.steps;
         let remaining = total.saturating_sub(start_step) as usize;
         let mut history = Vec::with_capacity(remaining);
@@ -7185,23 +7630,101 @@ impl Trainer {
         E: PolicyExecution<P>,
     {
         let binding = self.coordinate_checkpoint_binding(policy, exec)?;
-        self.coordinate_side_effect(exec, "checkpoint write", |trainer| {
-            if !exec.is_execution_primary(trainer.comm.as_ref()) {
-                return Ok(());
+        let execution_comm = exec.execution_comm(self.comm.as_ref());
+        let is_primary = exec.is_execution_primary(self.comm.as_ref());
+        let dir = self.checkpoints_dir.join(format!("step-{completed}"));
+        let checkpoint_state_local = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if is_primary {
+                Ok(Some((opt.state()?, policy.sampler_state()?)))
+            } else {
+                Ok(None)
             }
-            let dir = trainer.checkpoints_dir.join(format!("step-{completed}"));
-            let opt_state = opt.state()?;
-            let sampler_state = policy.sampler_state()?;
-            crate::checkpoint::save_checkpoint(
-                &dir,
-                vars,
-                &opt_state,
-                &sampler_state,
-                completed,
-                &binding,
-            )?;
+        }))
+        .unwrap_or_else(|payload| {
+            Err(TrainerError::Contract(format!(
+                "ordinary checkpoint state capture panicked before publication: {}",
+                panic_payload_message(payload.as_ref())
+            )))
+        });
+        let checkpoint_state = Self::coordinate_comm_result(
+            execution_comm,
+            "ordinary checkpoint state capture",
+            checkpoint_state_local,
+        )?;
+        let save_local = if is_primary {
+            let (opt_state, sampler_state) = checkpoint_state
+                .expect("execution rank 0 owns the coordinated ordinary checkpoint state");
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::checkpoint::save_checkpoint(
+                    &dir,
+                    vars,
+                    &opt_state,
+                    &sampler_state,
+                    completed,
+                    &binding,
+                )?;
+                Ok(())
+            }))
+            .unwrap_or_else(|payload| {
+                Err(TrainerError::Checkpoint(
+                    crate::checkpoint::CheckpointError::PublicationAmbiguous {
+                        path: dir.clone(),
+                        detail: format!(
+                            "ordinary checkpoint publication panicked after the publisher was entered: {}",
+                            panic_payload_message(payload.as_ref())
+                        ),
+                    },
+                ))
+            })
+        } else {
             Ok(())
-        })
+        };
+        if execution_comm.world_size() <= 1 {
+            return save_local;
+        }
+        let publication_signal = match &save_local {
+            Ok(()) => 0.0,
+            Err(TrainerError::Checkpoint(
+                crate::checkpoint::CheckpointError::PublicationAmbiguous { .. },
+            )) => 2.0,
+            Err(_) => 1.0,
+        };
+        let publication_signal =
+            execution_comm.all_reduce_scalar_sum(if is_primary { publication_signal } else { 0.0 });
+        let publication_signal = match publication_signal {
+            Ok(signal) => signal,
+            Err(communication) => {
+                return Err(TrainerError::PublicationAmbiguousAfterComm {
+                    artifact: "ordinary checkpoint",
+                    path: dir,
+                    detail: "execution rank 0 entered ordinary checkpoint publication before the status collective".into(),
+                    communication: Box::new(communication),
+                });
+            }
+        };
+        if publication_signal > 1.5 {
+            return match save_local {
+                Err(error) => Err(error),
+                Ok(()) => Err(TrainerError::Checkpoint(
+                    crate::checkpoint::CheckpointError::PublicationAmbiguous {
+                        path: dir,
+                        detail:
+                            "execution rank 0 reported ambiguous ordinary checkpoint publication"
+                                .into(),
+                    },
+                )),
+            };
+        }
+        if publication_signal > 0.5 {
+            return match save_local {
+                Err(error) => Err(error),
+                Ok(()) => Err(TrainerError::Contract(
+                    "execution rank 0 failed before ordinary checkpoint visibility; every rank may retry"
+                        .into(),
+                )),
+            };
+        }
+        save_local
     }
 
     fn coordinate_side_effect<P, E, F>(
@@ -18718,15 +19241,17 @@ mod tests {
         for (rank, err) in &results {
             if *rank == 0 {
                 assert!(
-                    matches!(err, TrainerError::Candle(e)
-                        if e.to_string().contains("rank-local sampler restore failure")),
-                    "rank 0 should return the local restore error, got {err:?}"
+                    matches!(err, TrainerError::Contract(message)
+                        if message.contains("rank-local sampler restore failure")
+                            && message.contains("discard the policy instance")),
+                    "rank 0 should combine the local failure with discard-required rollback, got {err:?}"
                 );
             } else {
                 assert!(
-                    matches!(err, TrainerError::Contract(msg)
-                        if msg.contains("checkpoint identity/payload preflight failed on a peer rank")),
-                    "peer rank should abort in lockstep, got {err:?}"
+                    matches!(err, TrainerError::Contract(message)
+                        if message.contains("checkpoint identity/payload preflight failed on a peer rank")
+                            && message.contains("discard the policy instance")),
+                    "peer rank should globalize discard-required rollback, got {err:?}"
                 );
             }
         }
@@ -18948,7 +19473,320 @@ mod tests {
             assert_primary_checkpoint_peer_contract(
                 *rank,
                 err,
-                "checkpoint write failed on a peer rank",
+                "execution rank 0 failed before ordinary checkpoint visibility",
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn ordinary_checkpoint_ambiguous_publication_is_globalized_with_a_healthy_world() {
+        let tmp = WireTmp::new("ordinary-checkpoint-healthy-ambiguity");
+        let checkpoint_root = tmp.0.join("shared-checkpoints");
+        let final_dir = checkpoint_root.join("step-1");
+
+        let seed_run = RunDir::create(&tmp.0, "seed").unwrap();
+        let mut seed_trainer = Trainer::new(TrainerConfig::default(), &seed_run)
+            .unwrap()
+            .with_checkpoint_policy_sha256(checkpoint_policy_sha256())
+            .with_checkpoints_dir(&checkpoint_root);
+        let seed_policy = stateful_candidate_policy();
+        let seed_vars = seed_policy.trainable_vars();
+        let seed_binding = seed_trainer.checkpoint_binding(&seed_policy, 1).unwrap();
+        let seed_opt = seed_trainer.new_optimizer(seed_vars.clone()).unwrap();
+        seed_trainer
+            .write_checkpoint(
+                1,
+                &seed_vars,
+                &seed_opt,
+                &seed_policy,
+                &UnshardedPolicyExecution,
+            )
+            .unwrap();
+
+        let comms =
+            crate::comm::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(5));
+        let mut outcomes = std::thread::scope(|scope| {
+            let handles = comms
+                .into_iter()
+                .map(|comm| {
+                    let rank = comm.rank();
+                    let base = tmp.0.clone();
+                    let checkpoint_root = checkpoint_root.clone();
+                    scope.spawn(move || {
+                        let run = RunDir::create(&base, format!("rank-{rank}")).unwrap();
+                        let mut trainer = Trainer::with_comm(TrainerConfig::default(), &run, comm)
+                            .unwrap()
+                            .with_checkpoint_policy_sha256(checkpoint_policy_sha256())
+                            .with_checkpoints_dir(&checkpoint_root);
+                        let mut policy = stateful_candidate_policy();
+                        policy.sampler = 9;
+                        let vars = policy.trainable_vars();
+                        let binding = trainer.checkpoint_binding(&policy, 1).unwrap();
+                        for var in &vars {
+                            var.set(
+                                &Tensor::ones(
+                                    var.as_tensor().dims(),
+                                    var.as_tensor().dtype(),
+                                    var.as_tensor().device(),
+                                )
+                                .unwrap(),
+                            )
+                            .unwrap();
+                        }
+                        let replacement_opt_state = OptimizerState {
+                            step_t: 7,
+                            first_moments: vars
+                                .iter()
+                                .map(|var| {
+                                    Tensor::full(
+                                        2.0_f32,
+                                        var.as_tensor().dims(),
+                                        var.as_tensor().device(),
+                                    )
+                                    .unwrap()
+                                })
+                                .collect(),
+                            second_moments: vars
+                                .iter()
+                                .map(|var| {
+                                    Tensor::full(
+                                        3.0_f32,
+                                        var.as_tensor().dims(),
+                                        var.as_tensor().device(),
+                                    )
+                                    .unwrap()
+                                })
+                                .collect(),
+                        };
+                        let mut opt = trainer.new_optimizer(vars.clone()).unwrap();
+                        opt.load_state(&replacement_opt_state).unwrap();
+                        if rank == 0 {
+                            crate::checkpoint::inject_ordinary_aside_cleanup_failure_once();
+                        }
+                        let error = trainer
+                            .write_checkpoint(1, &vars, &opt, &policy, &UnshardedPolicyExecution)
+                            .unwrap_err();
+                        assert!(
+                            matches!(
+                                error,
+                                TrainerError::Checkpoint(
+                                    crate::checkpoint::CheckpointError::PublicationAmbiguous { .. }
+                                )
+                            ),
+                            "rank {rank}: {error:?}"
+                        );
+                        (rank, error.to_string(), binding)
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        outcomes.sort_by_key(|(rank, _, _)| *rank);
+        let replacement_binding = outcomes[0].2.clone();
+        assert!(
+            outcomes
+                .iter()
+                .all(|(_, _, binding)| binding == &replacement_binding),
+            "distributed publishers derived different ordinary-checkpoint bindings"
+        );
+
+        let verify_policy = stateful_candidate_policy();
+        let verify_vars = verify_policy.trainable_vars();
+        let prior_values = snapshot_trainable_values(&verify_vars);
+        let expected_values = verify_vars
+            .iter()
+            .map(|var| vec![1.0; var.as_tensor().elem_count()])
+            .collect::<Vec<_>>();
+        let loaded =
+            crate::checkpoint::load_checkpoint(&final_dir, &verify_vars, &replacement_binding)
+                .unwrap();
+        assert_eq!(loaded.step, 1);
+        assert_eq!(loaded.sampler_state, Some(9_u64.to_le_bytes().to_vec()));
+        assert_eq!(snapshot_trainable_values(&verify_vars), expected_values);
+        let loaded_opt = loaded.optimizer_state.unwrap();
+        assert_eq!(loaded_opt.step_t, 7);
+        assert!(loaded_opt.first_moments.iter().all(|tensor| tensor
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            == vec![2.0; tensor.elem_count()]));
+        assert!(loaded_opt.second_moments.iter().all(|tensor| tensor
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            == vec![3.0; tensor.elem_count()]));
+        let aside_paths = std::fs::read_dir(&checkpoint_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("step-1.old-"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            aside_paths.len(),
+            1,
+            "durable prior recovery candidate was removed"
+        );
+        let prior_policy = stateful_candidate_policy();
+        let prior_vars = prior_policy.trainable_vars();
+        let prior = crate::checkpoint::load_checkpoint(&aside_paths[0], &prior_vars, &seed_binding)
+            .unwrap();
+        assert_eq!(prior.sampler_state, Some(0_u64.to_le_bytes().to_vec()));
+        assert_eq!(snapshot_trainable_values(&prior_vars), prior_values);
+        assert_eq!(prior.optimizer_state.unwrap().step_t, 0);
+        for (rank, message, _) in outcomes {
+            assert!(
+                message.contains("publication requires reconciliation"),
+                "rank {rank}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn ordinary_checkpoint_publication_status_comm_failure_preserves_visibility() {
+        use std::sync::atomic::Ordering;
+
+        #[derive(Debug)]
+        struct PublicationStatusFailureState {
+            failed: std::sync::atomic::AtomicBool,
+            calls_after_failure: std::sync::atomic::AtomicUsize,
+        }
+
+        #[derive(Debug)]
+        struct FailWhenCheckpointVisibleComm<C> {
+            inner: C,
+            manifest_path: PathBuf,
+            state: std::sync::Arc<PublicationStatusFailureState>,
+        }
+
+        impl<C: Comm> Comm for FailWhenCheckpointVisibleComm<C> {
+            fn rank(&self) -> usize {
+                self.inner.rank()
+            }
+
+            fn world_size(&self) -> usize {
+                self.inner.world_size()
+            }
+
+            fn validate_all_reduce_sum(
+                &self,
+                tensors: &[Tensor],
+            ) -> Result<(), crate::comm::CommError> {
+                self.inner.validate_all_reduce_sum(tensors)
+            }
+
+            fn all_reduce_sum(
+                &self,
+                tensors: &mut Vec<Tensor>,
+            ) -> Result<(), crate::comm::CommError> {
+                self.inner.all_reduce_sum(tensors)
+            }
+
+            fn all_reduce_scalar_sum(&self, value: f64) -> Result<f64, crate::comm::CommError> {
+                if self.state.failed.load(Ordering::SeqCst) {
+                    self.state
+                        .calls_after_failure
+                        .fetch_add(1, Ordering::SeqCst);
+                    return Err(crate::comm::CommError::Poisoned(
+                        "collective issued after ordinary publication-status failure".into(),
+                    ));
+                }
+                if self.manifest_path.is_file() {
+                    self.state.failed.store(true, Ordering::SeqCst);
+                    return Err(crate::comm::CommError::Mismatch(
+                        "injected ordinary checkpoint publication-status failure".into(),
+                    ));
+                }
+                self.inner.all_reduce_scalar_sum(value)
+            }
+        }
+
+        let tmp = WireTmp::new("ordinary-checkpoint-publication-terminal-comm");
+        let checkpoint_root = tmp.0.join("shared-checkpoints");
+        let final_dir = checkpoint_root.join("step-1");
+        let states: Vec<_> = (0..2)
+            .map(|_| {
+                std::sync::Arc::new(PublicationStatusFailureState {
+                    failed: std::sync::atomic::AtomicBool::new(false),
+                    calls_after_failure: std::sync::atomic::AtomicUsize::new(0),
+                })
+            })
+            .collect();
+        let outcomes: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = crate::comm::LocalComm::world_with_timeout(
+                2,
+                std::time::Duration::from_secs(5),
+            )
+            .into_iter()
+            .zip(states.iter().cloned())
+            .map(|(inner, state)| {
+                let rank = inner.rank();
+                let base = tmp.0.clone();
+                let checkpoint_root = checkpoint_root.clone();
+                let final_dir = final_dir.clone();
+                scope.spawn(move || {
+                    let comm = FailWhenCheckpointVisibleComm {
+                        inner,
+                        manifest_path: final_dir.join("manifest.json"),
+                        state,
+                    };
+                    let run = RunDir::create(&base, format!("rank-{rank}")).unwrap();
+                    let mut trainer = Trainer::with_comm(TrainerConfig::default(), &run, comm)
+                        .unwrap()
+                        .with_checkpoint_policy_sha256(checkpoint_policy_sha256())
+                        .with_checkpoints_dir(&checkpoint_root);
+                    let policy = stateful_candidate_policy();
+                    let vars = policy.trainable_vars();
+                    let opt = trainer.new_optimizer(vars.clone()).unwrap();
+                    let error = trainer
+                        .write_checkpoint(1, &vars, &opt, &policy, &UnshardedPolicyExecution)
+                        .unwrap_err();
+                    match &error {
+                        TrainerError::PublicationAmbiguousAfterComm {
+                            artifact,
+                            path,
+                            detail: _,
+                            communication: _,
+                        } => {
+                            assert_eq!(*artifact, "ordinary checkpoint");
+                            assert_eq!(path, &final_dir);
+                        }
+                        other => panic!(
+                            "rank {rank}: expected ordinary checkpoint publication ambiguity, got {other:?}"
+                        ),
+                    }
+                    (rank, error.to_string())
+                })
+            })
+            .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        });
+
+        assert!(final_dir.join("manifest.json").is_file());
+        assert_eq!(
+            crate::checkpoint::read_manifest(&final_dir).unwrap().step,
+            1
+        );
+        for (rank, message) in outcomes {
+            assert!(
+                message.contains("publication may be visible"),
+                "rank {rank}: {message}"
+            );
+            assert_eq!(
+                states[rank].calls_after_failure.load(Ordering::SeqCst),
+                0,
+                "rank {rank} issued a collective after publication-status failure"
             );
         }
     }

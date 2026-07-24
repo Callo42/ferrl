@@ -44,15 +44,17 @@
 //!
 //! Both writers coordinate through one persistent per-destination advisory lock,
 //! so an ordinary replacement cannot overlap continuation publication. Ordinary
-//! writers then stage the whole checkpoint into a sibling temp directory
-//! (`<dir>.tmp-<pid>`) and publish it with a single `rename` — so the published
-//! path never holds a *partial* checkpoint (the manifest-last ordering inside
-//! the stage is belt-and-braces on top). Replacing an existing checkpoint
-//! renames the old directory aside first and removes it only after the new one
-//! is published, so at every instant the prior **or** the new complete
-//! checkpoint exists on disk (a crash can at worst leave the prior one under
-//! `<dir>.old-<pid>`, recoverable by hand). Stale `.tmp-*`/`.old-*` siblings
-//! from crashed processes are swept by the next write to the same path.
+//! writers durably create the parent chain, stage the whole checkpoint into a
+//! unique sibling temp directory, and sync the stage before publication. When
+//! replacing a checkpoint, the writer renames the prior package aside and
+//! fences that entry before publishing and fencing the new canonical directory.
+//! The prior aside is removed only after the new directory and parent are both
+//! durable. Any pre-commit failure transactionally restores the old canonical
+//! path (or the prior absence); an unprovable rollback or post-commit cleanup is
+//! [`CheckpointError::PublicationAmbiguous`]. Under the destination lock, the
+//! next write restores a sole complete `.old-*` package before cleaning stale
+//! stages; multiple or malformed prior candidates fail closed instead of being
+//! deleted.
 //! Separated rollout continuations use an internal no-replace variant instead:
 //! an atomic destination-directory claim prevents forks, a synced private owner
 //! marker binds cleanup to that exact claim, and a temporary manifest is renamed
@@ -93,6 +95,18 @@ enum NoReplaceSyncPoint {
     ManifestParent,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrdinaryPublishFaultPoint {
+    AdapterPayloadSync,
+    ManifestPayloadSync,
+    PublishRename,
+    FinalDirectorySync,
+    FinalParentSync,
+    RollbackRestoreRename,
+    RollbackSync,
+    AsideCleanup,
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NoReplaceHookPoint {
@@ -112,6 +126,7 @@ thread_local! {
     static FAIL_NO_REPLACE_SYNCS: std::cell::RefCell<Vec<NoReplaceSyncPoint>> = const { std::cell::RefCell::new(Vec::new()) };
     static NO_REPLACE_HOOK: std::cell::RefCell<Option<(NoReplaceHookPoint, NoReplaceHook)>> = const { std::cell::RefCell::new(None) };
     static PANIC_NO_REPLACE_AFTER_MANIFEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_ORDINARY_PUBLICATION: std::cell::RefCell<Vec<OrdinaryPublishFaultPoint>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
@@ -132,11 +147,21 @@ pub(crate) fn inject_persistent_continuation_post_manifest_sync_failure_once() {
 }
 
 #[cfg(test)]
+pub(crate) fn inject_ordinary_aside_cleanup_failure_once() {
+    FAIL_ORDINARY_PUBLICATION.with(|failures| {
+        let mut failures = failures.borrow_mut();
+        assert!(failures.is_empty(), "ordinary publication fault leaked");
+        failures.push(OrdinaryPublishFaultPoint::AsideCleanup);
+    });
+}
+
+#[cfg(test)]
 pub(crate) fn inject_continuation_post_manifest_panic_once() {
     PANIC_NO_REPLACE_AFTER_MANIFEST.with(|panic| panic.set(true));
 }
 
 static CLAIM_TOKEN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static STAGED_TOKEN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 struct CheckpointWriterLock {
     _file: std::fs::File,
@@ -310,9 +335,9 @@ pub enum CheckpointError {
         /// Underlying I/O error.
         source: std::io::Error,
     },
-    /// A no-replace continuation may hold an incomplete claim or a reader-visible
-    /// package, but cleanup, durability, or exact package identity could not be
-    /// confirmed.
+    /// An ordinary replacement or no-replace continuation may hold competing
+    /// recoverable packages or a reader-visible package whose cleanup,
+    /// durability, or exact identity could not be confirmed.
     #[error("checkpoint publication requires reconciliation at {path}: {detail}")]
     PublicationAmbiguous {
         /// Claimed checkpoint destination that must be inspected before repair.
@@ -628,9 +653,7 @@ fn acquire_checkpoint_writer_lock(dir: &Path) -> Result<CheckpointWriterLock, Ch
             ),
         )
     })?;
-    if !parent.as_os_str().is_empty() {
-        std::fs::create_dir_all(parent).map_err(|error| io(parent, error))?;
-    }
+    create_directory_all_durable(parent)?;
     let lock_path = sibling_path_with_suffix(dir, WRITER_LOCK_SUFFIX);
     let file = std::fs::OpenOptions::new()
         .read(true)
@@ -682,78 +705,391 @@ impl ClaimOwnership {
     }
 }
 
-/// The sibling staging directory for an atomic checkpoint write:
-/// `<dir>.tmp-<pid>` (pid-suffixed so a stale stage from a dead process can
-/// never be confused with this one's).
-fn stage_path(dir: &Path) -> PathBuf {
-    sibling_path_with_suffix(dir, &format!(".tmp-{}", std::process::id()))
+fn staged_sibling_path(dir: &Path, kind: &str) -> PathBuf {
+    let sequence = STAGED_TOKEN_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    sibling_path_with_suffix(dir, &format!(".{kind}-{}-{sequence}", std::process::id()))
 }
 
-/// Prepare an empty staging directory for `dir`, sweeping any stale `.tmp-*` /
-/// `.old-*` sibling left behind by a crashed process (the pid suffix makes a
-/// live collision impossible, so anything matching is garbage).
-fn prepare_stage(dir: &Path) -> Result<PathBuf, CheckpointError> {
-    sweep_stale_siblings(dir)?;
-    let stage = stage_path(dir);
-    std::fs::create_dir_all(&stage).map_err(|e| io(&stage, e))?;
-    Ok(stage)
-}
-
-/// Remove every `<name>.tmp-*` / `<name>.old-*` sibling of `dir` — leftovers
-/// from interrupted writes by this or any dead process. Best-effort per entry
-/// is NOT enough here (a stale dir at this pid's own stage path must go), so
-/// failures surface.
-fn sweep_stale_siblings(dir: &Path) -> Result<(), CheckpointError> {
-    let Some(parent) = dir.parent() else {
-        return Ok(());
-    };
-    let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
-        return Ok(());
-    };
-    if !parent.exists() {
-        return Ok(());
+fn publication_ambiguous(dir: &Path, detail: impl Into<String>) -> CheckpointError {
+    CheckpointError::PublicationAmbiguous {
+        path: dir.to_path_buf(),
+        detail: detail.into(),
     }
-    let entries = std::fs::read_dir(parent).map_err(|e| io(parent, e))?;
-    for entry in entries {
-        let entry = entry.map_err(|e| io(parent, e))?;
-        let fname = entry.file_name();
-        let Some(fname) = fname.to_str() else {
-            continue;
-        };
-        let stale = fname
-            .strip_prefix(name)
-            .is_some_and(|rest| rest.starts_with(".tmp-") || rest.starts_with(".old-"));
-        if stale {
-            std::fs::remove_dir_all(entry.path()).map_err(|e| io(entry.path(), e))?;
+}
+
+fn ordinary_publication_fault(
+    point: OrdinaryPublishFaultPoint,
+    path: &Path,
+) -> Result<(), CheckpointError> {
+    #[cfg(test)]
+    FAIL_ORDINARY_PUBLICATION.with(|failures| {
+        let mut failures = failures.borrow_mut();
+        if failures.first() == Some(&point) {
+            failures.remove(0);
+            return Err(io(
+                path,
+                std::io::Error::other(format!(
+                    "injected ordinary publication failure at {point:?}"
+                )),
+            ));
+        }
+        Ok(())
+    })?;
+    #[cfg(not(test))]
+    let _ = (point, path);
+    Ok(())
+}
+
+#[allow(clippy::cognitive_complexity)] // complete self-consistency check before recovery cleanup
+fn require_recoverable_staged_package(path: &Path) -> Result<(), CheckpointError> {
+    let manifest = read_manifest(path)?;
+    let adapter_path = path.join(ADAPTER_FILE);
+    let adapter_bytes = read_payload(&adapter_path)?;
+    let adapter = candle_core::safetensors::load_buffer(&adapter_bytes, &Device::Cpu)?;
+    let expected_adapter_keys = (0..manifest.num_vars).map(var_key).collect::<BTreeSet<_>>();
+    let actual_adapter_keys = adapter.keys().cloned().collect::<BTreeSet<_>>();
+    if actual_adapter_keys != expected_adapter_keys {
+        return Err(CheckpointError::Mismatch(format!(
+            "recoverable checkpoint adapter key set mismatch: expected {expected_adapter_keys:?}, found {actual_adapter_keys:?}"
+        )));
+    }
+
+    if manifest.format_version >= 2 {
+        let optimizer_path = path.join(OPTIMIZER_FILE);
+        let optimizer_bytes = read_payload(&optimizer_path)?;
+        let optimizer = candle_core::safetensors::load_buffer(&optimizer_bytes, &Device::Cpu)?;
+        let optimizer_num_vars = manifest.optimizer_num_vars.ok_or_else(|| {
+            CheckpointError::Mismatch("recoverable checkpoint is missing optimizer_num_vars".into())
+        })?;
+        let float_adapter = (0..manifest.num_vars)
+            .filter_map(|index| {
+                adapter
+                    .get(&var_key(index))
+                    .filter(|tensor| tensor.dtype().is_float())
+            })
+            .collect::<Vec<_>>();
+        if float_adapter.len() != optimizer_num_vars {
+            return Err(CheckpointError::Mismatch(format!(
+                "recoverable checkpoint has {optimizer_num_vars} optimizer parameters for {} float adapter tensors",
+                float_adapter.len()
+            )));
+        }
+        let expected_optimizer_keys = (0..optimizer_num_vars)
+            .flat_map(|index| [moment_key("m", index), moment_key("v", index)])
+            .collect::<BTreeSet<_>>();
+        let actual_optimizer_keys = optimizer.keys().cloned().collect::<BTreeSet<_>>();
+        if actual_optimizer_keys != expected_optimizer_keys {
+            return Err(CheckpointError::Mismatch(format!(
+                "recoverable checkpoint optimizer key set mismatch: expected {expected_optimizer_keys:?}, found {actual_optimizer_keys:?}"
+            )));
+        }
+        for (index, adapter) in float_adapter.into_iter().enumerate() {
+            for key in [moment_key("m", index), moment_key("v", index)] {
+                let moment = optimizer.get(&key).ok_or_else(|| {
+                    CheckpointError::Mismatch(format!(
+                        "recoverable checkpoint is missing optimizer tensor {key}"
+                    ))
+                })?;
+                if moment.dims() != adapter.dims() || moment.dtype() != adapter.dtype() {
+                    return Err(CheckpointError::Mismatch(format!(
+                        "recoverable checkpoint optimizer tensor {key} shape/dtype does not match adapter tensor {index}"
+                    )));
+                }
+            }
+        }
+    }
+
+    if manifest.format_version == FORMAT_VERSION {
+        let identity = manifest.ordinary_checkpoint.as_ref().ok_or_else(|| {
+            CheckpointError::Mismatch("recoverable ordinary identity is missing".into())
+        })?;
+        let step_t = manifest.optimizer_step_t.ok_or_else(|| {
+            CheckpointError::Mismatch("recoverable checkpoint is missing optimizer_step_t".into())
+        })?;
+        let optimizer_bytes = read_payload(&path.join(OPTIMIZER_FILE))?;
+        let sampler = manifest.sampler_state.as_deref().ok_or_else(|| {
+            CheckpointError::Mismatch("recoverable checkpoint is missing sampler_state".into())
+        })?;
+        if identity.adapter_sha256 != adapter_payload_sha256(&adapter_bytes)
+            || identity.optimizer_sha256 != optimizer_payload_sha256(step_t, &optimizer_bytes)?
+            || identity.sampler_sha256 != sampler_payload_sha256(sampler)
+        {
+            return Err(CheckpointError::Mismatch(
+                "recoverable ordinary checkpoint payload digest mismatch".into(),
+            ));
         }
     }
     Ok(())
 }
 
-/// Publish a fully-written `stage` at `dir`. A prior checkpoint is renamed
-/// aside (never deleted before the new one is in place): old -> `.old-<pid>`,
-/// stage -> `dir`, then the aside copy is removed. At every instant the path
-/// set holds the prior or the new complete checkpoint, so a crash anywhere in
-/// this sequence loses nothing (at worst the prior survives under the aside
-/// name, swept by the next write).
-fn commit_stage(stage: &Path, dir: &Path) -> Result<(), CheckpointError> {
-    let mut aside_name = dir.file_name().unwrap_or_default().to_os_string();
-    aside_name.push(format!(".old-{}", std::process::id()));
-    let aside = dir.with_file_name(aside_name);
-    let had_prior = dir.exists();
-    if had_prior {
-        std::fs::rename(dir, &aside).map_err(|e| io(dir, e))?;
+fn remove_hidden_directory_durable(path: &Path, parent: &Path) -> Result<(), CheckpointError> {
+    if path.exists() {
+        std::fs::remove_dir_all(path).map_err(|error| io(path, error))?;
     }
-    std::fs::rename(stage, dir).map_err(|e| io(stage, e))?;
-    if had_prior {
-        std::fs::remove_dir_all(&aside).map_err(|e| io(&aside, e))?;
+    sync_directory(parent)
+}
+
+/// Reconcile hidden state from an interrupted ordinary replacement while the
+/// destination's exclusive writer lock is held. A sole complete prior aside is
+/// authoritative when the canonical path is absent; it is restored and fenced
+/// before any stale stage is removed. Multiple priors or a malformed visible
+/// package require operator reconciliation and are never swept blindly.
+#[allow(clippy::cognitive_complexity)] // explicit crash-residue state machine
+fn reconcile_staged_siblings(dir: &Path) -> Result<(), CheckpointError> {
+    let parent = dir.parent().ok_or_else(|| {
+        io(
+            dir,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "checkpoint path has no parent directory",
+            ),
+        )
+    })?;
+    let name = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| publication_ambiguous(dir, "checkpoint filename is not valid UTF-8"))?;
+    let listing_parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let mut stages = Vec::new();
+    let mut asides = Vec::new();
+    for entry in std::fs::read_dir(listing_parent).map_err(|error| io(parent, error))? {
+        let entry = entry.map_err(|error| io(parent, error))?;
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        let Some(suffix) = file_name.strip_prefix(name) else {
+            continue;
+        };
+        if suffix.starts_with(".tmp-") {
+            stages.push(entry.path());
+        } else if suffix.starts_with(".old-") {
+            asides.push(entry.path());
+        }
+    }
+    stages.sort();
+    asides.sort();
+
+    if !dir.exists() {
+        match asides.as_slice() {
+            [] => {}
+            [aside] => {
+                require_recoverable_staged_package(aside).map_err(|error| {
+                    publication_ambiguous(
+                        dir,
+                        format!(
+                            "canonical checkpoint is absent and its sole prior aside is not a complete package: {error}"
+                        ),
+                    )
+                })?;
+                std::fs::rename(aside, dir).map_err(|error| {
+                    publication_ambiguous(
+                        dir,
+                        format!("restore sole prior aside {}: {error}", aside.display()),
+                    )
+                })?;
+                sync_directory(dir)
+                    .and_then(|()| sync_directory(parent))
+                    .map_err(|error| {
+                        publication_ambiguous(
+                            dir,
+                            format!("fence restored prior checkpoint: {error}"),
+                        )
+                    })?;
+                asides.clear();
+            }
+            _ => {
+                return Err(publication_ambiguous(
+                    dir,
+                    format!(
+                        "canonical checkpoint is absent with {} prior aside candidates",
+                        asides.len()
+                    ),
+                ));
+            }
+        }
+    }
+
+    if dir.exists() && !asides.is_empty() {
+        require_recoverable_staged_package(dir).map_err(|error| {
+            publication_ambiguous(
+                dir,
+                format!(
+                    "visible checkpoint cannot be proven complete while prior asides remain: {error}"
+                ),
+            )
+        })?;
+    }
+    for hidden in stages.iter().chain(&asides) {
+        std::fs::remove_dir_all(hidden).map_err(|error| {
+            publication_ambiguous(
+                dir,
+                format!(
+                    "remove stale hidden checkpoint {}: {error}",
+                    hidden.display()
+                ),
+            )
+        })?;
+    }
+    if !stages.is_empty() || !asides.is_empty() {
+        sync_directory(parent).map_err(|error| {
+            publication_ambiguous(dir, format!("fence stale checkpoint cleanup: {error}"))
+        })?;
     }
     Ok(())
 }
 
-/// Run `write` against a staging directory for `dir`, committing on success and
-/// best-effort cleaning the stage on failure (so an aborted write does not
-/// strand a half-built directory next to the real checkpoints).
+fn prepare_stage(dir: &Path) -> Result<PathBuf, CheckpointError> {
+    reconcile_staged_siblings(dir)?;
+    let parent = dir.parent().ok_or_else(|| {
+        io(
+            dir,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "checkpoint path has no parent directory",
+            ),
+        )
+    })?;
+    let stage = staged_sibling_path(dir, "tmp");
+    std::fs::create_dir(&stage).map_err(|error| io(&stage, error))?;
+    sync_directory(parent)?;
+    Ok(stage)
+}
+
+fn rollback_staged_replacement(
+    stage: &Path,
+    dir: &Path,
+    aside: &Path,
+    had_prior: bool,
+    new_visible: bool,
+) -> Result<(), CheckpointError> {
+    let parent = dir.parent().ok_or_else(|| {
+        io(
+            dir,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "checkpoint path has no parent directory",
+            ),
+        )
+    })?;
+    if new_visible {
+        std::fs::rename(dir, stage).map_err(|error| io(dir, error))?;
+        sync_directory(parent)?;
+    }
+    if had_prior {
+        ordinary_publication_fault(OrdinaryPublishFaultPoint::RollbackRestoreRename, aside)?;
+        std::fs::rename(aside, dir).map_err(|error| io(aside, error))?;
+        ordinary_publication_fault(OrdinaryPublishFaultPoint::RollbackSync, dir)?;
+        sync_directory(dir)?;
+        sync_directory(parent)?;
+    } else {
+        ordinary_publication_fault(OrdinaryPublishFaultPoint::RollbackSync, parent)?;
+        sync_directory(parent)?;
+    }
+    remove_hidden_directory_durable(stage, parent)
+}
+
+fn rollback_publication_error(
+    stage: &Path,
+    dir: &Path,
+    aside: &Path,
+    had_prior: bool,
+    new_visible: bool,
+    publication_error: CheckpointError,
+) -> CheckpointError {
+    match rollback_staged_replacement(stage, dir, aside, had_prior, new_visible) {
+        Ok(()) => publication_error,
+        Err(rollback_error) => publication_ambiguous(
+            dir,
+            format!(
+                "ordinary replacement failed ({publication_error}); restoring the prior canonical package also failed ({rollback_error}); preserve every .old-* and .tmp-* candidate"
+            ),
+        ),
+    }
+}
+
+/// Publish a completed stage through a durably fenced replacement transaction.
+/// The prior canonical package remains recoverable until the new directory and
+/// its parent are both synced. Every pre-commit failure restores and fences the
+/// prior path; any uncertain rollback or post-commit cleanup is explicit
+/// publication ambiguity.
+fn commit_stage(stage: &Path, dir: &Path) -> Result<(), CheckpointError> {
+    let parent = dir.parent().ok_or_else(|| {
+        io(
+            dir,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "checkpoint path has no parent directory",
+            ),
+        )
+    })?;
+    let aside = staged_sibling_path(dir, "old");
+    let had_prior = dir.exists();
+
+    if let Err(error) = sync_directory(stage).and_then(|()| sync_directory(parent)) {
+        return Err(rollback_publication_error(
+            stage, dir, &aside, false, false, error,
+        ));
+    }
+    if had_prior {
+        if let Err(error) = std::fs::rename(dir, &aside).map_err(|error| io(dir, error)) {
+            return Err(rollback_publication_error(
+                stage, dir, &aside, false, false, error,
+            ));
+        }
+        if let Err(error) = sync_directory(parent) {
+            return Err(rollback_publication_error(
+                stage, dir, &aside, true, false, error,
+            ));
+        }
+    }
+    if let Err(error) = ordinary_publication_fault(OrdinaryPublishFaultPoint::PublishRename, stage)
+        .and_then(|()| std::fs::rename(stage, dir).map_err(|error| io(stage, error)))
+    {
+        return Err(rollback_publication_error(
+            stage, dir, &aside, had_prior, false, error,
+        ));
+    }
+    if let Err(error) =
+        ordinary_publication_fault(OrdinaryPublishFaultPoint::FinalDirectorySync, dir)
+            .and_then(|()| sync_directory(dir))
+    {
+        return Err(rollback_publication_error(
+            stage, dir, &aside, had_prior, true, error,
+        ));
+    }
+    if let Err(error) =
+        ordinary_publication_fault(OrdinaryPublishFaultPoint::FinalParentSync, parent)
+            .and_then(|()| sync_directory(parent))
+    {
+        return Err(rollback_publication_error(
+            stage, dir, &aside, had_prior, true, error,
+        ));
+    }
+
+    if had_prior {
+        if let Err(error) =
+            ordinary_publication_fault(OrdinaryPublishFaultPoint::AsideCleanup, &aside)
+                .and_then(|()| std::fs::remove_dir_all(&aside).map_err(|error| io(&aside, error)))
+                .and_then(|()| sync_directory(parent))
+        {
+            return Err(publication_ambiguous(
+                dir,
+                format!(
+                    "the new package is durably visible, but prior-aside cleanup could not be confirmed: {error}"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Run `write` against a staging directory for `dir`, durably cleaning a failed
+/// pre-publication stage or committing it through [`commit_stage`].
 fn write_staged(
     dir: &Path,
     write: impl FnOnce(&Path) -> Result<(), CheckpointError>,
@@ -764,9 +1100,25 @@ fn write_staged(
     let stage = prepare_stage(dir)?;
     match write(&stage) {
         Ok(()) => commit_stage(&stage, dir),
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(&stage);
-            Err(e)
+        Err(error) => {
+            let parent = dir.parent().ok_or_else(|| {
+                io(
+                    dir,
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "checkpoint path has no parent directory",
+                    ),
+                )
+            })?;
+            match remove_hidden_directory_durable(&stage, parent) {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(publication_ambiguous(
+                    dir,
+                    format!(
+                        "staged checkpoint write failed ({error}); hidden-stage cleanup also failed ({cleanup_error})"
+                    ),
+                )),
+            }
         }
     }
 }
@@ -781,16 +1133,16 @@ fn write_staged(
 /// CPU and made contiguous before serialization, so this works for vars living on
 /// any device.
 ///
-/// The write is **crash-atomic**: everything is staged into a sibling temp
-/// directory and published at `dir` with a single `rename` (see the module
-/// docs), with the manifest written last inside the stage as belt-and-braces.
-/// Re-writing an existing `dir` replaces it as a unit.
+/// The write is staged and durably fenced as described in the module docs.
+/// Re-writing an existing `dir` replaces it as a recoverable transaction: a
+/// failed pre-commit swap restores the prior package, while unresolved
+/// visibility or cleanup returns [`CheckpointError::PublicationAmbiguous`].
 ///
 /// # Errors
 ///
 /// Returns [`CheckpointError`] if the staging directory cannot be created, a
 /// tensor cannot be moved to CPU / serialized, the manifest cannot be written,
-/// or the final rename fails.
+/// or the durable publication/rollback sequence cannot complete.
 pub fn save_adapter(
     dir: impl AsRef<Path>,
     vars: &[Var],
@@ -805,7 +1157,10 @@ pub fn save_adapter(
             let t = v.as_tensor().to_device(&Device::Cpu)?.contiguous()?;
             tensors.insert(var_key(i), t);
         }
-        candle_core::safetensors::save(&tensors, stage.join(ADAPTER_FILE))?;
+        let adapter_path = stage.join(ADAPTER_FILE);
+        candle_core::safetensors::save(&tensors, &adapter_path)?;
+        ordinary_publication_fault(OrdinaryPublishFaultPoint::AdapterPayloadSync, &adapter_path)?;
+        sync_file(&adapter_path)?;
 
         let manifest = CheckpointManifest {
             format_version: 1,
@@ -820,7 +1175,21 @@ pub fn save_adapter(
         };
         let manifest_path = stage.join(MANIFEST_FILE);
         let json = serde_json::to_string_pretty(&manifest)?;
-        std::fs::write(&manifest_path, json).map_err(|e| io(&manifest_path, e))?;
+        let mut manifest_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&manifest_path)
+            .map_err(|error| io(&manifest_path, error))?;
+        manifest_file
+            .write_all(json.as_bytes())
+            .map_err(|error| io(&manifest_path, error))?;
+        ordinary_publication_fault(
+            OrdinaryPublishFaultPoint::ManifestPayloadSync,
+            &manifest_path,
+        )?;
+        manifest_file
+            .sync_all()
+            .map_err(|error| io(&manifest_path, error))?;
         Ok(())
     })
 }
@@ -1079,7 +1448,7 @@ pub struct LoadedCheckpoint {
 /// externally verified frozen-policy and canonical trainer identities plus the exact
 /// recipe; this function derives and records the ordered schema and exact payload hashes.
 ///
-/// The write is **crash-atomic** via the same stage-then-rename as
+/// The write uses the same durable, rollback-capable staged replacement as
 /// [`save_adapter`] (see the module docs).
 ///
 /// # Errors
@@ -1921,8 +2290,11 @@ pub struct LatestCheckpoint {
 /// ineligible but is not ordinary-resume corruption; a typed continuation block
 /// with any other discriminator fails closed. A malformed older sibling cannot
 /// cause replay and is ignored.
-/// Crash-leftover `.tmp-*` / `.old-*` siblings do not match the exact final-name
-/// shape and are ignored, as is any unrelated entry.
+/// Hidden `.tmp-*` stages are ignored. A `.old-*` package whose exact canonical
+/// `step-<n>` path is absent is treated as recoverable publication ambiguity,
+/// never as "no checkpoint"; the next destination-locked writer can restore a
+/// sole complete prior package. `.old-*` cleanup remnants next to an existing
+/// canonical path do not displace that path.
 ///
 /// # Errors
 ///
@@ -1943,6 +2315,37 @@ pub fn latest_checkpoint(
     for entry in std::fs::read_dir(dir).map_err(|e| io(dir, e))? {
         let entry = entry.map_err(|e| io(dir, e))?;
         let path = entry.path();
+        if let Some((step_digits, hidden_suffix)) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("step-"))
+            .and_then(|name| name.split_once(".old-"))
+        {
+            if !hidden_suffix.is_empty()
+                && !step_digits.is_empty()
+                && step_digits.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                let directory_step = step_digits.parse::<u64>().map_err(|_| {
+                    CheckpointError::Mismatch(format!(
+                        "ordinary checkpoint prior-aside step-{step_digits} exceeds the u64 step range"
+                    ))
+                })?;
+                let canonical = dir.join(format!("step-{directory_step}"));
+                if !canonical.exists() {
+                    malformed.push((
+                        directory_step,
+                        publication_ambiguous(
+                            &canonical,
+                            format!(
+                                "canonical checkpoint is absent while recoverable prior aside {} exists",
+                                path.display()
+                            ),
+                        ),
+                    ));
+                }
+                continue;
+            }
+        }
         // Match exactly `step-<digits>`: this excludes `.tmp-*` / `.old-*`
         // crash siblings (their names carry a dot-suffix after the digits) and
         // any foreign directory.
@@ -2174,6 +2577,29 @@ mod tests {
                     .unwrap()
             })
             .collect()
+    }
+
+    fn hidden_siblings(dir: &Path, kind: &str) -> Vec<PathBuf> {
+        let parent = dir.parent().unwrap();
+        let prefix = format!("{}.{kind}-", dir.file_name().unwrap().to_string_lossy());
+        let mut paths = std::fs::read_dir(parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(&prefix))
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+    }
+
+    fn inject_ordinary_publication_failures(points: &[OrdinaryPublishFaultPoint]) {
+        FAIL_ORDINARY_PUBLICATION.with(|failures| {
+            let mut failures = failures.borrow_mut();
+            assert!(failures.is_empty(), "ordinary publication fault leaked");
+            failures.extend_from_slice(points);
+        });
     }
 
     #[test]
@@ -3236,8 +3662,365 @@ mod tests {
         assert_eq!(loaded.step, 3);
         assert_eq!(loaded.sampler_state, Some(vec![7u8]));
         assert_eq!(snapshot(&vars), before);
-        let stage = dir.with_file_name(format!("step-3.tmp-{}", std::process::id()));
-        assert!(!stage.exists(), "failed stage must be cleaned up");
+        assert!(
+            hidden_siblings(&dir, "tmp").is_empty(),
+            "failed stage must be cleaned up"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // both payload-fence faults share one exact oracle
+    fn adapter_payload_sync_failures_preserve_the_prior_package() {
+        for point in [
+            OrdinaryPublishFaultPoint::AdapterPayloadSync,
+            OrdinaryPublishFaultPoint::ManifestPayloadSync,
+        ] {
+            let tmp = TempDir::new(&format!("adapter-payload-sync-{point:?}"));
+            let dir = tmp.path().join("step-3");
+            let vars = make_vars();
+            let prior = snapshot(&vars);
+            save_adapter(&dir, &vars, 3, None).unwrap();
+            clobber(&vars);
+            assert_ne!(snapshot(&vars), prior, "{point:?}: fixture did not mutate");
+
+            inject_ordinary_publication_failures(&[point]);
+            let error = save_adapter(&dir, &vars, 4, None).unwrap_err();
+            assert!(matches!(error, CheckpointError::Io { .. }), "{error:?}");
+
+            let loaded = load_adapter(&dir, &vars).unwrap();
+            assert_eq!(loaded.step, 3, "{point:?}");
+            assert_eq!(snapshot(&vars), prior, "{point:?}");
+            assert!(hidden_siblings(&dir, "old").is_empty(), "{point:?}");
+            assert!(hidden_siblings(&dir, "tmp").is_empty(), "{point:?}");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn ordinary_replacement_failures_restore_and_fence_the_prior_package() {
+        for point in [
+            OrdinaryPublishFaultPoint::PublishRename,
+            OrdinaryPublishFaultPoint::FinalDirectorySync,
+            OrdinaryPublishFaultPoint::FinalParentSync,
+        ] {
+            let tmp = TempDir::new(&format!("ordinary-rollback-{point:?}"));
+            let dir = tmp.path().join("step-3");
+            let vars = make_vars();
+            save_checkpoint(
+                &dir,
+                &vars,
+                &make_opt_state(),
+                &[7],
+                3,
+                &ordinary_binding(None),
+            )
+            .unwrap();
+            let prior_values = snapshot(&vars);
+
+            inject_ordinary_publication_failures(&[point]);
+            let error = save_checkpoint(
+                &dir,
+                &vars,
+                &make_opt_state(),
+                &[9],
+                3,
+                &ordinary_binding(None),
+            )
+            .unwrap_err();
+            assert!(matches!(error, CheckpointError::Io { .. }), "{error:?}");
+
+            clobber(&vars);
+            let loaded = load_checkpoint(&dir, &vars, &ordinary_binding(None)).unwrap();
+            assert_eq!(loaded.sampler_state, Some(vec![7]), "{point:?}");
+            assert_eq!(snapshot(&vars), prior_values, "{point:?}");
+            assert!(hidden_siblings(&dir, "old").is_empty(), "{point:?}");
+            assert!(hidden_siblings(&dir, "tmp").is_empty(), "{point:?}");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn ordinary_replacement_rollback_failure_preserves_both_recovery_candidates() {
+        let tmp = TempDir::new("ordinary-rollback-ambiguous");
+        let dir = tmp.path().join("step-3");
+        let vars = make_vars();
+        save_checkpoint(
+            &dir,
+            &vars,
+            &make_opt_state(),
+            &[7],
+            3,
+            &ordinary_binding(None),
+        )
+        .unwrap();
+
+        inject_ordinary_publication_failures(&[
+            OrdinaryPublishFaultPoint::PublishRename,
+            OrdinaryPublishFaultPoint::RollbackRestoreRename,
+        ]);
+        let error = save_checkpoint(
+            &dir,
+            &vars,
+            &make_opt_state(),
+            &[9],
+            3,
+            &ordinary_binding(None),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, CheckpointError::PublicationAmbiguous { .. }),
+            "{error:?}"
+        );
+        assert!(
+            !dir.exists(),
+            "failed rollback must not claim a canonical winner"
+        );
+        let asides = hidden_siblings(&dir, "old");
+        let stages = hidden_siblings(&dir, "tmp");
+        assert_eq!(asides.len(), 1, "prior package was lost");
+        assert_eq!(stages.len(), 1, "new package was lost");
+        assert_eq!(
+            load_checkpoint(&asides[0], &vars, &ordinary_binding(None))
+                .unwrap()
+                .sampler_state,
+            Some(vec![7])
+        );
+        assert_eq!(
+            load_checkpoint(&stages[0], &vars, &ordinary_binding(None))
+                .unwrap()
+                .sampler_state,
+            Some(vec![9])
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn ordinary_writer_restores_a_sole_crash_aside_before_a_new_failed_write() {
+        let tmp = TempDir::new("ordinary-old-only-recovery");
+        let dir = tmp.path().join("step-3");
+        let aside = dir.with_file_name("step-3.old-crash");
+        let vars = make_vars();
+        save_checkpoint(
+            &dir,
+            &vars,
+            &make_opt_state(),
+            &[7],
+            3,
+            &ordinary_binding(None),
+        )
+        .unwrap();
+        std::fs::rename(&dir, &aside).unwrap();
+        assert!(matches!(
+            latest_checkpoint(tmp.path()),
+            Err(CheckpointError::PublicationAmbiguous { .. })
+        ));
+
+        let error = write_staged(&dir, |_stage| {
+            Err(CheckpointError::Mismatch(
+                "synthetic new write failure".into(),
+            ))
+        })
+        .unwrap_err();
+        assert!(matches!(error, CheckpointError::Mismatch(_)), "{error:?}");
+        assert!(dir.is_dir());
+        assert!(!aside.exists());
+        assert_eq!(
+            load_checkpoint(&dir, &vars, &ordinary_binding(None))
+                .unwrap()
+                .sampler_state,
+            Some(vec![7])
+        );
+        assert!(hidden_siblings(&dir, "tmp").is_empty());
+    }
+
+    #[test]
+    fn ordinary_writer_preserves_a_corrupt_sole_crash_aside_for_reconciliation() {
+        let tmp = TempDir::new("ordinary-corrupt-old-only");
+        let dir = tmp.path().join("step-3");
+        let aside = dir.with_file_name("step-3.old-crash");
+        let vars = make_vars();
+        let binding = ordinary_binding(None);
+        save_checkpoint(&dir, &vars, &make_opt_state(), &[7], 3, &binding).unwrap();
+        std::fs::rename(&dir, &aside).unwrap();
+        std::fs::write(aside.join(ADAPTER_FILE), b"corrupt adapter").unwrap();
+
+        let error = save_checkpoint(&dir, &vars, &make_opt_state(), &[9], 3, &binding).unwrap_err();
+        assert!(
+            matches!(error, CheckpointError::PublicationAmbiguous { ref detail, .. }
+                if detail.contains("sole prior aside is not a complete package")),
+            "{error:?}"
+        );
+        assert!(!dir.exists(), "corrupt prior must not become canonical");
+        assert!(aside.is_dir(), "corrupt recovery candidate was deleted");
+        assert!(hidden_siblings(&dir, "tmp").is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // preserve and authenticate both crash candidates
+    fn ordinary_writer_preserves_valid_prior_when_visible_package_is_corrupt() {
+        let tmp = TempDir::new("ordinary-corrupt-visible-with-old");
+        let dir = tmp.path().join("step-3");
+        let aside = dir.with_file_name("step-3.old-crash");
+        let donor = tmp.path().join("donor");
+        let vars = make_vars();
+        let binding = ordinary_binding(None);
+        save_checkpoint(&dir, &vars, &make_opt_state(), &[7], 3, &binding).unwrap();
+        std::fs::rename(&dir, &aside).unwrap();
+        save_checkpoint(&donor, &vars, &make_opt_state(), &[8], 3, &binding).unwrap();
+        std::fs::rename(&donor, &dir).unwrap();
+        std::fs::write(dir.join(ADAPTER_FILE), b"corrupt adapter").unwrap();
+
+        let error = save_checkpoint(&dir, &vars, &make_opt_state(), &[9], 3, &binding).unwrap_err();
+        assert!(
+            matches!(error, CheckpointError::PublicationAmbiguous { ref detail, .. }
+                if detail.contains("visible checkpoint cannot be proven complete")),
+            "{error:?}"
+        );
+        assert!(
+            dir.is_dir(),
+            "corrupt visible candidate was unexpectedly moved"
+        );
+        assert!(aside.is_dir(), "last valid prior package was deleted");
+        assert!(load_checkpoint(&dir, &vars, &binding).is_err());
+        assert_eq!(
+            load_checkpoint(&aside, &vars, &binding)
+                .unwrap()
+                .sampler_state,
+            Some(vec![7])
+        );
+        assert!(hidden_siblings(&dir, "tmp").is_empty());
+    }
+
+    #[test]
+    fn ordinary_writer_rejects_multiple_prior_asides_without_deleting_them() {
+        let tmp = TempDir::new("ordinary-multiple-old");
+        let dir = tmp.path().join("step-3");
+        let vars = make_vars();
+        for (label, sampler) in [("a", 7), ("b", 8)] {
+            let package = tmp.path().join(format!("package-{label}"));
+            save_checkpoint(
+                &package,
+                &vars,
+                &make_opt_state(),
+                &[sampler],
+                3,
+                &ordinary_binding(None),
+            )
+            .unwrap();
+            std::fs::rename(package, dir.with_file_name(format!("step-3.old-{label}"))).unwrap();
+        }
+
+        let error = save_checkpoint(
+            &dir,
+            &vars,
+            &make_opt_state(),
+            &[9],
+            3,
+            &ordinary_binding(None),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, CheckpointError::PublicationAmbiguous { .. }),
+            "{error:?}"
+        );
+        assert!(!dir.exists());
+        assert_eq!(hidden_siblings(&dir, "old").len(), 2);
+    }
+
+    #[test]
+    fn ordinary_post_commit_cleanup_ambiguity_keeps_the_new_package_visible() {
+        let tmp = TempDir::new("ordinary-cleanup-ambiguous");
+        let dir = tmp.path().join("step-3");
+        let vars = make_vars();
+        save_checkpoint(
+            &dir,
+            &vars,
+            &make_opt_state(),
+            &[7],
+            3,
+            &ordinary_binding(None),
+        )
+        .unwrap();
+
+        inject_ordinary_publication_failures(&[OrdinaryPublishFaultPoint::AsideCleanup]);
+        let error = save_checkpoint(
+            &dir,
+            &vars,
+            &make_opt_state(),
+            &[9],
+            3,
+            &ordinary_binding(None),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, CheckpointError::PublicationAmbiguous { .. }),
+            "{error:?}"
+        );
+        assert_eq!(
+            load_checkpoint(&dir, &vars, &ordinary_binding(None))
+                .unwrap()
+                .sampler_state,
+            Some(vec![9])
+        );
+        assert_eq!(hidden_siblings(&dir, "old").len(), 1);
+    }
+
+    #[test]
+    fn ordinary_replacement_fences_stage_final_and_cleanup_in_order() {
+        let tmp = TempDir::new("ordinary-fence-order");
+        let dir = tmp.path().join("step-3");
+        let parent = dir.parent().unwrap().to_path_buf();
+        let vars = make_vars();
+        save_checkpoint(
+            &dir,
+            &vars,
+            &make_opt_state(),
+            &[7],
+            3,
+            &ordinary_binding(None),
+        )
+        .unwrap();
+        SYNCED_DIRECTORIES.with(|paths| paths.borrow_mut().clear());
+
+        save_checkpoint(
+            &dir,
+            &vars,
+            &make_opt_state(),
+            &[9],
+            3,
+            &ordinary_binding(None),
+        )
+        .unwrap();
+        let synced = SYNCED_DIRECTORIES.with(|paths| paths.borrow().clone());
+        let stage_index = synced
+            .iter()
+            .position(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("step-3.tmp-"))
+            })
+            .expect("completed stage directory was not synced");
+        let final_index = synced
+            .iter()
+            .enumerate()
+            .skip(stage_index + 1)
+            .find_map(|(index, path)| (path == &dir).then_some(index))
+            .expect("published final directory was not synced");
+        assert!(
+            synced[stage_index + 1..final_index]
+                .iter()
+                .filter(|path| path.as_path() == parent.as_path())
+                .count()
+                >= 2,
+            "stage and prior-aside entries were not fenced before final visibility: {synced:?}"
+        );
+        assert!(
+            synced[final_index + 1..]
+                .iter()
+                .filter(|path| path.as_path() == parent.as_path())
+                .count()
+                >= 2,
+            "final visibility and prior cleanup were not parent-fenced: {synced:?}"
+        );
     }
 
     #[test]
@@ -4017,12 +4800,11 @@ mod tests {
     }
 
     #[test]
-    fn latest_checkpoint_ignores_tmp_old_and_foreign_siblings() {
+    fn latest_checkpoint_ignores_tmp_and_foreign_but_rejects_an_orphan_prior() {
         let tmp = TempDir::new("latest-foreign");
         write_step(tmp.path(), 3);
-        // Crash-leftover stage / aside dirs (name has a dot-suffix after digits).
+        // A hidden partial stage and unrelated names cannot displace step 3.
         std::fs::create_dir_all(tmp.path().join("step-7.tmp-12345")).unwrap();
-        std::fs::create_dir_all(tmp.path().join("step-7.old-12345")).unwrap();
         // Foreign entries: non-numeric suffix, empty suffix, unrelated name, a file.
         std::fs::create_dir_all(tmp.path().join("step-abc")).unwrap();
         std::fs::create_dir_all(tmp.path().join("step-")).unwrap();
@@ -4034,6 +4816,15 @@ mod tests {
             "only the real step-3 checkpoint is a candidate"
         );
         assert_eq!(got.dir, tmp.path().join("step-3"));
+
+        // A hidden prior with no canonical step is different: ignoring it would
+        // silently replay step 3 or start fresh despite recoverable step-7 state.
+        std::fs::create_dir_all(tmp.path().join("step-7.old-12345")).unwrap();
+        let error = latest_checkpoint(tmp.path()).unwrap_err();
+        assert!(
+            matches!(error, CheckpointError::PublicationAmbiguous { .. }),
+            "{error:?}"
+        );
     }
 
     #[test]
