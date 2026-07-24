@@ -100,6 +100,7 @@ enum OrdinaryPublishFaultPoint {
     AdapterPayloadSync,
     ManifestPayloadSync,
     PublishRename,
+    PublishRenameAfterApply,
     FinalDirectorySync,
     FinalParentSync,
     RollbackRestoreRename,
@@ -829,11 +830,51 @@ fn remove_hidden_directory_durable(path: &Path, parent: &Path) -> Result<(), Che
     sync_directory(parent)
 }
 
+fn reconcile_publish_rename_error(
+    stage: &Path,
+    dir: &Path,
+    parent: &Path,
+    rename_error: &CheckpointError,
+) -> Result<(), CheckpointError> {
+    let stage_exists = stage.exists();
+    let canonical_exists = dir.exists();
+    if canonical_exists && !stage_exists {
+        require_recoverable_staged_package(dir).map_err(|error| {
+            publication_ambiguous(
+                dir,
+                format!(
+                    "publish rename reported an error ({rename_error}), the canonical name appeared and the stage disappeared, but the canonical package could not be validated: {error}; preserve every remaining recovery candidate"
+                ),
+            )
+        })?;
+        sync_directory(dir)
+            .and_then(|()| sync_directory(parent))
+            .map_err(|error| {
+                publication_ambiguous(
+                    dir,
+                    format!(
+                        "publish rename reported an error ({rename_error}) after the canonical name appeared, but fencing the reconciled package failed: {error}; preserve every remaining recovery candidate"
+                    ),
+                )
+            })?;
+        return Ok(());
+    }
+
+    Err(publication_ambiguous(
+        dir,
+        format!(
+            "publish rename reported an error ({rename_error}) and its effect cannot be proven from the namespace (canonical_exists={canonical_exists}, stage_exists={stage_exists}); preserve every .old-* and .tmp-* candidate"
+        ),
+    ))
+}
+
 /// Reconcile hidden state from an interrupted ordinary replacement while the
 /// destination's exclusive writer lock is held. A sole complete prior aside is
 /// authoritative when the canonical path is absent; it is restored and fenced
-/// before any stale stage is removed. Multiple priors or a malformed visible
-/// package require operator reconciliation and are never swept blindly.
+/// before any stale stage is removed. An existing complete canonical package is
+/// likewise fenced before any stage or aside is deleted. Multiple priors or a
+/// malformed visible package require operator reconciliation and are never
+/// swept blindly.
 #[allow(clippy::cognitive_complexity)] // explicit crash-residue state machine
 fn reconcile_staged_siblings(dir: &Path) -> Result<(), CheckpointError> {
     let parent = dir.parent().ok_or_else(|| {
@@ -873,6 +914,7 @@ fn reconcile_staged_siblings(dir: &Path) -> Result<(), CheckpointError> {
     }
     stages.sort();
     asides.sort();
+    let mut canonical_fenced = false;
 
     if !dir.exists() {
         match asides.as_slice() {
@@ -900,6 +942,7 @@ fn reconcile_staged_siblings(dir: &Path) -> Result<(), CheckpointError> {
                             format!("fence restored prior checkpoint: {error}"),
                         )
                     })?;
+                canonical_fenced = true;
                 asides.clear();
             }
             _ => {
@@ -923,6 +966,18 @@ fn reconcile_staged_siblings(dir: &Path) -> Result<(), CheckpointError> {
                 ),
             )
         })?;
+    }
+    if dir.exists() && (!stages.is_empty() || !asides.is_empty()) && !canonical_fenced {
+        sync_directory(dir)
+            .and_then(|()| sync_directory(parent))
+            .map_err(|error| {
+                publication_ambiguous(
+                    dir,
+                    format!(
+                        "fence visible checkpoint before stale checkpoint cleanup: {error}; preserve every .old-* and .tmp-* candidate"
+                    ),
+                )
+            })?;
     }
     for hidden in stages.iter().chain(&asides) {
         std::fs::remove_dir_all(hidden).map_err(|error| {
@@ -1048,11 +1103,18 @@ fn commit_stage(stage: &Path, dir: &Path) -> Result<(), CheckpointError> {
         }
     }
     if let Err(error) = ordinary_publication_fault(OrdinaryPublishFaultPoint::PublishRename, stage)
-        .and_then(|()| std::fs::rename(stage, dir).map_err(|error| io(stage, error)))
     {
         return Err(rollback_publication_error(
             stage, dir, &aside, had_prior, false, error,
         ));
+    }
+    if let Err(error) = std::fs::rename(stage, dir)
+        .map_err(|error| io(stage, error))
+        .and_then(|()| {
+            ordinary_publication_fault(OrdinaryPublishFaultPoint::PublishRenameAfterApply, dir)
+        })
+    {
+        reconcile_publish_rename_error(stage, dir, parent, &error)?;
     }
     if let Err(error) =
         ordinary_publication_fault(OrdinaryPublishFaultPoint::FinalDirectorySync, dir)
@@ -3834,6 +3896,101 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_recovery_fences_canonical_before_hidden_cleanup() {
+        let tmp = TempDir::new("ordinary-recovery-fence-order");
+        let dir = tmp.path().join("step-3");
+        let parent = dir.parent().unwrap().to_path_buf();
+        let aside = dir.with_file_name("step-3.old-crash");
+        let stage = dir.with_file_name("step-3.tmp-crash");
+        let donor = tmp.path().join("donor");
+        let vars = make_vars();
+        let binding = ordinary_binding(None);
+
+        save_checkpoint(&dir, &vars, &make_opt_state(), &[7], 3, &binding).unwrap();
+        std::fs::rename(&dir, &aside).unwrap();
+        save_checkpoint(&donor, &vars, &make_opt_state(), &[9], 3, &binding).unwrap();
+        std::fs::rename(&donor, &dir).unwrap();
+        std::fs::create_dir(&stage).unwrap();
+        std::fs::write(stage.join("crash-residue"), b"incomplete stage").unwrap();
+        SYNCED_DIRECTORIES.with(|paths| paths.borrow_mut().clear());
+
+        reconcile_staged_siblings(&dir).unwrap();
+
+        let synced = SYNCED_DIRECTORIES.with(|paths| paths.borrow().clone());
+        assert_eq!(synced.first(), Some(&dir), "canonical was not fenced first");
+        assert_eq!(
+            synced.get(1),
+            Some(&parent),
+            "canonical name was not fenced"
+        );
+        assert!(!aside.exists(), "fenced prior aside was not cleaned");
+        assert!(!stage.exists(), "fenced stale stage was not cleaned");
+        assert_eq!(
+            load_checkpoint(&dir, &vars, &binding)
+                .unwrap()
+                .sampler_state,
+            Some(vec![9])
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // both recovery fences must preserve every candidate
+    fn ordinary_recovery_fence_failure_preserves_all_candidates() {
+        for fail_canonical_directory in [true, false] {
+            let label = if fail_canonical_directory {
+                "ordinary-recovery-canonical-fence-failure"
+            } else {
+                "ordinary-recovery-parent-fence-failure"
+            };
+            let tmp = TempDir::new(label);
+            let dir = tmp.path().join("step-3");
+            let parent = dir.parent().unwrap().to_path_buf();
+            let aside = dir.with_file_name("step-3.old-crash");
+            let stage = dir.with_file_name("step-3.tmp-crash");
+            let donor = tmp.path().join("donor");
+            let vars = make_vars();
+            let binding = ordinary_binding(None);
+
+            save_checkpoint(&dir, &vars, &make_opt_state(), &[7], 3, &binding).unwrap();
+            std::fs::rename(&dir, &aside).unwrap();
+            save_checkpoint(&donor, &vars, &make_opt_state(), &[9], 3, &binding).unwrap();
+            std::fs::rename(&donor, &dir).unwrap();
+            std::fs::create_dir(&stage).unwrap();
+            std::fs::write(stage.join("crash-residue"), b"incomplete stage").unwrap();
+            let fail_path = if fail_canonical_directory {
+                dir.clone()
+            } else {
+                parent
+            };
+            FAIL_SYNC_DIRECTORY_ONCE.with(|failure| {
+                *failure.borrow_mut() = Some(fail_path);
+            });
+
+            let error = reconcile_staged_siblings(&dir).unwrap_err();
+            assert!(
+                matches!(error, CheckpointError::PublicationAmbiguous { ref detail, .. }
+                    if detail.contains("fence visible checkpoint before stale checkpoint cleanup")),
+                "{error:?}"
+            );
+            assert!(dir.is_dir(), "canonical recovery candidate was lost");
+            assert!(aside.is_dir(), "durable prior aside was lost");
+            assert!(stage.is_dir(), "staged recovery candidate was lost");
+            assert_eq!(
+                load_checkpoint(&aside, &vars, &binding)
+                    .unwrap()
+                    .sampler_state,
+                Some(vec![7])
+            );
+            assert_eq!(
+                load_checkpoint(&dir, &vars, &binding)
+                    .unwrap()
+                    .sampler_state,
+                Some(vec![9])
+            );
+        }
+    }
+
+    #[test]
     fn ordinary_writer_preserves_a_corrupt_sole_crash_aside_for_reconciliation() {
         let tmp = TempDir::new("ordinary-corrupt-old-only");
         let dir = tmp.path().join("step-3");
@@ -3963,6 +4120,26 @@ mod tests {
             Some(vec![9])
         );
         assert_eq!(hidden_siblings(&dir, "old").len(), 1);
+    }
+
+    #[test]
+    fn ordinary_publish_rename_applied_then_error_is_reconciled_as_success() {
+        let tmp = TempDir::new("ordinary-publish-rename-applied-error");
+        let dir = tmp.path().join("step-3");
+        let vars = make_vars();
+        let binding = ordinary_binding(None);
+
+        inject_ordinary_publication_failures(&[OrdinaryPublishFaultPoint::PublishRenameAfterApply]);
+        save_checkpoint(&dir, &vars, &make_opt_state(), &[9], 3, &binding).unwrap();
+
+        assert_eq!(
+            load_checkpoint(&dir, &vars, &binding)
+                .unwrap()
+                .sampler_state,
+            Some(vec![9])
+        );
+        assert!(hidden_siblings(&dir, "tmp").is_empty());
+        assert!(hidden_siblings(&dir, "old").is_empty());
     }
 
     #[test]
