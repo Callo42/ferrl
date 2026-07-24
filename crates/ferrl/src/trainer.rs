@@ -4501,6 +4501,39 @@ impl Trainer {
         Ok(())
     }
 
+    fn prepare_run_optimizer_vars<P, E>(
+        &self,
+        policy: &mut P,
+        exec: &E,
+        resume_vars: Option<&[Var]>,
+    ) -> Result<Vec<Var>, TrainerError>
+    where
+        P: Policy,
+        E: PolicyExecution<P>,
+    {
+        if let Some(expected) = resume_vars {
+            return Self::coordinate_comm_call(
+                exec.execution_comm(self.comm.as_ref()),
+                "ordinary checkpoint pre-optimizer variable handoff",
+                || {
+                    self.require_toggleable_reference_policy(
+                        policy,
+                        self.config.requires_reference_policy(),
+                    )?;
+                    let vars = policy.trainable_vars();
+                    self.require_same_rollout_ledger_vars(
+                        expected,
+                        &vars,
+                        "ordinary checkpoint pre-optimizer handoff",
+                    )?;
+                    Ok(vars)
+                },
+            );
+        }
+        self.require_toggleable_reference_policy(policy, self.config.requires_reference_policy())?;
+        Ok(policy.trainable_vars())
+    }
+
     fn new_optimizer(&self, vars: Vec<Var>) -> Result<FerrlAdamW, TrainerError> {
         let params = ParamsAdamW {
             lr: self.config.lr,
@@ -4846,6 +4879,20 @@ impl Trainer {
         if actual != expected {
             return Err(TrainerError::Contract(
                 "policy did not install the exact rollout-ledger sampler state".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn restore_ordinary_checkpoint_sampler<P: Policy>(
+        policy: &mut P,
+        expected: &[u8],
+    ) -> Result<(), TrainerError> {
+        policy.restore_sampler_state(expected)?;
+        let actual = policy.sampler_state()?;
+        if actual != expected {
+            return Err(TrainerError::Contract(
+                "policy did not install the exact ordinary checkpoint sampler state".into(),
             ));
         }
         Ok(())
@@ -5674,7 +5721,7 @@ impl Trainer {
         samples: &[Sample<R::Target>],
     ) -> Result<(Vec<Metrics>, RunStop), TrainerError> {
         let exec = UnshardedPolicyExecution;
-        self.run(0, None, policy, reward_fn, tokenizer, samples, &exec)
+        self.run(0, None, None, policy, reward_fn, tokenizer, samples, &exec)
     }
 
     /// Run training through a policy's explicit tensor-parallel rollout and
@@ -5708,7 +5755,7 @@ impl Trainer {
         let exec = TensorParallelPolicyExecution {
             comm: tensor_parallel_comm,
         };
-        self.run(0, None, policy, reward_fn, tokenizer, samples, &exec)
+        self.run(0, None, None, policy, reward_fn, tokenizer, samples, &exec)
     }
 
     /// Resume training from `start_step`, running steps `start_step .. config.steps`
@@ -5750,7 +5797,7 @@ impl Trainer {
     ) -> Result<(Vec<Metrics>, RunStop), TrainerError> {
         let exec = UnshardedPolicyExecution;
         self.run(
-            start_step, None, policy, reward_fn, tokenizer, samples, &exec,
+            start_step, None, None, policy, reward_fn, tokenizer, samples, &exec,
         )
     }
 
@@ -5777,7 +5824,7 @@ impl Trainer {
             comm: tensor_parallel_comm,
         };
         self.run(
-            start_step, None, policy, reward_fn, tokenizer, samples, &exec,
+            start_step, None, None, policy, reward_fn, tokenizer, samples, &exec,
         )
     }
 
@@ -5826,10 +5873,17 @@ impl Trainer {
         samples: &[Sample<R::Target>],
     ) -> Result<(Vec<Metrics>, RunStop), TrainerError> {
         let exec = UnshardedPolicyExecution;
-        let (start_step, opt_state) =
+        let (start_step, opt_state, resume_vars) =
             self.load_resume_point(checkpoint_dir.as_ref(), policy, &exec)?;
         self.run(
-            start_step, opt_state, policy, reward_fn, tokenizer, samples, &exec,
+            start_step,
+            opt_state,
+            Some(&resume_vars),
+            policy,
+            reward_fn,
+            tokenizer,
+            samples,
+            &exec,
         )
     }
 
@@ -5855,16 +5909,25 @@ impl Trainer {
         let exec = TensorParallelPolicyExecution {
             comm: tensor_parallel_comm,
         };
-        let (start_step, opt_state) =
+        let (start_step, opt_state, resume_vars) =
             self.load_resume_point(checkpoint_dir.as_ref(), policy, &exec)?;
         self.run(
-            start_step, opt_state, policy, reward_fn, tokenizer, samples, &exec,
+            start_step,
+            opt_state,
+            Some(&resume_vars),
+            policy,
+            reward_fn,
+            tokenizer,
+            samples,
+            &exec,
         )
     }
 
     /// Load `checkpoint_dir` into `policy` and return the resumed loop's
-    /// `(start_step, optimizer_state)` — the momentum-faithful prelude shared by
-    /// [`resume`](Self::resume) and [`resume_latest`](Self::resume_latest).
+    /// `(start_step, optimizer_state, trainable_variables)` — the momentum-faithful
+    /// prelude shared by [`resume`](Self::resume) and
+    /// [`resume_latest`](Self::resume_latest). The returned variable handles remain
+    /// the authority through the resumed loop's pre-optimizer handoff.
     ///
     /// The format-v4 identity, exact payloads, tensor schemas/keys, sampler blob,
     /// and temporary optimizer state are all prepared and coordinated before the
@@ -5874,7 +5937,7 @@ impl Trainer {
         checkpoint_dir: &Path,
         policy: &mut P,
         exec: &E,
-    ) -> Result<(u64, Option<OptimizerState>), TrainerError>
+    ) -> Result<(u64, Option<OptimizerState>, Vec<Var>), TrainerError>
     where
         P: Policy,
         E: PolicyExecution<P>,
@@ -5895,6 +5958,12 @@ impl Trainer {
                     )));
                 }
                 policy.validate_sampler_state(prepared.sampler_state())?;
+                let validated_vars = policy.trainable_vars();
+                self.require_same_rollout_ledger_vars(
+                    &vars,
+                    &validated_vars,
+                    "ordinary checkpoint sampler validation",
+                )?;
                 // Validate Adam against an isolated optimizer before any live policy
                 // mutation. The temporary moment writes do not alias trainable vars.
                 let mut preflight_opt = self.new_optimizer(vars.clone())?;
@@ -5907,16 +5976,28 @@ impl Trainer {
             "ordinary checkpoint prepared manifest",
             prepared.manifest_consensus_sha256().as_bytes(),
         )?;
-        let applied = (|| {
+        let applied = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let loaded = prepared.apply(&vars)?;
             let blob = loaded.sampler_state.as_deref().ok_or_else(|| {
                 TrainerError::Contract(
                     "validated ordinary checkpoint lost its sampler state before apply".into(),
                 )
             })?;
-            policy.restore_sampler_state(blob)?;
-            Ok((loaded.step, loaded.optimizer_state))
-        })();
+            Self::restore_ordinary_checkpoint_sampler(policy, blob)?;
+            let active_vars = policy.trainable_vars();
+            self.require_same_rollout_ledger_vars(
+                &vars,
+                &active_vars,
+                "ordinary checkpoint restore",
+            )?;
+            Ok((loaded.step, loaded.optimizer_state, vars))
+        }))
+        .unwrap_or_else(|payload| {
+            Err(TrainerError::Contract(format!(
+                "checkpoint validated-state application panicked: {}",
+                panic_payload_message(payload.as_ref())
+            )))
+        });
         self.coordinate_resume_result::<P, E, _>(
             exec,
             "checkpoint validated-state application",
@@ -6041,9 +6122,17 @@ impl Trainer {
                     world_size = exec.execution_world_size(self.comm.as_ref()),
                     "resume_latest: continuing from the newest checkpoint"
                 );
-                let (start_step, opt_state) = self.load_resume_point(&dir, policy, exec)?;
+                let (start_step, opt_state, resume_vars) =
+                    self.load_resume_point(&dir, policy, exec)?;
                 self.run(
-                    start_step, opt_state, policy, reward_fn, tokenizer, samples, exec,
+                    start_step,
+                    opt_state,
+                    Some(&resume_vars),
+                    policy,
+                    reward_fn,
+                    tokenizer,
+                    samples,
+                    exec,
                 )
             }
             None => {
@@ -6052,7 +6141,7 @@ impl Trainer {
                     world_size = exec.execution_world_size(self.comm.as_ref()),
                     "resume_latest: no checkpoint found — starting a fresh run"
                 );
-                self.run(0, None, policy, reward_fn, tokenizer, samples, exec)
+                self.run(0, None, None, policy, reward_fn, tokenizer, samples, exec)
             }
         }
     }
@@ -6235,6 +6324,7 @@ impl Trainer {
         &mut self,
         start_step: u64,
         resume_opt_state: Option<OptimizerState>,
+        resume_vars: Option<&[Var]>,
         policy: &mut P,
         reward_fn: &R,
         tokenizer: &dyn TokenizerLike,
@@ -6293,8 +6383,7 @@ impl Trainer {
         // full-FT runs take `beta = 0` (no frozen reference exists to pull
         // toward; a base-anchored KL needs a separately loaded base policy,
         // which this trainer does not model).
-        self.require_toggleable_reference_policy(policy, self.config.requires_reference_policy())?;
-        let vars = policy.trainable_vars();
+        let vars = self.prepare_run_optimizer_vars(policy, exec, resume_vars)?;
         let params = ParamsAdamW {
             lr: self.config.lr,
             weight_decay: self.config.weight_decay,
