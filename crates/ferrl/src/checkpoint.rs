@@ -23,19 +23,21 @@
 //! - [`save_adapter`] / [`load_adapter`] — **adapter only** (the eval / inference
 //!   path): just the trainable weights + the step count. This is the legacy
 //!   **format version 1** layout, and is what [`crate::eval`] loads.
-//! - [`save_checkpoint`] / [`load_checkpoint`] — a **momentum-faithful** checkpoint
-//!   (**format version 2/3**): the adapter weights *plus* the optimizer moments
-//!   ([`crate::optim::FerrlAdamW`]'s `m`/`v`/`step_t`) *plus* the rollout sampler RNG
-//!   blob ([`crate::sampler::GrpoSampler`], whose state is `serde`-serializable). This
-//!   is what lets [`crate::Trainer::resume`] continue an interrupted run **bit-exactly**
-//!   — the same machine produces the identical post-resume trajectory. **v3** adds the
-//!   run `base_seed` to the sampler blob (global-index substream seeding), making a
-//!   resume self-contained; a pre-v3 sampler blob has no `base_seed` and is rejected on
-//!   restore (a v2 momentum-faithful checkpoint is not resumable — fail-loud, not silent).
+//! - [`save_checkpoint`] / [`load_checkpoint`] — an identity-bound,
+//!   **momentum-faithful format-v4** checkpoint: adapter/trainable weights, Adam
+//!   `m`/`v`/`step_t`, sampler state, exact recipe, immutable frozen-policy digest,
+//!   canonical learner semantics, ordered tensor schema, and exact payload hashes.
+//!   One domain-separated state-envelope root binds those leaves to the completed
+//!   step and optimizer/schema relationship. Raw typed decoding rejects duplicate
+//!   manifest keys before generic JSON inspection. [`load_checkpoint`] validates the
+//!   complete binding and every payload before its first live [`Var::set`]. This is
+//!   the only ordinary format accepted by [`crate::Trainer::resume`].
 //!
-//! A v1 checkpoint still loads (both readers accept format versions `1..=3`); when only
-//! the adapter was persisted, [`load_checkpoint`] returns no optimizer/sampler state and
-//! a resume falls back to fresh momentum + the policy's current RNG. The manifest is
+//! Legacy v1 remains explicitly readable through [`load_adapter`]. Structurally
+//! complete v2/v3 manifests are parsed with a strict version-specific field matrix,
+//! but are not trusted ordinary-resume inputs because they cannot prove policy/config
+//! identity or payload integrity. Separated rollout-ledger continuations retain their
+//! v3 outer envelope and their stronger nested identity contract. The manifest is
 //! always written **last** within a checkpoint directory, as the commit marker.
 //!
 //! ## Crash atomicity
@@ -71,7 +73,7 @@
 //! reconciliation. A crash may still strand an incomplete claim, but it cannot
 //! expose or overwrite a completed continuation.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -160,7 +162,7 @@ struct CheckpointPackageFingerprint {
 
 /// Filename of the serialized adapter tensors within a checkpoint directory.
 const ADAPTER_FILE: &str = "adapter.safetensors";
-/// Filename of the serialized optimizer moment tensors (format version 2).
+/// Filename of the serialized optimizer moment tensors in momentum-bearing formats.
 const OPTIMIZER_FILE: &str = "optimizer.safetensors";
 /// Filename of the checkpoint manifest within a checkpoint directory.
 const MANIFEST_FILE: &str = "manifest.json";
@@ -171,16 +173,16 @@ const CLAIM_OWNER_FILE: &str = ".ferrl-continuation-owner";
 /// On-disk checkpoint layout version; bumped on an incompatible format change. v1 =
 /// adapter only; v2 = adapter + optimizer moments + sampler RNG (momentum-faithful);
 /// v3 = v2 with the sampler blob now carrying the run `base_seed` (global-index
-/// substream seeding — see [`crate::sampler::GrpoSampler`]). v3 checkpoints are
-/// self-contained: the seed that re-derives the rollout travels in the blob, so a
-/// resume is bit-exact regardless of how the policy is reconstructed. A pre-v3
-/// sampler blob lacks `base_seed`, so it cannot be resumed bit-exactly; restoring
-/// one fails loud (see [`crate::sampler::GrpoSampler::from_state_bytes`]) rather
-/// than silently re-seeding. (v1/v2 adapter weights still load for eval.)
-const FORMAT_VERSION: u32 = 3;
+/// substream seeding — see [`crate::sampler::GrpoSampler`]); v4 adds the required
+/// ordinary-checkpoint identity and exact payload digests. New ordinary trainer
+/// checkpoints are v4. Separated rollout-ledger continuations retain their existing
+/// v3 outer envelope because their nested manifest already binds the complete state.
+const FORMAT_VERSION: u32 = 4;
+const LEGACY_MOMENTUM_FORMAT_VERSION: u32 = 3;
 /// Lowest on-disk format version this build can read. Older (v1, adapter-only)
-/// checkpoints still load — a resume then falls back to fresh momentum.
+/// checkpoints remain available to the explicit adapter/eval path.
 const MIN_FORMAT_VERSION: u32 = 1;
+const ORDINARY_CHECKPOINT_KIND: &str = "ordinary";
 /// On-disk schema version for separated rollout-ledger continuations.
 pub(crate) const ROLLOUT_LEDGER_CONTINUATION_FORMAT_VERSION: u32 = 3;
 pub(crate) const MIN_ROLLOUT_LEDGER_CONTINUATION_FORMAT_VERSION: u32 = 1;
@@ -216,6 +218,87 @@ pub(crate) struct RolloutLedgerContinuationManifest {
     pub(crate) lineage_sha256: String,
 }
 
+/// Caller-supplied immutable provenance required to write or restore an ordinary
+/// checkpoint.
+///
+/// The generic checkpoint layer can derive the ordered trainable schema and every
+/// mutable payload digest itself. It cannot derive the frozen model content or the
+/// learner-semantic trainer projection from a bare `&[Var]`, so those two verified
+/// digests are supplied by [`crate::Trainer`]. The adapter recipe is carried here so
+/// save and restore compare its exact presence/value and include it in the schema
+/// identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CheckpointBinding {
+    frozen_policy_sha256: String,
+    trainer_config_sha256: String,
+    lora_recipe: Option<String>,
+}
+
+impl CheckpointBinding {
+    /// Construct a validated ordinary-checkpoint binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CheckpointError::Mismatch`] unless both digests are exactly 64
+    /// lowercase hexadecimal characters.
+    pub fn new(
+        frozen_policy_sha256: impl Into<String>,
+        trainer_config_sha256: impl Into<String>,
+        lora_recipe: Option<String>,
+    ) -> Result<Self, CheckpointError> {
+        let binding = Self {
+            frozen_policy_sha256: frozen_policy_sha256.into(),
+            trainer_config_sha256: trainer_config_sha256.into(),
+            lora_recipe,
+        };
+        validate_sha256("frozen_policy_sha256", &binding.frozen_policy_sha256)?;
+        validate_sha256("trainer_config_sha256", &binding.trainer_config_sha256)?;
+        Ok(binding)
+    }
+
+    /// Verified digest of the immutable frozen policy and execution recipe.
+    #[must_use]
+    pub fn frozen_policy_sha256(&self) -> &str {
+        &self.frozen_policy_sha256
+    }
+
+    /// Digest of the canonical learner-semantic trainer projection and topology.
+    #[must_use]
+    pub fn trainer_config_sha256(&self) -> &str {
+        &self.trainer_config_sha256
+    }
+
+    /// Exact adapter/full-FT recipe identity of the live policy.
+    #[must_use]
+    pub fn lora_recipe(&self) -> Option<&str> {
+        self.lora_recipe.as_deref()
+    }
+}
+
+/// Required identity and integrity block for an ordinary format-v4 checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrdinaryCheckpointIdentity {
+    /// Checkpoint flavor discriminator; exactly `"ordinary"` for v4.
+    pub kind: String,
+    /// Immutable frozen policy plus execution-recipe digest.
+    pub frozen_policy_sha256: String,
+    /// Canonical learner-semantic trainer configuration plus topology digest.
+    pub trainer_config_sha256: String,
+    /// Ordered trainable key/shape/dtype schema plus exact recipe digest.
+    pub tensor_schema_sha256: String,
+    /// Exact serialized `adapter.safetensors` payload digest.
+    pub adapter_sha256: String,
+    /// Exact serialized Adam payload plus bias-correction counter digest.
+    pub optimizer_sha256: String,
+    /// Exact opaque sampler-state payload digest.
+    pub sampler_sha256: String,
+    /// Canonical root binding the complete ordinary training-state envelope:
+    /// version/kind, completed step, tensor/optimizer counts, exact recipe,
+    /// immutable identities, and every mutable payload digest.
+    pub state_envelope_sha256: String,
+}
+
 /// Errors raised while saving or loading an adapter checkpoint.
 #[derive(Debug, thiserror::Error)]
 pub enum CheckpointError {
@@ -243,21 +326,21 @@ pub enum CheckpointError {
     /// The manifest could not be serialized or deserialized.
     #[error("checkpoint manifest error: {0}")]
     Manifest(#[from] serde_json::Error),
-    /// The on-disk checkpoint does not match the model it is being loaded into:
-    /// an unknown format version, a differing tensor count, a missing tensor, or a
-    /// shape/dtype mismatch against the live trainable [`Var`]s.
+    /// The on-disk checkpoint violates its version matrix, expected identity,
+    /// payload digest, exact tensor-key/schema contract, or live trainable [`Var`]
+    /// shape/dtype contract.
     #[error("checkpoint mismatch: {0}")]
     Mismatch(String),
 }
 
-/// Self-describing metadata stored alongside the adapter tensors.
+/// Self-describing metadata stored alongside checkpoint tensors.
 ///
-/// The three `Option` fields are the **format-version-2** additions; they are
-/// `#[serde(default)]` so a v1 manifest (which lacks them) still deserializes, with each
-/// defaulting to `None` (the fresh-momentum-on-resume fallback).
+/// Legacy fields remain optional at the serde layer so v1 can be read, while
+/// Manifest decoding enforces the exact required/forbidden matrix for every version.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CheckpointManifest {
-    /// On-disk format version (validated against `1..=3` by [`load_adapter`]).
+    /// On-disk format version (validated against the supported range by readers).
     pub format_version: u32,
     /// Number of optimizer steps completed before this checkpoint was written —
     /// the step index a resumed run should continue from
@@ -281,14 +364,12 @@ pub struct CheckpointManifest {
     /// string (e.g. `attn:qkvo|mlp:gud` — see
     /// [`crate::lora::DenseLoraTargets::canonical`] /
     /// [`crate::qwen35::LoraTargets::canonical`]) — recorded so a checkpoint is
-    /// self-describing about *which* projections its positional tensor list
-    /// covers. The load contract stays positional (count/shape/dtype validation
-    /// against the live model), but [`crate::Trainer::resume`] additionally
-    /// cross-checks this string against the restoring policy and fails loud on
-    /// a mismatch — count/shape/dtype cannot distinguish **shape-aliased**
-    /// recipes (e.g. `attn:qk` vs `attn:qv`). `None` for checkpoints written
-    /// before this field existed, or by a policy that does not report a recipe.
-    /// `#[serde(default)]` for back-compat.
+    /// self-describing about *which* projections its positional tensor list covers.
+    /// Format v4 requires explicit presence (a string or `null`), binds the value
+    /// into its ordered schema identity, and compares it exactly with the restoring
+    /// [`CheckpointBinding`] before mutation; count/shape/dtype alone cannot
+    /// distinguish **shape-aliased** recipes such as `attn:qk` and `attn:qv`.
+    /// `#[serde(default)]` retains legacy v1-v3 parsing.
     #[serde(default)]
     pub lora_recipe: Option<String>,
     /// Present only for a versioned separated rollout-ledger continuation.
@@ -296,6 +377,10 @@ pub struct CheckpointManifest {
     /// separated-continuation discovery.
     #[serde(default)]
     pub(crate) rollout_ledger_continuation: Option<RolloutLedgerContinuationManifest>,
+    /// Required only for an ordinary format-v4 checkpoint. Legacy adapter and
+    /// separated-continuation formats must omit it (or serialize it as `null`).
+    #[serde(default)]
+    pub ordinary_checkpoint: Option<OrdinaryCheckpointIdentity>,
 }
 
 /// Tensor key for the `i`-th trainable var, zero-padded so lexical order matches
@@ -316,6 +401,215 @@ fn io(path: impl Into<PathBuf>, source: std::io::Error) -> CheckpointError {
         path: path.into(),
         source,
     }
+}
+
+fn validate_sha256(label: &str, digest: &str) -> Result<(), CheckpointError> {
+    if digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Ok(());
+    }
+    Err(CheckpointError::Mismatch(format!(
+        "{label} must be 64 lowercase hexadecimal characters"
+    )))
+}
+
+fn domain_sha256(domain: &str, fields: &[&[u8]]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update((domain.len() as u64).to_le_bytes());
+    hasher.update(domain.as_bytes());
+    for field in fields {
+        hasher.update((field.len() as u64).to_le_bytes());
+        hasher.update(field);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn tensor_schema_sha256(
+    vars: &[Var],
+    lora_recipe: Option<&str>,
+) -> Result<String, CheckpointError> {
+    let schema = vars
+        .iter()
+        .enumerate()
+        .map(|(index, var)| {
+            (
+                var_key(index),
+                var.as_tensor().dims().to_vec(),
+                var.as_tensor().dtype().as_str().to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let encoded = serde_json::to_vec(&(lora_recipe, schema))?;
+    Ok(domain_sha256(
+        "ferrl.ordinary-checkpoint.tensor-schema.v1",
+        &[&encoded],
+    ))
+}
+
+fn adapter_payload_sha256(bytes: &[u8]) -> String {
+    domain_sha256("ferrl.ordinary-checkpoint.adapter.v1", &[bytes])
+}
+
+fn tensor_value_sha256(index: usize, bytes: &[u8]) -> String {
+    let key = var_key(index);
+    domain_sha256(
+        "ferrl.ordinary-checkpoint.tensor-value.v1",
+        &[key.as_bytes(), bytes],
+    )
+}
+
+fn adapter_tensor_value_sha256(
+    bytes: &[u8],
+    num_vars: usize,
+) -> Result<Vec<String>, CheckpointError> {
+    let loaded = safetensors::SafeTensors::deserialize(bytes).map_err(|error| {
+        CheckpointError::Mismatch(format!(
+            "decode ordinary checkpoint adapter values for live-state sealing: {error}"
+        ))
+    })?;
+    (0..num_vars)
+        .map(|index| {
+            let key = var_key(index);
+            let tensor = loaded.tensor(&key).map_err(|error| {
+                CheckpointError::Mismatch(format!(
+                    "read ordinary checkpoint tensor {key} for live-state sealing: {error}"
+                ))
+            })?;
+            Ok(tensor_value_sha256(index, tensor.data()))
+        })
+        .collect()
+}
+
+pub(crate) fn trainable_var_value_sha256(vars: &[Var]) -> Vec<String> {
+    vars.iter()
+        .enumerate()
+        .map(|(index, var)| {
+            let bytes = safetensors::tensor::View::data(var.as_tensor());
+            tensor_value_sha256(index, bytes.as_ref())
+        })
+        .collect()
+}
+
+fn optimizer_payload_sha256(step_t: usize, bytes: &[u8]) -> Result<String, CheckpointError> {
+    let step_t = u64::try_from(step_t).map_err(|_| {
+        CheckpointError::Mismatch(
+            "optimizer step_t does not fit the ordinary checkpoint u64 identity".into(),
+        )
+    })?;
+    Ok(domain_sha256(
+        "ferrl.ordinary-checkpoint.optimizer.v1",
+        &[&step_t.to_le_bytes(), bytes],
+    ))
+}
+
+fn sampler_payload_sha256(bytes: &[u8]) -> String {
+    domain_sha256("ferrl.ordinary-checkpoint.sampler.v1", &[bytes])
+}
+
+#[derive(Serialize)]
+struct OrdinaryCheckpointEnvelope<'a> {
+    format_version: u32,
+    kind: &'a str,
+    step: u64,
+    num_vars: u64,
+    lora_recipe: Option<&'a str>,
+    optimizer_step_t: u64,
+    optimizer_num_vars: u64,
+    frozen_policy_sha256: &'a str,
+    trainer_config_sha256: &'a str,
+    tensor_schema_sha256: &'a str,
+    adapter_sha256: &'a str,
+    optimizer_sha256: &'a str,
+    sampler_sha256: &'a str,
+}
+
+#[allow(clippy::too_many_arguments)] // fixed canonical checkpoint-state envelope
+fn state_envelope_sha256(
+    format_version: u32,
+    kind: &str,
+    step: u64,
+    num_vars: usize,
+    lora_recipe: Option<&str>,
+    optimizer_step_t: usize,
+    optimizer_num_vars: usize,
+    frozen_policy_sha256: &str,
+    trainer_config_sha256: &str,
+    tensor_schema_sha256: &str,
+    adapter_sha256: &str,
+    optimizer_sha256: &str,
+    sampler_sha256: &str,
+) -> Result<String, CheckpointError> {
+    let num_vars = u64::try_from(num_vars).map_err(|_| {
+        CheckpointError::Mismatch(
+            "trainable tensor count does not fit the ordinary checkpoint u64 envelope".into(),
+        )
+    })?;
+    let optimizer_step_t = u64::try_from(optimizer_step_t).map_err(|_| {
+        CheckpointError::Mismatch(
+            "optimizer step_t does not fit the ordinary checkpoint u64 envelope".into(),
+        )
+    })?;
+    let optimizer_num_vars = u64::try_from(optimizer_num_vars).map_err(|_| {
+        CheckpointError::Mismatch(
+            "optimizer tensor count does not fit the ordinary checkpoint u64 envelope".into(),
+        )
+    })?;
+    let envelope = OrdinaryCheckpointEnvelope {
+        format_version,
+        kind,
+        step,
+        num_vars,
+        lora_recipe,
+        optimizer_step_t,
+        optimizer_num_vars,
+        frozen_policy_sha256,
+        trainer_config_sha256,
+        tensor_schema_sha256,
+        adapter_sha256,
+        optimizer_sha256,
+        sampler_sha256,
+    };
+    let encoded = serde_json::to_vec(&envelope)?;
+    Ok(domain_sha256(
+        "ferrl.ordinary-checkpoint.state-envelope.v1",
+        &[&encoded],
+    ))
+}
+
+fn validate_state_envelope(
+    manifest: &CheckpointManifest,
+    identity: &OrdinaryCheckpointIdentity,
+) -> Result<(), CheckpointError> {
+    let optimizer_step_t = manifest.optimizer_step_t.ok_or_else(|| {
+        CheckpointError::Mismatch("ordinary checkpoint is missing optimizer_step_t".into())
+    })?;
+    let optimizer_num_vars = manifest.optimizer_num_vars.ok_or_else(|| {
+        CheckpointError::Mismatch("ordinary checkpoint is missing optimizer_num_vars".into())
+    })?;
+    let expected = state_envelope_sha256(
+        manifest.format_version,
+        &identity.kind,
+        manifest.step,
+        manifest.num_vars,
+        manifest.lora_recipe.as_deref(),
+        optimizer_step_t,
+        optimizer_num_vars,
+        &identity.frozen_policy_sha256,
+        &identity.trainer_config_sha256,
+        &identity.tensor_schema_sha256,
+        &identity.adapter_sha256,
+        &identity.optimizer_sha256,
+        &identity.sampler_sha256,
+    )?;
+    if identity.state_envelope_sha256 != expected {
+        return Err(CheckpointError::Mismatch(
+            "ordinary checkpoint state-envelope digest mismatch".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn sibling_path_with_suffix(dir: &Path, suffix: &str) -> PathBuf {
@@ -522,6 +816,7 @@ pub fn save_adapter(
             sampler_state: None,
             lora_recipe: recipe,
             rollout_ledger_continuation: None,
+            ordinary_checkpoint: None,
         };
         let manifest_path = stage.join(MANIFEST_FILE);
         let json = serde_json::to_string_pretty(&manifest)?;
@@ -530,7 +825,7 @@ pub fn save_adapter(
     })
 }
 
-/// Restore a checkpoint from `dir` into `vars`, in place.
+/// Restore an explicit legacy format-v1 adapter package from `dir` into `vars`.
 ///
 /// Reads `dir/manifest.json` and `dir/adapter.safetensors`, validates that the
 /// checkpoint matches `vars` (format version, tensor count, and each tensor's
@@ -544,9 +839,10 @@ pub fn save_adapter(
 ///
 /// # Errors
 ///
-/// Returns [`CheckpointError::Mismatch`] if the format version is unknown, the
-/// tensor count differs, a tensor is missing, or any tensor's shape/dtype does not
-/// match the corresponding live `Var`; or [`CheckpointError::Io`] /
+/// Returns [`CheckpointError::Mismatch`] if the format is not v1 (v4 requires
+/// [`load_checkpoint`], while v2/v3 require deliberate migration), the tensor count
+/// differs, a tensor is missing/extra, or any tensor's shape/dtype does not match the
+/// corresponding live `Var`; or [`CheckpointError::Io`] /
 /// [`CheckpointError::Candle`] / [`CheckpointError::Manifest`] on read failures.
 pub fn load_adapter(
     dir: impl AsRef<Path>,
@@ -555,6 +851,12 @@ pub fn load_adapter(
     let dir = dir.as_ref();
 
     let manifest = read_manifest(dir)?;
+    if manifest.format_version != 1 {
+        return Err(CheckpointError::Mismatch(format!(
+            "load_adapter accepts only explicit legacy format-v1 adapter packages; format v{} requires its identity-aware restore or migration path",
+            manifest.format_version
+        )));
+    }
     if manifest.num_vars != vars.len() {
         return Err(CheckpointError::Mismatch(format!(
             "checkpoint has {} tensors but the model exposes {} trainable vars",
@@ -563,32 +865,145 @@ pub fn load_adapter(
         )));
     }
 
-    load_adapter_tensors(dir, vars)?;
+    let adapter_path = dir.join(ADAPTER_FILE);
+    let bytes = std::fs::read(&adapter_path).map_err(|error| io(&adapter_path, error))?;
+    let prepared = prepare_adapter_tensors(&bytes, vars)?;
+    apply_adapter_tensors(vars, &prepared)?;
     Ok(manifest)
 }
 
-/// Read and version-validate `manifest.json` from `dir` **without touching any
-/// model state** — so a caller (e.g. [`crate::Trainer::resume`]) can run
-/// pre-flight checks (the adapter-recipe cross-check) before the positional
-/// load mutates the live `Var`s.
+/// Read and version/field-matrix-validate `manifest.json` from `dir` without
+/// touching model state. Ordinary resume uses the result as the first stage of
+/// its complete identity, schema, and payload preflight.
 pub(crate) fn read_manifest(dir: &Path) -> Result<CheckpointManifest, CheckpointError> {
     let manifest_path = dir.join(MANIFEST_FILE);
     let raw = std::fs::read_to_string(&manifest_path).map_err(|e| io(&manifest_path, e))?;
+    // Parse the typed structures directly from the raw object first. Serde's
+    // derived map visitors reject duplicate known fields at every nested level;
+    // parsing through `Value` first would silently retain only the last value.
     let manifest: CheckpointManifest = serde_json::from_str(&raw)?;
+    let value: serde_json::Value = serde_json::from_str(&raw)?;
     if manifest.format_version < MIN_FORMAT_VERSION || manifest.format_version > FORMAT_VERSION {
         return Err(CheckpointError::Mismatch(format!(
             "unsupported checkpoint format_version {} (this build reads {MIN_FORMAT_VERSION}..={FORMAT_VERSION})",
             manifest.format_version
         )));
     }
+    validate_manifest_field_matrix(&value, &manifest)?;
     Ok(manifest)
 }
 
-/// The tensor half of [`load_adapter`]: validate-then-apply `adapter.safetensors`
-/// into `vars` (all-or-nothing; see [`load_adapter`]).
-fn load_adapter_tensors(dir: &Path, vars: &[Var]) -> Result<(), CheckpointError> {
-    let adapter_path = dir.join(ADAPTER_FILE);
-    let loaded = candle_core::safetensors::load(&adapter_path, &Device::Cpu)?;
+fn validate_manifest_field_matrix(
+    value: &serde_json::Value,
+    manifest: &CheckpointManifest,
+) -> Result<(), CheckpointError> {
+    let object = value.as_object().ok_or_else(|| {
+        CheckpointError::Mismatch("checkpoint manifest must be a JSON object".into())
+    })?;
+    let present = |key: &str| object.get(key).is_some_and(|value| !value.is_null());
+    let require = |key: &str| {
+        if present(key) {
+            Ok(())
+        } else {
+            Err(CheckpointError::Mismatch(format!(
+                "checkpoint format v{} requires non-null manifest field {key}",
+                manifest.format_version
+            )))
+        }
+    };
+    let forbid = |key: &str| {
+        if present(key) {
+            Err(CheckpointError::Mismatch(format!(
+                "checkpoint format v{} forbids manifest field {key}",
+                manifest.format_version
+            )))
+        } else {
+            Ok(())
+        }
+    };
+
+    match manifest.format_version {
+        1 => {
+            forbid("optimizer_step_t")?;
+            forbid("optimizer_num_vars")?;
+            forbid("sampler_state")?;
+            forbid("rollout_ledger_continuation")?;
+            forbid("ordinary_checkpoint")?;
+        }
+        2 => {
+            require("optimizer_step_t")?;
+            require("optimizer_num_vars")?;
+            require("sampler_state")?;
+            forbid("rollout_ledger_continuation")?;
+            forbid("ordinary_checkpoint")?;
+        }
+        LEGACY_MOMENTUM_FORMAT_VERSION => {
+            require("optimizer_step_t")?;
+            require("optimizer_num_vars")?;
+            require("sampler_state")?;
+            forbid("ordinary_checkpoint")?;
+        }
+        FORMAT_VERSION => {
+            require("optimizer_step_t")?;
+            require("optimizer_num_vars")?;
+            require("sampler_state")?;
+            require("ordinary_checkpoint")?;
+            forbid("rollout_ledger_continuation")?;
+            if !object.contains_key("lora_recipe") {
+                return Err(CheckpointError::Mismatch(
+                    "checkpoint format v4 requires explicit lora_recipe (string or null)".into(),
+                ));
+            }
+            let identity = manifest.ordinary_checkpoint.as_ref().ok_or_else(|| {
+                CheckpointError::Mismatch(
+                    "checkpoint format v4 is missing its ordinary identity".into(),
+                )
+            })?;
+            if identity.kind != ORDINARY_CHECKPOINT_KIND {
+                return Err(CheckpointError::Mismatch(format!(
+                    "checkpoint format v4 kind {:?} is not {ORDINARY_CHECKPOINT_KIND:?}",
+                    identity.kind
+                )));
+            }
+            for (label, digest) in [
+                (
+                    "frozen_policy_sha256",
+                    identity.frozen_policy_sha256.as_str(),
+                ),
+                (
+                    "trainer_config_sha256",
+                    identity.trainer_config_sha256.as_str(),
+                ),
+                (
+                    "tensor_schema_sha256",
+                    identity.tensor_schema_sha256.as_str(),
+                ),
+                ("adapter_sha256", identity.adapter_sha256.as_str()),
+                ("optimizer_sha256", identity.optimizer_sha256.as_str()),
+                ("sampler_sha256", identity.sampler_sha256.as_str()),
+                (
+                    "state_envelope_sha256",
+                    identity.state_envelope_sha256.as_str(),
+                ),
+            ] {
+                validate_sha256(label, digest)?;
+            }
+            validate_state_envelope(manifest, identity)?;
+        }
+        _ => unreachable!("version range was checked before the field matrix"),
+    }
+    Ok(())
+}
+
+fn prepare_adapter_tensors(bytes: &[u8], vars: &[Var]) -> Result<Vec<Tensor>, CheckpointError> {
+    let loaded = candle_core::safetensors::load_buffer(bytes, &Device::Cpu)?;
+    let expected = (0..vars.len()).map(var_key).collect::<BTreeSet<_>>();
+    let actual = loaded.keys().cloned().collect::<BTreeSet<_>>();
+    if actual != expected {
+        return Err(CheckpointError::Mismatch(format!(
+            "adapter tensor key set mismatch: expected {expected:?}, found {actual:?}"
+        )));
+    }
 
     // Pass 1 — validate and device-prepare EVERY tensor before mutating anything,
     // so a missing/mis-shaped/mis-typed tensor aborts with the model untouched
@@ -621,42 +1036,36 @@ fn load_adapter_tensors(dir: &Path, vars: &[Var]) -> Result<(), CheckpointError>
         prepared.push(t.to_device(want.device())?.contiguous()?);
     }
 
-    // Pass 2 — every tensor validated; apply. `set` cannot fail here on shape (it
-    // matches), a self-set (the source is a fresh load), or a non-contiguous
-    // destination (LoRA factors are contiguous).
+    Ok(prepared)
+}
+
+fn apply_adapter_tensors(vars: &[Var], prepared: &[Tensor]) -> Result<(), CheckpointError> {
     for (v, t) in vars.iter().zip(prepared.iter()) {
         v.set(t)?;
     }
     Ok(())
 }
 
-/// The result of [`load_checkpoint`]: the resume step plus any persisted optimizer and
-/// sampler state.
+/// The result of [`load_checkpoint`]: the resume step plus the validated optimizer,
+/// sampler, and recipe state.
 ///
-/// For a v1 (adapter-only) checkpoint, `optimizer_state` and `sampler_state` are `None`
-/// — [`crate::Trainer::resume`] then falls back to fresh momentum and the policy's
-/// current sampler.
 #[derive(Debug)]
 pub struct LoadedCheckpoint {
     /// Completed optimizer steps — the `start_step` a resume continues from.
     pub step: u64,
-    /// The optimizer moments + step counter, if the checkpoint persisted them (v2).
+    /// The optimizer moments + step counter. Public v4 loads always return `Some`;
+    /// the option remains for the shared internal continuation representation.
     pub optimizer_state: Option<OptimizerState>,
-    /// The opaque rollout-sampler RNG blob, if the checkpoint persisted it (v2).
+    /// The opaque rollout-sampler RNG blob. Public v4 loads always return `Some`.
     pub sampler_state: Option<Vec<u8>>,
     /// The writing policy's canonical adapter-recipe string, if recorded (see
-    /// [`CheckpointManifest::lora_recipe`]). Surfaced so a caller can
-    /// cross-check it against the restoring policy: the positional load
-    /// validates only count/shape/dtype, which cannot distinguish
-    /// **shape-aliased** recipes (e.g. `attn:qk` vs `attn:qv` — the k and v
-    /// projections are shape-identical), so a recipe swap would otherwise
-    /// restore adapters onto the wrong projections silently.
-    /// [`crate::Trainer::resume`] fails loud on a mismatch.
+    /// [`CheckpointManifest::lora_recipe`]). Public v4 loading has already compared
+    /// its exact presence/value with the caller's [`CheckpointBinding`] and included
+    /// it in the ordered schema identity before this value is returned.
     pub lora_recipe: Option<String>,
 }
 
-/// Persist a **momentum-faithful** checkpoint (format version 2): the adapter weights,
-/// the optimizer moments, and the rollout-sampler RNG blob.
+/// Persist an identity-bound, momentum-faithful ordinary checkpoint (format v4).
 ///
 /// Writes `adapter.safetensors`, `optimizer.safetensors`, and (last, as the commit
 /// marker) `manifest.json`. The optimizer moments are keyed by parameter index; the
@@ -666,8 +1075,9 @@ pub struct LoadedCheckpoint {
 /// [`load_checkpoint`] + [`crate::Trainer::resume`].
 ///
 /// `sampler_state` is the opaque blob from [`crate::Policy::sampler_state`]; it is stored
-/// verbatim and only the policy interprets it on restore. `lora_recipe` is the policy's
-/// canonical adapter-recipe string (see [`CheckpointManifest::lora_recipe`]).
+/// verbatim and only the policy interprets it on restore. `binding` supplies the
+/// externally verified frozen-policy and canonical trainer identities plus the exact
+/// recipe; this function derives and records the ordered schema and exact payload hashes.
 ///
 /// The write is **crash-atomic** via the same stage-then-rename as
 /// [`save_adapter`] (see the module docs).
@@ -683,9 +1093,8 @@ pub fn save_checkpoint(
     opt_state: &OptimizerState,
     sampler_state: &[u8],
     step: u64,
-    lora_recipe: Option<&str>,
+    binding: &CheckpointBinding,
 ) -> Result<(), CheckpointError> {
-    let recipe = lora_recipe.map(str::to_owned);
     write_staged(dir.as_ref(), |stage| {
         write_checkpoint_contents(
             stage,
@@ -694,7 +1103,9 @@ pub fn save_checkpoint(
             opt_state,
             sampler_state,
             step,
-            recipe,
+            FORMAT_VERSION,
+            binding.lora_recipe.clone(),
+            Some(binding),
             None,
         )
     })
@@ -766,7 +1177,9 @@ pub(crate) fn save_checkpoint_no_replace(
         opt_state,
         sampler_state,
         continuation.completed_step,
+        LEGACY_MOMENTUM_FORMAT_VERSION,
         lora_recipe.map(str::to_owned),
+        None,
         Some(continuation),
     ) {
         return Err(cleanup_uncommitted_claim(dir, parent, &ownership, error));
@@ -1007,7 +1420,9 @@ fn write_checkpoint_contents(
     opt_state: &OptimizerState,
     sampler_state: &[u8],
     step: u64,
+    format_version: u32,
     lora_recipe: Option<String>,
+    ordinary_binding: Option<&CheckpointBinding>,
     rollout_ledger_continuation: Option<RolloutLedgerContinuationManifest>,
 ) -> Result<(), CheckpointError> {
     // Adapter weights (identical to the v1 layout).
@@ -1022,6 +1437,12 @@ fn write_checkpoint_contents(
 
     // Optimizer moments: `m.<i>` / `v.<i>`, CPU + contiguous.
     let n = opt_state.first_moments.len();
+    if opt_state.second_moments.len() != n {
+        return Err(CheckpointError::Mismatch(format!(
+            "optimizer state has {n} first moments but {} second moments",
+            opt_state.second_moments.len()
+        )));
+    }
     let mut moments: HashMap<String, Tensor> = HashMap::with_capacity(n * 2);
     for i in 0..n {
         let m = opt_state.first_moments[i]
@@ -1037,10 +1458,64 @@ fn write_checkpoint_contents(
     candle_core::safetensors::save(&moments, &optimizer_path)?;
     sync_file(&optimizer_path)?;
 
+    let ordinary_checkpoint = if let Some(binding) = ordinary_binding {
+        if format_version != FORMAT_VERSION || rollout_ledger_continuation.is_some() {
+            return Err(CheckpointError::Mismatch(
+                "ordinary checkpoint identity can only be written on a format-v4 ordinary package"
+                    .into(),
+            ));
+        }
+        if lora_recipe.as_deref() != binding.lora_recipe() {
+            return Err(CheckpointError::Mismatch(
+                "ordinary checkpoint recipe does not match its binding".into(),
+            ));
+        }
+        let adapter_bytes =
+            std::fs::read(&adapter_path).map_err(|error| io(&adapter_path, error))?;
+        let optimizer_bytes =
+            std::fs::read(&optimizer_path).map_err(|error| io(&optimizer_path, error))?;
+        let tensor_schema_sha256 = tensor_schema_sha256(vars, binding.lora_recipe())?;
+        let adapter_sha256 = adapter_payload_sha256(&adapter_bytes);
+        let optimizer_sha256 = optimizer_payload_sha256(opt_state.step_t, &optimizer_bytes)?;
+        let sampler_sha256 = sampler_payload_sha256(sampler_state);
+        let state_envelope_sha256 = state_envelope_sha256(
+            format_version,
+            ORDINARY_CHECKPOINT_KIND,
+            step,
+            vars.len(),
+            binding.lora_recipe(),
+            opt_state.step_t,
+            n,
+            &binding.frozen_policy_sha256,
+            &binding.trainer_config_sha256,
+            &tensor_schema_sha256,
+            &adapter_sha256,
+            &optimizer_sha256,
+            &sampler_sha256,
+        )?;
+        Some(OrdinaryCheckpointIdentity {
+            kind: ORDINARY_CHECKPOINT_KIND.into(),
+            frozen_policy_sha256: binding.frozen_policy_sha256.clone(),
+            trainer_config_sha256: binding.trainer_config_sha256.clone(),
+            tensor_schema_sha256,
+            adapter_sha256,
+            optimizer_sha256,
+            sampler_sha256,
+            state_envelope_sha256,
+        })
+    } else {
+        if format_version == FORMAT_VERSION {
+            return Err(CheckpointError::Mismatch(
+                "format-v4 ordinary checkpoint write requires an identity binding".into(),
+            ));
+        }
+        None
+    };
+
     // Manifest LAST — either inside a hidden staging directory or under a
     // temporary name that the no-replace publisher atomically commits.
     let manifest = CheckpointManifest {
-        format_version: FORMAT_VERSION,
+        format_version,
         step,
         num_vars: vars.len(),
         optimizer_step_t: Some(opt_state.step_t),
@@ -1048,6 +1523,7 @@ fn write_checkpoint_contents(
         sampler_state: Some(sampler_state.to_vec()),
         lora_recipe,
         rollout_ledger_continuation,
+        ordinary_checkpoint,
     };
     let json = serde_json::to_string_pretty(&manifest)?;
     let mut manifest_file = std::fs::OpenOptions::new()
@@ -1141,68 +1617,274 @@ fn create_directory_all_durable(path: &Path) -> Result<(), CheckpointError> {
     sync_directory(parent)
 }
 
-/// Restore a checkpoint from `dir` into `vars`, returning the resume step and any
-/// persisted optimizer / sampler state for a momentum-faithful resume.
+/// A completely parsed and validated ordinary checkpoint whose live adapter
+/// application has deliberately not happened yet.
 ///
-/// Loads the adapter weights into `vars` exactly as [`load_adapter`] (same
-/// all-or-nothing shape/dtype/count validation and `1..=3` version check). For a **v2
-/// or v3** checkpoint it additionally reads the optimizer moments (the manifest records
-/// how many) and the sampler RNG blob; for a **v1** checkpoint both come back `None`.
-/// Restoring a pre-v3 sampler blob fails loud at
-/// [`crate::sampler::GrpoSampler::from_state_bytes`] (no `base_seed`) rather than
-/// silently re-seeding — a v2 momentum-faithful checkpoint is therefore not resumable.
-///
-/// The optimizer moments are **not** validated against `vars` here — the optimizer
-/// filters to float parameters, so [`crate::optim::FerrlAdamW::load_state`] validates
-/// them against its own parameter set (count + shape + dtype) when they are applied.
+/// [`crate::Trainer`] uses this split to coordinate every rank's identity, payload,
+/// sampler, and temporary-Adam preflight before any rank mutates its policy.
+#[derive(Debug)]
+pub(crate) struct PreparedCheckpoint {
+    step: u64,
+    optimizer_state: OptimizerState,
+    sampler_state: Vec<u8>,
+    lora_recipe: Option<String>,
+    adapter_tensors: Vec<Tensor>,
+    adapter_value_sha256: Vec<String>,
+    manifest_consensus_sha256: String,
+}
+
+impl PreparedCheckpoint {
+    pub(crate) fn step(&self) -> u64 {
+        self.step
+    }
+
+    pub(crate) fn optimizer_state(&self) -> &OptimizerState {
+        &self.optimizer_state
+    }
+
+    pub(crate) fn sampler_state(&self) -> &[u8] {
+        &self.sampler_state
+    }
+
+    pub(crate) fn adapter_value_sha256(&self) -> &[String] {
+        &self.adapter_value_sha256
+    }
+
+    pub(crate) fn manifest_consensus_sha256(&self) -> &str {
+        &self.manifest_consensus_sha256
+    }
+
+    pub(crate) fn apply(self, vars: &[Var]) -> Result<LoadedCheckpoint, CheckpointError> {
+        apply_adapter_tensors(vars, &self.adapter_tensors)?;
+        Ok(LoadedCheckpoint {
+            step: self.step,
+            optimizer_state: Some(self.optimizer_state),
+            sampler_state: Some(self.sampler_state),
+            lora_recipe: self.lora_recipe,
+        })
+    }
+}
+
+fn prepare_optimizer_state(
+    bytes: &[u8],
+    step_t: usize,
+    num: usize,
+    vars: &[Var],
+) -> Result<OptimizerState, CheckpointError> {
+    let expected_vars = vars
+        .iter()
+        .filter(|var| var.as_tensor().dtype().is_float())
+        .collect::<Vec<_>>();
+    if num != expected_vars.len() {
+        return Err(CheckpointError::Mismatch(format!(
+            "checkpoint has {num} optimizer parameters but the model exposes {} float trainable vars",
+            expected_vars.len()
+        )));
+    }
+    let loaded = candle_core::safetensors::load_buffer(bytes, &Device::Cpu)?;
+    let expected = (0..num)
+        .flat_map(|index| [moment_key("m", index), moment_key("v", index)])
+        .collect::<BTreeSet<_>>();
+    let actual = loaded.keys().cloned().collect::<BTreeSet<_>>();
+    if actual != expected {
+        return Err(CheckpointError::Mismatch(format!(
+            "optimizer tensor key set mismatch: expected {expected:?}, found {actual:?}"
+        )));
+    }
+    let mut first_moments = Vec::with_capacity(num);
+    let mut second_moments = Vec::with_capacity(num);
+    for (index, var) in expected_vars.into_iter().enumerate() {
+        let want = var.as_tensor();
+        let mk = moment_key("m", index);
+        let vk = moment_key("v", index);
+        let m = loaded
+            .get(&mk)
+            .ok_or_else(|| CheckpointError::Mismatch(format!("missing optimizer tensor {mk}")))?;
+        let v = loaded
+            .get(&vk)
+            .ok_or_else(|| CheckpointError::Mismatch(format!("missing optimizer tensor {vk}")))?;
+        for (label, tensor) in [(mk.as_str(), m), (vk.as_str(), v)] {
+            if tensor.dims() != want.dims() {
+                return Err(CheckpointError::Mismatch(format!(
+                    "optimizer tensor {label}: checkpoint shape {:?} != parameter shape {:?}",
+                    tensor.dims(),
+                    want.dims()
+                )));
+            }
+            if tensor.dtype() != want.dtype() {
+                return Err(CheckpointError::Mismatch(format!(
+                    "optimizer tensor {label}: checkpoint dtype {:?} != parameter dtype {:?}",
+                    tensor.dtype(),
+                    want.dtype()
+                )));
+            }
+        }
+        first_moments.push(m.clone());
+        second_moments.push(v.clone());
+    }
+    Ok(OptimizerState {
+        step_t,
+        first_moments,
+        second_moments,
+    })
+}
+
+fn read_payload(path: &Path) -> Result<Vec<u8>, CheckpointError> {
+    std::fs::read(path).map_err(|error| io(path, error))
+}
+
+/// Parse and validate a format-v4 ordinary checkpoint without mutating `vars`.
+pub(crate) fn prepare_checkpoint(
+    dir: &Path,
+    vars: &[Var],
+    binding: &CheckpointBinding,
+) -> Result<PreparedCheckpoint, CheckpointError> {
+    let manifest = read_manifest(dir)?;
+    if manifest.format_version != FORMAT_VERSION {
+        return Err(CheckpointError::Mismatch(format!(
+            "Trainer resume requires an integrity-bound ordinary format-v4 checkpoint; found legacy format v{} (v1 remains adapter-only readable, while v2/v3 may be inspected for migration but are not trusted resume inputs)",
+            manifest.format_version
+        )));
+    }
+    let manifest_bytes = serde_json::to_vec(&manifest)?;
+    let manifest_consensus_sha256 = domain_sha256(
+        "ferrl.ordinary-checkpoint.manifest-consensus.v1",
+        &[&manifest_bytes],
+    );
+    if manifest.lora_recipe.as_deref() != binding.lora_recipe() {
+        return Err(CheckpointError::Mismatch(format!(
+            "checkpoint adapter recipe {:?} does not match the policy's {:?}",
+            manifest.lora_recipe,
+            binding.lora_recipe()
+        )));
+    }
+    let identity = manifest.ordinary_checkpoint.as_ref().ok_or_else(|| {
+        CheckpointError::Mismatch("ordinary checkpoint identity is missing".into())
+    })?;
+    if identity.frozen_policy_sha256 != binding.frozen_policy_sha256 {
+        return Err(CheckpointError::Mismatch(
+            "ordinary checkpoint frozen-policy identity mismatch".into(),
+        ));
+    }
+    if identity.trainer_config_sha256 != binding.trainer_config_sha256 {
+        return Err(CheckpointError::Mismatch(
+            "ordinary checkpoint learner-semantic trainer identity mismatch".into(),
+        ));
+    }
+    if manifest.num_vars != vars.len() {
+        return Err(CheckpointError::Mismatch(format!(
+            "checkpoint has {} tensors but the model exposes {} trainable vars",
+            manifest.num_vars,
+            vars.len()
+        )));
+    }
+    let schema = tensor_schema_sha256(vars, binding.lora_recipe())?;
+    if identity.tensor_schema_sha256 != schema {
+        return Err(CheckpointError::Mismatch(
+            "ordinary checkpoint ordered tensor-schema or recipe identity mismatch".into(),
+        ));
+    }
+    let step_t = manifest.optimizer_step_t.ok_or_else(|| {
+        CheckpointError::Mismatch("ordinary checkpoint is missing optimizer_step_t".into())
+    })?;
+    let optimizer_num_vars = manifest.optimizer_num_vars.ok_or_else(|| {
+        CheckpointError::Mismatch("ordinary checkpoint is missing optimizer_num_vars".into())
+    })?;
+    let sampler_state = manifest.sampler_state.clone().ok_or_else(|| {
+        CheckpointError::Mismatch("ordinary checkpoint is missing sampler_state".into())
+    })?;
+    validate_state_envelope(&manifest, identity)?;
+
+    let adapter_path = dir.join(ADAPTER_FILE);
+    let optimizer_path = dir.join(OPTIMIZER_FILE);
+    let adapter_bytes = read_payload(&adapter_path)?;
+    let optimizer_bytes = read_payload(&optimizer_path)?;
+    if identity.adapter_sha256 != adapter_payload_sha256(&adapter_bytes) {
+        return Err(CheckpointError::Mismatch(
+            "ordinary checkpoint adapter payload digest mismatch".into(),
+        ));
+    }
+    if identity.optimizer_sha256 != optimizer_payload_sha256(step_t, &optimizer_bytes)? {
+        return Err(CheckpointError::Mismatch(
+            "ordinary checkpoint Adam payload digest mismatch".into(),
+        ));
+    }
+    if identity.sampler_sha256 != sampler_payload_sha256(&sampler_state) {
+        return Err(CheckpointError::Mismatch(
+            "ordinary checkpoint sampler payload digest mismatch".into(),
+        ));
+    }
+
+    let adapter_tensors = prepare_adapter_tensors(&adapter_bytes, vars)?;
+    let adapter_value_sha256 = adapter_tensor_value_sha256(&adapter_bytes, vars.len())?;
+    let optimizer_state =
+        prepare_optimizer_state(&optimizer_bytes, step_t, optimizer_num_vars, vars)?;
+    Ok(PreparedCheckpoint {
+        step: manifest.step,
+        optimizer_state,
+        sampler_state,
+        lora_recipe: manifest.lora_recipe,
+        adapter_tensors,
+        adapter_value_sha256,
+        manifest_consensus_sha256,
+    })
+}
+
+/// Restore a format-v4 ordinary checkpoint after validating its complete binding
+/// and all payloads before the first live adapter mutation.
 ///
 /// # Errors
 ///
-/// As [`load_adapter`], plus [`CheckpointError::Mismatch`] if a v2 manifest references
-/// optimizer moments that are missing from `optimizer.safetensors`.
+/// Returns [`CheckpointError::Mismatch`] if the format is not v4, the caller's
+/// binding differs, a required field/key/schema is missing or extra, or any exact
+/// payload digest differs. Every such rejection happens before live adapter mutation.
 pub fn load_checkpoint(
     dir: impl AsRef<Path>,
     vars: &[Var],
+    binding: &CheckpointBinding,
 ) -> Result<LoadedCheckpoint, CheckpointError> {
-    let dir = dir.as_ref();
-    // Reuses the adapter load + all-or-nothing validation + version-range check.
-    let manifest = load_adapter(dir, vars)?;
+    prepare_checkpoint(dir.as_ref(), vars, binding)?.apply(vars)
+}
 
-    let optimizer_state = match (manifest.optimizer_step_t, manifest.optimizer_num_vars) {
-        (Some(step_t), Some(num)) => {
-            let opt_path = dir.join(OPTIMIZER_FILE);
-            let loaded = candle_core::safetensors::load(&opt_path, &Device::Cpu)?;
-            let mut first_moments = Vec::with_capacity(num);
-            let mut second_moments = Vec::with_capacity(num);
-            for i in 0..num {
-                let mk = moment_key("m", i);
-                let vk = moment_key("v", i);
-                let m = loaded.get(&mk).ok_or_else(|| {
-                    CheckpointError::Mismatch(format!(
-                        "checkpoint is missing optimizer tensor {mk}"
-                    ))
-                })?;
-                let v = loaded.get(&vk).ok_or_else(|| {
-                    CheckpointError::Mismatch(format!(
-                        "checkpoint is missing optimizer tensor {vk}"
-                    ))
-                })?;
-                first_moments.push(m.clone());
-                second_moments.push(v.clone());
-            }
-            Some(OptimizerState {
-                step_t,
-                first_moments,
-                second_moments,
-            })
-        }
-        _ => None,
-    };
-
+/// Internal legacy-v3 restore used only by the separately identity-bound
+/// rollout-ledger continuation path.
+pub(crate) fn load_rollout_ledger_checkpoint(
+    dir: &Path,
+    vars: &[Var],
+) -> Result<LoadedCheckpoint, CheckpointError> {
+    let manifest = read_manifest(dir)?;
+    if manifest.format_version != LEGACY_MOMENTUM_FORMAT_VERSION
+        || manifest.rollout_ledger_continuation.is_none()
+    {
+        return Err(CheckpointError::Mismatch(
+            "expected a format-v3 rollout-ledger continuation checkpoint".into(),
+        ));
+    }
+    if manifest.num_vars != vars.len() {
+        return Err(CheckpointError::Mismatch(format!(
+            "checkpoint has {} tensors but the model exposes {} trainable vars",
+            manifest.num_vars,
+            vars.len()
+        )));
+    }
+    let adapter_bytes = read_payload(&dir.join(ADAPTER_FILE))?;
+    let optimizer_bytes = read_payload(&dir.join(OPTIMIZER_FILE))?;
+    let step_t = manifest.optimizer_step_t.ok_or_else(|| {
+        CheckpointError::Mismatch("rollout-ledger checkpoint is missing optimizer_step_t".into())
+    })?;
+    let num = manifest.optimizer_num_vars.ok_or_else(|| {
+        CheckpointError::Mismatch("rollout-ledger checkpoint is missing optimizer_num_vars".into())
+    })?;
+    let sampler_state = manifest.sampler_state.ok_or_else(|| {
+        CheckpointError::Mismatch("rollout-ledger checkpoint is missing sampler_state".into())
+    })?;
+    let optimizer_state = prepare_optimizer_state(&optimizer_bytes, step_t, num, vars)?;
+    let adapter_tensors = prepare_adapter_tensors(&adapter_bytes, vars)?;
+    apply_adapter_tensors(vars, &adapter_tensors)?;
     Ok(LoadedCheckpoint {
         step: manifest.step,
-        optimizer_state,
-        sampler_state: manifest.sampler_state,
+        optimizer_state: Some(optimizer_state),
+        sampler_state: Some(sampler_state),
         lora_recipe: manifest.lora_recipe,
     })
 }
@@ -1224,26 +1906,31 @@ pub struct LatestCheckpoint {
 ///
 /// Scans only the immediate `step-<n>` subdirectories (the layout
 /// [`crate::Trainer`] writes), reads each one's manifest, and returns the one
-/// with the greatest completed-step count. Ordering is on the manifest's numeric
-/// `step`, **not** the directory name, so `step-10` correctly outranks `step-2`
-/// (a lexical sort would invert them).
+/// with the greatest completed-step count. Only integrity-bound ordinary v4 packages
+/// are eligible; legacy formats and separated continuations are excluded. A readable
+/// eligible manifest must agree exactly with its `step-<n>` directory.
 ///
-/// A subdirectory whose manifest is missing, unreadable, or an unsupported
-/// format version is **skipped, not an error**: the writer publishes a checkpoint
-/// only once its manifest is committed by an atomic rename (see the module docs),
-/// so a `step-<n>` directory without a readable manifest is an interrupted or
-/// foreign write, never a usable checkpoint. A present, readable manifest is a
-/// sufficient completeness marker: either every sibling landed in the same
-/// directory rename, or the no-replace writer committed the manifest only after
-/// every sibling. Crash-leftover `.tmp-*` / `.old-*` siblings do not match the
-/// `step-<n>` shape and are ignored, as is any unrelated entry.
+/// A malformed exact `step-<digits>` final name newer than every readable ordinary
+/// package is fail-closed: a non-directory entry, numeric suffix overflow, or
+/// missing/unreadable/malformed manifest is ambiguous published-state corruption
+/// and cannot silently fall back to an older step. Any readable v2/v3 ordinary
+/// package is also rejected because it lacks v4 identity/integrity, and every
+/// otherwise-valid v4 directory/manifest step disagreement is rejected regardless
+/// of its ordering relative to another checkpoint. An explicit v1 adapter package
+/// or v3 package carrying the exact separated-continuation discriminator remains
+/// ineligible but is not ordinary-resume corruption; a typed continuation block
+/// with any other discriminator fails closed. A malformed older sibling cannot
+/// cause replay and is ignored.
+/// Crash-leftover `.tmp-*` / `.old-*` siblings do not match the exact final-name
+/// shape and are ignored, as is any unrelated entry.
 ///
 /// # Errors
 ///
-/// Returns [`CheckpointError::Io`] only if `checkpoints_dir` exists but its
-/// listing cannot be read (a permissions / IO fault on the directory itself). A
-/// **missing** `checkpoints_dir` is not an error — it returns `None` (a run that
-/// has not checkpointed yet).
+/// Returns [`CheckpointError`] if the directory listing fails, a numeric suffix
+/// overflows, or the newest exact final-name candidate cannot be validated. A
+/// **missing** `checkpoints_dir` is not an error — it returns `None` (a run that has
+/// not checkpointed yet).
+#[allow(clippy::cognitive_complexity)] // fail-closed classification of every exact final-name state
 pub fn latest_checkpoint(
     checkpoints_dir: impl AsRef<Path>,
 ) -> Result<Option<LatestCheckpoint>, CheckpointError> {
@@ -1252,40 +1939,93 @@ pub fn latest_checkpoint(
         return Ok(None);
     }
     let mut best: Option<LatestCheckpoint> = None;
+    let mut malformed = Vec::<(u64, CheckpointError)>::new();
     for entry in std::fs::read_dir(dir).map_err(|e| io(dir, e))? {
         let entry = entry.map_err(|e| io(dir, e))?;
-        // A per-entry file-type fault (e.g. a sibling being swept right now) is
-        // not a candidate, not a reason to fail the whole discovery.
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if !file_type.is_dir() {
-            continue;
-        }
         let path = entry.path();
         // Match exactly `step-<digits>`: this excludes `.tmp-*` / `.old-*`
         // crash siblings (their names carry a dot-suffix after the digits) and
         // any foreign directory.
-        let is_step_dir = path
+        let Some(step_digits) = path
             .file_name()
             .and_then(|n| n.to_str())
             .and_then(|n| n.strip_prefix("step-"))
-            .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()));
-        if !is_step_dir {
-            continue;
-        }
-        // The manifest is both the completeness marker and the source of truth
-        // for `step`. A partial / foreign / future-version directory simply is
-        // not a candidate (skip, do not fail).
-        let Ok(manifest) = read_manifest(&path) else {
+            .filter(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+        else {
             continue;
         };
+        let directory_step = step_digits.parse::<u64>().map_err(|_| {
+            CheckpointError::Mismatch(format!(
+                "ordinary checkpoint directory name step-{step_digits} exceeds the u64 step range"
+            ))
+        })?;
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) => {
+                malformed.push((directory_step, io(&path, error)));
+                continue;
+            }
+        };
+        if !file_type.is_dir() {
+            malformed.push((
+                directory_step,
+                CheckpointError::Mismatch(format!(
+                    "ordinary checkpoint final name step-{directory_step} is not a directory"
+                )),
+            ));
+            continue;
+        }
+        // Atomic ordinary publication exposes only complete final directories.
+        // Any unreadable or malformed exact final name is therefore ambiguous
+        // corruption, never a valid partial-write stage.
+        let manifest = match read_manifest(&path) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                malformed.push((directory_step, error));
+                continue;
+            }
+        };
+        if let Some(continuation) = manifest.rollout_ledger_continuation.as_ref() {
+            if continuation.kind == ROLLOUT_LEDGER_CONTINUATION_KIND {
+                continue;
+            }
+            return Err(CheckpointError::Mismatch(format!(
+                "ordinary checkpoint discovery found format-v{} package at step-{directory_step} with continuation discriminator {:?}; only {ROLLOUT_LEDGER_CONTINUATION_KIND:?} is disjoint from ordinary resume",
+                manifest.format_version, continuation.kind
+            )));
+        }
+        if matches!(manifest.format_version, 2 | LEGACY_MOMENTUM_FORMAT_VERSION) {
+            return Err(CheckpointError::Mismatch(format!(
+                "ordinary checkpoint discovery found untrusted legacy format-v{} package at step-{directory_step}; trainer resume requires identity-bound format-v{FORMAT_VERSION}",
+                manifest.format_version
+            )));
+        }
+        if manifest.format_version != FORMAT_VERSION || manifest.ordinary_checkpoint.is_none() {
+            continue;
+        }
+        if manifest.step != directory_step {
+            return Err(CheckpointError::Mismatch(format!(
+                "ordinary checkpoint directory step-{directory_step} contains manifest step {}",
+                manifest.step
+            )));
+        }
         let candidate = LatestCheckpoint {
             dir: path,
             step: manifest.step,
         };
         if best.as_ref().is_none_or(|b| candidate.step > b.step) {
             best = Some(candidate);
+        }
+    }
+    if let Some((malformed_step, error)) = malformed
+        .into_iter()
+        .max_by_key(|(directory_step, _)| *directory_step)
+    {
+        if best
+            .as_ref()
+            .is_none_or(|checkpoint| malformed_step > checkpoint.step)
+        {
+            return Err(error);
         }
     }
     Ok(best)
@@ -1571,6 +2311,7 @@ mod tests {
             sampler_state: None,
             lora_recipe: None,
             rollout_ledger_continuation: None,
+            ordinary_checkpoint: None,
         };
         std::fs::write(
             tmp.path().join(MANIFEST_FILE),
@@ -1603,14 +2344,24 @@ mod tests {
             sampler_state: Some(vec![1, 2, 3, 4]),
             lora_recipe: Some("attn:qv|mlp:-".to_string()),
             rollout_ledger_continuation: None,
+            ordinary_checkpoint: Some(OrdinaryCheckpointIdentity {
+                kind: ORDINARY_CHECKPOINT_KIND.into(),
+                frozen_policy_sha256: "1".repeat(64),
+                trainer_config_sha256: "2".repeat(64),
+                tensor_schema_sha256: "3".repeat(64),
+                adapter_sha256: "4".repeat(64),
+                optimizer_sha256: "5".repeat(64),
+                sampler_sha256: "6".repeat(64),
+                state_envelope_sha256: "7".repeat(64),
+            }),
         };
         let j = serde_json::to_string(&m).unwrap();
         let back: CheckpointManifest = serde_json::from_str(&j).unwrap();
         assert_eq!(back, m);
     }
 
-    /// A v1 manifest (no optimizer/sampler fields on disk) still deserializes — the
-    /// `#[serde(default)]` fields come back `None` (the fresh-momentum fallback).
+    /// A v1 manifest (no optimizer/sampler fields on disk) still deserializes for
+    /// the explicit adapter-only compatibility path.
     #[test]
     fn v1_manifest_without_v2_fields_deserializes() {
         let j = r#"{"format_version":1,"step":7,"num_vars":2}"#;
@@ -1661,6 +2412,10 @@ mod tests {
         t.flatten_all().unwrap().to_vec1::<f32>().unwrap()
     }
 
+    fn ordinary_binding(recipe: Option<&str>) -> CheckpointBinding {
+        CheckpointBinding::new("a".repeat(64), "b".repeat(64), recipe.map(str::to_owned)).unwrap()
+    }
+
     fn continuation_manifest(step: u64) -> RolloutLedgerContinuationManifest {
         RolloutLedgerContinuationManifest {
             format_version: ROLLOUT_LEDGER_CONTINUATION_FORMAT_VERSION,
@@ -1707,8 +2462,8 @@ mod tests {
             &make_vars(),
             &make_opt_state(),
             &[9, 8, 7],
-            99,
-            Some("ordinary-replacement"),
+            1,
+            &ordinary_binding(Some("ordinary-replacement")),
         )
         .unwrap();
         replacement
@@ -1733,11 +2488,16 @@ mod tests {
             latest_checkpoint(checkpoints).unwrap().unwrap(),
             LatestCheckpoint {
                 dir: destination.to_path_buf(),
-                step: 99,
+                step: 1,
             }
         );
-        let loaded = load_checkpoint(destination, &make_vars()).unwrap();
-        assert_eq!(loaded.step, 99);
+        let loaded = load_checkpoint(
+            destination,
+            &make_vars(),
+            &ordinary_binding(Some("ordinary-replacement")),
+        )
+        .unwrap();
+        assert_eq!(loaded.step, 1);
         assert_eq!(loaded.sampler_state.as_deref(), Some([9, 8, 7].as_slice()));
         assert_eq!(loaded.lora_recipe.as_deref(), Some("ordinary-replacement"));
     }
@@ -1766,12 +2526,20 @@ mod tests {
 
     #[test]
     fn save_checkpoint_round_trips_the_adapter_and_step() {
-        let tmp = TempDir::new("v2-adapter");
+        let tmp = TempDir::new("v4-adapter");
         let vars = make_vars();
         let adapter = snapshot(&vars);
-        save_checkpoint(tmp.path(), &vars, &make_opt_state(), &[9u8, 8, 7], 13, None).unwrap();
+        save_checkpoint(
+            tmp.path(),
+            &vars,
+            &make_opt_state(),
+            &[9u8, 8, 7],
+            13,
+            &ordinary_binding(None),
+        )
+        .unwrap();
         clobber(&vars);
-        let loaded = load_checkpoint(tmp.path(), &vars).unwrap();
+        let loaded = load_checkpoint(tmp.path(), &vars, &ordinary_binding(None)).unwrap();
         assert_eq!(loaded.step, 13);
         assert_eq!(
             snapshot(&vars),
@@ -1823,7 +2591,7 @@ mod tests {
         );
 
         let vars = make_vars();
-        let loaded = load_checkpoint(&destination, &vars).unwrap();
+        let loaded = load_rollout_ledger_checkpoint(&destination, &vars).unwrap();
         assert_eq!(loaded.step, 1);
         assert!(matches!(loaded.sampler_state.as_deref(), Some([1 | 2])));
     }
@@ -1842,7 +2610,7 @@ mod tests {
                 &make_opt_state(),
                 &[9, 8, 7],
                 99,
-                Some("ordinary-replacement"),
+                &ordinary_binding(Some("ordinary-replacement")),
             )
             .unwrap_err();
             hook_blocked.set(matches!(
@@ -1925,7 +2693,7 @@ mod tests {
             synced.contains(&checkpoints),
             "step-1 claim was not anchored in checkpoints: {synced:?}"
         );
-        load_checkpoint(&destination, &make_vars()).unwrap();
+        load_rollout_ledger_checkpoint(&destination, &make_vars()).unwrap();
     }
 
     #[test]
@@ -1992,7 +2760,7 @@ mod tests {
             continuation_manifest(1),
         )
         .unwrap();
-        load_checkpoint(&destination, &make_vars()).unwrap();
+        load_rollout_ledger_checkpoint(&destination, &make_vars()).unwrap();
     }
 
     #[test]
@@ -2092,7 +2860,7 @@ mod tests {
                 step: 1,
             }
         );
-        let loaded = load_checkpoint(&destination, &make_vars()).unwrap();
+        let loaded = load_rollout_ledger_checkpoint(&destination, &make_vars()).unwrap();
         assert_eq!(loaded.step, 1);
         assert_eq!(loaded.sampler_state.as_deref(), Some([1].as_slice()));
     }
@@ -2193,13 +2961,17 @@ mod tests {
             Err(CheckpointError::PublicationAmbiguous { path, detail })
                 if path == destination && detail.contains("visible package verification failed")
         ));
-        assert_eq!(latest_checkpoint(&checkpoints).unwrap(), None);
+        assert!(matches!(
+            latest_checkpoint(&checkpoints),
+            Err(CheckpointError::Io { path, .. })
+                if path == destination.join(MANIFEST_FILE)
+        ));
         assert_eq!(
             latest_rollout_ledger_continuation(&checkpoints).unwrap(),
             None
         );
         assert!(matches!(
-            load_checkpoint(&destination, &make_vars()),
+            load_rollout_ledger_checkpoint(&destination, &make_vars()),
             Err(CheckpointError::Io { .. })
         ));
         assert!(matches!(
@@ -2274,13 +3046,17 @@ mod tests {
             Err(CheckpointError::PublicationAmbiguous { path, detail })
                 if path == destination && detail.contains("visible package verification failed")
         ));
-        assert_eq!(latest_checkpoint(&checkpoints).unwrap(), None);
+        assert!(matches!(
+            latest_checkpoint(&checkpoints),
+            Err(CheckpointError::Io { path, .. })
+                if path == destination.join(MANIFEST_FILE)
+        ));
         assert_eq!(
             latest_rollout_ledger_continuation(&checkpoints).unwrap(),
             None
         );
         assert!(matches!(
-            load_checkpoint(&destination, &make_vars()),
+            load_rollout_ledger_checkpoint(&destination, &make_vars()),
             Err(CheckpointError::Io { .. })
         ));
         assert!(matches!(
@@ -2350,7 +3126,7 @@ mod tests {
 
     #[test]
     fn save_checkpoint_round_trips_the_optimizer_and_sampler() {
-        let tmp = TempDir::new("v2-opt-sampler");
+        let tmp = TempDir::new("v4-opt-sampler");
         let vars = make_vars();
         let opt = make_opt_state();
         let sampler_blob = vec![9u8, 8, 7, 6, 5];
@@ -2360,13 +3136,18 @@ mod tests {
             &opt,
             &sampler_blob,
             13,
-            Some("attn:qkvo|mlp:gud|gdn:-"),
+            &ordinary_binding(Some("attn:qkvo|mlp:gud|gdn:-")),
         )
         .unwrap();
-        let loaded = load_checkpoint(tmp.path(), &vars).unwrap();
+        let loaded = load_checkpoint(
+            tmp.path(),
+            &vars,
+            &ordinary_binding(Some("attn:qkvo|mlp:gud|gdn:-")),
+        )
+        .unwrap();
         let os = loaded
             .optimizer_state
-            .expect("v2 must carry optimizer state");
+            .expect("v4 must carry optimizer state");
         assert_eq!(os.step_t, 11);
         assert_eq!(flat(&os.first_moments[0]), flat(&opt.first_moments[0]));
         assert_eq!(flat(&os.second_moments[1]), flat(&opt.second_moments[1]));
@@ -2391,19 +3172,35 @@ mod tests {
         std::fs::create_dir_all(&stage).unwrap();
         std::fs::write(stage.join("leftover"), b"x").unwrap();
 
-        save_checkpoint(&dir, &vars, &make_opt_state(), &[1u8], 5, None).unwrap();
+        save_checkpoint(
+            &dir,
+            &vars,
+            &make_opt_state(),
+            &[1u8],
+            5,
+            &ordinary_binding(None),
+        )
+        .unwrap();
 
         // The publish replaced the prior directory as a unit: the junk is gone,
         // the checkpoint is complete and loadable, and no stage dir remains.
         assert!(!dir.join("garbage.bin").exists(), "stale content survived");
         assert!(!stage.exists(), "stage dir must not survive a commit");
-        let loaded = load_checkpoint(&dir, &vars).unwrap();
+        let loaded = load_checkpoint(&dir, &vars, &ordinary_binding(None)).unwrap();
         assert_eq!(loaded.step, 5);
 
         // Re-writing the same path succeeds and stays complete (the in-place
         // overwrite path a periodic checkpointer hits on a re-run).
-        save_checkpoint(&dir, &vars, &make_opt_state(), &[2u8], 5, None).unwrap();
-        let again = load_checkpoint(&dir, &vars).unwrap();
+        save_checkpoint(
+            &dir,
+            &vars,
+            &make_opt_state(),
+            &[2u8],
+            5,
+            &ordinary_binding(None),
+        )
+        .unwrap();
+        let again = load_checkpoint(&dir, &vars, &ordinary_binding(None)).unwrap();
         assert_eq!(again.sampler_state, Some(vec![2u8]));
     }
 
@@ -2414,7 +3211,15 @@ mod tests {
         let tmp = TempDir::new("staged-err");
         let dir = tmp.path().join("step-3");
         let vars = make_vars();
-        save_checkpoint(&dir, &vars, &make_opt_state(), &[7u8], 3, None).unwrap();
+        save_checkpoint(
+            &dir,
+            &vars,
+            &make_opt_state(),
+            &[7u8],
+            3,
+            &ordinary_binding(None),
+        )
+        .unwrap();
         let before = snapshot(&vars);
 
         let err = write_staged(&dir, |stage| {
@@ -2427,7 +3232,7 @@ mod tests {
 
         // Prior checkpoint still loads bit-identically; no stage litter.
         clobber(&vars);
-        let loaded = load_checkpoint(&dir, &vars).unwrap();
+        let loaded = load_checkpoint(&dir, &vars, &ordinary_binding(None)).unwrap();
         assert_eq!(loaded.step, 3);
         assert_eq!(loaded.sampler_state, Some(vec![7u8]));
         assert_eq!(snapshot(&vars), before);
@@ -2446,10 +3251,10 @@ mod tests {
             &make_opt_state(),
             &[0u8],
             3,
-            Some("attn:qkvo|mlp:gud|gdn:-"),
+            &ordinary_binding(Some("attn:qkvo|mlp:gud|gdn:-")),
         )
         .unwrap();
-        let manifest = load_adapter(&dir_v2, &vars).unwrap();
+        let manifest = read_manifest(&dir_v2).unwrap();
         assert_eq!(
             manifest.lora_recipe.as_deref(),
             Some("attn:qkvo|mlp:gud|gdn:-")
@@ -2468,19 +3273,545 @@ mod tests {
     }
 
     #[test]
-    fn load_checkpoint_on_a_v1_adapter_only_yields_no_optimizer_or_sampler() {
-        // A v1 checkpoint (save_adapter) loads through load_checkpoint with no optimizer
-        // or sampler state — the documented fresh-momentum fallback.
+    fn load_checkpoint_rejects_v1_adapter_only_without_mutation() {
         let tmp = TempDir::new("v1-via-checkpoint");
         let vars = make_vars();
         save_adapter(tmp.path(), &vars, 4, None).unwrap();
-        let loaded = load_checkpoint(tmp.path(), &vars).unwrap();
-        assert_eq!(loaded.step, 4);
+        let before = snapshot(&vars);
+        let error = load_checkpoint(tmp.path(), &vars, &ordinary_binding(None)).unwrap_err();
+        assert!(error.to_string().contains("format-v4"), "{error}");
+        assert_eq!(snapshot(&vars), before);
+    }
+
+    fn write_manifest_value(dir: &Path, value: &serde_json::Value) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join(MANIFEST_FILE),
+            serde_json::to_vec_pretty(value).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn write_manifest_raw(dir: &Path, raw: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(MANIFEST_FILE), raw).unwrap();
+    }
+
+    fn refresh_v4_state_envelope(manifest: &mut serde_json::Value) {
+        let identity = &manifest["ordinary_checkpoint"];
+        let root = state_envelope_sha256(
+            u32::try_from(manifest["format_version"].as_u64().unwrap()).unwrap(),
+            identity["kind"].as_str().unwrap(),
+            manifest["step"].as_u64().unwrap(),
+            usize::try_from(manifest["num_vars"].as_u64().unwrap()).unwrap(),
+            manifest["lora_recipe"].as_str(),
+            usize::try_from(manifest["optimizer_step_t"].as_u64().unwrap()).unwrap(),
+            usize::try_from(manifest["optimizer_num_vars"].as_u64().unwrap()).unwrap(),
+            identity["frozen_policy_sha256"].as_str().unwrap(),
+            identity["trainer_config_sha256"].as_str().unwrap(),
+            identity["tensor_schema_sha256"].as_str().unwrap(),
+            identity["adapter_sha256"].as_str().unwrap(),
+            identity["optimizer_sha256"].as_str().unwrap(),
+            identity["sampler_sha256"].as_str().unwrap(),
+        )
+        .unwrap();
+        manifest["ordinary_checkpoint"]["state_envelope_sha256"] = serde_json::json!(root);
+    }
+
+    fn assert_manifest_rejected(dir: &Path, value: &serde_json::Value, label: &str) {
+        write_manifest_value(dir, value);
         assert!(
-            loaded.optimizer_state.is_none(),
-            "v1 has no optimizer state"
+            read_manifest(dir).is_err(),
+            "invalid manifest case {label} was accepted: {value}"
         );
-        assert!(loaded.sampler_state.is_none(), "v1 has no sampler state");
+    }
+
+    fn assert_v1_manifest_matrix(dir: &Path) -> serde_json::Value {
+        let v1 = serde_json::json!({
+            "format_version": 1,
+            "step": 1,
+            "num_vars": 2,
+        });
+        write_manifest_value(dir, &v1);
+        assert_eq!(read_manifest(dir).unwrap().format_version, 1);
+
+        for (field, value) in [
+            ("optimizer_step_t", serde_json::json!(2)),
+            ("optimizer_num_vars", serde_json::json!(2)),
+            ("sampler_state", serde_json::json!([1, 2, 3])),
+        ] {
+            let mut smuggled = v1.clone();
+            smuggled[field] = value;
+            assert_manifest_rejected(dir, &smuggled, &format!("v1 smuggled {field}"));
+        }
+        v1
+    }
+
+    fn assert_legacy_momentum_manifest_matrix(dir: &Path) {
+        for version in [2, LEGACY_MOMENTUM_FORMAT_VERSION] {
+            let complete = serde_json::json!({
+                "format_version": version,
+                "step": 1,
+                "num_vars": 2,
+                "optimizer_step_t": 3,
+                "optimizer_num_vars": 2,
+                "sampler_state": [1, 2, 3],
+            });
+            write_manifest_value(dir, &complete);
+            assert_eq!(read_manifest(dir).unwrap().format_version, version);
+            for field in ["optimizer_step_t", "optimizer_num_vars", "sampler_state"] {
+                let mut missing = complete.clone();
+                missing.as_object_mut().unwrap().remove(field);
+                assert_manifest_rejected(dir, &missing, &format!("v{version} missing {field}"));
+                let mut null = complete.clone();
+                null[field] = serde_json::Value::Null;
+                assert_manifest_rejected(dir, &null, &format!("v{version} null {field}"));
+            }
+        }
+    }
+
+    fn save_v4_manifest_fixture(dir: &Path) -> serde_json::Value {
+        let vars = make_vars();
+        save_checkpoint(
+            dir,
+            &vars,
+            &make_opt_state(),
+            &[1, 2, 3],
+            1,
+            &ordinary_binding(Some("recipe")),
+        )
+        .unwrap();
+        serde_json::from_slice(&std::fs::read(dir.join(MANIFEST_FILE)).unwrap()).unwrap()
+    }
+
+    fn assert_v4_required_fields(dir: &Path, v4: &serde_json::Value) {
+        for field in [
+            "optimizer_step_t",
+            "optimizer_num_vars",
+            "sampler_state",
+            "ordinary_checkpoint",
+            "lora_recipe",
+        ] {
+            let mut missing = v4.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert_manifest_rejected(dir, &missing, &format!("v4 missing {field}"));
+        }
+        for field in [
+            "kind",
+            "frozen_policy_sha256",
+            "trainer_config_sha256",
+            "tensor_schema_sha256",
+            "adapter_sha256",
+            "optimizer_sha256",
+            "sampler_sha256",
+            "state_envelope_sha256",
+        ] {
+            let mut missing = v4.clone();
+            missing["ordinary_checkpoint"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert_manifest_rejected(dir, &missing, &format!("v4 identity missing {field}"));
+        }
+    }
+
+    fn assert_v4_identity_and_kind_controls(dir: &Path, v4: &serde_json::Value) {
+        let mut malformed_digest = v4.clone();
+        malformed_digest["ordinary_checkpoint"]["adapter_sha256"] =
+            serde_json::json!("A".repeat(64));
+        assert_manifest_rejected(dir, &malformed_digest, "v4 uppercase digest");
+        let mut wrong_kind = v4.clone();
+        wrong_kind["ordinary_checkpoint"]["kind"] = serde_json::json!("rollout_ledger");
+        assert_manifest_rejected(dir, &wrong_kind, "v4 wrong kind");
+        let mut continuation = v4.clone();
+        continuation["rollout_ledger_continuation"] =
+            serde_json::to_value(continuation_manifest(1)).unwrap();
+        assert_manifest_rejected(dir, &continuation, "v4 continuation smuggling");
+        let mut nested_unknown = v4.clone();
+        nested_unknown["ordinary_checkpoint"]["typo_field"] = serde_json::json!(true);
+        assert_manifest_rejected(dir, &nested_unknown, "unknown ordinary identity field");
+        let mut unknown = v4.clone();
+        unknown["typo_field"] = serde_json::json!(true);
+        assert_manifest_rejected(dir, &unknown, "unknown top-level field");
+    }
+
+    fn assert_cross_version_identity_smuggling_rejected(
+        dir: &Path,
+        v1: &serde_json::Value,
+        v4: &serde_json::Value,
+    ) {
+        let mut v1_ordinary = v1.clone();
+        v1_ordinary["ordinary_checkpoint"] = v4["ordinary_checkpoint"].clone();
+        assert_manifest_rejected(dir, &v1_ordinary, "v1 ordinary identity smuggling");
+        let mut v1_continuation = v1.clone();
+        v1_continuation["rollout_ledger_continuation"] =
+            serde_json::to_value(continuation_manifest(1)).unwrap();
+        assert_manifest_rejected(dir, &v1_continuation, "v1 continuation smuggling");
+
+        let mut v2_continuation = serde_json::json!({
+            "format_version": 2,
+            "step": 1,
+            "num_vars": 2,
+            "optimizer_step_t": 3,
+            "optimizer_num_vars": 2,
+            "sampler_state": [1, 2, 3],
+        });
+        v2_continuation["rollout_ledger_continuation"] =
+            serde_json::to_value(continuation_manifest(1)).unwrap();
+        assert_manifest_rejected(dir, &v2_continuation, "v2 continuation smuggling");
+
+        let mut v3_ordinary = serde_json::json!({
+            "format_version": LEGACY_MOMENTUM_FORMAT_VERSION,
+            "step": 1,
+            "num_vars": 2,
+            "optimizer_step_t": 3,
+            "optimizer_num_vars": 2,
+            "sampler_state": [1, 2, 3],
+        });
+        v3_ordinary["ordinary_checkpoint"] = v4["ordinary_checkpoint"].clone();
+        assert_manifest_rejected(dir, &v3_ordinary, "v3 ordinary identity smuggling");
+    }
+
+    #[test]
+    fn ordinary_manifest_required_field_matrix_is_version_exact() {
+        let tmp = TempDir::new("field-matrix");
+        let dir = tmp.path().join("case");
+        let v1 = assert_v1_manifest_matrix(&dir);
+        assert_legacy_momentum_manifest_matrix(&dir);
+        let v4 = save_v4_manifest_fixture(&dir);
+        assert_v4_required_fields(&dir, &v4);
+        assert_v4_identity_and_kind_controls(&dir, &v4);
+        assert_cross_version_identity_smuggling_rejected(&dir, &v1, &v4);
+    }
+
+    #[test]
+    fn ordinary_manifest_rejects_raw_duplicate_security_fields() {
+        let tmp = TempDir::new("duplicate-manifest-fields");
+        let dir = tmp.path().join("case");
+        let manifest = save_v4_manifest_fixture(&dir);
+        let raw = serde_json::to_string_pretty(&manifest).unwrap();
+        let zero_digest = "0".repeat(64);
+        let mut cases = vec![
+            (
+                "top-level format_version".to_string(),
+                raw.replacen(
+                    "\"format_version\": 4,",
+                    "\"format_version\": 4,\n  \"format_version\": 4,",
+                    1,
+                ),
+            ),
+            (
+                "top-level step".to_string(),
+                raw.replacen("\"step\": 1\n", "\"step\": 1,\n  \"step\": 1\n", 1),
+            ),
+            (
+                "top-level identity".to_string(),
+                raw.replacen(
+                    "\"ordinary_checkpoint\": {",
+                    "\"ordinary_checkpoint\": null,\n  \"ordinary_checkpoint\": {",
+                    1,
+                ),
+            ),
+            (
+                "nested kind".to_string(),
+                raw.replacen(
+                    "\"kind\": \"ordinary\",",
+                    "\"kind\": \"ordinary\",\n    \"kind\": \"ordinary\",",
+                    1,
+                ),
+            ),
+        ];
+        for field in [
+            "frozen_policy_sha256",
+            "trainer_config_sha256",
+            "tensor_schema_sha256",
+            "adapter_sha256",
+            "optimizer_sha256",
+            "sampler_sha256",
+            "state_envelope_sha256",
+        ] {
+            cases.push((
+                format!("nested digest {field}"),
+                raw.replacen(
+                    &format!("\"{field}\":"),
+                    &format!("\"{field}\": \"{zero_digest}\",\n    \"{field}\":"),
+                    1,
+                ),
+            ));
+        }
+        for (label, duplicate) in cases {
+            assert_ne!(duplicate, raw, "duplicate control did not alter {label}");
+            write_manifest_raw(&dir, &duplicate);
+            let error = read_manifest(&dir).unwrap_err();
+            assert!(
+                error.to_string().contains("duplicate field"),
+                "{label}: wrong rejection: {error}"
+            );
+        }
+    }
+
+    fn save_integrity_fixture(dir: &Path) {
+        save_checkpoint(
+            dir,
+            &make_vars(),
+            &make_opt_state(),
+            &[9, 8, 7, 6],
+            13,
+            &ordinary_binding(Some("recipe")),
+        )
+        .unwrap();
+    }
+
+    fn sentinel_vars() -> Vec<Var> {
+        let vars = make_vars();
+        for var in &vars {
+            var.set(
+                &Tensor::ones(var.as_tensor().dims(), DType::F32, &Device::Cpu)
+                    .unwrap()
+                    .affine(17.0, 0.0)
+                    .unwrap(),
+            )
+            .unwrap();
+        }
+        vars
+    }
+
+    fn rewrite_first_tensor(path: &Path, key: &str) {
+        let bytes = std::fs::read(path).unwrap();
+        let mut tensors = candle_core::safetensors::load_buffer(&bytes, &Device::Cpu).unwrap();
+        let changed = tensors.get(key).unwrap().affine(1.0, 1.0).unwrap();
+        tensors.insert(key.to_owned(), changed);
+        candle_core::safetensors::save(&tensors, path).unwrap();
+    }
+
+    #[test]
+    fn ordinary_checkpoint_state_envelope_rejects_step_relabelling_before_mutation() {
+        let tmp = TempDir::new("step-relabel");
+        save_integrity_fixture(tmp.path());
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(tmp.path().join(MANIFEST_FILE)).unwrap())
+                .unwrap();
+        manifest["step"] = serde_json::json!(14);
+        write_manifest_value(tmp.path(), &manifest);
+
+        let destination = sentinel_vars();
+        let before = snapshot(&destination);
+        let error = load_checkpoint(tmp.path(), &destination, &ordinary_binding(Some("recipe")))
+            .unwrap_err();
+        assert!(error.to_string().contains("state-envelope"), "{error}");
+        assert_eq!(snapshot(&destination), before);
+    }
+
+    #[test]
+    fn ordinary_checkpoint_state_envelope_rejects_coherent_leaf_transplant() {
+        let tmp = TempDir::new("coherent-leaf-transplant");
+        let recipient = tmp.path().join("recipient");
+        let donor = tmp.path().join("donor");
+        save_integrity_fixture(&recipient);
+
+        let donor_vars = make_vars();
+        donor_vars[0]
+            .set(&donor_vars[0].as_tensor().affine(1.0, 11.0).unwrap())
+            .unwrap();
+        let mut donor_optimizer = make_opt_state();
+        donor_optimizer.first_moments[0] =
+            donor_optimizer.first_moments[0].affine(1.0, 5.0).unwrap();
+        save_checkpoint(
+            &donor,
+            &donor_vars,
+            &donor_optimizer,
+            &[4, 3, 2, 1],
+            13,
+            &ordinary_binding(Some("recipe")),
+        )
+        .unwrap();
+
+        std::fs::copy(donor.join(ADAPTER_FILE), recipient.join(ADAPTER_FILE)).unwrap();
+        let donor_manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(donor.join(MANIFEST_FILE)).unwrap()).unwrap();
+        let mut recipient_manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(recipient.join(MANIFEST_FILE)).unwrap()).unwrap();
+        assert_ne!(
+            recipient_manifest["ordinary_checkpoint"]["optimizer_sha256"],
+            donor_manifest["ordinary_checkpoint"]["optimizer_sha256"],
+            "the transplant control requires the recipient Adam state to remain distinct"
+        );
+        assert_ne!(
+            recipient_manifest["ordinary_checkpoint"]["sampler_sha256"],
+            donor_manifest["ordinary_checkpoint"]["sampler_sha256"],
+            "the transplant control requires the recipient sampler state to remain distinct"
+        );
+        recipient_manifest["ordinary_checkpoint"]["adapter_sha256"] =
+            donor_manifest["ordinary_checkpoint"]["adapter_sha256"].clone();
+        let transplanted_bytes = std::fs::read(recipient.join(ADAPTER_FILE)).unwrap();
+        assert_eq!(
+            recipient_manifest["ordinary_checkpoint"]["adapter_sha256"]
+                .as_str()
+                .unwrap(),
+            adapter_payload_sha256(&transplanted_bytes),
+            "the transplanted payload and its leaf digest must be internally coherent"
+        );
+        write_manifest_value(&recipient, &recipient_manifest);
+
+        let destination = sentinel_vars();
+        let before = snapshot(&destination);
+        let error = load_checkpoint(&recipient, &destination, &ordinary_binding(Some("recipe")))
+            .unwrap_err();
+        assert!(error.to_string().contains("state-envelope"), "{error}");
+        assert_eq!(snapshot(&destination), before);
+    }
+
+    #[test]
+    fn ordinary_checkpoint_rejects_valid_payload_tampering_before_adapter_mutation() {
+        let tmp = TempDir::new("payload-tamper");
+        for (label, tamper) in [
+            ("adapter", 0_u8),
+            ("optimizer", 1_u8),
+            ("sampler", 2_u8),
+            ("optimizer-step", 3_u8),
+        ] {
+            let dir = tmp.path().join(label);
+            save_integrity_fixture(&dir);
+            match tamper {
+                0 => rewrite_first_tensor(&dir.join(ADAPTER_FILE), &var_key(0)),
+                1 => rewrite_first_tensor(&dir.join(OPTIMIZER_FILE), &moment_key("m", 0)),
+                2 => {
+                    let mut manifest: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(dir.join(MANIFEST_FILE)).unwrap())
+                            .unwrap();
+                    manifest["sampler_state"] = serde_json::json!([9, 8, 7, 5]);
+                    write_manifest_value(&dir, &manifest);
+                }
+                3 => {
+                    let mut manifest: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(dir.join(MANIFEST_FILE)).unwrap())
+                            .unwrap();
+                    manifest["optimizer_step_t"] = serde_json::json!(12);
+                    write_manifest_value(&dir, &manifest);
+                }
+                _ => unreachable!(),
+            }
+            let destination = sentinel_vars();
+            let before = snapshot(&destination);
+            let error =
+                load_checkpoint(&dir, &destination, &ordinary_binding(Some("recipe"))).unwrap_err();
+            assert!(
+                error.to_string().contains("digest mismatch"),
+                "{label}: wrong rejection: {error}"
+            );
+            assert_eq!(
+                snapshot(&destination),
+                before,
+                "{label}: live adapter changed before tamper rejection"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_checkpoint_rejects_binding_drift_before_adapter_mutation() {
+        let tmp = TempDir::new("binding-drift");
+        save_integrity_fixture(tmp.path());
+        let bindings = [
+            CheckpointBinding::new("c".repeat(64), "b".repeat(64), Some("recipe".into())).unwrap(),
+            CheckpointBinding::new("a".repeat(64), "c".repeat(64), Some("recipe".into())).unwrap(),
+            CheckpointBinding::new("a".repeat(64), "b".repeat(64), Some("other".into())).unwrap(),
+            CheckpointBinding::new("a".repeat(64), "b".repeat(64), None).unwrap(),
+        ];
+        for binding in bindings {
+            let destination = sentinel_vars();
+            let before = snapshot(&destination);
+            assert!(load_checkpoint(tmp.path(), &destination, &binding).is_err());
+            assert_eq!(snapshot(&destination), before);
+        }
+    }
+
+    #[test]
+    fn ordinary_checkpoint_rejects_extra_tensor_keys_even_with_refreshed_hashes() {
+        let tmp = TempDir::new("extra-keys");
+        for (label, file, key, identity_field) in [
+            (
+                "adapter",
+                ADAPTER_FILE,
+                "unexpected.adapter",
+                "adapter_sha256",
+            ),
+            (
+                "optimizer",
+                OPTIMIZER_FILE,
+                "unexpected.optimizer",
+                "optimizer_sha256",
+            ),
+        ] {
+            let dir = tmp.path().join(label);
+            save_integrity_fixture(&dir);
+            let path = dir.join(file);
+            let bytes = std::fs::read(&path).unwrap();
+            let mut tensors = candle_core::safetensors::load_buffer(&bytes, &Device::Cpu).unwrap();
+            tensors.insert(
+                key.to_owned(),
+                Tensor::zeros((1,), DType::F32, &Device::Cpu).unwrap(),
+            );
+            candle_core::safetensors::save(&tensors, &path).unwrap();
+
+            // Refresh the corresponding digest so the exact-key-set comparison,
+            // rather than the outer content hash, is the load-bearing rejection.
+            let bytes = std::fs::read(&path).unwrap();
+            let mut manifest: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(dir.join(MANIFEST_FILE)).unwrap()).unwrap();
+            let digest = if file == ADAPTER_FILE {
+                adapter_payload_sha256(&bytes)
+            } else {
+                optimizer_payload_sha256(
+                    usize::try_from(manifest["optimizer_step_t"].as_u64().unwrap()).unwrap(),
+                    &bytes,
+                )
+                .unwrap()
+            };
+            manifest["ordinary_checkpoint"][identity_field] = serde_json::json!(digest);
+            refresh_v4_state_envelope(&mut manifest);
+            write_manifest_value(&dir, &manifest);
+
+            let destination = sentinel_vars();
+            let before = snapshot(&destination);
+            let error =
+                load_checkpoint(&dir, &destination, &ordinary_binding(Some("recipe"))).unwrap_err();
+            assert!(error.to_string().contains("key set mismatch"), "{error}");
+            assert_eq!(snapshot(&destination), before);
+        }
+    }
+
+    #[test]
+    fn ordinary_checkpoint_rejects_same_schema_payload_swaps_before_mutation() {
+        let tmp = TempDir::new("payload-swap");
+        let first = tmp.path().join("first");
+        save_integrity_fixture(&first);
+
+        for file in [ADAPTER_FILE, OPTIMIZER_FILE] {
+            let second = tmp.path().join(format!("second-{file}"));
+            let vars = make_vars();
+            vars[0]
+                .set(&vars[0].as_tensor().affine(1.0, 3.0).unwrap())
+                .unwrap();
+            let mut optimizer = make_opt_state();
+            optimizer.first_moments[0] = optimizer.first_moments[0].affine(1.0, 2.0).unwrap();
+            save_checkpoint(
+                &second,
+                &vars,
+                &optimizer,
+                &[4, 5, 6],
+                13,
+                &ordinary_binding(Some("recipe")),
+            )
+            .unwrap();
+            std::fs::copy(first.join(file), second.join(file)).unwrap();
+
+            let destination = sentinel_vars();
+            let before = snapshot(&destination);
+            let error = load_checkpoint(&second, &destination, &ordinary_binding(Some("recipe")))
+                .unwrap_err();
+            assert!(error.to_string().contains("digest mismatch"), "{error}");
+            assert_eq!(snapshot(&destination), before);
+        }
     }
 
     /// Write a real (loadable) checkpoint at `root/step-<n>` with manifest `step = n`.
@@ -2491,9 +3822,49 @@ mod tests {
             &make_opt_state(),
             &[1u8],
             n,
+            &ordinary_binding(None),
+        )
+        .unwrap();
+    }
+
+    fn write_legacy_ordinary_step(root: &Path, n: u64, format_version: u32) {
+        assert!(matches!(format_version, 2 | LEGACY_MOMENTUM_FORMAT_VERSION));
+        let dir = root.join(format!("step-{n}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_checkpoint_contents(
+            &dir,
+            &dir.join(MANIFEST_FILE),
+            &make_vars(),
+            &make_opt_state(),
+            &[1, 2, 3],
+            n,
+            format_version,
+            None,
+            None,
             None,
         )
         .unwrap();
+    }
+
+    fn write_step_with_manifest_mismatch(root: &Path, directory_step: u64, manifest_step: u64) {
+        write_step(root, directory_step);
+        let dir = root.join(format!("step-{directory_step}"));
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join(MANIFEST_FILE)).unwrap()).unwrap();
+        manifest["step"] = serde_json::json!(manifest_step);
+        refresh_v4_state_envelope(&mut manifest);
+        write_manifest_value(&dir, &manifest);
+    }
+
+    fn write_legacy_with_wrong_continuation_kind(root: &Path, n: u64) {
+        write_legacy_ordinary_step(root, n, LEGACY_MOMENTUM_FORMAT_VERSION);
+        let dir = root.join(format!("step-{n}"));
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join(MANIFEST_FILE)).unwrap()).unwrap();
+        let mut continuation = continuation_manifest(n);
+        continuation.kind = "ordinary".into();
+        manifest["rollout_ledger_continuation"] = serde_json::to_value(continuation).unwrap();
+        write_manifest_value(&dir, &manifest);
     }
 
     #[test]
@@ -2517,18 +3888,132 @@ mod tests {
         assert_eq!(got.dir, tmp.path().join("step-10"));
         // And the discovered checkpoint actually loads from there.
         let vars = make_vars();
-        assert_eq!(load_checkpoint(&got.dir, &vars).unwrap().step, 10);
+        assert_eq!(
+            load_checkpoint(&got.dir, &vars, &ordinary_binding(None))
+                .unwrap()
+                .step,
+            10
+        );
     }
 
     #[test]
-    fn latest_checkpoint_skips_dirs_without_a_committed_manifest() {
-        // A higher-numbered directory with no manifest (an interrupted write)
-        // is not a candidate — discovery falls back to the newest complete one.
+    fn latest_checkpoint_rejects_any_readable_legacy_momentum_package() {
+        for (label, format_version, valid_step, legacy_step) in [
+            ("v2-alone", 2, None, 2),
+            ("v2-older", 2, Some(5), 1),
+            ("v2-newer", 2, Some(5), 9),
+            ("v3-alone", LEGACY_MOMENTUM_FORMAT_VERSION, None, 2),
+            ("v3-older", LEGACY_MOMENTUM_FORMAT_VERSION, Some(5), 1),
+            ("v3-newer", LEGACY_MOMENTUM_FORMAT_VERSION, Some(5), 9),
+        ] {
+            let tmp = TempDir::new(label);
+            if let Some(step) = valid_step {
+                write_step(tmp.path(), step);
+            }
+            write_legacy_ordinary_step(tmp.path(), legacy_step, format_version);
+            let error = latest_checkpoint(tmp.path()).unwrap_err();
+            assert!(
+                error.to_string().contains("untrusted legacy")
+                    && error
+                        .to_string()
+                        .contains(&format!("format-v{format_version}")),
+                "{label}: wrong rejection: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn latest_checkpoint_rejects_wrong_continuation_kind_instead_of_fresh_or_fallback() {
+        for (label, valid_step, legacy_step) in [
+            ("wrong-continuation-kind-only", None, 4),
+            ("wrong-continuation-kind-above-v4", Some(1), 4),
+        ] {
+            let tmp = TempDir::new(label);
+            if let Some(step) = valid_step {
+                write_step(tmp.path(), step);
+            }
+            write_legacy_with_wrong_continuation_kind(tmp.path(), legacy_step);
+            let error = latest_checkpoint(tmp.path()).unwrap_err();
+            let message = error.to_string();
+            assert!(
+                message.contains("continuation discriminator \"ordinary\"")
+                    && message.contains("only \"rollout_ledger\" is disjoint"),
+                "{label}: wrong rejection: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn latest_checkpoint_rejects_every_valid_v4_step_disagreement() {
+        for (label, directory_step, manifest_step) in [
+            ("older-directory-newer-manifest", 4, 6),
+            ("newer-directory-older-manifest", 6, 4),
+            ("older-in-both-coordinates", 1, 2),
+        ] {
+            let tmp = TempDir::new(label);
+            write_step(tmp.path(), 5);
+            write_step_with_manifest_mismatch(tmp.path(), directory_step, manifest_step);
+            let error = latest_checkpoint(tmp.path()).unwrap_err();
+            let message = error.to_string();
+            assert!(
+                message.contains(&format!("directory step-{directory_step}"))
+                    && message.contains(&format!("manifest step {manifest_step}")),
+                "{label}: wrong rejection: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn latest_checkpoint_rejects_newer_exact_dir_without_a_manifest() {
+        // Ordinary publication exposes only atomically renamed final directories;
+        // silently falling back here would replay step 5 despite visible step 99.
         let tmp = TempDir::new("latest-partial");
         write_step(tmp.path(), 5);
-        std::fs::create_dir_all(tmp.path().join("step-99")).unwrap(); // no manifest
-        let got = latest_checkpoint(tmp.path()).unwrap().unwrap();
-        assert_eq!(got.step, 5, "the manifest-less step-99 must be skipped");
+        std::fs::create_dir_all(tmp.path().join("step-99")).unwrap();
+        assert!(matches!(
+            latest_checkpoint(tmp.path()).unwrap_err(),
+            CheckpointError::Io { .. }
+        ));
+    }
+
+    #[test]
+    fn latest_checkpoint_ignores_malformed_older_exact_dir_without_replay() {
+        let tmp = TempDir::new("latest-older-malformed");
+        std::fs::create_dir_all(tmp.path().join("step-1")).unwrap();
+        write_step(tmp.path(), 5);
+        assert_eq!(latest_checkpoint(tmp.path()).unwrap().unwrap().step, 5);
+    }
+
+    #[test]
+    fn latest_checkpoint_rejects_newer_malformed_manifest_and_suffix_overflow() {
+        let malformed = TempDir::new("latest-malformed");
+        write_step(malformed.path(), 5);
+        let bad_dir = malformed.path().join("step-99");
+        std::fs::create_dir_all(&bad_dir).unwrap();
+        std::fs::write(bad_dir.join(MANIFEST_FILE), b"{not-json").unwrap();
+        assert!(matches!(
+            latest_checkpoint(malformed.path()).unwrap_err(),
+            CheckpointError::Manifest(_)
+        ));
+
+        let overflow = TempDir::new("latest-overflow");
+        write_step(overflow.path(), 5);
+        std::fs::create_dir_all(overflow.path().join("step-18446744073709551616")).unwrap();
+        let error = latest_checkpoint(overflow.path()).unwrap_err();
+        assert!(error.to_string().contains("u64 step range"), "{error}");
+    }
+
+    #[test]
+    fn latest_checkpoint_rejects_newer_exact_final_name_that_is_not_a_directory() {
+        let tmp = TempDir::new("latest-final-file");
+        write_step(tmp.path(), 5);
+        std::fs::write(
+            tmp.path().join("step-99"),
+            b"not an atomic checkpoint directory",
+        )
+        .unwrap();
+        let error = latest_checkpoint(tmp.path()).unwrap_err();
+        assert!(error.to_string().contains("is not a directory"), "{error}");
     }
 
     #[test]
@@ -2542,12 +4027,52 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("step-abc")).unwrap();
         std::fs::create_dir_all(tmp.path().join("step-")).unwrap();
         std::fs::create_dir_all(tmp.path().join("latest")).unwrap();
-        std::fs::write(tmp.path().join("step-100"), b"a file, not a dir").unwrap();
+        std::fs::write(tmp.path().join("step-100.foreign"), b"a foreign file").unwrap();
         let got = latest_checkpoint(tmp.path()).unwrap().unwrap();
         assert_eq!(
             got.step, 3,
             "only the real step-3 checkpoint is a candidate"
         );
         assert_eq!(got.dir, tmp.path().join("step-3"));
+    }
+
+    #[test]
+    fn ordinary_and_continuation_discovery_keep_checkpoint_kinds_disjoint() {
+        let tmp = TempDir::new("discovery-kinds");
+        write_step(tmp.path(), 3);
+        save_adapter(
+            tmp.path().join("step-1"),
+            &make_vars(),
+            1,
+            Some("explicit-eval-adapter"),
+        )
+        .unwrap();
+        let continuation = tmp.path().join("step-9");
+        save_checkpoint_no_replace(
+            &continuation,
+            &make_vars(),
+            &make_opt_state(),
+            &[1],
+            None,
+            continuation_manifest(9),
+        )
+        .unwrap();
+
+        assert_eq!(
+            latest_checkpoint(tmp.path()).unwrap().unwrap(),
+            LatestCheckpoint {
+                dir: tmp.path().join("step-3"),
+                step: 3,
+            }
+        );
+        assert_eq!(
+            latest_rollout_ledger_continuation(tmp.path())
+                .unwrap()
+                .unwrap(),
+            LatestCheckpoint {
+                dir: continuation,
+                step: 9,
+            }
+        );
     }
 }

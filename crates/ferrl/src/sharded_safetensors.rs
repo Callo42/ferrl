@@ -10,8 +10,10 @@
 //! Indexed checkpoints keep `weight_map` authoritative and open a shard only
 //! when its declared tensor is requested. Index shard names must be one ordinary
 //! relative `.safetensors` filename; directories, absolute paths, `.`/`..`, and
-//! symlink shard files are rejected. Each accepted shard is opened once, its
-//! complete extent is validated, and all later reads use that stable handle.
+//! symlink shard files are rejected. Bound production loads authenticate each
+//! accepted shard in fixed-size chunks and verify the exact chunks used by every
+//! later tensor read, forming an immutable authenticated view without copying a
+//! multi-billion-parameter checkpoint into memory or temporary storage.
 
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
@@ -26,11 +28,13 @@ use candle_nn::{Init, VarBuilder};
 use safetensors::tensor::{Metadata, TensorInfo};
 use serde::de::{Error as _, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
+use sha2::{Digest, Sha256};
 
 use crate::tensor_parallel::TensorParallelPlan;
 
 const HEADER_LEN_BYTES: usize = 8;
 const MAX_HEADER_LEN: usize = 100_000_000;
+const AUTH_CHUNK_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug)]
 struct OpenShard {
@@ -39,6 +43,7 @@ struct OpenShard {
     file_len: u64,
     data_start: u64,
     metadata: Metadata,
+    authenticated_chunks: Option<Vec<[u8; 32]>>,
 }
 
 #[derive(Debug, Clone)]
@@ -65,7 +70,21 @@ struct ShardedSafetensorsBackend {
     plan: TensorParallelPlan,
 }
 
+/// Rank-invariant description of the exact authenticated checkpoint sources that
+/// back a streaming [`VarBuilder`].
+///
+/// `weight_map` contains only the model-family-selected tensors. `shards` is in
+/// filename order and hashes each complete source while recording fixed-size
+/// chunk digests. Every later model read authenticates the exact returned bytes
+/// against those captured chunk digests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BoundSafetensorsIdentity {
+    pub(crate) weight_map: Vec<(String, String)>,
+    pub(crate) shards: Vec<(String, u64, [u8; 32])>,
+}
+
 impl ShardedSafetensorsBackend {
+    #[cfg(test)]
     fn from_dir(dir: &Path, plan: TensorParallelPlan) -> CandleResult<Self> {
         ensure_supported_platform()?;
         let index_path = dir.join("model.safetensors.index.json");
@@ -211,6 +230,7 @@ impl SimpleBackend for ShardedSafetensorsBackend {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn varbuilder_from_rank_local_safetensors(
     dir: &Path,
     dtype: DType,
@@ -222,6 +242,111 @@ pub(crate) fn varbuilder_from_rank_local_safetensors(
         Box::new(backend),
         dtype,
         device.clone(),
+    ))
+}
+
+/// Build a rank-local streaming backend and bind its identity to the same open
+/// handles retained for all later tensor reads.
+///
+/// The selector is applied before shards are opened. This keeps a text-only
+/// policy independent of vision-only shard assignments while ensuring every
+/// rank hashes the same logical source set regardless of its local TP slice.
+pub(crate) fn varbuilder_from_rank_local_safetensors_bound(
+    dir: &Path,
+    dtype: DType,
+    device: &Device,
+    plan: TensorParallelPlan,
+    selected: impl Fn(&str) -> bool,
+) -> CandleResult<(VarBuilder<'static>, BoundSafetensorsIdentity)> {
+    ensure_supported_platform()?;
+    let index_path = dir.join("model.safetensors.index.json");
+    let single_path = dir.join("model.safetensors");
+    let (layout, identity) = if index_path.is_file() {
+        let assignments = read_index(&index_path)?
+            .into_iter()
+            .filter(|(tensor, _)| selected(tensor))
+            .collect::<HashMap<_, _>>();
+        if assignments.is_empty() {
+            return Err(msg(format!(
+                "no selected tensors found in {}",
+                index_path.display()
+            )));
+        }
+        let mut weight_map = assignments
+            .iter()
+            .map(|(tensor, shard)| (tensor.clone(), shard.to_string_lossy().into_owned()))
+            .collect::<Vec<_>>();
+        weight_map.sort();
+        let shard_names = weight_map
+            .iter()
+            .map(|(_, shard)| shard.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut open_shards = HashMap::new();
+        let mut shards = Vec::with_capacity(shard_names.len());
+        for name in shard_names {
+            let relative = PathBuf::from(&name);
+            let (shard, digest) = open_authenticated_shard(&dir.join(&relative))?;
+            shards.push((name, shard.file_len, digest));
+            open_shards.insert(relative, shard);
+        }
+        (
+            CheckpointLayout::Indexed {
+                dir: dir.to_path_buf(),
+                assignments,
+                open_shards: Mutex::new(open_shards),
+            },
+            BoundSafetensorsIdentity { weight_map, shards },
+        )
+    } else if single_path.is_file() {
+        let (shard, digest) = open_authenticated_shard(&single_path)?;
+        let mut weight_map = shard
+            .metadata
+            .tensors()
+            .into_iter()
+            .filter(|(name, _)| selected(name))
+            .map(|(name, _)| (name, "model.safetensors".to_string()))
+            .collect::<Vec<_>>();
+        weight_map.sort();
+        if weight_map.is_empty() {
+            return Err(msg(format!(
+                "no selected tensors found in {}",
+                single_path.display()
+            )));
+        }
+        let tensors = weight_map
+            .iter()
+            .map(|(name, _)| {
+                let info = shard.metadata.info(name).cloned().ok_or_else(|| {
+                    msg(format!(
+                        "selected tensor {name:?} disappeared from metadata"
+                    ))
+                })?;
+                Ok((
+                    name.clone(),
+                    TensorSource {
+                        shard: Arc::clone(&shard),
+                        info,
+                    },
+                ))
+            })
+            .collect::<CandleResult<HashMap<_, _>>>()?;
+        (
+            CheckpointLayout::Single { tensors },
+            BoundSafetensorsIdentity {
+                weight_map,
+                shards: vec![("model.safetensors".to_string(), shard.file_len, digest)],
+            },
+        )
+    } else {
+        return Err(msg(format!(
+            "neither model.safetensors.index.json nor model.safetensors found in {}",
+            dir.display()
+        )));
+    };
+    let backend = ShardedSafetensorsBackend { layout, plan };
+    Ok((
+        VarBuilder::from_backend(Box::new(backend), dtype, device.clone()),
+        identity,
     ))
 }
 
@@ -308,6 +433,117 @@ fn validate_shard_name(index_path: &Path, shard: &str) -> CandleResult<PathBuf> 
     Ok(path.to_path_buf())
 }
 
+fn open_authenticated_shard(path: &Path) -> CandleResult<(Arc<OpenShard>, [u8; 32])> {
+    let path_metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| msg(format!("inspect {}: {error}", path.display())))?;
+    if path_metadata.file_type().is_symlink() {
+        return Err(msg(format!(
+            "safetensors shard {} is a symlink; shard symlinks are not supported",
+            path.display()
+        )));
+    }
+    if !path_metadata.is_file() {
+        return Err(msg(format!(
+            "safetensors shard {} is not a regular file",
+            path.display()
+        )));
+    }
+    let mut file =
+        File::open(path).map_err(|error| msg(format!("open {}: {error}", path.display())))?;
+    let file_metadata = file
+        .metadata()
+        .map_err(|error| msg(format!("inspect opened {}: {error}", path.display())))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if path_metadata.dev() != file_metadata.dev() || path_metadata.ino() != file_metadata.ino()
+        {
+            return Err(msg(format!(
+                "safetensors shard {} changed while it was being opened",
+                path.display()
+            )));
+        }
+    }
+
+    let file_len = file_metadata.len();
+    let chunk_count = file_len
+        .checked_add(AUTH_CHUNK_BYTES as u64 - 1)
+        .ok_or_else(|| msg("safetensors authentication chunk count overflows u64".into()))?
+        / AUTH_CHUNK_BYTES as u64;
+    let mut chunk_digests =
+        Vec::with_capacity(usize::try_from(chunk_count).map_err(|_| {
+            msg("safetensors authentication chunk count does not fit usize".into())
+        })?);
+    let mut full_hasher = Sha256::new();
+    let mut buffer = vec![0_u8; AUTH_CHUNK_BYTES];
+    let mut remaining = file_len;
+    while remaining > 0 {
+        let chunk_len = usize::try_from(remaining.min(AUTH_CHUNK_BYTES as u64)).map_err(|_| {
+            msg("safetensors authentication chunk length does not fit usize".into())
+        })?;
+        file.read_exact(&mut buffer[..chunk_len])
+            .map_err(|error| msg(format!("read {}: {error}", path.display())))?;
+        full_hasher.update(&buffer[..chunk_len]);
+        chunk_digests.push(Sha256::digest(&buffer[..chunk_len]).into());
+        remaining -= chunk_len as u64;
+    }
+
+    let mut len_bytes = [0_u8; HEADER_LEN_BYTES];
+    read_authenticated_absolute(&mut file, path, file_len, &chunk_digests, 0, &mut len_bytes)?;
+    let header_len = usize::try_from(u64::from_le_bytes(len_bytes)).map_err(|_| {
+        msg(format!(
+            "{} header length does not fit usize",
+            path.display()
+        ))
+    })?;
+    if header_len > MAX_HEADER_LEN {
+        return Err(msg(format!(
+            "{} safetensors header length {header_len} exceeds {MAX_HEADER_LEN}",
+            path.display()
+        )));
+    }
+    let mut header = vec![0_u8; header_len];
+    read_authenticated_absolute(
+        &mut file,
+        path,
+        file_len,
+        &chunk_digests,
+        HEADER_LEN_BYTES as u64,
+        &mut header,
+    )?;
+    let metadata: Metadata = serde_json::from_slice(&header)
+        .map_err(|error| msg(format!("parse {} header: {error}", path.display())))?;
+    let data_start = (HEADER_LEN_BYTES as u64)
+        .checked_add(header_len as u64)
+        .ok_or_else(|| msg(format!("{} header extent overflows u64", path.display())))?;
+    let data_len = u64::try_from(metadata.data_len())
+        .map_err(|_| msg(format!("{} data length does not fit u64", path.display())))?;
+    let declared_len = data_start.checked_add(data_len).ok_or_else(|| {
+        msg(format!(
+            "{} total file length overflows u64",
+            path.display()
+        ))
+    })?;
+    if declared_len != file_len {
+        return Err(msg(format!(
+            "safetensors shard {} declares file length {declared_len}, actual length is {file_len}",
+            path.display()
+        )));
+    }
+    Ok((
+        Arc::new(OpenShard {
+            path: path.to_path_buf(),
+            file: Mutex::new(file),
+            file_len,
+            data_start,
+            metadata,
+            authenticated_chunks: Some(chunk_digests),
+        }),
+        full_hasher.finalize().into(),
+    ))
+}
+
 fn open_shard(path: &Path) -> CandleResult<Arc<OpenShard>> {
     let path_metadata = std::fs::symlink_metadata(path)
         .map_err(|error| msg(format!("inspect {}: {error}", path.display())))?;
@@ -362,6 +598,7 @@ fn open_shard(path: &Path) -> CandleResult<Arc<OpenShard>> {
         file_len,
         data_start,
         metadata,
+        authenticated_chunks: None,
     }))
 }
 
@@ -466,6 +703,33 @@ fn read_rank_local_tensor(
             source.shard.path.display()
         ))
     })?;
+    if let Some(chunks) = source.shard.authenticated_chunks.as_deref() {
+        let mut mappings = Vec::with_capacity(expected[0]);
+        for row in 0..expected[0] {
+            let row_offset = row
+                .checked_mul(full_row_bytes)
+                .and_then(|offset| offset.checked_add(column_offset))
+                .ok_or_else(|| msg(format!("tensor {name:?} row offset overflow")))?;
+            let output_start = row
+                .checked_mul(row_bytes)
+                .ok_or_else(|| msg(format!("tensor {name:?} output offset overflow")))?;
+            mappings.push(tensor_read_mapping(
+                source,
+                row_offset,
+                output_start,
+                row_bytes,
+            )?);
+        }
+        read_authenticated_mappings(
+            &mut file,
+            &source.shard.path,
+            source.shard.file_len,
+            chunks,
+            &mappings,
+            &mut bytes,
+        )?;
+        return Ok(bytes);
+    }
     for row in 0..expected[0] {
         let row_offset = row
             .checked_mul(full_row_bytes)
@@ -516,6 +780,36 @@ fn read_tensor_range_into(
     tensor_relative_start: usize,
     output: &mut [u8],
 ) -> CandleResult<()> {
+    let mapping = tensor_read_mapping(source, tensor_relative_start, 0, output.len())?;
+    if let Some(chunks) = source.shard.authenticated_chunks.as_deref() {
+        return read_authenticated_mappings(
+            file,
+            &source.shard.path,
+            source.shard.file_len,
+            chunks,
+            &[mapping],
+            output,
+        );
+    }
+    file.seek(SeekFrom::Start(mapping.absolute_start))
+        .map_err(|error| msg(format!("seek {}: {error}", source.shard.path.display())))?;
+    file.read_exact(output)
+        .map_err(|error| msg(format!("read {}: {error}", source.shard.path.display())))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReadMapping {
+    absolute_start: u64,
+    output_start: usize,
+    len: usize,
+}
+
+fn tensor_read_mapping(
+    source: &TensorSource,
+    tensor_relative_start: usize,
+    output_start: usize,
+    len: usize,
+) -> CandleResult<ReadMapping> {
     let (tensor_start, tensor_end) = source.info.data_offsets;
     let tensor_len = tensor_end.checked_sub(tensor_start).ok_or_else(|| {
         msg(format!(
@@ -524,7 +818,7 @@ fn read_tensor_range_into(
         ))
     })?;
     let range_end = tensor_relative_start
-        .checked_add(output.len())
+        .checked_add(len)
         .ok_or_else(|| msg("tensor read range overflows usize".into()))?;
     if range_end > tensor_len {
         return Err(msg(format!(
@@ -544,8 +838,7 @@ fn read_tensor_range_into(
         .ok_or_else(|| msg("tensor absolute offset overflows u64".into()))?;
     let absolute_end = absolute
         .checked_add(
-            u64::try_from(output.len())
-                .map_err(|_| msg("tensor read length does not fit u64".into()))?,
+            u64::try_from(len).map_err(|_| msg("tensor read length does not fit u64".into()))?,
         )
         .ok_or_else(|| msg("tensor absolute end overflows u64".into()))?;
     if absolute_end > source.shard.file_len {
@@ -555,10 +848,175 @@ fn read_tensor_range_into(
             source.shard.path.display()
         )));
     }
-    file.seek(SeekFrom::Start(absolute))
-        .map_err(|error| msg(format!("seek {}: {error}", source.shard.path.display())))?;
-    file.read_exact(output)
-        .map_err(|error| msg(format!("read {}: {error}", source.shard.path.display())))
+    Ok(ReadMapping {
+        absolute_start: absolute,
+        output_start,
+        len,
+    })
+}
+
+fn read_authenticated_absolute(
+    file: &mut File,
+    path: &Path,
+    file_len: u64,
+    chunk_digests: &[[u8; 32]],
+    absolute_start: u64,
+    output: &mut [u8],
+) -> CandleResult<()> {
+    if output.is_empty() {
+        return Ok(());
+    }
+    read_authenticated_mappings(
+        file,
+        path,
+        file_len,
+        chunk_digests,
+        &[ReadMapping {
+            absolute_start,
+            output_start: 0,
+            len: output.len(),
+        }],
+        output,
+    )
+}
+
+/// Read a set of sorted, non-overlapping file ranges through the
+/// cryptographically immutable view captured at bound-loader construction.
+/// Each covering chunk is read and authenticated exactly once; only bytes from
+/// that verified local buffer are copied into the caller's output.
+#[allow(clippy::cognitive_complexity)] // one ordered sparse-range sweep preserves authenticate-once semantics
+fn read_authenticated_mappings(
+    file: &mut File,
+    path: &Path,
+    file_len: u64,
+    chunk_digests: &[[u8; 32]],
+    mappings: &[ReadMapping],
+    output: &mut [u8],
+) -> CandleResult<()> {
+    if mappings.is_empty() {
+        return Ok(());
+    }
+    for (index, mapping) in mappings.iter().enumerate() {
+        let output_end = mapping
+            .output_start
+            .checked_add(mapping.len)
+            .ok_or_else(|| msg("authenticated output range overflows usize".into()))?;
+        if output_end > output.len() {
+            return Err(msg(format!(
+                "authenticated output range {}..{output_end} exceeds output length {}",
+                mapping.output_start,
+                output.len()
+            )));
+        }
+        let file_end = mapping
+            .absolute_start
+            .checked_add(
+                u64::try_from(mapping.len)
+                    .map_err(|_| msg("authenticated read length does not fit u64".into()))?,
+            )
+            .ok_or_else(|| msg("authenticated file range overflows u64".into()))?;
+        if file_end > file_len {
+            return Err(msg(format!(
+                "authenticated read ending at {file_end} exceeds file length {file_len} in {}",
+                path.display()
+            )));
+        }
+        if index > 0 {
+            let previous = mappings[index - 1];
+            let previous_len = u64::try_from(previous.len)
+                .map_err(|_| msg("authenticated prior length does not fit u64".into()))?;
+            let previous_end = previous
+                .absolute_start
+                .checked_add(previous_len)
+                .ok_or_else(|| msg("authenticated prior range overflows u64".into()))?;
+            if mapping.absolute_start < previous_end {
+                return Err(msg(
+                    "authenticated read mappings must be sorted and non-overlapping".into(),
+                ));
+            }
+        }
+    }
+
+    let chunk_bytes = AUTH_CHUNK_BYTES as u64;
+    let mut mapping_index = 0_usize;
+    let mut chunk_index = mappings[0].absolute_start / chunk_bytes;
+    let mut chunk = vec![0_u8; AUTH_CHUNK_BYTES];
+    while mapping_index < mappings.len() {
+        let chunk_start = chunk_index
+            .checked_mul(chunk_bytes)
+            .ok_or_else(|| msg("authenticated chunk offset overflows u64".into()))?;
+        let chunk_len = usize::try_from((file_len - chunk_start).min(chunk_bytes))
+            .map_err(|_| msg("authenticated chunk length does not fit usize".into()))?;
+        let expected = chunk_digests
+            .get(
+                usize::try_from(chunk_index)
+                    .map_err(|_| msg("authenticated chunk index does not fit usize".into()))?,
+            )
+            .ok_or_else(|| msg("authenticated chunk digest is missing".into()))?;
+        file.seek(SeekFrom::Start(chunk_start))
+            .map_err(|error| msg(format!("seek {}: {error}", path.display())))?;
+        file.read_exact(&mut chunk[..chunk_len])
+            .map_err(|error| msg(format!("read {}: {error}", path.display())))?;
+        let actual: [u8; 32] = Sha256::digest(&chunk[..chunk_len]).into();
+        if &actual != expected {
+            return Err(msg(format!(
+                "safetensors shard {} changed after its bound identity was captured; authenticated chunk {chunk_index} does not match",
+                path.display()
+            )));
+        }
+
+        let chunk_len_u64 = u64::try_from(chunk_len)
+            .map_err(|_| msg("authenticated chunk length does not fit u64".into()))?;
+        let chunk_end = chunk_start
+            .checked_add(chunk_len_u64)
+            .ok_or_else(|| msg("authenticated chunk end overflows u64".into()))?;
+        let mut next_mapping = mapping_index;
+        while next_mapping < mappings.len() && mappings[next_mapping].absolute_start < chunk_end {
+            let mapping = mappings[next_mapping];
+            let mapping_len = u64::try_from(mapping.len)
+                .map_err(|_| msg("authenticated mapping length does not fit u64".into()))?;
+            let mapping_end = mapping
+                .absolute_start
+                .checked_add(mapping_len)
+                .ok_or_else(|| msg("authenticated mapping end overflows u64".into()))?;
+            let overlap_start = mapping.absolute_start.max(chunk_start);
+            let overlap_end = mapping_end.min(chunk_end);
+            if overlap_start < overlap_end {
+                let source_start = usize::try_from(overlap_start - chunk_start)
+                    .map_err(|_| msg("authenticated source offset does not fit usize".into()))?;
+                let destination_start = mapping
+                    .output_start
+                    .checked_add(
+                        usize::try_from(overlap_start - mapping.absolute_start).map_err(|_| {
+                            msg("authenticated destination offset does not fit usize".into())
+                        })?,
+                    )
+                    .ok_or_else(
+                        || msg("authenticated destination offset overflows usize".into()),
+                    )?;
+                let copy_len = usize::try_from(overlap_end - overlap_start)
+                    .map_err(|_| msg("authenticated copy length does not fit usize".into()))?;
+                output[destination_start..destination_start + copy_len]
+                    .copy_from_slice(&chunk[source_start..source_start + copy_len]);
+            }
+            if mapping_end <= chunk_end {
+                next_mapping += 1;
+            } else {
+                break;
+            }
+        }
+        mapping_index = next_mapping;
+        chunk_index = if mapping_index < mappings.len()
+            && mappings[mapping_index].absolute_start < chunk_end
+        {
+            chunk_index + 1
+        } else if mapping_index < mappings.len() {
+            mappings[mapping_index].absolute_start / chunk_bytes
+        } else {
+            break;
+        };
+    }
+    Ok(())
 }
 
 fn shape_error(name: &str, requested: &[usize], checkpoint: &[usize]) -> Error {
@@ -951,6 +1409,169 @@ mod tests {
         assert_eq!(
             got.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
             original.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
+    }
+
+    #[test]
+    fn bound_backend_identity_and_reads_survive_replacement_between_hash_and_load() {
+        let dir = TestDir::new("bound-replacement");
+        let path = dir.0.join("model.safetensors");
+        let original = matrix(2, 3);
+        safetensors::save(&HashMap::from([("weight", original.clone())]), &path).unwrap();
+        let (vb, original_identity) = varbuilder_from_rank_local_safetensors_bound(
+            &dir.0,
+            DType::F32,
+            &Device::Cpu,
+            TensorParallelPlan::new(0, 2).unwrap(),
+            |_| true,
+        )
+        .unwrap();
+
+        std::fs::rename(&path, dir.0.join("original.safetensors")).unwrap();
+        let replacement = Tensor::zeros((2, 3), DType::F32, &Device::Cpu).unwrap();
+        safetensors::save(&HashMap::from([("weight", replacement)]), &path).unwrap();
+        let (_replacement_vb, replacement_identity) = varbuilder_from_rank_local_safetensors_bound(
+            &dir.0,
+            DType::F32,
+            &Device::Cpu,
+            TensorParallelPlan::new(0, 2).unwrap(),
+            |_| true,
+        )
+        .unwrap();
+        assert_ne!(original_identity, replacement_identity);
+
+        let got = vb.get((2, 3), "weight").unwrap();
+        assert_eq!(
+            got.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            original.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            "the bound backend must load through the exact handle it hashed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bound_row_parallel_read_authenticates_multi_chunk_ranges_once() {
+        let dir = TestDir::new("bound-row-multi-chunk");
+        let path = dir.0.join("model.safetensors");
+        let original = matrix(1024, 512);
+        safetensors::save(&HashMap::from([("weight", original.clone())]), &path).unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() > 2 * AUTH_CHUNK_BYTES as u64);
+
+        let (vb, _identity) = varbuilder_from_rank_local_safetensors_bound(
+            &dir.0,
+            DType::F32,
+            &Device::Cpu,
+            TensorParallelPlan::new(1, 2).unwrap(),
+            |_| true,
+        )
+        .unwrap();
+        let expected = original.narrow(1, 256, 256).unwrap();
+        let got = vb.get((1024, 256), "weight").unwrap();
+        assert_eq!(
+            got.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            expected.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
+
+        let mutation_offset = AUTH_CHUNK_BYTES as u64 + 17;
+        let mut source = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        source.seek(SeekFrom::Start(mutation_offset)).unwrap();
+        let mut original_byte = [0_u8; 1];
+        source.read_exact(&mut original_byte).unwrap();
+        source.seek(SeekFrom::Start(mutation_offset)).unwrap();
+        source.write_all(&[original_byte[0] ^ 1]).unwrap();
+        source.flush().unwrap();
+        let error = vb.get((1024, 256), "weight").unwrap_err().to_string();
+        assert!(error.contains("authenticated chunk 1 does not match"));
+
+        source.seek(SeekFrom::Start(mutation_offset)).unwrap();
+        source.write_all(&original_byte).unwrap();
+        source.flush().unwrap();
+        drop(source);
+        let restored = vb.get((1024, 256), "weight").unwrap();
+        assert_eq!(
+            restored.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            expected.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // one mutation/restore lifecycle with identity and inode assertions
+    fn bound_backend_rejects_persistent_same_inode_mutation_then_accepts_exact_restore() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = TestDir::new("bound-in-place-mutation");
+        let path = dir.0.join("model.safetensors");
+        let original = matrix(2, 3);
+        safetensors::save(&HashMap::from([("weight", original.clone())]), &path).unwrap();
+        let original_bytes = std::fs::read(&path).unwrap();
+        let (vb, original_identity) = varbuilder_from_rank_local_safetensors_bound(
+            &dir.0,
+            DType::F32,
+            &Device::Cpu,
+            TensorParallelPlan::new(0, 2).unwrap(),
+            |_| true,
+        )
+        .unwrap();
+
+        let replacement_path = dir.0.join("replacement.safetensors");
+        let replacement = Tensor::zeros((2, 3), DType::F32, &Device::Cpu).unwrap();
+        safetensors::save(
+            &HashMap::from([("weight", replacement.clone())]),
+            &replacement_path,
+        )
+        .unwrap();
+        let replacement_bytes = std::fs::read(&replacement_path).unwrap();
+        let before = std::fs::metadata(&path).unwrap();
+        assert_eq!(replacement_bytes.len() as u64, before.len());
+        let mut source = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        source.seek(SeekFrom::Start(0)).unwrap();
+        source.write_all(&replacement_bytes).unwrap();
+        source.flush().unwrap();
+        drop(source);
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!(after.dev(), before.dev(), "mutation must preserve device");
+        assert_eq!(after.ino(), before.ino(), "mutation must preserve inode");
+        assert_eq!(after.len(), before.len(), "mutation must preserve length");
+
+        let error = vb.get((2, 3), "weight").unwrap_err().to_string();
+        assert!(error.contains("changed after its bound identity was captured"));
+
+        let (replacement_vb, replacement_identity) = varbuilder_from_rank_local_safetensors_bound(
+            &dir.0,
+            DType::F32,
+            &Device::Cpu,
+            TensorParallelPlan::new(0, 2).unwrap(),
+            |_| true,
+        )
+        .unwrap();
+        assert_ne!(original_identity, replacement_identity);
+        assert_eq!(
+            replacement_vb
+                .get((2, 3), "weight")
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            replacement.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            "the source mutation must remain present while the original builder is read"
+        );
+
+        let mut source = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        source.seek(SeekFrom::Start(0)).unwrap();
+        source.write_all(&original_bytes).unwrap();
+        source.flush().unwrap();
+        drop(source);
+        let got = vb.get((2, 3), "weight").unwrap();
+        assert_eq!(
+            got.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            original.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            "restoring the exact authenticated bytes must revive the existing bound view without rehashing"
         );
     }
 }

@@ -59,6 +59,10 @@ use ferrl::{
 const VOCAB: usize = 5;
 const SEED: u64 = 11;
 
+fn checkpoint_policy_sha256() -> String {
+    format!("{:064x}", 0xfeed_u64)
+}
+
 // ---- the deterministic policy ----------------------------------------------
 
 /// A one-layer `LoRA` LM (the toy-echo scaffold) whose `generate` is
@@ -164,6 +168,447 @@ impl Policy for ScriptedPolicy {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumePreflightPanic {
+    LoraRecipe,
+    TrainableVars,
+    SamplerValidation,
+}
+
+#[derive(Debug, Default)]
+struct ResumePreflightCalls {
+    generate: usize,
+    token_logprobs: Cell<usize>,
+    detached: Cell<usize>,
+    backward: Cell<usize>,
+    adapter_toggles: usize,
+    trainable_vars: Cell<usize>,
+    sampler_validation: Cell<usize>,
+    sampler_restore: usize,
+    lora_recipe: Cell<usize>,
+}
+
+/// A public-entry-point resume oracle whose fault is armed only after the test
+/// captures the live prestate. Raw state inspection deliberately reaches the
+/// inner policy so post-error assertions cannot accidentally retrigger the
+/// faulting hook.
+struct ResumePreflightPanicPolicy {
+    inner: ScriptedPolicy,
+    sampler_state: Vec<u8>,
+    rank: usize,
+    fault: ResumePreflightPanic,
+    armed: bool,
+    calls: ResumePreflightCalls,
+}
+
+impl ResumePreflightPanicPolicy {
+    fn new(rank: usize, fault: ResumePreflightPanic) -> Self {
+        Self {
+            inner: ScriptedPolicy::new(SEED).unwrap(),
+            sampler_state: vec![0xa5, rank as u8],
+            rank,
+            fault,
+            armed: false,
+            calls: ResumePreflightCalls::default(),
+        }
+    }
+
+    fn fault_here(&self, fault: ResumePreflightPanic) -> bool {
+        self.armed && self.rank == 1 && self.fault == fault
+    }
+
+    fn raw_var_bits(&self) -> Vec<Vec<u32>> {
+        var_bits(&self.inner)
+    }
+
+    fn raw_var_ids(&self) -> Vec<candle_core::TensorId> {
+        self.inner
+            .trainable_vars()
+            .iter()
+            .map(|var| var.as_tensor().id())
+            .collect()
+    }
+}
+
+impl Policy for ResumePreflightPanicPolicy {
+    fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
+        self.calls.generate += 1;
+        self.inner.generate(prompt, cfg)
+    }
+
+    fn token_logprobs(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+        self.calls
+            .token_logprobs
+            .set(self.calls.token_logprobs.get() + 1);
+        self.inner.token_logprobs(rollout)
+    }
+
+    fn token_logprobs_detached(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+        self.calls.detached.set(self.calls.detached.get() + 1);
+        self.inner.token_logprobs_detached(rollout)
+    }
+
+    fn backward(&self, loss: &Tensor) -> CandleResult<candle_core::backprop::GradStore> {
+        self.calls.backward.set(self.calls.backward.get() + 1);
+        self.inner.backward(loss)
+    }
+
+    fn set_adapter_enabled(&mut self, enabled: bool) {
+        self.calls.adapter_toggles += 1;
+        self.inner.set_adapter_enabled(enabled);
+    }
+
+    fn adapter_enabled(&self) -> bool {
+        self.inner.adapter_enabled()
+    }
+
+    fn trainable_vars(&self) -> Vec<Var> {
+        self.calls
+            .trainable_vars
+            .set(self.calls.trainable_vars.get() + 1);
+        assert!(
+            !self.fault_here(ResumePreflightPanic::TrainableVars),
+            "injected ordinary-resume trainable-vars panic"
+        );
+        self.inner.trainable_vars()
+    }
+
+    fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+        Ok(self.sampler_state.clone())
+    }
+
+    fn validate_sampler_state(&self, state: &[u8]) -> CandleResult<()> {
+        self.calls
+            .sampler_validation
+            .set(self.calls.sampler_validation.get() + 1);
+        assert!(
+            !self.fault_here(ResumePreflightPanic::SamplerValidation),
+            "injected ordinary-resume sampler-validation panic"
+        );
+        let _ = state;
+        Ok(())
+    }
+
+    fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
+        self.calls.sampler_restore += 1;
+        self.sampler_state = state.to_vec();
+        Ok(())
+    }
+
+    fn lora_recipe(&self) -> Option<String> {
+        self.calls.lora_recipe.set(self.calls.lora_recipe.get() + 1);
+        assert!(
+            !self.fault_here(ResumePreflightPanic::LoraRecipe),
+            "injected ordinary-resume lora-recipe panic"
+        );
+        self.inner.lora_recipe()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumePostconditionFault {
+    NoOpSamplerRestore,
+    ReplaceVarsDuringValidation,
+    ReplaceVarsDuringRestore,
+    MutateVarsDuringRestore,
+    ReplaceVarsBeforeOptimizer,
+    MutateVarsBeforeOptimizer,
+    ResetSamplerBeforeOptimizer,
+    PanicSamplerRestore,
+    PanicSamplerReadback,
+    PanicVarsDuringRestore,
+}
+
+impl ResumePostconditionFault {
+    const ALL: [Self; 10] = [
+        Self::NoOpSamplerRestore,
+        Self::ReplaceVarsDuringValidation,
+        Self::ReplaceVarsDuringRestore,
+        Self::MutateVarsDuringRestore,
+        Self::ReplaceVarsBeforeOptimizer,
+        Self::MutateVarsBeforeOptimizer,
+        Self::ResetSamplerBeforeOptimizer,
+        Self::PanicSamplerRestore,
+        Self::PanicSamplerReadback,
+        Self::PanicVarsDuringRestore,
+    ];
+
+    fn tag(self) -> &'static str {
+        match self {
+            Self::NoOpSamplerRestore => "no-op-sampler-restore",
+            Self::ReplaceVarsDuringValidation => "replace-vars-during-validation",
+            Self::ReplaceVarsDuringRestore => "replace-vars-during-restore",
+            Self::MutateVarsDuringRestore => "mutate-vars-during-restore",
+            Self::ReplaceVarsBeforeOptimizer => "replace-vars-before-optimizer",
+            Self::MutateVarsBeforeOptimizer => "mutate-vars-before-optimizer",
+            Self::ResetSamplerBeforeOptimizer => "reset-sampler-before-optimizer",
+            Self::PanicSamplerRestore => "panic-sampler-restore",
+            Self::PanicSamplerReadback => "panic-sampler-readback",
+            Self::PanicVarsDuringRestore => "panic-vars-during-restore",
+        }
+    }
+
+    fn local_error(self) -> &'static str {
+        match self {
+            Self::NoOpSamplerRestore => {
+                "policy did not install the exact ordinary checkpoint sampler state"
+            }
+            Self::ReplaceVarsDuringValidation => {
+                "policy trainable-variable set changed during ordinary checkpoint sampler validation"
+            }
+            Self::ReplaceVarsDuringRestore => {
+                "policy trainable-variable set changed during ordinary checkpoint restore"
+            }
+            Self::ReplaceVarsBeforeOptimizer => {
+                "policy trainable-variable set changed during ordinary checkpoint final pre-optimizer live-state seal"
+            }
+            Self::MutateVarsDuringRestore | Self::MutateVarsBeforeOptimizer => {
+                "policy trainable-variable value at ordered index 0 differs from the ordinary checkpoint at the final pre-optimizer live-state seal"
+            }
+            Self::ResetSamplerBeforeOptimizer => {
+                "policy sampler state differs from the ordinary checkpoint at the final pre-optimizer live-state seal"
+            }
+            Self::PanicSamplerRestore => {
+                "checkpoint validated-state application panicked: injected ordinary-resume sampler-restore panic"
+            }
+            Self::PanicSamplerReadback => {
+                "checkpoint validated-state application panicked: injected ordinary-resume sampler-readback panic"
+            }
+            Self::PanicVarsDuringRestore => {
+                "checkpoint validated-state application panicked: injected ordinary-resume restoration trainable-vars panic"
+            }
+        }
+    }
+
+    fn peer_error(self) -> &'static str {
+        match self {
+            Self::ReplaceVarsDuringValidation => {
+                "checkpoint identity/payload preflight failed on a peer rank"
+            }
+            Self::NoOpSamplerRestore
+            | Self::ReplaceVarsDuringRestore
+            | Self::PanicSamplerRestore
+            | Self::PanicSamplerReadback
+            | Self::PanicVarsDuringRestore => {
+                "checkpoint validated-state application failed on a peer rank"
+            }
+            Self::ReplaceVarsBeforeOptimizer
+            | Self::MutateVarsDuringRestore
+            | Self::MutateVarsBeforeOptimizer
+            | Self::ResetSamplerBeforeOptimizer => {
+                "ordinary checkpoint pre-optimizer live-state seal failed on a peer rank"
+            }
+        }
+    }
+
+    fn replaces_vars(self) -> bool {
+        matches!(
+            self,
+            Self::ReplaceVarsDuringValidation
+                | Self::ReplaceVarsDuringRestore
+                | Self::ReplaceVarsBeforeOptimizer
+        )
+    }
+
+    fn preserves_sampler(self) -> bool {
+        matches!(self, Self::NoOpSamplerRestore | Self::PanicSamplerRestore)
+    }
+
+    fn mutates_var_values(self) -> bool {
+        matches!(
+            self,
+            Self::MutateVarsDuringRestore | Self::MutateVarsBeforeOptimizer
+        )
+    }
+
+    fn resets_sampler(self) -> bool {
+        self == Self::ResetSamplerBeforeOptimizer
+    }
+}
+
+#[derive(Debug, Default)]
+struct ResumePostconditionCalls {
+    generate: usize,
+    token_logprobs: Cell<usize>,
+    detached: Cell<usize>,
+    backward: Cell<usize>,
+}
+
+/// Adversarial public-`Policy` oracle for ordinary resume. Replacements install
+/// newly allocated but schema-identical policies, while the value and sampler
+/// faults mutate existing live state after the checkpoint's immediate checks.
+struct ResumePostconditionPolicy {
+    inner: RefCell<ScriptedPolicy>,
+    sampler_state: Vec<u8>,
+    rank: usize,
+    fault_rank: usize,
+    fault: ResumePostconditionFault,
+    fault_fired: Cell<bool>,
+    restore_completed: Cell<bool>,
+    value_mutation_prestate: RefCell<Option<Vec<u32>>>,
+    sampler_reset_prestate: RefCell<Option<Vec<u8>>>,
+    calls: ResumePostconditionCalls,
+}
+
+impl ResumePostconditionPolicy {
+    fn new(rank: usize, fault_rank: usize, fault: ResumePostconditionFault) -> Self {
+        Self {
+            inner: RefCell::new(ScriptedPolicy::new(SEED).unwrap()),
+            sampler_state: vec![0xa5, rank as u8],
+            rank,
+            fault_rank,
+            fault,
+            fault_fired: Cell::new(false),
+            restore_completed: Cell::new(false),
+            value_mutation_prestate: RefCell::new(None),
+            sampler_reset_prestate: RefCell::new(None),
+            calls: ResumePostconditionCalls::default(),
+        }
+    }
+
+    fn take_fault(&self, fault: ResumePostconditionFault) -> bool {
+        if self.rank == self.fault_rank && self.fault == fault && !self.fault_fired.get() {
+            self.fault_fired.set(true);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn replacement(&self) -> CandleResult<ScriptedPolicy> {
+        ScriptedPolicy::new(SEED.wrapping_add(10_000 + self.rank as u64))
+    }
+
+    fn raw_var_ids(&self) -> Vec<candle_core::TensorId> {
+        self.inner
+            .borrow()
+            .trainable_vars()
+            .iter()
+            .map(|var| var.as_tensor().id())
+            .collect()
+    }
+
+    fn raw_var_shapes(&self) -> Vec<Vec<usize>> {
+        self.inner
+            .borrow()
+            .trainable_vars()
+            .iter()
+            .map(|var| var.as_tensor().dims().to_vec())
+            .collect()
+    }
+
+    fn first_var_bits(&self) -> Vec<u32> {
+        let var = self.inner.borrow().trainable_vars().remove(0);
+        var.as_tensor()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    fn mutate_first_var(&self) -> CandleResult<()> {
+        let var = self.inner.borrow().trainable_vars().remove(0);
+        *self.value_mutation_prestate.borrow_mut() = Some(self.first_var_bits());
+        let mutated = var.as_tensor().affine(1.0, 1.0)?;
+        var.set(&mutated)
+    }
+}
+
+impl Policy for ResumePostconditionPolicy {
+    fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
+        self.calls.generate += 1;
+        self.inner.get_mut().generate(prompt, cfg)
+    }
+
+    fn token_logprobs(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+        self.calls
+            .token_logprobs
+            .set(self.calls.token_logprobs.get() + 1);
+        self.inner.borrow().token_logprobs(rollout)
+    }
+
+    fn token_logprobs_detached(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+        self.calls.detached.set(self.calls.detached.get() + 1);
+        Ok(self.inner.borrow().token_logprobs(rollout)?.detach())
+    }
+
+    fn backward(&self, loss: &Tensor) -> CandleResult<candle_core::backprop::GradStore> {
+        self.calls.backward.set(self.calls.backward.get() + 1);
+        loss.backward()
+    }
+
+    fn set_adapter_enabled(&mut self, enabled: bool) {
+        if self.take_fault(ResumePostconditionFault::ReplaceVarsBeforeOptimizer) {
+            let replacement = self.replacement().unwrap();
+            *self.inner.get_mut() = replacement;
+        }
+        if self.take_fault(ResumePostconditionFault::MutateVarsBeforeOptimizer) {
+            self.mutate_first_var().unwrap();
+        }
+        if self.take_fault(ResumePostconditionFault::ResetSamplerBeforeOptimizer) {
+            *self.sampler_reset_prestate.borrow_mut() = Some(self.sampler_state.clone());
+            self.sampler_state = vec![0x5a, self.rank as u8];
+        }
+        self.inner.get_mut().set_adapter_enabled(enabled);
+    }
+
+    fn adapter_enabled(&self) -> bool {
+        self.inner.borrow().adapter_enabled()
+    }
+
+    fn trainable_vars(&self) -> Vec<Var> {
+        assert!(
+            !(self.restore_completed.get()
+                && self.take_fault(ResumePostconditionFault::PanicVarsDuringRestore)),
+            "injected ordinary-resume restoration trainable-vars panic"
+        );
+        self.inner.borrow().trainable_vars()
+    }
+
+    fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+        assert!(
+            !(self.restore_completed.get()
+                && self.take_fault(ResumePostconditionFault::PanicSamplerReadback)),
+            "injected ordinary-resume sampler-readback panic"
+        );
+        Ok(self.sampler_state.clone())
+    }
+
+    fn validate_sampler_state(&self, state: &[u8]) -> CandleResult<()> {
+        if !state.is_empty() {
+            candle_core::bail!("test ordinary checkpoint sampler state must be empty")
+        }
+        if self.take_fault(ResumePostconditionFault::ReplaceVarsDuringValidation) {
+            let replacement = self.replacement()?;
+            *self.inner.borrow_mut() = replacement;
+        }
+        Ok(())
+    }
+
+    fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
+        assert!(
+            !self.take_fault(ResumePostconditionFault::PanicSamplerRestore),
+            "injected ordinary-resume sampler-restore panic"
+        );
+        if self.take_fault(ResumePostconditionFault::NoOpSamplerRestore) {
+            return Ok(());
+        }
+        if self.take_fault(ResumePostconditionFault::ReplaceVarsDuringRestore) {
+            let replacement = self.replacement()?;
+            *self.inner.get_mut() = replacement;
+        }
+        self.sampler_state = state.to_vec();
+        if self.take_fault(ResumePostconditionFault::MutateVarsDuringRestore) {
+            self.mutate_first_var()?;
+        }
+        self.restore_completed.set(true);
+        Ok(())
+    }
+}
+
 /// A deterministic but genuinely stateful rollout stream over the same real
 /// LoRA/autograd scoring path as [`ScriptedPolicy`]. Each prompt group advances
 /// an opaque epoch and changes how many rows echo the prompt, so sampler handoff
@@ -253,6 +698,13 @@ impl Policy for StatefulScriptedPolicy {
         let mut state = Self::STATE_MAGIC.to_vec();
         state.extend_from_slice(&self.sampler_epoch.to_le_bytes());
         Ok(state)
+    }
+
+    fn validate_sampler_state(&self, state: &[u8]) -> CandleResult<()> {
+        if state.len() != 12 || state[..4] != Self::STATE_MAGIC {
+            candle_core::bail!("invalid stateful scripted sampler state")
+        }
+        Ok(())
     }
 
     fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
@@ -563,6 +1015,19 @@ impl RewardFn for EchoOrFlatReward {
             (Some(p), Some(c)) if p == c => 1.0,
             _ => 0.0,
         })
+    }
+}
+
+struct PreflightCountingReward {
+    calls: Arc<AtomicUsize>,
+}
+
+impl RewardFn for PreflightCountingReward {
+    type Target = ();
+
+    fn reward(&self, _sample: &Sample<()>, _completion: &str) -> Result<f32, RewardError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        panic!("ordinary resume preflight failure reached reward evaluation")
     }
 }
 
@@ -1291,6 +1756,37 @@ impl Comm for SpyComm {
     }
 }
 
+#[derive(Debug)]
+struct ResumePreflightCountingComm<C> {
+    inner: C,
+    scalar_calls: Arc<AtomicUsize>,
+    tensor_calls: Arc<AtomicUsize>,
+}
+
+impl<C: Comm> Comm for ResumePreflightCountingComm<C> {
+    fn rank(&self) -> usize {
+        self.inner.rank()
+    }
+
+    fn world_size(&self) -> usize {
+        self.inner.world_size()
+    }
+
+    fn validate_all_reduce_sum(&self, tensors: &[Tensor]) -> Result<(), CommError> {
+        self.inner.validate_all_reduce_sum(tensors)
+    }
+
+    fn all_reduce_sum(&self, tensors: &mut Vec<Tensor>) -> Result<(), CommError> {
+        self.tensor_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.all_reduce_sum(tensors)
+    }
+
+    fn all_reduce_scalar_sum(&self, value: f64) -> Result<f64, CommError> {
+        self.scalar_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.all_reduce_scalar_sum(value)
+    }
+}
+
 // ---- harness ----------------------------------------------------------------
 
 struct TempDir(PathBuf);
@@ -1465,7 +1961,9 @@ fn run_scripted_world(
                     let rank = comm.rank();
                     let mut policy = ScriptedPolicy::new(SEED).unwrap();
                     let run = RunDir::create(base, format!("rank{rank}")).unwrap();
-                    let mut trainer = Trainer::with_comm(cfg.clone(), &run, comm).unwrap();
+                    let mut trainer = Trainer::with_comm(cfg.clone(), &run, comm)
+                        .unwrap()
+                        .with_checkpoint_policy_sha256(checkpoint_policy_sha256());
                     let history = trainer
                         .train(&mut policy, &EchoOrFlatReward, &CharTokenizer, samples)
                         .unwrap();
@@ -1482,7 +1980,9 @@ fn run_scripted_world(
 fn run_scripted_single(base: &Path, cfg: &TrainerConfig, samples: &[Sample<()>]) -> RankRun {
     let mut policy = ScriptedPolicy::new(SEED).unwrap();
     let run = RunDir::create(base, "single").unwrap();
-    let mut trainer = Trainer::new(cfg.clone(), &run).unwrap();
+    let mut trainer = Trainer::new(cfg.clone(), &run)
+        .unwrap()
+        .with_checkpoint_policy_sha256(checkpoint_policy_sha256());
     let history = trainer
         .train(&mut policy, &EchoOrFlatReward, &CharTokenizer, samples)
         .unwrap();
@@ -1527,15 +2027,19 @@ fn run_stateful_direct_dp(
                     let mut policy = StatefulScriptedPolicy::new(SEED, 0).unwrap();
                     let initial_adapter = var_bits(&policy);
                     let run = RunDir::create(&base, format!("{tag}-direct-rank{rank}")).unwrap();
-                    let mut trainer = Trainer::with_comm(cfg.clone(), &run, comm).unwrap();
+                    let mut trainer = Trainer::with_comm(cfg.clone(), &run, comm)
+                        .unwrap()
+                        .with_checkpoint_policy_sha256(checkpoint_policy_sha256());
                     let metrics = trainer
                         .train(&mut policy, &EchoOrFlatReward, &CharTokenizer, &samples)
                         .unwrap()
                         .0;
                     let optimizer = if rank == 0 {
+                        let binding = trainer.checkpoint_binding(&policy, 1).unwrap();
                         let loaded = ferrl::load_checkpoint(
                             run.checkpoints_dir().join(format!("step-{}", cfg.steps)),
                             &policy.trainable_vars(),
+                            &binding,
                         )
                         .unwrap();
                         Some(optimizer_bits(&loaded.optimizer_state.unwrap()))
@@ -1784,7 +2288,9 @@ fn preemption_flag_stops_the_whole_dp_world_in_lockstep() {
                     let rank = comm.rank();
                     let mut policy = ScriptedPolicy::new(SEED).unwrap();
                     let run = RunDir::create(&base, format!("rank{rank}")).unwrap();
-                    let mut trainer = Trainer::with_comm(cfg, &run, comm).unwrap();
+                    let mut trainer = Trainer::with_comm(cfg, &run, comm)
+                        .unwrap()
+                        .with_checkpoint_policy_sha256(checkpoint_policy_sha256());
                     if rank == 0 {
                         trainer = trainer.with_preemption_flag(flag0);
                     }
@@ -1985,7 +2491,9 @@ fn world_one_rollout_ledger_update_is_bit_identical_to_direct_training() {
     let mut direct_policy = ScriptedPolicy::new(SEED).unwrap();
     let initial_adapter = var_bits(&direct_policy);
     let direct_run = RunDir::create(tmp.path(), "direct").unwrap();
-    let mut direct_trainer = Trainer::new(cfg.clone(), &direct_run).unwrap();
+    let mut direct_trainer = Trainer::new(cfg.clone(), &direct_run)
+        .unwrap()
+        .with_checkpoint_policy_sha256(policy_sha256.clone());
     let (direct_history, _) = direct_trainer
         .train(
             &mut direct_policy,
@@ -2017,6 +2525,7 @@ fn world_one_rollout_ledger_update_is_bit_identical_to_direct_training() {
     let direct_checkpoint = ferrl::checkpoint::load_checkpoint(
         direct_run.checkpoints_dir().join("step-1"),
         &direct_probe.trainable_vars(),
+        &direct_trainer.checkpoint_binding(&direct_probe, 1).unwrap(),
     )
     .unwrap();
     let direct_optimizer = direct_checkpoint
@@ -2481,7 +2990,9 @@ fn world_one_rollout_ledger_sampler_handoff_and_resume_are_bit_exact() {
 
     let mut direct_policy = StatefulScriptedPolicy::new(SEED, 0).unwrap();
     let direct_run = RunDir::create(tmp.path(), "stateful-direct").unwrap();
-    let mut direct_trainer = Trainer::new(cfg.clone(), &direct_run).unwrap();
+    let mut direct_trainer = Trainer::new(cfg.clone(), &direct_run)
+        .unwrap()
+        .with_checkpoint_policy_sha256(policy_sha256.clone());
     let (direct_metrics, direct_stop) = direct_trainer
         .train(
             &mut direct_policy,
@@ -2506,6 +3017,7 @@ fn world_one_rollout_ledger_sampler_handoff_and_resume_are_bit_exact() {
     let direct_checkpoint = ferrl::load_checkpoint(
         direct_run.checkpoints_dir().join("step-3"),
         &direct_probe.trainable_vars(),
+        &direct_trainer.checkpoint_binding(&direct_probe, 1).unwrap(),
     )
     .unwrap();
     let direct_optimizer = direct_checkpoint.optimizer_state.unwrap();
@@ -2774,7 +3286,12 @@ fn world_one_rollout_ledger_sampler_handoff_and_resume_are_bit_exact() {
         first_continuation_state.optimizer_state(),
         &learner_policy.sampler_state().unwrap(),
         999,
-        learner_policy.lora_recipe().as_deref(),
+        &ferrl::CheckpointBinding::new(
+            policy_sha256.clone(),
+            "b".repeat(64),
+            learner_policy.lora_recipe(),
+        )
+        .unwrap(),
     )
     .unwrap();
     let mut ordinary_discovery_probe = StatefulScriptedPolicy::new(SEED, 0).unwrap();
@@ -3110,6 +3627,138 @@ fn copy_checkpoint_package(source: &Path, destination: &Path) {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum OrdinaryDiscoveryFailureCase {
+    LegacyOnly,
+    OlderLegacyBeforeV4,
+    NewerLegacyAfterV4,
+    WrongContinuationKindOnly,
+    WrongContinuationKindAfterV4,
+    NewerDirectoryOlderManifest,
+    OlderDirectoryNewerManifest,
+}
+
+impl OrdinaryDiscoveryFailureCase {
+    fn tag(self) -> &'static str {
+        match self {
+            Self::LegacyOnly => "legacy-only",
+            Self::OlderLegacyBeforeV4 => "older-legacy-before-v4",
+            Self::NewerLegacyAfterV4 => "newer-legacy-after-v4",
+            Self::WrongContinuationKindOnly => "wrong-continuation-kind-only",
+            Self::WrongContinuationKindAfterV4 => "wrong-continuation-kind-after-v4",
+            Self::NewerDirectoryOlderManifest => "newer-dir-older-manifest",
+            Self::OlderDirectoryNewerManifest => "older-dir-newer-manifest",
+        }
+    }
+}
+
+fn rewrite_as_legacy_v3(checkpoint: &Path, step: u64) {
+    let manifest_path = checkpoint.join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["format_version"] = serde_json::json!(3);
+    manifest["step"] = serde_json::json!(step);
+    manifest
+        .as_object_mut()
+        .unwrap()
+        .remove("ordinary_checkpoint");
+    std::fs::write(manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+}
+
+fn add_fully_typed_wrong_continuation_kind(checkpoint: &Path, step: u64) {
+    let manifest_path = checkpoint.join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["rollout_ledger_continuation"] = serde_json::json!({
+        "format_version": 3,
+        "kind": "ordinary",
+        "world_size": 1,
+        "tensor_parallel_world_size": 1,
+        "tensor_parallel_layout": "tensor_parallel.communicator_rank_ascending.v1",
+        "completed_step": step,
+        "policy_sha256": "a".repeat(64),
+        "trainer_config_sha256": "b".repeat(64),
+        "tensor_schema_sha256": "c".repeat(64),
+        "adapter_sha256": "d".repeat(64),
+        "optimizer_sha256": "e".repeat(64),
+        "sampler_sha256": "f".repeat(64),
+        "parent_lineage_sha256": "1".repeat(64),
+        "consumed_ledger_sha256": "2".repeat(64),
+        "lineage_sha256": "3".repeat(64),
+    });
+    std::fs::write(manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+}
+
+fn prepare_ordinary_discovery_failure_case(
+    base: &Path,
+    seed: &Path,
+    case: OrdinaryDiscoveryFailureCase,
+) -> PathBuf {
+    let root = base.join(case.tag());
+    match case {
+        OrdinaryDiscoveryFailureCase::LegacyOnly => {
+            let legacy = root.join("step-4");
+            copy_checkpoint_package(&seed.join("step-3"), &legacy);
+            rewrite_as_legacy_v3(&legacy, 4);
+        }
+        OrdinaryDiscoveryFailureCase::OlderLegacyBeforeV4 => {
+            let legacy = root.join("step-1");
+            copy_checkpoint_package(&seed.join("step-1"), &legacy);
+            rewrite_as_legacy_v3(&legacy, 1);
+            copy_checkpoint_package(&seed.join("step-3"), &root.join("step-3"));
+        }
+        OrdinaryDiscoveryFailureCase::NewerLegacyAfterV4 => {
+            copy_checkpoint_package(&seed.join("step-1"), &root.join("step-1"));
+            let legacy = root.join("step-4");
+            copy_checkpoint_package(&seed.join("step-3"), &legacy);
+            rewrite_as_legacy_v3(&legacy, 4);
+        }
+        OrdinaryDiscoveryFailureCase::WrongContinuationKindOnly => {
+            let legacy = root.join("step-4");
+            copy_checkpoint_package(&seed.join("step-3"), &legacy);
+            rewrite_as_legacy_v3(&legacy, 4);
+            add_fully_typed_wrong_continuation_kind(&legacy, 4);
+        }
+        OrdinaryDiscoveryFailureCase::WrongContinuationKindAfterV4 => {
+            copy_checkpoint_package(&seed.join("step-1"), &root.join("step-1"));
+            let legacy = root.join("step-4");
+            copy_checkpoint_package(&seed.join("step-3"), &legacy);
+            rewrite_as_legacy_v3(&legacy, 4);
+            add_fully_typed_wrong_continuation_kind(&legacy, 4);
+        }
+        OrdinaryDiscoveryFailureCase::NewerDirectoryOlderManifest => {
+            copy_checkpoint_package(&seed.join("step-1"), &root.join("step-1"));
+            // The package remains a valid v4 step-2 envelope; only its exact
+            // final directory claims a different completed step.
+            copy_checkpoint_package(&seed.join("step-2"), &root.join("step-4"));
+        }
+        OrdinaryDiscoveryFailureCase::OlderDirectoryNewerManifest => {
+            // The valid step-3 package would be selected if discovery silently
+            // ignored the older exact directory whose manifest claims step 3.
+            copy_checkpoint_package(&seed.join("step-3"), &root.join("step-3"));
+            copy_checkpoint_package(&seed.join("step-3"), &root.join("step-2"));
+        }
+    }
+    root
+}
+
+#[allow(clippy::cognitive_complexity)] // explicit zero-call contract across every preflight hook
+fn assert_no_discovery_policy_work(calls: &ResumePreflightCalls, context: &str) {
+    assert_eq!(calls.generate, 0, "{context}: generated");
+    assert_eq!(calls.token_logprobs.get(), 0, "{context}: live scoring");
+    assert_eq!(calls.detached.get(), 0, "{context}: detached scoring");
+    assert_eq!(calls.backward.get(), 0, "{context}: backward");
+    assert_eq!(calls.adapter_toggles, 0, "{context}: adapter toggle");
+    assert_eq!(calls.trainable_vars.get(), 0, "{context}: trainable vars");
+    assert_eq!(
+        calls.sampler_validation.get(),
+        0,
+        "{context}: sampler validation"
+    );
+    assert_eq!(calls.sampler_restore, 0, "{context}: sampler restore");
+    assert_eq!(calls.lora_recipe.get(), 0, "{context}: recipe derivation");
+}
+
 fn rewrite_continuation_topology(
     checkpoint: &Path,
     format_version: u64,
@@ -3172,6 +3821,7 @@ fn run_stateful_world_one_reference(
     let metrics_path = run.metrics_path().to_path_buf();
     let mut trainer = Trainer::new(cfg.clone(), &run)
         .unwrap()
+        .with_checkpoint_policy_sha256(checkpoint_policy_sha256())
         .with_checkpoints_dir(&checkpoint_root);
     let metrics = trainer
         .train(&mut policy, &EchoOrFlatReward, &CharTokenizer, samples)
@@ -3180,6 +3830,7 @@ fn run_stateful_world_one_reference(
     let loaded = ferrl::load_checkpoint(
         checkpoint_root.join(format!("step-{}", cfg.steps)),
         &policy.trainable_vars(),
+        &trainer.checkpoint_binding(&policy, 1).unwrap(),
     )
     .unwrap();
     StatefulTpRank {
@@ -3231,6 +3882,7 @@ fn run_stateful_direct_tp_scaled(
                     let metrics_path = run.metrics_path().to_path_buf();
                     let mut trainer = Trainer::new(cfg.clone(), &run)
                         .unwrap()
+                        .with_checkpoint_policy_sha256(checkpoint_policy_sha256())
                         .with_checkpoints_dir(&checkpoint_root);
                     let metrics = trainer
                         .train_tensor_parallel(
@@ -3245,6 +3897,7 @@ fn run_stateful_direct_tp_scaled(
                     let loaded = ferrl::load_checkpoint(
                         checkpoint_root.join(format!("step-{}", cfg.steps)),
                         &policy.trainable_vars(),
+                        &trainer.checkpoint_binding(&policy, 2).unwrap(),
                     )
                     .unwrap();
                     StatefulTpRank {
@@ -4176,7 +4829,9 @@ fn distributed_continuation_save_preflight_panic_aborts_every_rank() {
                 let policy_sha256 = policy_sha256.clone();
                 scope.spawn(move || {
                     let run = RunDir::create(&base, format!("save-panic-rank{rank}")).unwrap();
-                    let mut trainer = Trainer::with_comm(cfg, &run, comm).unwrap();
+                    let mut trainer = Trainer::with_comm(cfg, &run, comm)
+                        .unwrap()
+                        .with_checkpoint_policy_sha256(checkpoint_policy_sha256());
                     let mut collector = StatefulScriptedPolicy::new(SEED, 0).unwrap();
                     let mut learner = StatefulScriptedPolicy::new(SEED, 0).unwrap();
                     trainer
@@ -4577,7 +5232,9 @@ fn distributed_collector_and_learner_comm_failures_never_coordinate_recovery() {
                 let policy_sha256 = policy_sha256.clone();
                 scope.spawn(move || {
                     let run = RunDir::create(&base, format!("terminal-source-rank{rank}")).unwrap();
-                    let mut trainer = Trainer::with_comm(cfg, &run, comm).unwrap();
+                    let mut trainer = Trainer::with_comm(cfg, &run, comm)
+                        .unwrap()
+                        .with_checkpoint_policy_sha256(checkpoint_policy_sha256());
                     let mut policy = StatefulScriptedPolicy::new(SEED, 0).unwrap();
                     trainer
                         .collect_rollout_ledger_step(
@@ -5989,7 +6646,9 @@ fn rank_zero_writes_the_only_checkpoint_and_a_dp_resume_continues_bit_exactly() 
                     let rank = comm.rank();
                     let mut policy = ScriptedPolicy::new(SEED).unwrap();
                     let run = RunDir::create(base, format!("resume-rank{rank}")).unwrap();
-                    let mut trainer = Trainer::with_comm(cfg, &run, comm).unwrap();
+                    let mut trainer = Trainer::with_comm(cfg, &run, comm)
+                        .unwrap()
+                        .with_checkpoint_policy_sha256(checkpoint_policy_sha256());
                     let history = trainer
                         .resume(
                             &ckpt,
@@ -6038,6 +6697,7 @@ fn run_dp_world_resume_latest(
                     let run = RunDir::create(base, format!("rl{tag}-rank{rank}")).unwrap();
                     let mut trainer = Trainer::with_comm(cfg, &run, comm)
                         .unwrap()
+                        .with_checkpoint_policy_sha256(checkpoint_policy_sha256())
                         .with_checkpoints_dir(shared);
                     let history = trainer
                         .resume_latest(
@@ -6207,7 +6867,9 @@ fn resume_latest_under_dp_without_a_shared_dir_aborts_load_in_lockstep_not_fresh
                     let rank = comm.rank();
                     let mut policy = ScriptedPolicy::new(SEED).unwrap();
                     let run = RunDir::open(basep, format!("rank{rank}")).unwrap();
-                    let mut trainer = Trainer::with_comm(cfg, &run, comm).unwrap();
+                    let mut trainer = Trainer::with_comm(cfg, &run, comm)
+                        .unwrap()
+                        .with_checkpoint_policy_sha256(checkpoint_policy_sha256());
                     trainer
                         .resume_latest(
                             &mut policy,
@@ -6227,7 +6889,7 @@ fn resume_latest_under_dp_without_a_shared_dir_aborts_load_in_lockstep_not_fresh
     let err0 = outcomes[0].as_ref().unwrap_err();
     assert!(
         matches!(err0, TrainerError::Contract(msg)
-            if msg.contains("checkpoint load/restore failed on a peer rank")),
+            if msg.contains("checkpoint identity/payload preflight failed on a peer rank")),
         "rank 0 must abort when a peer cannot load the broadcast checkpoint: got {err0:?}"
     );
     // rank 1 received rank 0's broadcast step and tried to resume from its OWN (empty)
@@ -6301,6 +6963,847 @@ fn resume_latest_under_dp_broadcasts_a_rank0_scan_failure_instead_of_hanging() {
         errs.iter().any(|e| matches!(e, TrainerError::Contract(_))),
         "the peer must surface the synthesized lockstep-abort error: {errs:?}"
     );
+}
+
+#[test]
+#[allow(clippy::cognitive_complexity)] // complete one-rank discovery corruption matrix
+fn world_one_resume_latest_rejects_legacy_and_step_mismatch_before_policy_work() {
+    let tmp = TempDir::new("world1-ordinary-discovery-failures");
+    let seed_root = tmp.path().join("seed-checkpoints");
+    let seed_cfg = TrainerConfig {
+        steps: 3,
+        checkpoint_every: Some(1),
+        ..scripted_cfg()
+    };
+    let seed = run_dp_world_resume_latest(tmp.path(), &seed_root, 70, &seed_cfg);
+    assert_lockstep(&seed, "world-one discovery fixture seed");
+
+    for case in [
+        OrdinaryDiscoveryFailureCase::LegacyOnly,
+        OrdinaryDiscoveryFailureCase::OlderLegacyBeforeV4,
+        OrdinaryDiscoveryFailureCase::NewerLegacyAfterV4,
+        OrdinaryDiscoveryFailureCase::WrongContinuationKindOnly,
+        OrdinaryDiscoveryFailureCase::WrongContinuationKindAfterV4,
+        OrdinaryDiscoveryFailureCase::NewerDirectoryOlderManifest,
+        OrdinaryDiscoveryFailureCase::OlderDirectoryNewerManifest,
+    ] {
+        let tag = case.tag();
+        let checkpoint_root = prepare_ordinary_discovery_failure_case(tmp.path(), &seed_root, case);
+        let collective_calls = Arc::new(AtomicUsize::new(0));
+        let run = RunDir::create(tmp.path(), format!("world1-{tag}")).unwrap();
+        let mut trainer = Trainer::with_comm(
+            TrainerConfig {
+                steps: 4,
+                checkpoint_every: Some(1),
+                ..scripted_cfg()
+            },
+            &run,
+            SpyComm {
+                calls: Arc::clone(&collective_calls),
+            },
+        )
+        .unwrap()
+        .with_checkpoint_policy_sha256(checkpoint_policy_sha256())
+        .with_checkpoints_dir(checkpoint_root);
+        let metrics_sentinel = format!("metrics-{tag}\n").into_bytes();
+        let candidates_sentinel = format!("candidates-{tag}\n").into_bytes();
+        std::fs::write(run.metrics_path(), &metrics_sentinel).unwrap();
+        std::fs::write(run.candidates_path(), &candidates_sentinel).unwrap();
+
+        let reward_calls = Arc::new(AtomicUsize::new(0));
+        let mut policy = ResumePreflightPanicPolicy::new(0, ResumePreflightPanic::LoraRecipe);
+        let values_before = policy.raw_var_bits();
+        let ids_before = policy.raw_var_ids();
+        let mode_before = policy.inner.adapter_enabled();
+        let sampler_before = policy.sampler_state().unwrap();
+        let error = trainer
+            .resume_latest(
+                &mut policy,
+                &PreflightCountingReward {
+                    calls: Arc::clone(&reward_calls),
+                },
+                &CharTokenizer,
+                &live_samples(),
+            )
+            .map(|_| ())
+            .unwrap_err();
+
+        assert!(
+            matches!(error, TrainerError::Checkpoint(_)),
+            "{tag}: discovery did not fail closed: {error:?}"
+        );
+        assert_eq!(collective_calls.load(Ordering::SeqCst), 0, "{tag}");
+        assert_eq!(reward_calls.load(Ordering::SeqCst), 0, "{tag}: reward");
+        assert_eq!(policy.raw_var_bits(), values_before, "{tag}: values");
+        assert_eq!(policy.raw_var_ids(), ids_before, "{tag}: identities");
+        assert_eq!(policy.inner.adapter_enabled(), mode_before, "{tag}: mode");
+        assert_eq!(
+            policy.sampler_state().unwrap(),
+            sampler_before,
+            "{tag}: sampler"
+        );
+        assert_no_discovery_policy_work(&policy.calls, tag);
+        assert_eq!(std::fs::read(run.metrics_path()).unwrap(), metrics_sentinel);
+        assert_eq!(
+            std::fs::read(run.candidates_path()).unwrap(),
+            candidates_sentinel
+        );
+    }
+}
+
+#[test]
+#[allow(clippy::cognitive_complexity)] // complete two-rank discovery corruption matrix
+fn dp_resume_latest_coordinates_legacy_and_step_mismatch_as_scan_failed() {
+    let tmp = TempDir::new("dp-ordinary-discovery-failures");
+    let seed_root = tmp.path().join("seed-checkpoints");
+    let seed_cfg = TrainerConfig {
+        steps: 3,
+        checkpoint_every: Some(1),
+        ..scripted_cfg()
+    };
+    let seed = run_dp_world_resume_latest(tmp.path(), &seed_root, 71, &seed_cfg);
+    assert_lockstep(&seed, "DP discovery fixture seed");
+
+    for case in [
+        OrdinaryDiscoveryFailureCase::LegacyOnly,
+        OrdinaryDiscoveryFailureCase::OlderLegacyBeforeV4,
+        OrdinaryDiscoveryFailureCase::NewerLegacyAfterV4,
+        OrdinaryDiscoveryFailureCase::WrongContinuationKindOnly,
+        OrdinaryDiscoveryFailureCase::WrongContinuationKindAfterV4,
+        OrdinaryDiscoveryFailureCase::NewerDirectoryOlderManifest,
+        OrdinaryDiscoveryFailureCase::OlderDirectoryNewerManifest,
+    ] {
+        let tag = case.tag();
+        let checkpoint_root = prepare_ordinary_discovery_failure_case(tmp.path(), &seed_root, case);
+        let reward_calls = Arc::new(AtomicUsize::new(0));
+        let outcomes = std::thread::scope(|scope| {
+            let handles: Vec<_> =
+                LocalComm::world_with_timeout(2, std::time::Duration::from_secs(15))
+                    .into_iter()
+                    .enumerate()
+                    .map(|(rank, inner)| {
+                        let checkpoint_root = checkpoint_root.clone();
+                        let reward_calls = Arc::clone(&reward_calls);
+                        let base = tmp.path();
+                        scope.spawn(move || {
+                            let scalar_calls = Arc::new(AtomicUsize::new(0));
+                            let tensor_calls = Arc::new(AtomicUsize::new(0));
+                            let comm = ResumePreflightCountingComm {
+                                inner,
+                                scalar_calls: Arc::clone(&scalar_calls),
+                                tensor_calls: Arc::clone(&tensor_calls),
+                            };
+                            let run = RunDir::create(base, format!("dp-{tag}-rank{rank}")).unwrap();
+                            let mut trainer = Trainer::with_comm(
+                                TrainerConfig {
+                                    steps: 4,
+                                    checkpoint_every: Some(1),
+                                    ..scripted_cfg()
+                                },
+                                &run,
+                                comm,
+                            )
+                            .unwrap()
+                            .with_checkpoint_policy_sha256(checkpoint_policy_sha256())
+                            .with_checkpoints_dir(checkpoint_root);
+                            scalar_calls.store(0, Ordering::SeqCst);
+                            tensor_calls.store(0, Ordering::SeqCst);
+                            let metrics_sentinel =
+                                format!("metrics-{tag}-rank{rank}\n").into_bytes();
+                            let candidates_sentinel =
+                                format!("candidates-{tag}-rank{rank}\n").into_bytes();
+                            std::fs::write(run.metrics_path(), &metrics_sentinel).unwrap();
+                            std::fs::write(run.candidates_path(), &candidates_sentinel).unwrap();
+
+                            let mut policy = ResumePreflightPanicPolicy::new(
+                                rank,
+                                ResumePreflightPanic::LoraRecipe,
+                            );
+                            let values_before = policy.raw_var_bits();
+                            let ids_before = policy.raw_var_ids();
+                            let mode_before = policy.inner.adapter_enabled();
+                            let sampler_before = policy.sampler_state().unwrap();
+                            let error = trainer
+                                .resume_latest(
+                                    &mut policy,
+                                    &PreflightCountingReward {
+                                        calls: reward_calls,
+                                    },
+                                    &CharTokenizer,
+                                    &live_samples(),
+                                )
+                                .map(|_| ())
+                                .unwrap_err();
+
+                            assert_eq!(
+                                scalar_calls.load(Ordering::SeqCst),
+                                1,
+                                "{tag} rank {rank}: later scalar collective"
+                            );
+                            assert_eq!(
+                                tensor_calls.load(Ordering::SeqCst),
+                                0,
+                                "{tag} rank {rank}: tensor collective"
+                            );
+                            assert_eq!(
+                                policy.raw_var_bits(),
+                                values_before,
+                                "{tag} rank {rank}: values"
+                            );
+                            assert_eq!(
+                                policy.raw_var_ids(),
+                                ids_before,
+                                "{tag} rank {rank}: identities"
+                            );
+                            assert_eq!(
+                                policy.inner.adapter_enabled(),
+                                mode_before,
+                                "{tag} rank {rank}: mode"
+                            );
+                            assert_eq!(
+                                policy.sampler_state().unwrap(),
+                                sampler_before,
+                                "{tag} rank {rank}: sampler"
+                            );
+                            assert_no_discovery_policy_work(
+                                &policy.calls,
+                                &format!("{tag} rank {rank}"),
+                            );
+                            assert_eq!(
+                                std::fs::read(run.metrics_path()).unwrap(),
+                                metrics_sentinel
+                            );
+                            assert_eq!(
+                                std::fs::read(run.candidates_path()).unwrap(),
+                                candidates_sentinel
+                            );
+                            (rank, error)
+                        })
+                    })
+                    .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        assert_eq!(reward_calls.load(Ordering::SeqCst), 0, "{tag}: reward");
+        for (rank, error) in outcomes {
+            if rank == 0 {
+                assert!(
+                    matches!(error, TrainerError::Checkpoint(_)),
+                    "{tag} rank 0: {error:?}"
+                );
+            } else {
+                assert!(
+                    matches!(error, TrainerError::Contract(ref message)
+                        if message.contains("checkpoint discovery failed")),
+                    "{tag} rank {rank}: {error:?}"
+                );
+            }
+        }
+    }
+}
+
+/// A newer canonical final directory with a malformed manifest is not a crash
+/// staging artifact: ordinary publication exposes only complete `step-N`
+/// directories. Rank 0 must therefore broadcast scan failure instead of
+/// silently replaying the older valid package while its peers wait or follow.
+#[test]
+#[allow(clippy::cognitive_complexity)] // coordinated failure plus state/telemetry sentinels
+fn resume_latest_under_dp_rejects_newer_malformed_final_without_fallback() {
+    let tmp = TempDir::new("rl-dp-malformed-latest");
+    let shared_ckpts = tmp.path().join("shared-checkpoints");
+    let seed_cfg = TrainerConfig {
+        steps: 1,
+        checkpoint_every: Some(1),
+        ..scripted_cfg()
+    };
+    let seed = run_dp_world_resume_latest(tmp.path(), &shared_ckpts, 1, &seed_cfg);
+    assert_lockstep(&seed, "malformed-latest seed");
+    assert!(shared_ckpts.join("step-1").is_dir());
+
+    let malformed = shared_ckpts.join("step-2");
+    std::fs::create_dir_all(&malformed).unwrap();
+    std::fs::write(malformed.join("manifest.json"), b"{not-json").unwrap();
+
+    let reward_calls = Arc::new(AtomicUsize::new(0));
+    let cfg = TrainerConfig {
+        steps: 2,
+        checkpoint_every: Some(1),
+        ..scripted_cfg()
+    };
+    let outcomes: Vec<(usize, TrainerError)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = LocalComm::world_with_timeout(2, std::time::Duration::from_secs(15))
+            .into_iter()
+            .map(|comm| {
+                let cfg = cfg.clone();
+                let shared_ckpts = shared_ckpts.clone();
+                let reward_calls = Arc::clone(&reward_calls);
+                let base = tmp.path();
+                scope.spawn(move || {
+                    let rank = comm.rank();
+                    let run = RunDir::create(base, format!("malformed-latest-rank{rank}")).unwrap();
+                    let metrics_sentinel = format!("metrics-rank-{rank}\n").into_bytes();
+                    let candidates_sentinel = format!("candidates-rank-{rank}\n").into_bytes();
+                    std::fs::write(run.metrics_path(), &metrics_sentinel).unwrap();
+                    std::fs::write(run.candidates_path(), &candidates_sentinel).unwrap();
+
+                    let mut policy = ScriptedPolicy::new(SEED).unwrap();
+                    let values_before = var_bits(&policy);
+                    let sampler_before = policy.sampler_state().unwrap();
+                    let mode_before = policy.adapter_enabled();
+                    let mut trainer = Trainer::with_comm(cfg, &run, comm)
+                        .unwrap()
+                        .with_checkpoint_policy_sha256(checkpoint_policy_sha256())
+                        .with_checkpoints_dir(shared_ckpts);
+                    let error = trainer
+                        .resume_latest(
+                            &mut policy,
+                            &PreflightCountingReward {
+                                calls: reward_calls,
+                            },
+                            &CharTokenizer,
+                            &live_samples(),
+                        )
+                        .map(|_| ())
+                        .unwrap_err();
+
+                    assert_eq!(var_bits(&policy), values_before, "rank {rank} values");
+                    assert_eq!(
+                        policy.sampler_state().unwrap(),
+                        sampler_before,
+                        "rank {rank} sampler"
+                    );
+                    assert_eq!(
+                        policy.adapter_enabled(),
+                        mode_before,
+                        "rank {rank} adapter mode"
+                    );
+                    assert_eq!(std::fs::read(run.metrics_path()).unwrap(), metrics_sentinel);
+                    assert_eq!(
+                        std::fs::read(run.candidates_path()).unwrap(),
+                        candidates_sentinel
+                    );
+                    (rank, error)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect()
+    });
+
+    assert_eq!(reward_calls.load(Ordering::SeqCst), 0);
+    for (rank, error) in outcomes {
+        assert!(
+            !matches!(error, TrainerError::Comm(_)),
+            "rank {rank}: {error:?}"
+        );
+        if rank == 0 {
+            assert!(
+                matches!(error, TrainerError::Checkpoint(_)),
+                "rank 0: {error:?}"
+            );
+        } else {
+            assert!(
+                matches!(error, TrainerError::Contract(ref message)
+                    if message.contains("checkpoint discovery failed")),
+                "rank {rank}: {error:?}"
+            );
+        }
+    }
+}
+
+#[test]
+#[allow(clippy::cognitive_complexity)] // one matrix pins three asymmetric policy-hook panics
+fn ordinary_dp_resume_panic_contains_the_complete_preflight_before_any_mutation() {
+    let tmp = TempDir::new("ordinary-resume-preflight-panics");
+    let cfg = TrainerConfig {
+        steps: 1,
+        checkpoint_every: Some(1),
+        ..scripted_cfg()
+    };
+    let seed = run_scripted_world(tmp.path(), 2, &cfg, &live_samples());
+    assert_lockstep(&seed, "ordinary resume panic seed");
+    let checkpoint = tmp.path().join("rank0/checkpoints/step-1");
+    assert!(checkpoint.is_dir(), "seed checkpoint was not published");
+
+    for (case, fault, expected_scalars) in [
+        ("lora-recipe", ResumePreflightPanic::LoraRecipe, 1),
+        ("trainable-vars", ResumePreflightPanic::TrainableVars, 11),
+        (
+            "sampler-validation",
+            ResumePreflightPanic::SamplerValidation,
+            11,
+        ),
+    ] {
+        let reward_calls = Arc::new(AtomicUsize::new(0));
+        let base = tmp.path();
+        let mut outcomes = std::thread::scope(|scope| {
+            let handles: Vec<_> =
+                LocalComm::world_with_timeout(2, std::time::Duration::from_secs(15))
+                    .into_iter()
+                    .enumerate()
+                    .map(|(rank, inner)| {
+                        let checkpoint = checkpoint.clone();
+                        let reward_calls = Arc::clone(&reward_calls);
+                        let cfg = cfg.clone();
+                        scope.spawn(move || {
+                            let scalar_calls = Arc::new(AtomicUsize::new(0));
+                            let tensor_calls = Arc::new(AtomicUsize::new(0));
+                            let comm = ResumePreflightCountingComm {
+                                inner,
+                                scalar_calls: Arc::clone(&scalar_calls),
+                                tensor_calls: Arc::clone(&tensor_calls),
+                            };
+                            let run = RunDir::create(base, format!("{case}-rank{rank}")).unwrap();
+                            let mut trainer = Trainer::with_comm(cfg, &run, comm)
+                                .unwrap()
+                                .with_checkpoint_policy_sha256(checkpoint_policy_sha256());
+                            // Exclude constructor config-consensus collectives from the
+                            // resume-preflight oracle.
+                            scalar_calls.store(0, Ordering::SeqCst);
+                            tensor_calls.store(0, Ordering::SeqCst);
+
+                            let metrics_sentinel =
+                                format!("metrics-{case}-rank{rank}\n").into_bytes();
+                            let candidates_sentinel =
+                                format!("candidates-{case}-rank{rank}\n").into_bytes();
+                            std::fs::write(run.metrics_path(), &metrics_sentinel).unwrap();
+                            std::fs::write(run.candidates_path(), &candidates_sentinel).unwrap();
+
+                            let mut policy = ResumePreflightPanicPolicy::new(rank, fault);
+                            let values_before = policy.raw_var_bits();
+                            let ids_before = policy.raw_var_ids();
+                            let mode_before = policy.inner.adapter_enabled();
+                            let sampler_before = policy.sampler_state().unwrap();
+                            policy.armed = true;
+                            let error = trainer
+                                .resume(
+                                    &checkpoint,
+                                    &mut policy,
+                                    &PreflightCountingReward {
+                                        calls: reward_calls,
+                                    },
+                                    &CharTokenizer,
+                                    &live_samples(),
+                                )
+                                .unwrap_err();
+
+                            assert_eq!(
+                                policy.raw_var_bits(),
+                                values_before,
+                                "{case} rank {rank} values"
+                            );
+                            assert_eq!(
+                                policy.raw_var_ids(),
+                                ids_before,
+                                "{case} rank {rank} identities"
+                            );
+                            assert_eq!(
+                                policy.inner.adapter_enabled(),
+                                mode_before,
+                                "{case} rank {rank} mode"
+                            );
+                            assert_eq!(
+                                policy.sampler_state().unwrap(),
+                                sampler_before,
+                                "{case} rank {rank} sampler"
+                            );
+                            assert_eq!(
+                                std::fs::read(run.metrics_path()).unwrap(),
+                                metrics_sentinel
+                            );
+                            assert_eq!(
+                                std::fs::read(run.candidates_path()).unwrap(),
+                                candidates_sentinel
+                            );
+                            assert_eq!(policy.calls.generate, 0, "{case} rank {rank} generated");
+                            assert_eq!(
+                                policy.calls.token_logprobs.get(),
+                                0,
+                                "{case} rank {rank} scored live"
+                            );
+                            assert_eq!(
+                                policy.calls.detached.get(),
+                                0,
+                                "{case} rank {rank} scored detached"
+                            );
+                            assert_eq!(
+                                policy.calls.backward.get(),
+                                0,
+                                "{case} rank {rank} ran backward"
+                            );
+                            assert_eq!(
+                                policy.calls.adapter_toggles, 0,
+                                "{case} rank {rank} toggled adapter"
+                            );
+                            assert_eq!(
+                                policy.calls.sampler_restore, 0,
+                                "{case} rank {rank} restored sampler"
+                            );
+                            assert_eq!(
+                                tensor_calls.load(Ordering::SeqCst),
+                                0,
+                                "{case} rank {rank} entered a tensor collective"
+                            );
+                            assert_eq!(
+                                scalar_calls.load(Ordering::SeqCst),
+                                expected_scalars,
+                                "{case} rank {rank} ran a later scalar collective"
+                            );
+                            (rank, error, policy.calls)
+                        })
+                    })
+                    .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        outcomes.sort_by_key(|(rank, _, _)| *rank);
+        assert_eq!(
+            reward_calls.load(Ordering::SeqCst),
+            0,
+            "{case} reached reward"
+        );
+        for (rank, error, calls) in outcomes {
+            assert!(
+                matches!(error, TrainerError::Contract(ref message)
+                    if if rank == 1 {
+                        message.contains("panicked: injected ordinary-resume")
+                    } else {
+                        message.contains("failed on a peer rank; aborting in lockstep")
+                    }),
+                "{case} rank {rank} did not return promptly through the coordinated panic boundary: {error:?}"
+            );
+            assert_eq!(
+                calls.lora_recipe.get(),
+                1,
+                "{case} rank {rank} recipe calls"
+            );
+            match fault {
+                ResumePreflightPanic::LoraRecipe => {
+                    assert_eq!(calls.trainable_vars.get(), 0);
+                    assert_eq!(calls.sampler_validation.get(), 0);
+                }
+                ResumePreflightPanic::TrainableVars => {
+                    assert_eq!(
+                        calls.trainable_vars.get(),
+                        1 + usize::from(rank == 0),
+                        "the successful peer checks the binding again after sampler validation"
+                    );
+                    assert_eq!(
+                        calls.sampler_validation.get(),
+                        usize::from(rank == 0),
+                        "the panicking rank must stop inside trainable_vars"
+                    );
+                }
+                ResumePreflightPanic::SamplerValidation => {
+                    assert_eq!(
+                        calls.trainable_vars.get(),
+                        1 + usize::from(rank == 0),
+                        "the successful peer checks the binding again after sampler validation"
+                    );
+                    assert_eq!(calls.sampler_validation.get(), 1);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[allow(clippy::cognitive_complexity)]
+fn ordinary_world_one_resume_enforces_exact_policy_postconditions_before_rollout() {
+    for fault in ResumePostconditionFault::ALL {
+        let tmp = TempDir::new(fault.tag());
+        let seed_cfg = TrainerConfig {
+            steps: 1,
+            checkpoint_every: Some(1),
+            ..scripted_cfg()
+        };
+        let seed = run_scripted_world(tmp.path(), 1, &seed_cfg, &live_samples());
+        assert_lockstep(&seed, "ordinary world-one postcondition seed");
+        let checkpoint = tmp.path().join("rank0/checkpoints/step-1");
+        assert!(checkpoint.is_dir(), "seed checkpoint was not published");
+
+        let run = RunDir::create(tmp.path(), format!("{}-resume", fault.tag())).unwrap();
+        let metrics_sentinel = format!("metrics-{}\n", fault.tag()).into_bytes();
+        let candidates_sentinel = format!("candidates-{}\n", fault.tag()).into_bytes();
+        std::fs::write(run.metrics_path(), &metrics_sentinel).unwrap();
+        std::fs::write(run.candidates_path(), &candidates_sentinel).unwrap();
+        let reward_calls = Arc::new(AtomicUsize::new(0));
+        let mut trainer = Trainer::new(
+            TrainerConfig {
+                steps: 2,
+                checkpoint_every: Some(1),
+                ..scripted_cfg()
+            },
+            &run,
+        )
+        .unwrap()
+        .with_checkpoint_policy_sha256(checkpoint_policy_sha256());
+        let mut policy = ResumePostconditionPolicy::new(0, 0, fault);
+        let ids_before = policy.raw_var_ids();
+        let shapes_before = policy.raw_var_shapes();
+        let sampler_before = policy.sampler_state().unwrap();
+
+        let error = trainer
+            .resume(
+                &checkpoint,
+                &mut policy,
+                &PreflightCountingReward {
+                    calls: Arc::clone(&reward_calls),
+                },
+                &CharTokenizer,
+                &live_samples(),
+            )
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains(fault.local_error()),
+            "{} returned the wrong error: {error:?}",
+            fault.tag()
+        );
+        assert!(policy.fault_fired.get(), "{} did not fire", fault.tag());
+        assert_eq!(
+            policy.raw_var_shapes(),
+            shapes_before,
+            "{} changed tensor schema",
+            fault.tag()
+        );
+        if fault.replaces_vars() {
+            assert_ne!(
+                policy.raw_var_ids(),
+                ids_before,
+                "{} did not replace the live same-shaped Vars",
+                fault.tag()
+            );
+        } else {
+            assert_eq!(policy.raw_var_ids(), ids_before);
+        }
+        if fault.mutates_var_values() {
+            let mutation_prestate = policy.value_mutation_prestate.borrow();
+            let mutation_prestate = mutation_prestate
+                .as_ref()
+                .expect("value mutation did not capture its prestate");
+            assert_ne!(
+                policy.first_var_bits(),
+                *mutation_prestate,
+                "{} did not mutate the existing Var's value",
+                fault.tag()
+            );
+        }
+        if fault.resets_sampler() {
+            assert_eq!(
+                policy.sampler_reset_prestate.borrow().as_deref(),
+                Some(&[][..]),
+                "{} did not reset the sampler after exact checkpoint restoration",
+                fault.tag()
+            );
+            assert_eq!(policy.sampler_state().unwrap(), vec![0x5a, 0]);
+        }
+        if fault.preserves_sampler() {
+            assert_eq!(policy.sampler_state().unwrap(), sampler_before);
+        }
+        assert_eq!(policy.calls.generate, 0, "{} generated", fault.tag());
+        assert_eq!(
+            policy.calls.token_logprobs.get(),
+            0,
+            "{} scored live",
+            fault.tag()
+        );
+        assert_eq!(
+            policy.calls.detached.get(),
+            0,
+            "{} scored detached",
+            fault.tag()
+        );
+        assert_eq!(
+            policy.calls.backward.get(),
+            0,
+            "{} ran backward",
+            fault.tag()
+        );
+        assert_eq!(
+            reward_calls.load(Ordering::SeqCst),
+            0,
+            "{} rewarded",
+            fault.tag()
+        );
+        assert_eq!(std::fs::read(run.metrics_path()).unwrap(), metrics_sentinel);
+        assert_eq!(
+            std::fs::read(run.candidates_path()).unwrap(),
+            candidates_sentinel
+        );
+    }
+}
+
+#[test]
+#[allow(clippy::cognitive_complexity)]
+fn ordinary_distributed_resume_globalizes_exact_policy_postcondition_failures() {
+    for fault in ResumePostconditionFault::ALL {
+        let tmp = TempDir::new(fault.tag());
+        let seed_cfg = TrainerConfig {
+            steps: 1,
+            checkpoint_every: Some(1),
+            ..scripted_cfg()
+        };
+        let seed = run_scripted_world(tmp.path(), 2, &seed_cfg, &live_samples());
+        assert_lockstep(&seed, "ordinary distributed postcondition seed");
+        let checkpoint = tmp.path().join("rank0/checkpoints/step-1");
+        assert!(checkpoint.is_dir(), "seed checkpoint was not published");
+        let resume_cfg = TrainerConfig {
+            steps: 2,
+            checkpoint_every: Some(1),
+            ..scripted_cfg()
+        };
+        let reward_calls = Arc::new(AtomicUsize::new(0));
+
+        let mut outcomes = std::thread::scope(|scope| {
+            let handles = LocalComm::world_with_timeout(2, std::time::Duration::from_secs(15))
+                .into_iter()
+                .map(|comm| {
+                    let rank = comm.rank();
+                    let checkpoint = checkpoint.clone();
+                    let cfg = resume_cfg.clone();
+                    let reward_calls = Arc::clone(&reward_calls);
+                    let base = tmp.path();
+                    scope.spawn(move || {
+                        let run =
+                            RunDir::create(base, format!("{}-distributed-rank{rank}", fault.tag()))
+                                .unwrap();
+                        let metrics_sentinel =
+                            format!("metrics-{}-rank{rank}\n", fault.tag()).into_bytes();
+                        let candidates_sentinel =
+                            format!("candidates-{}-rank{rank}\n", fault.tag()).into_bytes();
+                        std::fs::write(run.metrics_path(), &metrics_sentinel).unwrap();
+                        std::fs::write(run.candidates_path(), &candidates_sentinel).unwrap();
+                        let mut trainer = Trainer::with_comm(cfg, &run, comm)
+                            .unwrap()
+                            .with_checkpoint_policy_sha256(checkpoint_policy_sha256());
+                        let mut policy = ResumePostconditionPolicy::new(rank, 1, fault);
+                        let ids_before = policy.raw_var_ids();
+                        let shapes_before = policy.raw_var_shapes();
+
+                        let error = trainer
+                            .resume(
+                                &checkpoint,
+                                &mut policy,
+                                &PreflightCountingReward {
+                                    calls: reward_calls,
+                                },
+                                &CharTokenizer,
+                                &live_samples(),
+                            )
+                            .unwrap_err();
+
+                        assert_eq!(
+                            policy.raw_var_shapes(),
+                            shapes_before,
+                            "{} rank {rank} changed tensor schema",
+                            fault.tag()
+                        );
+                        if rank == 1 && fault.replaces_vars() {
+                            assert_ne!(
+                                policy.raw_var_ids(),
+                                ids_before,
+                                "{} rank {rank} did not replace the live same-shaped Vars",
+                                fault.tag()
+                            );
+                        } else {
+                            assert_eq!(policy.raw_var_ids(), ids_before);
+                        }
+                        if rank == 1 && fault.mutates_var_values() {
+                            let mutation_prestate = policy.value_mutation_prestate.borrow();
+                            let mutation_prestate = mutation_prestate
+                                .as_ref()
+                                .expect("value mutation did not capture its prestate");
+                            assert_ne!(
+                                policy.first_var_bits(),
+                                *mutation_prestate,
+                                "{} rank {rank} did not mutate the existing Var's value",
+                                fault.tag()
+                            );
+                        }
+                        if rank == 1 && fault.resets_sampler() {
+                            assert_eq!(
+                                policy.sampler_reset_prestate.borrow().as_deref(),
+                                Some(&[][..]),
+                                "{} rank {rank} did not reset the sampler after exact checkpoint restoration",
+                                fault.tag()
+                            );
+                            assert_eq!(
+                                policy.sampler_state().unwrap(),
+                                vec![0x5a, rank as u8]
+                            );
+                        }
+                        assert_eq!(
+                            policy.fault_fired.get(),
+                            rank == 1,
+                            "{} rank {rank} fault state",
+                            fault.tag()
+                        );
+                        assert_eq!(
+                            policy.calls.generate,
+                            0,
+                            "{} rank {rank} generated",
+                            fault.tag()
+                        );
+                        assert_eq!(
+                            policy.calls.token_logprobs.get(),
+                            0,
+                            "{} rank {rank} scored live",
+                            fault.tag()
+                        );
+                        assert_eq!(
+                            policy.calls.detached.get(),
+                            0,
+                            "{} rank {rank} scored detached",
+                            fault.tag()
+                        );
+                        assert_eq!(
+                            policy.calls.backward.get(),
+                            0,
+                            "{} rank {rank} ran backward",
+                            fault.tag()
+                        );
+                        assert_eq!(std::fs::read(run.metrics_path()).unwrap(), metrics_sentinel);
+                        assert_eq!(
+                            std::fs::read(run.candidates_path()).unwrap(),
+                            candidates_sentinel
+                        );
+                        (rank, error)
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        outcomes.sort_by_key(|(rank, _)| *rank);
+        assert_eq!(
+            reward_calls.load(Ordering::SeqCst),
+            0,
+            "{} reached reward",
+            fault.tag()
+        );
+        for (rank, error) in outcomes {
+            let expected = if rank == 1 {
+                fault.local_error()
+            } else {
+                fault.peer_error()
+            };
+            assert!(
+                error.to_string().contains(expected),
+                "{} rank {rank} returned the wrong error: {error:?}",
+                fault.tag()
+            );
+        }
+    }
 }
 
 // ---- gate 2: real tiny qwen3.5, bitwise rank lockstep, both modes -------------

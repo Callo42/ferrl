@@ -5288,10 +5288,9 @@ mod tests {
         model.forward(&ids(4)).unwrap();
     }
 
-    /// The v2 positional checkpoint mechanism works unchanged over the
-    /// full-FT registry order: save, displace every var, load restores
-    /// bit-exactly, and the manifest carries the `"full-ft"` recipe the
-    /// trainer's resume cross-check guards on.
+    /// The explicit legacy-v1 adapter-only positional checkpoint mechanism works
+    /// unchanged over the full-FT registry order: save, displace every var, load
+    /// restores bit-exactly, and the manifest carries the `"full-ft"` recipe.
     #[test]
     fn full_ft_checkpoint_round_trips_positionally() {
         // Both menus: the MoE arm puts the packed 3-D vars (and the trained

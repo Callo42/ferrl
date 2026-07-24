@@ -508,6 +508,27 @@ pub trait Policy {
     /// Returns a candle error if the sampler state cannot be serialized.
     fn sampler_state(&self) -> CandleResult<Vec<u8>>;
 
+    /// Parse and validate a checkpoint sampler blob against this policy without
+    /// changing the live sampler.
+    ///
+    /// Ordinary checkpoint resume coordinates this preflight across every rank
+    /// before adapter or sampler mutation. Policies with a non-empty opaque state
+    /// must override this method. The default accepts only the stateless empty-blob
+    /// contract and otherwise fails closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a candle error when `state` is malformed, semantically incompatible
+    /// with this policy, or the policy has not implemented non-mutating validation.
+    fn validate_sampler_state(&self, state: &[u8]) -> CandleResult<()> {
+        if state.is_empty() && self.sampler_state()?.is_empty() {
+            return Ok(());
+        }
+        candle_core::bail!(
+            "policy with non-empty sampler state must implement validate_sampler_state for non-mutating checkpoint preflight"
+        )
+    }
+
     /// Restore the rollout-sampler RNG state from a blob produced by
     /// [`sampler_state`](Self::sampler_state), so a resumed run continues the exact
     /// token stream. **Fails loud** if the blob is malformed or does not match this
@@ -520,10 +541,11 @@ pub trait Policy {
 
     /// The policy's `LoRA` recipe as a stable canonical string, recorded into
     /// checkpoint manifests (see
-    /// [`crate::checkpoint::CheckpointManifest::lora_recipe`]). Informational —
-    /// the checkpoint load contract stays positional. Defaulted (`None`) so toy
-    /// / test policies need not implement it; model-backed policies forward
-    /// their [`crate::GradModel::lora_recipe`].
+    /// [`crate::checkpoint::CheckpointManifest::lora_recipe`]). Ordinary v4
+    /// checkpoints bind its exact presence/value into both the caller-supplied
+    /// identity and ordered tensor schema, preventing shape-aliased recipe swaps.
+    /// Defaulted (`None`) so policies with no adapter recipe remain explicit;
+    /// model-backed policies forward their [`crate::GradModel::lora_recipe`].
     fn lora_recipe(&self) -> Option<String> {
         None
     }

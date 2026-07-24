@@ -37,7 +37,9 @@
 //! lockstep. Paired with the cooperative preemption flag (`SIGTERM`/`SIGUSR1`),
 //! the DP run survives a Slurm preempt/timeout: it checkpoints on the signal,
 //! exits before eval/gate, and the requeue continues. A `DP_PREEMPTED rank=R` line
-//! marks that path.
+//! marks that path. Every rank derives the same immutable checkpoint-content and
+//! loader-recipe digest before model construction; frozen-model or execution-recipe
+//! drift makes ordinary resume fail before live policy mutation.
 //!
 //! Requires `--features nccl` (a multi-GPU build); the default build prints a
 //! usage note and exits non-zero. Every knob has an `FERRL_CDDP_*` override.
@@ -62,14 +64,12 @@ mod dp {
 
     use anyhow::{anyhow, bail, Context, Result};
     use candle_core::{DType, Device};
-    use candle_nn::VarBuilder;
-    use candle_transformers::models::qwen3::Config;
     use ferrl::countdown::{
         build_prompt, generate_dataset, CountdownConfig, CountdownProblem, CountdownReward,
     };
     use ferrl::{
-        read_metrics, Comm, HfTokenizer, Metrics, NcclComm, Policy, QwenGradModel, QwenPolicy,
-        RunDir, RunStop, Sample, Trainer, TrainerConfig,
+        load_qwen_policy_bound, read_metrics, Comm, HfTokenizer, LoaderOpts, Metrics, NcclComm,
+        Policy, QwenPolicy, RunDir, RunStop, Sample, Trainer, TrainerConfig,
     };
     use tracing::{info, warn};
 
@@ -79,12 +79,6 @@ mod dp {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(default)
-    }
-
-    /// Load the Qwen3 config from `dir/config.json`.
-    fn load_config(dir: &Path) -> Result<Config> {
-        let bytes = std::fs::read(dir.join("config.json")).context("read config.json")?;
-        serde_json::from_slice(&bytes).context("parse config.json into qwen3::Config")
     }
 
     /// Resolve the production EOS contract before any durable run publication.
@@ -145,23 +139,12 @@ mod dp {
     /// Build the policy over the real `Qwen3-0.6B-Base` checkpoint on `device` (the
     /// rank's local GPU), `FERRL_CDDP_BASE_DTYPE` base / F32 `LoRA` adapter, the legacy
     /// q/v recipe — the same recipe as the single-process `countdown_grpo` harness.
-    fn build_policy(dir: &Path, device: &Device) -> Result<(QwenPolicy, HfTokenizer)> {
-        let cfg = load_config(dir)?;
-        let buf = std::fs::read(dir.join("model.safetensors")).context("read model.safetensors")?;
-        let vb = VarBuilder::from_buffered_safetensors(buf, resolve_base_dtype()?, device)
-            .context("load model.safetensors onto the GPU")?;
-        let rank = env_parse("FERRL_CDDP_RANK", 16usize);
-        let alpha = env_parse("FERRL_CDDP_ALPHA", 32.0f64);
-        let model = QwenGradModel::load_with_adapter_dtype(&cfg, &vb, rank, alpha, DType::F32)
-            .context("build QwenGradModel")?;
-        // SAME seed on every rank ⇒ identical initial adapter ⇒ the lockstep
-        // invariant holds (the trainer shards the data by global row index, so
-        // identical seeds do NOT mean identical rollouts).
-        let seed = env_parse("FERRL_CDDP_SEED", 1234u64);
-        let temperature = env_parse("FERRL_CDDP_TEMP", 1.0f64);
-        let policy = QwenPolicy::new(model, seed, temperature);
-        let tok = HfTokenizer::from_file(dir.join("tokenizer.json")).context("load tokenizer")?;
-        Ok((policy, tok))
+    fn build_policy(
+        dir: &Path,
+        device: &Device,
+        opts: &LoaderOpts,
+    ) -> Result<(QwenPolicy, HfTokenizer, String)> {
+        load_qwen_policy_bound(dir, device, opts).context("load bound Qwen3 policy")
     }
 
     /// The Countdown training prompts (every rank generates the identical set from
@@ -305,7 +288,17 @@ mod dp {
             anyhow!("set FERRL_QWEN_WEIGHTS to the Qwen3-0.6B-Base asset directory")
         })?;
         let dir = PathBuf::from(weights);
-        let (mut policy, tok) = build_policy(&dir, &device)?;
+        let loader_opts = LoaderOpts {
+            lora_rank: env_parse("FERRL_CDDP_RANK", 16usize),
+            lora_alpha: env_parse("FERRL_CDDP_ALPHA", 32.0f64),
+            base_dtype: resolve_base_dtype()?,
+            adapter_dtype: DType::F32,
+            seed: env_parse("FERRL_CDDP_SEED", 1234u64),
+            temperature: env_parse("FERRL_CDDP_TEMP", 1.0f64),
+            ..LoaderOpts::default()
+        };
+        let (mut policy, tok, checkpoint_policy_sha256) =
+            build_policy(&dir, &device, &loader_opts)?;
         let train_samples = build_train_samples();
         let reward = CountdownReward::default();
         let eos = coordinate_eos_resolution(&comm, resolve_eos(&dir, &tok))?;
@@ -322,6 +315,7 @@ mod dp {
         let (run, shared_ckpts, preempt) = open_dp_run(rank)?;
         let metrics_path = run.metrics_path();
         let mut trainer = Trainer::with_comm(tcfg, &run, comm)?
+            .with_checkpoint_policy_sha256(checkpoint_policy_sha256)
             .with_preemption_flag(preempt)
             .with_checkpoints_dir(shared_ckpts);
         // resume_latest auto-discovers rank 0's newest checkpoint and broadcasts it

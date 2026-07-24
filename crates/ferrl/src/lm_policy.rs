@@ -910,7 +910,20 @@ impl<M: GradModel> Policy for LmPolicy<M> {
         self.sampler.to_state_bytes()
     }
 
+    fn validate_sampler_state(&self, state: &[u8]) -> CandleResult<()> {
+        let restored = GrpoSampler::from_state_bytes(state)?;
+        if (restored.temperature() - self.temperature).abs() > f64::EPSILON {
+            candle_core::bail!(
+                "sampler state was checkpointed at temperature {} but this policy runs at {}; rebuild the policy with the checkpoint's temperature to resume it",
+                restored.temperature(),
+                self.temperature
+            );
+        }
+        Ok(())
+    }
+
     fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
+        self.validate_sampler_state(state)?;
         let restored = GrpoSampler::from_state_bytes(state)?;
         // The blob bakes the temperature it was checkpointed at. This policy
         // scores (and samples) at ITS OWN temperature, so a mismatched blob is a
@@ -2746,6 +2759,9 @@ mod tests {
         }
         fn sampler_state(&self) -> CandleResult<Vec<u8>> {
             self.inner.sampler_state()
+        }
+        fn validate_sampler_state(&self, state: &[u8]) -> CandleResult<()> {
+            self.inner.validate_sampler_state(state)
         }
         fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
             self.inner.restore_sampler_state(state)

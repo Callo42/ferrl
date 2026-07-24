@@ -84,8 +84,9 @@ use ferrl::countdown::{
 };
 use ferrl::policy::GenConfig;
 use ferrl::{
-    evaluate, EvalReport, EvalSampling, HfTokenizer, LoraTargets, Metrics, Qwen3_5Config,
-    Qwen3_5GradModel, Qwen3_5Policy, RunDir, RunStop, Sample, Trainer, TrainerConfig,
+    evaluate, load_qwen35_policy_with_targets_bound, EvalReport, EvalSampling, HfTokenizer,
+    LoaderOpts, LoraTargets, Metrics, Qwen3_5Policy, RunDir, RunStop, Sample, Trainer,
+    TrainerConfig,
 };
 use tracing::{info, warn};
 
@@ -212,31 +213,11 @@ fn reward_trend(history: &[Metrics]) -> (f32, f32) {
 fn build_policy(
     dir: &Path,
     device: &Device,
-    knobs: &RunKnobs,
-) -> Result<(Qwen3_5Policy, HfTokenizer)> {
-    let cfg = Qwen3_5Config::from_json_file(dir.join("config.json"))
-        .context("parse config.json into Qwen3_5Config")?;
-    // bf16-base / F32-adapter split, as on the dense harness: the frozen base
-    // (weights AND the retained activations dominating the GRPO grad forward)
-    // halves, while the trainable adapter stays F32.
-    let vb = ferrl::varbuilder_from_pretrained(dir, DType::BF16, device)
-        .context("load checkpoint weights onto the GPU")?;
-    let targets = resolve_targets()?;
-    let mut model = Qwen3_5GradModel::load_with_targets(
-        &cfg,
-        &vb,
-        knobs.rank,
-        knobs.alpha,
-        DType::F32,
-        targets,
-    )
-    .context("build Qwen3_5GradModel")?;
-    if knobs.remat {
-        model.set_activation_checkpointing(true);
-    }
-    let policy = Qwen3_5Policy::new(model, knobs.seed, knobs.temperature);
-    let tok = HfTokenizer::from_file(dir.join("tokenizer.json")).context("load tokenizer")?;
-    Ok((policy, tok))
+    opts: &LoaderOpts,
+    targets: LoraTargets,
+) -> Result<(Qwen3_5Policy, HfTokenizer, String)> {
+    load_qwen35_policy_with_targets_bound(dir, device, opts, targets)
+        .context("load bound Qwen3.5 policy")
 }
 
 /// Draw the held-out problems from a different stream (`data_seed + 1`),
@@ -481,8 +462,10 @@ fn report_and_gate(history: &[Metrics], post: &EvalReport, gen: &GenConfig) -> R
 /// boundary (the library itself never touches signals). A stable
 /// `FERRL_CD35_RUN_ID` makes a requeued job **continue** the same run directory
 /// (resuming from its latest checkpoint via [`Trainer::resume_latest`]); unset gives
-/// a fresh, unique run per invocation. Returns the run dir plus the flag to hand the
-/// trainer.
+/// a fresh, unique run per invocation. The caller also derives an immutable digest
+/// from the exact checkpoint files and loader recipe; a requeue whose frozen model,
+/// `LoRA` scale/dtypes, or execution recipe drifted is rejected before restore. Returns
+/// the run dir plus the flag to hand the trainer.
 fn open_run_with_preemption(out: &str) -> Result<(RunDir, Arc<AtomicBool>)> {
     let preempt = Arc::new(AtomicBool::new(false));
     for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGUSR1] {
@@ -517,7 +500,19 @@ fn main() -> Result<()> {
     let dir = PathBuf::from(weights);
     let knobs = read_knobs()?;
     let device = open_cuda_device()?;
-    let (mut policy, tok) = build_policy(&dir, &device, &knobs)?;
+    let targets = resolve_targets()?;
+    let loader_opts = LoaderOpts {
+        lora_rank: knobs.rank,
+        lora_alpha: knobs.alpha,
+        base_dtype: DType::BF16,
+        adapter_dtype: DType::F32,
+        seed: knobs.seed,
+        temperature: knobs.temperature,
+        activation_checkpointing: knobs.remat,
+        ..LoaderOpts::default()
+    };
+    let (mut policy, tok, checkpoint_policy_sha256) =
+        build_policy(&dir, &device, &loader_opts, targets)?;
     let (train_samples, eval_samples) = build_splits(knobs.data_seed)?;
     let reward = CountdownReward::default();
     // The EOS id flows into both the trainer and the eval `gen` below so
@@ -533,7 +528,7 @@ fn main() -> Result<()> {
         lr = tcfg.lr,
         warmup_steps = tcfg.warmup_steps,
         eos_token_id = ?tcfg.eos_token_id,
-        targets = %resolve_targets()?.canonical(),
+        targets = %targets.canonical(),
         rank = knobs.rank,
         alpha = knobs.alpha,
         seed = knobs.seed,
@@ -548,7 +543,9 @@ fn main() -> Result<()> {
 
     let out = env_parse("FERRL_CD35_OUT", "/tmp/ferrl-runs".to_string())?;
     let (run, preempt) = open_run_with_preemption(&out)?;
-    let mut trainer = Trainer::new(tcfg, &run)?.with_preemption_flag(preempt);
+    let mut trainer = Trainer::new(tcfg, &run)?
+        .with_checkpoint_policy_sha256(checkpoint_policy_sha256)
+        .with_preemption_flag(preempt);
     // resume_latest continues from the newest checkpoint if one exists (a requeue),
     // else trains from scratch — paired with the preemption flag above, the run
     // survives a Slurm preempt/timeout: it checkpoints on the signal and resumes here.
