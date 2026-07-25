@@ -99,6 +99,7 @@ enum NoReplaceSyncPoint {
 enum OrdinaryPublishFaultPoint {
     AdapterPayloadSync,
     ManifestPayloadSync,
+    PriorAsideRenameAfterApply,
     PublishRename,
     PublishRenameAfterApply,
     FinalDirectorySync,
@@ -1067,6 +1068,63 @@ fn rollback_publication_error(
     }
 }
 
+fn reconcile_prior_aside_rename_error(
+    stage: &Path,
+    dir: &Path,
+    aside: &Path,
+    parent: &Path,
+    rename_error: CheckpointError,
+) -> CheckpointError {
+    let canonical_exists = dir.exists();
+    let aside_exists = aside.exists();
+    match (canonical_exists, aside_exists) {
+        (false, true) => {
+            if let Err(error) = require_recoverable_staged_package(aside) {
+                return publication_ambiguous(
+                    dir,
+                    format!(
+                        "moving the prior canonical package aside reported an error ({rename_error}), the aside appeared and the canonical name disappeared, but the prior package could not be validated: {error}; preserve every .old-* and .tmp-* candidate"
+                    ),
+                );
+            }
+            rollback_publication_error(stage, dir, aside, true, false, rename_error)
+        }
+        (true, false) => {
+            if let Err(error) = require_recoverable_staged_package(dir) {
+                return publication_ambiguous(
+                    dir,
+                    format!(
+                        "moving the prior canonical package aside reported an error ({rename_error}), the canonical name remained and no aside appeared, but the prior package could not be validated: {error}; preserve every .old-* and .tmp-* candidate"
+                    ),
+                );
+            }
+            if let Err(error) = sync_directory(dir).and_then(|()| sync_directory(parent)) {
+                return publication_ambiguous(
+                    dir,
+                    format!(
+                        "moving the prior canonical package aside reported an error ({rename_error}), the canonical name remained and no aside appeared, but fencing the prior package failed: {error}; preserve every .old-* and .tmp-* candidate"
+                    ),
+                );
+            }
+            match remove_hidden_directory_durable(stage, parent) {
+                Ok(()) => rename_error,
+                Err(error) => publication_ambiguous(
+                    dir,
+                    format!(
+                        "moving the prior canonical package aside reported an error ({rename_error}) without changing the visible namespace, but cleaning the completed stage failed: {error}; preserve every remaining recovery candidate"
+                    ),
+                ),
+            }
+        }
+        _ => publication_ambiguous(
+            dir,
+            format!(
+                "moving the prior canonical package aside reported an error ({rename_error}) and its effect cannot be proven from the namespace (canonical_exists={canonical_exists}, aside_exists={aside_exists}); preserve every .old-* and .tmp-* candidate"
+            ),
+        ),
+    }
+}
+
 /// Publish a completed stage through a durably fenced replacement transaction.
 /// The prior canonical package remains recoverable until the new directory and
 /// its parent are both synced. Every pre-commit failure restores and fences the
@@ -1091,9 +1149,17 @@ fn commit_stage(stage: &Path, dir: &Path) -> Result<(), CheckpointError> {
         ));
     }
     if had_prior {
-        if let Err(error) = std::fs::rename(dir, &aside).map_err(|error| io(dir, error)) {
-            return Err(rollback_publication_error(
-                stage, dir, &aside, false, false, error,
+        if let Err(error) = std::fs::rename(dir, &aside)
+            .map_err(|error| io(dir, error))
+            .and_then(|()| {
+                ordinary_publication_fault(
+                    OrdinaryPublishFaultPoint::PriorAsideRenameAfterApply,
+                    &aside,
+                )
+            })
+        {
+            return Err(reconcile_prior_aside_rename_error(
+                stage, dir, &aside, parent, error,
             ));
         }
         if let Err(error) = sync_directory(parent) {
@@ -3798,6 +3864,74 @@ mod tests {
             assert!(hidden_siblings(&dir, "old").is_empty(), "{point:?}");
             assert!(hidden_siblings(&dir, "tmp").is_empty(), "{point:?}");
         }
+    }
+
+    #[test]
+    fn ordinary_prior_aside_rename_applied_then_error_restores_and_fences_prior() {
+        let tmp = TempDir::new("ordinary-prior-aside-rename-applied-error");
+        let dir = tmp.path().join("step-3");
+        let parent = dir.parent().unwrap().to_path_buf();
+        let vars = make_vars();
+        let binding = ordinary_binding(None);
+        save_checkpoint(&dir, &vars, &make_opt_state(), &[7], 3, &binding).unwrap();
+        SYNCED_DIRECTORIES.with(|paths| paths.borrow_mut().clear());
+
+        inject_ordinary_publication_failures(&[
+            OrdinaryPublishFaultPoint::PriorAsideRenameAfterApply,
+        ]);
+        let error = save_checkpoint(&dir, &vars, &make_opt_state(), &[9], 3, &binding).unwrap_err();
+        assert!(matches!(error, CheckpointError::Io { .. }), "{error:?}");
+        assert_eq!(
+            load_checkpoint(&dir, &vars, &binding)
+                .unwrap()
+                .sampler_state,
+            Some(vec![7])
+        );
+        assert!(hidden_siblings(&dir, "old").is_empty());
+        assert!(hidden_siblings(&dir, "tmp").is_empty());
+
+        let synced = SYNCED_DIRECTORIES.with(|paths| paths.borrow().clone());
+        assert!(
+            synced.ends_with(&[dir, parent.clone(), parent]),
+            "the restored prior must be fenced before stage cleanup: {synced:?}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn ordinary_prior_aside_rename_applied_then_rollback_failure_preserves_candidates() {
+        let tmp = TempDir::new("ordinary-prior-aside-rename-rollback-ambiguous");
+        let dir = tmp.path().join("step-3");
+        let vars = make_vars();
+        let binding = ordinary_binding(None);
+        save_checkpoint(&dir, &vars, &make_opt_state(), &[7], 3, &binding).unwrap();
+
+        inject_ordinary_publication_failures(&[
+            OrdinaryPublishFaultPoint::PriorAsideRenameAfterApply,
+            OrdinaryPublishFaultPoint::RollbackRestoreRename,
+        ]);
+        let error = save_checkpoint(&dir, &vars, &make_opt_state(), &[9], 3, &binding).unwrap_err();
+        assert!(
+            matches!(error, CheckpointError::PublicationAmbiguous { .. }),
+            "{error:?}"
+        );
+        assert!(!dir.exists(), "an unfenced prior must not appear canonical");
+        let asides = hidden_siblings(&dir, "old");
+        let stages = hidden_siblings(&dir, "tmp");
+        assert_eq!(asides.len(), 1, "the durable prior was not preserved");
+        assert_eq!(stages.len(), 1, "the completed stage was not preserved");
+        assert_eq!(
+            load_checkpoint(&asides[0], &vars, &binding)
+                .unwrap()
+                .sampler_state,
+            Some(vec![7])
+        );
+        assert_eq!(
+            load_checkpoint(&stages[0], &vars, &binding)
+                .unwrap()
+                .sampler_state,
+            Some(vec![9])
+        );
     }
 
     #[test]
