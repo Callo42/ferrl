@@ -31,6 +31,12 @@ impl TempRepo {
         repo.write("Cargo.toml", b"[workspace]\nmembers = [\"crates/ferrl\"]\n");
         repo.write("Cargo.lock", b"# exact lock\n");
         repo.write(
+            "rust-toolchain.toml",
+            b"[toolchain]\nchannel = \"stable\"\n",
+        );
+        std::fs::create_dir_all(repo.path().join(".cargo")).unwrap();
+        repo.write(".cargo/config.toml", b"[build]\ntarget-dir = \"target\"\n");
+        repo.write(
             "crates/ferrl/Cargo.toml",
             b"[package]\nname = \"ferrl\"\nversion = \"0.0.0\"\n",
         );
@@ -71,7 +77,21 @@ impl TempRepo {
     }
 
     fn write(&self, relative: &str, bytes: &[u8]) {
+        if let Some(parent) = self.0.join(relative).parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
         std::fs::write(self.0.join(relative), bytes).unwrap();
+    }
+
+    fn head(&self) -> String {
+        String::from_utf8(self.git(&["rev-parse", "HEAD^{commit}"]).stdout)
+            .unwrap()
+            .trim()
+            .to_owned()
+    }
+
+    fn manifest_dir(&self) -> PathBuf {
+        self.path().join("crates/ferrl")
     }
 }
 
@@ -153,4 +173,103 @@ fn exact_source_check_ignores_git_replacement_objects() {
         "replacement refs should fool Git's ordinary cleanliness view"
     );
     assert!(!build_script::source_tree_is_exact(repo.path()));
+}
+
+#[test]
+fn exact_source_check_binds_toolchain_and_repository_cargo_config() {
+    let repo = TempRepo::seeded();
+    let head = repo.head();
+    assert!(build_script::source_tree_is_exact_at(repo.path(), &head));
+
+    repo.write(
+        "rust-toolchain.toml",
+        b"[toolchain]\nchannel = \"nightly\"\n",
+    );
+    assert!(!build_script::source_tree_is_exact_at(repo.path(), &head));
+    assert!(repo
+        .git(&["checkout-index", "--force", "--", "rust-toolchain.toml"])
+        .status
+        .success());
+    assert!(build_script::source_tree_is_exact_at(repo.path(), &head));
+
+    repo.write(
+        ".cargo/config.toml",
+        b"[build]\nrustflags = [\"-Copt-level=3\"]\n",
+    );
+    assert!(!build_script::source_tree_is_exact_at(repo.path(), &head));
+}
+
+#[test]
+fn build_identity_rejects_non_commit_head() {
+    let repo = TempRepo::seeded();
+    let tree = String::from_utf8(repo.git(&["rev-parse", "HEAD^{tree}"]).stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    std::fs::write(repo.path().join(".git/HEAD"), format!("{tree}\n")).unwrap();
+    assert!(!build_script::source_tree_is_exact(repo.path()));
+    let identity = build_script::inspect_source_identity_with_hook(&repo.manifest_dir(), || {});
+    assert_eq!(identity.commit, None);
+    assert!(identity.dirty);
+}
+
+#[test]
+#[allow(clippy::cognitive_complexity)] // one deterministic validate-then-ref-drift control
+fn build_identity_rejects_head_drift_after_validation() {
+    let repo = TempRepo::seeded();
+    let original = repo.head();
+    repo.write("crates/ferrl/src/lib.rs", b"pub fn second() {}\n");
+    assert!(repo.git(&["add", "."]).status.success());
+    assert!(repo
+        .git(&[
+            "-c",
+            "user.name=Ferrl Test",
+            "-c",
+            "user.email=ferrl@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "--no-verify",
+            "-m",
+            "test: drift target",
+        ])
+        .status
+        .success());
+    let replacement = repo.head();
+    assert!(repo
+        .git(&["update-ref", "HEAD", &original])
+        .status
+        .success());
+    assert!(repo.git(&["read-tree", &original]).status.success());
+    assert!(repo
+        .git(&["checkout-index", "--all", "--force"])
+        .status
+        .success());
+
+    let identity = build_script::inspect_source_identity_with_hook(&repo.manifest_dir(), || {
+        assert!(repo
+            .git(&["update-ref", "HEAD", &replacement])
+            .status
+            .success());
+    });
+    assert_eq!(identity.commit, None);
+    assert!(identity.dirty);
+}
+
+#[test]
+fn build_identity_rejects_nested_repository_root() {
+    let repo = TempRepo::seeded();
+    let nested = repo.manifest_dir();
+    assert!(Command::new("git")
+        .arg("-C")
+        .arg(&nested)
+        .args(["init", "--quiet"])
+        .status()
+        .unwrap()
+        .success());
+
+    let identity = build_script::inspect_source_identity_with_hook(&nested, || {});
+    assert_eq!(identity.commit, None);
+    assert!(identity.dirty);
 }

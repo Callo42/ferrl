@@ -1491,13 +1491,30 @@ impl RunConfig {
     /// budget. This is the form `trimul-baseline` measures against; `train` layers the
     /// guarded baseline on top via [`build_trimul_reward`](Self::build_trimul_reward).
     fn build_trimul_reward_base(&self) -> Result<TrimulReward, CliError> {
+        let assets = self.capture_trimul_verifier_assets()?;
+        self.build_trimul_reward_base_with_assets(assets)
+    }
+
+    fn capture_trimul_verifier_assets(
+        &self,
+    ) -> Result<ferrl::trimul::TrimulVerifierAssets, CliError> {
         let t = &self.trimul;
-        let (tests, benches) = ferrl::trimul::load_task_yml(t.eval_dir.join("task.yml"))?;
+        ferrl::trimul::TrimulVerifierAssets::capture(&t.image, &t.eval_dir, &t.scratch_root)
+            .map_err(|error| CliError::msg(error.to_string()))
+    }
+
+    fn build_trimul_reward_base_with_assets(
+        &self,
+        assets: ferrl::trimul::TrimulVerifierAssets,
+    ) -> Result<TrimulReward, CliError> {
+        let t = &self.trimul;
+        let (tests, benches) = ferrl::trimul::parse_task_yml(assets.task_yml())?;
         let wall = Duration::from_secs(if t.wall_secs == 0 { 600 } else { t.wall_secs });
         let mut reward = TrimulReward::new(&t.image, &t.eval_dir, &t.scratch_root)
             .with_cases(tests, benches)
             .with_secret_seed(t.secret_seed)
-            .with_wall(wall);
+            .with_wall(wall)
+            .with_verifier_assets(assets);
         reward = reward
             .with_reward_profile(t.reward)
             .map_err(CliError::msg)?;
@@ -1524,9 +1541,18 @@ impl RunConfig {
     /// node's GPU matches the GPU the baseline was measured on. With no baseline the
     /// reward falls back to an inverse-time signal (faster still scores higher).
     fn build_trimul_reward(&self) -> Result<TrimulReward, CliError> {
+        self.trimul_submission_extract_mode()?;
+        let assets = self.capture_trimul_verifier_assets()?;
+        self.build_trimul_reward_with_assets(assets)
+    }
+
+    fn build_trimul_reward_with_assets(
+        &self,
+        assets: ferrl::trimul::TrimulVerifierAssets,
+    ) -> Result<TrimulReward, CliError> {
         let mode = self.trimul_submission_extract_mode()?;
         let mut reward = self
-            .build_trimul_reward_base()?
+            .build_trimul_reward_base_with_assets(assets)?
             .with_submission_extract_mode(mode);
         if let Some(b) = &self.trimul.baseline {
             guard_baseline_gpu(&b.gpu)?;
@@ -1584,6 +1610,8 @@ struct LaunchPayload {
     model: LaunchModelIdentity,
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt: Option<LaunchPromptIdentity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verifier: Option<ferrl::trimul::TrimulVerifierIdentity>,
     candidate_ledger: LaunchCandidateLedger,
 }
 
@@ -2012,18 +2040,42 @@ fn canonicalize_json(value: serde_json::Value) -> serde_json::Value {
 /// data, and run training.
 fn train(args: &TrainArgs) -> Result<(), CliError> {
     let _ = ferrl::init_tracing();
-    let build_source = embedded_build_source_identity()?;
     let launch_runtime = open_launch_runtime()?;
-    train_with_launch_runtime(args, launch_runtime, build_source, prepare_launch_device)
+    train_with_launch_runtime_and_source_result(
+        args,
+        launch_runtime,
+        embedded_build_source_identity(),
+        prepare_launch_device,
+    )
 }
 
+#[cfg(test)]
 fn train_with_launch_runtime(
     args: &TrainArgs,
     launch_runtime: Option<LaunchRuntime>,
     build_source: BuildSourceIdentity,
     prepare_device: impl FnOnce(&RunConfig, Option<&LaunchRuntime>) -> Result<Device, CliError>,
 ) -> Result<(), CliError> {
+    train_with_launch_runtime_and_source_result(
+        args,
+        launch_runtime,
+        Ok(build_source),
+        prepare_device,
+    )
+}
+
+fn train_with_launch_runtime_and_source_result(
+    args: &TrainArgs,
+    launch_runtime: Option<LaunchRuntime>,
+    local_build_source: Result<BuildSourceIdentity, CliError>,
+    prepare_device: impl FnOnce(&RunConfig, Option<&LaunchRuntime>) -> Result<Device, CliError>,
+) -> Result<(), CliError> {
     let launch_comm = launch_runtime.as_ref().map(|runtime| runtime.comm.as_ref());
+    let build_source = coordinate_distributed_result(
+        launch_comm,
+        "embedded build source validation",
+        local_build_source,
+    )?;
     let loaded = coordinate_distributed_result(
         launch_comm,
         "run config load",
@@ -2066,6 +2118,7 @@ fn train_with_launch_runtime(
                 &train,
                 &eval,
                 None,
+                None,
                 &launch,
                 launch_runtime,
             )
@@ -2083,22 +2136,26 @@ fn train_with_launch_runtime(
                 &train,
                 &eval,
                 None,
+                None,
                 &launch,
                 launch_runtime,
             )
         }
         "trimul" => {
-            let (prompt_file_bytes, train, eval, reward) = coordinate_distributed_result(
-                launch_comm,
-                "TriMul reward and dataset setup",
-                (|| {
-                    let prompt_file_bytes = cfg.trimul_prompt_file_bytes()?;
-                    let prompt = cfg.trimul_prompt_text(&prompt_file_bytes)?;
-                    let (train, eval) = cfg.trimul_splits_from_prompt(&prompt);
-                    let reward = cfg.build_trimul_reward()?;
-                    Ok((prompt_file_bytes, train, eval, reward))
-                })(),
-            )?;
+            let (prompt_file_bytes, train, eval, reward, verifier_assets) =
+                coordinate_distributed_result(
+                    launch_comm,
+                    "TriMul reward and dataset setup",
+                    (|| {
+                        let prompt_file_bytes = cfg.trimul_prompt_file_bytes()?;
+                        let prompt = cfg.trimul_prompt_text(&prompt_file_bytes)?;
+                        let (train, eval) = cfg.trimul_splits_from_prompt(&prompt);
+                        let verifier_assets = cfg.capture_trimul_verifier_assets()?;
+                        let reward =
+                            cfg.build_trimul_reward_with_assets(verifier_assets.clone())?;
+                        Ok((prompt_file_bytes, train, eval, reward, verifier_assets))
+                    })(),
+                )?;
             run_training(
                 &cfg,
                 &device,
@@ -2106,6 +2163,7 @@ fn train_with_launch_runtime(
                 &train,
                 &eval,
                 Some(&prompt_file_bytes),
+                Some(&verifier_assets),
                 &launch,
                 launch_runtime,
             )
@@ -2128,6 +2186,7 @@ fn run_training<R: RewardFn>(
     train: &[Sample<R::Target>],
     eval: &[Sample<R::Target>],
     rendered_prompt_bytes: Option<&[u8]>,
+    verifier_assets: Option<&ferrl::trimul::TrimulVerifierAssets>,
     launch: &LaunchContext,
     launch_runtime: Option<LaunchRuntime>,
 ) -> Result<(), CliError> {
@@ -2139,6 +2198,7 @@ fn run_training<R: RewardFn>(
         train,
         eval,
         rendered_prompt_bytes,
+        verifier_assets,
         launch,
         launch_runtime,
         Some(&launch_attestor),
@@ -2170,6 +2230,7 @@ fn run_training_with_loader<P, R>(
     train: &[Sample<R::Target>],
     eval: &[Sample<R::Target>],
     rendered_prompt_bytes: Option<&[u8]>,
+    verifier_assets: Option<&ferrl::trimul::TrimulVerifierAssets>,
     launch: &LaunchContext,
     launch_runtime: Option<LaunchRuntime>,
     launch_attestor: Option<&dyn LaunchAttestor>,
@@ -2245,6 +2306,7 @@ where
         coordinate_distributed_result(launch_comm, "model and EOS setup", model_setup)?;
     validate_resolved_eos_consensus(tcfg.eos_token_id, launch_comm)?;
     let prompt_sha256 = rendered_prompt_bytes.map(sha256_hex);
+    let verifier_identity = verifier_assets.map(|assets| assets.identity().clone());
     let common_provenance = serde_json::to_vec(&(
         &launch.ferrl_commit,
         &launch.run.group_id,
@@ -2252,6 +2314,7 @@ where
         &policy_identity.tokenizer_sha256,
         policy_identity.model_family,
         &prompt_sha256,
+        &verifier_identity,
     ))
     .map_err(|error| CliError::msg(format!("serialize launch provenance: {error}")))?;
     validate_launch_value_consensus(
@@ -2280,6 +2343,7 @@ where
                 sha256: sha256_hex(bytes),
                 len_bytes: bytes.len(),
             }),
+            verifier: verifier_identity,
             candidate_ledger: LaunchCandidateLedger {
                 file: RunDir::CANDIDATES_FILE.to_owned(),
                 format_version: 1,
@@ -2304,6 +2368,15 @@ where
         launch_comm,
         "external launch attestation",
         attestation_setup,
+    )?;
+    coordinate_distributed_result(
+        launch_comm,
+        "attested verifier asset revalidation",
+        verifier_assets.map_or(Ok(()), |assets| {
+            assets
+                .verify_current()
+                .map_err(|error| CliError::msg(error.to_string()))
+        }),
     )?;
 
     let publication_setup = (|| {
@@ -3373,10 +3446,22 @@ struct ArtifactConfigManifest {
 /// Eval harness provenance fields.
 #[derive(Debug, Serialize)]
 struct EvalManifest {
-    /// Immutable eval bundle identity.
-    bundle: String,
-    /// Immutable sandbox image identity.
-    sandbox_image: String,
+    /// Configured eval bundle path (informational; the digest is authoritative).
+    bundle_path: String,
+    /// SHA-256 of every ordered relative file name and byte in the eval bundle.
+    bundle_sha256: String,
+    /// Number of regular files bound by `bundle_sha256`.
+    bundle_file_count: usize,
+    /// Configured sandbox image path (informational; the digest is authoritative).
+    sandbox_image_path: String,
+    /// SHA-256 of the exact sandbox image bytes.
+    sandbox_image_sha256: String,
+    /// Exact sandbox image length.
+    sandbox_image_len_bytes: u64,
+    /// SHA-256 of the exact case-selecting `task.yml` bytes.
+    task_yml_sha256: String,
+    /// Exact `task.yml` length.
+    task_yml_len_bytes: usize,
     /// Number of correctness cases loaded from `task.yml`.
     test_cases: usize,
     /// Number of benchmark cases loaded from `task.yml`.
@@ -3426,11 +3511,7 @@ fn load_bound_run_candidate_with_trust(
     validate_lower_sha256("--candidate-sha256", candidate_sha256)?;
     let launch_path = run_dir.join(RunDir::LAUNCH_FILE);
     let launch_bytes = read_regular_bytes(&launch_path)?;
-    let launch: LaunchManifest =
-        serde_json::from_slice(&launch_bytes).map_err(|source| CliError::Config {
-            path: launch_path.clone(),
-            source,
-        })?;
+    let launch = parse_exact_launch_manifest(&launch_path, &launch_bytes)?;
     verify_launch_manifest_payload(&launch)?;
     verify_launch_attestation(&launch, trust_policy)?;
     let run_name = run_dir
@@ -3568,6 +3649,25 @@ fn load_bound_run_candidate_with_trust(
         candidate,
         candidate_row_bytes,
     })
+}
+
+fn parse_exact_launch_manifest(
+    launch_path: &Path,
+    launch_bytes: &[u8],
+) -> Result<LaunchManifest, CliError> {
+    let launch: LaunchManifest =
+        serde_json::from_slice(launch_bytes).map_err(|source| CliError::Config {
+            path: launch_path.to_path_buf(),
+            source,
+        })?;
+    let canonical = launch.to_pretty_bytes()?;
+    if launch_bytes != canonical {
+        return Err(CliError::msg(format!(
+            "launch manifest {} is not in the exact canonical production encoding",
+            launch_path.display()
+        )));
+    }
+    Ok(launch)
 }
 
 fn parse_strict_candidate_row(
@@ -3717,6 +3817,35 @@ fn verify_launch_manifest_payload(manifest: &LaunchManifest) -> Result<(), CliEr
     if let Some(prompt) = &manifest.payload.prompt {
         validate_lower_sha256("launch prompt sha256", &prompt.sha256)?;
     }
+    match (&manifest.payload.verifier, manifest.payload.task.as_str()) {
+        (Some(verifier), "trimul") => {
+            validate_lower_sha256("launch verifier image_sha256", &verifier.image_sha256)?;
+            validate_lower_sha256(
+                "launch verifier eval_bundle_sha256",
+                &verifier.eval_bundle_sha256,
+            )?;
+            validate_lower_sha256("launch verifier task_yml_sha256", &verifier.task_yml_sha256)?;
+            if verifier.image_len_bytes == 0
+                || verifier.eval_file_count == 0
+                || verifier.task_yml_len_bytes == 0
+            {
+                return Err(CliError::msg(
+                    "TriMul launch verifier identity has an empty required asset",
+                ));
+            }
+        }
+        (None, "trimul") => {
+            return Err(CliError::msg(
+                "TriMul launch manifest is missing verifier asset identity",
+            ));
+        }
+        (Some(_), _) => {
+            return Err(CliError::msg(
+                "non-TriMul launch manifest unexpectedly carries verifier assets",
+            ));
+        }
+        (None, _) => {}
+    }
     validate_full_git_commit(&manifest.payload.ferrl_commit)?;
     if !matches!(
         manifest.payload.model.family.as_str(),
@@ -3842,6 +3971,7 @@ fn trimul_artifact_with_trust(
     let baseline = cfg.trimul.baseline.as_ref().ok_or_else(|| {
         CliError::msg("trimul-artifact requires trimul.baseline in the run config")
     })?;
+    let verifier_assets = capture_attested_trimul_verifier_assets(cfg, &bound.launch)?;
     let baseline_median = median_checked(&args.baseline_measurements_ns, "baseline-ns")?;
     require_baseline_matches_config(baseline_median, baseline.ns)?;
     let gpu = detect_gpu_name().ok_or_else(|| {
@@ -3854,7 +3984,7 @@ fn trimul_artifact_with_trust(
     let raw_completion = &bound.candidate.completion;
     let extract_mode = cfg.trimul_submission_extract_mode()?;
     let mut reward = cfg
-        .build_trimul_reward_base()?
+        .build_trimul_reward_base_with_assets(verifier_assets.clone())?
         .with_submission_extract_mode(extract_mode);
     let submission = reward.extract_submission(raw_completion).ok_or_else(|| {
         CliError::msg("completion does not contain a closed non-empty fenced code block")
@@ -3863,8 +3993,7 @@ fn trimul_artifact_with_trust(
     reward = reward
         .with_secret_seed(args.audit_secret_seed)
         .with_baseline_ns(baseline_median);
-    let (test_cases, benchmark_cases) =
-        ferrl::trimul::load_task_yml(cfg.trimul.eval_dir.join("task.yml"))?;
+    let (test_cases, benchmark_cases) = ferrl::trimul::parse_task_yml(verifier_assets.task_yml())?;
     let runs = verify_submission_repeated(&reward, &submission, args.repeats)?;
     let accepted = accepted_artifact(&runs, baseline_median)
         && args.source_inspection == SourceInspectionResult::Clean;
@@ -3892,6 +4021,25 @@ fn trimul_artifact_with_trust(
         args.out.display()
     );
     Ok(())
+}
+
+fn capture_attested_trimul_verifier_assets(
+    cfg: &RunConfig,
+    launch: &LaunchManifest,
+) -> Result<ferrl::trimul::TrimulVerifierAssets, CliError> {
+    let expected = launch.payload.verifier.as_ref().ok_or_else(|| {
+        CliError::msg("TriMul launch manifest is missing verifier asset identity")
+    })?;
+    let assets = cfg.capture_trimul_verifier_assets()?;
+    if assets.identity() != expected {
+        return Err(CliError::msg(
+            "live TriMul verifier assets do not match the attested launch identity",
+        ));
+    }
+    assets
+        .verify_current()
+        .map_err(|error| CliError::msg(error.to_string()))?;
+    Ok(assets)
 }
 
 /// Values needed to write the artifact bundle.
@@ -4045,6 +4193,10 @@ fn build_manifest(
     inputs: &ArtifactInputs<'_>,
 ) -> ArtifactManifest {
     let launch = &inputs.launch.payload;
+    let verifier = launch
+        .verifier
+        .as_ref()
+        .expect("verified TriMul launch must bind verifier assets");
     let candidate = inputs.candidate;
     ArtifactManifest {
         contract_version: 2,
@@ -4112,8 +4264,14 @@ fn build_manifest(
             verifier_cuda_device_pool: cfg.trimul.verifier_cuda_device_pool.clone(),
         },
         eval: EvalManifest {
-            bundle: cfg.trimul.eval_dir.display().to_string(),
-            sandbox_image: cfg.trimul.image.display().to_string(),
+            bundle_path: cfg.trimul.eval_dir.display().to_string(),
+            bundle_sha256: verifier.eval_bundle_sha256.clone(),
+            bundle_file_count: verifier.eval_file_count,
+            sandbox_image_path: cfg.trimul.image.display().to_string(),
+            sandbox_image_sha256: verifier.image_sha256.clone(),
+            sandbox_image_len_bytes: verifier.image_len_bytes,
+            task_yml_sha256: verifier.task_yml_sha256.clone(),
+            task_yml_len_bytes: verifier.task_yml_len_bytes,
             test_cases: inputs.test_cases,
             benchmark_cases: inputs.benchmark_cases,
         },
@@ -4424,12 +4582,22 @@ fn artifact_report(
     );
     push_check(
         &mut out,
-        !manifest.eval.bundle.trim().is_empty(),
+        !manifest.eval.bundle_path.trim().is_empty()
+            && validate_lower_sha256("artifact eval bundle", &manifest.eval.bundle_sha256).is_ok()
+            && manifest.eval.bundle_file_count > 0,
         "eval bundle identity recorded",
     );
     push_check(
         &mut out,
-        !manifest.eval.sandbox_image.trim().is_empty(),
+        !manifest.eval.sandbox_image_path.trim().is_empty()
+            && validate_lower_sha256(
+                "artifact sandbox image",
+                &manifest.eval.sandbox_image_sha256,
+            )
+            .is_ok()
+            && manifest.eval.sandbox_image_len_bytes > 0
+            && validate_lower_sha256("artifact task.yml", &manifest.eval.task_yml_sha256).is_ok()
+            && manifest.eval.task_yml_len_bytes > 0,
         "sandbox image identity recorded",
     );
     push_check(
@@ -5285,6 +5453,11 @@ mod tests {
     struct TestLaunchAttestor;
     struct RejectingLaunchAttestor;
     struct RankOneRejectingAttestor;
+    struct MutatingLaunchAttestor {
+        path: PathBuf,
+        replacement: Vec<u8>,
+        rank: Option<usize>,
+    }
 
     fn test_attestation_pkcs8() -> &'static [u8] {
         static KEY: OnceLock<Vec<u8>> = OnceLock::new();
@@ -5345,6 +5518,32 @@ mod tests {
             } else {
                 TEST_LAUNCH_ATTESTOR.attest(manifest)
             }
+        }
+    }
+
+    impl LaunchAttestor for MutatingLaunchAttestor {
+        fn attest(&self, manifest: &LaunchManifest) -> Result<LaunchAttestation, CliError> {
+            let attestation = TEST_LAUNCH_ATTESTOR.attest(manifest)?;
+            if self
+                .rank
+                .is_none_or(|rank| rank == manifest.payload.run.data_parallel_rank)
+            {
+                let replacement_path = self.path.with_extension(format!(
+                    "ferrl-replacement-{}",
+                    manifest.payload.run.data_parallel_rank
+                ));
+                std::fs::write(&replacement_path, &self.replacement).map_err(|source| {
+                    CliError::Io {
+                        path: replacement_path.clone(),
+                        source,
+                    }
+                })?;
+                std::fs::rename(&replacement_path, &self.path).map_err(|source| CliError::Io {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            }
+            Ok(attestation)
         }
     }
 
@@ -5575,6 +5774,17 @@ mod tests {
         validated_build_source_identity(&"01".repeat(20), false).unwrap()
     }
 
+    fn test_trimul_verifier_identity() -> ferrl::trimul::TrimulVerifierIdentity {
+        ferrl::trimul::TrimulVerifierIdentity {
+            image_sha256: "55".repeat(32),
+            image_len_bytes: 17,
+            eval_bundle_sha256: "66".repeat(32),
+            eval_file_count: 5,
+            task_yml_sha256: "77".repeat(32),
+            task_yml_len_bytes: 19,
+        }
+    }
+
     fn launch_context_for_test(
         cfg: &RunConfig,
         run_id: String,
@@ -5644,6 +5854,44 @@ mod tests {
         )
     }
 
+    fn write_trimul_verifier_fixture(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let image = root.join("image.sif");
+        let eval_dir = root.join("eval");
+        let scratch = root.join("scratch");
+        std::fs::create_dir_all(&eval_dir).unwrap();
+        std::fs::write(&image, b"exact-test-sif-image").unwrap();
+        for name in ["eval.py", "reference.py", "task.py", "utils.py"] {
+            std::fs::write(eval_dir.join(name), format!("# exact {name}\n")).unwrap();
+        }
+        std::fs::write(
+            eval_dir.join("task.yml"),
+            b"tests:\n  - {\"seqlen\": 8, \"bs\": 1, \"dim\": 4, \"hiddendim\": 4, \"seed\": 1, \"nomask\": true, \"distribution\": \"normal\"}\nbenchmarks:\n  - {\"seqlen\": 16, \"bs\": 1, \"dim\": 4, \"hiddendim\": 4, \"seed\": 2, \"nomask\": false, \"distribution\": \"cauchy\"}\n",
+        )
+        .unwrap();
+        (image, eval_dir, scratch)
+    }
+
+    fn trimul_config_with_verifier_fixture(
+        root: &Path,
+        model_dir: &Path,
+        out_dir: &Path,
+    ) -> RunConfig {
+        let (image, eval_dir, scratch) = write_trimul_verifier_fixture(root);
+        let prompt = root.join("prompt.txt");
+        std::fs::write(&prompt, b"exact prompt").unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_str(&trimul_score_test_config(4242)).unwrap();
+        value["model_dir"] = serde_json::json!(model_dir);
+        value["out_dir"] = serde_json::json!(out_dir);
+        value["trimul"]["prompt_path"] = serde_json::json!(prompt);
+        value["trimul"]["image"] = serde_json::json!(image);
+        value["trimul"]["eval_dir"] = serde_json::json!(eval_dir);
+        value["trimul"]["scratch_root"] = serde_json::json!(scratch);
+        value["trainer"]["max_new_tokens"] = serde_json::json!(2);
+        value["trainer"]["candidate_log_top_k"] = serde_json::json!(1);
+        serde_json::from_value(value).unwrap()
+    }
+
     fn trimul_score_args_for_test(dir: &Path) -> TrimulScoreArgs {
         TrimulScoreArgs {
             config: dir.join("run.json"),
@@ -5704,6 +5952,7 @@ mod tests {
                     sha256: sha256_hex(prompt),
                     len_bytes: prompt.len(),
                 }),
+                verifier: (cfg.task == "trimul").then(test_trimul_verifier_identity),
                 candidate_ledger: LaunchCandidateLedger {
                     file: RunDir::CANDIDATES_FILE.to_owned(),
                     format_version: 1,
@@ -7402,6 +7651,7 @@ mod tests {
             &[Sample::new("hello", ())],
             &[Sample::new("hello", ())],
             None,
+            None,
             &launch,
             None,
             Some(&TEST_LAUNCH_ATTESTOR),
@@ -7489,6 +7739,7 @@ mod tests {
             &[Sample::new("hello", ())],
             &[],
             None,
+            None,
             &launch,
             None,
             Some(&REJECTING_LAUNCH_ATTESTOR),
@@ -7559,6 +7810,7 @@ mod tests {
                             &[Sample::new("hello", ())],
                             &[],
                             None,
+                            None,
                             &launch,
                             Some(LaunchRuntime {
                                 device: Device::Cpu,
@@ -7610,6 +7862,155 @@ mod tests {
     }
 
     #[test]
+    fn post_attestation_trimul_asset_substitutions_stop_before_rollout_or_publication() {
+        for target in ["image.sif", "eval/eval.py", "eval/task.yml"] {
+            let tmp = TestDir::new(&format!("trimul-attested-substitution-{target}"));
+            let model_dir = tmp.path().join("model");
+            let out_dir = tmp.path().join("runs-must-not-exist");
+            write_generation_metadata_fixture(
+                &model_dir,
+                Some(serde_json::json!(3)),
+                &serde_json::json!(4),
+            );
+            let cfg = trimul_config_with_verifier_fixture(tmp.path(), &model_dir, &out_dir);
+            let verifier_assets = cfg.capture_trimul_verifier_assets().unwrap();
+            let launch = launch_context_for_test(&cfg, "test-run".to_owned(), 0, 1);
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let loader_seen = Arc::clone(&seen);
+            let attestor = MutatingLaunchAttestor {
+                path: tmp.path().join(target),
+                replacement: b"post-attestation replacement".to_vec(),
+                rank: None,
+            };
+
+            let error = run_training_with_loader(
+                &cfg,
+                &Device::Cpu,
+                &EosSetupReward,
+                &[Sample::new("hello", ())],
+                &[],
+                Some(b"exact prompt"),
+                Some(&verifier_assets),
+                &launch,
+                None,
+                Some(&attestor),
+                move |model_dir, _device, _opts| {
+                    let tokenizer = ferrl::HfTokenizer::from_file(model_dir.join("tokenizer.json"))
+                        .map_err(|error| CliError::msg(error.to_string()))?;
+                    Ok((
+                        EosRecordingPolicy::new(loader_seen),
+                        tokenizer,
+                        test_policy_identity(),
+                    ))
+                },
+            )
+            .unwrap_err()
+            .to_string();
+
+            assert!(
+                error.contains("changed after verifier attestation"),
+                "{target}: {error}"
+            );
+            assert!(seen.lock().unwrap().is_empty(), "{target} reached rollout");
+            assert!(!out_dir.exists(), "{target} reached run publication");
+        }
+    }
+
+    #[test]
+    fn distributed_post_attestation_trimul_substitution_returns_all_ranks_before_rollout() {
+        let tmp = TestDir::new("distributed-trimul-attested-substitution");
+        let model_dir = tmp.path().join("model");
+        write_generation_metadata_fixture(
+            &model_dir,
+            Some(serde_json::json!(3)),
+            &serde_json::json!(4),
+        );
+        let results = std::thread::scope(|scope| {
+            ferrl::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(5))
+                .into_iter()
+                .map(|comm| {
+                    let rank = comm.rank();
+                    let root = tmp.path().join(format!("rank-{rank}"));
+                    std::fs::create_dir_all(&root).unwrap();
+                    let model_dir = model_dir.clone();
+                    scope.spawn(move || {
+                        let out_dir = root.join("runs-must-not-exist");
+                        let mut cfg =
+                            trimul_config_with_verifier_fixture(&root, &model_dir, &out_dir);
+                        cfg.distributed.enabled = true;
+                        let verifier_assets = cfg.capture_trimul_verifier_assets().unwrap();
+                        let launch = launch_context_for_test(
+                            &cfg,
+                            format!("test-group-rank{rank}"),
+                            rank,
+                            2,
+                        );
+                        let seen = Arc::new(Mutex::new(Vec::new()));
+                        let loader_seen = Arc::clone(&seen);
+                        let attestor = MutatingLaunchAttestor {
+                            path: root.join("eval/task.yml"),
+                            replacement: b"rank-local post-attestation replacement".to_vec(),
+                            rank: Some(1),
+                        };
+                        let result = run_training_with_loader(
+                            &cfg,
+                            &Device::Cpu,
+                            &EosSetupReward,
+                            &[Sample::new("hello", ())],
+                            &[],
+                            Some(b"exact prompt"),
+                            Some(&verifier_assets),
+                            &launch,
+                            Some(LaunchRuntime {
+                                device: Device::Cpu,
+                                comm: Box::new(comm),
+                            }),
+                            Some(&attestor),
+                            move |model_dir, _device, _opts| {
+                                let tokenizer =
+                                    ferrl::HfTokenizer::from_file(model_dir.join("tokenizer.json"))
+                                        .map_err(|error| CliError::msg(error.to_string()))?;
+                                Ok((
+                                    EosRecordingPolicy::new(loader_seen),
+                                    tokenizer,
+                                    test_policy_identity(),
+                                ))
+                            },
+                        );
+                        let rollout_calls = seen.lock().unwrap().len();
+                        (
+                            rank,
+                            result.map_err(|error| error.to_string()),
+                            rollout_calls,
+                            out_dir,
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        for (rank, result, rollout_calls, out_dir) in results {
+            let error = result.unwrap_err();
+            if rank == 1 {
+                assert!(
+                    error.contains("changed after verifier attestation"),
+                    "{error}"
+                );
+            } else {
+                assert!(
+                    error.contains("attested verifier asset revalidation"),
+                    "{error}"
+                );
+            }
+            assert_eq!(rollout_calls, 0, "rank {rank} reached rollout");
+            assert!(!out_dir.exists(), "rank {rank} reached publication");
+        }
+    }
+
+    #[test]
     fn production_training_rejects_existing_launch_before_rollout() {
         let tmp = TestDir::new("production-launch-create-new");
         let model_dir = tmp.path().join("model");
@@ -7637,6 +8038,7 @@ mod tests {
             &EosSetupReward,
             &[Sample::new("hello", ())],
             &[],
+            None,
             None,
             &launch,
             None,
@@ -7705,6 +8107,7 @@ mod tests {
                             &EosSetupReward,
                             &[Sample::new("hello", ())],
                             &[],
+                            None,
                             None,
                             &launch,
                             Some(LaunchRuntime {
@@ -7792,6 +8195,7 @@ mod tests {
                             &EosSetupReward,
                             &[Sample::new("hello", ())],
                             &[],
+                            None,
                             None,
                             &launch,
                             Some(LaunchRuntime {
@@ -8130,6 +8534,72 @@ mod tests {
             assert!(result.is_err(), "{field} unexpectedly reached training");
             assert!(!prepared.get(), "{field} reached device/model setup");
         }
+    }
+
+    #[test]
+    fn asymmetric_invalid_build_source_returns_all_ranks_before_device_or_publication() {
+        let tmp = TestDir::new("asymmetric-invalid-build-source");
+        let config_path = tmp.path().join("run.json");
+        let out_dir = tmp.path().join("runs-must-not-exist");
+        let mut json: serde_json::Value =
+            serde_json::from_str(&countdown_train_config("")).unwrap();
+        json["out_dir"] = serde_json::json!(&out_dir);
+        json["distributed"] = serde_json::json!({ "enabled": true });
+        std::fs::write(&config_path, serde_json::to_vec(&json).unwrap()).unwrap();
+        let prepared = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let results = std::thread::scope(|scope| {
+            ferrl::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(5))
+                .into_iter()
+                .map(|comm| {
+                    let rank = comm.rank();
+                    let config_path = config_path.clone();
+                    let prepared = Arc::clone(&prepared);
+                    scope.spawn(move || {
+                        let local_source = if rank == 1 {
+                            Err(CliError::msg("test dirty source on rank one"))
+                        } else {
+                            Ok(test_build_source_identity())
+                        };
+                        (
+                            rank,
+                            train_with_launch_runtime_and_source_result(
+                                &TrainArgs {
+                                    config: config_path,
+                                },
+                                Some(LaunchRuntime {
+                                    device: Device::Cpu,
+                                    comm: Box::new(comm),
+                                }),
+                                local_source,
+                                move |_, _| {
+                                    prepared.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                    Ok(Device::Cpu)
+                                },
+                            )
+                            .map_err(|error| error.to_string()),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        for (rank, result) in results {
+            let error = result.unwrap_err();
+            if rank == 1 {
+                assert!(error.contains("test dirty source on rank one"), "{error}");
+            } else {
+                assert!(
+                    error.contains("embedded build source validation"),
+                    "{error}"
+                );
+            }
+        }
+        assert_eq!(prepared.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!out_dir.exists());
     }
 
     #[test]
@@ -9204,6 +9674,8 @@ mod tests {
         let eval_dir =
             std::env::temp_dir().join(format!("ferrl-trimul-config-test-{}", std::process::id()));
         std::fs::create_dir_all(&eval_dir).unwrap();
+        let image = eval_dir.join("image.sif");
+        std::fs::write(&image, b"test image").unwrap();
         std::fs::write(
             eval_dir.join("task.yml"),
             r#"
@@ -9220,7 +9692,7 @@ benchmarks:
                 "task": "trimul",
                 "model_dir": "/m",
                 "trimul": {{
-                  "image": "/img.sif",
+                  "image": "{}",
                   "eval_dir": "{}",
                   "scratch_root": "/tmp",
                   "verifier_cuda_visible_devices": "1",
@@ -9232,6 +9704,7 @@ benchmarks:
                   "lr": 1e-5, "weight_decay": 0.0,
                   "loss_type": "grpo", "scale_rewards": "group" }}
             }}"#,
+                image.display(),
                 eval_dir.display(),
                 verifier_max_procs_field
             )
@@ -9624,6 +10097,50 @@ benchmarks:
     }
 
     #[test]
+    fn trimul_artifact_ingest_rejects_noncanonical_launch_encoding() {
+        let (_tmp, run_dir, candidate_sha256) =
+            write_bound_candidate_run("artifact-launch-encoding", 0, 1, 0, 1);
+        let launch_path = run_dir.join(RunDir::LAUNCH_FILE);
+        let launch_value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&launch_path).unwrap()).unwrap();
+        std::fs::write(&launch_path, serde_json::to_vec(&launch_value).unwrap()).unwrap();
+
+        let error = load_bound_candidate_for_test(&run_dir, &candidate_sha256)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("exact canonical production encoding"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn trimul_artifact_rejects_post_attestation_verifier_substitution() {
+        for target in ["image.sif", "eval/utils.py", "eval/task.yml"] {
+            let tmp = TestDir::new(&format!("artifact-verifier-substitution-{target}"));
+            let cfg = trimul_config_with_verifier_fixture(
+                tmp.path(),
+                &tmp.path().join("model"),
+                &tmp.path().join("runs"),
+            );
+            let assets = cfg.capture_trimul_verifier_assets().unwrap();
+            let (launch, _signer) = launch_manifest_for_test(&cfg, "test-run", b"exact prompt");
+            let mut payload = launch.payload;
+            payload.verifier = Some(assets.identity().clone());
+            let launch = attest_launch_for_test(LaunchManifest::new(payload).unwrap());
+            std::fs::write(tmp.path().join(target), b"post-attestation replacement").unwrap();
+
+            let error = capture_attested_trimul_verifier_assets(&cfg, &launch)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("do not match the attested launch identity"),
+                "{target}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn trimul_artifact_rejects_an_appended_row_signed_by_an_operator_key() {
         let (_tmp, run_dir, _native_candidate_sha256) =
             write_bound_candidate_run("artifact-operator-row", 0, 1, 0, 1);
@@ -9826,10 +10343,10 @@ benchmarks:
         let (_tmp, run_dir, candidate_sha256) =
             write_bound_candidate_run("artifact-launch-mutation", 0, 1, 0, 1);
         let launch_path = run_dir.join(RunDir::LAUNCH_FILE);
-        let mut launch: serde_json::Value =
+        let mut launch: LaunchManifest =
             serde_json::from_slice(&std::fs::read(&launch_path).unwrap()).unwrap();
-        launch["payload"]["model"]["tokenizer_sha256"] = serde_json::json!("55".repeat(32));
-        std::fs::write(&launch_path, serde_json::to_vec_pretty(&launch).unwrap()).unwrap();
+        launch.payload.model.tokenizer_sha256 = "55".repeat(32);
+        std::fs::write(&launch_path, launch.to_pretty_bytes().unwrap()).unwrap();
         let launch_error = load_bound_candidate_for_test(&run_dir, &candidate_sha256)
             .unwrap_err()
             .to_string();
@@ -9951,8 +10468,14 @@ benchmarks:
                 verifier_cuda_device_pool: Vec::new(),
             },
             eval: EvalManifest {
-                bundle: "eval-bundle".to_string(),
-                sandbox_image: "sandbox-image".to_string(),
+                bundle_path: "eval-bundle".to_string(),
+                bundle_sha256: "09".repeat(32),
+                bundle_file_count: 5,
+                sandbox_image_path: "sandbox-image".to_string(),
+                sandbox_image_sha256: "0a".repeat(32),
+                sandbox_image_len_bytes: 1024,
+                task_yml_sha256: "0b".repeat(32),
+                task_yml_len_bytes: 512,
                 test_cases: 3,
                 benchmark_cases: 2,
             },

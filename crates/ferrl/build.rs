@@ -7,9 +7,20 @@ use std::process::Command;
 const SOURCE_PATHS: &[&str] = &[
     "Cargo.toml",
     "Cargo.lock",
+    "rust-toolchain.toml",
+    ".cargo/config",
+    ".cargo/config.toml",
     "crates/ferrl/Cargo.toml",
     "crates/ferrl/build.rs",
     "crates/ferrl/src",
+];
+
+const REQUIRED_SOURCE_FILES: &[&str] = &[
+    "Cargo.toml",
+    "Cargo.lock",
+    "rust-toolchain.toml",
+    "crates/ferrl/Cargo.toml",
+    "crates/ferrl/build.rs",
 ];
 
 struct HeadBlob {
@@ -110,27 +121,29 @@ fn parse_head_blobs(bytes: &[u8]) -> Option<Vec<HeadBlob>> {
     (!blobs.is_empty()).then_some(blobs)
 }
 
-fn head_source_blobs(repo_root: &Path) -> Option<Vec<HeadBlob>> {
-    let bytes = git_output(
-        repo_root,
-        &[
-            "ls-tree",
-            "-r",
-            "-z",
-            "HEAD",
-            "--",
-            "Cargo.toml",
-            "Cargo.lock",
-            "crates/ferrl/Cargo.toml",
-            "crates/ferrl/build.rs",
-            "crates/ferrl/src",
-        ],
-    )?;
+fn source_path_args<'a>(prefix: &'a [&'a str], commit: Option<&'a str>) -> Vec<&'a str> {
+    let mut args =
+        Vec::with_capacity(prefix.len() + usize::from(commit.is_some()) + 1 + SOURCE_PATHS.len());
+    args.extend_from_slice(prefix);
+    if let Some(commit) = commit {
+        args.push(commit);
+    }
+    args.push("--");
+    args.extend_from_slice(SOURCE_PATHS);
+    args
+}
+
+fn commit_source_blobs(repo_root: &Path, commit: &str) -> Option<Vec<HeadBlob>> {
+    let args = source_path_args(&["ls-tree", "-r", "-z"], Some(commit));
+    let bytes = git_output(repo_root, &args)?;
     let blobs = parse_head_blobs(&bytes)?;
-    SOURCE_PATHS
+    REQUIRED_SOURCE_FILES
         .iter()
-        .take(4)
         .all(|required| blobs.iter().any(|blob| blob.path == Path::new(required)))
+        .then_some(())?;
+    blobs
+        .iter()
+        .any(|blob| blob.path.starts_with("crates/ferrl/src"))
         .then_some(blobs)
 }
 
@@ -169,20 +182,8 @@ fn worktree_blobs_match(repo_root: &Path, blobs: &[HeadBlob]) -> bool {
 }
 
 fn index_entries_are_ordinary(repo_root: &Path, blobs: &[HeadBlob]) -> bool {
-    let Some(bytes) = git_output(
-        repo_root,
-        &[
-            "ls-files",
-            "-v",
-            "-z",
-            "--",
-            "Cargo.toml",
-            "Cargo.lock",
-            "crates/ferrl/Cargo.toml",
-            "crates/ferrl/build.rs",
-            "crates/ferrl/src",
-        ],
-    ) else {
+    let args = source_path_args(&["ls-files", "-v", "-z"], None);
+    let Some(bytes) = git_output(repo_root, &args) else {
         return false;
     };
     let entries = bytes
@@ -202,60 +203,92 @@ fn index_entries_are_ordinary(repo_root: &Path, blobs: &[HeadBlob]) -> bool {
     paths == blobs.iter().map(|blob| blob.path.clone()).collect()
 }
 
-/// Return whether every build-relevant source byte and index entry equals `HEAD`.
-pub(crate) fn source_tree_is_exact(repo_root: &Path) -> bool {
-    let Some(blobs) = head_source_blobs(repo_root) else {
+fn resolve_head_commit(repo_root: &Path) -> Option<String> {
+    git_output(repo_root, &["rev-parse", "--verify", "HEAD^{commit}"])
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .map(|value| value.trim().to_owned())
+        .filter(|value| valid_object_id(value))
+}
+
+/// Return whether every build-relevant source byte and index entry equals `commit`.
+pub(crate) fn source_tree_is_exact_at(repo_root: &Path, commit: &str) -> bool {
+    if !valid_object_id(commit) {
+        return false;
+    }
+    let Some(blobs) = commit_source_blobs(repo_root, commit) else {
         return false;
     };
+    let diff_args = source_path_args(&["diff-index", "--cached", "--quiet"], Some(commit));
+    let untracked_args = source_path_args(&["ls-files", "--others", "-z"], None);
     worktree_blobs_match(repo_root, &blobs)
         && index_entries_are_ordinary(repo_root, &blobs)
-        && git_success(
-            repo_root,
-            &[
-                "diff-index",
-                "--cached",
-                "--quiet",
-                "HEAD",
-                "--",
-                "Cargo.toml",
-                "Cargo.lock",
-                "crates/ferrl/Cargo.toml",
-                "crates/ferrl/build.rs",
-                "crates/ferrl/src",
-            ],
-        )
-        && git_output(
-            repo_root,
-            &[
-                "ls-files",
-                "--others",
-                "-z",
-                "--",
-                "Cargo.toml",
-                "Cargo.lock",
-                "crates/ferrl/Cargo.toml",
-                "crates/ferrl/build.rs",
-                "crates/ferrl/src",
-            ],
-        )
-        .is_some_and(|untracked| untracked.is_empty())
+        && git_success(repo_root, &diff_args)
+        && git_output(repo_root, &untracked_args).is_some_and(|untracked| untracked.is_empty())
+}
+
+/// Return whether every build-relevant source byte and index entry equals the one
+/// commit currently named by `HEAD`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn source_tree_is_exact(repo_root: &Path) -> bool {
+    resolve_head_commit(repo_root).is_some_and(|commit| source_tree_is_exact_at(repo_root, &commit))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SourceIdentity {
+    pub(crate) commit: Option<String>,
+    pub(crate) dirty: bool,
+}
+
+fn canonical_path(path: &Path) -> Option<PathBuf> {
+    std::fs::canonicalize(path).ok()
+}
+
+/// Resolve and validate one immutable commit identity for the expected workspace.
+/// The hook exists only so the regression suite can deterministically move `HEAD`
+/// across the final recheck; production supplies a no-op closure.
+pub(crate) fn inspect_source_identity_with_hook(
+    manifest_dir: &Path,
+    after_validation: impl FnOnce(),
+) -> SourceIdentity {
+    let expected_root = canonical_path(&manifest_dir.join("../.."));
+    let discovered_root = git_path(manifest_dir, &["rev-parse", "--show-toplevel"])
+        .as_deref()
+        .and_then(canonical_path);
+    let Some(repo_root) =
+        expected_root.filter(|expected| Some(expected) == discovered_root.as_ref())
+    else {
+        return SourceIdentity {
+            commit: None,
+            dirty: true,
+        };
+    };
+    let Some(commit) = resolve_head_commit(&repo_root) else {
+        return SourceIdentity {
+            commit: None,
+            dirty: true,
+        };
+    };
+    let exact = source_tree_is_exact_at(&repo_root, &commit);
+    after_validation();
+    if resolve_head_commit(&repo_root).as_deref() != Some(commit.as_str()) {
+        return SourceIdentity {
+            commit: None,
+            dirty: true,
+        };
+    }
+    SourceIdentity {
+        commit: Some(commit),
+        dirty: !exact,
+    }
 }
 
 fn main() {
     let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
-    let repo_root = git_path(&manifest_dir, &["rev-parse", "--show-toplevel"]);
-    let commit = repo_root
-        .as_deref()
-        .and_then(|root| git_output(root, &["rev-parse", "--verify", "HEAD"]))
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .map(|value| value.trim().to_owned())
-        .filter(|value| valid_object_id(value))
-        .unwrap_or_else(|| "unknown".to_owned());
-    let dirty = repo_root
-        .as_deref()
-        .is_none_or(|root| !source_tree_is_exact(root));
+    let identity = inspect_source_identity_with_hook(&manifest_dir, || {});
+    let commit = identity.commit.unwrap_or_else(|| "unknown".to_owned());
+    let dirty = identity.dirty;
 
     println!("cargo:rustc-env=FERRL_BUILD_GIT_COMMIT={commit}");
     println!("cargo:rustc-env=FERRL_BUILD_GIT_DIRTY={dirty}");
@@ -264,6 +297,9 @@ fn main() {
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=../../Cargo.toml");
     println!("cargo:rerun-if-changed=../../Cargo.lock");
+    println!("cargo:rerun-if-changed=../../rust-toolchain.toml");
+    println!("cargo:rerun-if-changed=../../.cargo/config");
+    println!("cargo:rerun-if-changed=../../.cargo/config.toml");
     if let Some(git_dir) = git_path(&manifest_dir, &["rev-parse", "--absolute-git-dir"]) {
         watch(&git_dir.join("HEAD"));
         watch(&git_dir.join("index"));

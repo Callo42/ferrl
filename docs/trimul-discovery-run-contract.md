@@ -23,7 +23,12 @@ the external trust policy, and only then commits `<run-dir>/launch.json` before
 Trainer publication. The attested payload binds the full resolved config,
 synchronized run identity, build-embedded training commit,
 exact model/checkpoint loader identity, exact tokenizer bytes, prompt, and candidate
-ledger contract. The prompt is frozen to `<run-dir>/prompt.txt`; the compatibility
+ledger contract. For TriMul it also binds the SHA-256 and byte length of the sandbox
+image, a digest and file count for the complete ordered eval tree, and the exact
+`task.yml` SHA-256 and byte length. Ferrl keeps the image on one stable open file
+identity, snapshots the eval tree, revalidates the configured assets after attestation
+and before verifier use, and aborts in lockstep on a rank-local substitution. The prompt
+is frozen to `<run-dir>/prompt.txt`; the compatibility
 digest remains at `<run-dir>/prompt.sha256`. `trimul.prompt_path` is the complete rendered
 model prompt: ferrl does not trim, wrap, prepend, append, or otherwise construct
 prompt text. Select completion parsing separately with
@@ -33,8 +38,9 @@ trimul-artifact --run-dir <run-dir> --candidate-sha256 <record_sha256>
 --out <artifact-dir> --audit-secret-seed <seed> --baseline-ns <ns>
 --baseline-ns <ns> --baseline-ns <ns> --run-health <summary>
 --source-inspection clean --source-inspection-notes <notes>`. Artifact extraction
-validates `launch.json`, every candidate row, the exact selected row, and the frozen
-prompt before GPU detection or audit verification. It does not accept operator-authored
+requires `launch.json` to have the exact production-canonical encoding, then validates
+its attestation, every candidate row, the exact selected row, the frozen prompt, and the
+live verifier assets before GPU detection or audit verification. It does not accept operator-authored
 completion, coordinate, reward, run, commit, model, tokenizer, eval, or sandbox
 provenance fields.
 
@@ -241,9 +247,9 @@ with the final report:
 | reward profile | `trimul.reward`; defaults to `trimul_shaped_v1`, with custom ladder-preserving values allowed. |
 | run-health policy | `run_health`; post-run warn/fail policy, including the original top-level config passed to `ferrl runreport --config`. |
 | model | Loader-derived family, exact model/checkpoint policy SHA-256, exact tokenizer-file SHA-256, resolved EOS, LoRA rank/alpha, base dtype, and rollout seed, all sealed at launch. |
-| TriMul eval bundle | Immutable identity of the GPUMODE `bioml/trimul` bundle used for `eval_dir` (commit, release, or digest). |
-| sandbox image | Immutable identity of the Apptainer image used by `trimul.image` (path plus digest when available). |
-| cases | `task.yml` identity and the loaded counts for `tests` and `benchmarks`. |
+| TriMul eval bundle | Attested SHA-256 over every ordered relative regular-file name and byte under `eval_dir`, plus the exact file count. The configured path is informational only. |
+| sandbox image | Attested SHA-256 and byte length of the exact Apptainer image consumed through a stable open file identity. The configured path is informational only. |
+| cases | Attested `task.yml` SHA-256 and byte length plus the loaded counts for `tests` and `benchmarks`. |
 | seeds | `data.seed`, `policy.seed`, trainer seed-bearing knobs, and the training `trimul.secret_seed`. |
 | scratch cap | `trimul.scratch_max_bytes`; `0` means the ferrl default, currently 1 GiB. |
 | verifier process cap | `trimul.verifier_max_procs`; `0` means the TriMul default, currently `1024`. This is a per-UID `RLIMIT_NPROC` cap, not a per-container task count. |
@@ -336,8 +342,14 @@ launch- and row-derived identities:
     "verifier_cuda_device_pool": []
   },
   "eval": {
-    "bundle": "<immutable eval bundle identity>",
-    "sandbox_image": "<image identity>",
+    "bundle_path": "<configured eval_dir; informational>",
+    "bundle_sha256": "<ordered eval-tree sha256>",
+    "bundle_file_count": 0,
+    "sandbox_image_path": "<configured image path; informational>",
+    "sandbox_image_sha256": "<exact image sha256>",
+    "sandbox_image_len_bytes": 0,
+    "task_yml_sha256": "<exact task.yml sha256>",
+    "task_yml_len_bytes": 0,
     "test_cases": 0,
     "benchmark_cases": 0
   },
@@ -373,8 +385,8 @@ A TriMul run counts as a success only if one artifact candidate satisfies every 
 
 1. The candidate is extracted from a model completion, not hand-authored after the run.
 2. The candidate passes every correctness case in a clean re-verification run.
-3. Re-verification uses the same eval bundle, same sandbox image, same GPU product name,
-   and a fresh scratch directory.
+3. Re-verification matches the attested eval-bundle, sandbox-image, and `task.yml`
+   content identities, uses the same GPU product name, and uses a fresh scratch directory.
 4. Re-verification uses an audit `trimul.secret_seed` that was not used for training.
 5. At least three clean benchmark re-runs are recorded for the candidate.
 6. The median candidate geometric-mean runtime is lower than the median guarded
