@@ -959,12 +959,12 @@ fn reconcile_staged_siblings(dir: &Path) -> Result<(), CheckpointError> {
         }
     }
 
-    if dir.exists() && !asides.is_empty() {
+    if dir.exists() && (!stages.is_empty() || !asides.is_empty()) {
         require_recoverable_staged_package(dir).map_err(|error| {
             publication_ambiguous(
                 dir,
                 format!(
-                    "visible checkpoint cannot be proven complete while prior asides remain: {error}"
+                    "visible checkpoint cannot be proven complete while hidden recovery candidates remain: {error}"
                 ),
             )
         })?;
@@ -3720,8 +3720,17 @@ mod tests {
         let dir = tmp.path().join("step-5");
         let vars = make_vars();
 
-        // Seed the published path with junk simulating a stale/partial write.
-        std::fs::create_dir_all(&dir).unwrap();
+        // Seed a complete published checkpoint plus unbound junk. Recovery may
+        // clean a stale stage only after proving this canonical package.
+        save_checkpoint(
+            &dir,
+            &vars,
+            &make_opt_state(),
+            &[0u8],
+            5,
+            &ordinary_binding(None),
+        )
+        .unwrap();
         std::fs::write(dir.join("garbage.bin"), b"partial").unwrap();
         // And a stale stage from a "dead" prior attempt of this same pid.
         let stage = dir.with_file_name(format!("step-5.tmp-{}", std::process::id()));
@@ -3930,7 +3939,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::cognitive_complexity)] // authenticate both preserved recovery candidates
-    fn ordinary_prior_aside_rename_no_effect_preserves_corrupt_prior_and_stage() {
+    fn ordinary_second_writer_preserves_corrupt_canonical_and_complete_stage() {
         let tmp = TempDir::new("ordinary-prior-aside-rename-no-effect-corrupt");
         let dir = tmp.path().join("step-3");
         let vars = make_vars();
@@ -3952,6 +3961,28 @@ mod tests {
         assert_eq!(stages.len(), 1, "the completed stage was not preserved");
         assert_eq!(
             load_checkpoint(&stages[0], &vars, &binding)
+                .unwrap()
+                .sampler_state,
+            Some(vec![9])
+        );
+
+        let second_error =
+            save_checkpoint(&dir, &vars, &make_opt_state(), &[11], 3, &binding).unwrap_err();
+        assert!(
+            matches!(second_error, CheckpointError::PublicationAmbiguous { ref detail, .. }
+                if detail.contains("hidden recovery candidates remain")),
+            "{second_error:?}"
+        );
+        assert!(dir.is_dir(), "the corrupt canonical candidate was lost");
+        assert!(load_checkpoint(&dir, &vars, &binding).is_err());
+        assert!(hidden_siblings(&dir, "old").is_empty());
+        let surviving_stages = hidden_siblings(&dir, "tmp");
+        assert_eq!(
+            surviving_stages, stages,
+            "the second writer changed the complete staged candidate"
+        );
+        assert_eq!(
+            load_checkpoint(&surviving_stages[0], &vars, &binding)
                 .unwrap()
                 .sampler_state,
             Some(vec![9])
