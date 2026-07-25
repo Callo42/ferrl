@@ -2,11 +2,11 @@
 //! JSON run config, and report on a finished run.
 //!
 //! ```text
-//! ferrl train --config run.json     # GRPO-train a built-in task (countdown | math | trimul)
+//! ferrl train --config run.json                    # train a built-in task
 //! ferrl trimul-baseline --config run.json   # measure the TriMul reference baseline (ns) on this GPU
 //! ferrl trimul-score --config run.json --prompt-copy prompt.txt --completion raw.txt --out scores.jsonl
 //! ferrl trimul-score --config run.json --prompt-copy prompt.txt --completion raw.txt --completion-normalization llama-cpp --out scores.jsonl
-//! ferrl trimul-artifact --config run.json --prompt-copy runs/trimul-1/prompt.txt --completion raw.txt --out artifact/ ...
+//! ferrl trimul-artifact --run-dir runs/trimul-1 --candidate-sha256 <record-sha256> --out artifact/ ...
 //! ferrl runreport <run-dir> [--config run.json] [--json] [--strict]   # one-glance run health summary
 //! ferrl perf-gate --baseline <run-dir> --candidate <run-dir>   # resource regression check
 //! ```
@@ -44,13 +44,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs::OpenOptions;
-use std::io::Write as IoWrite;
+use std::io::{Read as IoRead, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
 use candle_core::{DType, Device};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use ring::signature::{UnparsedPublicKey, ED25519};
 use serde::{
     de::Error as _,
     ser::{Error as _, SerializeStruct},
@@ -61,7 +62,7 @@ use tracing::info;
 
 use ferrl::countdown::{build_prompt, generate_dataset, CountdownConfig, CountdownProblem};
 use ferrl::policy::{GenConfig, Policy, TensorParallelPolicy};
-use ferrl::telemetry::{CandidateRecord, RegressionFailure};
+use ferrl::telemetry::{CandidateRecord, CandidateSigner, RegressionFailure};
 use ferrl::{
     compare_distributed_metrics, compare_metrics, evaluate, read_jsonl, summarize,
     train_eval_split, BaseQuantization, CountdownReward, LoaderOpts, MathProblem, MathReward,
@@ -94,7 +95,7 @@ enum Command {
     TrimulBaseline(TrimulBaselineArgs),
     /// Score external TriMul completions once with the shaped reward.
     TrimulScore(Box<TrimulScoreArgs>),
-    /// Extract and verify a TriMul artifact bundle from a raw model completion.
+    /// Extract and verify a TriMul artifact bundle from one launch-bound candidate row.
     TrimulArtifact(Box<TrimulArtifactArgs>),
     /// Print a one-glance health summary for a finished run.
     Runreport(RunreportArgs),
@@ -181,46 +182,15 @@ struct TrimulScoreArgs {
 /// Arguments for `ferrl trimul-artifact`.
 #[derive(Debug, Args)]
 struct TrimulArtifactArgs {
-    /// Path to the JSON run config used for the discovery run.
+    /// Immutable run directory containing `launch.json` and `candidates.jsonl`.
     #[arg(long)]
-    config: PathBuf,
-    /// Immutable prompt copy frozen at training launch, usually `<run-dir>/prompt.txt`.
+    run_dir: PathBuf,
+    /// Exact `record_sha256` of one immutable row in `candidates.jsonl`.
     #[arg(long)]
-    prompt_copy: PathBuf,
-    /// Raw model completion to extract `custom_kernel` from.
-    #[arg(long)]
-    completion: PathBuf,
-    /// Normalize known external-runtime transport text before TriMul extraction.
-    ///
-    /// The raw completion is still copied into the artifact bundle. When this is
-    /// not `none`, the normalized text used for extraction is also copied as
-    /// `completion.normalized.txt` and recorded in `manifest.json`.
-    #[arg(long, value_enum, default_value = "none")]
-    completion_normalization: CompletionNormalization,
+    candidate_sha256: String,
     /// Output artifact directory. Fails if `manifest.json` already exists.
     #[arg(long)]
     out: PathBuf,
-    /// Training run id or run directory name.
-    #[arg(long)]
-    run_id: String,
-    /// Candidate optimizer step, when known from the run notes.
-    #[arg(long, default_value_t = 0)]
-    step: u64,
-    /// Global prompt ordinal from `candidates.jsonl`.
-    #[arg(long, default_value_t = 0)]
-    prompt_index: u64,
-    /// Candidate index within the sampled group, when known from the run notes.
-    #[arg(long, default_value_t = 0)]
-    group_index: u64,
-    /// Data-parallel rank from `candidates.jsonl`.
-    #[arg(long, default_value_t = 0)]
-    rank: usize,
-    /// Data-parallel world size from `candidates.jsonl`.
-    #[arg(long, default_value_t = 1)]
-    world_size: usize,
-    /// Candidate training reward recorded when this candidate was selected.
-    #[arg(long)]
-    training_reward: f64,
     /// Audit seed for clean held-out re-verification. Must differ from training seed.
     #[arg(long)]
     audit_secret_seed: u64,
@@ -233,9 +203,6 @@ struct TrimulArtifactArgs {
     /// Number of clean candidate verification re-runs.
     #[arg(long, default_value_t = 3)]
     repeats: usize,
-    /// Full ferrl git commit SHA for the training run.
-    #[arg(long)]
-    ferrl_commit: String,
     /// Training run health summary copied from `runreport` or run notes.
     #[arg(long)]
     run_health: String,
@@ -246,21 +213,6 @@ struct TrimulArtifactArgs {
     /// environment variables, network sockets, and paths outside kernel inputs.
     #[arg(long)]
     source_inspection_notes: String,
-    /// Model family label for the artifact manifest.
-    #[arg(long, default_value = "qwen3.x")]
-    model_family: String,
-    /// Operator-supplied checkpoint identity. Defaults to `model_dir`.
-    #[arg(long)]
-    checkpoint: Option<String>,
-    /// Operator-supplied tokenizer identity. Defaults to `model_dir/tokenizer.json`.
-    #[arg(long)]
-    tokenizer: Option<String>,
-    /// Immutable identity of the GPUMODE eval bundle. Defaults to `trimul.eval_dir`.
-    #[arg(long)]
-    eval_bundle: Option<String>,
-    /// Immutable identity of the Apptainer image. Defaults to `trimul.image`.
-    #[arg(long)]
-    sandbox_image: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1278,19 +1230,27 @@ impl RunConfig {
             source,
         })?;
         cfg.validate_current_config_support()?;
-        let mut canonical = cfg.canonical_wire_value()?;
-        if let Some(tensor_parallel) = canonical
+        let resolved_config = canonicalize_json(cfg.canonical_wire_value()?);
+        let resolved_bytes = serde_json::to_vec(&resolved_config)
+            .map_err(|err| CliError::msg(format!("failed to canonicalize run config: {err}")))?;
+        let mut consensus_config = resolved_config.clone();
+        if let Some(tensor_parallel) = consensus_config
             .get_mut("tensor_parallel")
             .and_then(serde_json::Value::as_object_mut)
         {
             tensor_parallel.remove("rank");
         }
-        let canonical = canonicalize_json(canonical);
-        let canonical_bytes = serde_json::to_vec(&canonical)
+        let consensus_config = canonicalize_json(consensus_config);
+        let consensus_bytes = serde_json::to_vec(&consensus_config)
             .map_err(|err| CliError::msg(format!("failed to canonicalize run config: {err}")))?;
         Ok(LoadedRunConfig {
             config: cfg,
-            consensus_digest: Sha256::digest(canonical_bytes).into(),
+            launch_config: LaunchConfigSnapshot {
+                source_sha256: sha256_hex(&bytes),
+                resolved_sha256: sha256_hex(&resolved_bytes),
+                resolved: resolved_config,
+            },
+            consensus_digest: Sha256::digest(consensus_bytes).into(),
         })
     }
 
@@ -1446,23 +1406,6 @@ impl RunConfig {
         Ok(trainer)
     }
 
-    /// A unique run id: `<task>-<unix-seconds>`, rank-suffixed under DP or sharded TP.
-    fn run_id(&self) -> String {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
-        let base = format!("{}-{stamp}", self.task);
-        let tp = self.tensor_parallel_plan();
-        if self.distributed.enabled {
-            let rank = std::env::var("SLURM_PROCID").unwrap_or_else(|_| "unknown".to_owned());
-            format!("{base}-rank{rank}")
-        } else if tp.is_sharded() {
-            format!("{base}-rank{}", tp.rank())
-        } else {
-            base
-        }
-    }
-
     /// Build the Countdown train/eval splits: generate `train_n + eval_n` problems
     /// and hold out `eval_n` via the dedup-aware [`train_eval_split`].
     fn countdown_splits(&self) -> Splits<CountdownProblem> {
@@ -1595,7 +1538,455 @@ impl RunConfig {
 
 struct LoadedRunConfig {
     config: RunConfig,
+    launch_config: LaunchConfigSnapshot,
     consensus_digest: [u8; 32],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LaunchConfigSnapshot {
+    source_sha256: String,
+    resolved_sha256: String,
+    resolved: serde_json::Value,
+}
+
+const LAUNCH_CONTRACT_VERSION: u32 = 1;
+const LAUNCH_KIND: &str = "ferrl.run-launch";
+const CANDIDATE_RECORD_DOMAIN: &str = CandidateRecord::DIGEST_DOMAIN;
+const LAUNCH_ATTESTATION_CONTRACT_VERSION: u32 = 1;
+const LAUNCH_ATTESTATION_KIND: &str = "ferrl.run-launch-attestation";
+const LAUNCH_ATTESTATION_ALGORITHM: &str = "ed25519";
+const LAUNCH_ATTESTATION_DOMAIN: &str = "ferrl.run-launch-attestation.v1";
+const LAUNCH_ATTESTATION_REQUEST_KIND: &str = "ferrl.run-launch-attestation-request";
+const LAUNCH_TRUST_POLICY_KIND: &str = "ferrl.run-launch-trust-policy";
+const LAUNCH_ATTESTOR_SOCKET: &str = "/run/ferrl/launch-attestor.sock";
+const LAUNCH_TRUST_POLICY: &str = "/etc/ferrl/launch-trust.json";
+const MAX_ATTESTATION_RESPONSE_BYTES: u64 = 16 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LaunchManifest {
+    contract_version: u32,
+    kind: String,
+    payload_sha256: String,
+    payload: LaunchPayload,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attestation: Option<LaunchAttestation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LaunchPayload {
+    task: String,
+    ferrl_commit: String,
+    run: LaunchRunIdentity,
+    config: LaunchConfigSnapshot,
+    model: LaunchModelIdentity,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt: Option<LaunchPromptIdentity>,
+    candidate_ledger: LaunchCandidateLedger,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LaunchRunIdentity {
+    group_id: String,
+    run_id: String,
+    data_parallel_rank: usize,
+    data_parallel_world_size: usize,
+    tensor_parallel_rank: usize,
+    tensor_parallel_world_size: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LaunchModelIdentity {
+    family: String,
+    checkpoint_policy_sha256: String,
+    tokenizer_sha256: String,
+    resolved_eos_token_id: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LaunchPromptIdentity {
+    file: String,
+    sha256: String,
+    len_bytes: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LaunchCandidateLedger {
+    file: String,
+    format_version: u32,
+    row_digest_domain: String,
+    row_signature_algorithm: String,
+    signing_public_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LaunchAttestation {
+    contract_version: u32,
+    kind: String,
+    algorithm: String,
+    key_id: String,
+    launch_payload_sha256: String,
+    signature: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LaunchAttestationRequest {
+    contract_version: u32,
+    kind: String,
+    algorithm: String,
+    launch_payload_sha256: String,
+    launch_payload_json_hex: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LaunchTrustPolicy {
+    contract_version: u32,
+    kind: String,
+    keys: Vec<LaunchTrustKey>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LaunchTrustKey {
+    key_id: String,
+    algorithm: String,
+    public_key: String,
+}
+
+trait LaunchAttestor {
+    fn attest(&self, manifest: &LaunchManifest) -> Result<LaunchAttestation, CliError>;
+}
+
+struct SystemLaunchAttestor;
+
+#[derive(Debug, Clone)]
+struct LaunchContext {
+    ferrl_commit: String,
+    run: LaunchRunIdentity,
+    config: LaunchConfigSnapshot,
+}
+
+#[derive(Debug, Clone)]
+struct BuildSourceIdentity {
+    commit: String,
+    dirty: bool,
+}
+
+fn embedded_build_source_identity() -> Result<BuildSourceIdentity, CliError> {
+    validated_build_source_identity(
+        env!("FERRL_BUILD_GIT_COMMIT"),
+        env!("FERRL_BUILD_GIT_DIRTY") == "true",
+    )
+}
+
+fn validated_build_source_identity(
+    commit: &str,
+    dirty: bool,
+) -> Result<BuildSourceIdentity, CliError> {
+    let commit = validate_full_git_commit(commit).map_err(|_| {
+        CliError::msg("ferrl train requires a Git-built binary with an embedded full source commit")
+    })?;
+    if dirty {
+        return Err(CliError::msg(
+            "ferrl train refuses a binary built from a dirty source tree; commit the exact source before building",
+        ));
+    }
+    Ok(BuildSourceIdentity {
+        commit,
+        dirty: false,
+    })
+}
+
+impl LaunchManifest {
+    fn new(payload: LaunchPayload) -> Result<Self, CliError> {
+        let payload_bytes = serde_json::to_vec(&payload)
+            .map_err(|error| CliError::msg(format!("serialize launch payload: {error}")))?;
+        Ok(Self {
+            contract_version: LAUNCH_CONTRACT_VERSION,
+            kind: LAUNCH_KIND.to_owned(),
+            payload_sha256: domain_sha256("ferrl.run-launch.payload.v1", &[&payload_bytes]),
+            payload,
+            attestation: None,
+        })
+    }
+
+    fn attest(mut self, attestor: &dyn LaunchAttestor) -> Result<Self, CliError> {
+        if self.attestation.is_some() {
+            return Err(CliError::msg("launch manifest is already attested"));
+        }
+        self.attestation = Some(attestor.attest(&self)?);
+        Ok(self)
+    }
+
+    fn to_pretty_bytes(&self) -> Result<Vec<u8>, CliError> {
+        serde_json::to_vec_pretty(self)
+            .map_err(|error| CliError::msg(format!("serialize launch manifest: {error}")))
+    }
+}
+
+impl LaunchAttestor for SystemLaunchAttestor {
+    fn attest(&self, manifest: &LaunchManifest) -> Result<LaunchAttestation, CliError> {
+        let trust_policy = load_system_launch_trust_policy()?;
+        request_launch_attestation(manifest, &trust_policy)
+    }
+}
+
+fn launch_attestation_message(launch_payload_sha256: &str) -> String {
+    domain_sha256(
+        LAUNCH_ATTESTATION_DOMAIN,
+        &[launch_payload_sha256.as_bytes()],
+    )
+}
+
+fn valid_attestation_key_id(key_id: &str) -> bool {
+    !key_id.is_empty()
+        && key_id.len() <= 128
+        && key_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'))
+}
+
+fn decode_lower_hex(label: &str, value: &str, expected_bytes: usize) -> Result<Vec<u8>, CliError> {
+    validate_lower_hex(label, value, expected_bytes)?;
+    Ok(value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let nibble = |byte| match byte {
+                b'0'..=b'9' => byte - b'0',
+                b'a'..=b'f' => byte - b'a' + 10,
+                _ => unreachable!("validate_lower_hex checked every byte"),
+            };
+            (nibble(pair[0]) << 4) | nibble(pair[1])
+        })
+        .collect())
+}
+
+fn lower_hex_bytes(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    encoded
+}
+
+fn validate_launch_trust_policy(policy: &LaunchTrustPolicy) -> Result<(), CliError> {
+    if policy.contract_version != LAUNCH_ATTESTATION_CONTRACT_VERSION
+        || policy.kind != LAUNCH_TRUST_POLICY_KIND
+        || policy.keys.is_empty()
+    {
+        return Err(CliError::msg(
+            "launch trust policy has an unsupported contract or no keys",
+        ));
+    }
+    let mut key_ids = BTreeSet::new();
+    for key in &policy.keys {
+        if !valid_attestation_key_id(&key.key_id) || key.algorithm != LAUNCH_ATTESTATION_ALGORITHM {
+            return Err(CliError::msg(format!(
+                "launch trust policy key {:?} has an invalid id or algorithm",
+                key.key_id
+            )));
+        }
+        validate_lower_hex("launch trust public_key", &key.public_key, 32)?;
+        if !key_ids.insert(key.key_id.as_str()) {
+            return Err(CliError::msg(format!(
+                "launch trust policy repeats key id {:?}",
+                key.key_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn verify_launch_attestation(
+    manifest: &LaunchManifest,
+    trust_policy: &LaunchTrustPolicy,
+) -> Result<(), CliError> {
+    validate_launch_trust_policy(trust_policy)?;
+    let attestation = manifest
+        .attestation
+        .as_ref()
+        .ok_or_else(|| CliError::msg("launch manifest has no trusted external attestation"))?;
+    if attestation.contract_version != LAUNCH_ATTESTATION_CONTRACT_VERSION
+        || attestation.kind != LAUNCH_ATTESTATION_KIND
+        || attestation.algorithm != LAUNCH_ATTESTATION_ALGORITHM
+        || attestation.launch_payload_sha256 != manifest.payload_sha256
+        || !valid_attestation_key_id(&attestation.key_id)
+    {
+        return Err(CliError::msg(
+            "launch manifest has an invalid external attestation envelope",
+        ));
+    }
+    let key = trust_policy
+        .keys
+        .iter()
+        .find(|key| key.key_id == attestation.key_id)
+        .ok_or_else(|| {
+            CliError::msg(format!(
+                "launch attestation key {:?} is not trusted",
+                attestation.key_id
+            ))
+        })?;
+    let public_key = decode_lower_hex("launch trust public_key", &key.public_key, 32)?;
+    let signature = decode_lower_hex("launch attestation signature", &attestation.signature, 64)?;
+    let message = launch_attestation_message(&manifest.payload_sha256);
+    UnparsedPublicKey::new(&ED25519, public_key)
+        .verify(message.as_bytes(), &signature)
+        .map_err(|_| CliError::msg("launch attestation signature is invalid"))
+}
+
+#[cfg(unix)]
+#[allow(clippy::cognitive_complexity)] // one linear ownership/type/parent-chain validation
+fn require_root_owned_protected_path(path: &Path, expect_socket: bool) -> Result<(), CliError> {
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+
+    let metadata = std::fs::symlink_metadata(path).map_err(|source| CliError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let expected_type = if expect_socket {
+        metadata.file_type().is_socket()
+    } else {
+        metadata.file_type().is_file()
+    };
+    let unsafe_mode = if expect_socket {
+        metadata.mode() & 0o002 != 0
+    } else {
+        metadata.mode() & 0o022 != 0
+    };
+    if !expected_type || metadata.uid() != 0 || unsafe_mode {
+        return Err(CliError::msg(format!(
+            "external launch trust path {} must be a protected root-owned {}",
+            path.display(),
+            if expect_socket {
+                "non-world-writable Unix socket"
+            } else {
+                "non-group/world-writable regular file"
+            }
+        )));
+    }
+    for parent in path.ancestors().skip(1) {
+        let parent_metadata = std::fs::symlink_metadata(parent).map_err(|source| CliError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+        if !parent_metadata.file_type().is_dir()
+            || parent_metadata.uid() != 0
+            || parent_metadata.mode() & 0o022 != 0
+        {
+            return Err(CliError::msg(format!(
+                "external launch trust parent {} is not root-owned and protected",
+                parent.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn require_root_owned_protected_path(_path: &Path, _expect_socket: bool) -> Result<(), CliError> {
+    Err(CliError::msg(
+        "external launch attestation currently requires a Unix platform",
+    ))
+}
+
+fn load_system_launch_trust_policy() -> Result<LaunchTrustPolicy, CliError> {
+    let path = Path::new(LAUNCH_TRUST_POLICY);
+    require_root_owned_protected_path(path, false)?;
+    let bytes = read_regular_bytes(path)?;
+    let policy: LaunchTrustPolicy =
+        serde_json::from_slice(&bytes).map_err(|source| CliError::Config {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    validate_launch_trust_policy(&policy)?;
+    Ok(policy)
+}
+
+fn exchange_launch_attestation<S: IoRead + IoWrite>(
+    stream: &mut S,
+    manifest: &LaunchManifest,
+    trust_policy: &LaunchTrustPolicy,
+) -> Result<LaunchAttestation, CliError> {
+    verify_launch_manifest_payload(manifest)?;
+    let request = LaunchAttestationRequest {
+        contract_version: LAUNCH_ATTESTATION_CONTRACT_VERSION,
+        kind: LAUNCH_ATTESTATION_REQUEST_KIND.to_owned(),
+        algorithm: LAUNCH_ATTESTATION_ALGORITHM.to_owned(),
+        launch_payload_sha256: manifest.payload_sha256.clone(),
+        launch_payload_json_hex: lower_hex_bytes(&serde_json::to_vec(&manifest.payload).map_err(
+            |error| CliError::msg(format!("serialize launch payload for attestation: {error}")),
+        )?),
+    };
+    serde_json::to_writer(&mut *stream, &request)
+        .map_err(|error| CliError::msg(format!("serialize launch attestation request: {error}")))?;
+    stream
+        .write_all(b"\n")
+        .map_err(|error| CliError::msg(format!("write launch attestation request: {error}")))?;
+    stream
+        .flush()
+        .map_err(|error| CliError::msg(format!("flush launch attestation request: {error}")))?;
+    let mut response = Vec::new();
+    stream
+        .take(MAX_ATTESTATION_RESPONSE_BYTES + 1)
+        .read_to_end(&mut response)
+        .map_err(|error| CliError::msg(format!("read launch attestor response: {error}")))?;
+    if response.len() as u64 > MAX_ATTESTATION_RESPONSE_BYTES {
+        return Err(CliError::msg("launch attestor response exceeds 16 KiB"));
+    }
+    let attestation: LaunchAttestation = serde_json::from_slice(&response)
+        .map_err(|error| CliError::msg(format!("parse launch attestor response: {error}")))?;
+    let mut attested = manifest.clone();
+    attested.attestation = Some(attestation.clone());
+    verify_launch_attestation(&attested, trust_policy)?;
+    Ok(attestation)
+}
+
+#[cfg(unix)]
+fn request_launch_attestation(
+    manifest: &LaunchManifest,
+    trust_policy: &LaunchTrustPolicy,
+) -> Result<LaunchAttestation, CliError> {
+    use std::os::unix::net::UnixStream;
+
+    let socket = Path::new(LAUNCH_ATTESTOR_SOCKET);
+    require_root_owned_protected_path(socket, true)?;
+    let mut stream = UnixStream::connect(socket).map_err(|source| CliError::Io {
+        path: socket.to_path_buf(),
+        source,
+    })?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .map_err(|source| CliError::Io {
+            path: socket.to_path_buf(),
+            source,
+        })?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .map_err(|source| CliError::Io {
+            path: socket.to_path_buf(),
+            source,
+        })?;
+    exchange_launch_attestation(&mut stream, manifest, trust_policy)
+}
+
+#[cfg(not(unix))]
+fn request_launch_attestation(
+    _manifest: &LaunchManifest,
+    _trust_policy: &LaunchTrustPolicy,
+) -> Result<LaunchAttestation, CliError> {
+    Err(CliError::msg(
+        "external launch attestation currently requires a Unix platform",
+    ))
 }
 
 fn canonicalize_json(value: serde_json::Value) -> serde_json::Value {
@@ -1621,13 +2012,15 @@ fn canonicalize_json(value: serde_json::Value) -> serde_json::Value {
 /// data, and run training.
 fn train(args: &TrainArgs) -> Result<(), CliError> {
     let _ = ferrl::init_tracing();
+    let build_source = embedded_build_source_identity()?;
     let launch_runtime = open_launch_runtime()?;
-    train_with_launch_runtime(args, launch_runtime, prepare_launch_device)
+    train_with_launch_runtime(args, launch_runtime, build_source, prepare_launch_device)
 }
 
 fn train_with_launch_runtime(
     args: &TrainArgs,
     launch_runtime: Option<LaunchRuntime>,
+    build_source: BuildSourceIdentity,
     prepare_device: impl FnOnce(&RunConfig, Option<&LaunchRuntime>) -> Result<Device, CliError>,
 ) -> Result<(), CliError> {
     let launch_comm = launch_runtime.as_ref().map(|runtime| runtime.comm.as_ref());
@@ -1639,6 +2032,14 @@ fn train_with_launch_runtime(
     let cfg = loaded.config;
     validate_launch_runtime(&cfg, launch_runtime.as_ref())?;
     validate_launch_config_consensus(&loaded.consensus_digest, launch_comm)?;
+    debug_assert!(!build_source.dirty);
+    let ferrl_commit = build_source.commit;
+    validate_launch_value_consensus("training commit", ferrl_commit.as_bytes(), launch_comm)?;
+    let launch = LaunchContext {
+        ferrl_commit,
+        run: synchronized_run_identity(&cfg, launch_comm)?,
+        config: loaded.launch_config,
+    };
     let data_parallel_world = if cfg.distributed.enabled {
         launch_comm
             .ok_or_else(|| {
@@ -1665,6 +2066,7 @@ fn train_with_launch_runtime(
                 &train,
                 &eval,
                 None,
+                &launch,
                 launch_runtime,
             )
         }
@@ -1681,6 +2083,7 @@ fn train_with_launch_runtime(
                 &train,
                 &eval,
                 None,
+                &launch,
                 launch_runtime,
             )
         }
@@ -1703,6 +2106,7 @@ fn train_with_launch_runtime(
                 &train,
                 &eval,
                 Some(&prompt_file_bytes),
+                &launch,
                 launch_runtime,
             )
         }
@@ -1716,6 +2120,7 @@ fn train_with_launch_runtime(
 ///
 /// Monomorphized per task by the [`train`] dispatch — the one place the concrete
 /// reward and its typed target are known.
+#[allow(clippy::too_many_arguments)] // one typed task launch plus immutable launch context
 fn run_training<R: RewardFn>(
     cfg: &RunConfig,
     device: &Device,
@@ -1723,8 +2128,10 @@ fn run_training<R: RewardFn>(
     train: &[Sample<R::Target>],
     eval: &[Sample<R::Target>],
     rendered_prompt_bytes: Option<&[u8]>,
+    launch: &LaunchContext,
     launch_runtime: Option<LaunchRuntime>,
 ) -> Result<(), CliError> {
+    let launch_attestor = SystemLaunchAttestor;
     run_training_with_loader(
         cfg,
         device,
@@ -1732,9 +2139,11 @@ fn run_training<R: RewardFn>(
         train,
         eval,
         rendered_prompt_bytes,
+        launch,
         launch_runtime,
+        Some(&launch_attestor),
         |model_dir, device, opts| {
-            ferrl::load_auto_policy_bound(model_dir, device, opts).map_err(CliError::from)
+            ferrl::load_auto_policy_with_identity(model_dir, device, opts).map_err(CliError::from)
         },
     )
 }
@@ -1761,12 +2170,15 @@ fn run_training_with_loader<P, R>(
     train: &[Sample<R::Target>],
     eval: &[Sample<R::Target>],
     rendered_prompt_bytes: Option<&[u8]>,
+    launch: &LaunchContext,
     launch_runtime: Option<LaunchRuntime>,
+    launch_attestor: Option<&dyn LaunchAttestor>,
     load_policy: impl FnOnce(
         &Path,
         &Device,
         &LoaderOpts,
-    ) -> Result<(P, ferrl::HfTokenizer, String), CliError>,
+    )
+        -> Result<(P, ferrl::HfTokenizer, ferrl::PolicyLoadIdentity), CliError>,
 ) -> Result<(), CliError>
 where
     P: CliTrainingPolicy,
@@ -1806,8 +2218,11 @@ where
 
     let model_setup = (|| {
         let loader_opts = cfg.loader_opts();
-        let (policy, tok, bound_policy_sha256) = load_policy(&cfg.model_dir, device, &loader_opts)?;
-        let checkpoint_policy_sha256 = cfg.trainer.checkpoint_every.map(|_| bound_policy_sha256);
+        let (policy, tok, identity) = load_policy(&cfg.model_dir, device, &loader_opts)?;
+        let checkpoint_policy_sha256 = cfg
+            .trainer
+            .checkpoint_every
+            .map(|_| identity.policy_sha256.clone());
         let tcfg = cfg.resolved_trainer_config(&tok)?;
         if cfg.tensor_parallel.enabled && !policy.supports_cli_tensor_parallel() {
             return Err(CliError::msg(
@@ -1824,27 +2239,85 @@ where
                  policy does not provide cross-rank backward semantics",
             ));
         }
-        Ok((policy, tok, tcfg, checkpoint_policy_sha256))
+        Ok((policy, tok, tcfg, identity, checkpoint_policy_sha256))
     })();
-    let (mut policy, tok, tcfg, checkpoint_policy_sha256) =
+    let (mut policy, tok, tcfg, policy_identity, checkpoint_policy_sha256) =
         coordinate_distributed_result(launch_comm, "model and EOS setup", model_setup)?;
     validate_resolved_eos_consensus(tcfg.eos_token_id, launch_comm)?;
+    let prompt_sha256 = rendered_prompt_bytes.map(sha256_hex);
+    let common_provenance = serde_json::to_vec(&(
+        &launch.ferrl_commit,
+        &launch.run.group_id,
+        &policy_identity.policy_sha256,
+        &policy_identity.tokenizer_sha256,
+        policy_identity.model_family,
+        &prompt_sha256,
+    ))
+    .map_err(|error| CliError::msg(format!("serialize launch provenance: {error}")))?;
+    validate_launch_value_consensus(
+        "model/checkpoint/tokenizer/prompt provenance",
+        &common_provenance,
+        launch_comm,
+    )?;
     let gen = GenConfig::from(&tcfg);
 
+    let attestation_setup = (|| {
+        let candidate_signer = CandidateSigner::generate()?;
+        let signing_public_key = candidate_signer.public_key_hex();
+        let manifest = LaunchManifest::new(LaunchPayload {
+            task: cfg.task.clone(),
+            ferrl_commit: launch.ferrl_commit.clone(),
+            run: launch.run.clone(),
+            config: launch.config.clone(),
+            model: LaunchModelIdentity {
+                family: policy_identity.model_family.to_owned(),
+                checkpoint_policy_sha256: policy_identity.policy_sha256.clone(),
+                tokenizer_sha256: policy_identity.tokenizer_sha256.clone(),
+                resolved_eos_token_id: tcfg.eos_token_id,
+            },
+            prompt: rendered_prompt_bytes.map(|bytes| LaunchPromptIdentity {
+                file: RunDir::PROMPT_FILE.to_owned(),
+                sha256: sha256_hex(bytes),
+                len_bytes: bytes.len(),
+            }),
+            candidate_ledger: LaunchCandidateLedger {
+                file: RunDir::CANDIDATES_FILE.to_owned(),
+                format_version: 1,
+                row_digest_domain: CANDIDATE_RECORD_DOMAIN.to_owned(),
+                row_signature_algorithm: "ed25519".to_owned(),
+                signing_public_key,
+            },
+        })?;
+        let manifest = if cfg.trainer.candidate_log_top_k > 0 {
+            let attestor = launch_attestor.ok_or_else(|| {
+                CliError::msg(
+                    "launch-authenticated candidate logging requires an external attestor",
+                )
+            })?;
+            manifest.attest(attestor)?
+        } else {
+            manifest
+        };
+        Ok((candidate_signer, manifest))
+    })();
+    let (candidate_signer, manifest) = coordinate_distributed_result(
+        launch_comm,
+        "external launch attestation",
+        attestation_setup,
+    )?;
+
     let publication_setup = (|| {
-        let run = RunDir::create(&cfg.out_dir, cfg.run_id())?;
-        if let Some(prompt_bytes) = rendered_prompt_bytes {
-            write_bytes(&run.root().join("prompt.txt"), prompt_bytes)?;
-            write_text(
-                &run.root().join("prompt.sha256"),
-                &format!("{}\n", sha256_hex(prompt_bytes)),
-            )?;
-        }
+        let launch_sha256 = manifest.payload_sha256.clone();
+        let manifest_bytes = manifest.to_pretty_bytes()?;
+        let run = RunDir::create(&cfg.out_dir, launch.run.run_id.clone())?;
+        run.write_immutable_launch(&manifest_bytes, rendered_prompt_bytes)?;
         let trainer = open_trainer(
             tcfg,
             &run,
             distributed_comm,
             checkpoint_policy_sha256.as_deref(),
+            &launch_sha256,
+            candidate_signer,
         )?;
         Ok((run, trainer))
     })();
@@ -1934,17 +2407,20 @@ fn open_trainer(
     run: &RunDir,
     distributed_comm: Option<SharedComm>,
     checkpoint_policy_sha256: Option<&str>,
+    candidate_launch_sha256: &str,
+    candidate_signer: CandidateSigner,
 ) -> Result<Trainer, CliError> {
     let trainer = if let Some(comm) = distributed_comm {
         Trainer::with_comm(config, run, comm)?
     } else {
         Trainer::new(config, run)?
     };
-    Ok(if let Some(digest) = checkpoint_policy_sha256 {
+    let trainer = if let Some(digest) = checkpoint_policy_sha256 {
         trainer.with_checkpoint_policy_sha256(digest)
     } else {
         trainer
-    })
+    };
+    Ok(trainer.with_candidate_provenance(candidate_launch_sha256, candidate_signer)?)
 }
 
 #[derive(Clone)]
@@ -2062,6 +2538,104 @@ fn validate_tensor_parallel_runtime(
         ))
     });
     coordinate_distributed_result(Some(comm), "tensor_parallel config validation", local)
+}
+
+fn validate_full_git_commit(value: &str) -> Result<String, CliError> {
+    let valid_len = matches!(value.len(), 40 | 64);
+    let valid_hex = value
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    if valid_len && valid_hex {
+        Ok(value.to_owned())
+    } else {
+        Err(CliError::msg(
+            "git commit must be a full 40- or 64-character lowercase SHA",
+        ))
+    }
+}
+
+fn synchronized_run_identity(
+    cfg: &RunConfig,
+    comm: Option<&dyn ferrl::Comm>,
+) -> Result<LaunchRunIdentity, CliError> {
+    let local_stamp = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .map_err(|error| CliError::msg(format!("system clock precedes Unix epoch: {error}")))
+    };
+    let stamp = match comm.filter(|comm| comm.world_size() > 1) {
+        Some(comm) => {
+            let local = if comm.rank() == 0 {
+                local_stamp()
+            } else {
+                Ok(0)
+            };
+            let local = coordinate_distributed_result(Some(comm), "run timestamp", local)?;
+            let reduced = comm.all_reduce_scalar_sum(local as f64)?;
+            if !reduced.is_finite()
+                || reduced < 0.0
+                || reduced.fract() != 0.0
+                || reduced > (1_u64 << 53) as f64
+            {
+                return Err(CliError::msg(format!(
+                    "distributed run timestamp is not an exact u64: {reduced:?}"
+                )));
+            }
+            reduced as u64
+        }
+        None => local_stamp()?,
+    };
+    let group_id = format!("{}-{stamp}", cfg.task);
+    let tensor_parallel = cfg.tensor_parallel_plan();
+    let (data_parallel_rank, data_parallel_world_size) = if cfg.distributed.enabled {
+        let comm = comm.ok_or_else(|| {
+            CliError::msg("distributed run identity requires a live communicator")
+        })?;
+        (comm.rank(), comm.world_size())
+    } else {
+        (0, 1)
+    };
+    let run_id = if cfg.distributed.enabled {
+        format!("{group_id}-rank{data_parallel_rank}")
+    } else if tensor_parallel.is_sharded() {
+        format!("{group_id}-rank{}", tensor_parallel.rank())
+    } else {
+        group_id.clone()
+    };
+    Ok(LaunchRunIdentity {
+        group_id,
+        run_id,
+        data_parallel_rank,
+        data_parallel_world_size,
+        tensor_parallel_rank: tensor_parallel.rank(),
+        tensor_parallel_world_size: tensor_parallel.world_size(),
+    })
+}
+
+fn validate_launch_value_consensus(
+    label: &'static str,
+    value: &[u8],
+    comm: Option<&dyn ferrl::Comm>,
+) -> Result<(), CliError> {
+    let Some(comm) = comm.filter(|comm| comm.world_size() > 1) else {
+        return Ok(());
+    };
+    let digest: [u8; 32] = Sha256::digest(value).into();
+    let world = comm.world_size() as f64;
+    let mut mismatch = false;
+    for byte in digest {
+        let scalar = f64::from(byte);
+        mismatch |= comm.all_reduce_scalar_sum(scalar)? != world * scalar;
+    }
+    let local = if mismatch {
+        Err(CliError::msg(format!(
+            "launch ranks disagree on {label}; all ranks must bind identical bytes"
+        )))
+    } else {
+        Ok(())
+    };
+    coordinate_distributed_result(Some(comm), "launch provenance consensus", local)
 }
 
 fn validate_launch_config_consensus(
@@ -2689,6 +3263,14 @@ struct ArtifactManifest {
     ferrl_commit: String,
     /// Training run id.
     run_id: String,
+    /// Digest of the immutable launch payload that owns this candidate.
+    launch_sha256: String,
+    /// SHA-256 of the exact `launch.json` copied into the artifact bundle.
+    launch_file_sha256: String,
+    /// Trusted external key that attested the launch before rollout.
+    launch_attestation_key_id: String,
+    /// Signature algorithm used by the trusted launch attestor.
+    launch_attestation_algorithm: String,
     /// Candidate provenance.
     candidate: CandidateManifest,
     /// Model provenance.
@@ -2706,56 +3288,41 @@ struct ArtifactManifest {
 /// Candidate provenance fields.
 #[derive(Debug, Serialize)]
 struct CandidateManifest {
+    /// Domain-separated digest stored on the selected candidate row.
+    record_sha256: String,
+    /// Ed25519 authentication made by the externally attested per-run key.
+    record_signature: String,
+    /// SHA-256 of the exact JSONL row bytes copied to `candidate.json`.
+    ledger_row_sha256: String,
     /// Optimizer step where this candidate was sampled.
     step: u64,
     /// Global prompt ordinal where this candidate was sampled.
     prompt_index: u64,
     /// Candidate group index where this candidate was sampled.
-    group_index: u64,
+    group_index: usize,
     /// Data-parallel rank that sampled this candidate.
     rank: usize,
     /// Data-parallel world size for the training run.
     world_size: usize,
     /// Training reward recorded when this candidate was selected.
-    training_reward: f64,
+    training_reward: f32,
     /// SHA-256 of the raw completion text.
     completion_sha256: String,
-    /// Optional normalization applied before extracting `submission.py`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    completion_normalization: Option<ArtifactCompletionNormalization>,
     /// SHA-256 of `submission.py`.
     source_sha256: String,
     /// Operator-facing source-inspection evidence.
     source_inspection: SourceInspectionManifest,
 }
 
-/// Completion normalization provenance for artifact extraction.
-#[derive(Debug, Serialize)]
-struct ArtifactCompletionNormalization {
-    /// Normalization mode requested by the operator.
-    mode: &'static str,
-    /// Whether normalization changed the raw completion text.
-    changed: bool,
-    /// Raw completion length in bytes.
-    raw_completion_len_bytes: usize,
-    /// Normalized completion length in bytes.
-    normalized_completion_len_bytes: usize,
-    /// SHA-256 of the normalized completion text used for extraction.
-    normalized_completion_sha256: String,
-    /// Artifact-relative normalized completion file, present only when changed.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    normalized_completion_file: Option<&'static str>,
-}
-
 /// Model provenance fields.
 #[derive(Debug, Serialize)]
 struct ModelManifest {
-    /// Model family label.
+    /// Loader-derived model family.
     family: String,
-    /// Operator-supplied checkpoint identity.
-    checkpoint: String,
-    /// Operator-supplied tokenizer identity.
-    tokenizer: String,
+    /// Exact model/checkpoint bytes plus loader execution semantics.
+    checkpoint_policy_sha256: String,
+    /// Exact tokenizer bytes used by the training process.
+    tokenizer_sha256: String,
     /// `LoRA` rank.
     lora_rank: usize,
     /// `LoRA` alpha.
@@ -2769,8 +3336,10 @@ struct ModelManifest {
 /// Run-config provenance fields.
 #[derive(Debug, Serialize)]
 struct ArtifactConfigManifest {
-    /// SHA-256 of the run config bytes passed to this command.
-    run_config_sha256: String,
+    /// SHA-256 of the original run-config file bytes seen at launch.
+    run_config_source_sha256: String,
+    /// SHA-256 of the complete canonical resolved launch config.
+    run_config_resolved_sha256: String,
     /// SHA-256 of the exact rendered TriMul model prompt bytes.
     prompt_sha256: String,
     /// Artifact-relative prompt copy used for audit.
@@ -2838,23 +3407,433 @@ struct VerificationManifest {
     accepted: bool,
 }
 
+#[derive(Debug)]
+struct BoundRunCandidate {
+    launch: LaunchManifest,
+    launch_bytes: Vec<u8>,
+    config: RunConfig,
+    prompt_bytes: Vec<u8>,
+    candidate: CandidateRecord,
+    candidate_row_bytes: Vec<u8>,
+}
+
+#[allow(clippy::cognitive_complexity)] // linear fail-closed validation of every provenance layer
+fn load_bound_run_candidate_with_trust(
+    run_dir: &Path,
+    candidate_sha256: &str,
+    trust_policy: &LaunchTrustPolicy,
+) -> Result<BoundRunCandidate, CliError> {
+    validate_lower_sha256("--candidate-sha256", candidate_sha256)?;
+    let launch_path = run_dir.join(RunDir::LAUNCH_FILE);
+    let launch_bytes = read_regular_bytes(&launch_path)?;
+    let launch: LaunchManifest =
+        serde_json::from_slice(&launch_bytes).map_err(|source| CliError::Config {
+            path: launch_path.clone(),
+            source,
+        })?;
+    verify_launch_manifest_payload(&launch)?;
+    verify_launch_attestation(&launch, trust_policy)?;
+    let run_name = run_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            CliError::msg(format!(
+                "run directory {} has no UTF-8 final component",
+                run_dir.display()
+            ))
+        })?;
+    if run_name != launch.payload.run.run_id {
+        return Err(CliError::msg(format!(
+            "run directory name {run_name:?} does not match launch run_id {:?}",
+            launch.payload.run.run_id
+        )));
+    }
+
+    let resolved_bytes =
+        serde_json::to_vec(&canonicalize_json(launch.payload.config.resolved.clone()))
+            .map_err(|error| CliError::msg(format!("serialize resolved launch config: {error}")))?;
+    let resolved_sha256 = sha256_hex(&resolved_bytes);
+    if resolved_sha256 != launch.payload.config.resolved_sha256 {
+        return Err(CliError::msg(format!(
+            "resolved launch config hash mismatch: recorded {}, computed {resolved_sha256}",
+            launch.payload.config.resolved_sha256
+        )));
+    }
+    let config = parse_run_config(&launch_path, &resolved_bytes)?;
+    if config.task != "trimul" || launch.payload.task != "trimul" {
+        return Err(CliError::msg(
+            "trimul-artifact requires a launch whose task is exactly \"trimul\"",
+        ));
+    }
+    verify_launch_config_identity(&launch, &config)?;
+    let prompt = launch
+        .payload
+        .prompt
+        .as_ref()
+        .ok_or_else(|| CliError::msg("TriMul launch manifest is missing prompt provenance"))?;
+    if prompt.file != RunDir::PROMPT_FILE {
+        return Err(CliError::msg(format!(
+            "unsupported launch prompt file {:?}",
+            prompt.file
+        )));
+    }
+    let prompt_bytes = read_regular_bytes(&run_dir.join(&prompt.file))?;
+    if prompt_bytes.len() != prompt.len_bytes || sha256_hex(&prompt_bytes) != prompt.sha256 {
+        return Err(CliError::msg(
+            "launch-bound prompt bytes do not match launch.json",
+        ));
+    }
+    let ledger = &launch.payload.candidate_ledger;
+    if ledger.file != RunDir::CANDIDATES_FILE
+        || ledger.format_version != 1
+        || ledger.row_digest_domain != CANDIDATE_RECORD_DOMAIN
+        || ledger.row_signature_algorithm != "ed25519"
+    {
+        return Err(CliError::msg(
+            "unsupported candidate-ledger contract in launch.json",
+        ));
+    }
+    let ledger_path = run_dir.join(&ledger.file);
+    let ledger_bytes = read_regular_bytes(&ledger_path)?;
+    if !ledger_bytes.is_empty() && !ledger_bytes.ends_with(b"\n") {
+        return Err(CliError::msg(format!(
+            "candidate ledger {} has an unterminated final row",
+            ledger_path.display()
+        )));
+    }
+    let ledger_text = std::str::from_utf8(&ledger_bytes).map_err(|error| {
+        CliError::msg(format!(
+            "candidate ledger {} is not UTF-8: {error}",
+            ledger_path.display()
+        ))
+    })?;
+    let mut selected = None;
+    for (index, raw_line) in ledger_text.split_terminator('\n').enumerate() {
+        if raw_line.trim().is_empty() {
+            return Err(CliError::msg(format!(
+                "candidate ledger {} contains blank row {}",
+                ledger_path.display(),
+                index + 1
+            )));
+        }
+        let record = parse_strict_candidate_row(&ledger_path, index + 1, raw_line)?;
+        record.verify_signed_provenance(&ledger.signing_public_key)?;
+        if record.launch_sha256.as_deref() != Some(launch.payload_sha256.as_str()) {
+            return Err(CliError::msg(format!(
+                "candidate ledger {} row {} belongs to a different launch",
+                ledger_path.display(),
+                index + 1
+            )));
+        }
+        if record.rank != launch.payload.run.data_parallel_rank
+            || record.world_size != launch.payload.run.data_parallel_world_size
+        {
+            return Err(CliError::msg(format!(
+                "candidate ledger {} row {} rank/world disagree with launch.json",
+                ledger_path.display(),
+                index + 1
+            )));
+        }
+        if record.step >= config.trainer.steps
+            || record.group_index >= config.trainer.group_size
+            || record.completion_len_tokens > config.trainer.max_new_tokens
+        {
+            return Err(CliError::msg(format!(
+                "candidate ledger {} row {} coordinates exceed the launch config",
+                ledger_path.display(),
+                index + 1
+            )));
+        }
+        if record.record_sha256.as_deref() == Some(candidate_sha256) {
+            if selected.is_some() {
+                return Err(CliError::msg(format!(
+                    "candidate digest {candidate_sha256} occurs more than once in {}",
+                    ledger_path.display()
+                )));
+            }
+            selected = Some((record, raw_line.as_bytes().to_vec()));
+        }
+    }
+    let (candidate, candidate_row_bytes) = selected.ok_or_else(|| {
+        CliError::msg(format!(
+            "candidate digest {candidate_sha256} was not found in {}",
+            ledger_path.display()
+        ))
+    })?;
+    Ok(BoundRunCandidate {
+        launch,
+        launch_bytes,
+        config,
+        prompt_bytes,
+        candidate,
+        candidate_row_bytes,
+    })
+}
+
+fn parse_strict_candidate_row(
+    ledger_path: &Path,
+    row_number: usize,
+    raw_line: &str,
+) -> Result<CandidateRecord, CliError> {
+    const FIELDS: &[&str] = &[
+        "launch_sha256",
+        "record_sha256",
+        "record_signature",
+        "step",
+        "rank",
+        "world_size",
+        "prompt_index",
+        "group_index",
+        "reward",
+        "completion_len_tokens",
+        "reward_diagnostic",
+        "reward_metadata",
+        "completion",
+    ];
+    let value: serde_json::Value = serde_json::from_str(raw_line).map_err(|error| {
+        CliError::msg(format!(
+            "parse candidate ledger {} row {row_number}: {error}",
+            ledger_path.display()
+        ))
+    })?;
+    let object = value.as_object().ok_or_else(|| {
+        CliError::msg(format!(
+            "candidate ledger {} row {row_number} is not a JSON object",
+            ledger_path.display()
+        ))
+    })?;
+    if let Some(field) = object
+        .keys()
+        .find(|field| !FIELDS.contains(&field.as_str()))
+    {
+        return Err(CliError::msg(format!(
+            "candidate ledger {} row {row_number} contains unknown field {field:?}",
+            ledger_path.display()
+        )));
+    }
+    let record: CandidateRecord = serde_json::from_value(value).map_err(|error| {
+        CliError::msg(format!(
+            "parse candidate ledger {} row {row_number}: {error}",
+            ledger_path.display()
+        ))
+    })?;
+    let canonical = serde_json::to_string(&record).map_err(|error| {
+        CliError::msg(format!(
+            "serialize candidate ledger {} row {row_number}: {error}",
+            ledger_path.display()
+        ))
+    })?;
+    if canonical != raw_line {
+        return Err(CliError::msg(format!(
+            "candidate ledger {} row {row_number} is not in the exact production encoding",
+            ledger_path.display()
+        )));
+    }
+    Ok(record)
+}
+
+fn verify_launch_config_identity(
+    launch: &LaunchManifest,
+    config: &RunConfig,
+) -> Result<(), CliError> {
+    let run = &launch.payload.run;
+    let tensor_parallel = config.tensor_parallel_plan();
+    if run.tensor_parallel_rank != tensor_parallel.rank()
+        || run.tensor_parallel_world_size != tensor_parallel.world_size()
+    {
+        return Err(CliError::msg(
+            "launch run identity disagrees with resolved tensor_parallel config",
+        ));
+    }
+    if config.distributed.enabled {
+        if run.data_parallel_world_size == 0
+            || run.data_parallel_rank >= run.data_parallel_world_size
+        {
+            return Err(CliError::msg(
+                "launch run identity has invalid data-parallel coordinates",
+            ));
+        }
+    } else if run.data_parallel_rank != 0 || run.data_parallel_world_size != 1 {
+        return Err(CliError::msg(
+            "world-one launch has non-world-one data-parallel coordinates",
+        ));
+    }
+    let prefix = format!("{}-", launch.payload.task);
+    let stamp = run
+        .group_id
+        .strip_prefix(&prefix)
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| CliError::msg("launch group_id is not a generated task timestamp"))?;
+    if run.group_id != format!("{}-{stamp}", launch.payload.task) {
+        return Err(CliError::msg(
+            "launch group_id is not in canonical generated form",
+        ));
+    }
+    let expected_run_id = if config.distributed.enabled {
+        format!("{}-rank{}", run.group_id, run.data_parallel_rank)
+    } else if tensor_parallel.is_sharded() {
+        format!("{}-rank{}", run.group_id, run.tensor_parallel_rank)
+    } else {
+        run.group_id.clone()
+    };
+    if run.run_id != expected_run_id {
+        return Err(CliError::msg(format!(
+            "launch run_id {:?} does not match generated identity {expected_run_id:?}",
+            run.run_id
+        )));
+    }
+    Ok(())
+}
+
+fn verify_launch_manifest_payload(manifest: &LaunchManifest) -> Result<(), CliError> {
+    if manifest.contract_version != LAUNCH_CONTRACT_VERSION || manifest.kind != LAUNCH_KIND {
+        return Err(CliError::msg(format!(
+            "unsupported launch manifest contract {} / {:?}",
+            manifest.contract_version, manifest.kind
+        )));
+    }
+    validate_lower_sha256("launch payload_sha256", &manifest.payload_sha256)?;
+    validate_lower_sha256(
+        "launch config source_sha256",
+        &manifest.payload.config.source_sha256,
+    )?;
+    validate_lower_sha256(
+        "launch config resolved_sha256",
+        &manifest.payload.config.resolved_sha256,
+    )?;
+    validate_lower_sha256(
+        "launch checkpoint_policy_sha256",
+        &manifest.payload.model.checkpoint_policy_sha256,
+    )?;
+    validate_lower_sha256(
+        "launch tokenizer_sha256",
+        &manifest.payload.model.tokenizer_sha256,
+    )?;
+    validate_lower_hex(
+        "launch candidate signing_public_key",
+        &manifest.payload.candidate_ledger.signing_public_key,
+        32,
+    )?;
+    if let Some(prompt) = &manifest.payload.prompt {
+        validate_lower_sha256("launch prompt sha256", &prompt.sha256)?;
+    }
+    validate_full_git_commit(&manifest.payload.ferrl_commit)?;
+    if !matches!(
+        manifest.payload.model.family.as_str(),
+        "qwen3" | "qwen3_5" | "gemma4"
+    ) {
+        return Err(CliError::msg(format!(
+            "launch manifest has unsupported model family {:?}",
+            manifest.payload.model.family
+        )));
+    }
+    if manifest.payload.run.run_id.is_empty()
+        || manifest.payload.run.group_id.is_empty()
+        || manifest.payload.run.data_parallel_world_size == 0
+        || manifest.payload.run.data_parallel_rank >= manifest.payload.run.data_parallel_world_size
+        || manifest.payload.run.tensor_parallel_world_size == 0
+        || manifest.payload.run.tensor_parallel_rank
+            >= manifest.payload.run.tensor_parallel_world_size
+    {
+        return Err(CliError::msg("launch manifest has an invalid run identity"));
+    }
+    let payload_bytes = serde_json::to_vec(&manifest.payload)
+        .map_err(|error| CliError::msg(format!("serialize launch payload: {error}")))?;
+    let expected = domain_sha256("ferrl.run-launch.payload.v1", &[&payload_bytes]);
+    if manifest.payload_sha256 != expected {
+        return Err(CliError::msg(format!(
+            "launch payload hash mismatch: recorded {}, computed {expected}",
+            manifest.payload_sha256
+        )));
+    }
+    Ok(())
+}
+
+fn read_regular_bytes(path: &Path) -> Result<Vec<u8>, CliError> {
+    let path_metadata = std::fs::symlink_metadata(path).map_err(|source| CliError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !path_metadata.file_type().is_file() {
+        return Err(CliError::msg(format!(
+            "provenance input {} is not a regular file",
+            path.display()
+        )));
+    }
+    let mut file = std::fs::File::open(path).map_err(|source| CliError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let file_metadata = file.metadata().map_err(|source| CliError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if path_metadata.dev() != file_metadata.dev() || path_metadata.ino() != file_metadata.ino()
+        {
+            return Err(CliError::msg(format!(
+                "provenance input {} changed while it was opened",
+                path.display()
+            )));
+        }
+    }
+    let expected_len = file_metadata.len();
+    let mut bytes = Vec::with_capacity(usize::try_from(expected_len).unwrap_or(0));
+    file.read_to_end(&mut bytes)
+        .map_err(|source| CliError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if bytes.len() as u64 != expected_len {
+        return Err(CliError::msg(format!(
+            "provenance input {} changed length while it was captured",
+            path.display()
+        )));
+    }
+    Ok(bytes)
+}
+
+fn validate_lower_sha256(label: &str, digest: &str) -> Result<(), CliError> {
+    validate_lower_hex(label, digest, 32)
+}
+
+fn validate_lower_hex(label: &str, value: &str, bytes: usize) -> Result<(), CliError> {
+    let expected_len = bytes.saturating_mul(2);
+    if value.len() == expected_len
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Ok(())
+    } else {
+        Err(CliError::msg(format!(
+            "{label} must be {expected_len} lowercase hexadecimal characters"
+        )))
+    }
+}
+
 /// Dispatch `ferrl trimul-artifact`: extract `custom_kernel` from a model completion,
 /// re-verify it with an audit seed, and write the contract artifact bundle.
 fn trimul_artifact(args: &TrimulArtifactArgs) -> Result<(), CliError> {
+    let trust_policy = load_system_launch_trust_policy()?;
+    trimul_artifact_with_trust(args, &trust_policy)
+}
+
+fn trimul_artifact_with_trust(
+    args: &TrimulArtifactArgs,
+    trust_policy: &LaunchTrustPolicy,
+) -> Result<(), CliError> {
     let _ = ferrl::init_tracing();
     if args.repeats < 3 {
         return Err(CliError::msg(
             "trimul-artifact requires --repeats >= 3 for the first-run contract",
         ));
     }
-    let config_bytes = read_bytes(&args.config)?;
-    let cfg = parse_run_config(&args.config, &config_bytes)?;
-    if cfg.task != "trimul" {
-        return Err(CliError::msg(
-            "trimul-artifact requires a config with task \"trimul\"",
-        ));
-    }
-    let prompt_bytes = read_verified_prompt_copy(&args.prompt_copy)?;
+    let bound =
+        load_bound_run_candidate_with_trust(&args.run_dir, &args.candidate_sha256, trust_policy)?;
+    let cfg = &bound.config;
     if args.audit_secret_seed == cfg.trimul.secret_seed {
         return Err(CliError::msg(
             "audit secret seed must differ from trimul.secret_seed used during training",
@@ -2872,19 +3851,12 @@ fn trimul_artifact(args: &TrimulArtifactArgs) -> Result<(), CliError> {
     })?;
     baseline_gpu_matches(&baseline.gpu, Some(&gpu)).map_err(CliError::Msg)?;
 
-    let completion_bytes = read_bytes(&args.completion)?;
-    let raw_completion = String::from_utf8(completion_bytes.clone()).map_err(|e| {
-        CliError::msg(format!(
-            "completion file {} is not valid UTF-8: {e}",
-            args.completion.display()
-        ))
-    })?;
-    let completion = normalize_completion(&raw_completion, args.completion_normalization);
+    let raw_completion = &bound.candidate.completion;
     let extract_mode = cfg.trimul_submission_extract_mode()?;
     let mut reward = cfg
         .build_trimul_reward_base()?
         .with_submission_extract_mode(extract_mode);
-    let submission = reward.extract_submission(&completion.text).ok_or_else(|| {
+    let submission = reward.extract_submission(raw_completion).ok_or_else(|| {
         CliError::msg("completion does not contain a closed non-empty fenced code block")
     })?;
 
@@ -2898,16 +3870,15 @@ fn trimul_artifact(args: &TrimulArtifactArgs) -> Result<(), CliError> {
         && args.source_inspection == SourceInspectionResult::Clean;
     write_artifact_bundle(
         args,
-        &cfg,
+        cfg,
         &ArtifactInputs {
             gpu,
-            raw_completion: &raw_completion,
-            normalized_completion: &completion.text,
-            completion_normalization: args.completion_normalization,
-            completion_normalization_changed: completion.changed,
-            completion_bytes: &completion_bytes,
-            config_bytes: &config_bytes,
-            prompt_bytes: &prompt_bytes,
+            launch: &bound.launch,
+            launch_bytes: &bound.launch_bytes,
+            candidate: &bound.candidate,
+            candidate_row_bytes: &bound.candidate_row_bytes,
+            raw_completion,
+            prompt_bytes: &bound.prompt_bytes,
             submission: &submission,
             baseline_median,
             test_cases: test_cases.len(),
@@ -2927,18 +3898,16 @@ fn trimul_artifact(args: &TrimulArtifactArgs) -> Result<(), CliError> {
 struct ArtifactInputs<'a> {
     /// GPU product name.
     gpu: String,
-    /// Raw completion string exactly as read from the operator-provided file.
+    /// Verified immutable launch manifest.
+    launch: &'a LaunchManifest,
+    /// Exact `launch.json` bytes captured from the run directory.
+    launch_bytes: &'a [u8],
+    /// Verified exact candidate row.
+    candidate: &'a CandidateRecord,
+    /// Exact source JSONL row bytes.
+    candidate_row_bytes: &'a [u8],
+    /// Raw completion string exactly as stored in the candidate row.
     raw_completion: &'a str,
-    /// Completion string used for extraction after optional normalization.
-    normalized_completion: &'a str,
-    /// Completion normalization mode used before extraction.
-    completion_normalization: CompletionNormalization,
-    /// Whether completion normalization changed the raw text.
-    completion_normalization_changed: bool,
-    /// Raw completion bytes.
-    completion_bytes: &'a [u8],
-    /// Raw config bytes.
-    config_bytes: &'a [u8],
     /// Rendered TriMul model prompt bytes.
     prompt_bytes: &'a [u8],
     /// Extracted source.
@@ -3052,12 +4021,8 @@ fn write_artifact_bundle(
     })?;
     write_text(&args.out.join("submission.py"), inputs.submission)?;
     write_text(&args.out.join("completion.txt"), inputs.raw_completion)?;
-    if inputs.completion_normalization_changed {
-        write_text(
-            &args.out.join("completion.normalized.txt"),
-            inputs.normalized_completion,
-        )?;
-    }
+    write_bytes(&args.out.join(RunDir::LAUNCH_FILE), inputs.launch_bytes)?;
+    write_bytes(&args.out.join("candidate.json"), inputs.candidate_row_bytes)?;
     write_bytes(&args.out.join("prompt.txt"), inputs.prompt_bytes)?;
     for (i, run) in inputs.runs.iter().enumerate() {
         write_json(&args.out.join(format!("verification/run-{i:03}.json")), run)?;
@@ -3079,20 +4044,40 @@ fn build_manifest(
     cfg: &RunConfig,
     inputs: &ArtifactInputs<'_>,
 ) -> ArtifactManifest {
+    let launch = &inputs.launch.payload;
+    let candidate = inputs.candidate;
     ArtifactManifest {
-        contract_version: 1,
+        contract_version: 2,
         task: "trimul",
-        ferrl_commit: args.ferrl_commit.clone(),
-        run_id: args.run_id.clone(),
+        ferrl_commit: launch.ferrl_commit.clone(),
+        run_id: launch.run.run_id.clone(),
+        launch_sha256: inputs.launch.payload_sha256.clone(),
+        launch_file_sha256: sha256_hex(inputs.launch_bytes),
+        launch_attestation_key_id: inputs
+            .launch
+            .attestation
+            .as_ref()
+            .expect("verified candidate launch must have an attestation")
+            .key_id
+            .clone(),
+        launch_attestation_algorithm: LAUNCH_ATTESTATION_ALGORITHM.to_owned(),
         candidate: CandidateManifest {
-            step: args.step,
-            prompt_index: args.prompt_index,
-            group_index: args.group_index,
-            rank: args.rank,
-            world_size: args.world_size,
-            training_reward: args.training_reward,
-            completion_sha256: sha256_hex(inputs.completion_bytes),
-            completion_normalization: artifact_completion_normalization(inputs),
+            record_sha256: candidate
+                .record_sha256
+                .clone()
+                .expect("verified candidate must have record_sha256"),
+            record_signature: candidate
+                .record_signature
+                .clone()
+                .expect("verified candidate must have record_signature"),
+            ledger_row_sha256: sha256_hex(inputs.candidate_row_bytes),
+            step: candidate.step,
+            prompt_index: candidate.prompt_index,
+            group_index: candidate.group_index,
+            rank: candidate.rank,
+            world_size: candidate.world_size,
+            training_reward: candidate.reward,
+            completion_sha256: sha256_hex(inputs.raw_completion.as_bytes()),
             source_sha256: sha256_hex(inputs.submission.as_bytes()),
             source_inspection: SourceInspectionManifest {
                 result: args.source_inspection,
@@ -3100,22 +4085,17 @@ fn build_manifest(
             },
         },
         model: ModelManifest {
-            family: args.model_family.clone(),
-            checkpoint: args
-                .checkpoint
-                .clone()
-                .unwrap_or_else(|| cfg.model_dir.display().to_string()),
-            tokenizer: args
-                .tokenizer
-                .clone()
-                .unwrap_or_else(|| cfg.model_dir.join("tokenizer.json").display().to_string()),
+            family: launch.model.family.clone(),
+            checkpoint_policy_sha256: launch.model.checkpoint_policy_sha256.clone(),
+            tokenizer_sha256: launch.model.tokenizer_sha256.clone(),
             lora_rank: cfg.policy.lora_rank,
             lora_alpha: cfg.policy.lora_alpha,
             base_dtype: cfg.policy.base_dtype.as_str(),
             base_quantization: cfg.policy.base_quantization.as_str(),
         },
         config: ArtifactConfigManifest {
-            run_config_sha256: sha256_hex(inputs.config_bytes),
+            run_config_source_sha256: launch.config.source_sha256.clone(),
+            run_config_resolved_sha256: launch.config.resolved_sha256.clone(),
             prompt_sha256: sha256_hex(inputs.prompt_bytes),
             prompt_file: "prompt.txt",
             reward_profile: cfg.trimul.reward,
@@ -3132,14 +4112,8 @@ fn build_manifest(
             verifier_cuda_device_pool: cfg.trimul.verifier_cuda_device_pool.clone(),
         },
         eval: EvalManifest {
-            bundle: args
-                .eval_bundle
-                .clone()
-                .unwrap_or_else(|| cfg.trimul.eval_dir.display().to_string()),
-            sandbox_image: args
-                .sandbox_image
-                .clone()
-                .unwrap_or_else(|| cfg.trimul.image.display().to_string()),
+            bundle: cfg.trimul.eval_dir.display().to_string(),
+            sandbox_image: cfg.trimul.image.display().to_string(),
             test_cases: inputs.test_cases,
             benchmark_cases: inputs.benchmark_cases,
         },
@@ -3147,9 +4121,10 @@ fn build_manifest(
             gpu: inputs.gpu.clone(),
             measurements_ns: args.baseline_measurements_ns.clone(),
             median_ns: inputs.baseline_median,
-            command: args.baseline_command.clone().unwrap_or_else(|| {
-                format!("ferrl trimul-baseline --config {}", args.config.display())
-            }),
+            command: args
+                .baseline_command
+                .clone()
+                .unwrap_or_else(|| "ferrl trimul-baseline --config <launch-config>".to_owned()),
         },
         verification: VerificationManifest {
             gpu: inputs.gpu.clone(),
@@ -3157,24 +4132,6 @@ fn build_manifest(
             accepted: inputs.accepted,
         },
     }
-}
-
-fn artifact_completion_normalization(
-    inputs: &ArtifactInputs<'_>,
-) -> Option<ArtifactCompletionNormalization> {
-    if inputs.completion_normalization == CompletionNormalization::None {
-        return None;
-    }
-    Some(ArtifactCompletionNormalization {
-        mode: inputs.completion_normalization.as_str(),
-        changed: inputs.completion_normalization_changed,
-        raw_completion_len_bytes: inputs.completion_bytes.len(),
-        normalized_completion_len_bytes: inputs.normalized_completion.len(),
-        normalized_completion_sha256: sha256_hex(inputs.normalized_completion.as_bytes()),
-        normalized_completion_file: inputs
-            .completion_normalization_changed
-            .then_some("completion.normalized.txt"),
-    })
 }
 
 /// The effective TriMul scratch cap in bytes.
@@ -3291,8 +4248,17 @@ fn artifact_report(
         .expect("writing to String cannot fail");
     writeln!(
         &mut out,
-        "- Config hash: {}",
-        manifest.config.run_config_sha256
+        "- Launch/config hashes: payload={}, file={}, source={}, resolved={}",
+        manifest.launch_sha256,
+        manifest.launch_file_sha256,
+        manifest.config.run_config_source_sha256,
+        manifest.config.run_config_resolved_sha256
+    )
+    .expect("writing to String cannot fail");
+    writeln!(
+        &mut out,
+        "- Launch attestation: {} ({})",
+        manifest.launch_attestation_key_id, manifest.launch_attestation_algorithm
     )
     .expect("writing to String cannot fail");
     writeln!(
@@ -3310,10 +4276,10 @@ fn artifact_report(
     .expect("writing to String cannot fail");
     writeln!(
         &mut out,
-        "- Model: family={}, checkpoint={}, tokenizer={}, lora_rank={}, lora_alpha={}, base_dtype={}, base_quantization={}",
+        "- Model: family={}, checkpoint_policy_sha256={}, tokenizer_sha256={}, lora_rank={}, lora_alpha={}, base_dtype={}, base_quantization={}",
         manifest.model.family,
-        manifest.model.checkpoint,
-        manifest.model.tokenizer,
+        manifest.model.checkpoint_policy_sha256,
+        manifest.model.tokenizer_sha256,
         manifest.model.lora_rank,
         manifest.model.lora_alpha,
         manifest.model.base_dtype,
@@ -3389,8 +4355,13 @@ fn artifact_report(
     );
     push_check(
         &mut out,
-        !manifest.config.run_config_sha256.is_empty(),
-        "config hash recorded",
+        !manifest.launch_sha256.is_empty()
+            && !manifest.launch_file_sha256.is_empty()
+            && !manifest.launch_attestation_key_id.is_empty()
+            && manifest.launch_attestation_algorithm == LAUNCH_ATTESTATION_ALGORITHM
+            && !manifest.config.run_config_source_sha256.is_empty()
+            && !manifest.config.run_config_resolved_sha256.is_empty(),
+        "launch attestation and config hashes recorded",
     );
     push_check(
         &mut out,
@@ -3526,6 +4497,17 @@ fn sha256_hex(bytes: &[u8]) -> String {
         write!(&mut out, "{b:02x}").expect("writing to String cannot fail");
     }
     out
+}
+
+fn domain_sha256(domain: &str, fields: &[&[u8]]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update((domain.len() as u64).to_le_bytes());
+    hasher.update(domain.as_bytes());
+    for field in fields {
+        hasher.update((field.len() as u64).to_le_bytes());
+        hasher.update(field);
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 /// Median of positive finite values. Requires at least three values for first-run
@@ -4291,7 +5273,84 @@ mod tests {
     use super::*;
     use candle_core::{Result as CandleResult, Tensor, Var};
     use ferrl::Comm as _;
-    use std::sync::{Arc, Mutex};
+    use ring::rand::SystemRandom;
+    use ring::signature::{Ed25519KeyPair, KeyPair as _};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    const TEST_ATTESTATION_KEY_ID: &str = "test-root-1";
+    const TEST_LAUNCH_ATTESTOR: TestLaunchAttestor = TestLaunchAttestor;
+    const REJECTING_LAUNCH_ATTESTOR: RejectingLaunchAttestor = RejectingLaunchAttestor;
+    const RANK_ONE_REJECTING_ATTESTOR: RankOneRejectingAttestor = RankOneRejectingAttestor;
+
+    struct TestLaunchAttestor;
+    struct RejectingLaunchAttestor;
+    struct RankOneRejectingAttestor;
+
+    fn test_attestation_pkcs8() -> &'static [u8] {
+        static KEY: OnceLock<Vec<u8>> = OnceLock::new();
+        KEY.get_or_init(|| {
+            Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
+                .unwrap()
+                .as_ref()
+                .to_vec()
+        })
+    }
+
+    fn test_attestation_key_pair() -> Ed25519KeyPair {
+        Ed25519KeyPair::from_pkcs8(test_attestation_pkcs8()).unwrap()
+    }
+
+    fn test_launch_trust_policy() -> LaunchTrustPolicy {
+        let key_pair = test_attestation_key_pair();
+        LaunchTrustPolicy {
+            contract_version: LAUNCH_ATTESTATION_CONTRACT_VERSION,
+            kind: LAUNCH_TRUST_POLICY_KIND.to_owned(),
+            keys: vec![LaunchTrustKey {
+                key_id: TEST_ATTESTATION_KEY_ID.to_owned(),
+                algorithm: LAUNCH_ATTESTATION_ALGORITHM.to_owned(),
+                public_key: lower_hex_bytes(key_pair.public_key().as_ref()),
+            }],
+        }
+    }
+
+    impl LaunchAttestor for TestLaunchAttestor {
+        fn attest(&self, manifest: &LaunchManifest) -> Result<LaunchAttestation, CliError> {
+            verify_launch_manifest_payload(manifest)?;
+            let message = launch_attestation_message(&manifest.payload_sha256);
+            Ok(LaunchAttestation {
+                contract_version: LAUNCH_ATTESTATION_CONTRACT_VERSION,
+                kind: LAUNCH_ATTESTATION_KIND.to_owned(),
+                algorithm: LAUNCH_ATTESTATION_ALGORITHM.to_owned(),
+                key_id: TEST_ATTESTATION_KEY_ID.to_owned(),
+                launch_payload_sha256: manifest.payload_sha256.clone(),
+                signature: lower_hex_bytes(
+                    test_attestation_key_pair()
+                        .sign(message.as_bytes())
+                        .as_ref(),
+                ),
+            })
+        }
+    }
+
+    impl LaunchAttestor for RejectingLaunchAttestor {
+        fn attest(&self, _manifest: &LaunchManifest) -> Result<LaunchAttestation, CliError> {
+            Err(CliError::msg("test launch attestor rejected request"))
+        }
+    }
+
+    impl LaunchAttestor for RankOneRejectingAttestor {
+        fn attest(&self, manifest: &LaunchManifest) -> Result<LaunchAttestation, CliError> {
+            if manifest.payload.run.data_parallel_rank == 1 {
+                Err(CliError::msg("test rank-one attestor rejection"))
+            } else {
+                TEST_LAUNCH_ATTESTOR.attest(manifest)
+            }
+        }
+    }
+
+    fn attest_launch_for_test(manifest: LaunchManifest) -> LaunchManifest {
+        manifest.attest(&TEST_LAUNCH_ATTESTOR).unwrap()
+    }
 
     struct TestDir(PathBuf);
 
@@ -4504,6 +5563,44 @@ mod tests {
         (tmp, path)
     }
 
+    fn test_policy_identity() -> ferrl::PolicyLoadIdentity {
+        ferrl::PolicyLoadIdentity {
+            policy_sha256: "00".repeat(32),
+            tokenizer_sha256: "11".repeat(32),
+            model_family: "qwen3",
+        }
+    }
+
+    fn test_build_source_identity() -> BuildSourceIdentity {
+        validated_build_source_identity(&"01".repeat(20), false).unwrap()
+    }
+
+    fn launch_context_for_test(
+        cfg: &RunConfig,
+        run_id: String,
+        data_parallel_rank: usize,
+        data_parallel_world_size: usize,
+    ) -> LaunchContext {
+        let resolved = canonicalize_json(cfg.canonical_wire_value().unwrap());
+        let resolved_bytes = serde_json::to_vec(&resolved).unwrap();
+        LaunchContext {
+            ferrl_commit: "01".repeat(20),
+            run: LaunchRunIdentity {
+                group_id: "test-group".to_owned(),
+                run_id,
+                data_parallel_rank,
+                data_parallel_world_size,
+                tensor_parallel_rank: 0,
+                tensor_parallel_world_size: 1,
+            },
+            config: LaunchConfigSnapshot {
+                source_sha256: "22".repeat(32),
+                resolved_sha256: sha256_hex(&resolved_bytes),
+                resolved,
+            },
+        }
+    }
+
     fn trimul_score_test_config(secret_seed: u64) -> String {
         format!(
             r#"{{
@@ -4570,32 +5667,113 @@ mod tests {
 
     fn trimul_artifact_args_for_test(dir: &Path) -> TrimulArtifactArgs {
         TrimulArtifactArgs {
-            config: dir.join("run.json"),
-            prompt_copy: dir.join("prompt.txt"),
-            completion: dir.join("completion.txt"),
-            completion_normalization: CompletionNormalization::None,
+            run_dir: dir.join("test-run"),
+            candidate_sha256: "11".repeat(32),
             out: dir.join("artifact"),
-            run_id: "test-run".to_string(),
-            step: 0,
-            prompt_index: 0,
-            group_index: 0,
-            rank: 0,
-            world_size: 1,
-            training_reward: 0.0,
             audit_secret_seed: 999,
             baseline_measurements_ns: vec![1.0, 1.0, 1.0],
             baseline_command: None,
             repeats: 3,
-            ferrl_commit: "test-commit".to_string(),
             run_health: "test".to_string(),
             source_inspection: SourceInspectionResult::Clean,
             source_inspection_notes: "clean".to_string(),
-            model_family: "gemma4".to_string(),
-            checkpoint: None,
-            tokenizer: None,
-            eval_bundle: None,
-            sandbox_image: None,
         }
+    }
+
+    fn launch_manifest_for_test(
+        cfg: &RunConfig,
+        run_id: &str,
+        prompt: &[u8],
+    ) -> (LaunchManifest, CandidateSigner) {
+        let context = launch_context_for_test(cfg, run_id.to_owned(), 0, 1);
+        let signer = CandidateSigner::generate().unwrap();
+        let manifest = attest_launch_for_test(
+            LaunchManifest::new(LaunchPayload {
+                task: cfg.task.clone(),
+                ferrl_commit: context.ferrl_commit,
+                run: context.run,
+                config: context.config,
+                model: LaunchModelIdentity {
+                    family: "gemma4".to_owned(),
+                    checkpoint_policy_sha256: "33".repeat(32),
+                    tokenizer_sha256: "44".repeat(32),
+                    resolved_eos_token_id: None,
+                },
+                prompt: Some(LaunchPromptIdentity {
+                    file: RunDir::PROMPT_FILE.to_owned(),
+                    sha256: sha256_hex(prompt),
+                    len_bytes: prompt.len(),
+                }),
+                candidate_ledger: LaunchCandidateLedger {
+                    file: RunDir::CANDIDATES_FILE.to_owned(),
+                    format_version: 1,
+                    row_digest_domain: CANDIDATE_RECORD_DOMAIN.to_owned(),
+                    row_signature_algorithm: "ed25519".to_owned(),
+                    signing_public_key: signer.public_key_hex(),
+                },
+            })
+            .unwrap(),
+        );
+        (manifest, signer)
+    }
+
+    fn candidate_for_test(
+        launch: &LaunchManifest,
+        signer: &CandidateSigner,
+        completion: &str,
+    ) -> CandidateRecord {
+        let mut candidate = CandidateRecord::new(0, 0, 1, 12, 1, 1.5, 3, completion.to_owned());
+        candidate.reward_metadata = Some(serde_json::json!({ "correct": true }));
+        signer
+            .sign_candidate(&candidate, &launch.payload_sha256)
+            .unwrap()
+    }
+
+    fn write_bound_candidate_run(
+        tag: &str,
+        launch_rank: usize,
+        launch_world: usize,
+        candidate_rank: usize,
+        candidate_world: usize,
+    ) -> (TestDir, PathBuf, String) {
+        let tmp = TestDir::new(tag);
+        let run_id = if launch_world == 1 {
+            "trimul-1".to_owned()
+        } else {
+            format!("trimul-1-rank{launch_rank}")
+        };
+        let mut config_value: serde_json::Value =
+            serde_json::from_str(&trimul_score_test_config(4242)).unwrap();
+        if launch_world > 1 {
+            config_value["distributed"] = serde_json::json!({ "enabled": true });
+        }
+        let cfg: RunConfig = serde_json::from_value(config_value).unwrap();
+        let (mut launch, signer) = launch_manifest_for_test(&cfg, &run_id, b"prompt");
+        launch.payload.run.group_id = "trimul-1".to_owned();
+        launch.payload.run.data_parallel_rank = launch_rank;
+        launch.payload.run.data_parallel_world_size = launch_world;
+        launch = attest_launch_for_test(LaunchManifest::new(launch.payload).unwrap());
+        let mut candidate = candidate_for_test(&launch, &signer, "```python\npass\n```\n");
+        candidate.rank = candidate_rank;
+        candidate.world_size = candidate_world;
+        candidate = signer
+            .sign_candidate(&candidate, &launch.payload_sha256)
+            .unwrap();
+        let candidate_sha256 = candidate.record_sha256.clone().unwrap();
+        let run = RunDir::create(tmp.path(), &run_id).unwrap();
+        run.write_immutable_launch(&launch.to_pretty_bytes().unwrap(), Some(b"prompt"))
+            .unwrap();
+        let mut row = serde_json::to_vec(&candidate).unwrap();
+        row.push(b'\n');
+        std::fs::write(run.candidates_path(), row).unwrap();
+        (tmp, run.root().to_path_buf(), candidate_sha256)
+    }
+
+    fn load_bound_candidate_for_test(
+        run_dir: &Path,
+        candidate_sha256: &str,
+    ) -> Result<BoundRunCandidate, CliError> {
+        load_bound_run_candidate_with_trust(run_dir, candidate_sha256, &test_launch_trust_policy())
     }
 
     fn trimul_score_input_for_test(
@@ -4894,9 +6072,9 @@ mod tests {
             cfg.loader_opts().tensor_parallel,
             TensorParallelPlan::new(0, 2).unwrap()
         );
-        let run_id = cfg.run_id();
-        assert!(run_id.starts_with("countdown-"), "{run_id}");
-        assert!(run_id.ends_with("-rank0"), "{run_id}");
+        let run = synchronized_run_identity(&cfg, None).unwrap();
+        assert!(run.run_id.starts_with("countdown-"), "{}", run.run_id);
+        assert!(run.run_id.ends_with("-rank0"), "{}", run.run_id);
     }
 
     #[test]
@@ -5035,6 +6213,8 @@ mod tests {
                                         &run,
                                         Some(trainer_comm),
                                         None,
+                                        &"11".repeat(32),
+                                        CandidateSigner::generate()?,
                                     )
                                 })()
                             };
@@ -5533,8 +6713,13 @@ mod tests {
                             device: Device::Cpu,
                             comm: Box::new(comm),
                         };
-                        train_with_launch_runtime(&args, Some(runtime), prepare_test_launch_device)
-                            .map_err(|err| err.to_string())
+                        train_with_launch_runtime(
+                            &args,
+                            Some(runtime),
+                            test_build_source_identity(),
+                            prepare_test_launch_device,
+                        )
+                        .map_err(|err| err.to_string())
                     })
                 })
                 .collect();
@@ -5553,6 +6738,69 @@ mod tests {
         let digests =
             configs.map(|path| RunConfig::load_for_launch(&path).unwrap().consensus_digest);
         assert_eq!(digests[0], digests[1]);
+    }
+
+    #[test]
+    fn distributed_run_identity_uses_one_rank_zero_timestamp() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&countdown_train_config("")).unwrap();
+        value["distributed"] = serde_json::json!({ "enabled": true });
+        let identities = std::thread::scope(|scope| {
+            ferrl::LocalComm::world(2)
+                .into_iter()
+                .map(|comm| {
+                    let cfg: RunConfig = serde_json::from_value(value.clone()).unwrap();
+                    scope.spawn(move || synchronized_run_identity(&cfg, Some(&comm)).unwrap())
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        assert_eq!(identities[0].group_id, identities[1].group_id);
+        assert_eq!(
+            identities[0].run_id,
+            format!("{}-rank0", identities[0].group_id)
+        );
+        assert_eq!(
+            identities[1].run_id,
+            format!("{}-rank1", identities[1].group_id)
+        );
+        assert_eq!(identities[0].data_parallel_world_size, 2);
+        assert_eq!(identities[1].data_parallel_rank, 1);
+    }
+
+    #[test]
+    fn distributed_launch_rejects_tokenizer_identity_drift() {
+        let results = std::thread::scope(|scope| {
+            ferrl::LocalComm::world(2)
+                .into_iter()
+                .map(|comm| {
+                    let rank = comm.rank();
+                    scope.spawn(move || {
+                        validate_launch_value_consensus(
+                            "model/checkpoint/tokenizer/prompt provenance",
+                            if rank == 0 {
+                                b"tokenizer-a"
+                            } else {
+                                b"tokenizer-b"
+                            },
+                            Some(&comm),
+                        )
+                        .map_err(|error| error.to_string())
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        assert!(results.iter().all(|result| result
+            .as_ref()
+            .unwrap_err()
+            .contains("launch ranks disagree")));
     }
 
     #[test]
@@ -5845,7 +7093,19 @@ mod tests {
         let score_err = trimul_score(&trimul_score_args_for_test(tmp.path()))
             .unwrap_err()
             .to_string();
-        let artifact_err = trimul_artifact(&trimul_artifact_args_for_test(tmp.path()))
+        let cfg: RunConfig =
+            serde_json::from_str(&trimul_invalid_reward_test_config(4242)).unwrap();
+        let (launch, signer) = launch_manifest_for_test(&cfg, "test-run", b"prompt");
+        let candidate = candidate_for_test(&launch, &signer, "```python\npass\n```\n");
+        let run = RunDir::create(tmp.path(), "test-run").unwrap();
+        run.write_immutable_launch(&launch.to_pretty_bytes().unwrap(), Some(b"prompt"))
+            .unwrap();
+        let mut row = serde_json::to_vec(&candidate).unwrap();
+        row.push(b'\n');
+        std::fs::write(run.candidates_path(), row).unwrap();
+        let mut artifact_args = trimul_artifact_args_for_test(tmp.path());
+        artifact_args.candidate_sha256 = candidate.record_sha256.clone().unwrap();
+        let artifact_err = trimul_artifact_with_trust(&artifact_args, &test_launch_trust_policy())
             .unwrap_err()
             .to_string();
 
@@ -6114,6 +7374,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cognitive_complexity)] // one production seam with exact persisted assertions
     fn production_training_setup_threads_resolved_eos_to_trainer_eval_and_persistence() {
         let tmp = TestDir::new("production-checkpoint-eos-resolution");
         let model_dir = tmp.path().join("model");
@@ -6128,7 +7389,9 @@ mod tests {
         value["model_dir"] = serde_json::json!(model_dir);
         value["out_dir"] = serde_json::json!(out_dir);
         value["trainer"]["max_new_tokens"] = serde_json::json!(2);
+        value["trainer"]["candidate_log_top_k"] = serde_json::json!(1);
         let cfg: RunConfig = serde_json::from_value(value).unwrap();
+        let launch = launch_context_for_test(&cfg, "test-run".to_owned(), 0, 1);
         let seen = Arc::new(Mutex::new(Vec::new()));
         let loader_seen = Arc::clone(&seen);
 
@@ -6139,14 +7402,16 @@ mod tests {
             &[Sample::new("hello", ())],
             &[Sample::new("hello", ())],
             None,
+            &launch,
             None,
+            Some(&TEST_LAUNCH_ATTESTOR),
             move |model_dir, _device, _opts| {
                 let tokenizer = ferrl::HfTokenizer::from_file(model_dir.join("tokenizer.json"))
                     .map_err(|error| CliError::msg(error.to_string()))?;
                 Ok((
                     EosRecordingPolicy::new(loader_seen),
                     tokenizer,
-                    "00".repeat(32),
+                    test_policy_identity(),
                 ))
             },
         )
@@ -6170,6 +7435,230 @@ mod tests {
         let persisted: serde_json::Value =
             serde_json::from_slice(&std::fs::read(run_root.join("config.json")).unwrap()).unwrap();
         assert_eq!(persisted["eos_token_id"], serde_json::json!(3));
+        let launch: LaunchManifest =
+            serde_json::from_slice(&std::fs::read(run_root.join(RunDir::LAUNCH_FILE)).unwrap())
+                .unwrap();
+        verify_launch_manifest_payload(&launch).unwrap();
+        verify_launch_attestation(&launch, &test_launch_trust_policy()).unwrap();
+        assert_eq!(launch.payload.ferrl_commit, "01".repeat(20));
+        assert_eq!(launch.payload.model.resolved_eos_token_id, Some(3));
+        assert_eq!(launch.payload.model.tokenizer_sha256, "11".repeat(32));
+        assert_eq!(launch.payload.config.resolved["task"], "countdown");
+        let candidate: CandidateRecord = serde_json::from_str(
+            std::fs::read_to_string(run_root.join(RunDir::CANDIDATES_FILE))
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        candidate
+            .verify_signed_provenance(&launch.payload.candidate_ledger.signing_public_key)
+            .unwrap();
+        assert_eq!(
+            candidate.launch_sha256.as_deref(),
+            Some(launch.payload_sha256.as_str())
+        );
+    }
+
+    #[test]
+    fn production_training_rejects_attestation_failure_before_rollout_or_run_publication() {
+        let tmp = TestDir::new("production-attestation-rejection");
+        let model_dir = tmp.path().join("model");
+        let out_dir = tmp.path().join("runs-must-not-exist");
+        write_generation_metadata_fixture(
+            &model_dir,
+            Some(serde_json::json!(3)),
+            &serde_json::json!(4),
+        );
+        let mut value: serde_json::Value =
+            serde_json::from_str(&countdown_train_config("")).unwrap();
+        value["model_dir"] = serde_json::json!(model_dir);
+        value["out_dir"] = serde_json::json!(&out_dir);
+        value["trainer"]["max_new_tokens"] = serde_json::json!(2);
+        value["trainer"]["candidate_log_top_k"] = serde_json::json!(1);
+        let cfg: RunConfig = serde_json::from_value(value).unwrap();
+        let launch = launch_context_for_test(&cfg, "test-run".to_owned(), 0, 1);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let loader_seen = Arc::clone(&seen);
+
+        let error = run_training_with_loader(
+            &cfg,
+            &Device::Cpu,
+            &EosSetupReward,
+            &[Sample::new("hello", ())],
+            &[],
+            None,
+            &launch,
+            None,
+            Some(&REJECTING_LAUNCH_ATTESTOR),
+            move |model_dir, _device, _opts| {
+                let tokenizer = ferrl::HfTokenizer::from_file(model_dir.join("tokenizer.json"))
+                    .map_err(|error| CliError::msg(error.to_string()))?;
+                Ok((
+                    EosRecordingPolicy::new(loader_seen),
+                    tokenizer,
+                    test_policy_identity(),
+                ))
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("launch attestor rejected request"),
+            "{error}"
+        );
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "attestation failure reached rollout"
+        );
+        assert!(
+            !out_dir.exists(),
+            "attestation failure created a run directory"
+        );
+    }
+
+    #[test]
+    fn distributed_training_coordinates_attestation_failure_before_rollout_or_publication() {
+        let tmp = TestDir::new("distributed-attestation-rejection");
+        let model_dir = tmp.path().join("model");
+        write_generation_metadata_fixture(
+            &model_dir,
+            Some(serde_json::json!(3)),
+            &serde_json::json!(4),
+        );
+        let results = std::thread::scope(|scope| {
+            ferrl::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(5))
+                .into_iter()
+                .map(|comm| {
+                    let rank = comm.rank();
+                    let model_dir = model_dir.clone();
+                    let out_dir = tmp.path().join(format!("rank-{rank}-runs"));
+                    scope.spawn(move || {
+                        let mut value: serde_json::Value =
+                            serde_json::from_str(&countdown_train_config("")).unwrap();
+                        value["model_dir"] = serde_json::json!(model_dir);
+                        value["out_dir"] = serde_json::json!(&out_dir);
+                        value["distributed"] = serde_json::json!({ "enabled": true });
+                        value["trainer"]["max_new_tokens"] = serde_json::json!(2);
+                        value["trainer"]["candidate_log_top_k"] = serde_json::json!(1);
+                        let cfg: RunConfig = serde_json::from_value(value).unwrap();
+                        let launch = launch_context_for_test(
+                            &cfg,
+                            format!("test-group-rank{rank}"),
+                            rank,
+                            2,
+                        );
+                        let seen = Arc::new(Mutex::new(Vec::new()));
+                        let loader_seen = Arc::clone(&seen);
+                        let result = run_training_with_loader(
+                            &cfg,
+                            &Device::Cpu,
+                            &EosSetupReward,
+                            &[Sample::new("hello", ())],
+                            &[],
+                            None,
+                            &launch,
+                            Some(LaunchRuntime {
+                                device: Device::Cpu,
+                                comm: Box::new(comm),
+                            }),
+                            Some(&RANK_ONE_REJECTING_ATTESTOR),
+                            move |model_dir, _device, _opts| {
+                                let tokenizer =
+                                    ferrl::HfTokenizer::from_file(model_dir.join("tokenizer.json"))
+                                        .map_err(|error| CliError::msg(error.to_string()))?;
+                                Ok((
+                                    EosRecordingPolicy::new(loader_seen),
+                                    tokenizer,
+                                    test_policy_identity(),
+                                ))
+                            },
+                        );
+                        let rollout_calls = seen.lock().unwrap().len();
+                        (
+                            rank,
+                            result.map_err(|error| error.to_string()),
+                            rollout_calls,
+                            out_dir,
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        for (rank, result, rollout_calls, out_dir) in results {
+            let error = result.unwrap_err();
+            if rank == 1 {
+                assert!(
+                    error.contains("test rank-one attestor rejection"),
+                    "rank {rank}: {error}"
+                );
+            } else {
+                assert!(
+                    error.contains("external launch attestation"),
+                    "rank {rank}: {error}"
+                );
+            }
+            assert_eq!(rollout_calls, 0, "rank {rank} reached rollout");
+            assert!(!out_dir.exists(), "rank {rank} published a run directory");
+        }
+    }
+
+    #[test]
+    fn production_training_rejects_existing_launch_before_rollout() {
+        let tmp = TestDir::new("production-launch-create-new");
+        let model_dir = tmp.path().join("model");
+        let out_dir = tmp.path().join("runs");
+        write_generation_metadata_fixture(
+            &model_dir,
+            Some(serde_json::json!(3)),
+            &serde_json::json!(4),
+        );
+        let mut value: serde_json::Value =
+            serde_json::from_str(&countdown_train_config("")).unwrap();
+        value["model_dir"] = serde_json::json!(model_dir);
+        value["out_dir"] = serde_json::json!(out_dir);
+        value["trainer"]["max_new_tokens"] = serde_json::json!(2);
+        let cfg: RunConfig = serde_json::from_value(value).unwrap();
+        let launch = launch_context_for_test(&cfg, "test-run".to_owned(), 0, 1);
+        let existing = RunDir::create(&cfg.out_dir, "test-run").unwrap();
+        existing.write_immutable_launch(b"{}", None).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let loader_seen = Arc::clone(&seen);
+
+        let error = run_training_with_loader(
+            &cfg,
+            &Device::Cpu,
+            &EosSetupReward,
+            &[Sample::new("hello", ())],
+            &[],
+            None,
+            &launch,
+            None,
+            None,
+            move |model_dir, _device, _opts| {
+                let tokenizer = ferrl::HfTokenizer::from_file(model_dir.join("tokenizer.json"))
+                    .map_err(|error| CliError::msg(error.to_string()))?;
+                Ok((
+                    EosRecordingPolicy::new(loader_seen),
+                    tokenizer,
+                    test_policy_identity(),
+                ))
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("duplicate run_id"), "{error}");
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "rollout reached after launch rejection"
+        );
     }
 
     #[test]
@@ -6202,6 +7691,12 @@ mod tests {
                             value["trainer"]["eos_token_id"] = serde_json::json!("none");
                         }
                         let cfg: RunConfig = serde_json::from_value(value).unwrap();
+                        let launch = launch_context_for_test(
+                            &cfg,
+                            format!("test-group-rank{rank}"),
+                            rank,
+                            2,
+                        );
                         let seen = Arc::new(Mutex::new(Vec::new()));
                         let loader_seen = Arc::clone(&seen);
                         let result = run_training_with_loader(
@@ -6211,10 +7706,12 @@ mod tests {
                             &[Sample::new("hello", ())],
                             &[],
                             None,
+                            &launch,
                             Some(LaunchRuntime {
                                 device: Device::Cpu,
                                 comm: Box::new(comm),
                             }),
+                            None,
                             move |model_dir, _device, _opts| {
                                 let tokenizer =
                                     ferrl::HfTokenizer::from_file(model_dir.join("tokenizer.json"))
@@ -6222,7 +7719,7 @@ mod tests {
                                 Ok((
                                     EosRecordingPolicy::new(loader_seen),
                                     tokenizer,
-                                    "00".repeat(32),
+                                    test_policy_identity(),
                                 ))
                             },
                         );
@@ -6250,6 +7747,94 @@ mod tests {
                 error.contains("resolved EOS consensus"),
                 "rank {rank}: {error}"
             );
+            assert_eq!(entries, vec![sentinel.file_name().unwrap().to_os_string()]);
+        }
+    }
+
+    #[test]
+    fn distributed_production_rejects_tokenizer_identity_drift_before_rollout_or_publication() {
+        let tmp = TestDir::new("production-tokenizer-identity-consensus");
+        let model_dir = tmp.path().join("model");
+        write_generation_metadata_fixture(
+            &model_dir,
+            Some(serde_json::json!(3)),
+            &serde_json::json!(4),
+        );
+        let results = std::thread::scope(|scope| {
+            ferrl::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(5))
+                .into_iter()
+                .map(|comm| {
+                    let rank = comm.rank();
+                    let model_dir = model_dir.clone();
+                    let out_dir = tmp.path().join(format!("tokenizer-rank-{rank}-runs"));
+                    std::fs::create_dir_all(&out_dir).unwrap();
+                    let sentinel = out_dir.join("sentinel");
+                    std::fs::write(&sentinel, format!("rank-{rank}")).unwrap();
+                    scope.spawn(move || {
+                        let mut value: serde_json::Value =
+                            serde_json::from_str(&countdown_train_config("")).unwrap();
+                        value["model_dir"] = serde_json::json!(model_dir);
+                        value["out_dir"] = serde_json::json!(out_dir);
+                        value["distributed"] = serde_json::json!({ "enabled": true });
+                        value["trainer"]["max_new_tokens"] = serde_json::json!(2);
+                        let cfg: RunConfig = serde_json::from_value(value).unwrap();
+                        let launch = launch_context_for_test(
+                            &cfg,
+                            format!("test-group-rank{rank}"),
+                            rank,
+                            2,
+                        );
+                        let seen = Arc::new(Mutex::new(Vec::new()));
+                        let loader_seen = Arc::clone(&seen);
+                        let result = run_training_with_loader(
+                            &cfg,
+                            &Device::Cpu,
+                            &EosSetupReward,
+                            &[Sample::new("hello", ())],
+                            &[],
+                            None,
+                            &launch,
+                            Some(LaunchRuntime {
+                                device: Device::Cpu,
+                                comm: Box::new(comm),
+                            }),
+                            None,
+                            move |model_dir, _device, _opts| {
+                                let tokenizer =
+                                    ferrl::HfTokenizer::from_file(model_dir.join("tokenizer.json"))
+                                        .map_err(|error| CliError::msg(error.to_string()))?;
+                                let mut identity = test_policy_identity();
+                                identity.tokenizer_sha256 = format!("{rank:02x}").repeat(32);
+                                Ok((EosRecordingPolicy::new(loader_seen), tokenizer, identity))
+                            },
+                        );
+                        let entries = std::fs::read_dir(&cfg.out_dir)
+                            .unwrap()
+                            .map(|entry| entry.unwrap().file_name())
+                            .collect::<Vec<_>>();
+                        let rollout_calls = seen.lock().unwrap().len();
+                        (
+                            rank,
+                            result.map_err(|error| error.to_string()),
+                            rollout_calls,
+                            entries,
+                            sentinel,
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        for (rank, result, rollout_calls, entries, sentinel) in results {
+            let error = result.unwrap_err();
+            assert!(
+                error.contains("tokenizer/prompt provenance"),
+                "rank {rank}: {error}"
+            );
+            assert_eq!(rollout_calls, 0, "rank {rank} reached rollout");
             assert_eq!(entries, vec![sentinel.file_name().unwrap().to_os_string()]);
         }
     }
@@ -6532,10 +8117,15 @@ mod tests {
             std::fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
             let prepared = std::cell::Cell::new(false);
 
-            let result = train_with_launch_runtime(&TrainArgs { config: path }, None, |_, _| {
-                prepared.set(true);
-                Ok(Device::Cpu)
-            });
+            let result = train_with_launch_runtime(
+                &TrainArgs { config: path },
+                None,
+                test_build_source_identity(),
+                |_, _| {
+                    prepared.set(true);
+                    Ok(Device::Cpu)
+                },
+            );
 
             assert!(result.is_err(), "{field} unexpectedly reached training");
             assert!(!prepared.get(), "{field} reached device/model setup");
@@ -6564,6 +8154,7 @@ mod tests {
                 device: Device::Cpu,
                 comm: Box::new(ferrl::SoloComm),
             }),
+            test_build_source_identity(),
             |_, _| {
                 prepared.set(true);
                 Err(CliError::msg(
@@ -6607,6 +8198,7 @@ mod tests {
                                 device: Device::Cpu,
                                 comm: Box::new(comm),
                             }),
+                            test_build_source_identity(),
                             move |_, _| {
                                 prepared.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                                 Err(CliError::msg(
@@ -6707,6 +8299,15 @@ mod tests {
     fn clap_parses_train_and_trimul_baseline() {
         let c = Cli::try_parse_from(["ferrl", "train", "--config", "run.json"]).unwrap();
         assert!(matches!(c.cmd, Command::Train(_)));
+        assert!(Cli::try_parse_from([
+            "ferrl",
+            "train",
+            "--config",
+            "run.json",
+            "--ferrl-commit",
+            "0123456789012345678901234567890123456789",
+        ])
+        .is_err());
         // The `TrimulBaseline` variant renders as the `trimul-baseline` subcommand.
         let b = Cli::try_parse_from(["ferrl", "trimul-baseline", "--config", "run.json"]).unwrap();
         assert!(matches!(b.cmd, Command::TrimulBaseline(_)));
@@ -7497,28 +9098,12 @@ mod tests {
         let a = Cli::try_parse_from([
             "ferrl",
             "trimul-artifact",
-            "--config",
-            "run.json",
-            "--prompt-copy",
-            "runs/trimul-1/prompt.txt",
-            "--completion",
-            "completion.txt",
-            "--completion-normalization",
-            "llama-cpp",
+            "--run-dir",
+            "runs/trimul-1",
+            "--candidate-sha256",
+            "1111111111111111111111111111111111111111111111111111111111111111",
             "--out",
             "artifact",
-            "--run-id",
-            "trimul-1",
-            "--prompt-index",
-            "5",
-            "--group-index",
-            "1",
-            "--rank",
-            "0",
-            "--world-size",
-            "1",
-            "--training-reward",
-            "1.25",
             "--run-health",
             "healthy",
             "--source-inspection",
@@ -7533,24 +9118,36 @@ mod tests {
             "11",
             "--baseline-ns",
             "12",
-            "--ferrl-commit",
-            "abc123",
         ])
         .unwrap();
         match a.cmd {
             Command::TrimulArtifact(a) => {
-                assert_eq!(
-                    (a.prompt_index, a.group_index, a.rank, a.world_size),
-                    (5, 1, 0, 1)
-                );
-                assert_eq!(a.prompt_copy, PathBuf::from("runs/trimul-1/prompt.txt"));
-                assert_eq!(
-                    a.completion_normalization,
-                    CompletionNormalization::LlamaCpp
-                );
+                assert_eq!(a.run_dir, PathBuf::from("runs/trimul-1"));
+                assert_eq!(a.candidate_sha256, "11".repeat(32));
             }
             _ => panic!("expected trimul-artifact"),
         }
+    }
+
+    #[test]
+    fn clap_rejects_operator_authored_artifact_candidate_provenance() {
+        let error = Cli::try_parse_from([
+            "ferrl",
+            "trimul-artifact",
+            "--run-dir",
+            "runs/trimul-1",
+            "--candidate-sha256",
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            "--completion",
+            "replacement.txt",
+        ])
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("unexpected argument '--completion'"),
+            "{error}"
+        );
     }
 
     /// A `trimul` run config parses, with its task block and a baseline pin.
@@ -7859,6 +9456,24 @@ benchmarks:
     }
 
     #[test]
+    fn launch_requires_a_full_lowercase_training_commit() {
+        assert_eq!(
+            validate_full_git_commit(&"ab".repeat(20)).unwrap(),
+            "ab".repeat(20)
+        );
+        assert!(validate_full_git_commit("abc123").is_err());
+        assert!(validate_full_git_commit(&"AB".repeat(20)).is_err());
+        assert!(validated_build_source_identity("unknown", false).is_err());
+        assert!(validated_build_source_identity(&"ab".repeat(20), true).is_err());
+        assert_eq!(
+            validated_build_source_identity(&"ab".repeat(20), false)
+                .unwrap()
+                .commit,
+            "ab".repeat(20)
+        );
+    }
+
+    #[test]
     fn prompt_copy_must_match_adjacent_launch_hash() {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -7902,39 +9517,325 @@ benchmarks:
     }
 
     #[test]
-    fn trimul_artifact_completion_normalization_records_llama_cpp_manifest_metadata() {
-        let raw = b"```python\npass\n``` [end of text]\n\n";
-        let normalized = "```python\npass\n```\n";
-        let inputs = ArtifactInputs {
-            gpu: "H100".to_string(),
-            raw_completion: std::str::from_utf8(raw).unwrap(),
-            normalized_completion: normalized,
-            completion_normalization: CompletionNormalization::LlamaCpp,
-            completion_normalization_changed: true,
-            completion_bytes: raw,
-            config_bytes: b"{}",
-            prompt_bytes: b"prompt",
-            submission: "pass\n",
-            baseline_median: 1.0,
-            test_cases: 1,
-            benchmark_cases: 1,
-            runs: Vec::new(),
-            accepted: false,
-        };
+    fn launch_bound_candidate_rejects_completion_and_coordinate_mutation() {
+        let cfg: RunConfig = serde_json::from_str(&trimul_score_test_config(4242)).unwrap();
+        let (launch, signer) = launch_manifest_for_test(&cfg, "test-run", b"prompt");
+        let candidate = candidate_for_test(&launch, &signer, "```python\npass\n```\n");
+        candidate
+            .verify_signed_provenance(&launch.payload.candidate_ledger.signing_public_key)
+            .unwrap();
 
-        let metadata = artifact_completion_normalization(&inputs).unwrap();
+        let mut completion_mutation = candidate.clone();
+        completion_mutation.completion.push_str("# changed");
+        assert!(completion_mutation.verify_provenance().is_err());
 
-        assert_eq!(metadata.mode, "llama_cpp");
-        assert!(metadata.changed);
-        assert_eq!(metadata.raw_completion_len_bytes, raw.len());
-        assert_eq!(metadata.normalized_completion_len_bytes, normalized.len());
+        let mut coordinate_mutation = candidate;
+        coordinate_mutation.group_index += 1;
+        assert!(coordinate_mutation.verify_provenance().is_err());
+    }
+
+    #[test]
+    fn launch_trust_policy_rejects_untrusted_shapes() {
+        let mut policy = test_launch_trust_policy();
+        policy.keys.push(policy.keys[0].clone());
+        assert!(validate_launch_trust_policy(&policy)
+            .unwrap_err()
+            .to_string()
+            .contains("repeats key id"));
+
+        let mut policy = test_launch_trust_policy();
+        policy.keys[0].key_id = "operator/path".to_owned();
+        assert!(validate_launch_trust_policy(&policy)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid id or algorithm"));
+
+        let mut policy = test_launch_trust_policy();
+        policy.keys[0].public_key = "00".repeat(31);
+        assert!(validate_launch_trust_policy(&policy)
+            .unwrap_err()
+            .to_string()
+            .contains("64 lowercase hexadecimal"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launch_attestation_protocol_binds_the_exact_payload() {
+        use std::io::BufRead as _;
+        use std::os::unix::net::UnixStream;
+
+        let cfg: RunConfig = serde_json::from_str(&trimul_score_test_config(4242)).unwrap();
+        let (mut manifest, _candidate_signer) =
+            launch_manifest_for_test(&cfg, "test-run", b"prompt");
+        manifest.attestation = None;
+        let expected_digest = manifest.payload_sha256.clone();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(server);
+            let mut request = String::new();
+            reader.read_line(&mut request).unwrap();
+            let request: LaunchAttestationRequest = serde_json::from_str(&request).unwrap();
+            assert_eq!(
+                request.contract_version,
+                LAUNCH_ATTESTATION_CONTRACT_VERSION
+            );
+            assert_eq!(request.kind, LAUNCH_ATTESTATION_REQUEST_KIND);
+            assert_eq!(request.algorithm, LAUNCH_ATTESTATION_ALGORITHM);
+            let payload_bytes = decode_lower_hex(
+                "test launch payload",
+                &request.launch_payload_json_hex,
+                request.launch_payload_json_hex.len() / 2,
+            )
+            .unwrap();
+            let payload: LaunchPayload = serde_json::from_slice(&payload_bytes).unwrap();
+            assert_eq!(serde_json::to_vec(&payload).unwrap(), payload_bytes);
+            let reconstructed = LaunchManifest::new(payload).unwrap();
+            assert_eq!(request.launch_payload_sha256, reconstructed.payload_sha256);
+            assert_eq!(request.launch_payload_sha256, expected_digest);
+            let attestation = TEST_LAUNCH_ATTESTOR.attest(&reconstructed).unwrap();
+            serde_json::to_writer(reader.get_mut(), &attestation).unwrap();
+        });
+
+        let attestation =
+            exchange_launch_attestation(&mut client, &manifest, &test_launch_trust_policy())
+                .unwrap();
+        server.join().unwrap();
+        manifest.attestation = Some(attestation);
+        verify_launch_attestation(&manifest, &test_launch_trust_policy()).unwrap();
+    }
+
+    #[test]
+    fn trimul_artifact_ingest_selects_one_exact_launch_bound_row() {
+        let (_tmp, run_dir, candidate_sha256) =
+            write_bound_candidate_run("artifact-bound-row", 0, 1, 0, 1);
+
+        let bound = load_bound_candidate_for_test(&run_dir, &candidate_sha256).unwrap();
+
+        assert_eq!(bound.launch.payload.run.run_id, "trimul-1");
         assert_eq!(
-            metadata.normalized_completion_sha256,
-            sha256_hex(normalized.as_bytes())
+            bound.candidate.record_sha256.as_deref(),
+            Some(candidate_sha256.as_str())
         );
+        assert_eq!(bound.prompt_bytes, b"prompt");
         assert_eq!(
-            metadata.normalized_completion_file,
-            Some("completion.normalized.txt")
+            bound.candidate_row_bytes,
+            serde_json::to_vec(&bound.candidate).unwrap()
+        );
+    }
+
+    #[test]
+    fn trimul_artifact_rejects_an_appended_row_signed_by_an_operator_key() {
+        let (_tmp, run_dir, _native_candidate_sha256) =
+            write_bound_candidate_run("artifact-operator-row", 0, 1, 0, 1);
+        let launch: LaunchManifest =
+            serde_json::from_slice(&std::fs::read(run_dir.join(RunDir::LAUNCH_FILE)).unwrap())
+                .unwrap();
+        let attacker = CandidateSigner::generate().unwrap();
+        let forged = attacker
+            .sign_candidate(
+                &CandidateRecord::new(
+                    0,
+                    0,
+                    1,
+                    12,
+                    0,
+                    9.0,
+                    3,
+                    "```python\n# externally authored fast kernel\n```\n".to_owned(),
+                ),
+                &launch.payload_sha256,
+            )
+            .unwrap();
+        let forged_sha256 = forged.record_sha256.clone().unwrap();
+        let mut writer =
+            ferrl::telemetry::CandidateWriter::open(run_dir.join(RunDir::CANDIDATES_FILE)).unwrap();
+        writer.append(&forged).unwrap();
+        drop(writer);
+
+        let error = load_bound_candidate_for_test(&run_dir, &forged_sha256)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("record_signature was not made by the launch signing key"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn trimul_artifact_rejects_operator_rekeyed_whole_launch() {
+        let (_tmp, run_dir, _native_candidate_sha256) =
+            write_bound_candidate_run("artifact-operator-launch", 0, 1, 0, 1);
+        let launch_path = run_dir.join(RunDir::LAUNCH_FILE);
+        let original: LaunchManifest =
+            serde_json::from_slice(&std::fs::read(&launch_path).unwrap()).unwrap();
+
+        let candidate_signer = CandidateSigner::generate().unwrap();
+        let mut payload = original.payload;
+        payload.candidate_ledger.signing_public_key = candidate_signer.public_key_hex();
+        let mut forged_launch = LaunchManifest::new(payload).unwrap();
+        let attacker_root = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        let attacker_root = Ed25519KeyPair::from_pkcs8(attacker_root.as_ref()).unwrap();
+        let message = launch_attestation_message(&forged_launch.payload_sha256);
+        forged_launch.attestation = Some(LaunchAttestation {
+            contract_version: LAUNCH_ATTESTATION_CONTRACT_VERSION,
+            kind: LAUNCH_ATTESTATION_KIND.to_owned(),
+            algorithm: LAUNCH_ATTESTATION_ALGORITHM.to_owned(),
+            key_id: "operator-root".to_owned(),
+            launch_payload_sha256: forged_launch.payload_sha256.clone(),
+            signature: lower_hex_bytes(attacker_root.sign(message.as_bytes()).as_ref()),
+        });
+        let forged_candidate = candidate_signer
+            .sign_candidate(
+                &CandidateRecord::new(
+                    0,
+                    0,
+                    1,
+                    12,
+                    0,
+                    9.0,
+                    3,
+                    "```python\n# operator-authored replacement\n```\n".to_owned(),
+                ),
+                &forged_launch.payload_sha256,
+            )
+            .unwrap();
+        let forged_sha256 = forged_candidate.record_sha256.clone().unwrap();
+        std::fs::write(&launch_path, forged_launch.to_pretty_bytes().unwrap()).unwrap();
+        let mut row = serde_json::to_vec(&forged_candidate).unwrap();
+        row.push(b'\n');
+        std::fs::write(run_dir.join(RunDir::CANDIDATES_FILE), row).unwrap();
+
+        let error = load_bound_candidate_for_test(&run_dir, &forged_sha256)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("launch attestation key \"operator-root\" is not trusted"),
+            "{error}"
+        );
+
+        forged_launch.attestation.as_mut().unwrap().key_id = TEST_ATTESTATION_KEY_ID.to_owned();
+        std::fs::write(&launch_path, forged_launch.to_pretty_bytes().unwrap()).unwrap();
+        let error = load_bound_candidate_for_test(&run_dir, &forged_sha256)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("launch attestation signature is invalid"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn trimul_artifact_ingest_rejects_mutated_row_before_verification() {
+        let (_tmp, run_dir, candidate_sha256) =
+            write_bound_candidate_run("artifact-mutated-row", 0, 1, 0, 1);
+        let ledger_path = run_dir.join(RunDir::CANDIDATES_FILE);
+        let mut row: CandidateRecord = serde_json::from_slice(
+            std::fs::read(&ledger_path)
+                .unwrap()
+                .strip_suffix(b"\n")
+                .unwrap(),
+        )
+        .unwrap();
+        row.completion = "```python\nchanged\n```\n".to_owned();
+        let mut bytes = serde_json::to_vec(&row).unwrap();
+        bytes.push(b'\n');
+        std::fs::write(&ledger_path, bytes).unwrap();
+
+        let error = load_bound_candidate_for_test(&run_dir, &candidate_sha256)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("record_sha256 mismatch"), "{error}");
+    }
+
+    #[test]
+    fn trimul_artifact_ingest_rejects_operator_added_row_fields() {
+        let (_tmp, run_dir, candidate_sha256) =
+            write_bound_candidate_run("artifact-extra-row-field", 0, 1, 0, 1);
+        let ledger_path = run_dir.join(RunDir::CANDIDATES_FILE);
+        let mut row: serde_json::Value = serde_json::from_slice(
+            std::fs::read(&ledger_path)
+                .unwrap()
+                .strip_suffix(b"\n")
+                .unwrap(),
+        )
+        .unwrap();
+        row["operator_provenance"] = serde_json::json!("not launch bound");
+        let mut bytes = serde_json::to_vec(&row).unwrap();
+        bytes.push(b'\n');
+        std::fs::write(&ledger_path, bytes).unwrap();
+
+        let error = load_bound_candidate_for_test(&run_dir, &candidate_sha256)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("unknown field \"operator_provenance\""),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn trimul_artifact_ingest_rejects_reencoded_candidate_rows() {
+        let (_tmp, run_dir, candidate_sha256) =
+            write_bound_candidate_run("artifact-reencoded-row", 0, 1, 0, 1);
+        let ledger_path = run_dir.join(RunDir::CANDIDATES_FILE);
+        let row: serde_json::Value = serde_json::from_slice(
+            std::fs::read(&ledger_path)
+                .unwrap()
+                .strip_suffix(b"\n")
+                .unwrap(),
+        )
+        .unwrap();
+        let bytes = format!(" {}\n", serde_json::to_string(&row).unwrap()).into_bytes();
+        std::fs::write(&ledger_path, bytes).unwrap();
+
+        let error = load_bound_candidate_for_test(&run_dir, &candidate_sha256)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("exact production encoding"), "{error}");
+    }
+
+    #[test]
+    fn trimul_artifact_ingest_rejects_distributed_rank_rebinding() {
+        let (_tmp, run_dir, candidate_sha256) =
+            write_bound_candidate_run("artifact-rank-rebinding", 1, 2, 0, 2);
+
+        let error = load_bound_candidate_for_test(&run_dir, &candidate_sha256)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("rank/world disagree with launch.json"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn trimul_artifact_ingest_rejects_prompt_and_launch_mutation() {
+        let (_tmp, run_dir, candidate_sha256) =
+            write_bound_candidate_run("artifact-prompt-mutation", 0, 1, 0, 1);
+        std::fs::write(run_dir.join(RunDir::PROMPT_FILE), b"changed").unwrap();
+        let prompt_error = load_bound_candidate_for_test(&run_dir, &candidate_sha256)
+            .unwrap_err()
+            .to_string();
+        assert!(prompt_error.contains("prompt bytes"), "{prompt_error}");
+
+        let (_tmp, run_dir, candidate_sha256) =
+            write_bound_candidate_run("artifact-launch-mutation", 0, 1, 0, 1);
+        let launch_path = run_dir.join(RunDir::LAUNCH_FILE);
+        let mut launch: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&launch_path).unwrap()).unwrap();
+        launch["payload"]["model"]["tokenizer_sha256"] = serde_json::json!("55".repeat(32));
+        std::fs::write(&launch_path, serde_json::to_vec_pretty(&launch).unwrap()).unwrap();
+        let launch_error = load_bound_candidate_for_test(&run_dir, &candidate_sha256)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            launch_error.contains("launch payload hash mismatch"),
+            "{launch_error}"
         );
     }
 
@@ -7964,14 +9865,17 @@ benchmarks:
         )
         .unwrap();
         let args = trimul_artifact_args_for_test(Path::new("artifact-provenance"));
+        let (launch, signer) = launch_manifest_for_test(&cfg, "test-run", b"prompt");
+        let candidate = candidate_for_test(&launch, &signer, "```python\npass\n```\n");
+        let candidate_row = serde_json::to_vec(&candidate).unwrap();
+        let launch_bytes = launch.to_pretty_bytes().unwrap();
         let inputs = ArtifactInputs {
             gpu: "H100".to_string(),
-            raw_completion: "```python\npass\n```\n",
-            normalized_completion: "```python\npass\n```\n",
-            completion_normalization: CompletionNormalization::None,
-            completion_normalization_changed: false,
-            completion_bytes: b"completion",
-            config_bytes: b"config",
+            launch: &launch,
+            launch_bytes: &launch_bytes,
+            candidate: &candidate,
+            candidate_row_bytes: &candidate_row,
+            raw_completion: &candidate.completion,
             prompt_bytes: b"prompt",
             submission: "pass\n",
             baseline_median: 1.0,
@@ -7986,17 +9890,25 @@ benchmarks:
 
         assert_eq!(manifest.model.base_dtype, "bf16");
         assert_eq!(manifest.model.base_quantization, "q8_0");
+        assert_eq!(manifest.launch_file_sha256, sha256_hex(&launch_bytes));
         assert!(json.contains(r#""base_quantization":"q8_0""#));
     }
 
     #[test]
     fn artifact_report_matches_the_contract_outline() {
         let manifest = ArtifactManifest {
-            contract_version: 1,
+            contract_version: 2,
             task: "trimul",
-            ferrl_commit: "abc123".to_string(),
+            ferrl_commit: "01".repeat(20),
             run_id: "trimul-1".to_string(),
+            launch_sha256: "02".repeat(32),
+            launch_file_sha256: "03".repeat(32),
+            launch_attestation_key_id: "test-root-1".to_owned(),
+            launch_attestation_algorithm: LAUNCH_ATTESTATION_ALGORITHM.to_owned(),
             candidate: CandidateManifest {
+                record_sha256: "04".repeat(32),
+                record_signature: "06".repeat(64),
+                ledger_row_sha256: "05".repeat(32),
                 step: 7,
                 prompt_index: 12,
                 group_index: 2,
@@ -8004,7 +9916,6 @@ benchmarks:
                 world_size: 1,
                 training_reward: 1.5,
                 completion_sha256: "completion-hash".to_string(),
-                completion_normalization: None,
                 source_sha256: "source-hash".to_string(),
                 source_inspection: SourceInspectionManifest {
                     result: SourceInspectionResult::Clean,
@@ -8014,15 +9925,16 @@ benchmarks:
             },
             model: ModelManifest {
                 family: "qwen3.x".to_string(),
-                checkpoint: "checkpoint".to_string(),
-                tokenizer: "tokenizer".to_string(),
+                checkpoint_policy_sha256: "06".repeat(32),
+                tokenizer_sha256: "07".repeat(32),
                 lora_rank: 8,
                 lora_alpha: 16.0,
                 base_dtype: "bf16",
                 base_quantization: "q8_0",
             },
             config: ArtifactConfigManifest {
-                run_config_sha256: "config-hash".to_string(),
+                run_config_source_sha256: "07".repeat(32),
+                run_config_resolved_sha256: "08".repeat(32),
                 prompt_sha256: "prompt-hash".to_string(),
                 prompt_file: "prompt.txt",
                 reward_profile: ferrl::trimul::TrimulRewardProfile::default(),
@@ -8076,12 +9988,19 @@ benchmarks:
             },
         };
         let report = artifact_report(&manifest, Path::new("artifact"), "manifest-hash");
+        assert!(report.contains(&format!("ferrl commit: {}", "01".repeat(20))));
+        assert!(report.contains(&format!(
+            "Launch/config hashes: payload={}, file={}, source={}, resolved={}",
+            "02".repeat(32),
+            "03".repeat(32),
+            "07".repeat(32),
+            "08".repeat(32)
+        )));
         for required in [
             "## 1. Verdict",
             "Raw measurements ns: 10.000000, 11.000000, 12.000000",
             "Command used: `ferrl trimul-baseline --config run.json`",
-            "ferrl commit: abc123",
-            "Config hash: config-hash",
+            "Launch attestation: test-root-1 (ed25519)",
             "Prompt copy: prompt.txt (prompt-hash)",
             "Reward profile: `{\"scheme\":\"trimul_shaped_v1\"",
             "base_quantization=q8_0",

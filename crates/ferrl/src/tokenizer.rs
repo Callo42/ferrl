@@ -12,7 +12,8 @@
 //! contract — the trainer calls them in the hot rollout loop, and neither the
 //! [`Policy`](crate::policy::Policy) nor the [`RewardFn`](crate::reward::RewardFn)
 //! should have to thread a tokenizer error. Construction
-//! ([`HfTokenizer::from_file`]) is therefore where loading/validation failures
+//! ([`HfTokenizer::from_file`] / [`HfTokenizer::from_bytes`]) is therefore where
+//! loading/validation failures
 //! surface; at call time the wrapper is total, decoding lossily rather than
 //! erroring (the documented [`TokenizerLike`] behavior). In practice a fast
 //! tokenizer does not fail to encode valid UTF-8 or to decode in-vocab ids.
@@ -71,9 +72,30 @@ impl HfTokenizer {
     /// contain a valid `tokenizers` definition.
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, TokenizerError> {
         let path = path.as_ref();
-        // `tokenizers::from_file` returns a boxed error (`tokenizers::Error`);
-        // capture it as the typed variant's `source` so the chain is preserved.
-        let inner = Tokenizer::from_file(path).map_err(|source| TokenizerError::Load {
+        let bytes = std::fs::read(path).map_err(|source| TokenizerError::Load {
+            path: path.to_path_buf(),
+            source: Box::new(source),
+        })?;
+        Self::from_bytes(path, bytes)
+    }
+
+    /// Construct a fast tokenizer from already-captured `tokenizer.json` bytes.
+    ///
+    /// This is the identity-bearing production seam: callers can hash these
+    /// exact bytes and construct the tokenizer from the same owned snapshot, so
+    /// replacing the source path cannot create a digest-A/tokenizer-B launch.
+    /// `source_path` is used only to preserve an actionable error location.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TokenizerError::Load`] if `bytes` do not contain a valid
+    /// `tokenizers` definition.
+    pub fn from_bytes<P: AsRef<Path>, B: AsRef<[u8]>>(
+        source_path: P,
+        bytes: B,
+    ) -> Result<Self, TokenizerError> {
+        let path = source_path.as_ref();
+        let inner = Tokenizer::from_bytes(bytes).map_err(|source| TokenizerError::Load {
             path: path.to_path_buf(),
             source,
         })?;
@@ -145,6 +167,13 @@ mod tests {
         assert_eq!(ids, vec![0, 1]);
         let text = tok.decode(&ids);
         assert_eq!(text, "hello world");
+    }
+
+    #[test]
+    fn constructs_from_the_exact_captured_bytes() {
+        let bytes = std::fs::read(fixture()).unwrap();
+        let tok = HfTokenizer::from_bytes("captured-tokenizer.json", bytes).unwrap();
+        assert_eq!(tok.encode("hello world"), vec![0, 1]);
     }
 
     #[test]

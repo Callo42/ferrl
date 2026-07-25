@@ -93,7 +93,7 @@ use crate::rollout_ledger::{
 };
 use crate::sample::Sample;
 use crate::telemetry::{
-    cuda_memory_snapshot, CandidateRecord, CandidateWriter, DecoderCacheSnapshot,
+    cuda_memory_snapshot, CandidateRecord, CandidateSigner, CandidateWriter, DecoderCacheSnapshot,
     GpuMemoryProbeEvent, GpuMemorySnapshot, Metrics, MetricsWriter, ModelTelemetryRecorder, RunDir,
     TelemetryError,
 };
@@ -2050,6 +2050,32 @@ impl Trainer {
     pub fn with_checkpoint_policy_sha256(mut self, digest: impl Into<String>) -> Self {
         self.checkpoint_policy_sha256 = Some(digest.into());
         self
+    }
+
+    /// Bind and authenticate every candidate row emitted by this trainer to one
+    /// externally attested immutable launch manifest payload.
+    ///
+    /// Has no effect when candidate logging is disabled. When enabled, the
+    /// writer computes the row digest and signs it with the launch's process-local
+    /// Ed25519 capability only after all reward/completion fields are final,
+    /// immediately before publication. Binding fails when the candidate ledger
+    /// is already non-empty: the process-local key is intentionally not
+    /// restorable, so checkpoint continuation must disable candidate logging or
+    /// start a new run identity instead of appending unverifiable evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrainerError::Telemetry`] if `digest` is not a lowercase
+    /// SHA-256 value or the candidate ledger already contains rows.
+    pub fn with_candidate_provenance(
+        mut self,
+        digest: &str,
+        signer: CandidateSigner,
+    ) -> Result<Self, TrainerError> {
+        if let Some(writer) = self.candidate_writer.as_mut() {
+            writer.bind_launch(digest, signer)?;
+        }
+        Ok(self)
     }
 
     /// Redirect checkpoint reads **and** writes to `dir` instead of this run's
@@ -7411,6 +7437,9 @@ impl Trainer {
             .into_iter()
             .take(k)
             .map(|group_index| CandidateRecord {
+                launch_sha256: None,
+                record_sha256: None,
+                record_signature: None,
                 step: ctx.step,
                 rank: ctx.rank,
                 world_size: ctx.world_size,

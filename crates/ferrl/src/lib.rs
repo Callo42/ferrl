@@ -226,9 +226,10 @@ pub use llama::{LlamaGradModel, LlamaMergedDecoder};
 pub use lm_policy::{Gemma4Policy, LlamaPolicy, LmPolicy, Qwen3_5Policy, QwenPolicy};
 #[doc(inline)]
 pub use loader::{
-    checkpoint_policy_sha256, load_auto_policy, load_auto_policy_bound, load_gemma4_policy,
-    load_gemma4_policy_bound, load_qwen35_policy_with_targets_bound, load_qwen_policy,
-    load_qwen_policy_bound, AutoPolicy, LoaderError, LoaderOpts,
+    checkpoint_policy_sha256, load_auto_policy, load_auto_policy_bound,
+    load_auto_policy_with_identity, load_gemma4_policy, load_gemma4_policy_bound,
+    load_qwen35_policy_with_targets_bound, load_qwen_policy, load_qwen_policy_bound, AutoPolicy,
+    LoaderError, LoaderOpts, PolicyLoadIdentity,
 };
 #[doc(inline)]
 pub use lora::{BaseQuantization, DenseLoraTargets};

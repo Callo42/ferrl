@@ -176,10 +176,15 @@ on a finished run:
 
 ```sh
 cargo build --release            # builds the `ferrl` binary (target/release/ferrl)
-ferrl train --config run.json    # GRPO-train a built-in task; writes a run under runs/
+ferrl train --config run.json
+                                # GRPO-train; writes an identity-bound run under runs/
 ferrl runreport runs/<run-id> --config run.json
                                 # one-glance health summary + configured post-run policy
 ```
+
+`ferrl train` accepts only a binary built from a clean Git tree. The build
+embeds its full source commit, so the launch cannot substitute an
+operator-supplied revision at runtime.
 
 A `run.json` selects a task, points at a supported model checkpoint, and carries the trainer
 config (only `task`, `model_dir`, and `trainer` are required; everything else has a
@@ -299,13 +304,23 @@ reward curve. Before spending GPU time on a TriMul run, use the
 [TriMul Discovery Run Contract](docs/trimul-discovery-run-contract.md). It defines the
 artifact bundle, provenance fields, same-GPU baseline pin, held-out verification,
 dynamic reward-hacking checks, and the no-win stopping report that the operator audits.
-Set `trainer.candidate_log_top_k` to a positive value for discovery runs so the best
-sampled completions are persisted in `candidates.jsonl`; pass that ledger row's raw
-completion plus its step/prompt/group/rank coordinates to `ferrl trimul-artifact`
-(see the contract for the full command) to extract `submission.py`, re-verify with
-an audit seed, and write the manifest/report. Include `--prompt-copy
-<run-dir>/prompt.txt` so the artifact uses the rendered model prompt frozen at
-training launch; extraction verifies the adjacent `<run-dir>/prompt.sha256`.
+`ferrl train` refuses candidate-producing runs unless the binary embeds a clean,
+exact source commit and a protected external attestor authenticates `launch.json`
+before rollout. The launch payload integrity-binds the synchronized run identity, complete
+resolved config, model/checkpoint loader identity, exact tokenizer bytes, rendered
+prompt, per-run candidate key, and candidate-ledger contract. The attestor private key
+never enters ferrl or the run directory: deployment pins its public key in the protected
+`/etc/ferrl/launch-trust.json` policy and exposes the one-launch service at the protected
+`/run/ferrl/launch-attestor.sock`. Set `trainer.candidate_log_top_k` to a positive
+value for discovery runs so the best sampled completions are persisted in
+`candidates.jsonl`; every production row carries the externally attested launch digest,
+a digest over all candidate fields, and a signature from the attested per-run key.
+Promote exactly one row with `ferrl trimul-artifact --run-dir
+<run-dir> --candidate-sha256 <record_sha256> ...`. The extractor validates the whole
+ledger and the external attestation against the protected trust policy, selects that exact row, and derives completion, coordinates, reward, model,
+tokenizer, config, run id, prompt, and training commit from immutable run evidence.
+The artifact bundle retains the exact verified `launch.json` and selected row bytes,
+with hashes for both in `manifest.json`.
 For rollout-only diagnostics from an external inference runtime, use
 `ferrl trimul-score --config <run.json> --prompt-copy <prompt.txt>
 --completion <raw.txt> --out <scores.jsonl> --score-secret-seed <seed>` (or
@@ -315,11 +330,11 @@ training `trimul.secret_seed`. `trimul-score` records opaque `source_id` values,
 not input file paths; use `--source-label <public-id>` or JSONL `source_id` values
 that are safe to copy into public reports. The default completion contract is strict:
 ferrl scores exactly the completion bytes supplied. For GGUF rollouts served through
-llama.cpp, pass `--completion-normalization llama-cpp` to `trimul-score` and
-`trimul-artifact`; this strips only llama.cpp's trailing `[end of text]` stdout
-sentinel before extraction and records raw and normalized hashes in the score/artifact
-metadata. Then run `ferrl trimul-artifact` only on promising extracted candidates;
-`trimul-score` is diagnostic evidence, not the strict artifact gate.
+llama.cpp, pass `--completion-normalization llama-cpp` to `trimul-score`; this strips
+only llama.cpp's trailing `[end of text]` stdout sentinel before extraction and records
+raw and normalized hashes in score metadata. External scores remain diagnostic
+evidence and are not accepted by `trimul-artifact`, whose input must be one
+launch-bound native candidate row.
 Verifier-backed rewards may also attach `reward_diagnostic` to candidate rows so
 low or zero rewards remain explainable without re-running the whole training step; for
 reward-tail triage, set `candidate_log_top_k` at least as high as `group_size` so every
@@ -640,7 +655,11 @@ Each training run writes to `runs/<run_id>/`:
 
 ```
 runs/<run_id>/
+├── launch.json       # immutable full launch/run/model/tokenizer/ledger binding
+├── prompt.txt        # exact rendered prompt bytes (TriMul launches)
+├── prompt.sha256     # compatibility digest sidecar for prompt.txt
 ├── config.json       # the trainer config written by the generic Trainer
+├── candidates.jsonl  # optional launch-bound, per-row-digested candidate ledger
 ├── metrics.jsonl     # one JSON object per step:
 │                     #   step, reward_mean, reward_std, frac_reward_zero_std,
 │                     #   kl, clip_ratio, frac_truncated, completion_len,

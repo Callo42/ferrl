@@ -7,28 +7,124 @@ candidate kernel can count as a discovery artifact. It is not a general task SDK
 The contract applies to runs of `ferrl train --config <run.json>` where `task` is
 `trimul` and to the artifact extraction step that follows such a run. Set
 `trainer.candidate_log_top_k` high enough to persist the best sampled completions
-in `candidates.jsonl`; that ledger is the source for the raw completion and the
-`--step` / `--prompt-index` / `--group-index` / `--rank` / `--world-size`
-coordinates passed to artifact extraction. TriMul candidate rows may also include
+in `candidates.jsonl`; every production row is integrity-bound to the immutable
+launch payload, carries its own `record_sha256`, and is authenticated by the
+process-local Ed25519 key whose public half is committed in an externally attested
+launch. A later
+process cannot recover that capability: launch-bound candidate logging rejects
+a non-empty ledger before append, so checkpoint continuation must use a new run
+identity or disable candidate logging. TriMul candidate rows may also include
 `reward_diagnostic` (for example no submission, test failure, no pass grade, sandbox
 timeout, or missing/implausible benchmark data); preserve it in the run report when
 explaining low- or zero-reward tails. For reward-tail triage, set `candidate_log_top_k >=
 group_size` so every sampled completion is retained. At launch, `ferrl train`
-freezes the exact configured model prompt to `<run-dir>/prompt.txt` and writes its
-digest to `<run-dir>/prompt.sha256`. `trimul.prompt_path` is the complete rendered
+obtains a detached signature from the protected launch attestor, verifies it against
+the external trust policy, and only then commits `<run-dir>/launch.json` before
+Trainer publication. The attested payload binds the full resolved config,
+synchronized run identity, build-embedded training commit,
+exact model/checkpoint loader identity, exact tokenizer bytes, prompt, and candidate
+ledger contract. The prompt is frozen to `<run-dir>/prompt.txt`; the compatibility
+digest remains at `<run-dir>/prompt.sha256`. `trimul.prompt_path` is the complete rendered
 model prompt: ferrl does not trim, wrap, prepend, append, or otherwise construct
 prompt text. Select completion parsing separately with
 `trimul.submission_extract_mode`, which must be either `final_fence` or
 `thinking_after_think` and never changes prompt bytes. The extraction command is `ferrl
-trimul-artifact --config <run.json> --prompt-copy <run-dir>/prompt.txt
---completion <raw.txt> --out <artifact-dir> --run-id <run-id> --step <step>
---prompt-index <prompt-index> --group-index <group-index> --rank <rank>
---world-size <world-size> --training-reward <reward> --audit-secret-seed <seed>
---baseline-ns <ns> --baseline-ns <ns> --baseline-ns <ns> --ferrl-commit <sha>
---run-health <summary> --source-inspection clean --source-inspection-notes
-<notes>` with run provenance, audit seed, source-inspection evidence, the frozen
-prompt copy, and repeated `--baseline-ns` values. Artifact extraction verifies
-that `--prompt-copy` matches the adjacent launch-time `prompt.sha256`.
+trimul-artifact --run-dir <run-dir> --candidate-sha256 <record_sha256>
+--out <artifact-dir> --audit-secret-seed <seed> --baseline-ns <ns>
+--baseline-ns <ns> --baseline-ns <ns> --run-health <summary>
+--source-inspection clean --source-inspection-notes <notes>`. Artifact extraction
+validates `launch.json`, every candidate row, the exact selected row, and the frozen
+prompt before GPU detection or audit verification. It does not accept operator-authored
+completion, coordinate, reward, run, commit, model, tokenizer, eval, or sandbox
+provenance fields.
+
+## External Launch Attestation
+
+Candidate-producing training and artifact extraction deliberately have no CLI or
+run-config override for the trust root. Deployment provides two protected system
+surfaces:
+
+- `/etc/ferrl/launch-trust.json`: a root-owned regular file whose parent chain and
+  contents are not group/world writable. It lists the accepted Ed25519 public keys.
+  Key rotation adds a new `key_id`; retain old verification keys for every artifact
+  whose launch remains admissible.
+- `/run/ferrl/launch-attestor.sock`: a root-owned, non-world-writable Unix socket under
+  a protected parent chain. Its group may grant the live launcher access. The external
+  service owns the private key and must authorize only the live
+  launcher/job; the run and artifact operator must never receive the root private key
+  or an unrestricted signing capability.
+
+Socket access alone is not authorization. The attestor must bind every request to the
+protected scheduler/launcher identity, approved executable measurement and source
+commit, expected job/config policy, and permitted DP/TP rank set; it must reject replay
+or requests beyond that launch. A generic daemon that signs any well-formed request
+from the socket group does not satisfy this contract. The launcher must also isolate the
+training process from the artifact operator while the delegated candidate private key
+is live (including ptrace, process-memory, core-dump, and `/proc` credential exposure);
+otherwise the operator could steal the delegated capability instead of replacing it.
+
+The trust policy is strict JSON:
+
+```json
+{
+  "contract_version": 1,
+  "kind": "ferrl.run-launch-trust-policy",
+  "keys": [
+    {
+      "key_id": "cluster-launch-2026-01",
+      "algorithm": "ed25519",
+      "public_key": "<64 lowercase hex characters>"
+    }
+  ]
+}
+```
+
+Ferrl sends one newline-terminated
+`ferrl.run-launch-attestation-request` JSON object containing contract version 1,
+algorithm `ed25519`, the exact compact launch-payload JSON bytes as lowercase hex,
+and their domain-separated SHA-256. The service must decode and strictly parse those
+exact bytes, recompute and policy-check the payload hash, return one strict
+`ferrl.run-launch-attestation` object, and close the connection. The response carries
+the trusted `key_id`, the same launch digest, and a 128-character lowercase Ed25519
+signature over the domain-separated attestation message. Ferrl verifies that response
+against the protected policy before creating the run directory. Absence, malformed
+policy, service rejection, an untrusted key, or a bad signature fails before launch,
+candidate, metrics, checkpoint, rollout, reward, or optimizer publication.
+
+The wire shapes are:
+
+```json
+{
+  "contract_version": 1,
+  "kind": "ferrl.run-launch-attestation-request",
+  "algorithm": "ed25519",
+  "launch_payload_sha256": "<64 lowercase hex characters>",
+  "launch_payload_json_hex": "<lowercase hex of exact compact payload JSON>"
+}
+```
+
+```json
+{
+  "contract_version": 1,
+  "kind": "ferrl.run-launch-attestation",
+  "algorithm": "ed25519",
+  "key_id": "cluster-launch-2026-01",
+  "launch_payload_sha256": "<same digest>",
+  "signature": "<128 lowercase hex characters>"
+}
+```
+
+Domain hashes use SHA-256 over `u64_le(domain_length) || domain ||
+u64_le(field_length) || field` for each ordered field. The payload domain is
+`ferrl.run-launch.payload.v1` with the exact compact JSON bytes as its sole field.
+The attestation message is the 64-byte lowercase hexadecimal result of the same
+construction under domain `ferrl.run-launch-attestation.v1`, with the ASCII launch
+payload digest as its sole field. Ed25519 signs those 64 message bytes directly.
+
+`trimul-artifact` loads the same protected policy independently. Replacing the entire
+run directory, recomputing every unkeyed hash, and signing rows under an
+operator-generated key therefore remains rejected: the replacement launch lacks a
+signature under a key trusted outside that directory.
 
 For rollout-only diagnostics from an external inference runtime, use `ferrl
 trimul-score --config <run.json> --prompt-copy <prompt.txt> --completion <raw.txt>
@@ -50,18 +146,17 @@ hash/length metadata. `trimul-score` is a search-quality diagnostic for comparin
 external rollouts; it does not replace `trimul-artifact` and cannot by itself satisfy
 the artifact acceptance rule.
 
-Use the same `--completion-normalization` value when promoting an external candidate
-to `ferrl trimul-artifact`. Artifact bundles always preserve the raw model output as
-`completion.txt`; when normalization changes the text used for extraction, they also
-write `completion.normalized.txt` and record the normalization mode plus hashes in
-`manifest.json`.
+External-score rows are diagnostic evidence and are not artifact inputs. The strict
+artifact path accepts only a native, launch-bound `candidates.jsonl` row and preserves
+that row as `candidate.json`, its completion as `completion.txt`, and the exact verified
+run manifest as `launch.json`.
 
 For prompt-controlled runs, `trimul.prompt_path` is only the mutable launch-time
 path for the complete rendered model prompt. Do not use that local path as artifact
 provenance: it may change and may expose private filesystem layout. `ferrl train`
 freezes the exact prompt file bytes into the run directory as `prompt.txt` and
-records `prompt.sha256`; `ferrl trimul-artifact` verifies the adjacent
-`prompt.sha256`, copies the immutable rendered prompt into the artifact bundle as
+records `prompt.sha256`; `ferrl trimul-artifact` verifies the prompt against
+`launch.json`, copies the immutable rendered prompt into the artifact bundle as
 `prompt.txt`, and records `prompt_sha256`. Any operator-facing path in notes should
 be redacted or replaced by a stable non-private identifier. TriMul training has no
 built-in prompt fallback, no suffix prompt path, and no prompt wrapper, so the run
@@ -138,20 +233,21 @@ with the final report:
 
 | Field | Required value |
 |---|---|
-| ferrl revision | Full git commit SHA. |
-| run config | The exact JSON config passed to `ferrl train`. |
-| prompt | The exact rendered model prompt bytes, frozen as `<run-dir>/prompt.txt` plus `prompt.sha256`; do not rely on a mutable local `trimul.prompt_path` for provenance. |
+| ferrl revision | Full git commit SHA embedded when the binary is built from a clean Git tree and sealed in `launch.json`; no runtime revision claim is accepted. |
+| launch attestation | Trusted external `key_id`, Ed25519 algorithm, and detached launch signature verified through `/etc/ferrl/launch-trust.json`; the private key and signing authority stay outside ferrl and the operator-writable run directory. |
+| run config | Original file SHA-256 plus the complete canonical resolved config stored in `launch.json`. |
+| prompt | The exact rendered model prompt bytes, frozen as `<run-dir>/prompt.txt` and sealed in `launch.json`; `prompt.sha256` remains a compatibility sidecar. Do not rely on a mutable local `trimul.prompt_path` for provenance. |
 | submission extraction | `trimul.submission_extract_mode` (`final_fence` or `thinking_after_think`); this controls parsing only and must not construct prompt text. |
 | reward profile | `trimul.reward`; defaults to `trimul_shaped_v1`, with custom ladder-preserving values allowed. |
 | run-health policy | `run_health`; post-run warn/fail policy, including the original top-level config passed to `ferrl runreport --config`. |
-| model | Model family, checkpoint identity, tokenizer identity, LoRA rank/alpha, base dtype, and rollout seed. |
+| model | Loader-derived family, exact model/checkpoint policy SHA-256, exact tokenizer-file SHA-256, resolved EOS, LoRA rank/alpha, base dtype, and rollout seed, all sealed at launch. |
 | TriMul eval bundle | Immutable identity of the GPUMODE `bioml/trimul` bundle used for `eval_dir` (commit, release, or digest). |
 | sandbox image | Immutable identity of the Apptainer image used by `trimul.image` (path plus digest when available). |
 | cases | `task.yml` identity and the loaded counts for `tests` and `benchmarks`. |
 | seeds | `data.seed`, `policy.seed`, trainer seed-bearing knobs, and the training `trimul.secret_seed`. |
 | scratch cap | `trimul.scratch_max_bytes`; `0` means the ferrl default, currently 1 GiB. |
 | verifier process cap | `trimul.verifier_max_procs`; `0` means the TriMul default, currently `1024`. This is a per-UID `RLIMIT_NPROC` cap, not a per-container task count. |
-| candidate ledger | `trainer.candidate_log_top_k`; use a positive value for discovery runs, and use at least `group_size` for `run_health.correctness_collapse`, `run_health.source_dominance`, and low- or zero-reward tail diagnosis so all completions are persisted in `candidates.jsonl`; retain any `reward_diagnostic` values in the report. |
+| candidate ledger | `trainer.candidate_log_top_k`; use a positive value for discovery runs, and use at least `group_size` for `run_health.correctness_collapse`, `run_health.source_dominance`, and low- or zero-reward tail diagnosis. Every persisted row must carry the launch digest, its exact `record_sha256`, and a valid Ed25519 `record_signature` under the public key frozen in `launch.json`; retain any `reward_diagnostic` values in the report. |
 | trainer scalar controls | Exact `trainer.lr_schedule` and `trainer.beta_schedule` when present, otherwise the scalar `lr`, `warmup_steps`, and `beta` values. Schedules are deterministic step-index functions and must be copied with the final run config. |
 | hardware | GPU product name reported by the baseline command and visible CUDA device count. |
 | budget | Trainer `steps`, `group_size`, wall-clock allocation, and the stop condition chosen below. |
@@ -166,21 +262,31 @@ median `ns` in the config. Keep all raw baseline measurements in the report.
 A candidate is an accepted artifact only when the final bundle contains all of:
 
 - `submission.py`: the exact extracted `custom_kernel` source.
+- `launch.json`: the exact verified immutable run manifest from the training directory.
+- `candidate.json`: the exact selected `candidates.jsonl` row bytes.
 - `prompt.txt`: the exact rendered TriMul model prompt used for generation,
-  copied from `<run-dir>/prompt.txt` after verifying `<run-dir>/prompt.sha256`.
+  copied from `<run-dir>/prompt.txt` after verifying `launch.json`.
 - `manifest.json`: a machine-readable manifest with the fields below.
 - `verification/`: the clean re-verification logs and benchmark summaries.
 - `report.md`: the human summary and operator checklist outcome.
 
-The manifest schema is versioned from the first run:
+Artifact contract v2 replaces operator-composed candidate/model provenance with
+launch- and row-derived identities:
 
 ```json
 {
-  "contract_version": 1,
+  "contract_version": 2,
   "task": "trimul",
   "ferrl_commit": "<full git sha>",
   "run_id": "<run directory name>",
+  "launch_sha256": "<launch payload sha256>",
+  "launch_file_sha256": "<sha256 of launch.json>",
+  "launch_attestation_key_id": "cluster-launch-2026-01",
+  "launch_attestation_algorithm": "ed25519",
   "candidate": {
+    "record_sha256": "<domain-separated candidate digest>",
+    "record_signature": "<Ed25519 signature from the launch key>",
+    "ledger_row_sha256": "<sha256 of candidate.json>",
     "step": 0,
     "prompt_index": 0,
     "group_index": 0,
@@ -195,16 +301,17 @@ The manifest schema is versioned from the first run:
     }
   },
   "model": {
-    "family": "qwen3.x",
-    "checkpoint": "<operator supplied identity>",
-    "tokenizer": "<operator supplied identity>",
+    "family": "<loader-derived family>",
+    "checkpoint_policy_sha256": "<exact model/checkpoint plus loader semantics>",
+    "tokenizer_sha256": "<exact tokenizer.json bytes>",
     "lora_rank": 16,
     "lora_alpha": 32.0,
     "base_dtype": "bf16",
     "base_quantization": "none"
   },
   "config": {
-    "run_config_sha256": "<sha256 of resolved run config>",
+    "run_config_source_sha256": "<sha256 of launch input file>",
+    "run_config_resolved_sha256": "<sha256 of complete canonical resolved config>",
     "prompt_sha256": "<sha256 of prompt.txt>",
     "prompt_file": "prompt.txt",
     "reward_profile": {
@@ -254,8 +361,11 @@ The manifest schema is versioned from the first run:
 }
 ```
 
-The artifact extractor may add fields, but it must keep the fields above stable for
-the first run so an operator can audit the result without reading training logs by hand.
+The remaining reward, eval, baseline, verification, and run-health fields retain their
+v1 meanings. Candidate completion, coordinates, training reward, run id, commit,
+model/checkpoint, tokenizer, prompt, eval path, and sandbox path are all derived from
+the verified run; only audit-time measurements and inspection evidence remain command
+inputs.
 
 ## Acceptance Rule
 

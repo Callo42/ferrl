@@ -94,6 +94,18 @@ impl Default for LoaderOpts {
     }
 }
 
+/// Immutable identities captured from the exact policy and tokenizer sources
+/// consumed by a production load.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyLoadIdentity {
+    /// Model/checkpoint bytes plus loader execution semantics.
+    pub policy_sha256: String,
+    /// Exact `tokenizer.json` bytes used to construct [`HfTokenizer`].
+    pub tokenizer_sha256: String,
+    /// Loader-derived model family, never an operator-authored label.
+    pub model_family: &'static str,
+}
+
 #[derive(Debug)]
 struct CapturedShard {
     name: String,
@@ -338,6 +350,14 @@ fn read_regular_file(path: &Path) -> Result<Vec<u8>, LoaderError> {
         ));
     }
     Ok(bytes)
+}
+
+fn capture_tokenizer(dir: &Path) -> Result<(HfTokenizer, String), LoaderError> {
+    let path = dir.join("tokenizer.json");
+    let bytes = read_regular_file(&path)?;
+    let digest = format!("{:x}", Sha256::digest(&bytes));
+    let tokenizer = HfTokenizer::from_bytes(&path, &bytes)?;
+    Ok((tokenizer, digest))
 }
 
 fn validate_shard_name(index_path: &Path, shard: &str) -> Result<(), LoaderError> {
@@ -741,7 +761,8 @@ pub fn load_qwen_policy_bound(
     let model_type = model_type_from_bytes(&config_bytes, &config_path)?;
     let source = CapturedPolicySource::capture_with_config(dir, config_bytes, model_type.as_ref())?;
     let digest = source.digest(opts)?;
-    load_qwen_policy_from_source(dir, device, opts, source, digest)
+    let (tokenizer, _) = capture_tokenizer(dir)?;
+    load_qwen_policy_from_source(dir, device, opts, source, tokenizer, digest)
 }
 
 fn load_qwen_policy_from_source(
@@ -749,6 +770,7 @@ fn load_qwen_policy_from_source(
     device: &Device,
     opts: &LoaderOpts,
     source: CapturedPolicySource,
+    tokenizer: HfTokenizer,
     digest: String,
 ) -> Result<(QwenPolicy, HfTokenizer, String), LoaderError> {
     let cfg_path = dir.join("config.json");
@@ -766,9 +788,7 @@ fn load_qwen_policy_from_source(
     )?;
     model.set_activation_checkpointing(opts.activation_checkpointing);
     let policy = QwenPolicy::new(model, opts.seed, opts.temperature);
-
-    let tok = HfTokenizer::from_file(dir.join("tokenizer.json"))?;
-    Ok((policy, tok, digest))
+    Ok((policy, tokenizer, digest))
 }
 
 /// Load any policy supported by the CLI from a checkpoint directory.
@@ -787,7 +807,7 @@ pub fn load_auto_policy(
     device: &Device,
     opts: &LoaderOpts,
 ) -> Result<(AutoPolicy, HfTokenizer), LoaderError> {
-    let (policy, tokenizer, _) = load_auto_policy_bound(dir, device, opts)?;
+    let (policy, tokenizer, _) = load_auto_policy_with_identity(dir, device, opts)?;
     Ok((policy, tokenizer))
 }
 
@@ -802,15 +822,42 @@ pub fn load_auto_policy_bound(
     device: &Device,
     opts: &LoaderOpts,
 ) -> Result<(AutoPolicy, HfTokenizer, String), LoaderError> {
-    load_auto_policy_bound_inner(dir, device, opts, || {})
+    let (policy, tokenizer, identity) = load_auto_policy_with_identity(dir, device, opts)?;
+    Ok((policy, tokenizer, identity.policy_sha256))
 }
 
+/// Load any supported production policy and return the model/checkpoint and
+/// tokenizer identities captured from the exact bytes consumed by the load.
+///
+/// # Errors
+///
+/// As [`load_auto_policy`].
+pub fn load_auto_policy_with_identity(
+    dir: &Path,
+    device: &Device,
+    opts: &LoaderOpts,
+) -> Result<(AutoPolicy, HfTokenizer, PolicyLoadIdentity), LoaderError> {
+    load_auto_policy_with_identity_inner(dir, device, opts, || {})
+}
+
+#[cfg(test)]
 fn load_auto_policy_bound_inner(
     dir: &Path,
     device: &Device,
     opts: &LoaderOpts,
     after_identity: impl FnOnce(),
 ) -> Result<(AutoPolicy, HfTokenizer, String), LoaderError> {
+    let (policy, tokenizer, identity) =
+        load_auto_policy_with_identity_inner(dir, device, opts, after_identity)?;
+    Ok((policy, tokenizer, identity.policy_sha256))
+}
+
+fn load_auto_policy_with_identity_inner(
+    dir: &Path,
+    device: &Device,
+    opts: &LoaderOpts,
+    after_identity: impl FnOnce(),
+) -> Result<(AutoPolicy, HfTokenizer, PolicyLoadIdentity), LoaderError> {
     let config_path = dir.join("config.json");
     let config_bytes = read_regular_file(&config_path)?;
     let model_type = model_type_from_bytes(&config_bytes, &config_path)?;
@@ -834,10 +881,26 @@ fn load_auto_policy_bound_inner(
         }
         Some(ModelType::Unsupported(_)) => unreachable!("unsupported model type returned above"),
     }
+    let model_family = model_type.as_ref().map_or("qwen3", ModelType::family_label);
+    let (tokenizer, tokenizer_sha256) = capture_tokenizer(dir)?;
     if matches!(&model_type, Some(ModelType::Gemma4)) && opts.tensor_parallel.is_sharded() {
-        let loaded =
-            load_gemma4_policy_streaming_bound(dir, device, opts, &config_bytes, after_identity)?;
-        return Ok((AutoPolicy::Gemma4(Box::new(loaded.0)), loaded.1, loaded.2));
+        let loaded = load_gemma4_policy_streaming_bound(
+            dir,
+            device,
+            opts,
+            &config_bytes,
+            tokenizer,
+            after_identity,
+        )?;
+        return Ok((
+            AutoPolicy::Gemma4(Box::new(loaded.0)),
+            loaded.1,
+            PolicyLoadIdentity {
+                policy_sha256: loaded.2,
+                tokenizer_sha256,
+                model_family,
+            },
+        ));
     }
     let source = CapturedPolicySource::capture_with_config(dir, config_bytes, model_type.as_ref())?;
     let digest = source.digest(opts)?;
@@ -845,8 +908,16 @@ fn load_auto_policy_bound_inner(
     match model_type {
         None | Some(ModelType::Qwen3) => {
             let (policy, tok, digest) =
-                load_qwen_policy_from_source(dir, device, opts, source, digest)?;
-            Ok((AutoPolicy::Qwen(Box::new(policy)), tok, digest))
+                load_qwen_policy_from_source(dir, device, opts, source, tokenizer, digest)?;
+            Ok((
+                AutoPolicy::Qwen(Box::new(policy)),
+                tok,
+                PolicyLoadIdentity {
+                    policy_sha256: digest,
+                    tokenizer_sha256,
+                    model_family,
+                },
+            ))
         }
         Some(ModelType::Qwen3_5) => {
             let (policy, tok, digest) = load_qwen35_policy_from_source(
@@ -855,14 +926,31 @@ fn load_auto_policy_bound_inner(
                 opts,
                 source,
                 Qwen35LoraTargets::industrial(),
+                tokenizer,
                 digest,
             )?;
-            Ok((AutoPolicy::Qwen3_5(Box::new(policy)), tok, digest))
+            Ok((
+                AutoPolicy::Qwen3_5(Box::new(policy)),
+                tok,
+                PolicyLoadIdentity {
+                    policy_sha256: digest,
+                    tokenizer_sha256,
+                    model_family,
+                },
+            ))
         }
         Some(ModelType::Gemma4) => {
             let (policy, tok, digest) =
-                load_gemma4_policy_from_source(dir, device, opts, source, digest)?;
-            Ok((AutoPolicy::Gemma4(Box::new(policy)), tok, digest))
+                load_gemma4_policy_from_source(dir, device, opts, source, tokenizer, digest)?;
+            Ok((
+                AutoPolicy::Gemma4(Box::new(policy)),
+                tok,
+                PolicyLoadIdentity {
+                    policy_sha256: digest,
+                    tokenizer_sha256,
+                    model_family,
+                },
+            ))
         }
         Some(ModelType::Unsupported(model_type)) => {
             Err(LoaderError::UnsupportedModelType { model_type })
@@ -876,6 +964,17 @@ enum ModelType {
     Qwen3_5,
     Gemma4,
     Unsupported(Option<String>),
+}
+
+impl ModelType {
+    fn family_label(&self) -> &'static str {
+        match self {
+            Self::Qwen3 => "qwen3",
+            Self::Qwen3_5 => "qwen3_5",
+            Self::Gemma4 => "gemma4",
+            Self::Unsupported(_) => "unsupported",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -927,7 +1026,8 @@ pub fn load_qwen35_policy_with_targets_bound(
     let model_type = model_type_from_bytes(&config_bytes, &config_path)?;
     let source = CapturedPolicySource::capture_with_config(dir, config_bytes, model_type.as_ref())?;
     let digest = source.digest(opts)?;
-    load_qwen35_policy_from_source(dir, device, opts, source, targets, digest)
+    let (tokenizer, _) = capture_tokenizer(dir)?;
+    load_qwen35_policy_from_source(dir, device, opts, source, targets, tokenizer, digest)
 }
 
 fn load_qwen35_policy_from_source(
@@ -936,6 +1036,7 @@ fn load_qwen35_policy_from_source(
     opts: &LoaderOpts,
     source: CapturedPolicySource,
     targets: Qwen35LoraTargets,
+    tokenizer: HfTokenizer,
     digest: String,
 ) -> Result<(Qwen3_5Policy, HfTokenizer, String), LoaderError> {
     validate_qwen35_loader_options(opts)?;
@@ -952,8 +1053,7 @@ fn load_qwen35_policy_from_source(
     model.set_memory_efficient_cached_gqa(opts.memory_efficient_cached_gqa);
     model.set_activation_checkpointing(opts.activation_checkpointing);
     let policy = Qwen3_5Policy::new(model, opts.seed, opts.temperature);
-    let tok = HfTokenizer::from_file(dir.join("tokenizer.json"))?;
-    Ok((policy, tok, digest))
+    Ok((policy, tokenizer, digest))
 }
 
 fn read_gemma4_config_bytes(
@@ -1092,12 +1192,20 @@ pub fn load_gemma4_policy_bound(
     let model_type = model_type_from_bytes(&config_bytes, &config_path)?;
     let cfg = read_gemma4_config_bytes(&config_bytes, &config_path)?;
     validate_gemma4_loader_options(opts, &cfg)?;
+    let (tokenizer, _) = capture_tokenizer(dir)?;
     if opts.tensor_parallel.is_sharded() {
-        return load_gemma4_policy_streaming_bound(dir, device, opts, &config_bytes, || {});
+        return load_gemma4_policy_streaming_bound(
+            dir,
+            device,
+            opts,
+            &config_bytes,
+            tokenizer,
+            || {},
+        );
     }
     let source = CapturedPolicySource::capture_with_config(dir, config_bytes, model_type.as_ref())?;
     let digest = source.digest(opts)?;
-    load_gemma4_policy_from_source(dir, device, opts, source, digest)
+    load_gemma4_policy_from_source(dir, device, opts, source, tokenizer, digest)
 }
 
 fn load_gemma4_policy_from_source(
@@ -1105,12 +1213,13 @@ fn load_gemma4_policy_from_source(
     device: &Device,
     opts: &LoaderOpts,
     source: CapturedPolicySource,
+    tokenizer: HfTokenizer,
     digest: String,
 ) -> Result<(Gemma4Policy, HfTokenizer, String), LoaderError> {
     let cfg = read_gemma4_config_bytes(&source.config_bytes, &dir.join("config.json"))?;
     validate_gemma4_loader_options(opts, &cfg)?;
     let vb = source.into_tensor_varbuilder(opts.base_dtype, device, is_gemma4_text_tensor)?;
-    build_gemma4_policy(dir, device, opts, &cfg, &vb, digest)
+    build_gemma4_policy(device, opts, &cfg, &vb, tokenizer, digest)
 }
 
 fn load_gemma4_policy_streaming_bound(
@@ -1118,6 +1227,7 @@ fn load_gemma4_policy_streaming_bound(
     device: &Device,
     opts: &LoaderOpts,
     config_bytes: &[u8],
+    tokenizer: HfTokenizer,
     after_identity: impl FnOnce(),
 ) -> Result<(Gemma4Policy, HfTokenizer, String), LoaderError> {
     let cfg = read_gemma4_config_bytes(config_bytes, &dir.join("config.json"))?;
@@ -1132,15 +1242,15 @@ fn load_gemma4_policy_streaming_bound(
     let BoundSafetensorsIdentity { weight_map, shards } = identity;
     let digest = checkpoint_policy_digest(config_bytes, &weight_map, shards, opts)?;
     after_identity();
-    build_gemma4_policy(dir, device, opts, &cfg, &vb, digest)
+    build_gemma4_policy(device, opts, &cfg, &vb, tokenizer, digest)
 }
 
 fn build_gemma4_policy(
-    dir: &Path,
     _device: &Device,
     opts: &LoaderOpts,
     cfg: &Gemma4Config,
     vb: &VarBuilder<'static>,
+    tokenizer: HfTokenizer,
     digest: String,
 ) -> Result<(Gemma4Policy, HfTokenizer, String), LoaderError> {
     let mut model = Gemma4GradModel::load_with_targets_base_quantization_and_tensor_parallel(
@@ -1155,8 +1265,7 @@ fn build_gemma4_policy(
     )?;
     model.set_activation_checkpointing(opts.activation_checkpointing);
     let policy = Gemma4Policy::new(model, opts.seed, opts.temperature);
-    let tok = HfTokenizer::from_file(dir.join("tokenizer.json"))?;
-    Ok((policy, tok, digest))
+    Ok((policy, tokenizer, digest))
 }
 
 #[cfg(test)]
@@ -1211,6 +1320,12 @@ mod tests {
         std::fs::create_dir_all(dir).unwrap();
         std::fs::write(dir.join("config.json"), br#"{"model_type":"qwen3"}"#).unwrap();
         std::fs::write(dir.join("model.safetensors"), model_bytes).unwrap();
+    }
+
+    fn write_tiny_tokenizer(dir: &Path) {
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny_tokenizer.json");
+        std::fs::copy(fixture, dir.join("tokenizer.json")).unwrap();
     }
 
     #[test]
@@ -1457,6 +1572,7 @@ mod tests {
     fn gemma4_loader_enters_rank_local_safetensors_path() {
         let tmp = TempDir::new("loader-gemma4-tensor-parallel-option");
         std::fs::write(tmp.path().join("config.json"), gemma4_config_json()).unwrap();
+        write_tiny_tokenizer(tmp.path());
 
         let err = load_gemma4_policy(tmp.path(), &Device::Cpu, &sharded_tensor_parallel_opts())
             .unwrap_err();
@@ -1619,6 +1735,7 @@ mod tests {
     fn auto_loader_reaches_gemma4_weight_capture_after_config_validation() {
         let tmp = TempDir::new("loader-gemma4-recognized");
         std::fs::write(tmp.path().join("config.json"), gemma4_config_json()).unwrap();
+        write_tiny_tokenizer(tmp.path());
         match load_auto_policy(tmp.path(), &Device::Cpu, &LoaderOpts::default()) {
             Err(LoaderError::Io { path, source }) => {
                 assert!(path.ends_with("model.safetensors"));
@@ -1633,6 +1750,7 @@ mod tests {
     fn auto_loader_reaches_gemma4_unified_weight_capture_after_config_validation() {
         let tmp = TempDir::new("loader-gemma4-unified-recognized");
         std::fs::write(tmp.path().join("config.json"), gemma4_unified_config_json()).unwrap();
+        write_tiny_tokenizer(tmp.path());
         match load_auto_policy(tmp.path(), &Device::Cpu, &LoaderOpts::default()) {
             Err(LoaderError::Io { path, source }) => {
                 assert!(path.ends_with("model.safetensors"));
@@ -1755,6 +1873,32 @@ mod tests {
             expected,
             "the offline post-replacement directory fingerprint must see model B"
         );
+    }
+
+    #[test]
+    fn production_identity_and_tokenizer_use_the_same_captured_bytes() {
+        let tmp = TempDir::new("loader-tokenizer-bound-replacement");
+        let fixture_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        copy_dir_contents(&fixture_root.join("tiny_qwen35"), tmp.path());
+        let tokenizer_path = tmp.path().join("tokenizer.json");
+        std::fs::copy(fixture_root.join("tiny_tokenizer.json"), &tokenizer_path).unwrap();
+        let tokenizer_bytes = std::fs::read(&tokenizer_path).unwrap();
+        let expected_tokenizer_sha256 = format!("{:x}", Sha256::digest(&tokenizer_bytes));
+        let opts = LoaderOpts {
+            lora_rank: 4,
+            lora_alpha: 8.0,
+            ..LoaderOpts::default()
+        };
+
+        let (_policy, tokenizer, identity) =
+            load_auto_policy_with_identity_inner(tmp.path(), &Device::Cpu, &opts, || {
+                std::fs::write(&tokenizer_path, b"replacement bytes are not a tokenizer").unwrap();
+            })
+            .unwrap();
+
+        assert_eq!(identity.tokenizer_sha256, expected_tokenizer_sha256);
+        assert_eq!(identity.model_family, "qwen3_5");
+        assert_eq!(tokenizer.vocab_size(), 4);
     }
 
     #[test]
