@@ -99,6 +99,7 @@ enum NoReplaceSyncPoint {
 enum OrdinaryPublishFaultPoint {
     AdapterPayloadSync,
     ManifestPayloadSync,
+    PriorAsideRename,
     PriorAsideRenameAfterApply,
     PublishRename,
     PublishRenameAfterApply,
@@ -1149,14 +1150,15 @@ fn commit_stage(stage: &Path, dir: &Path) -> Result<(), CheckpointError> {
         ));
     }
     if had_prior {
-        if let Err(error) = std::fs::rename(dir, &aside)
-            .map_err(|error| io(dir, error))
-            .and_then(|()| {
-                ordinary_publication_fault(
-                    OrdinaryPublishFaultPoint::PriorAsideRenameAfterApply,
-                    &aside,
-                )
-            })
+        if let Err(error) =
+            ordinary_publication_fault(OrdinaryPublishFaultPoint::PriorAsideRename, dir)
+                .and_then(|()| std::fs::rename(dir, &aside).map_err(|error| io(dir, error)))
+                .and_then(|()| {
+                    ordinary_publication_fault(
+                        OrdinaryPublishFaultPoint::PriorAsideRenameAfterApply,
+                        &aside,
+                    )
+                })
         {
             return Err(reconcile_prior_aside_rename_error(
                 stage, dir, &aside, parent, error,
@@ -3898,6 +3900,65 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_prior_aside_rename_no_effect_fences_prior_before_stage_cleanup() {
+        let tmp = TempDir::new("ordinary-prior-aside-rename-no-effect");
+        let dir = tmp.path().join("step-3");
+        let parent = dir.parent().unwrap().to_path_buf();
+        let vars = make_vars();
+        let binding = ordinary_binding(None);
+        save_checkpoint(&dir, &vars, &make_opt_state(), &[7], 3, &binding).unwrap();
+        SYNCED_DIRECTORIES.with(|paths| paths.borrow_mut().clear());
+
+        inject_ordinary_publication_failures(&[OrdinaryPublishFaultPoint::PriorAsideRename]);
+        let error = save_checkpoint(&dir, &vars, &make_opt_state(), &[9], 3, &binding).unwrap_err();
+        assert!(matches!(error, CheckpointError::Io { .. }), "{error:?}");
+        assert_eq!(
+            load_checkpoint(&dir, &vars, &binding)
+                .unwrap()
+                .sampler_state,
+            Some(vec![7])
+        );
+        assert!(hidden_siblings(&dir, "old").is_empty());
+        assert!(hidden_siblings(&dir, "tmp").is_empty());
+
+        let synced = SYNCED_DIRECTORIES.with(|paths| paths.borrow().clone());
+        assert!(
+            synced.ends_with(&[dir, parent.clone(), parent]),
+            "the unchanged prior must be validated and fenced before durable stage cleanup: {synced:?}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // authenticate both preserved recovery candidates
+    fn ordinary_prior_aside_rename_no_effect_preserves_corrupt_prior_and_stage() {
+        let tmp = TempDir::new("ordinary-prior-aside-rename-no-effect-corrupt");
+        let dir = tmp.path().join("step-3");
+        let vars = make_vars();
+        let binding = ordinary_binding(None);
+        save_checkpoint(&dir, &vars, &make_opt_state(), &[7], 3, &binding).unwrap();
+        std::fs::write(dir.join(ADAPTER_FILE), b"corrupt adapter").unwrap();
+
+        inject_ordinary_publication_failures(&[OrdinaryPublishFaultPoint::PriorAsideRename]);
+        let error = save_checkpoint(&dir, &vars, &make_opt_state(), &[9], 3, &binding).unwrap_err();
+        assert!(
+            matches!(error, CheckpointError::PublicationAmbiguous { ref detail, .. }
+                if detail.contains("prior package could not be validated")),
+            "{error:?}"
+        );
+        assert!(dir.is_dir(), "the corrupt prior candidate was lost");
+        assert!(load_checkpoint(&dir, &vars, &binding).is_err());
+        assert!(hidden_siblings(&dir, "old").is_empty());
+        let stages = hidden_siblings(&dir, "tmp");
+        assert_eq!(stages.len(), 1, "the completed stage was not preserved");
+        assert_eq!(
+            load_checkpoint(&stages[0], &vars, &binding)
+                .unwrap()
+                .sampler_state,
+            Some(vec![9])
+        );
+    }
+
+    #[test]
     #[allow(clippy::cognitive_complexity)]
     fn ordinary_prior_aside_rename_applied_then_rollback_failure_preserves_candidates() {
         let tmp = TempDir::new("ordinary-prior-aside-rename-rollback-ambiguous");
@@ -3931,6 +3992,48 @@ mod tests {
                 .unwrap()
                 .sampler_state,
             Some(vec![9])
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // restored prior remains unfenced, so preserve the stage
+    fn ordinary_prior_aside_rename_applied_then_rollback_sync_failure_preserves_stage() {
+        let tmp = TempDir::new("ordinary-prior-aside-rename-rollback-sync-ambiguous");
+        let dir = tmp.path().join("step-3");
+        let vars = make_vars();
+        let binding = ordinary_binding(None);
+        save_checkpoint(&dir, &vars, &make_opt_state(), &[7], 3, &binding).unwrap();
+        SYNCED_DIRECTORIES.with(|paths| paths.borrow_mut().clear());
+
+        inject_ordinary_publication_failures(&[
+            OrdinaryPublishFaultPoint::PriorAsideRenameAfterApply,
+            OrdinaryPublishFaultPoint::RollbackSync,
+        ]);
+        let error = save_checkpoint(&dir, &vars, &make_opt_state(), &[9], 3, &binding).unwrap_err();
+        assert!(
+            matches!(error, CheckpointError::PublicationAmbiguous { .. }),
+            "{error:?}"
+        );
+        assert_eq!(
+            load_checkpoint(&dir, &vars, &binding)
+                .unwrap()
+                .sampler_state,
+            Some(vec![7])
+        );
+        assert!(hidden_siblings(&dir, "old").is_empty());
+        let stages = hidden_siblings(&dir, "tmp");
+        assert_eq!(stages.len(), 1, "the completed stage was not preserved");
+        assert_eq!(
+            load_checkpoint(&stages[0], &vars, &binding)
+                .unwrap()
+                .sampler_state,
+            Some(vec![9])
+        );
+
+        let synced = SYNCED_DIRECTORIES.with(|paths| paths.borrow().clone());
+        assert!(
+            !synced.contains(&dir),
+            "the injected rollback fence failure must not record the prior as durable: {synced:?}"
         );
     }
 
