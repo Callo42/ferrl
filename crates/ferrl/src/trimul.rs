@@ -507,11 +507,11 @@ pub struct TrimulVerifierIdentity {
     pub task_yml_len_bytes: usize,
 }
 
-/// Failure while capturing or revalidating a TriMul verifier asset snapshot.
+/// Failure while capturing or revalidating immutable TriMul verifier assets.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum TrimulAssetError {
-    /// A verifier asset could not be read or snapshotted.
+    /// A verifier asset could not be read or sealed.
     #[error("TriMul verifier asset I/O failed at {path}: {source}")]
     Io {
         /// Asset path being accessed.
@@ -566,45 +566,78 @@ struct EvalBundleSnapshot {
 }
 
 #[derive(Debug)]
+struct SealedEvalFile {
+    relative_path: PathBuf,
+    file: File,
+    len: u64,
+}
+
+impl SealedEvalFile {
+    fn verify(&self) -> Result<(), TrimulAssetError> {
+        verify_sealed_asset(&self.file, &self.relative_path, self.len)
+    }
+
+    fn descriptor_path(&self) -> PathBuf {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd as _;
+            PathBuf::from(format!(
+                "/proc/{}/fd/{}",
+                std::process::id(),
+                self.file.as_raw_fd()
+            ))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            PathBuf::new()
+        }
+    }
+}
+
+#[derive(Debug)]
 struct VerifierAssetSnapshot {
     image_path: PathBuf,
     image_file: File,
     image_stamp: FileStamp,
     eval_dir: PathBuf,
-    eval_snapshot_dir: PathBuf,
+    sealed_eval_files: Vec<SealedEvalFile>,
     task_yml: String,
     identity: TrimulVerifierIdentity,
 }
 
-impl Drop for VerifierAssetSnapshot {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.eval_snapshot_dir);
-    }
-}
+const SANDBOX_EVAL_FILES: [(&str, &str); 4] = [
+    ("eval.py", "/tmp/ferrl-trimul-eval.py"),
+    ("reference.py", "/tmp/ferrl-trimul-reference.py"),
+    ("task.py", "/tmp/ferrl-trimul-task.py"),
+    ("utils.py", "/tmp/ferrl-trimul-utils.py"),
+];
 
 /// Stable verifier assets captured before launch attestation.
 ///
-/// The large image remains on one open file identity and is passed to Apptainer via
-/// that stable descriptor on Linux. The small eval tree is copied byte-for-byte into
-/// a private snapshot and that snapshot, not the mutable configured path, is bound
-/// into every verifier. Both configured paths and both stable snapshots are checked
-/// again after attestation and before each verifier use.
+/// The image and every file in the eval tree are copied byte-for-byte into anonymous
+/// Linux memfds with write/grow/shrink/further-seal operations permanently disabled
+/// by the kernel. The image is streamed and hashed in one pass during capture. Exact
+/// sealed descriptors, never writable snapshot pathnames, supply every verifier
+/// invocation; later checks inspect source identities and kernel seals without
+/// repeatedly rereading the potentially multi-gigabyte image.
 #[derive(Debug, Clone)]
 pub struct TrimulVerifierAssets {
     snapshot: Arc<VerifierAssetSnapshot>,
 }
 
 impl TrimulVerifierAssets {
-    /// Capture exact image and eval-bundle content under `scratch_root`.
+    /// Capture exact image and eval-bundle content. The legacy scratch-root
+    /// argument is retained for API compatibility but no verifier asset is staged
+    /// there: eval files live only in anonymous kernel-sealed descriptors.
     ///
     /// # Errors
     ///
     /// Returns [`TrimulAssetError`] if an asset is missing, non-regular, changes
-    /// during capture, contains a symlink/special entry, or cannot be snapshotted.
+    /// during capture, contains a symlink/special entry, or cannot be kernel-sealed.
     pub fn capture(
         image_path: impl AsRef<Path>,
         eval_dir: impl AsRef<Path>,
-        scratch_root: impl AsRef<Path>,
+        _scratch_root: impl AsRef<Path>,
     ) -> Result<Self, TrimulAssetError> {
         let image_path = image_path.as_ref().to_path_buf();
         let eval_dir = eval_dir.as_ref().to_path_buf();
@@ -621,7 +654,15 @@ impl TrimulVerifierAssets {
                 TrimulAssetError::Invalid(format!("TriMul task.yml is not UTF-8: {error}"))
             })?
             .to_owned();
-        let eval_snapshot_dir = stage_eval_bundle(scratch_root.as_ref(), &eval.files)?;
+        for (relative, _) in SANDBOX_EVAL_FILES {
+            if !eval.files.contains_key(Path::new(relative)) {
+                return Err(TrimulAssetError::Invalid(format!(
+                    "TriMul eval bundle {} has no regular {relative}",
+                    eval_dir.display()
+                )));
+            }
+        }
+        let sealed_eval_files = seal_eval_bundle(&eval.files)?;
         let identity = TrimulVerifierIdentity {
             image_sha256,
             image_len_bytes: image_stamp.len,
@@ -636,7 +677,7 @@ impl TrimulVerifierAssets {
                 image_file,
                 image_stamp,
                 eval_dir,
-                eval_snapshot_dir,
+                sealed_eval_files,
                 task_yml,
                 identity,
             }),
@@ -657,7 +698,7 @@ impl TrimulVerifierAssets {
         &self.snapshot.task_yml
     }
 
-    /// Revalidate configured and snapshotted assets without changing which bytes
+    /// Revalidate configured sources and sealed assets without changing which bytes
     /// subsequent verifier invocations consume.
     ///
     /// # Errors
@@ -665,29 +706,22 @@ impl TrimulVerifierAssets {
     /// Returns [`TrimulAssetError`] after any path substitution or in-place change.
     pub fn verify_current(&self) -> Result<(), TrimulAssetError> {
         let image_path_metadata = regular_metadata(&self.snapshot.image_path)?;
-        let image_handle_metadata =
-            self.snapshot
-                .image_file
-                .metadata()
-                .map_err(|source| TrimulAssetError::Io {
-                    path: self.snapshot.image_path.clone(),
-                    source,
-                })?;
-        let image_sha256 = hash_open_file(&self.snapshot.image_file, &self.snapshot.image_path)?;
-        if FileStamp::from_metadata(&image_path_metadata) != self.snapshot.image_stamp
-            || FileStamp::from_metadata(&image_handle_metadata) != self.snapshot.image_stamp
-            || image_sha256 != self.snapshot.identity.image_sha256
-        {
+        if FileStamp::from_metadata(&image_path_metadata) != self.snapshot.image_stamp {
             return Err(TrimulAssetError::Invalid(
                 "TriMul sandbox image changed after verifier attestation".to_string(),
             ));
         }
+        verify_sealed_asset(
+            &self.snapshot.image_file,
+            &self.snapshot.image_path,
+            self.snapshot.identity.image_len_bytes,
+        )?;
         let current_eval = capture_eval_bundle(&self.snapshot.eval_dir)?;
-        let snapshot_eval = capture_eval_bundle(&self.snapshot.eval_snapshot_dir)?;
+        for file in &self.snapshot.sealed_eval_files {
+            file.verify()?;
+        }
         if current_eval.identity != self.snapshot.identity.eval_bundle_sha256
             || current_eval.files.len() != self.snapshot.identity.eval_file_count
-            || snapshot_eval.identity != self.snapshot.identity.eval_bundle_sha256
-            || snapshot_eval.files.len() != self.snapshot.identity.eval_file_count
         {
             return Err(TrimulAssetError::Invalid(
                 "TriMul eval bundle changed after verifier attestation".to_string(),
@@ -712,8 +746,19 @@ impl TrimulVerifierAssets {
         }
     }
 
-    fn eval_for_sandbox(&self) -> &Path {
-        &self.snapshot.eval_snapshot_dir
+    fn eval_binds(&self) -> Vec<Bind> {
+        SANDBOX_EVAL_FILES
+            .iter()
+            .map(|(relative, destination)| {
+                let sealed = self
+                    .snapshot
+                    .sealed_eval_files
+                    .iter()
+                    .find(|file| file.relative_path == Path::new(relative))
+                    .expect("capture validates every sandbox eval file");
+                Bind::ro(sealed.descriptor_path(), *destination)
+            })
+            .collect()
     }
 }
 
@@ -731,92 +776,83 @@ fn regular_metadata(path: &Path) -> Result<std::fs::Metadata, TrimulAssetError> 
     Ok(metadata)
 }
 
+#[cfg(target_os = "linux")]
 fn capture_image(path: &Path) -> Result<(File, FileStamp, String), TrimulAssetError> {
+    use std::io::{Read as _, Write as _};
+
     let path_metadata = regular_metadata(path)?;
-    let file = File::open(path).map_err(|source| TrimulAssetError::Io {
+    let mut source_file = File::open(path).map_err(|source| TrimulAssetError::Io {
         path: path.to_path_buf(),
         source,
     })?;
-    let before =
-        FileStamp::from_metadata(&file.metadata().map_err(|source| TrimulAssetError::Io {
+    let before = FileStamp::from_metadata(&source_file.metadata().map_err(|source| {
+        TrimulAssetError::Io {
             path: path.to_path_buf(),
             source,
-        })?);
+        }
+    })?);
     if before != FileStamp::from_metadata(&path_metadata) {
         return Err(TrimulAssetError::Invalid(format!(
             "TriMul sandbox image {} changed while it was opened",
             path.display()
         )));
     }
-    let digest = hash_open_file(&file, path)?;
-    Ok((file, before, digest))
-}
-
-fn hash_open_file(file: &File, path: &Path) -> Result<String, TrimulAssetError> {
-    let before =
-        FileStamp::from_metadata(&file.metadata().map_err(|source| TrimulAssetError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?);
+    let descriptor =
+        rustix::fs::memfd_create("ferrl-trimul-image", rustix::fs::MemfdFlags::ALLOW_SEALING)
+            .map_err(|source| TrimulAssetError::Io {
+                path: path.to_path_buf(),
+                source: source.into(),
+            })?;
+    let mut sealed_file = File::from(descriptor);
     let mut digest = Sha256::new();
     let mut copied = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::FileExt as _;
-        loop {
-            let read =
-                file.read_at(&mut buffer, copied)
-                    .map_err(|source| TrimulAssetError::Io {
-                        path: path.to_path_buf(),
-                        source,
-                    })?;
-            if read == 0 {
-                break;
-            }
-            copied += read as u64;
-            digest.update(&buffer[..read]);
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let read = source_file
+            .read(&mut buffer)
+            .map_err(|source| TrimulAssetError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if read == 0 {
+            break;
         }
+        sealed_file
+            .write_all(&buffer[..read])
+            .map_err(|source| TrimulAssetError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        copied += read as u64;
+        digest.update(&buffer[..read]);
     }
-    #[cfg(not(unix))]
-    {
-        use std::io::{Read as _, Seek as _};
-        let mut reader = file.try_clone().map_err(|source| TrimulAssetError::Io {
+    let after = FileStamp::from_metadata(&source_file.metadata().map_err(|source| {
+        TrimulAssetError::Io {
             path: path.to_path_buf(),
             source,
-        })?;
-        reader.rewind().map_err(|source| TrimulAssetError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        loop {
-            let read = reader
-                .read(&mut buffer)
-                .map_err(|source| TrimulAssetError::Io {
-                    path: path.to_path_buf(),
-                    source,
-                })?;
-            if read == 0 {
-                break;
-            }
-            copied += read as u64;
-            digest.update(&buffer[..read]);
         }
-    }
-
-    let after =
-        FileStamp::from_metadata(&file.metadata().map_err(|source| TrimulAssetError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?);
+    })?);
     if before != after || copied != before.len {
         return Err(TrimulAssetError::Invalid(format!(
-            "TriMul sandbox image {} changed while it was hashed",
+            "TriMul sandbox image {} changed while it was captured",
             path.display()
         )));
     }
-    Ok(format!("{:x}", digest.finalize()))
+    rustix::fs::fcntl_add_seals(&sealed_file, required_asset_seals()).map_err(|source| {
+        TrimulAssetError::Io {
+            path: path.to_path_buf(),
+            source: source.into(),
+        }
+    })?;
+    verify_sealed_asset(&sealed_file, path, copied)?;
+    Ok((sealed_file, before, format!("{:x}", digest.finalize())))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn capture_image(_path: &Path) -> Result<(File, FileStamp, String), TrimulAssetError> {
+    Err(TrimulAssetError::Invalid(
+        "TriMul verifier assets require Linux kernel-sealed memfd storage".to_string(),
+    ))
 }
 
 fn capture_eval_bundle(root: &Path) -> Result<EvalBundleSnapshot, TrimulAssetError> {
@@ -903,53 +939,88 @@ fn eval_bundle_sha256(files: &BTreeMap<PathBuf, Vec<u8>>) -> Result<String, Trim
     Ok(format!("{:x}", digest.finalize()))
 }
 
-fn stage_eval_bundle(
-    scratch_root: &Path,
-    files: &BTreeMap<PathBuf, Vec<u8>>,
-) -> Result<PathBuf, TrimulAssetError> {
-    std::fs::create_dir_all(scratch_root).map_err(|source| TrimulAssetError::Io {
-        path: scratch_root.to_path_buf(),
-        source,
-    })?;
-    let mut snapshot = None;
-    for _ in 0..100 {
-        let seq = ASSET_SNAPSHOT_SEQ.fetch_add(1, Ordering::Relaxed);
-        let candidate =
-            scratch_root.join(format!(".ferrl-trimul-assets-{}-{seq}", std::process::id()));
-        match std::fs::create_dir(&candidate) {
-            Ok(()) => {
-                snapshot = Some(candidate);
-                break;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(source) => {
-                return Err(TrimulAssetError::Io {
-                    path: candidate,
-                    source,
-                });
-            }
-        }
-    }
-    let snapshot = snapshot.ok_or_else(|| {
-        TrimulAssetError::Invalid("could not allocate a unique TriMul asset snapshot".to_string())
-    })?;
-    for (relative, bytes) in files {
-        let path = snapshot.join(relative);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|source| TrimulAssetError::Io {
-                path: parent.to_path_buf(),
-                source,
-            })?;
-        }
-        std::fs::write(&path, bytes).map_err(|source| TrimulAssetError::Io {
-            path: path.clone(),
-            source,
-        })?;
-    }
-    Ok(snapshot)
+#[cfg(target_os = "linux")]
+fn required_asset_seals() -> rustix::fs::SealFlags {
+    rustix::fs::SealFlags::WRITE
+        | rustix::fs::SealFlags::GROW
+        | rustix::fs::SealFlags::SHRINK
+        | rustix::fs::SealFlags::SEAL
 }
 
-static ASSET_SNAPSHOT_SEQ: AtomicU64 = AtomicU64::new(0);
+fn verify_sealed_asset(file: &File, path: &Path, len: u64) -> Result<(), TrimulAssetError> {
+    let metadata = file.metadata().map_err(|source| TrimulAssetError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if metadata.len() != len {
+        return Err(TrimulAssetError::Invalid(format!(
+            "sealed TriMul verifier asset {} changed length",
+            path.display()
+        )));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let seals = rustix::fs::fcntl_get_seals(file).map_err(|source| TrimulAssetError::Io {
+            path: path.to_path_buf(),
+            source: source.into(),
+        })?;
+        if !seals.contains(required_asset_seals()) {
+            return Err(TrimulAssetError::Invalid(format!(
+                "TriMul verifier asset {} is not kernel-sealed",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn seal_eval_bundle(
+    files: &BTreeMap<PathBuf, Vec<u8>>,
+) -> Result<Vec<SealedEvalFile>, TrimulAssetError> {
+    use std::io::Write as _;
+
+    let mut sealed = Vec::with_capacity(files.len());
+    for (index, (relative_path, bytes)) in files.iter().enumerate() {
+        let descriptor = rustix::fs::memfd_create(
+            format!("ferrl-trimul-eval-{index}"),
+            rustix::fs::MemfdFlags::ALLOW_SEALING,
+        )
+        .map_err(|source| TrimulAssetError::Io {
+            path: relative_path.clone(),
+            source: source.into(),
+        })?;
+        let mut file = File::from(descriptor);
+        file.write_all(bytes)
+            .map_err(|source| TrimulAssetError::Io {
+                path: relative_path.clone(),
+                source,
+            })?;
+        rustix::fs::fcntl_add_seals(&file, required_asset_seals()).map_err(|source| {
+            TrimulAssetError::Io {
+                path: relative_path.clone(),
+                source: source.into(),
+            }
+        })?;
+        let sealed_file = SealedEvalFile {
+            relative_path: relative_path.clone(),
+            file,
+            len: bytes.len() as u64,
+        };
+        sealed_file.verify()?;
+        sealed.push(sealed_file);
+    }
+    Ok(sealed)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn seal_eval_bundle(
+    _files: &BTreeMap<PathBuf, Vec<u8>>,
+) -> Result<Vec<SealedEvalFile>, TrimulAssetError> {
+    Err(TrimulAssetError::Invalid(
+        "TriMul verifier assets require Linux kernel-sealed memfd storage".to_string(),
+    ))
+}
 
 /// Parse one flow-mapping case line (the body between `{` and `}`) into a [`TrimulCase`].
 /// Values may be quoted; the mapping has no nested commas, so a flat split on `,` is safe.
@@ -1065,7 +1136,7 @@ pub struct TrimulReward {
     verifier_max_procs: u64,
     /// The sandbox backend.
     sandbox: ApptainerSandbox,
-    /// Optional immutable verifier snapshot captured before launch attestation.
+    /// Optional immutable verifier assets captured before launch attestation.
     verifier_assets: Option<TrimulVerifierAssets>,
 }
 
@@ -1130,7 +1201,7 @@ impl TrimulReward {
         }
     }
 
-    /// Consume one pre-attestation verifier snapshot for every sandbox invocation.
+    /// Consume one pre-attestation verifier asset set for every sandbox invocation.
     #[must_use]
     pub fn with_verifier_assets(mut self, assets: TrimulVerifierAssets) -> Self {
         self.verifier_assets = Some(assets);
@@ -1325,11 +1396,11 @@ impl TrimulReward {
         }
     }
 
-    /// The `bash -c` program run inside the image: copy the read-only eval files next
+    /// The `bash -c` program run inside the image: copy the immutable eval files next
     /// to the staged `submission.py`, run `test`, and — only if it exits cleanly —
     /// `benchmark`, each writing its result via fd 3 (`POPCORN_FD`). A trailing `true` keeps the
     /// shell's exit status clean; ferrl reads the result files, not the exit code.
-    fn in_container_command() -> String {
+    fn in_container_command(&self) -> String {
         // Route the grade (POPCORN fd 3) to the *captured stdout pipe* (`3>&1`) and
         // send the eval's — and the candidate's — own stdout to `/dev/null`
         // (`1>/dev/null`). The grade therefore arrives on a channel the untrusted
@@ -1337,8 +1408,17 @@ impl TrimulReward {
         // it non-inheritable) and its stdout is discarded, so it cannot forge a pass by
         // writing files or printing. A separator splits the two sections; benchmark runs
         // only if `test` exits cleanly.
-        "cp /eval/eval.py /eval/reference.py /eval/task.py /eval/utils.py . && \
-         { POPCORN_FD=3 python eval.py test test_spec.txt 3>&1 1>/dev/null; \
+        let stage_eval = if self.verifier_assets.is_some() {
+            "cp /tmp/ferrl-trimul-eval.py eval.py && \
+             cp /tmp/ferrl-trimul-reference.py reference.py && \
+             cp /tmp/ferrl-trimul-task.py task.py && \
+             cp /tmp/ferrl-trimul-utils.py utils.py"
+        } else {
+            "cp /eval/eval.py /eval/reference.py /eval/task.py /eval/utils.py ."
+        };
+        format!(
+            "{stage_eval} && \
+         {{ POPCORN_FD=3 python eval.py test test_spec.txt 3>&1 1>/dev/null; \
            test_rc=$?; \
            echo \"test-exit: $test_rc\"; \
            if [ \"$test_rc\" -eq 0 ]; then \
@@ -1346,9 +1426,9 @@ impl TrimulReward {
              POPCORN_FD=3 python eval.py benchmark bench_spec.txt 3>&1 1>/dev/null; \
              bench_rc=$?; \
              echo \"benchmark-exit: $bench_rc\"; \
-           fi; }; \
+           fi; }}; \
          true"
-            .to_string()
+        )
     }
 
     /// Build the [`RunSpec`] for a candidate whose scratch dir is `scratch`: the eval
@@ -1384,19 +1464,17 @@ impl TrimulReward {
             || self.image.clone(),
             TrimulVerifierAssets::image_for_sandbox,
         );
-        let eval_dir = self.verifier_assets.as_ref().map_or(
-            self.eval_dir.as_path(),
-            TrimulVerifierAssets::eval_for_sandbox,
+        let mut binds = self.verifier_assets.as_ref().map_or_else(
+            || vec![Bind::ro(&self.eval_dir, "/eval")],
+            TrimulVerifierAssets::eval_binds,
         );
+        binds.push(Bind::rw(scratch, "/work").with_total_limit(self.scratch_max_bytes));
         RunSpec::new(
             image,
-            vec!["bash".into(), "-c".into(), Self::in_container_command()],
+            vec!["bash".into(), "-c".into(), self.in_container_command()],
         )
         .with_gpu(true)
-        .with_binds(vec![
-            Bind::ro(eval_dir, "/eval"),
-            Bind::rw(scratch, "/work").with_total_limit(self.scratch_max_bytes),
-        ])
+        .with_binds(binds)
         .with_workdir("/work")
         .with_env(env)
         .with_limits(self.limits())
@@ -1999,6 +2077,9 @@ mod tests {
         std::fs::create_dir_all(&eval).unwrap();
         std::fs::write(&image, b"exact image").unwrap();
         std::fs::write(eval.join("eval.py"), b"# exact eval\n").unwrap();
+        std::fs::write(eval.join("reference.py"), b"# exact reference\n").unwrap();
+        std::fs::write(eval.join("task.py"), b"# exact task\n").unwrap();
+        std::fs::write(eval.join("utils.py"), b"# exact utils\n").unwrap();
         std::fs::write(
             eval.join("task.yml"),
             b"tests:\n  - {\"seqlen\": 8, \"bs\": 1, \"dim\": 4, \"hiddendim\": 4, \"seed\": 1, \"nomask\": true, \"distribution\": \"normal\"}\nbenchmarks:\n  - {\"seqlen\": 16, \"bs\": 1, \"dim\": 4, \"hiddendim\": 4, \"seed\": 2, \"nomask\": false, \"distribution\": \"cauchy\"}\n",
@@ -2008,7 +2089,8 @@ mod tests {
     }
 
     #[test]
-    fn verifier_assets_consume_stable_image_and_eval_snapshots() {
+    #[cfg(target_os = "linux")]
+    fn verifier_assets_consume_stable_image_and_sealed_eval_descriptors() {
         let (root, image, eval, scratch) = verifier_fixture("stable-consumption");
         let assets = TrimulVerifierAssets::capture(&image, &eval, &scratch).unwrap();
         let reward =
@@ -2023,12 +2105,23 @@ mod tests {
         let eval_bind = spec
             .binds
             .iter()
-            .find(|bind| bind.dst == Path::new("/eval"))
+            .find(|bind| bind.dst == Path::new("/tmp/ferrl-trimul-eval.py"))
             .unwrap();
         assert_ne!(eval_bind.src, eval);
+        assert!(eval_bind
+            .src
+            .starts_with(format!("/proc/{}/fd", std::process::id())));
+        assert_eq!(std::fs::read(&eval_bind.src).unwrap(), b"# exact eval\n");
         assert_eq!(
-            std::fs::read(eval_bind.src.join("eval.py")).unwrap(),
-            b"# exact eval\n"
+            spec.binds
+                .iter()
+                .filter(|bind| {
+                    SANDBOX_EVAL_FILES
+                        .iter()
+                        .any(|(_, destination)| bind.dst == Path::new(destination))
+                })
+                .count(),
+            SANDBOX_EVAL_FILES.len()
         );
         assets.verify_current().unwrap();
         drop(reward);
@@ -2037,6 +2130,43 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    fn verifier_assets_reject_in_flight_mutation_between_sandbox_open_and_use() {
+        use std::io::Write as _;
+
+        let (root, image, eval, scratch) = verifier_fixture("in-flight-mutation");
+        let assets = TrimulVerifierAssets::capture(&image, &eval, &scratch).unwrap();
+        let reward =
+            TrimulReward::new(&image, &eval, &scratch).with_verifier_assets(assets.clone());
+        let spec = reward.build_run_spec(&scratch.join("candidate"));
+        assets.verify_current().unwrap();
+
+        let eval_bind = spec
+            .binds
+            .iter()
+            .find(|bind| bind.dst == Path::new("/tmp/ferrl-trimul-eval.py"))
+            .unwrap();
+        for (target, expected) in [
+            (spec.image.as_path(), b"exact image".as_slice()),
+            (eval_bind.src.as_path(), b"# exact eval\n".as_slice()),
+        ] {
+            let mut attacker = std::fs::OpenOptions::new()
+                .write(true)
+                .open(target)
+                .unwrap();
+            let error = attacker.write_all(b"# forged verifier\n").unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(1));
+            assert_eq!(std::fs::read(target).unwrap(), expected);
+        }
+        assets.verify_current().unwrap();
+
+        drop(reward);
+        drop(assets);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
     fn verifier_assets_reject_image_eval_and_task_substitution() {
         for target in ["image.sif", "eval/eval.py", "eval/task.yml"] {
             let (root, image, eval, scratch) = verifier_fixture(target);
@@ -2871,7 +3001,7 @@ mod tests {
 
     #[test]
     fn in_container_command_routes_the_grade_to_stdout_and_gates_benchmark() {
-        let cmd = TrimulReward::in_container_command();
+        let cmd = reward().in_container_command();
         // Grade -> fd 3 -> the captured stdout pipe; the eval's/candidate's own stdout
         // is discarded, so a forged file or print cannot influence the score.
         assert!(cmd.contains("eval.py test test_spec.txt 3>&1 1>/dev/null"));
@@ -2881,7 +3011,7 @@ mod tests {
 
     #[test]
     fn in_container_command_reports_eval_exit_statuses() {
-        let cmd = TrimulReward::in_container_command();
+        let cmd = reward().in_container_command();
         // The shell reports eval process exits on the same controlled grade channel,
         // so missing grade output can be distinguished from eval process failure.
         assert!(cmd.contains("test_rc=$?"));

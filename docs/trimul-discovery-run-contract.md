@@ -25,9 +25,11 @@ synchronized run identity, build-embedded training commit,
 exact model/checkpoint loader identity, exact tokenizer bytes, prompt, and candidate
 ledger contract. For TriMul it also binds the SHA-256 and byte length of the sandbox
 image, a digest and file count for the complete ordered eval tree, and the exact
-`task.yml` SHA-256 and byte length. Ferrl keeps the image on one stable open file
-identity, snapshots the eval tree, revalidates the configured assets after attestation
-and before verifier use, and aborts in lockstep on a rank-local substitution. The prompt
+`task.yml` SHA-256 and byte length. Ferrl streams and hashes the image once into a
+kernel-sealed anonymous descriptor, gives every eval-tree file the same sealed
+storage, binds those exact descriptors rather than writable pathnames, revalidates
+source identities and kernel seals after attestation and around verifier use, and
+aborts in lockstep on a rank-local substitution. The prompt
 is frozen to `<run-dir>/prompt.txt`; the compatibility
 digest remains at `<run-dir>/prompt.sha256`. `trimul.prompt_path` is the complete rendered
 model prompt: ferrl does not trim, wrap, prepend, append, or otherwise construct
@@ -247,8 +249,8 @@ with the final report:
 | reward profile | `trimul.reward`; defaults to `trimul_shaped_v1`, with custom ladder-preserving values allowed. |
 | run-health policy | `run_health`; post-run warn/fail policy, including the original top-level config passed to `ferrl runreport --config`. |
 | model | Loader-derived family, exact model/checkpoint policy SHA-256, exact tokenizer-file SHA-256, resolved EOS, LoRA rank/alpha, base dtype, and rollout seed, all sealed at launch. |
-| TriMul eval bundle | Attested SHA-256 over every ordered relative regular-file name and byte under `eval_dir`, plus the exact file count. The configured path is informational only. |
-| sandbox image | Attested SHA-256 and byte length of the exact Apptainer image consumed through a stable open file identity. The configured path is informational only. |
+| TriMul eval bundle | Attested SHA-256 over every ordered relative regular-file name and byte under `eval_dir`, plus the exact file count. Every captured file is held in a Linux kernel-sealed anonymous descriptor; the sandbox receives only descriptor-backed read-only file binds, so no writable staging pathname exists. The configured path is informational only. |
+| sandbox image | Attested SHA-256 and byte length of the exact Apptainer image streamed once into a kernel-sealed anonymous descriptor. Invocation checks validate the source identity, sealed descriptor, and length without rereading the complete image. The configured path is informational only. |
 | cases | Attested `task.yml` SHA-256 and byte length plus the loaded counts for `tests` and `benchmarks`. |
 | seeds | `data.seed`, `policy.seed`, trainer seed-bearing knobs, and the training `trimul.secret_seed`. |
 | scratch cap | `trimul.scratch_max_bytes`; `0` means the ferrl default, currently 1 GiB. |

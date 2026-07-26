@@ -21,6 +21,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use ferrl::trimul::TrimulVerifierAssets;
 use ferrl::{Distribution, RewardFn, Sample, TrimulCase, TrimulReward};
 
 /// A required path from the environment (the gate only runs with `--ignored`).
@@ -31,6 +32,10 @@ fn env_path(key: &str) -> PathBuf {
 /// A reward over a couple of small, generic cases (not GPU Mode's specific sizes).
 fn reward() -> TrimulReward {
     let scratch = std::env::var("FERRL_TRIMUL_SCRATCH").unwrap_or_else(|_| "/tmp".to_string());
+    let image = env_path("FERRL_TRIMUL_IMAGE");
+    let eval_dir = env_path("FERRL_TRIMUL_EVAL_DIR");
+    let verifier_assets = TrimulVerifierAssets::capture(&image, &eval_dir, &scratch)
+        .expect("capture kernel-sealed verifier assets");
     let cases = vec![
         TrimulCase {
             seqlen: 32,
@@ -51,14 +56,11 @@ fn reward() -> TrimulReward {
             distribution: Distribution::Normal,
         },
     ];
-    TrimulReward::new(
-        env_path("FERRL_TRIMUL_IMAGE"),
-        env_path("FERRL_TRIMUL_EVAL_DIR"),
-        scratch,
-    )
-    .with_cases(cases.clone(), cases)
-    .with_secret_seed(123)
-    .with_wall(Duration::from_secs(300))
+    TrimulReward::new(image, eval_dir, scratch)
+        .with_verifier_assets(verifier_assets)
+        .with_cases(cases.clone(), cases)
+        .with_secret_seed(123)
+        .with_wall(Duration::from_secs(300))
 }
 
 fn score(completion: &str) -> f32 {

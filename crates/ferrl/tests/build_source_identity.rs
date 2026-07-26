@@ -200,6 +200,40 @@ fn exact_source_check_binds_toolchain_and_repository_cargo_config() {
 }
 
 #[test]
+#[allow(clippy::cognitive_complexity)] // one ordered optional-input/index-flag control
+fn exact_source_check_rejects_untracked_cargo_config_and_skip_worktree() {
+    let repo = TempRepo::seeded();
+    let head = repo.head();
+    assert!(build_script::source_tree_is_exact_at(repo.path(), &head));
+
+    repo.write(
+        ".cargo/config",
+        b"[build]\nrustflags = [\"-Cdebuginfo=0\"]\n",
+    );
+    assert!(
+        !build_script::source_tree_is_exact_at(repo.path(), &head),
+        "an untracked repository-local Cargo config must invalidate provenance"
+    );
+    std::fs::remove_file(repo.path().join(".cargo/config")).unwrap();
+    assert!(build_script::source_tree_is_exact_at(repo.path(), &head));
+
+    assert!(repo
+        .git(&["update-index", "--skip-worktree", ".cargo/config.toml",])
+        .status
+        .success());
+    assert!(
+        !build_script::source_tree_is_exact_at(repo.path(), &head),
+        "skip-worktree must be rejected even before content diverges"
+    );
+    repo.write(
+        ".cargo/config.toml",
+        b"[build]\nrustflags = [\"-Copt-level=3\"]\n",
+    );
+    assert!(repo.git(&["status", "--porcelain"]).stdout.is_empty());
+    assert!(!build_script::source_tree_is_exact_at(repo.path(), &head));
+}
+
+#[test]
 fn build_identity_rejects_non_commit_head() {
     let repo = TempRepo::seeded();
     let tree = String::from_utf8(repo.git(&["rev-parse", "HEAD^{tree}"]).stdout)
@@ -268,6 +302,68 @@ fn build_identity_rejects_nested_repository_root() {
         .status()
         .unwrap()
         .success());
+
+    std::fs::write(
+        nested.join("src/lib.rs"),
+        b"pub fn forged_outer_source() {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        nested.join("Cargo.toml"),
+        b"[workspace]\nmembers = [\"crates/ferrl\"]\n",
+    )
+    .unwrap();
+    std::fs::write(nested.join("Cargo.lock"), b"# clean decoy lock\n").unwrap();
+    std::fs::write(
+        nested.join("rust-toolchain.toml"),
+        b"[toolchain]\nchannel = \"stable\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(nested.join(".cargo")).unwrap();
+    std::fs::write(
+        nested.join(".cargo/config.toml"),
+        b"[build]\ntarget-dir = \"target\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(nested.join("crates/ferrl/src")).unwrap();
+    std::fs::write(
+        nested.join("crates/ferrl/Cargo.toml"),
+        b"[package]\nname = \"ferrl\"\nversion = \"0.0.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(nested.join("crates/ferrl/build.rs"), b"fn main() {}\n").unwrap();
+    std::fs::write(
+        nested.join("crates/ferrl/src/lib.rs"),
+        b"pub fn decoy_source() {}\n",
+    )
+    .unwrap();
+    assert!(Command::new("git")
+        .arg("-C")
+        .arg(&nested)
+        .args(["add", "."])
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("git")
+        .arg("-C")
+        .arg(&nested)
+        .args([
+            "-c",
+            "user.name=Ferrl Test",
+            "-c",
+            "user.email=ferrl@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "--no-verify",
+            "-m",
+            "test: seed complete decoy",
+        ])
+        .status()
+        .unwrap()
+        .success());
+    assert!(build_script::source_tree_is_exact(&nested));
 
     let identity = build_script::inspect_source_identity_with_hook(&nested, || {});
     assert_eq!(identity.commit, None);

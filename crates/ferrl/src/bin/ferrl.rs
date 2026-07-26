@@ -9676,6 +9676,9 @@ mod tests {
         std::fs::create_dir_all(&eval_dir).unwrap();
         let image = eval_dir.join("image.sif");
         std::fs::write(&image, b"test image").unwrap();
+        for verifier_file in ["eval.py", "reference.py", "task.py", "utils.py"] {
+            std::fs::write(eval_dir.join(verifier_file), b"# verifier fixture\n").unwrap();
+        }
         std::fs::write(
             eval_dir.join("task.yml"),
             r#"

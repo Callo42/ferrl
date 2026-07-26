@@ -29,6 +29,7 @@ safetensors = { workspace = true }
 sha2 = { workspace = true }
 ring = { workspace = true }
 fs2 = { workspace = true }
+rustix = { workspace = true }
 thiserror = { workspace = true }
 rand = { workspace = true }
 # CLI parsing for the `ferrl` binary (the single-binary front door). Used only by

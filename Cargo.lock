@@ -776,6 +776,7 @@ dependencies = [
  "proptest",
  "rand 0.10.1",
  "ring",
+ "rustix",
  "safetensors 0.7.0",
  "serde",
  "serde_json",
