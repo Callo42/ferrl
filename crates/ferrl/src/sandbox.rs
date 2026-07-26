@@ -24,6 +24,10 @@
 //! - `--nv` only when [`RunSpec::gpu`] is set — GPU passthrough is opt-in;
 //! - read-only / read-write [`Bind`]s for exactly the reference harness and a
 //!   scratch directory, nothing else;
+//! - kernel-sealed anonymous verifier assets are copied into a one-launch private
+//!   tmpfs and the entire tmpfs is remounted read-only before Apptainer resolves
+//!   their paths. The untrusted nested user namespace cannot remount its parent's
+//!   asset filesystem;
 //! - in-image `ulimit`s (CPU, address space, processes, file size), beneath a
 //!   **host-side wall-clock supervisor** that is the final authority on the time
 //!   budget — it kills the run if it overruns, and cannot be evaded from inside
@@ -36,15 +40,17 @@
 //!
 //! ## Testing split (the same shape as [`crate::cuda_compat`])
 //!
-//! The *policy* is pure and fully unit-tested on any machine: [`ApptainerSandbox::build_argv`]
-//! and the in-image-script builder encode every isolation flag and resource cap, and
-//! their tests are **security-invariant regression guards** — they fail if a future
-//! edit drops `--cleanenv`, opens the network, or stops capping processes. The
-//! host-side wall-clock supervisor is tested against a plain subprocess (no
-//! container runtime needed). The proof that Apptainer *actually contains a hostile
-//! payload* — a malicious-probe battery — lives behind the off-by-default `gate`
-//! feature in `tests/sandbox_gate.rs`, run on a cluster node with an isolated
-//! allocation; it is never compiled in CI, just as the GPU tests are not.
+//! The *policy* is pure and fully unit-tested on any machine:
+//! [`ApptainerSandbox::build_argv`], its private-asset host-command builder, and the
+//! in-image-script builder encode every isolation flag and resource cap. Their tests
+//! are **security-invariant regression guards** — they fail if a future edit drops
+//! `--cleanenv`, opens the network, exposes a sealed descriptor through an ordinary
+//! host pathname, or stops capping processes. The host-side wall-clock supervisor is
+//! tested against a plain subprocess (no container runtime needed). The proof that
+//! Apptainer *actually contains a hostile payload* — a malicious-probe battery —
+//! lives behind the off-by-default `gate` feature in `tests/sandbox_gate.rs`, run on
+//! a cluster node with an isolated allocation; it is never compiled in CI, just as
+//! the GPU tests are not.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -405,15 +411,127 @@ impl ApptainerSandbox {
         argv.push(in_container_script(spec));
         argv
     }
+
+    /// Build the host command, interposing a private user/mount namespace when
+    /// Apptainer must consume anonymous descriptor-backed assets.
+    fn build_host_command(&self, spec: &RunSpec) -> Command {
+        let Some((staged_spec, copies)) = stage_descriptor_paths(spec) else {
+            let mut command = Command::new(&self.bin);
+            command.args(self.build_argv(spec));
+            return command;
+        };
+
+        let mut apptainer_argv = self.build_argv(&staged_spec);
+        // The outer unprivileged user namespace owns the private tmpfs mount.
+        // Force Apptainer's non-setuid nested-user-namespace workflow inside it.
+        apptainer_argv.insert(1, "--userns".to_string());
+
+        let mut command = Command::new("unshare");
+        command.args([
+            "--user",
+            "--map-root-user",
+            "--mount",
+            "--propagation",
+            "private",
+            "/bin/bash",
+            "-c",
+            PRIVATE_DESCRIPTOR_STAGE_SCRIPT,
+            "ferrl-private-descriptor-stage",
+        ]);
+        command.arg(copies.len().to_string());
+        for (source, destination) in copies {
+            command.arg(source);
+            command.arg(destination);
+        }
+        command.arg(&self.bin);
+        command.args(apptainer_argv);
+        command
+    }
 }
 
 impl Sandbox for ApptainerSandbox {
     fn run(&self, spec: &RunSpec) -> Result<RunOutcome, SandboxError> {
-        let mut command = Command::new(&self.bin);
-        command.args(self.build_argv(spec));
+        let command = self.build_host_command(spec);
         let scratch_limits = scratch_limits(spec);
         supervise(command, spec.limits.wall, &scratch_limits)
     }
+}
+
+const PRIVATE_DESCRIPTOR_ROOT: &str = "/mnt/ferrl-verifier-assets";
+
+/// The outer namespace mounts a process-private tmpfs over root-owned `/mnt`,
+/// copies only already-authenticated sealed descriptors into it, then remounts the
+/// complete filesystem read-only before Apptainer resolves any pathname. An ordinary
+/// helper in the trainer's host namespace cannot address or replace these private
+/// dentries, and the nested Apptainer user namespace cannot remount a filesystem
+/// owned by its parent namespace. Copy or remount failures abort before Apptainer.
+const PRIVATE_DESCRIPTOR_STAGE_SCRIPT: &str = r#"
+set -euo pipefail
+mount -t tmpfs -o mode=0700,nosuid,nodev,noexec tmpfs /mnt
+mkdir -p /mnt/ferrl-verifier-assets
+remaining="$1"
+shift
+while [ "$remaining" -gt 0 ]; do
+    source="$1"
+    destination="$2"
+    cp -- "$source" "$destination"
+    chmod 0400 "$destination"
+    source_fd="${source##*/}"
+    exec {source_fd}<&-
+    shift 2
+    remaining=$((remaining - 1))
+done
+mount -o remount,ro,nosuid,nodev,noexec tmpfs /mnt
+exec "$@"
+"#;
+
+/// Replace this process's `/proc/<pid>/fd/<n>` assets with regular paths that
+/// exist only inside the private read-only mount namespace used for one launch.
+fn stage_descriptor_paths(spec: &RunSpec) -> Option<(RunSpec, Vec<(PathBuf, PathBuf)>)> {
+    let mut staged = spec.clone();
+    let mut copies = Vec::new();
+
+    if let Some(source) = inherited_descriptor_path(&spec.image) {
+        let destination = private_descriptor_path(copies.len(), Some("sif"));
+        copies.push((source, destination.clone()));
+        staged.image = destination;
+    }
+    for bind in &mut staged.binds {
+        if bind.mode != BindMode::ReadOnly {
+            continue;
+        }
+        let Some(source) = inherited_descriptor_path(&bind.src) else {
+            continue;
+        };
+        let extension = bind.dst.extension().and_then(|value| value.to_str());
+        let destination = private_descriptor_path(copies.len(), extension);
+        copies.push((source, destination.clone()));
+        bind.src = destination;
+    }
+
+    (!copies.is_empty()).then_some((staged, copies))
+}
+
+/// Turn this process's proc-fd pathname into the equivalent inherited handle.
+///
+/// The sealed verifier memfds are created without `CLOEXEC`, so `unshare`, its
+/// shell, and each `cp` child retain the numbered descriptor. A child user
+/// namespace cannot traverse the parent process's proc-fd directory, while
+/// `/proc/self/fd/<n>` resolves the same sealed inode inside every child. The
+/// staging script closes each inherited descriptor before it execs Apptainer.
+fn inherited_descriptor_path(path: &Path) -> Option<PathBuf> {
+    let path = path.to_str()?;
+    let prefix = format!("/proc/{}/fd/", std::process::id());
+    let fd = path.strip_prefix(&prefix)?;
+    if fd.is_empty() || !fd.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some(PathBuf::from(format!("/proc/self/fd/{fd}")))
+}
+
+fn private_descriptor_path(index: usize, extension: Option<&str>) -> PathBuf {
+    let suffix = extension.map_or_else(String::new, |value| format!(".{value}"));
+    PathBuf::from(format!("{PRIVATE_DESCRIPTOR_ROOT}/asset-{index}{suffix}"))
 }
 
 /// Extract writable bind limits from the run spec.
@@ -637,6 +755,12 @@ mod tests {
         argv.iter().position(|s| s.as_str() == needle)
     }
 
+    fn assert_contains_all(argv: &[String], required: &[&str]) {
+        for value in required {
+            assert!(pos(argv, value).is_some(), "host command missing {value:?}");
+        }
+    }
+
     #[test]
     fn argv_always_isolates_env_home_and_namespaces() {
         let argv = ApptainerSandbox::default().build_argv(&spec());
@@ -706,6 +830,97 @@ mod tests {
         assert_eq!(argv[n - 3], "/bin/bash");
         assert_eq!(argv[n - 2], "-c");
         assert!(argv[n - 1].contains("exec 'python'"));
+    }
+
+    fn descriptor_spec() -> (RunSpec, PathBuf, PathBuf, PathBuf) {
+        let pid = std::process::id();
+        let image = PathBuf::from(format!("/proc/{pid}/fd/10"));
+        let eval = PathBuf::from(format!("/proc/{pid}/fd/11"));
+        let scratch = PathBuf::from("/host/scratch");
+        let source_spec = RunSpec::new(&image, vec!["python".into(), "/eval.py".into()])
+            .with_binds(vec![
+                Bind::ro(&eval, "/eval.py"),
+                Bind::rw(&scratch, "/work"),
+            ]);
+        (source_spec, image, eval, scratch)
+    }
+
+    #[test]
+    fn descriptor_assets_are_mapped_to_private_read_only_paths() {
+        let (source_spec, _image, _eval, scratch) = descriptor_spec();
+        let (staged, copies) =
+            stage_descriptor_paths(&source_spec).expect("owned descriptors must be staged");
+        assert_eq!(
+            staged.image,
+            Path::new("/mnt/ferrl-verifier-assets/asset-0.sif")
+        );
+        assert_eq!(
+            staged.binds[0].src,
+            Path::new("/mnt/ferrl-verifier-assets/asset-1.py")
+        );
+        assert_eq!(staged.binds[1].src, scratch);
+        assert_eq!(
+            copies,
+            vec![
+                (PathBuf::from("/proc/self/fd/10"), staged.image.clone()),
+                (
+                    PathBuf::from("/proc/self/fd/11"),
+                    staged.binds[0].src.clone()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn descriptor_assets_use_the_private_namespace_host_command() {
+        let (source_spec, _image, _eval, _scratch) = descriptor_spec();
+        let command = ApptainerSandbox::default().build_host_command(&source_spec);
+        assert_eq!(command.get_program(), "unshare");
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_contains_all(
+            &args,
+            &[
+                "--user",
+                "--map-root-user",
+                "--mount",
+                "private",
+                PRIVATE_DESCRIPTOR_STAGE_SCRIPT,
+                "2",
+                "/proc/self/fd/10",
+                "/proc/self/fd/11",
+                "/mnt/ferrl-verifier-assets/asset-0.sif",
+                "/mnt/ferrl-verifier-assets/asset-1.py",
+                "apptainer",
+                "--userns",
+                "/host/scratch:/work:rw",
+            ],
+        );
+        assert!(PRIVATE_DESCRIPTOR_STAGE_SCRIPT.contains("mount -t tmpfs"));
+        assert!(PRIVATE_DESCRIPTOR_STAGE_SCRIPT.contains("exec {source_fd}<&-"));
+        let remount = PRIVATE_DESCRIPTOR_STAGE_SCRIPT
+            .find("remount,ro")
+            .expect("the private asset filesystem is remounted read-only");
+        let exec = PRIVATE_DESCRIPTOR_STAGE_SCRIPT
+            .find("exec \"$@\"")
+            .expect("Apptainer is exec'd after staging");
+        assert!(
+            remount < exec,
+            "the filesystem must be read-only before Apptainer resolves assets"
+        );
+        assert!(
+            !PRIVATE_DESCRIPTOR_STAGE_SCRIPT.contains("remount,rw"),
+            "the launch must never reopen the verifier asset mount"
+        );
+    }
+
+    #[test]
+    fn ordinary_paths_do_not_need_the_private_staging_wrapper() {
+        assert!(stage_descriptor_paths(&spec()).is_none());
+        let command = ApptainerSandbox::default().build_host_command(&spec());
+        assert_eq!(command.get_program(), "apptainer");
     }
 
     #[test]

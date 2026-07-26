@@ -7,12 +7,38 @@ use std::process::Command;
 const SOURCE_PATHS: &[&str] = &[
     "Cargo.toml",
     "Cargo.lock",
+    "rust-toolchain",
     "rust-toolchain.toml",
     ".cargo/config",
     ".cargo/config.toml",
+    "crates/rust-toolchain",
+    "crates/rust-toolchain.toml",
+    "crates/.cargo/config",
+    "crates/.cargo/config.toml",
     "crates/ferrl/Cargo.toml",
     "crates/ferrl/build.rs",
+    "crates/ferrl/rust-toolchain",
+    "crates/ferrl/rust-toolchain.toml",
+    "crates/ferrl/.cargo/config",
+    "crates/ferrl/.cargo/config.toml",
     "crates/ferrl/src",
+];
+
+/// Cargo and rustup configuration visible when building from either the workspace
+/// root or the supported `crates/ferrl` member directory.
+const BUILD_CONFIGURATION_PATHS: &[&str] = &[
+    "rust-toolchain",
+    "rust-toolchain.toml",
+    ".cargo/config",
+    ".cargo/config.toml",
+    "crates/rust-toolchain",
+    "crates/rust-toolchain.toml",
+    "crates/.cargo/config",
+    "crates/.cargo/config.toml",
+    "crates/ferrl/rust-toolchain",
+    "crates/ferrl/rust-toolchain.toml",
+    "crates/ferrl/.cargo/config",
+    "crates/ferrl/.cargo/config.toml",
 ];
 
 const REQUIRED_SOURCE_FILES: &[&str] = &[
@@ -297,9 +323,10 @@ fn main() {
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=../../Cargo.toml");
     println!("cargo:rerun-if-changed=../../Cargo.lock");
-    println!("cargo:rerun-if-changed=../../rust-toolchain.toml");
-    println!("cargo:rerun-if-changed=../../.cargo/config");
-    println!("cargo:rerun-if-changed=../../.cargo/config.toml");
+    let workspace_root = manifest_dir.join("../..");
+    for path in BUILD_CONFIGURATION_PATHS {
+        watch(&workspace_root.join(path));
+    }
     if let Some(git_dir) = git_path(&manifest_dir, &["rev-parse", "--absolute-git-dir"]) {
         watch(&git_dir.join("HEAD"));
         watch(&git_dir.join("index"));

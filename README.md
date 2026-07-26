@@ -183,8 +183,9 @@ ferrl runreport runs/<run-id> --config run.json
 ```
 
 `ferrl train` accepts only a binary built from a clean Git tree. The build
-embeds its full source commit, so the launch cannot substitute an
-operator-supplied revision at runtime.
+embeds its full source commit and rejects repository-local Cargo or rustup
+configuration shadows from the workspace root through the ferrl member, so the
+launch cannot substitute an operator-supplied revision at runtime.
 
 A `run.json` selects a task, points at a supported model checkpoint, and carries the trainer
 config (only `task`, `model_dir`, and `trainer` are required; everything else has a

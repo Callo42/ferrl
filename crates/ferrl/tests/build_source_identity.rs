@@ -234,6 +234,50 @@ fn exact_source_check_rejects_untracked_cargo_config_and_skip_worktree() {
 }
 
 #[test]
+fn exact_source_check_rejects_member_and_ancestor_build_config_shadows() {
+    const SHADOWS: [(&str, &[u8]); 9] = [
+        ("rust-toolchain", b"nightly\n" as &[u8]),
+        ("crates/rust-toolchain", b"nightly\n" as &[u8]),
+        (
+            "crates/rust-toolchain.toml",
+            b"[toolchain]\nchannel = \"nightly\"\n" as &[u8],
+        ),
+        (
+            "crates/.cargo/config",
+            b"[build]\nrustflags = [\"-Copt-level=3\"]\n" as &[u8],
+        ),
+        (
+            "crates/.cargo/config.toml",
+            b"[build]\nrustflags = [\"-Copt-level=3\"]\n" as &[u8],
+        ),
+        ("crates/ferrl/rust-toolchain", b"nightly\n" as &[u8]),
+        (
+            "crates/ferrl/rust-toolchain.toml",
+            b"[toolchain]\nchannel = \"nightly\"\n" as &[u8],
+        ),
+        (
+            "crates/ferrl/.cargo/config",
+            b"[build]\nrustflags = [\"-Copt-level=3\"]\n" as &[u8],
+        ),
+        (
+            "crates/ferrl/.cargo/config.toml",
+            b"[build]\nrustflags = [\"-Copt-level=3\"]\n" as &[u8],
+        ),
+    ];
+
+    for (path, bytes) in SHADOWS {
+        let repo = TempRepo::seeded();
+        let head = repo.head();
+        assert!(build_script::source_tree_is_exact_at(repo.path(), &head));
+        repo.write(path, bytes);
+        assert!(
+            !build_script::source_tree_is_exact_at(repo.path(), &head),
+            "untracked build-configuration shadow {path} must invalidate provenance"
+        );
+    }
+}
+
+#[test]
 fn build_identity_rejects_non_commit_head() {
     let repo = TempRepo::seeded();
     let tree = String::from_utf8(repo.git(&["rev-parse", "HEAD^{tree}"]).stdout)

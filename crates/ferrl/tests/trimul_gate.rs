@@ -108,10 +108,29 @@ def custom_kernel(data):
 #[test]
 #[ignore = "needs an sm_80 GPU + the eval image/bundle; run with --ignored"]
 fn gate_correct_submission_scores_positive() {
-    let value = score(CORRECT);
+    let outcomes = reward()
+        .reward_group_detailed(
+            &Sample::new("write a faster TriMul kernel", ()),
+            &[CORRECT.to_string()],
+        )
+        .expect("the real eval should produce correctness and benchmark evidence");
+    let outcome = &outcomes[0];
     assert!(
-        value > 0.0,
-        "a correct kernel should score above zero, got {value}"
+        outcome.reward >= 1.0,
+        "a correct kernel should reach the default correctness floor, got {}: {outcome:#?}",
+        outcome.reward,
+    );
+    let metadata = outcome
+        .metadata
+        .as_ref()
+        .expect("the TriMul eval should return structured evidence");
+    assert_eq!(metadata["correct"], serde_json::json!(true));
+    assert_eq!(metadata["benchmark_exit"], serde_json::json!(0));
+    assert!(
+        metadata["geomean_ns"]
+            .as_f64()
+            .is_some_and(|value| value > 0.0),
+        "the correct-candidate smoke must record a positive benchmark geomean: {metadata}"
     );
 }
 

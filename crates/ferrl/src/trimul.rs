@@ -616,10 +616,14 @@ const SANDBOX_EVAL_FILES: [(&str, &str); 4] = [
 ///
 /// The image and every file in the eval tree are copied byte-for-byte into anonymous
 /// Linux memfds with write/grow/shrink/further-seal operations permanently disabled
-/// by the kernel. The image is streamed and hashed in one pass during capture. Exact
-/// sealed descriptors, never writable snapshot pathnames, supply every verifier
-/// invocation; later checks inspect source identities and kernel seals without
-/// repeatedly rereading the potentially multi-gigabyte image.
+/// by the kernel. After sealing, the image descriptor and complete ordered eval
+/// descriptor set are hashed again and compared with the identities captured from
+/// their sources. Exact sealed descriptors, never writable snapshot pathnames, supply
+/// every verifier invocation. Because Apptainer cannot open a deleted memfd pseudo-
+/// pathname directly, the sandbox wrapper copies those sealed bytes into a one-launch
+/// private tmpfs and remounts the complete asset filesystem read-only before Apptainer
+/// resolves it. Later checks inspect source identities and kernel seals without
+/// repeatedly rehashing the potentially multi-gigabyte image.
 #[derive(Debug, Clone)]
 pub struct TrimulVerifierAssets {
     snapshot: Arc<VerifierAssetSnapshot>,
@@ -662,7 +666,7 @@ impl TrimulVerifierAssets {
                 )));
             }
         }
-        let sealed_eval_files = seal_eval_bundle(&eval.files)?;
+        let sealed_eval_files = seal_eval_bundle(&eval.files, &eval.identity)?;
         let identity = TrimulVerifierIdentity {
             image_sha256,
             image_len_bytes: image_stamp.len,
@@ -778,6 +782,14 @@ fn regular_metadata(path: &Path) -> Result<std::fs::Metadata, TrimulAssetError> 
 
 #[cfg(target_os = "linux")]
 fn capture_image(path: &Path) -> Result<(File, FileStamp, String), TrimulAssetError> {
+    capture_image_with_hook(path, |_| {})
+}
+
+#[cfg(target_os = "linux")]
+fn capture_image_with_hook(
+    path: &Path,
+    before_seal: impl FnOnce(&File),
+) -> Result<(File, FileStamp, String), TrimulAssetError> {
     use std::io::{Read as _, Write as _};
 
     let path_metadata = regular_metadata(path)?;
@@ -806,7 +818,7 @@ fn capture_image(path: &Path) -> Result<(File, FileStamp, String), TrimulAssetEr
     let mut sealed_file = File::from(descriptor);
     let mut digest = Sha256::new();
     let mut copied = 0_u64;
-    let mut buffer = [0_u8; 1024 * 1024];
+    let mut buffer = vec![0_u8; 1024 * 1024];
     loop {
         let read = source_file
             .read(&mut buffer)
@@ -838,14 +850,16 @@ fn capture_image(path: &Path) -> Result<(File, FileStamp, String), TrimulAssetEr
             path.display()
         )));
     }
+    let source_sha256 = format!("{:x}", digest.finalize());
+    before_seal(&sealed_file);
     rustix::fs::fcntl_add_seals(&sealed_file, required_asset_seals()).map_err(|source| {
         TrimulAssetError::Io {
             path: path.to_path_buf(),
             source: source.into(),
         }
     })?;
-    verify_sealed_asset(&sealed_file, path, copied)?;
-    Ok((sealed_file, before, format!("{:x}", digest.finalize())))
+    authenticate_sealed_asset(&sealed_file, path, copied, &source_sha256)?;
+    Ok((sealed_file, before, source_sha256))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -975,27 +989,120 @@ fn verify_sealed_asset(file: &File, path: &Path, len: u64) -> Result<(), TrimulA
 }
 
 #[cfg(target_os = "linux")]
+fn update_digest_from_sealed_asset(
+    digest: &mut Sha256,
+    file: &File,
+    path: &Path,
+    len: u64,
+) -> Result<(), TrimulAssetError> {
+    use std::os::unix::fs::FileExt as _;
+
+    verify_sealed_asset(file, path, len)?;
+    let mut offset = 0_u64;
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    while offset < len {
+        let remaining = len - offset;
+        let chunk_len = usize::try_from(remaining.min(buffer.len() as u64))
+            .expect("bounded descriptor-hash chunk fits usize");
+        let read = file
+            .read_at(&mut buffer[..chunk_len], offset)
+            .map_err(|source| TrimulAssetError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if read == 0 {
+            return Err(TrimulAssetError::Invalid(format!(
+                "sealed TriMul verifier asset {} ended before its authenticated length",
+                path.display()
+            )));
+        }
+        digest.update(&buffer[..read]);
+        offset += read as u64;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn sealed_asset_sha256(file: &File, path: &Path, len: u64) -> Result<String, TrimulAssetError> {
+    let mut digest = Sha256::new();
+    update_digest_from_sealed_asset(&mut digest, file, path, len)?;
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+#[cfg(target_os = "linux")]
+fn authenticate_sealed_asset(
+    file: &File,
+    path: &Path,
+    len: u64,
+    expected_sha256: &str,
+) -> Result<(), TrimulAssetError> {
+    if sealed_asset_sha256(file, path, len)? != expected_sha256 {
+        return Err(TrimulAssetError::Invalid(format!(
+            "sealed TriMul verifier asset {} does not match its captured identity",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn sealed_eval_bundle_sha256(files: &[SealedEvalFile]) -> Result<String, TrimulAssetError> {
+    let mut digest = Sha256::new();
+    digest.update(b"ferrl.trimul.eval-bundle.v1\0");
+    for file in files {
+        let path = file.relative_path.to_str().ok_or_else(|| {
+            TrimulAssetError::Invalid("TriMul eval bundle paths must be UTF-8".to_string())
+        })?;
+        digest.update((path.len() as u64).to_le_bytes());
+        digest.update(path.as_bytes());
+        digest.update(file.len.to_le_bytes());
+        update_digest_from_sealed_asset(&mut digest, &file.file, &file.relative_path, file.len)?;
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+#[cfg(target_os = "linux")]
 fn seal_eval_bundle(
     files: &BTreeMap<PathBuf, Vec<u8>>,
+    expected_sha256: &str,
+) -> Result<Vec<SealedEvalFile>, TrimulAssetError> {
+    seal_eval_bundle_with_hook(files, expected_sha256, |_, _| {})
+}
+
+#[cfg(target_os = "linux")]
+fn seal_eval_bundle_with_hook(
+    files: &BTreeMap<PathBuf, Vec<u8>>,
+    expected_sha256: &str,
+    mut before_seal: impl FnMut(&Path, &File),
 ) -> Result<Vec<SealedEvalFile>, TrimulAssetError> {
     use std::io::Write as _;
 
     let mut sealed = Vec::with_capacity(files.len());
     for (index, (relative_path, bytes)) in files.iter().enumerate() {
-        let descriptor = rustix::fs::memfd_create(
-            format!("ferrl-trimul-eval-{index}"),
-            rustix::fs::MemfdFlags::ALLOW_SEALING,
-        )
-        .map_err(|source| TrimulAssetError::Io {
-            path: relative_path.clone(),
-            source: source.into(),
-        })?;
+        // Only descriptors copied by the private sandbox wrapper may cross exec.
+        // Everything else in the attested bundle (notably task.yml and optional
+        // fixtures) remains process-private even though it is retained for identity
+        // checks. The wrapper closes every inherited descriptor after copying it.
+        let sandbox_consumed = SANDBOX_EVAL_FILES
+            .iter()
+            .any(|(path, _)| relative_path == Path::new(path));
+        let flags = if sandbox_consumed {
+            rustix::fs::MemfdFlags::ALLOW_SEALING
+        } else {
+            rustix::fs::MemfdFlags::ALLOW_SEALING | rustix::fs::MemfdFlags::CLOEXEC
+        };
+        let descriptor = rustix::fs::memfd_create(format!("ferrl-trimul-eval-{index}"), flags)
+            .map_err(|source| TrimulAssetError::Io {
+                path: relative_path.clone(),
+                source: source.into(),
+            })?;
         let mut file = File::from(descriptor);
         file.write_all(bytes)
             .map_err(|source| TrimulAssetError::Io {
                 path: relative_path.clone(),
                 source,
             })?;
+        before_seal(relative_path, &file);
         rustix::fs::fcntl_add_seals(&file, required_asset_seals()).map_err(|source| {
             TrimulAssetError::Io {
                 path: relative_path.clone(),
@@ -1010,12 +1117,18 @@ fn seal_eval_bundle(
         sealed_file.verify()?;
         sealed.push(sealed_file);
     }
+    if sealed_eval_bundle_sha256(&sealed)? != expected_sha256 {
+        return Err(TrimulAssetError::Invalid(
+            "sealed TriMul eval bundle does not match its captured identity".to_string(),
+        ));
+    }
     Ok(sealed)
 }
 
 #[cfg(not(target_os = "linux"))]
 fn seal_eval_bundle(
     _files: &BTreeMap<PathBuf, Vec<u8>>,
+    _expected_sha256: &str,
 ) -> Result<Vec<SealedEvalFile>, TrimulAssetError> {
     Err(TrimulAssetError::Invalid(
         "TriMul verifier assets require Linux kernel-sealed memfd storage".to_string(),
@@ -2131,6 +2244,33 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
+    fn verifier_assets_inherit_only_descriptors_consumed_by_the_sandbox() {
+        let (root, image, eval, scratch) = verifier_fixture("descriptor-inheritance");
+        let assets = TrimulVerifierAssets::capture(&image, &eval, &scratch).unwrap();
+        let image_flags = rustix::io::fcntl_getfd(&assets.snapshot.image_file).unwrap();
+        assert!(
+            !image_flags.contains(rustix::io::FdFlags::CLOEXEC),
+            "the image handle must reach the private staging wrapper"
+        );
+        for file in &assets.snapshot.sealed_eval_files {
+            let flags = rustix::io::fcntl_getfd(&file.file).unwrap();
+            let sandbox_consumed = SANDBOX_EVAL_FILES
+                .iter()
+                .any(|(path, _)| file.relative_path == Path::new(path));
+            assert_eq!(
+                flags.contains(rustix::io::FdFlags::CLOEXEC),
+                !sandbox_consumed,
+                "unexpected inheritance policy for {}",
+                file.relative_path.display()
+            );
+        }
+
+        drop(assets);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
     fn verifier_assets_reject_in_flight_mutation_between_sandbox_open_and_use() {
         use std::io::Write as _;
 
@@ -2162,6 +2302,39 @@ mod tests {
 
         drop(reward);
         drop(assets);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn verifier_assets_capture_authenticates_contents_after_sealing() {
+        use std::os::unix::fs::FileExt as _;
+
+        let (root, image, eval_dir, _scratch) = verifier_fixture("pre-seal-mutation");
+        let image_error = capture_image_with_hook(&image, |file| {
+            assert_eq!(file.write_at(b"X", 0).unwrap(), 1);
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            image_error.contains("does not match its captured identity"),
+            "{image_error}"
+        );
+
+        let eval = capture_eval_bundle(&eval_dir).unwrap();
+        let eval_error =
+            seal_eval_bundle_with_hook(&eval.files, &eval.identity, |relative_path, file| {
+                if relative_path == Path::new("eval.py") {
+                    assert_eq!(file.write_at(b"X", 0).unwrap(), 1);
+                }
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            eval_error.contains("does not match its captured identity"),
+            "{eval_error}"
+        );
+
         let _ = std::fs::remove_dir_all(root);
     }
 
