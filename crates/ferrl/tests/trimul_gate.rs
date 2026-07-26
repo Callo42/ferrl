@@ -116,7 +116,6 @@ def custom_kernel(data):
 const MUTATE_SEALED_ASSETS: &str = "```python
 def custom_kernel(data):
     import os
-    import sys
     paths = (
         \"/opt/ferrl-verifier/eval.py\",
         \"/opt/ferrl-verifier/reference.py\",
@@ -134,19 +133,11 @@ def custom_kernel(data):
         except OSError:
             continue
         raise RuntimeError(f\"sealed verifier path was writable: {path}\")
-    # Writable cache survives the shell's test/benchmark boundary. A normal
-    # interpreter would auto-import this hook before the sealed driver; `-I`
-    # must keep it outside the benchmark startup path.
-    user_site = os.path.join(
-        os.path.expanduser(\"~\"),
-        \".local\",
-        \"lib\",
-        f\"python{sys.version_info.major}.{sys.version_info.minor}\",
-        \"site-packages\",
-    )
-    os.makedirs(user_site, exist_ok=True)
-    with open(os.path.join(user_site, \"sitecustomize.py\"), \"w\") as handle:
-        handle.write(\"raise RuntimeError('candidate startup hook executed')\\n\")
+    # Cache/output is the only intentionally writable storage and survives the
+    # shell's test/benchmark boundary without changing any scored input.
+    os.makedirs(\"/work/cache/candidate-output\", exist_ok=True)
+    with open(\"/work/cache/candidate-output/marker\", \"w\") as handle:
+        handle.write(\"candidate-controlled cache bytes\\n\")
     from reference import ref_kernel
     return ref_kernel(data)
 ```";
