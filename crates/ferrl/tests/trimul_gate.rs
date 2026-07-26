@@ -6,6 +6,9 @@
 //! floor plus speed signal, a wrong kernel remains below the correctness floor, and a
 //! hostile kernel is **contained** (the sandbox denies it the network even inside the
 //! torch/triton image) and remains below the correctness floor.
+//! A mutation-sensitive candidate also tries to replace every verifier,
+//! submission, and rendered-case pathname during testing; the same exact sealed
+//! bytes must remain in force through benchmarking.
 //!
 //! Gated behind the off-by-default `gate` feature, so — like the GPU tests — CI never
 //! compiles it. Run on a node with an `sm_80` GPU and the eval bundle:
@@ -105,6 +108,49 @@ def custom_kernel(data):
     return ref_kernel(data)
 ```";
 
+/// Mutation attempt: replace every byte-bearing input after the sandbox has staged
+/// and opened the verifier, while the test worker is executing. All paths must remain
+/// read-only; if any write succeeds, raising prevents an apparently correct result.
+/// A successful correctness + benchmark outcome therefore proves the exact same
+/// sealed verifier, submission, and case bytes survived the between-phase boundary.
+const MUTATE_SEALED_ASSETS: &str = "```python
+def custom_kernel(data):
+    import os
+    import sys
+    paths = (
+        \"/opt/ferrl-verifier/eval.py\",
+        \"/opt/ferrl-verifier/reference.py\",
+        \"/opt/ferrl-verifier/task.py\",
+        \"/opt/ferrl-verifier/utils.py\",
+        \"/opt/ferrl-verifier/ferrl_eval.py\",
+        \"/opt/ferrl-verifier/submission.py\",
+        \"/opt/ferrl-verifier/test_spec.txt\",
+        \"/opt/ferrl-verifier/bench_spec.txt\",
+    )
+    for path in paths:
+        try:
+            with open(path, \"wb\") as handle:
+                handle.write(b\"forged verifier bytes\\n\")
+        except OSError:
+            continue
+        raise RuntimeError(f\"sealed verifier path was writable: {path}\")
+    # Writable cache survives the shell's test/benchmark boundary. A normal
+    # interpreter would auto-import this hook before the sealed driver; `-I`
+    # must keep it outside the benchmark startup path.
+    user_site = os.path.join(
+        os.path.expanduser(\"~\"),
+        \".local\",
+        \"lib\",
+        f\"python{sys.version_info.major}.{sys.version_info.minor}\",
+        \"site-packages\",
+    )
+    os.makedirs(user_site, exist_ok=True)
+    with open(os.path.join(user_site, \"sitecustomize.py\"), \"w\") as handle:
+        handle.write(\"raise RuntimeError('candidate startup hook executed')\\n\")
+    from reference import ref_kernel
+    return ref_kernel(data)
+```";
+
 #[test]
 #[ignore = "needs an sm_80 GPU + the eval image/bundle; run with --ignored"]
 fn gate_correct_submission_scores_positive() {
@@ -170,6 +216,28 @@ fn gate_malicious_submission_is_contained_and_stays_below_correctness_floor() {
 
 #[test]
 #[ignore = "needs an sm_80 GPU + the eval image/bundle; run with --ignored"]
+fn gate_sealed_assets_survive_candidate_mutation_through_benchmark() {
+    let outcomes = reward()
+        .reward_group_detailed(
+            &Sample::new("write a faster TriMul kernel", ()),
+            &[MUTATE_SEALED_ASSETS.to_string()],
+        )
+        .expect("sealed verifier bytes should remain executable through benchmark");
+    let outcome = &outcomes[0];
+    assert!(
+        outcome.reward >= 1.0,
+        "write attempts must fail while correctness and benchmark still pass: {outcome:#?}"
+    );
+    let metadata = outcome
+        .metadata
+        .as_ref()
+        .expect("the mutation control should return structured verifier evidence");
+    assert_eq!(metadata["correct"], serde_json::json!(true));
+    assert_eq!(metadata["benchmark_exit"], serde_json::json!(0));
+}
+
+#[test]
+#[ignore = "needs an sm_80 GPU + the eval image/bundle; run with --ignored"]
 fn gate_no_code_scores_zero() {
     assert_eq!(
         score("I won't write that."),
@@ -205,9 +273,10 @@ def custom_kernel(data):
     return x.clone()
 ```";
 
-/// Forge attempt: hunt the grader's grade fd via /proc and write a fake pass with an
-/// absurd time. The fd IS reachable (documented residual), but the plausibility floor
-/// rejects the absurd time, so it scores zero.
+/// Forge attempt: hunt the grader's protected grade fd via `/proc` and write a fake
+/// pass with an absurd time. The trusted parent is non-dumpable and makes the grade fd
+/// non-inheritable before spawning the candidate worker, so no usable fd should be
+/// found. The timing plausibility floor remains an independent defense in depth.
 const FORGE_PROCFD: &str = "```python
 def custom_kernel(data):
     import os, glob
@@ -244,10 +313,8 @@ fn gate_forged_stdout_stays_below_correctness_floor() {
 #[test]
 #[ignore = "needs an sm_80 GPU + the eval image/bundle; run with --ignored"]
 fn gate_forged_proc_fd_with_absurd_timing_is_rejected() {
-    // The /proc fd DOES reach the grade channel (a documented residual — the candidate
-    // worker shares the grader's PID namespace + uid), but its absurd forged time is
-    // caught by the plausibility floor, so it scores zero. A plausible-time /proc forge
-    // remains a known residual, closed only by per-candidate PID-namespace isolation.
+    // The protected parent fd should be unreachable; even a future descriptor leak
+    // must not turn this physically impossible timing into accepted evidence.
     assert_eq!(
         score(FORGE_PROCFD),
         0.0,

@@ -24,10 +24,10 @@
 //! - `--nv` only when [`RunSpec::gpu`] is set — GPU passthrough is opt-in;
 //! - read-only / read-write [`Bind`]s for exactly the reference harness and a
 //!   scratch directory, nothing else;
-//! - kernel-sealed anonymous verifier assets are copied into a one-launch private
-//!   tmpfs, the entire tmpfs is remounted read-only, and every staged byte is
-//!   compared with its sealed source before Apptainer resolves the path. The
-//!   untrusted nested user namespace cannot remount its parent's asset filesystem;
+//! - kernel-sealed anonymous verifier assets are copied through retained file
+//!   descriptors to exclusive files in a one-launch private tmpfs. The tmpfs is
+//!   remounted read-only, then every path and byte is reauthenticated against its
+//!   sealed source before Apptainer resolves it;
 //! - in-image `ulimit`s (CPU, address space, processes, file size), beneath a
 //!   **host-side wall-clock supervisor** that is the final authority on the time
 //!   budget — it owns a fresh process group and kills the complete launch tree if
@@ -54,7 +54,7 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -317,6 +317,9 @@ pub struct RunOutcome {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum SandboxError {
+    /// Host paths or launch configuration violate the private-stage preflight.
+    #[error("invalid sandbox run specification: {0}")]
+    InvalidSpec(String),
     /// The sandbox process could not be spawned (e.g. `apptainer` not on `PATH`).
     #[error("failed to spawn sandbox process: {0}")]
     Spawn(#[source] std::io::Error),
@@ -433,7 +436,7 @@ impl ApptainerSandbox {
     /// calls always pass `none`, while the regression can deterministically alter
     /// a completed staged file before the read-only/authentication boundary.
     fn build_host_command_with_stage_fault(&self, spec: &RunSpec, stage_fault: &str) -> Command {
-        let Some((staged_spec, copies)) = stage_descriptor_paths(spec) else {
+        let Some((staged_spec, mounts)) = stage_descriptor_paths(spec) else {
             let mut command = Command::new(&self.bin);
             command.args(self.build_argv(spec));
             return command;
@@ -455,14 +458,13 @@ impl ApptainerSandbox {
             "--mount-proc",
             "--propagation",
             "private",
-            "/bin/bash",
+            "/usr/bin/python3",
             "-c",
             PRIVATE_DESCRIPTOR_STAGE_SCRIPT,
-            "ferrl-private-descriptor-stage",
         ]);
-        command.arg(copies.len().to_string());
+        command.arg(mounts.len().to_string());
         command.arg(stage_fault);
-        for (source, destination) in copies {
+        for (source, destination) in mounts {
             command.arg(source);
             command.arg(destination);
         }
@@ -474,6 +476,7 @@ impl ApptainerSandbox {
 
 impl Sandbox for ApptainerSandbox {
     fn run(&self, spec: &RunSpec) -> Result<RunOutcome, SandboxError> {
+        validate_private_stage_preflight(spec, &self.bin)?;
         let command = self.build_host_command(spec);
         let scratch_limits = scratch_limits(spec);
         supervise(
@@ -487,65 +490,146 @@ impl Sandbox for ApptainerSandbox {
 
 const PRIVATE_DESCRIPTOR_ROOT: &str = "/mnt";
 
-/// The outer namespace mounts a process-private tmpfs over root-owned `/mnt`,
-/// copies only already-authenticated sealed descriptors into a non-traversable
-/// tmpfs, then atomically makes the mount traversable and read-only and compares every
-/// staged file with its sealed source before Apptainer resolves any pathname. An
-/// ordinary same-UID helper cannot traverse the directory while a writable file is
-/// being populated; after population every file is non-writable and the mount is
-/// read-only. The nested Apptainer user namespace cannot remount a filesystem owned
-/// by its parent namespace. Copy, remount, or authentication failure aborts before
-/// Apptainer and therefore before the verifier-entry protocol token.
+/// The outer namespace makes itself non-dumpable before mounting, preventing a
+/// same-UID helper from reopening its mount view or retained descriptors through
+/// procfs. Each destination is created with `O_EXCL|O_NOFOLLOW` and retained by fd.
+/// After chmod plus the read-only remount, the pathname must still be the same
+/// single-link regular inode on the expected tmpfs before its bytes are compared
+/// with the sealed source. Only then are handles closed and Apptainer executed.
 const PRIVATE_DESCRIPTOR_STAGE_SCRIPT: &str = r#"
-set -euo pipefail
-mount -t tmpfs -o mode=000,nosuid,nodev,noexec tmpfs /mnt
-remaining="$1"
-stage_fault="$2"
-shift 2
-declare -a sources=()
-declare -a destinations=()
-while [ "$remaining" -gt 0 ]; do
-    source="$1"
-    destination="$2"
-    cp -- "$source" "$destination"
-    chmod 0400 "$destination"
-    sources+=("$source")
-    destinations+=("$destination")
-    shift 2
-    remaining=$((remaining - 1))
-done
-case "$stage_fault" in
-    none) ;;
-    replace-first) printf 'forged staged verifier bytes\n' > "${destinations[0]}" ;;
-    orphan-after-mount)
-        host_pid="$(awk '/^NSpid:/ { print $2 }' /proc/self/status)"
-        printf 'private-stage-host-pid:%s\n' "$host_pid" >&2
-        setsid sleep 30 &
-        wait
-        ;;
-    *) printf 'unknown private-stage fault selector\n' >&2; exit 125 ;;
-esac
-mount -o remount,ro,mode=0500,nosuid,nodev,noexec tmpfs /mnt
-for index in "${!sources[@]}"; do
-    if ! cmp -s -- "${sources[$index]}" "${destinations[$index]}"; then
-        printf 'private verifier asset authentication failed\n' >&2
-        exit 125
-    fi
-    source_fd="${sources[$index]##*/}"
-    exec {source_fd}<&-
-done
-exec "$@"
+import ctypes
+import os
+import stat
+import subprocess
+import sys
+import tempfile
+
+PR_SET_DUMPABLE = 4
+ROOT = "/mnt"
+
+
+def fail(message):
+    print(message, file=sys.stderr, flush=True)
+    raise SystemExit(125)
+
+
+if ctypes.CDLL(None, use_errno=True).prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) != 0:
+    fail("private verifier stage could not disable procfs inspection")
+
+remaining = int(sys.argv[1])
+stage_fault = sys.argv[2]
+cursor = 3
+assets = []
+subprocess.run(
+    ["mount", "-t", "tmpfs", "-o", "mode=0700,nosuid,nodev,noexec", "tmpfs", ROOT],
+    check=True,
+)
+
+for _ in range(remaining):
+    source = sys.argv[cursor]
+    destination = sys.argv[cursor + 1]
+    cursor += 2
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+    destination_fd = os.open(destination, flags, 0o400)
+    source_fd = os.open(source, os.O_RDONLY | os.O_CLOEXEC)
+    while True:
+        chunk = os.read(source_fd, 1024 * 1024)
+        if not chunk:
+            break
+        view = memoryview(chunk)
+        while view:
+            written = os.write(destination_fd, view)
+            view = view[written:]
+    os.close(source_fd)
+    os.fchmod(destination_fd, 0o400)
+    assets.append((source, destination, destination_fd, os.fstat(destination_fd)))
+
+external_file = None
+if stage_fault == "replace-first":
+    os.ftruncate(assets[0][2], 0)
+    os.write(assets[0][2], b"forged staged verifier bytes\n")
+elif stage_fault == "symlink-first":
+    external_file = tempfile.TemporaryFile(prefix="ferrl-stage-external-")
+    external_file.write(b"external forged verifier bytes\n")
+    external_file.flush()
+    os.unlink(assets[0][1])
+    os.symlink(f"/proc/self/fd/{external_file.fileno()}", assets[0][1])
+elif stage_fault == "orphan-after-mount":
+    mount_namespace = os.readlink("/proc/self/ns/mnt")
+    print(f"private-stage-mount-ns:{mount_namespace}", file=sys.stderr, flush=True)
+    process = subprocess.Popen(["setsid", "sleep", "30"])
+    process.wait()
+elif stage_fault != "none":
+    fail("unknown private-stage fault selector")
+
+# A writable file description prevents a read-only remount. Reopen each retained
+# inode read-only through our own protected proc-fd view, prove it is the same
+# inode created above, and close the writable description before remounting.
+read_only_assets = []
+for source, destination, destination_fd, retained in assets:
+    read_only_fd = os.open(
+        f"/proc/self/fd/{destination_fd}", os.O_RDONLY | os.O_CLOEXEC
+    )
+    read_only = os.fstat(read_only_fd)
+    if (read_only.st_dev, read_only.st_ino) != (retained.st_dev, retained.st_ino):
+        fail("private verifier retained inode changed during staging")
+    if read_only.st_nlink != 1:
+        fail("private verifier retained inode was unlinked during staging")
+    os.close(destination_fd)
+    read_only_assets.append((source, destination, read_only_fd, retained))
+assets = read_only_assets
+
+os.chmod(ROOT, 0o500)
+subprocess.run(
+    ["mount", "-o", "remount,ro,nosuid,nodev,noexec", "tmpfs", ROOT],
+    check=True,
+)
+filesystem = subprocess.run(
+    ["stat", "-f", "-c", "%T", ROOT],
+    check=True,
+    stdout=subprocess.PIPE,
+    universal_newlines=True,
+).stdout.strip()
+if filesystem != "tmpfs":
+    fail("private verifier stage is not backed by tmpfs")
+root_device = os.stat(ROOT, follow_symlinks=False).st_dev
+
+for source, destination, destination_fd, retained in assets:
+    visible = os.stat(destination, follow_symlinks=False)
+    if not stat.S_ISREG(visible.st_mode):
+        fail("private verifier destination is not a regular inode")
+    if visible.st_nlink != 1 or visible.st_dev != root_device:
+        fail("private verifier destination escaped the expected tmpfs")
+    if (visible.st_dev, visible.st_ino) != (retained.st_dev, retained.st_ino):
+        fail("private verifier destination inode changed during staging")
+    os.lseek(destination_fd, 0, os.SEEK_SET)
+    source_fd = os.open(source, os.O_RDONLY | os.O_CLOEXEC)
+    while True:
+        expected = os.read(source_fd, 1024 * 1024)
+        actual = os.read(destination_fd, 1024 * 1024)
+        if expected != actual:
+            fail("private verifier asset authentication failed")
+        if not expected:
+            break
+    os.close(source_fd)
+
+for source, _, destination_fd, _ in assets:
+    os.close(destination_fd)
+    os.close(int(source.rsplit("/", 1)[1]))
+if external_file is not None:
+    external_file.close()
+os.execvp(sys.argv[cursor], sys.argv[cursor:])
 "#;
 
 /// Replace this process's `/proc/<pid>/fd/<n>` assets with regular paths that
 /// exist only inside the private read-only mount namespace used for one launch.
 fn stage_descriptor_paths(spec: &RunSpec) -> Option<(RunSpec, Vec<(PathBuf, PathBuf)>)> {
     let mut staged = spec.clone();
-    let mut copies = Vec::new();
+    let mut mounts = Vec::new();
 
     if let Some(source) = inherited_descriptor_path(&spec.image) {
-        let destination = private_descriptor_path(copies.len(), Some("sif"));
-        copies.push((source, destination.clone()));
+        let destination = private_descriptor_path(mounts.len(), Some("sif"));
+        mounts.push((source, destination.clone()));
         staged.image = destination;
     }
     for bind in &mut staged.binds {
@@ -556,18 +640,73 @@ fn stage_descriptor_paths(spec: &RunSpec) -> Option<(RunSpec, Vec<(PathBuf, Path
             continue;
         };
         let extension = bind.dst.extension().and_then(|value| value.to_str());
-        let destination = private_descriptor_path(copies.len(), extension);
-        copies.push((source, destination.clone()));
+        let destination = private_descriptor_path(mounts.len(), extension);
+        mounts.push((source, destination.clone()));
         bind.src = destination;
     }
 
-    (!copies.is_empty()).then_some((staged, copies))
+    (!mounts.is_empty()).then_some((staged, mounts))
+}
+
+/// Mounting the process-private tmpfs over `/mnt` must never hide an input that
+/// the runtime still needs to resolve. Descriptor destinations intentionally
+/// live there; configured image, bind-source, and executable paths may not.
+fn validate_private_stage_preflight(spec: &RunSpec, bin: &Path) -> Result<(), SandboxError> {
+    if stage_descriptor_paths(spec).is_none() {
+        return Ok(());
+    }
+    let hidden = Path::new(PRIVATE_DESCRIPTOR_ROOT);
+    let mut paths = vec![("sandbox image", spec.image.as_path())];
+    paths.extend(
+        spec.binds
+            .iter()
+            .map(|bind| ("bind source", bind.src.as_path())),
+    );
+    for (label, path) in paths {
+        if resolves_within(path, hidden) {
+            return Err(SandboxError::InvalidSpec(format!(
+                "{label} {} would be hidden by the private verifier mount at {}",
+                path.display(),
+                hidden.display()
+            )));
+        }
+    }
+    if resolve_executable(bin).is_some_and(|path| resolves_within(&path, hidden)) {
+        return Err(SandboxError::InvalidSpec(format!(
+            "sandbox executable {} would be hidden by the private verifier mount at {}",
+            bin.display(),
+            hidden.display()
+        )));
+    }
+    Ok(())
+}
+
+fn resolves_within(path: &Path, root: &Path) -> bool {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
+    };
+    std::fs::canonicalize(&absolute)
+        .unwrap_or(absolute)
+        .starts_with(root)
+}
+
+fn resolve_executable(bin: &Path) -> Option<PathBuf> {
+    if bin.components().count() > 1 {
+        return Some(bin.to_path_buf());
+    }
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .map(|directory| directory.join(bin))
+        .find(|candidate| candidate.is_file())
 }
 
 /// Turn this process's proc-fd pathname into the equivalent inherited handle.
 ///
-/// The sealed verifier memfds are created without `CLOEXEC`, so `unshare`, its
-/// shell, and each `cp` child retain the numbered descriptor. A child user
+/// The sealed verifier memfds are created without `CLOEXEC`, so `unshare` and its
+/// descriptor-copying Python child retain the numbered descriptor. A child user
 /// namespace cannot traverse the parent process's proc-fd directory, while
 /// `/proc/self/fd/<n>` resolves the same sealed inode inside every child. The
 /// staging script closes each inherited descriptor after the authenticated
@@ -676,10 +815,26 @@ enum EntryProtocol {
 /// (wall-clock) by killing the process if it overruns. The concurrent drain avoids
 /// the classic pipe-buffer deadlock; the kill is the final authority over a runaway.
 fn supervise(
+    command: Command,
+    deadline: Duration,
+    scratch_limits: &[ScratchLimit],
+    entry_protocol: EntryProtocol,
+) -> Result<RunOutcome, SandboxError> {
+    supervise_with_post_spawn_hook(
+        command,
+        deadline,
+        scratch_limits,
+        entry_protocol,
+        |_| Ok(()),
+    )
+}
+
+fn supervise_with_post_spawn_hook(
     mut command: Command,
     deadline: Duration,
     scratch_limits: &[ScratchLimit],
     entry_protocol: EntryProtocol,
+    post_spawn: impl FnOnce(u32) -> std::io::Result<()>,
 ) -> Result<RunOutcome, SandboxError> {
     command
         .stdin(Stdio::null())
@@ -687,30 +842,39 @@ fn supervise(
         .stderr(Stdio::piped());
     configure_process_tree(&mut command);
     let start = Instant::now();
-    let mut child = command.spawn().map_err(SandboxError::Spawn)?;
-    let out = drain(child.stdout.take());
-    let err = drain(child.stderr.take());
+    let child = command.spawn().map_err(SandboxError::Spawn)?;
+    let mut child = ProcessTreeGuard::new(child);
+    post_spawn(child.id()).map_err(SandboxError::Supervise)?;
+    let out = drain(child.child_mut().stdout.take());
+    let err = drain(child.child_mut().stderr.take());
 
     let mut timed_out = false;
     let mut scratch_exceeded = false;
     let status = loop {
-        if let Some(status) = child.try_wait().map_err(SandboxError::Supervise)? {
+        if let Some(status) = child
+            .child_mut()
+            .try_wait()
+            .map_err(SandboxError::Supervise)?
+        {
             scratch_exceeded = scratch_over_limit(scratch_limits);
             // A launcher may exit while a descendant still holds output pipes,
             // descriptors, or its mount namespace. Reap the residual group on
             // every terminal path, not only timeout/scratch enforcement.
-            terminate_process_tree(&mut child);
+            child.terminate_residuals();
+            child.disarm();
             break status;
         }
         if start.elapsed() >= deadline {
-            terminate_process_tree(&mut child);
             timed_out = true;
-            break child.wait().map_err(SandboxError::Supervise)?;
+            break child
+                .terminate_and_wait()
+                .map_err(SandboxError::Supervise)?;
         }
         if scratch_over_limit(scratch_limits) {
-            terminate_process_tree(&mut child);
             scratch_exceeded = true;
-            break child.wait().map_err(SandboxError::Supervise)?;
+            break child
+                .terminate_and_wait()
+                .map_err(SandboxError::Supervise)?;
         }
         thread::sleep(POLL_INTERVAL);
     };
@@ -727,6 +891,53 @@ fn supervise(
         stderr,
         wall: start.elapsed(),
     })
+}
+
+/// Armed immediately after spawn. Any subsequent error or unwind kills the
+/// complete process group and waits for its leader before stack unwinding can
+/// release inherited descriptors or the private mount namespace unsafely.
+struct ProcessTreeGuard {
+    child: Child,
+    armed: bool,
+}
+
+impl ProcessTreeGuard {
+    fn new(child: Child) -> Self {
+        Self { child, armed: true }
+    }
+
+    fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+
+    fn terminate_residuals(&mut self) {
+        terminate_process_tree(&mut self.child);
+    }
+
+    fn terminate_and_wait(&mut self) -> std::io::Result<ExitStatus> {
+        self.terminate_residuals();
+        let status = self.child.wait()?;
+        self.armed = false;
+        Ok(status)
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ProcessTreeGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.terminate_residuals();
+            let _ = self.child.wait();
+            self.armed = false;
+        }
+    }
 }
 
 /// Give every launch a fresh process group before `exec`. The process group
@@ -972,7 +1183,7 @@ mod tests {
     #[test]
     fn descriptor_assets_are_mapped_to_private_read_only_paths() {
         let (source_spec, _image, _eval, scratch) = descriptor_spec();
-        let (staged, copies) =
+        let (staged, mounts) =
             stage_descriptor_paths(&source_spec).expect("owned descriptors must be staged");
         assert_eq!(staged.image, Path::new("/mnt/ferrl-verifier-asset-0.sif"));
         assert_eq!(
@@ -981,7 +1192,7 @@ mod tests {
         );
         assert_eq!(staged.binds[1].src, scratch);
         assert_eq!(
-            copies,
+            mounts,
             vec![
                 (PathBuf::from("/proc/self/fd/10"), staged.image.clone()),
                 (
@@ -1012,6 +1223,7 @@ mod tests {
                 "--fork",
                 "--kill-child=KILL",
                 "--mount-proc",
+                "/usr/bin/python3",
                 "private",
                 PRIVATE_DESCRIPTOR_STAGE_SCRIPT,
                 "2",
@@ -1025,25 +1237,32 @@ mod tests {
                 "/host/scratch:/work:rw",
             ],
         );
-        assert!(PRIVATE_DESCRIPTOR_STAGE_SCRIPT.contains("mount -t tmpfs"));
-        assert!(PRIVATE_DESCRIPTOR_STAGE_SCRIPT.contains("mode=000"));
-        assert!(PRIVATE_DESCRIPTOR_STAGE_SCRIPT.contains("remount,ro,mode=0500"));
-        assert!(PRIVATE_DESCRIPTOR_STAGE_SCRIPT.contains("exec {source_fd}<&-"));
+        assert!(PRIVATE_DESCRIPTOR_STAGE_SCRIPT.contains("mode=0700"));
+        assert!(PRIVATE_DESCRIPTOR_STAGE_SCRIPT.contains("os.O_EXCL | os.O_NOFOLLOW"));
+        assert!(PRIVATE_DESCRIPTOR_STAGE_SCRIPT.contains("follow_symlinks=False"));
+        assert!(PRIVATE_DESCRIPTOR_STAGE_SCRIPT.contains("os.fstat(destination_fd)"));
+        assert!(PRIVATE_DESCRIPTOR_STAGE_SCRIPT.contains("PR_SET_DUMPABLE"));
         let remount = PRIVATE_DESCRIPTOR_STAGE_SCRIPT
             .find("remount,ro")
             .expect("the private asset filesystem is remounted read-only");
         let authenticate = PRIVATE_DESCRIPTOR_STAGE_SCRIPT
-            .find("cmp -s")
+            .find("expected != actual")
             .expect("the staged bytes are compared with the sealed descriptors");
+        let writable_close = PRIVATE_DESCRIPTOR_STAGE_SCRIPT
+            .find("os.close(destination_fd)")
+            .expect("writable destination descriptors are closed before remount");
         let close = PRIVATE_DESCRIPTOR_STAGE_SCRIPT
-            .find("exec {source_fd}<&-")
-            .expect("sealed descriptors are closed before Apptainer starts");
+            .rfind("os.close(destination_fd)")
+            .expect("read-only retained descriptors are closed before Apptainer starts");
         let exec = PRIVATE_DESCRIPTOR_STAGE_SCRIPT
-            .find("exec \"$@\"")
+            .find("os.execvp")
             .expect("Apptainer is exec'd after staging");
         assert!(
-            remount < authenticate && authenticate < close && close < exec,
-            "read-only remount, byte authentication, descriptor close, and Apptainer exec must be ordered"
+            writable_close < remount
+                && remount < authenticate
+                && authenticate < close
+                && close < exec,
+            "writable close, read-only remount, byte authentication, final close, and Apptainer exec must be ordered"
         );
         assert!(
             !PRIVATE_DESCRIPTOR_STAGE_SCRIPT.contains("remount,rw"),
@@ -1056,6 +1275,25 @@ mod tests {
         assert!(stage_descriptor_paths(&spec()).is_none());
         let command = ApptainerSandbox::default().build_host_command(&spec());
         assert_eq!(command.get_program(), "apptainer");
+    }
+
+    #[test]
+    fn private_stage_preflight_rejects_hidden_bind_sources_and_executables() {
+        let (source_spec, _, _, _) = descriptor_spec();
+        let hidden_bind = RunSpec {
+            binds: vec![Bind::rw("/mnt/colliding-scratch", "/work")],
+            ..source_spec.clone()
+        };
+        let error = validate_private_stage_preflight(&hidden_bind, Path::new("/bin/true"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("bind source /mnt/colliding-scratch would be hidden"));
+
+        let error =
+            validate_private_stage_preflight(&source_spec, Path::new("/mnt/colliding-apptainer"))
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("sandbox executable /mnt/colliding-apptainer would be hidden"));
     }
 
     #[test]
@@ -1316,10 +1554,115 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    fn wait_for_descendant_pid(path: &Path) -> u32 {
+        let started = Instant::now();
+        loop {
+            if let Ok(value) = std::fs::read_to_string(path) {
+                if let Ok(pid) = value.trim().parse() {
+                    return pid;
+                }
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "child did not publish its descendant pid"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_process_gone(pid: u32) {
+        let proc_path = PathBuf::from(format!("/proc/{pid}"));
+        let started = Instant::now();
+        while proc_path.exists() && started.elapsed() < Duration::from_secs(2) {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !proc_path.exists(),
+            "descendant {pid} survived guard teardown"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn mount_namespace_is_live(namespace: &str) -> bool {
+        std::fs::read_dir("/proc").is_ok_and(|entries| {
+            entries.flatten().any(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.bytes().all(|byte| byte.is_ascii_digit()))
+                    && std::fs::read_link(entry.path().join("ns/mnt"))
+                        .is_ok_and(|target| target.to_string_lossy() == namespace)
+            })
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_spawn_supervision_error_drops_through_armed_tree_guard() {
+        let root =
+            std::env::temp_dir().join(format!("ferrl-post-spawn-error-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let pid_file = root.join("descendant.pid");
+        let script = format!(
+            "sleep 30 & printf '%s\\n' \"$!\" > {}; wait",
+            shell_quote(&pid_file.display().to_string())
+        );
+        let error = supervise_with_post_spawn_hook(
+            sh(&script),
+            Duration::from_secs(5),
+            &[],
+            EntryProtocol::NotRequired,
+            |_| {
+                let _ = wait_for_descendant_pid(&pid_file);
+                Err(std::io::Error::other(
+                    "injected post-spawn supervision error",
+                ))
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, SandboxError::Supervise(_)));
+        let descendant = wait_for_descendant_pid(&pid_file);
+        assert_process_gone(descendant);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_spawn_unwind_drops_through_armed_tree_guard() {
+        let root =
+            std::env::temp_dir().join(format!("ferrl-post-spawn-unwind-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let pid_file = root.join("descendant.pid");
+        let script = format!(
+            "sleep 30 & printf '%s\\n' \"$!\" > {}; wait",
+            shell_quote(&pid_file.display().to_string())
+        );
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = supervise_with_post_spawn_hook(
+                sh(&script),
+                Duration::from_secs(5),
+                &[],
+                EntryProtocol::NotRequired,
+                |_| {
+                    let _ = wait_for_descendant_pid(&pid_file);
+                    panic!("injected post-spawn unwind")
+                },
+            );
+        }));
+        assert!(unwind.is_err());
+        let descendant = wait_for_descendant_pid(&pid_file);
+        assert_process_gone(descendant);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "needs unprivileged user/mount namespaces"]
-    fn private_stage_rejects_deterministic_post_copy_mutation() {
+    fn private_stage_rejects_deterministic_post_stage_mutation() {
         use std::io::Write as _;
         use std::os::fd::AsRawFd as _;
 
@@ -1339,12 +1682,16 @@ mod tests {
         )
         .unwrap();
         rustix::io::fcntl_setfd(&file, rustix::io::FdFlags::empty()).unwrap();
-        let image = PathBuf::from(format!(
+        let submission = PathBuf::from(format!(
             "/proc/{}/fd/{}",
             std::process::id(),
             file.as_raw_fd()
         ));
-        let source_spec = RunSpec::new(image, vec!["true".into()]);
+        let source_spec =
+            RunSpec::new("/bin/true", vec!["true".into()]).with_binds(vec![Bind::ro(
+                submission,
+                "/opt/ferrl-verifier/submission.py",
+            )]);
         let command = ApptainerSandbox::with_bin("/bin/true")
             .build_host_command_with_stage_fault(&source_spec, "replace-first");
         let error = supervise(
@@ -1354,13 +1701,70 @@ mod tests {
             EntryProtocol::Required,
         )
         .unwrap_err();
-        assert!(matches!(
-            error,
+        assert!(
+            matches!(
+                &error,
+                SandboxError::Infrastructure {
+                    status: RunStatus::Exited(125),
+                    stderr,
+                } if stderr.contains("private verifier asset authentication failed")
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs unprivileged user/mount namespaces"]
+    fn private_stage_rejects_destination_symlink_substitution() {
+        use std::io::Write as _;
+        use std::os::fd::AsRawFd as _;
+
+        let descriptor = rustix::fs::memfd_create(
+            "ferrl-private-stage-symlink",
+            rustix::fs::MemfdFlags::ALLOW_SEALING,
+        )
+        .unwrap();
+        let mut file = std::fs::File::from(descriptor);
+        file.write_all(b"attested verifier bytes\n").unwrap();
+        rustix::fs::fcntl_add_seals(
+            &file,
+            rustix::fs::SealFlags::WRITE
+                | rustix::fs::SealFlags::GROW
+                | rustix::fs::SealFlags::SHRINK
+                | rustix::fs::SealFlags::SEAL,
+        )
+        .unwrap();
+        rustix::io::fcntl_setfd(&file, rustix::io::FdFlags::empty()).unwrap();
+        let submission = PathBuf::from(format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            file.as_raw_fd()
+        ));
+        let source_spec =
+            RunSpec::new("/bin/true", vec!["true".into()]).with_binds(vec![Bind::ro(
+                submission,
+                "/opt/ferrl-verifier/submission.py",
+            )]);
+        let command = ApptainerSandbox::with_bin("/bin/true")
+            .build_host_command_with_stage_fault(&source_spec, "symlink-first");
+        let error = supervise(
+            command,
+            Duration::from_secs(10),
+            &[],
+            EntryProtocol::Required,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                &error,
             SandboxError::Infrastructure {
                 status: RunStatus::Exited(125),
-                ref stderr,
-            } if stderr.contains("private verifier asset authentication failed")
-        ));
+                stderr,
+                } if stderr.contains("private verifier retained inode was unlinked during staging")
+            ),
+            "{error:?}"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -1406,20 +1810,19 @@ mod tests {
             other => panic!("unexpected stage-timeout error: {other:?}"),
         };
         assert_eq!(status, RunStatus::TimedOut);
-        let host_pid = stderr
+        let mount_namespace = stderr
             .lines()
-            .find_map(|line| line.strip_prefix("private-stage-host-pid:"))
-            .unwrap()
-            .parse::<u32>()
+            .find_map(|line| line.strip_prefix("private-stage-mount-ns:"))
             .unwrap();
-        let proc_path = PathBuf::from(format!("/proc/{host_pid}"));
         let wait_started = Instant::now();
-        while proc_path.exists() && wait_started.elapsed() < Duration::from_secs(2) {
+        while mount_namespace_is_live(mount_namespace)
+            && wait_started.elapsed() < Duration::from_secs(2)
+        {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(
-            !proc_path.exists(),
-            "private namespace init {host_pid} and its tmpfs mount survived timeout cleanup"
+            !mount_namespace_is_live(mount_namespace),
+            "private mount namespace {mount_namespace} survived timeout cleanup"
         );
     }
 
