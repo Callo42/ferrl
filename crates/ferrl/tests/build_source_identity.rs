@@ -234,6 +234,37 @@ fn exact_source_check_rejects_untracked_cargo_config_and_skip_worktree() {
 }
 
 #[test]
+fn exact_source_check_rejects_staged_only_source_divergence() {
+    let repo = TempRepo::seeded();
+    let head = repo.head();
+    let source = repo.path().join("crates/ferrl/src/lib.rs");
+    let committed = std::fs::read(&source).unwrap();
+
+    repo.write("crates/ferrl/src/lib.rs", b"pub fn staged_only() {}\n");
+    assert!(repo
+        .git(&["add", "--", "crates/ferrl/src/lib.rs"])
+        .status
+        .success());
+    std::fs::write(&source, committed).unwrap();
+    assert_eq!(
+        std::fs::read(&source).unwrap(),
+        b"pub fn exact() {}\n",
+        "the worktree bytes must be restored to the committed source"
+    );
+    assert!(
+        !repo
+            .git(&["diff", "--cached", "--quiet", "--"])
+            .status
+            .success(),
+        "the index mutation must remain staged after worktree restoration"
+    );
+    assert!(
+        !build_script::source_tree_is_exact_at(repo.path(), &head),
+        "cached-index validation must independently reject staged-only divergence"
+    );
+}
+
+#[test]
 fn exact_source_check_rejects_member_and_ancestor_build_config_shadows() {
     const SHADOWS: [(&str, &[u8]); 9] = [
         ("rust-toolchain", b"nightly\n" as &[u8]),
@@ -274,6 +305,50 @@ fn exact_source_check_rejects_member_and_ancestor_build_config_shadows() {
             !build_script::source_tree_is_exact_at(repo.path(), &head),
             "untracked build-configuration shadow {path} must invalidate provenance"
         );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn exact_source_check_rejects_symlinked_root_and_member_cargo_parents() {
+    use std::os::unix::fs::symlink;
+
+    for relative in [".cargo", "crates/ferrl/.cargo"] {
+        let repo = TempRepo::seeded();
+        let head = repo.head();
+        assert!(build_script::source_tree_is_exact_at(repo.path(), &head));
+
+        let external = repo.path().with_extension(format!(
+            "external-cargo-{}",
+            relative.replace(['/', '.'], "-")
+        ));
+        std::fs::create_dir_all(&external).unwrap();
+        if relative == ".cargo" {
+            std::fs::write(
+                external.join("config.toml"),
+                b"[build]\ntarget-dir = \"target\"\n",
+            )
+            .unwrap();
+            std::fs::remove_file(repo.path().join(".cargo/config.toml")).unwrap();
+        } else {
+            std::fs::write(
+                external.join("config.toml"),
+                b"[build]\nrustflags = [\"-Copt-level=3\"]\n",
+            )
+            .unwrap();
+        }
+        std::fs::remove_dir(repo.path().join(relative)).unwrap_or_else(|error| {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                panic!("remove original {relative}: {error}");
+            }
+        });
+        symlink(&external, repo.path().join(relative)).unwrap();
+
+        assert!(
+            !build_script::source_tree_is_exact_at(repo.path(), &head),
+            "Cargo configuration parent symlink {relative} must invalidate provenance"
+        );
+        std::fs::remove_dir_all(&external).unwrap();
     }
 }
 

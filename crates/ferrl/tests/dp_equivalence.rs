@@ -53,7 +53,8 @@ use ferrl::trainer::{TokenizerLike, Trainer, TrainerConfig, TrainerError};
 use ferrl::{
     tensors_from_pretrained, varbuilder_from_pretrained, Comm, CommError, LocalComm, LossType,
     Metrics, ModelTelemetryRecorder, OptimizerState, Qwen3_5Config, Qwen3_5GradModel,
-    Qwen3_5Policy, RewardError, RewardFn, RewardGroupScope, RolloutLedgerError, Sample, SoloComm,
+    Qwen3_5Policy, RewardError, RewardFn, RewardGroupScope, RolloutLedgerError, RunStatus, Sample,
+    SandboxError, SoloComm,
 };
 
 const VOCAB: usize = 5;
@@ -1295,9 +1296,10 @@ impl RewardFn for FailingCollectionReward {
 
     fn reward(&self, sample: &Sample<()>, completion: &str) -> Result<f32, RewardError> {
         if self.fail {
-            return Err(RewardError::msg(
-                "injected rank-local rollout reward failure",
-            ));
+            return Err(RewardError::verifier(SandboxError::Infrastructure {
+                status: RunStatus::Exited(125),
+                stderr: "injected rank-local pre-verifier staging failure".to_string(),
+            }));
         }
         EchoOrFlatReward.reward(sample, completion)
     }
@@ -5732,6 +5734,12 @@ fn separated_dp_asymmetric_collection_failures_rewind_every_sampler_before_stats
         for (rank, error, adapter_before, adapter_after, sampler_before, sampler_after) in outcomes
         {
             assert!(!error.contains("timeout"), "{mode}: rank {rank}: {error}");
+            if mode == "reward" && rank == 0 {
+                assert!(
+                    error.contains("sandbox infrastructure failed before verifier entry"),
+                    "{mode}: rank {rank}: {error}"
+                );
+            }
             assert_eq!(adapter_after, adapter_before, "{mode}: rank {rank} adapter");
             assert_eq!(sampler_after, sampler_before, "{mode}: rank {rank} sampler");
         }

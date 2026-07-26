@@ -16432,9 +16432,12 @@ mod tests {
                         })),
                     })
                     .collect()),
-                CoordinatedTpRewardMode::Error => {
-                    Err(RewardError::msg("execution-primary reward failure"))
-                }
+                CoordinatedTpRewardMode::Error => Err(RewardError::verifier(
+                    crate::sandbox::SandboxError::Infrastructure {
+                        status: crate::sandbox::RunStatus::Exited(125),
+                        stderr: "execution-primary pre-verifier staging failure".to_string(),
+                    },
+                )),
                 CoordinatedTpRewardMode::CountMismatch => Ok(vec![RewardOutcome::reward(1.0)]),
                 CoordinatedTpRewardMode::Panic => {
                     panic!("execution-primary reward panic")
@@ -18516,7 +18519,9 @@ mod tests {
             assert_eq!(results[1].reward_calls, 0);
             match (mode, results[0].result.as_ref().unwrap_err()) {
                 (CoordinatedTpRewardMode::Error, TrainerError::Reward(err)) => {
-                    assert!(err.to_string().contains("execution-primary reward failure"));
+                    assert!(err
+                        .to_string()
+                        .contains("sandbox infrastructure failed before verifier entry"));
                 }
                 (CoordinatedTpRewardMode::CountMismatch, TrainerError::Contract(msg)) => {
                     assert!(msg.contains("returned 1 rewards for 2 completions"));

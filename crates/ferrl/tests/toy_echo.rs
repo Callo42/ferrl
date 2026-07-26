@@ -37,7 +37,7 @@ use ferrl::telemetry::RunDir;
 use ferrl::trainer::{
     RunStop, ScalarSchedule, SchedulePoint, TokenizerLike, Trainer, TrainerConfig, TrainerError,
 };
-use ferrl::{LossType, Metrics, RewardError, Sample, ScaleRewards};
+use ferrl::{LossType, Metrics, RewardError, RunStatus, Sample, SandboxError, ScaleRewards};
 
 /// Toy vocabulary size; the (full-rank) `LoRA` rank equals it, so a rank-`VOCAB`
 /// adapter can represent the whole echo map.
@@ -455,7 +455,10 @@ struct FailingReward;
 impl RewardFn for FailingReward {
     type Target = ();
     fn reward(&self, _sample: &Sample<()>, _completion: &str) -> Result<f32, RewardError> {
-        Err(RewardError::msg("verifier exploded"))
+        Err(RewardError::verifier(SandboxError::Infrastructure {
+            status: RunStatus::Exited(125),
+            stderr: "world-one pre-verifier staging failure".to_string(),
+        }))
     }
 }
 
@@ -2092,8 +2095,21 @@ fn reward_error_propagates_through_the_trainer() {
         .train(&mut policy, &FailingReward, &CharTokenizer, &prompts)
         .unwrap_err();
     assert!(
-        matches!(err, TrainerError::Reward(_)),
+        matches!(
+            &err,
+            TrainerError::Reward(error)
+                if error
+                    .to_string()
+                    .contains("sandbox infrastructure failed before verifier entry")
+        ),
         "expected a Reward error, got {err:?}"
+    );
+    assert!(ferrl::read_metrics(run.metrics_path()).unwrap().is_empty());
+    assert!(
+        std::fs::read_to_string(run.candidates_path())
+            .unwrap_or_default()
+            .is_empty(),
+        "pre-verifier infrastructure failure reached candidate publication"
     );
 }
 

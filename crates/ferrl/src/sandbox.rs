@@ -25,13 +25,13 @@
 //! - read-only / read-write [`Bind`]s for exactly the reference harness and a
 //!   scratch directory, nothing else;
 //! - kernel-sealed anonymous verifier assets are copied into a one-launch private
-//!   tmpfs and the entire tmpfs is remounted read-only before Apptainer resolves
-//!   their paths. The untrusted nested user namespace cannot remount its parent's
-//!   asset filesystem;
+//!   tmpfs, the entire tmpfs is remounted read-only, and every staged byte is
+//!   compared with its sealed source before Apptainer resolves the path. The
+//!   untrusted nested user namespace cannot remount its parent's asset filesystem;
 //! - in-image `ulimit`s (CPU, address space, processes, file size), beneath a
 //!   **host-side wall-clock supervisor** that is the final authority on the time
-//!   budget — it kills the run if it overruns, and cannot be evaded from inside
-//!   the container;
+//!   budget — it owns a fresh process group and kills the complete launch tree if
+//!   the run overruns, and cannot be evaded from inside the container;
 //! - optional host-supervised total byte caps for writable binds such as `/work`,
 //!   so many-small-file fills are bounded as well as single large writes;
 //! - **bounded output capture** — at most `CAPTURE_CAP` bytes per stream are read
@@ -189,13 +189,15 @@ impl Default for ResourceLimits {
 #[derive(Debug, Clone)]
 pub struct RunSpec {
     /// The container image — an Apptainer `.sif`, or any reference `apptainer
-    /// exec` accepts.
+    /// exec` accepts. A descriptor-backed path must remain owned by the caller
+    /// until [`Sandbox::run`] returns and must never name standard fd 0, 1, or 2.
     pub image: PathBuf,
     /// The command + args to run *inside* the sandbox (e.g. `["python",
     /// "/work/eval.py"]`). This is **ferrl-controlled**; untrusted model code is
     /// delivered as a *file* under a [`Bind`], never spliced into this argv.
     pub command: Vec<String>,
-    /// Host directories / files exposed inside, with their modes.
+    /// Host directories / files exposed inside, with their modes. Descriptor-backed
+    /// sources have the same lifetime and standard-fd restrictions as [`Self::image`].
     pub binds: Vec<Bind>,
     /// Working directory inside the sandbox (`--pwd`).
     pub workdir: PathBuf,
@@ -309,10 +311,9 @@ pub struct RunOutcome {
 
 /// Error from attempting a sandboxed run.
 ///
-/// A non-zero exit, a timeout, or an OOM is **not** an error — those are normal
-/// [`RunOutcome`]s a reward interprets. An error here means the run could not be
-/// carried out at all: the sandbox binary could not be spawned, or an OS I/O
-/// failure occurred while supervising it.
+/// After the trusted verifier-entry boundary, a non-zero exit, timeout, or OOM is
+/// a normal [`RunOutcome`] a reward interprets. The same termination before entry
+/// is an infrastructure error because no candidate result was produced.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum SandboxError {
@@ -322,6 +323,16 @@ pub enum SandboxError {
     /// An OS error occurred while supervising the run.
     #[error("sandbox supervision failed: {0}")]
     Supervise(#[source] std::io::Error),
+    /// The wrapper or container runtime failed before the trusted in-container
+    /// verifier command was entered. This is an infrastructure failure, never a
+    /// low-quality candidate result.
+    #[error("sandbox infrastructure failed before verifier entry ({status:?}): {stderr}")]
+    Infrastructure {
+        /// How the pre-entry wrapper terminated.
+        status: RunStatus,
+        /// Bounded wrapper/runtime diagnostics with the entry token removed.
+        stderr: String,
+    },
 }
 
 /// A backend that runs a [`RunSpec`] under isolation and returns its [`RunOutcome`].
@@ -334,9 +345,9 @@ pub trait Sandbox {
     ///
     /// # Errors
     ///
-    /// Returns [`SandboxError`] only if the run could not be carried out — never
-    /// for a non-zero exit, a timeout, or a resource kill, which are reported as
-    /// [`RunOutcome`]s.
+    /// Returns [`SandboxError`] if the run could not reach the trusted verifier
+    /// entry boundary. After entry, non-zero exits, timeouts, and resource kills
+    /// are reported as [`RunOutcome`]s.
     fn run(&self, spec: &RunSpec) -> Result<RunOutcome, SandboxError>;
 }
 
@@ -415,6 +426,13 @@ impl ApptainerSandbox {
     /// Build the host command, interposing a private user/mount namespace when
     /// Apptainer must consume anonymous descriptor-backed assets.
     fn build_host_command(&self, spec: &RunSpec) -> Command {
+        self.build_host_command_with_stage_fault(spec, "none")
+    }
+
+    /// The private fault selector is a production-reaching test seam: ordinary
+    /// calls always pass `none`, while the regression can deterministically alter
+    /// a completed staged file before the read-only/authentication boundary.
+    fn build_host_command_with_stage_fault(&self, spec: &RunSpec, stage_fault: &str) -> Command {
         let Some((staged_spec, copies)) = stage_descriptor_paths(spec) else {
             let mut command = Command::new(&self.bin);
             command.args(self.build_argv(spec));
@@ -431,6 +449,10 @@ impl ApptainerSandbox {
             "--user",
             "--map-root-user",
             "--mount",
+            "--pid",
+            "--fork",
+            "--kill-child=KILL",
+            "--mount-proc",
             "--propagation",
             "private",
             "/bin/bash",
@@ -439,6 +461,7 @@ impl ApptainerSandbox {
             "ferrl-private-descriptor-stage",
         ]);
         command.arg(copies.len().to_string());
+        command.arg(stage_fault);
         for (source, destination) in copies {
             command.arg(source);
             command.arg(destination);
@@ -453,35 +476,64 @@ impl Sandbox for ApptainerSandbox {
     fn run(&self, spec: &RunSpec) -> Result<RunOutcome, SandboxError> {
         let command = self.build_host_command(spec);
         let scratch_limits = scratch_limits(spec);
-        supervise(command, spec.limits.wall, &scratch_limits)
+        supervise(
+            command,
+            spec.limits.wall,
+            &scratch_limits,
+            EntryProtocol::Required,
+        )
     }
 }
 
-const PRIVATE_DESCRIPTOR_ROOT: &str = "/mnt/ferrl-verifier-assets";
+const PRIVATE_DESCRIPTOR_ROOT: &str = "/mnt";
 
 /// The outer namespace mounts a process-private tmpfs over root-owned `/mnt`,
-/// copies only already-authenticated sealed descriptors into it, then remounts the
-/// complete filesystem read-only before Apptainer resolves any pathname. An ordinary
-/// helper in the trainer's host namespace cannot address or replace these private
-/// dentries, and the nested Apptainer user namespace cannot remount a filesystem
-/// owned by its parent namespace. Copy or remount failures abort before Apptainer.
+/// copies only already-authenticated sealed descriptors into a non-traversable
+/// tmpfs, then atomically makes the mount traversable and read-only and compares every
+/// staged file with its sealed source before Apptainer resolves any pathname. An
+/// ordinary same-UID helper cannot traverse the directory while a writable file is
+/// being populated; after population every file is non-writable and the mount is
+/// read-only. The nested Apptainer user namespace cannot remount a filesystem owned
+/// by its parent namespace. Copy, remount, or authentication failure aborts before
+/// Apptainer and therefore before the verifier-entry protocol token.
 const PRIVATE_DESCRIPTOR_STAGE_SCRIPT: &str = r#"
 set -euo pipefail
-mount -t tmpfs -o mode=0700,nosuid,nodev,noexec tmpfs /mnt
-mkdir -p /mnt/ferrl-verifier-assets
+mount -t tmpfs -o mode=000,nosuid,nodev,noexec tmpfs /mnt
 remaining="$1"
-shift
+stage_fault="$2"
+shift 2
+declare -a sources=()
+declare -a destinations=()
 while [ "$remaining" -gt 0 ]; do
     source="$1"
     destination="$2"
     cp -- "$source" "$destination"
     chmod 0400 "$destination"
-    source_fd="${source##*/}"
-    exec {source_fd}<&-
+    sources+=("$source")
+    destinations+=("$destination")
     shift 2
     remaining=$((remaining - 1))
 done
-mount -o remount,ro,nosuid,nodev,noexec tmpfs /mnt
+case "$stage_fault" in
+    none) ;;
+    replace-first) printf 'forged staged verifier bytes\n' > "${destinations[0]}" ;;
+    orphan-after-mount)
+        host_pid="$(awk '/^NSpid:/ { print $2 }' /proc/self/status)"
+        printf 'private-stage-host-pid:%s\n' "$host_pid" >&2
+        setsid sleep 30 &
+        wait
+        ;;
+    *) printf 'unknown private-stage fault selector\n' >&2; exit 125 ;;
+esac
+mount -o remount,ro,mode=0500,nosuid,nodev,noexec tmpfs /mnt
+for index in "${!sources[@]}"; do
+    if ! cmp -s -- "${sources[$index]}" "${destinations[$index]}"; then
+        printf 'private verifier asset authentication failed\n' >&2
+        exit 125
+    fi
+    source_fd="${sources[$index]##*/}"
+    exec {source_fd}<&-
+done
 exec "$@"
 "#;
 
@@ -518,12 +570,15 @@ fn stage_descriptor_paths(spec: &RunSpec) -> Option<(RunSpec, Vec<(PathBuf, Path
 /// shell, and each `cp` child retain the numbered descriptor. A child user
 /// namespace cannot traverse the parent process's proc-fd directory, while
 /// `/proc/self/fd/<n>` resolves the same sealed inode inside every child. The
-/// staging script closes each inherited descriptor before it execs Apptainer.
+/// staging script closes each inherited descriptor after the authenticated
+/// read-only copy boundary and before it execs Apptainer. Standard descriptors
+/// are rejected so verifier handles can never alias stdin/stdout/stderr.
 fn inherited_descriptor_path(path: &Path) -> Option<PathBuf> {
     let path = path.to_str()?;
     let prefix = format!("/proc/{}/fd/", std::process::id());
     let fd = path.strip_prefix(&prefix)?;
-    if fd.is_empty() || !fd.bytes().all(|byte| byte.is_ascii_digit()) {
+    let fd = fd.parse::<u32>().ok()?;
+    if fd <= 2 {
         return None;
     }
     Some(PathBuf::from(format!("/proc/self/fd/{fd}")))
@@ -531,7 +586,9 @@ fn inherited_descriptor_path(path: &Path) -> Option<PathBuf> {
 
 fn private_descriptor_path(index: usize, extension: Option<&str>) -> PathBuf {
     let suffix = extension.map_or_else(String::new, |value| format!(".{value}"));
-    PathBuf::from(format!("{PRIVATE_DESCRIPTOR_ROOT}/asset-{index}{suffix}"))
+    PathBuf::from(format!(
+        "{PRIVATE_DESCRIPTOR_ROOT}/ferrl-verifier-asset-{index}{suffix}"
+    ))
 }
 
 /// Extract writable bind limits from the run spec.
@@ -571,9 +628,18 @@ fn in_container_script(spec: &RunSpec) -> String {
         script.push_str(&format!("ulimit -f {} || true; ", bytes / 1024));
     }
     let quoted: Vec<String> = spec.command.iter().map(|word| shell_quote(word)).collect();
-    script.push_str(&format!("exec {}", quoted.join(" ")));
+    script.push_str(&format!(
+        "printf '%s\\n' '{}' >&2; exec {}",
+        SANDBOX_ENTRY_MARKER,
+        quoted.join(" ")
+    ));
     script
 }
+
+/// Written by the trusted in-image shell immediately before it execs the
+/// verifier command. Its absence proves that a wrapper/runtime/staging failure
+/// occurred before candidate evaluation began.
+const SANDBOX_ENTRY_MARKER: &str = "ferrl-sandbox-verifier-entry-v1";
 
 /// POSIX single-quote `word` so it is one literal shell word (a literal single
 /// quote becomes `'\''`). The command is ferrl-controlled, but quoting keeps paths
@@ -599,6 +665,13 @@ const DRAIN_GRACE: Duration = Duration::from_secs(2);
 /// eval's machine-read *result* travels via a bound output file, not this log stream.
 const CAPTURE_CAP: usize = 8 << 20;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryProtocol {
+    #[cfg(test)]
+    NotRequired,
+    Required,
+}
+
 /// Spawn `command`, drain its stdout/stderr concurrently, and enforce `deadline`
 /// (wall-clock) by killing the process if it overruns. The concurrent drain avoids
 /// the classic pipe-buffer deadlock; the kill is the final authority over a runaway.
@@ -606,11 +679,13 @@ fn supervise(
     mut command: Command,
     deadline: Duration,
     scratch_limits: &[ScratchLimit],
+    entry_protocol: EntryProtocol,
 ) -> Result<RunOutcome, SandboxError> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    configure_process_tree(&mut command);
     let start = Instant::now();
     let mut child = command.spawn().map_err(SandboxError::Spawn)?;
     let out = drain(child.stdout.take());
@@ -621,27 +696,76 @@ fn supervise(
     let status = loop {
         if let Some(status) = child.try_wait().map_err(SandboxError::Supervise)? {
             scratch_exceeded = scratch_over_limit(scratch_limits);
+            // A launcher may exit while a descendant still holds output pipes,
+            // descriptors, or its mount namespace. Reap the residual group on
+            // every terminal path, not only timeout/scratch enforcement.
+            terminate_process_tree(&mut child);
             break status;
         }
         if start.elapsed() >= deadline {
-            let _ = child.kill();
+            terminate_process_tree(&mut child);
             timed_out = true;
             break child.wait().map_err(SandboxError::Supervise)?;
         }
         if scratch_over_limit(scratch_limits) {
-            let _ = child.kill();
+            terminate_process_tree(&mut child);
             scratch_exceeded = true;
             break child.wait().map_err(SandboxError::Supervise)?;
         }
         thread::sleep(POLL_INTERVAL);
     };
 
+    let status = classify_exit(status, timed_out, scratch_exceeded);
+    let stdout = collect_output(&out);
+    let mut stderr = collect_output(&err);
+    if entry_protocol == EntryProtocol::Required && !consume_entry_marker(&mut stderr) {
+        return Err(SandboxError::Infrastructure { status, stderr });
+    }
     Ok(RunOutcome {
-        status: classify_exit(status, timed_out, scratch_exceeded),
-        stdout: collect_output(&out),
-        stderr: collect_output(&err),
+        status,
+        stdout,
+        stderr,
         wall: start.elapsed(),
     })
+}
+
+/// Give every launch a fresh process group before `exec`. The process group
+/// catches wrapper/copy/container descendants; Apptainer's `--containall` PID
+/// namespace and the descriptor wrapper's `unshare --kill-child` close the
+/// setsid/session escape path when their namespace init is killed.
+#[cfg(unix)]
+fn configure_process_tree(command: &mut Command) {
+    use std::os::unix::process::CommandExt as _;
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_process_tree(_command: &mut Command) {}
+
+#[cfg(unix)]
+fn terminate_process_tree(child: &mut std::process::Child) {
+    if let Ok(raw_pid) = i32::try_from(child.id()) {
+        if let Some(pid) = rustix::process::Pid::from_raw(raw_pid) {
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+        }
+    }
+    // The direct kill is a race-safe fallback if the child exited or changed
+    // process-group state between observation and the group signal.
+    let _ = child.kill();
+}
+
+#[cfg(not(unix))]
+fn terminate_process_tree(child: &mut std::process::Child) {
+    let _ = child.kill();
+}
+
+fn consume_entry_marker(stderr: &mut String) -> bool {
+    let token = format!("{SANDBOX_ENTRY_MARKER}\n");
+    let Some(offset) = stderr.find(&token) else {
+        return false;
+    };
+    stderr.replace_range(offset..offset + token.len(), "");
+    true
 }
 
 /// `true` if any monitored path's current tree size is over its cap. Missing
@@ -850,13 +974,10 @@ mod tests {
         let (source_spec, _image, _eval, scratch) = descriptor_spec();
         let (staged, copies) =
             stage_descriptor_paths(&source_spec).expect("owned descriptors must be staged");
-        assert_eq!(
-            staged.image,
-            Path::new("/mnt/ferrl-verifier-assets/asset-0.sif")
-        );
+        assert_eq!(staged.image, Path::new("/mnt/ferrl-verifier-asset-0.sif"));
         assert_eq!(
             staged.binds[0].src,
-            Path::new("/mnt/ferrl-verifier-assets/asset-1.py")
+            Path::new("/mnt/ferrl-verifier-asset-1.py")
         );
         assert_eq!(staged.binds[1].src, scratch);
         assert_eq!(
@@ -872,6 +993,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cognitive_complexity)] // explicit stage-order security assertions
     fn descriptor_assets_use_the_private_namespace_host_command() {
         let (source_spec, _image, _eval, _scratch) = descriptor_spec();
         let command = ApptainerSandbox::default().build_host_command(&source_spec);
@@ -886,29 +1008,42 @@ mod tests {
                 "--user",
                 "--map-root-user",
                 "--mount",
+                "--pid",
+                "--fork",
+                "--kill-child=KILL",
+                "--mount-proc",
                 "private",
                 PRIVATE_DESCRIPTOR_STAGE_SCRIPT,
                 "2",
+                "none",
                 "/proc/self/fd/10",
                 "/proc/self/fd/11",
-                "/mnt/ferrl-verifier-assets/asset-0.sif",
-                "/mnt/ferrl-verifier-assets/asset-1.py",
+                "/mnt/ferrl-verifier-asset-0.sif",
+                "/mnt/ferrl-verifier-asset-1.py",
                 "apptainer",
                 "--userns",
                 "/host/scratch:/work:rw",
             ],
         );
         assert!(PRIVATE_DESCRIPTOR_STAGE_SCRIPT.contains("mount -t tmpfs"));
+        assert!(PRIVATE_DESCRIPTOR_STAGE_SCRIPT.contains("mode=000"));
+        assert!(PRIVATE_DESCRIPTOR_STAGE_SCRIPT.contains("remount,ro,mode=0500"));
         assert!(PRIVATE_DESCRIPTOR_STAGE_SCRIPT.contains("exec {source_fd}<&-"));
         let remount = PRIVATE_DESCRIPTOR_STAGE_SCRIPT
             .find("remount,ro")
             .expect("the private asset filesystem is remounted read-only");
+        let authenticate = PRIVATE_DESCRIPTOR_STAGE_SCRIPT
+            .find("cmp -s")
+            .expect("the staged bytes are compared with the sealed descriptors");
+        let close = PRIVATE_DESCRIPTOR_STAGE_SCRIPT
+            .find("exec {source_fd}<&-")
+            .expect("sealed descriptors are closed before Apptainer starts");
         let exec = PRIVATE_DESCRIPTOR_STAGE_SCRIPT
             .find("exec \"$@\"")
             .expect("Apptainer is exec'd after staging");
         assert!(
-            remount < exec,
-            "the filesystem must be read-only before Apptainer resolves assets"
+            remount < authenticate && authenticate < close && close < exec,
+            "read-only remount, byte authentication, descriptor close, and Apptainer exec must be ordered"
         );
         assert!(
             !PRIVATE_DESCRIPTOR_STAGE_SCRIPT.contains("remount,rw"),
@@ -924,6 +1059,21 @@ mod tests {
     }
 
     #[test]
+    fn standard_descriptors_are_never_treated_as_verifier_assets() {
+        let pid = std::process::id();
+        for fd in 0..=2 {
+            assert!(
+                inherited_descriptor_path(Path::new(&format!("/proc/{pid}/fd/{fd}"))).is_none()
+            );
+        }
+        assert_eq!(
+            inherited_descriptor_path(Path::new(&format!("/proc/{pid}/fd/3"))),
+            Some(PathBuf::from("/proc/self/fd/3"))
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // one assertion per encoded resource/entry boundary
     fn in_container_script_encodes_the_ulimits_then_execs() {
         let script = in_container_script(&spec().with_limits(ResourceLimits {
             wall: Duration::from_secs(30),
@@ -938,6 +1088,7 @@ mod tests {
         assert!(script.contains("ulimit -f 8192")); // 8 MiB / 1 KiB
                                                     // No in-image timeout: the host supervisor owns the wall-clock budget.
         assert!(!script.contains("timeout"));
+        assert!(script.contains(SANDBOX_ENTRY_MARKER));
         assert!(script.contains("exec 'python' '/work/eval.py'"));
     }
 
@@ -951,7 +1102,10 @@ mod tests {
             max_file: None,
         }));
         assert!(!script.contains("ulimit"));
-        assert_eq!(script, "exec 'python' '/work/eval.py'");
+        assert_eq!(
+            script,
+            format!("printf '%s\\n' '{SANDBOX_ENTRY_MARKER}' >&2; exec 'python' '/work/eval.py'")
+        );
     }
 
     #[test]
@@ -990,7 +1144,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn supervise_captures_stdout_on_clean_exit() {
-        let outcome = supervise(sh("printf hello"), Duration::from_secs(5), &[]).unwrap();
+        let outcome = supervise(
+            sh("printf hello"),
+            Duration::from_secs(5),
+            &[],
+            EntryProtocol::NotRequired,
+        )
+        .unwrap();
         assert_eq!(outcome.status, RunStatus::Exited(0));
         assert_eq!(outcome.stdout, "hello");
     }
@@ -998,8 +1158,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn supervise_captures_stderr_and_nonzero_exit() {
-        let outcome =
-            supervise(sh("printf oops 1>&2; exit 3"), Duration::from_secs(5), &[]).unwrap();
+        let outcome = supervise(
+            sh("printf oops 1>&2; exit 3"),
+            Duration::from_secs(5),
+            &[],
+            EntryProtocol::NotRequired,
+        )
+        .unwrap();
         assert_eq!(outcome.status, RunStatus::Exited(3));
         assert_eq!(outcome.stderr, "oops");
     }
@@ -1009,7 +1174,13 @@ mod tests {
     fn supervise_kills_on_wallclock_overrun() {
         // `sh -c 'sleep 30'` exec-replaces sh with sleep, so the kill closes the
         // pipe and the drain returns promptly.
-        let outcome = supervise(sh("sleep 30"), Duration::from_millis(300), &[]).unwrap();
+        let outcome = supervise(
+            sh("sleep 30"),
+            Duration::from_millis(300),
+            &[],
+            EntryProtocol::NotRequired,
+        )
+        .unwrap();
         assert_eq!(outcome.status, RunStatus::TimedOut);
         assert!(
             outcome.wall < Duration::from_secs(5),
@@ -1025,6 +1196,7 @@ mod tests {
             Command::new("/no/such/ferrl-binary-xyz"),
             Duration::from_secs(1),
             &[],
+            EntryProtocol::NotRequired,
         )
         .unwrap_err();
         assert!(matches!(err, SandboxError::Spawn(_)));
@@ -1035,7 +1207,13 @@ mod tests {
     fn supervise_reports_a_signal_death() {
         // The child kills itself with SIGKILL — it dies by signal (no exit code),
         // so the outcome is `Signaled`, exercising the signal-classification path.
-        let outcome = supervise(sh("kill -KILL $$"), Duration::from_secs(5), &[]).unwrap();
+        let outcome = supervise(
+            sh("kill -KILL $$"),
+            Duration::from_secs(5),
+            &[],
+            EntryProtocol::NotRequired,
+        )
+        .unwrap();
         assert!(
             matches!(outcome.status, RunStatus::Signaled(_)),
             "expected a signal death, got {:?}",
@@ -1050,10 +1228,199 @@ mod tests {
         // builds the full argv and supervises the process, so the host-side path
         // (`Sandbox::run`) is covered without a container runtime. `/bin/true`
         // ignores the argv and exits 0.
-        let outcome = ApptainerSandbox::with_bin("/bin/true")
+        let error = ApptainerSandbox::with_bin("/bin/true")
             .run(&spec())
-            .unwrap();
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            SandboxError::Infrastructure {
+                status: RunStatus::Exited(0),
+                ..
+            }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verifier_entry_protocol_distinguishes_candidate_and_infrastructure_failures() {
+        let entered = format!("printf '%s\\n' '{SANDBOX_ENTRY_MARKER}' >&2; exit 7");
+        let outcome = supervise(
+            sh(&entered),
+            Duration::from_secs(5),
+            &[],
+            EntryProtocol::Required,
+        )
+        .unwrap();
+        assert_eq!(outcome.status, RunStatus::Exited(7));
+        assert_eq!(outcome.stderr, "");
+
+        let error = supervise(
+            sh("printf wrapper-failed >&2; exit 7"),
+            Duration::from_secs(5),
+            &[],
+            EntryProtocol::Required,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            SandboxError::Infrastructure {
+                status: RunStatus::Exited(7),
+                ref stderr,
+            } if stderr == "wrapper-failed"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supervise_kills_the_complete_process_group() {
+        let outcome = supervise(
+            sh("sleep 30 & printf '%s\\n' \"$!\"; wait"),
+            Duration::from_millis(300),
+            &[],
+            EntryProtocol::NotRequired,
+        )
+        .unwrap();
+        assert_eq!(outcome.status, RunStatus::TimedOut);
+        let descendant = outcome.stdout.trim().parse::<u32>().unwrap();
+        let proc_path = PathBuf::from(format!("/proc/{descendant}"));
+        let wait_started = Instant::now();
+        while proc_path.exists() && wait_started.elapsed() < Duration::from_secs(2) {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !proc_path.exists(),
+            "descendant {descendant} survived the process-tree kill"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supervise_reaps_descendants_after_the_launcher_exits() {
+        let outcome = supervise(
+            sh("sleep 30 & printf '%s\\n' \"$!\"; exit 0"),
+            Duration::from_secs(5),
+            &[],
+            EntryProtocol::NotRequired,
+        )
+        .unwrap();
         assert_eq!(outcome.status, RunStatus::Exited(0));
+        let descendant = outcome.stdout.trim().parse::<u32>().unwrap();
+        let proc_path = PathBuf::from(format!("/proc/{descendant}"));
+        let wait_started = Instant::now();
+        while proc_path.exists() && wait_started.elapsed() < Duration::from_secs(2) {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !proc_path.exists(),
+            "descendant {descendant} survived its launcher's exit"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs unprivileged user/mount namespaces"]
+    fn private_stage_rejects_deterministic_post_copy_mutation() {
+        use std::io::Write as _;
+        use std::os::fd::AsRawFd as _;
+
+        let descriptor = rustix::fs::memfd_create(
+            "ferrl-private-stage-mutation",
+            rustix::fs::MemfdFlags::ALLOW_SEALING,
+        )
+        .unwrap();
+        let mut file = std::fs::File::from(descriptor);
+        file.write_all(b"attested verifier bytes\n").unwrap();
+        rustix::fs::fcntl_add_seals(
+            &file,
+            rustix::fs::SealFlags::WRITE
+                | rustix::fs::SealFlags::GROW
+                | rustix::fs::SealFlags::SHRINK
+                | rustix::fs::SealFlags::SEAL,
+        )
+        .unwrap();
+        rustix::io::fcntl_setfd(&file, rustix::io::FdFlags::empty()).unwrap();
+        let image = PathBuf::from(format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            file.as_raw_fd()
+        ));
+        let source_spec = RunSpec::new(image, vec!["true".into()]);
+        let command = ApptainerSandbox::with_bin("/bin/true")
+            .build_host_command_with_stage_fault(&source_spec, "replace-first");
+        let error = supervise(
+            command,
+            Duration::from_secs(10),
+            &[],
+            EntryProtocol::Required,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            SandboxError::Infrastructure {
+                status: RunStatus::Exited(125),
+                ref stderr,
+            } if stderr.contains("private verifier asset authentication failed")
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs unprivileged user/mount namespaces"]
+    fn private_stage_timeout_reaps_descendants_and_mount_namespace() {
+        use std::io::Write as _;
+        use std::os::fd::AsRawFd as _;
+
+        let descriptor = rustix::fs::memfd_create(
+            "ferrl-private-stage-timeout",
+            rustix::fs::MemfdFlags::ALLOW_SEALING,
+        )
+        .unwrap();
+        let mut file = std::fs::File::from(descriptor);
+        file.write_all(b"attested verifier bytes\n").unwrap();
+        rustix::fs::fcntl_add_seals(
+            &file,
+            rustix::fs::SealFlags::WRITE
+                | rustix::fs::SealFlags::GROW
+                | rustix::fs::SealFlags::SHRINK
+                | rustix::fs::SealFlags::SEAL,
+        )
+        .unwrap();
+        rustix::io::fcntl_setfd(&file, rustix::io::FdFlags::empty()).unwrap();
+        let image = PathBuf::from(format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            file.as_raw_fd()
+        ));
+        let source_spec = RunSpec::new(image, vec!["true".into()]);
+        let command = ApptainerSandbox::with_bin("/bin/true")
+            .build_host_command_with_stage_fault(&source_spec, "orphan-after-mount");
+        let error = supervise(
+            command,
+            Duration::from_millis(500),
+            &[],
+            EntryProtocol::Required,
+        )
+        .unwrap_err();
+        let (status, stderr) = match error {
+            SandboxError::Infrastructure { status, stderr } => (status, stderr),
+            other => panic!("unexpected stage-timeout error: {other:?}"),
+        };
+        assert_eq!(status, RunStatus::TimedOut);
+        let host_pid = stderr
+            .lines()
+            .find_map(|line| line.strip_prefix("private-stage-host-pid:"))
+            .unwrap()
+            .parse::<u32>()
+            .unwrap();
+        let proc_path = PathBuf::from(format!("/proc/{host_pid}"));
+        let wait_started = Instant::now();
+        while proc_path.exists() && wait_started.elapsed() < Duration::from_secs(2) {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !proc_path.exists(),
+            "private namespace init {host_pid} and its tmpfs mount survived timeout cleanup"
+        );
     }
 
     #[cfg(unix)]
@@ -1074,6 +1441,7 @@ mod tests {
                 path: dir.clone(),
                 bytes: 1 << 20,
             }],
+            EntryProtocol::NotRequired,
         )
         .unwrap();
         let _ = std::fs::remove_dir_all(&dir);
@@ -1105,6 +1473,7 @@ mod tests {
                 path: dir.clone(),
                 bytes: 1 << 20,
             }],
+            EntryProtocol::NotRequired,
         )
         .unwrap();
         let _ = std::fs::remove_dir_all(&dir);
@@ -1121,6 +1490,7 @@ mod tests {
             sh("head -c 50000000 /dev/zero"),
             Duration::from_secs(5),
             &[],
+            EntryProtocol::NotRequired,
         )
         .unwrap();
         assert!(

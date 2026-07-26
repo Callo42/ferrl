@@ -76,7 +76,9 @@ use sha2::{Digest, Sha256};
 
 use crate::reward::{RewardError, RewardFn, RewardOutcome};
 use crate::sample::Sample;
-use crate::sandbox::{ApptainerSandbox, Bind, ResourceLimits, RunSpec, RunStatus, Sandbox};
+use crate::sandbox::{
+    ApptainerSandbox, Bind, ResourceLimits, RunOutcome, RunSpec, RunStatus, Sandbox, SandboxError,
+};
 
 /// Versioned TriMul training-reward scheme identifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1531,6 +1533,7 @@ impl TrimulReward {
         };
         format!(
             "{stage_eval} && \
+         printf '%s\\n' '{TRIMUL_VERIFIER_ENTRY_MARKER}' >&2 && \
          {{ POPCORN_FD=3 python eval.py test test_spec.txt 3>&1 1>/dev/null; \
            test_rc=$?; \
            echo \"test-exit: $test_rc\"; \
@@ -1669,6 +1672,7 @@ impl TrimulReward {
         // `/work` file or a printed `check: pass` cannot influence the score. A
         // crashing candidate yields no grade lines, scored a failure.
         let outcome = self.sandbox.run(spec).map_err(RewardError::verifier)?;
+        let outcome = require_trimul_verifier_entry(outcome).map_err(RewardError::verifier)?;
 
         let has_benchmark_section = outcome.stdout.contains(RESULT_SPLIT);
         let (test_log, bench_log) = split_result(&outcome.stdout);
@@ -1913,6 +1917,26 @@ impl TrimulReward {
             .map_or(Ok(()), TrimulVerifierAssets::verify_current)
             .map_err(RewardError::verifier)
     }
+}
+
+/// Emitted only after every immutable eval asset has been copied into the
+/// candidate scratch and immediately before the trusted verifier process starts.
+/// The generic sandbox-entry token proves Apptainer began executing; this second
+/// token distinguishes a later verifier-staging failure from candidate failure.
+const TRIMUL_VERIFIER_ENTRY_MARKER: &str = "ferrl-trimul-verifier-entry-v1";
+
+fn require_trimul_verifier_entry(mut outcome: RunOutcome) -> Result<RunOutcome, SandboxError> {
+    let token = format!("{TRIMUL_VERIFIER_ENTRY_MARKER}\n");
+    let Some(offset) = outcome.stderr.find(&token) else {
+        return Err(SandboxError::Infrastructure {
+            status: outcome.status,
+            stderr: outcome.stderr,
+        });
+    };
+    outcome
+        .stderr
+        .replace_range(offset..offset + token.len(), "");
+    Ok(outcome)
 }
 
 /// Process-wide counter for unique scratch-dir names.
@@ -2893,6 +2917,60 @@ mod tests {
             r.reward_diagnostic(&eval).as_deref(),
             Some("trimul:sandbox_timed_out")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pre_verifier_infrastructure_failure_never_earns_the_format_floor() {
+        let (root, image, eval, scratch) = verifier_fixture("pre-entry-infrastructure");
+        let mut r = TrimulReward::new(&image, &eval, &scratch);
+        r.sandbox = ApptainerSandbox::with_bin("/bin/false");
+        let sample = Sample::new("write a faster TriMul kernel", ());
+        let completion = "final:\n```python\ndef custom_kernel(data):\n    return data\n```\n";
+
+        let error = r
+            .reward_group_detailed(&sample, &[completion.to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("sandbox infrastructure failed before verifier entry"),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn verifier_staging_requires_a_positive_entry_token_before_scoring() {
+        let command = reward().in_container_command();
+        let staged = command.find("cp /eval/eval.py").unwrap();
+        let entered = command.find(TRIMUL_VERIFIER_ENTRY_MARKER).unwrap();
+        let verify = command.find("python eval.py test").unwrap();
+        assert!(staged < entered && entered < verify);
+
+        let error = require_trimul_verifier_entry(RunOutcome {
+            status: RunStatus::Exited(0),
+            stdout: String::new(),
+            stderr: "copy failed".to_string(),
+            wall: Duration::from_millis(1),
+        })
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            SandboxError::Infrastructure {
+                status: RunStatus::Exited(0),
+                ref stderr,
+            } if stderr == "copy failed"
+        ));
+
+        let entered_outcome = require_trimul_verifier_entry(RunOutcome {
+            status: RunStatus::Exited(7),
+            stdout: String::new(),
+            stderr: format!("{TRIMUL_VERIFIER_ENTRY_MARKER}\ncandidate failed\n"),
+            wall: Duration::from_millis(1),
+        })
+        .unwrap();
+        assert_eq!(entered_outcome.status, RunStatus::Exited(7));
+        assert_eq!(entered_outcome.stderr, "candidate failed\n");
     }
 
     #[test]

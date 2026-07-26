@@ -41,6 +41,11 @@ const BUILD_CONFIGURATION_PATHS: &[&str] = &[
     "crates/ferrl/.cargo/config.toml",
 ];
 
+/// Cargo walks these repository-local parent directories when resolving build
+/// configuration. Git pathspecs do not traverse an untracked directory symlink,
+/// so the parents themselves must be inspected independently of their children.
+const BUILD_CONFIGURATION_DIRS: &[&str] = &[".cargo", "crates/.cargo", "crates/ferrl/.cargo"];
+
 const REQUIRED_SOURCE_FILES: &[&str] = &[
     "Cargo.toml",
     "Cargo.lock",
@@ -229,6 +234,16 @@ fn index_entries_are_ordinary(repo_root: &Path, blobs: &[HeadBlob]) -> bool {
     paths == blobs.iter().map(|blob| blob.path.clone()).collect()
 }
 
+fn build_configuration_dirs_are_local(repo_root: &Path) -> bool {
+    BUILD_CONFIGURATION_DIRS.iter().all(|relative| {
+        match std::fs::symlink_metadata(repo_root.join(relative)) {
+            Ok(metadata) => metadata.file_type().is_dir(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(_) => false,
+        }
+    })
+}
+
 fn resolve_head_commit(repo_root: &Path) -> Option<String> {
     git_output(repo_root, &["rev-parse", "--verify", "HEAD^{commit}"])
         .and_then(|bytes| String::from_utf8(bytes).ok())
@@ -248,6 +263,7 @@ pub(crate) fn source_tree_is_exact_at(repo_root: &Path, commit: &str) -> bool {
     let untracked_args = source_path_args(&["ls-files", "--others", "-z"], None);
     worktree_blobs_match(repo_root, &blobs)
         && index_entries_are_ordinary(repo_root, &blobs)
+        && build_configuration_dirs_are_local(repo_root)
         && git_success(repo_root, &diff_args)
         && git_output(repo_root, &untracked_args).is_some_and(|untracked| untracked.is_empty())
 }
@@ -324,6 +340,9 @@ fn main() {
     println!("cargo:rerun-if-changed=../../Cargo.toml");
     println!("cargo:rerun-if-changed=../../Cargo.lock");
     let workspace_root = manifest_dir.join("../..");
+    for path in BUILD_CONFIGURATION_DIRS {
+        watch(&workspace_root.join(path));
+    }
     for path in BUILD_CONFIGURATION_PATHS {
         watch(&workspace_root.join(path));
     }
