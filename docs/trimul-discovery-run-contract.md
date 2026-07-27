@@ -249,8 +249,8 @@ with the final report:
 | reward profile | `trimul.reward`; defaults to `trimul_shaped_v1`, with custom ladder-preserving values allowed. |
 | run-health policy | `run_health`; post-run warn/fail policy, including the original top-level config passed to `ferrl runreport --config`. |
 | model | Loader-derived family, exact model/checkpoint policy SHA-256, exact tokenizer-file SHA-256, resolved EOS, LoRA rank/alpha, base dtype, and rollout seed, all sealed at launch. |
-| TriMul eval bundle | Attested SHA-256 over every ordered relative regular-file name and byte under `eval_dir`, plus the exact file count. Every captured file is held in a Linux kernel-sealed anonymous descriptor; after all seals are installed, the ordered descriptor contents are rehashed and required to equal the attested bundle identity. For each invocation, the sandbox wrapper copies only those sealed bytes into a process-private tmpfs, remounts the complete asset filesystem read-only, and then starts Apptainer in a nested user namespace that cannot remount its parent's filesystem. No writable verifier path is exposed in the trainer's host namespace. The configured path is informational only. |
-| sandbox image | Attested SHA-256 and byte length of the exact Apptainer image streamed into a kernel-sealed anonymous descriptor. After sealing, the descriptor is rehashed and required to equal the captured identity. Invocation checks validate the source identity, sealed descriptor, and length without repeatedly rehashing the complete image; the same private read-only tmpfs handoff is used because Apptainer cannot consume a deleted memfd pseudo-path directly. The configured path is informational only. |
+| TriMul eval bundle | Attested SHA-256 over every ordered relative regular-file name and byte under `eval_dir`, plus the exact file count. Every captured file is held in a Linux kernel-sealed anonymous descriptor; after all seals are installed, the ordered descriptor contents are rehashed and required to equal the attested bundle identity. One process bootstraps an empty user namespace, re-arms non-dumpability before creating its private mount namespace, copies only from those sealed handles into private tmpfs, remounts the complete stage read-only, and authenticates every final pathname/inode/byte. It also authenticates an execute-only private copy of the configured Apptainer runtime; dropping only effective DAC-read capabilities makes Linux preserve non-dumpability when that process becomes Apptainer via `exec`. No separate namespace-owning supervisor exists, and an externally synchronized post-exec control proves a same-UID helper cannot re-enter and remount the authenticated stage. All source descriptors are close-on-exec, so launcher, init, shell, and candidate processes inherit no verifier handle. The configured path is informational only. |
+| sandbox image | Attested SHA-256 and byte length of the exact Apptainer image streamed into a kernel-sealed anonymous descriptor. After sealing, the descriptor is rehashed and required to equal the captured identity. Invocation checks validate the source identity, sealed descriptor, and length; the authenticated private stage supplies the regular read-only path Apptainer's SIF loader requires. The configured path is informational only. |
 | cases | Attested `task.yml` SHA-256 and byte length plus the loaded counts for `tests` and `benchmarks`. |
 | seeds | `data.seed`, `policy.seed`, trainer seed-bearing knobs, and the training `trimul.secret_seed`. |
 | scratch cap | `trimul.scratch_max_bytes`; `0` means the ferrl default, currently 1 GiB. |
@@ -400,10 +400,15 @@ pin, the candidate is rejected even if a prior training reward was high.
 
 ## Dynamic Reward-Hacking Checks
 
-The TriMul reward already keeps candidate scratch bounded, routes the grade over a
-captured channel, denies network by default, and rejects implausibly fast timings. The
-first discovery run still needs dynamic checks on top candidates because the training
-loop is optimizing against that reward.
+The TriMul reward already keeps candidate scratch bounded, denies network by default,
+and rejects implausibly fast timings. A non-dumpable protected verifier process owns
+input generation, starts elapsed-time measurement before candidate input handoff,
+captures each result into a fresh parent-private tensor, and owns exact correctness
+checking, statistics, and the machine grade. Candidate Python runs in a separate
+spawned process and never inherits the post-launch grade socket; launcher/init/shell
+stdout is diagnostic only.
+The first discovery run still needs dynamic checks on top candidates because the
+training loop is optimizing against that reward.
 
 For every candidate included in the final report:
 

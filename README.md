@@ -349,6 +349,20 @@ the reward ladder: `format_extracted <= runnable` and
 `runnable + partial_correctness <= correctness`; implausibly fast benchmark timings
 remain fail-closed at zero.
 
+The attested SIF, evaluator, submission, and rendered specifications are retained in
+Linux kernel-sealed descriptors. One process re-arms non-dumpability before creating
+its mount namespace, copies only from those handles into private tmpfs, remounts the
+complete stage read-only, authenticates every final inode and byte, and becomes
+Apptainer via an authenticated execute-only runtime copy. Dropping only effective
+DAC-read capabilities before that `exec` makes Linux preserve non-dumpability across
+the credential transition; no separate namespace-owning supervisor survives.
+The verifier's non-dumpable parent and the untrusted candidate use separate processes:
+the parent starts timing before input handoff, captures candidate output into a fresh
+parent-private tensor, and owns correctness checks, statistics, and the post-launch
+machine-grade socket. Candidate code inherits neither that socket nor any launcher
+stdout alias, so its interpreter state and descriptor scans cannot fabricate a passing
+grade.
+
 ```jsonc
 "trimul": {
   "reward": {

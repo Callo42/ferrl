@@ -17,12 +17,13 @@
 //! 3. Run the eval in the sandbox ([`crate::sandbox::ApptainerSandbox`]): the pinned
 //!    GPUMODE eval files, Ferrl driver, candidate, and specs are bound **read-only**,
 //!    scratch is **read-write**, the GPU is exposed (`--nv`), and the **network is
-//!    denied**. The sealed driver runs `test` (correctness) then `benchmark`
-//!    (variance-aware CUDA-event timing).
-//!    Its grade is written to `POPCORN_FD`, which we route to the **captured stdout
-//!    pipe** while the candidate's own stdout goes to `/dev/null` — so the grade rides
-//!    a channel the untrusted candidate cannot reach (its worker neither inherits the
-//!    fd nor can target it by path), foreclosing a forged pass.
+//!    denied**. The sealed driver runs `test` then `benchmark`. Candidate Python lives
+//!    in a separate spawned process; the protected parent owns hidden-seed input
+//!    generation and starts monotonic timing before handing it an input. Every result
+//!    is captured into a fresh parent-private buffer before the parent checks it or
+//!    records statistics. Its grade travels over a post-launch Unix socket
+//!    owned only by the non-dumpable parent. Launcher/init/shell stdout descriptors are
+//!    untrusted diagnostics and can never become a grade.
 //! 4. Map the captured grade to a shaped training reward: missing submissions score
 //!    `0`, extracted-but-broken submissions get only a tiny format reward, runnable
 //!    candidates get a small floor, partially correct candidates scale below the
@@ -45,11 +46,12 @@
 //! ## Reward integrity
 //!
 //! Verifier, candidate, and rendered-case bytes remain kernel-sealed and read-only
-//! through correctness and benchmark execution. The grade and verifier-entry proof
-//! ride a non-inherited fd owned by a non-dumpable trusted parent, while candidate
-//! stdout is discarded. An implausibly fast time is rejected, so forged scratch files,
-//! printed passes, and zero-time kernels cannot reach the correctness floor. The
-//! negative-control suite gates those cases.
+//! through correctness and benchmark execution. Candidate code never shares memory
+//! with trusted checker/timer state. The grade and actual-import proof ride an
+//! exclusive post-launch socket owned by a non-dumpable trusted parent. An implausibly
+//! fast time is rejected, so forged scratch files, printed passes, and zero-time
+//! kernels cannot reach the correctness floor. The negative-control suite gates those
+//! cases.
 //!
 //! ## Testing split (as in [`crate::sandbox`])
 //!
@@ -71,7 +73,8 @@ use sha2::{Digest, Sha256};
 use crate::reward::{RewardError, RewardFn, RewardOutcome};
 use crate::sample::Sample;
 use crate::sandbox::{
-    ApptainerSandbox, Bind, ResourceLimits, RunOutcome, RunSpec, RunStatus, Sandbox, SandboxError,
+    ApptainerSandbox, Bind, ProtectedOutput, ResourceLimits, RunOutcome, RunSpec, RunStatus,
+    Sandbox, SandboxError,
 };
 
 /// Versioned TriMul training-reward scheme identifiers.
@@ -613,155 +616,11 @@ const SUBMISSION_PATH: &str = "/opt/ferrl-verifier/submission.py";
 const TEST_SPEC_PATH: &str = "/opt/ferrl-verifier/test_spec.txt";
 const BENCH_SPEC_PATH: &str = "/opt/ferrl-verifier/bench_spec.txt";
 
-/// Ferrl-owned immutable verifier driver. It imports the attested upstream
-/// verifier, starts its spawn worker, proves trusted imports plus CUDA runtime
-/// initialization inside that worker, and installs a one-shot sealed submission
-/// proxy. The proxy acknowledges a protected phase-entry record through a private
-/// worker/parent channel and closes that channel immediately before it imports or
-/// executes any candidate code.
-const FERRL_EVAL_DRIVER: &str = r#"import ctypes
-import os
-import sys
-
-PR_SET_DUMPABLE = 4
-
-# Protect the grade fd at the first executable driver boundary. The spawn worker
-# repeats this before it uses the private entry channel.
-if ctypes.CDLL(None, use_errno=True).prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) != 0:
-    raise SystemExit(114)
-
-# `python -I` excludes candidate-writable cwd, user-site, and environment path
-# hooks. Add only the immutable verifier root after the procfs boundary is armed.
-sys.path.insert(0, "/opt/ferrl-verifier")
-
-import importlib
-import multiprocessing
-import threading
-import types
-
-import eval as upstream
-import torch.cuda
-from reference import check_implementation, generate_input
-from task import TestSpec
-from utils import set_seed
-
-_ENTRY_CONNECTION = None
-_ENTRY_MODE = None
-_CANDIDATE_KERNEL = None
-_TRUSTED_READY = False
-
-
-def _signal_candidate_entry():
-    global _ENTRY_CONNECTION
-    connection = _ENTRY_CONNECTION
-    _ENTRY_CONNECTION = None
-    if connection is None:
-        return
-    try:
-        connection.send(_ENTRY_MODE)
-        if connection.recv() is not True:
-            raise RuntimeError("verifier entry was not acknowledged")
-    finally:
-        connection.close()
-
-
-def _dispatch_candidate(*args, **kwargs):
-    global _CANDIDATE_KERNEL
-    if _CANDIDATE_KERNEL is None:
-        if not _TRUSTED_READY:
-            raise RuntimeError("verifier worker was not trusted-probed")
-        # The exact worker has completed its CUDA synchronization, and upstream has
-        # generated the exact trusted input before it calls this proxy. Authenticate
-        # and acknowledge that boundary, close the channel, and only then import
-        # untrusted code.
-        _signal_candidate_entry()
-        sys.modules.pop("submission", None)
-        module = importlib.import_module("submission")
-        _CANDIDATE_KERNEL = module.custom_kernel
-    return _CANDIDATE_KERNEL(*args, **kwargs)
-
-
-def _trusted_worker_init(connection, mode):
-    global _ENTRY_CONNECTION, _ENTRY_MODE, _TRUSTED_READY
-    if ctypes.CDLL(None, use_errno=True).prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) != 0:
-        raise RuntimeError("could not protect verifier worker entry channel")
-    _ENTRY_CONNECTION = connection
-    _ENTRY_MODE = mode
-    _TRUSTED_READY = False
-    proxy = types.ModuleType("submission")
-    proxy.custom_kernel = _dispatch_candidate
-    sys.modules["submission"] = proxy
-
-
-def _trusted_worker_probe():
-    global _TRUSTED_READY
-    # Resolve every trusted dependency used before candidate dispatch and prove
-    # the CUDA runtime/device can complete real work in the exact worker.
-    assert check_implementation is not None
-    assert generate_input is not None
-    assert TestSpec is not None
-    assert set_seed is not None
-    torch.cuda.init()
-    torch.cuda.synchronize()
-    _TRUSTED_READY = True
-    return True
-
-
-def _forward_candidate_entry(connection, logger, mode, errors):
-    try:
-        if connection.recv() != mode:
-            raise RuntimeError("verifier worker reported the wrong phase entry")
-        logger.log("ferrl-entry", f"{mode}-v3")
-        connection.send(True)
-    except BaseException as error:
-        errors.append(repr(error))
-    finally:
-        connection.close()
-
-
-def main():
-    fd = os.getenv("POPCORN_FD")
-    if not fd or len(sys.argv) != 3:
-        return 111
-    mode = sys.argv[1]
-    if mode not in ("test", "benchmark"):
-        return 2
-
-    seed = os.getenv("POPCORN_SEED")
-    os.unsetenv("POPCORN_SEED")
-    seed = int(seed) if seed else None
-    upstream.set_seed(seed or 42)
-    tests = upstream.get_test_cases(sys.argv[2], seed)
-
-    with upstream.PopcornOutput(int(fd)) as logger:
-        mp_context = multiprocessing.get_context("spawn")
-        parent_entry, child_entry = mp_context.Pipe()
-        with mp_context.Pool(
-            1, initializer=_trusted_worker_init, initargs=(child_entry, mode)
-        ) as pool:
-            child_entry.close()
-            if pool.apply(_trusted_worker_probe) is not True:
-                return 114
-            errors = []
-            entry = threading.Thread(
-                target=_forward_candidate_entry,
-                args=(parent_entry, logger, mode, errors),
-                daemon=True,
-            )
-            entry.start()
-            if mode == "test":
-                result = upstream.run_testing(logger, pool, tests)
-            else:
-                result = upstream.run_benchmarking(logger, pool, tests)
-            entry.join(1)
-            if entry.is_alive() or errors:
-                return 114
-            return result
-
-
-if __name__ == "__main__":
-    sys.exit(main())
-"#;
+/// Ferrl-owned immutable verifier driver. The protected parent owns trusted input
+/// generation, checking, timing, statistics, and the machine-grade socket. Candidate
+/// Python runs only in fresh spawned children and can influence the parent solely
+/// through checked CUDA buffers plus a bounded raw status protocol.
+const FERRL_EVAL_DRIVER: &str = include_str!("trimul_eval_driver.py");
 
 /// Stable verifier assets captured before launch attestation.
 ///
@@ -770,11 +629,10 @@ if __name__ == "__main__":
 /// by the kernel. After sealing, the image descriptor and complete ordered eval
 /// descriptor set are hashed again and compared with the identities captured from
 /// their sources. Exact sealed descriptors, never writable snapshot pathnames, supply
-/// every verifier invocation. Because Apptainer cannot open a deleted memfd pseudo-
-/// pathname directly, the sandbox wrapper copies those sealed bytes into a one-launch
-/// private tmpfs and remounts the complete asset filesystem read-only before Apptainer
-/// resolves it. Later checks inspect source identities and kernel seals without
-/// repeatedly rehashing the potentially multi-gigabyte image.
+/// every verifier invocation. The sandbox copies only from those handles into its
+/// private tmpfs, remounts it read-only, and authenticates the final bytes before use.
+/// Later checks inspect source identities and kernel seals without repeatedly
+/// rehashing the potentially multi-gigabyte image.
 #[derive(Debug, Clone)]
 pub struct TrimulVerifierAssets {
     snapshot: Arc<VerifierAssetSnapshot>,
@@ -977,18 +835,20 @@ impl SealedInvocationAssets {
 fn seal_invocation_asset(path: &Path, bytes: &[u8]) -> Result<SealedEvalFile, TrimulAssetError> {
     use std::io::Write as _;
 
-    let descriptor = rustix::fs::memfd_create(path, rustix::fs::MemfdFlags::ALLOW_SEALING)
-        .map_err(|source| TrimulAssetError::Io {
+    let descriptor = rustix::fs::memfd_create(
+        path,
+        rustix::fs::MemfdFlags::ALLOW_SEALING | rustix::fs::MemfdFlags::CLOEXEC,
+    )
+    .map_err(|source| TrimulAssetError::Io {
+        path: path.to_path_buf(),
+        source: source.into(),
+    })?;
+    let mut file = descriptor_file_above_stdio(File::from(descriptor), true).map_err(|source| {
+        TrimulAssetError::Io {
             path: path.to_path_buf(),
-            source: source.into(),
-        })?;
-    let mut file =
-        descriptor_file_above_stdio(File::from(descriptor), false).map_err(|source| {
-            TrimulAssetError::Io {
-                path: path.to_path_buf(),
-                source,
-            }
-        })?;
+            source,
+        }
+    })?;
     file.write_all(bytes)
         .map_err(|source| TrimulAssetError::Io {
             path: path.to_path_buf(),
@@ -1057,14 +917,16 @@ fn capture_image_with_hook(
             path.display()
         )));
     }
-    let descriptor =
-        rustix::fs::memfd_create("ferrl-trimul-image", rustix::fs::MemfdFlags::ALLOW_SEALING)
-            .map_err(|source| TrimulAssetError::Io {
-                path: path.to_path_buf(),
-                source: source.into(),
-            })?;
+    let descriptor = rustix::fs::memfd_create(
+        "ferrl-trimul-image",
+        rustix::fs::MemfdFlags::ALLOW_SEALING | rustix::fs::MemfdFlags::CLOEXEC,
+    )
+    .map_err(|source| TrimulAssetError::Io {
+        path: path.to_path_buf(),
+        source: source.into(),
+    })?;
     let mut sealed_file =
-        descriptor_file_above_stdio(File::from(descriptor), false).map_err(|source| {
+        descriptor_file_above_stdio(File::from(descriptor), true).map_err(|source| {
             TrimulAssetError::Io {
                 path: path.to_path_buf(),
                 source,
@@ -1351,27 +1213,24 @@ fn seal_eval_bundle_with_hook(
 
     let mut sealed = Vec::with_capacity(files.len());
     for (index, (relative_path, bytes)) in files.iter().enumerate() {
-        // Only descriptors copied by the private sandbox wrapper may cross exec.
-        // Everything else in the attested bundle (notably task.yml and optional
-        // fixtures) remains process-private even though it is retained for identity
-        // checks. The wrapper closes every inherited descriptor after copying it.
-        let sandbox_consumed = SANDBOX_EVAL_FILES
-            .iter()
-            .any(|(path, _)| relative_path == Path::new(path));
-        let flags = if sandbox_consumed {
-            rustix::fs::MemfdFlags::ALLOW_SEALING
-        } else {
-            rustix::fs::MemfdFlags::ALLOW_SEALING | rustix::fs::MemfdFlags::CLOEXEC
-        };
-        let descriptor = rustix::fs::memfd_create(format!("ferrl-trimul-eval-{index}"), flags)
-            .map_err(|source| TrimulAssetError::Io {
-                path: relative_path.clone(),
-                source: source.into(),
-            })?;
-        let mut file = descriptor_file_above_stdio(File::from(descriptor), !sandbox_consumed)
-            .map_err(|source| TrimulAssetError::Io {
-                path: relative_path.clone(),
-                source,
+        // The protected handoff opens sandbox-consumed assets through the owner
+        // process's proc-fd path, authenticates their private read-only copies, and
+        // closes every source on exec. No verifier descriptor is inherited by
+        // launcher, init, shell, or candidate processes.
+        let descriptor = rustix::fs::memfd_create(
+            format!("ferrl-trimul-eval-{index}"),
+            rustix::fs::MemfdFlags::ALLOW_SEALING | rustix::fs::MemfdFlags::CLOEXEC,
+        )
+        .map_err(|source| TrimulAssetError::Io {
+            path: relative_path.clone(),
+            source: source.into(),
+        })?;
+        let mut file =
+            descriptor_file_above_stdio(File::from(descriptor), true).map_err(|source| {
+                TrimulAssetError::Io {
+                    path: relative_path.clone(),
+                    source,
+                }
             })?;
         file.write_all(bytes)
             .map_err(|source| TrimulAssetError::Io {
@@ -1483,11 +1342,6 @@ fn parse_distribution(raw: Option<&String>) -> Result<Distribution, TrimulError>
 /// and scores it on correctness + speed. Construct with [`TrimulReward::new`].
 #[derive(Debug, Clone)]
 pub struct TrimulReward {
-    /// The eval image (the pinned PyTorch+Triton `.sif`).
-    image: PathBuf,
-    /// The pinned GPUMODE eval bundle (`eval.py`/`reference.py`/`task.py`/`utils.py`),
-    /// bound **read-only**.
-    eval_dir: PathBuf,
     /// Where per-candidate scratch dirs are created — node-local tmpfs is preferred
     /// (e.g. `/dev/shm/ferrl`) so overflow cannot fill persistent host storage.
     scratch_root: PathBuf,
@@ -1525,8 +1379,9 @@ pub struct TrimulReward {
     verifier_max_procs: u64,
     /// The sandbox backend.
     sandbox: ApptainerSandbox,
-    /// Optional immutable verifier assets captured before launch attestation.
-    verifier_assets: Option<TrimulVerifierAssets>,
+    /// Immutable verifier assets captured before launch attestation. Construction
+    /// cannot produce an execution-capable reward without this owner.
+    verifier_assets: TrimulVerifierAssets,
 }
 
 /// The parsed result of one sandboxed TriMul eval.
@@ -1545,9 +1400,9 @@ pub struct TrimulVerification {
 /// A `custom_kernel` that delegates to the bundled reference implementation. Used to
 /// **measure the speedup baseline**: the reference is correct by definition, so it
 /// passes correctness and its benchmark time *is* the reference runtime. The
-/// `reference` module is bound read-only next to the sealed submission (see
-/// [`TrimulReward::in_container_command`]). This is the extracted code, not a fenced
-/// block — it is fed straight to the eval path, bypassing [`extract_submission`].
+/// `reference` module is bound read-only next to the sealed submission. This is the
+/// extracted code, not a fenced block — it is fed straight to the eval path,
+/// bypassing [`extract_submission`].
 const REFERENCE_SUBMISSION: &str =
     "def custom_kernel(data):\n    from reference import ref_kernel\n    return ref_kernel(data)\n";
 
@@ -1559,18 +1414,16 @@ const REFERENCE_SUBMISSION: &str =
 pub const DEFAULT_VERIFIER_MAX_PROCS: u64 = 1024;
 
 impl TrimulReward {
-    /// Construct with the eval `image`, the pinned `eval_dir` bundle, and a
-    /// node-local `scratch_root`. Cases default to empty — set them with
+    /// Construct from captured immutable verifier `assets` and a node-local
+    /// `scratch_root`. Cases default to empty — set them with
     /// [`with_cases`](Self::with_cases) (they are GPU Mode's, kept out of this repo).
+    ///
+    /// Requiring the descriptor owner here prevents an apparently valid reward or
+    /// run specification whose verifier handles were never captured or have already
+    /// been dropped.
     #[must_use]
-    pub fn new(
-        image: impl Into<PathBuf>,
-        eval_dir: impl Into<PathBuf>,
-        scratch_root: impl Into<PathBuf>,
-    ) -> Self {
+    pub fn new(assets: TrimulVerifierAssets, scratch_root: impl Into<PathBuf>) -> Self {
         Self {
-            image: image.into(),
-            eval_dir: eval_dir.into(),
             scratch_root: scratch_root.into(),
             scratch_max_bytes: 1 << 30,
             test_cases: Vec::new(),
@@ -1586,15 +1439,8 @@ impl TrimulReward {
             verifier_parallelism: 1,
             verifier_max_procs: DEFAULT_VERIFIER_MAX_PROCS,
             sandbox: ApptainerSandbox::default(),
-            verifier_assets: None,
+            verifier_assets: assets,
         }
-    }
-
-    /// Consume one pre-attestation verifier asset set for every sandbox invocation.
-    #[must_use]
-    pub fn with_verifier_assets(mut self, assets: TrimulVerifierAssets) -> Self {
-        self.verifier_assets = Some(assets);
-        self
     }
 
     /// Set the correctness and timing case lists.
@@ -1785,39 +1631,14 @@ impl TrimulReward {
         }
     }
 
-    /// The `bash -c` program run inside the image: execute the sealed Ferrl driver
-    /// against sealed read-only verifier, submission, and case files. `benchmark`
-    /// runs only after a clean `test`; each phase writes its protected grade and
-    /// post-initialization entry proof via fd 3 (`POPCORN_FD`). A trailing `true`
-    /// keeps candidate exits in the structured result instead of the shell status.
-    fn in_container_command(&self) -> String {
-        // Route the grade (POPCORN fd 3) to the *captured stdout pipe* (`3>&1`) and
-        // send the eval's — and the candidate's — own stdout to `/dev/null`
-        // (`1>/dev/null`). The grade therefore arrives on a channel the untrusted
-        // candidate cannot reach: its spawn-worker does not inherit fd 3 (eval.py marks
-        // it non-inheritable) and its stdout is discarded, so it cannot forge a pass by
-        // writing files or printing. A separator splits the two sections; benchmark runs
-        // only if `test` exits cleanly.
-        format!(
-            "{{ POPCORN_FD=3 python -I {FERRL_EVAL_DRIVER_PATH} test {TEST_SPEC_PATH} 3>&1 1>/dev/null; \
-           test_rc=$?; \
-           echo \"test-exit: $test_rc\"; \
-           if [ \"$test_rc\" -eq 0 ]; then \
-             echo '===FERRL-BENCH==='; \
-             POPCORN_FD=3 python -I {FERRL_EVAL_DRIVER_PATH} benchmark {BENCH_SPEC_PATH} 3>&1 1>/dev/null; \
-             bench_rc=$?; \
-             echo \"benchmark-exit: $bench_rc\"; \
-           fi; }}; \
-         true"
-        )
-    }
-
     /// Build the [`RunSpec`] for a candidate whose scratch dir is `scratch`: the eval
     /// image with the GPU exposed, the captured eval bundle bound read-only, scratch
     /// cache/output storage read-write, the network denied, and only the env needed
     /// by the eval. Per-candidate sealed binds are added immediately before launch.
-    #[must_use]
-    pub fn build_run_spec(&self, scratch: &Path) -> RunSpec {
+    ///
+    /// This remains private so descriptor-backed paths cannot outlive the
+    /// [`TrimulVerifierAssets`] owner held by this reward.
+    fn build_run_spec(&self, scratch: &Path) -> RunSpec {
         self.build_run_spec_with_devices(scratch, self.verifier_cuda_visible_devices.as_deref())
     }
 
@@ -1837,36 +1658,37 @@ impl TrimulReward {
             ("HOME".into(), "/work/cache".into()),
             ("TRITON_CACHE_DIR".into(), "/work/cache/triton".into()),
             ("POPCORN_SEED".into(), self.secret_seed.to_string()),
+            (
+                "FERRL_GRADE_SOCKET".into(),
+                "/work/.ferrl-grade-v1.sock".into(),
+            ),
         ];
         if let Some(devices) = devices {
             env.push(("CUDA_VISIBLE_DEVICES".into(), devices.to_string()));
         }
 
-        let image = self.verifier_assets.as_ref().map_or_else(
-            || self.image.clone(),
-            TrimulVerifierAssets::image_for_sandbox,
-        );
-        let mut binds = self.verifier_assets.as_ref().map_or_else(
-            || {
-                SANDBOX_EVAL_FILES
-                    .iter()
-                    .map(|(relative, destination)| {
-                        Bind::ro(self.eval_dir.join(relative), *destination)
-                    })
-                    .collect()
-            },
-            TrimulVerifierAssets::eval_binds,
-        );
+        let image = self.verifier_assets.image_for_sandbox();
+        let mut binds = self.verifier_assets.eval_binds();
         binds.push(Bind::rw(scratch, "/work").with_total_limit(self.scratch_max_bytes));
         RunSpec::new(
             image,
-            vec!["bash".into(), "-c".into(), self.in_container_command()],
+            vec![
+                "python".into(),
+                "-I".into(),
+                FERRL_EVAL_DRIVER_PATH.into(),
+                TEST_SPEC_PATH.into(),
+                BENCH_SPEC_PATH.into(),
+            ],
         )
         .with_gpu(true)
         .with_binds(binds)
         .with_workdir("/work")
         .with_env(env)
         .with_limits(self.limits())
+        .with_protected_output(ProtectedOutput::new(
+            scratch.join(".ferrl-grade-v1.sock"),
+            "/work/.ferrl-grade-v1.sock",
+        ))
     }
 
     /// Stage `submission`, run the eval in the sandbox, and score the result files.
@@ -1931,11 +1753,6 @@ impl TrimulReward {
         submission: &str,
         spec: &RunSpec,
     ) -> Result<TrimulEval, RewardError> {
-        if self.verifier_assets.is_none() {
-            return Err(RewardError::verifier(TrimulAssetError::Invalid(
-                "TriMul execution requires captured kernel-sealed verifier assets".to_string(),
-            )));
-        }
         std::fs::create_dir_all(scratch.join("cache")).map_err(RewardError::verifier)?;
         let test_spec = render_spec(&self.test_cases);
         let bench_spec = render_spec(&self.benchmark_cases);
@@ -1945,9 +1762,9 @@ impl TrimulReward {
         let mut sealed_spec = spec.clone();
         sealed_spec.binds.extend(invocation.binds());
 
-        // The grade arrives on the captured stdout (fd 3 → the pipe; see
-        // `in_container_command`), not on candidate-writable storage. The sealed
-        // invocation descriptors remain owned here until the sandbox returns.
+        // The machine grade arrives only through the verifier-owned Unix stream.
+        // Ordinary stdout/stderr remain untrusted diagnostics. The sealed invocation
+        // descriptors remain owned here until the sandbox returns.
         let outcome = self
             .sandbox
             .run(&sealed_spec)
@@ -1955,8 +1772,9 @@ impl TrimulReward {
         invocation.verify().map_err(RewardError::verifier)?;
         let outcome = require_trimul_verifier_entry(outcome).map_err(RewardError::verifier)?;
 
-        let has_benchmark_section = outcome.stdout.contains(RESULT_SPLIT);
-        let (test_log, bench_log) = split_result(&outcome.stdout);
+        let grade = outcome.protected_output;
+        let has_benchmark_section = grade.contains(RESULT_SPLIT);
+        let (test_log, bench_log) = split_result(&grade);
         let test_check = log_value(test_log, "check").map(str::to_string);
         let test_exit = log_i32_value(test_log, "test-exit");
         let benchmark_exit = log_i32_value(bench_log, "benchmark-exit");
@@ -1984,8 +1802,11 @@ impl TrimulReward {
             },
             status: outcome.status,
             output: TrimulEvalOutput {
-                stdout: outcome.stdout,
-                stderr: outcome.stderr,
+                stdout: grade,
+                stderr: format!(
+                    "sandbox stdout:\n{}\nsandbox stderr:\n{}",
+                    outcome.stdout, outcome.stderr
+                ),
             },
             test_check,
             test_exit,
@@ -2194,31 +2015,39 @@ impl TrimulReward {
 
     fn verify_verifier_assets(&self) -> Result<(), RewardError> {
         self.verifier_assets
-            .as_ref()
-            .map_or(Ok(()), TrimulVerifierAssets::verify_current)
+            .verify_current()
             .map_err(RewardError::verifier)
     }
 }
 
-const TEST_VERIFIER_ENTRY: &str = "test-v3";
-const BENCHMARK_VERIFIER_ENTRY: &str = "benchmark-v3";
+const TEST_VERIFIER_ENTRY: &str = "test-v4";
+const BENCHMARK_VERIFIER_ENTRY: &str = "benchmark-v4";
 
-/// Require entry records written by the sealed Ferrl driver on the protected
-/// grade fd only after the exact spawn worker has imported trusted verifier code
-/// and initialized the CUDA runtime. Benchmark entry is mandatory whenever the
-/// shell reached the benchmark phase, so a later platform failure cannot retain
+/// Require records written by the sealed parent on the verifier-only socket after
+/// exact trusted initialization and either actual candidate-frame entry or an
+/// authenticated candidate-source rejection. Benchmark proof is mandatory whenever
+/// the protected grade reached that phase, so a later platform failure cannot retain
 /// correctness credit.
 fn require_trimul_verifier_entry(outcome: RunOutcome) -> Result<RunOutcome, SandboxError> {
-    let (test_log, benchmark_log) = split_result(&outcome.stdout);
-    if log_value(test_log, "ferrl-entry") != Some(TEST_VERIFIER_ENTRY) {
+    let (test_log, benchmark_log) = split_result(&outcome.protected_output);
+    if !phase_reached(test_log, TEST_VERIFIER_ENTRY, "test-import-v1") {
         return Err(missing_verifier_entry(&outcome, "test"));
     }
-    if outcome.stdout.contains(RESULT_SPLIT)
-        && log_value(benchmark_log, "ferrl-entry") != Some(BENCHMARK_VERIFIER_ENTRY)
+    if outcome.protected_output.contains(RESULT_SPLIT)
+        && !phase_reached(
+            benchmark_log,
+            BENCHMARK_VERIFIER_ENTRY,
+            "benchmark-import-v1",
+        )
     {
         return Err(missing_verifier_entry(&outcome, "benchmark"));
     }
     Ok(outcome)
+}
+
+fn phase_reached(log: &str, entry: &str, rejected: &str) -> bool {
+    log_value(log, "ferrl-entry") == Some(entry)
+        || log_value(log, "ferrl-candidate-rejected") == Some(rejected)
 }
 
 fn missing_verifier_entry(outcome: &RunOutcome, phase: &str) -> SandboxError {
@@ -2488,7 +2317,11 @@ mod tests {
     }
 
     fn reward() -> TrimulReward {
-        TrimulReward::new("/img.sif", "/eval", "/tmp")
+        static FIXTURE: std::sync::OnceLock<(PathBuf, PathBuf, PathBuf, PathBuf)> =
+            std::sync::OnceLock::new();
+        let (_, image, eval, scratch) = FIXTURE.get_or_init(|| verifier_fixture("shared-reward"));
+        let assets = TrimulVerifierAssets::capture(image, eval, scratch).unwrap();
+        TrimulReward::new(assets, scratch)
     }
 
     fn verifier_fixture(tag: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
@@ -2522,8 +2355,7 @@ mod tests {
     fn verifier_assets_consume_stable_image_and_sealed_eval_descriptors() {
         let (root, image, eval, scratch) = verifier_fixture("stable-consumption");
         let assets = TrimulVerifierAssets::capture(&image, &eval, &scratch).unwrap();
-        let reward =
-            TrimulReward::new(&image, &eval, &scratch).with_verifier_assets(assets.clone());
+        let reward = TrimulReward::new(assets.clone(), &scratch);
         let run_scratch = scratch.join("candidate");
         let spec = reward.build_run_spec(&run_scratch);
 
@@ -2560,27 +2392,20 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn verifier_assets_inherit_only_descriptors_consumed_by_the_sandbox() {
+    fn verifier_assets_are_never_inherited_by_launcher_or_candidate_processes() {
         use std::os::fd::AsRawFd as _;
 
         let (root, image, eval, scratch) = verifier_fixture("descriptor-inheritance");
         let assets = TrimulVerifierAssets::capture(&image, &eval, &scratch).unwrap();
         let image_flags = rustix::io::fcntl_getfd(&assets.snapshot.image_file).unwrap();
-        assert!(
-            !image_flags.contains(rustix::io::FdFlags::CLOEXEC),
-            "the image handle must reach the private staging wrapper"
-        );
+        assert!(image_flags.contains(rustix::io::FdFlags::CLOEXEC));
         assert!(assets.snapshot.image_file.as_raw_fd() > 2);
         for file in &assets.snapshot.sealed_eval_files {
             assert!(file.file.as_raw_fd() > 2);
             let flags = rustix::io::fcntl_getfd(&file.file).unwrap();
-            let sandbox_consumed = SANDBOX_EVAL_FILES
-                .iter()
-                .any(|(path, _)| file.relative_path == Path::new(path));
-            assert_eq!(
+            assert!(
                 flags.contains(rustix::io::FdFlags::CLOEXEC),
-                !sandbox_consumed,
-                "unexpected inheritance policy for {}",
+                "{} could cross a launcher exec",
                 file.relative_path.display()
             );
         }
@@ -2616,6 +2441,13 @@ mod tests {
         );
         for (file, destination) in &assets.files {
             assert!(file.file.as_raw_fd() > 2);
+            assert!(
+                rustix::io::fcntl_getfd(&file.file)
+                    .unwrap()
+                    .contains(rustix::io::FdFlags::CLOEXEC),
+                "{} could cross a launcher exec",
+                file.relative_path.display()
+            );
             assert!(destination.starts_with("/opt/ferrl-verifier/"));
             let mut attacker = std::fs::OpenOptions::new()
                 .write(true)
@@ -2640,8 +2472,7 @@ mod tests {
 
         let (root, image, eval, scratch) = verifier_fixture("in-flight-mutation");
         let assets = TrimulVerifierAssets::capture(&image, &eval, &scratch).unwrap();
-        let reward =
-            TrimulReward::new(&image, &eval, &scratch).with_verifier_assets(assets.clone());
+        let reward = TrimulReward::new(assets.clone(), &scratch);
         let spec = reward.build_run_spec(&scratch.join("candidate"));
         assets.verify_current().unwrap();
 
@@ -3264,7 +3095,7 @@ mod tests {
     fn pre_verifier_infrastructure_failure_never_earns_the_format_floor() {
         let (root, image, eval, scratch) = verifier_fixture("pre-entry-infrastructure");
         let assets = TrimulVerifierAssets::capture(&image, &eval, &scratch).unwrap();
-        let mut r = TrimulReward::new(&image, &eval, &scratch).with_verifier_assets(assets);
+        let mut r = TrimulReward::new(assets, &scratch);
         r.sandbox = ApptainerSandbox::with_bin("/bin/false");
         let sample = Sample::new("write a faster TriMul kernel", ());
         let completion = "final:\n```python\ndef custom_kernel(data):\n    return data\n```\n";
@@ -3283,52 +3114,92 @@ mod tests {
     #[test]
     #[allow(clippy::cognitive_complexity)] // phase matrix keeps infrastructure and candidate outcomes adjacent
     fn verifier_entry_requires_trusted_worker_and_gpu_proof_for_each_phase() {
-        let command = reward().in_container_command();
-        assert!(command.contains(FERRL_EVAL_DRIVER_PATH));
-        assert!(command.contains("python -I"));
-        assert!(command.contains(TEST_SPEC_PATH));
-        assert!(command.contains(BENCH_SPEC_PATH));
-        assert!(!command.contains("cp "));
+        let spec = reward().build_run_spec(Path::new("/tmp/scratch"));
+        assert_eq!(
+            spec.command,
+            vec![
+                "python",
+                "-I",
+                FERRL_EVAL_DRIVER_PATH,
+                TEST_SPEC_PATH,
+                BENCH_SPEC_PATH,
+            ]
+        );
+        assert!(spec.protected_output.is_some());
+        assert!(spec.env.iter().any(
+            |(key, value)| key == "FERRL_GRADE_SOCKET" && value == "/work/.ferrl-grade-v1.sock"
+        ));
 
         let protect = FERRL_EVAL_DRIVER
-            .find("prctl(PR_SET_DUMPABLE")
+            .find("_prctl(PR_SET_DUMPABLE, 0)")
             .expect("the grade parent is protected before trusted imports");
         let trusted_import = FERRL_EVAL_DRIVER
             .find("import eval as upstream")
             .expect("the sealed driver imports the attested verifier");
-        let dispatch = FERRL_EVAL_DRIVER
-            .split_once("def _dispatch_candidate")
-            .expect("the worker has a candidate-dispatch boundary")
+        let worker = FERRL_EVAL_DRIVER
+            .split_once("def _candidate_worker")
+            .expect("candidate execution has a separate process target")
             .1;
-        let readiness = dispatch
-            .find("if not _TRUSTED_READY")
-            .expect("replacement workers cannot bypass the trusted probe");
-        let entry = dispatch
-            .find("_signal_candidate_entry()")
-            .expect("the worker authenticates candidate entry");
-        let candidate_import = dispatch
+        let ready = worker
+            .find("_send_status(status, b\"READY\")")
+            .expect("the candidate process proves trusted CUDA initialization");
+        let ack = worker
+            .find("commands.recv() != (\"ack-v1\",")
+            .expect("candidate import follows the parent acknowledgement");
+        let traced_entry = worker
+            .find("frame.f_code.co_filename == SUBMISSION_PATH")
+            .expect("entry is observed from the actual submission module frame");
+        let candidate_import = worker
             .find("importlib.import_module(\"submission\")")
             .expect("candidate import is explicit and deferred");
-        let probe = FERRL_EVAL_DRIVER
-            .split_once("def _trusted_worker_probe")
-            .expect("the worker has an exact-process trusted probe")
-            .1;
-        let gpu_sync = probe
-            .find("torch.cuda.synchronize()")
-            .expect("the trusted probe synchronizes the GPU");
-        let ready = probe
-            .find("_TRUSTED_READY = True")
-            .expect("the exact probed worker records readiness");
         assert!(protect < trusted_import);
-        assert!(readiness < entry && entry < candidate_import);
-        assert!(gpu_sync < ready);
-        assert!(FERRL_EVAL_DRIVER.contains("connection.close()"));
-        assert!(FERRL_EVAL_DRIVER.contains("types.ModuleType(\"submission\")"));
+        assert!(ready < ack && ack < traced_entry && traced_entry < candidate_import);
+        assert!(FERRL_EVAL_DRIVER.contains("multiprocessing.get_context(\"spawn\")"));
+        assert!(FERRL_EVAL_DRIVER.contains("time.perf_counter_ns()"));
+        assert!(FERRL_EVAL_DRIVER.contains("_CHECK_IMPLEMENTATION(data, output)"));
+        assert!(FERRL_EVAL_DRIVER.contains("_CALCULATE_STATS(durations)"));
+        assert!(FERRL_EVAL_DRIVER.contains("copy_tensor(output_buffer, output)"));
+        assert!(FERRL_EVAL_DRIVER.contains("trusted correctness checker failed"));
+        assert!(!FERRL_EVAL_DRIVER.contains("upstream.run_testing"));
+        assert!(!FERRL_EVAL_DRIVER.contains("multiprocessing.Pool"));
+
+        let execute = FERRL_EVAL_DRIVER
+            .split_once("def execute(self, candidate_data, shared_output, checked_output):")
+            .expect("the protected parent owns candidate handoff and output capture")
+            .1;
+        let timer = execute
+            .find("started = time.perf_counter_ns()")
+            .expect("protected timing starts explicitly");
+        let handoff = execute
+            .find("self.commands.send((\"prepare-v1\", candidate_data, shared_output))")
+            .expect("the hidden input is handed off explicitly");
+        let private_capture = execute
+            .find("_COPY_TENSOR(checked_output, shared_output)")
+            .expect("the parent captures a private result");
+        let elapsed = execute
+            .find("return time.perf_counter_ns() - started")
+            .expect("timing ends only after private capture");
+        assert!(timer < handoff && handoff < private_capture && private_capture < elapsed);
+        assert!(FERRL_EVAL_DRIVER.contains("_wrap_check(data, checked_output)"));
+
+        let main = FERRL_EVAL_DRIVER
+            .split_once("def main():")
+            .expect("the sealed driver has one protected main boundary")
+            .1;
+        let grade_connect = main
+            .find("logger = GradeLogger(grade_socket)")
+            .expect("the protected parent opens the only grade endpoint");
+        let candidate_start = main
+            .find("_run_testing(logger, test_cases)")
+            .expect("candidate test execution is explicit");
+        assert!(grade_connect < candidate_start);
+        assert!(FERRL_EVAL_DRIVER.contains("self.socket.set_inheritable(False)"));
 
         let missing_runtime = require_trimul_verifier_entry(RunOutcome {
             status: RunStatus::Exited(0),
-            stdout: "test-exit: 127\n".to_string(),
+            stdout: "ferrl-entry: test-v4\ncheck: pass\n".to_string(),
             stderr: "python: not found".to_string(),
+            protected_output: String::new(),
             wall: Duration::from_millis(1),
         })
         .unwrap_err();
@@ -3343,11 +3214,12 @@ mod tests {
 
         let trusted_benchmark_import_failure = require_trimul_verifier_entry(RunOutcome {
             status: RunStatus::Exited(0),
-            stdout: format!(
+            stdout: "candidate forged stdout\n".to_string(),
+            stderr: "ImportError: trusted benchmark dependency".to_string(),
+            protected_output: format!(
                 "ferrl-entry: {TEST_VERIFIER_ENTRY}\ncheck: pass\ntest-exit: 0\n\
                  {RESULT_SPLIT}\nbenchmark-exit: 1\n"
             ),
-            stderr: "ImportError: trusted benchmark dependency".to_string(),
             wall: Duration::from_millis(1),
         })
         .unwrap_err();
@@ -3362,8 +3234,9 @@ mod tests {
 
         let candidate_failure = require_trimul_verifier_entry(RunOutcome {
             status: RunStatus::Exited(7),
-            stdout: format!("ferrl-entry: {TEST_VERIFIER_ENTRY}\ntest-exit: 7\n"),
+            stdout: String::new(),
             stderr: "candidate failed\n".to_string(),
+            protected_output: format!("ferrl-entry: {TEST_VERIFIER_ENTRY}\ntest-exit: 7\n"),
             wall: Duration::from_millis(1),
         })
         .unwrap();
@@ -3371,15 +3244,28 @@ mod tests {
 
         let benchmark_candidate_failure = require_trimul_verifier_entry(RunOutcome {
             status: RunStatus::Exited(0),
-            stdout: format!(
+            stdout: String::new(),
+            stderr: "candidate benchmark failed\n".to_string(),
+            protected_output: format!(
                 "ferrl-entry: {TEST_VERIFIER_ENTRY}\ncheck: pass\ntest-exit: 0\n\
                  {RESULT_SPLIT}\nferrl-entry: {BENCHMARK_VERIFIER_ENTRY}\nbenchmark-exit: 7\n"
             ),
-            stderr: "candidate benchmark failed\n".to_string(),
             wall: Duration::from_millis(1),
         })
         .unwrap();
         assert_eq!(benchmark_candidate_failure.status, RunStatus::Exited(0));
+
+        let rejected_candidate = require_trimul_verifier_entry(RunOutcome {
+            status: RunStatus::Exited(0),
+            stdout: String::new(),
+            stderr: String::new(),
+            protected_output:
+                "ferrl-candidate-rejected: test-import-v1\ncheck: fail\ntest-exit: 112\n"
+                    .to_string(),
+            wall: Duration::from_millis(1),
+        })
+        .unwrap();
+        assert_eq!(rejected_candidate.status, RunStatus::Exited(0));
     }
 
     #[test]
@@ -3662,28 +3548,27 @@ mod tests {
     }
 
     #[test]
-    fn in_container_command_routes_the_grade_to_stdout_and_gates_benchmark() {
-        let cmd = reward().in_container_command();
-        // Grade -> fd 3 -> the captured stdout pipe; the eval's/candidate's own stdout
-        // is discarded, so a forged file or print cannot influence the score.
-        assert!(cmd.contains(&format!(
-            "python -I {FERRL_EVAL_DRIVER_PATH} test {TEST_SPEC_PATH} 3>&1 1>/dev/null"
-        )));
-        assert!(cmd.contains(&format!(
-            "python -I {FERRL_EVAL_DRIVER_PATH} benchmark {BENCH_SPEC_PATH} 3>&1 1>/dev/null"
-        )));
-        assert!(cmd.contains("if [ \"$test_rc\" -eq 0 ]; then"));
+    fn run_spec_uses_one_protected_driver_and_no_grade_fd_alias() {
+        let spec = reward().build_run_spec(Path::new("/tmp/scratch"));
+        assert_eq!(spec.command[0..3], ["python", "-I", FERRL_EVAL_DRIVER_PATH]);
+        assert_eq!(spec.command[3], TEST_SPEC_PATH);
+        assert_eq!(spec.command[4], BENCH_SPEC_PATH);
+        assert!(spec.protected_output.is_some());
+        assert!(!spec.command.iter().any(|value| value.contains("3>&1")));
+        assert!(!spec.env.iter().any(|(key, _)| key == "POPCORN_FD"));
     }
 
     #[test]
-    fn in_container_command_reports_eval_exit_statuses() {
-        let cmd = reward().in_container_command();
-        // The shell reports eval process exits on the same controlled grade channel,
-        // so missing grade output can be distinguished from eval process failure.
-        assert!(cmd.contains("test_rc=$?"));
-        assert!(cmd.contains("echo \"test-exit: $test_rc\""));
-        assert!(cmd.contains("bench_rc=$?"));
-        assert!(cmd.contains("echo \"benchmark-exit: $bench_rc\""));
+    fn protected_driver_reports_phase_status_after_candidate_teardown() {
+        assert!(FERRL_EVAL_DRIVER.contains("logger.log(\"test-exit\""));
+        assert!(FERRL_EVAL_DRIVER.contains("logger.log(\"benchmark-exit\""));
+        let final_kill = FERRL_EVAL_DRIVER
+            .rfind("_kill_candidate_tree()")
+            .expect("the driver has a final candidate-tree kill");
+        let grade_close = FERRL_EVAL_DRIVER
+            .rfind("logger.close()")
+            .expect("the verifier closes its exclusive grade endpoint");
+        assert!(final_kill < grade_close);
     }
 
     #[test]

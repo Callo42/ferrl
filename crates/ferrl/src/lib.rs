@@ -270,8 +270,8 @@ pub use sample::Sample;
 pub use sampler::GrpoSampler;
 #[doc(inline)]
 pub use sandbox::{
-    ApptainerSandbox, Bind, BindMode, NetworkPolicy, ResourceLimits, RunOutcome, RunSpec,
-    RunStatus, Sandbox, SandboxError,
+    ApptainerSandbox, Bind, BindMode, NetworkPolicy, ProtectedOutput, ResourceLimits, RunOutcome,
+    RunSpec, RunStatus, Sandbox, SandboxError,
 };
 #[doc(inline)]
 pub use telemetry::{

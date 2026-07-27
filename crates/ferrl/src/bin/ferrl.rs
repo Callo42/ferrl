@@ -1510,11 +1510,10 @@ impl RunConfig {
         let t = &self.trimul;
         let (tests, benches) = ferrl::trimul::parse_task_yml(assets.task_yml())?;
         let wall = Duration::from_secs(if t.wall_secs == 0 { 600 } else { t.wall_secs });
-        let mut reward = TrimulReward::new(&t.image, &t.eval_dir, &t.scratch_root)
+        let mut reward = TrimulReward::new(assets, &t.scratch_root)
             .with_cases(tests, benches)
             .with_secret_seed(t.secret_seed)
-            .with_wall(wall)
-            .with_verifier_assets(assets);
+            .with_wall(wall);
         reward = reward
             .with_reward_profile(t.reward)
             .map_err(CliError::msg)?;
@@ -9715,37 +9714,24 @@ benchmarks:
         let json = config_json(r#""verifier_max_procs": 2048,"#);
         let cfg: RunConfig = serde_json::from_str(&json).unwrap();
         let reward = cfg.build_trimul_reward_base().unwrap();
-        let spec = reward.build_run_spec(std::path::Path::new("/tmp/scratch"));
 
         assert_eq!(reward.reward_profile().format_extracted, 0.03);
         assert_eq!(reward.reward_profile().runnable, 0.07);
         assert_eq!(reward.reward_profile().partial_correctness, 0.70);
-        assert!(spec
-            .env
-            .iter()
-            .any(|(k, v)| k == "CUDA_VISIBLE_DEVICES" && v == "1"));
-        assert_eq!(spec.limits.max_procs, Some(2048));
+        assert_eq!(
+            cfg.trimul.verifier_cuda_visible_devices.as_deref(),
+            Some("1")
+        );
+        assert_eq!(cfg.trimul.verifier_max_procs, 2048);
 
         let omitted_cfg: RunConfig = serde_json::from_str(&config_json("")).unwrap();
-        let omitted_spec = omitted_cfg
-            .build_trimul_reward_base()
-            .unwrap()
-            .build_run_spec(std::path::Path::new("/tmp/scratch"));
-        assert_eq!(
-            omitted_spec.limits.max_procs,
-            Some(ferrl::trimul::DEFAULT_VERIFIER_MAX_PROCS)
-        );
+        let _ = omitted_cfg.build_trimul_reward_base().unwrap();
+        assert_eq!(omitted_cfg.trimul.verifier_max_procs, 0);
 
         let zero_json = config_json(r#""verifier_max_procs": 0,"#);
         let zero_cfg: RunConfig = serde_json::from_str(&zero_json).unwrap();
-        let zero_spec = zero_cfg
-            .build_trimul_reward_base()
-            .unwrap()
-            .build_run_spec(std::path::Path::new("/tmp/scratch"));
-        assert_eq!(
-            zero_spec.limits.max_procs,
-            Some(ferrl::trimul::DEFAULT_VERIFIER_MAX_PROCS)
-        );
+        let _ = zero_cfg.build_trimul_reward_base().unwrap();
+        assert_eq!(zero_cfg.trimul.verifier_max_procs, 0);
     }
 
     /// TriMul prompt loading is exact; extraction mode is parser-only and does not wrap text.

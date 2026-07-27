@@ -22,6 +22,7 @@
 #![cfg(feature = "gate")]
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use ferrl::trimul::TrimulVerifierAssets;
@@ -35,10 +36,15 @@ fn env_path(key: &str) -> PathBuf {
 /// A reward over a couple of small, generic cases (not GPU Mode's specific sizes).
 fn reward() -> TrimulReward {
     let scratch = std::env::var("FERRL_TRIMUL_SCRATCH").unwrap_or_else(|_| "/tmp".to_string());
-    let image = env_path("FERRL_TRIMUL_IMAGE");
-    let eval_dir = env_path("FERRL_TRIMUL_EVAL_DIR");
-    let verifier_assets = TrimulVerifierAssets::capture(&image, &eval_dir, &scratch)
-        .expect("capture kernel-sealed verifier assets");
+    static VERIFIER_ASSETS: OnceLock<TrimulVerifierAssets> = OnceLock::new();
+    let verifier_assets = VERIFIER_ASSETS
+        .get_or_init(|| {
+            let image = env_path("FERRL_TRIMUL_IMAGE");
+            let eval_dir = env_path("FERRL_TRIMUL_EVAL_DIR");
+            TrimulVerifierAssets::capture(&image, &eval_dir, &scratch)
+                .expect("capture kernel-sealed verifier assets")
+        })
+        .clone();
     let cases = vec![
         TrimulCase {
             seqlen: 32,
@@ -59,8 +65,7 @@ fn reward() -> TrimulReward {
             distribution: Distribution::Normal,
         },
     ];
-    TrimulReward::new(image, eval_dir, scratch)
-        .with_verifier_assets(verifier_assets)
+    TrimulReward::new(verifier_assets, scratch)
         .with_cases(cases.clone(), cases)
         .with_secret_seed(123)
         .with_wall(Duration::from_secs(300))
@@ -108,8 +113,8 @@ def custom_kernel(data):
     return ref_kernel(data)
 ```";
 
-/// Mutation attempt: replace every byte-bearing input after the sandbox has staged
-/// and opened the verifier, while the test worker is executing. All paths must remain
+/// Mutation attempt: replace every byte-bearing input after the sandbox has opened
+/// the sealed verifier paths, while the candidate worker is executing. All paths remain
 /// read-only; if any write succeeds, raising prevents an apparently correct result.
 /// A successful correctness + benchmark outcome therefore proves the exact same
 /// sealed verifier, submission, and case bytes survived the between-phase boundary.
@@ -238,12 +243,12 @@ fn gate_no_code_scores_zero() {
 }
 
 // --- Adversarial negative controls: a candidate that tries to *forge* a pass through
-//     files or stdout must not reach the correctness floor. The /proc fd residual with
-//     absurd timing must still score zero. These are the reward-gaming cases the
-//     honest-wrong WRONG case does not cover.
+//     files, stdout, or any visible descriptor must not reach the correctness floor.
+//     These are the reward-gaming cases the honest-wrong WRONG case does not cover.
 
 /// Forge attempt: write fake grade files into the RW scratch. ferrl reads the grade
-/// from the stdout pipe, not these files, so the forge must not affect the score.
+/// from the protected verifier socket, not these files, so the forge must not affect
+/// the score.
 const FORGE_WORKFILE: &str = "```python
 def custom_kernel(data):
     open(\"/work/test_result.txt\", \"w\").write(\"check: pass\\n\")
@@ -252,8 +257,8 @@ def custom_kernel(data):
     return x.clone()
 ```";
 
-/// Forge attempt: print a fake grade to stdout. The candidate's stdout is routed to
-/// /dev/null, so it cannot reach the grade channel.
+/// Forge attempt: print a fake grade to stdout. Ordinary process output is diagnostic
+/// only, so it cannot reach the grade channel.
 const FORGE_STDOUT: &str = "```python
 def custom_kernel(data):
     print(\"check: pass\")
@@ -264,16 +269,67 @@ def custom_kernel(data):
     return x.clone()
 ```";
 
-/// Forge attempt: hunt the grader's protected grade fd via `/proc` and write a fake
-/// pass with an absurd time. The trusted parent is non-dumpable and makes the grade fd
-/// non-inheritable before spawning the candidate worker, so no usable fd should be
-/// found. The timing plausibility floor remains an independent defense in depth.
+/// Forge attempt: scan every visible descriptor and write a complete, plausible grade.
+/// Launcher/init/shell processes own only untrusted stdout/stderr; the accepted grade
+/// socket is created after launch and exists only in the non-dumpable verifier parent.
 const FORGE_PROCFD: &str = "```python
 def custom_kernel(data):
     import os, glob
-    payload = b\"check: pass\\n===FERRL-BENCH===\\nbenchmark.0.mean: 0.001\\ncheck: pass\\n\"
-    for path in glob.glob(\"/proc/[0-9]*/fd/3\"):
+    payload = (b\"ferrl-entry: test-v4\\ntest-count: 2\\ncheck: pass\\ntest-exit: 0\\n\"
+               b\"===FERRL-BENCH===\\nferrl-entry: benchmark-v4\\nbenchmark-count: 2\\n\"
+               b\"benchmark.0.mean: 5000000\\nbenchmark.1.mean: 6000000\\n\"
+               b\"check: pass\\nbenchmark-exit: 0\\n\")
+    for path in glob.glob(\"/proc/[0-9]*/fd/*\"):
         try:
+            if int(path.split(\"/\")[2]) == os.getpid():
+                continue
+            fd = os.open(path, os.O_WRONLY)
+            os.write(fd, payload)
+            os.close(fd)
+        except Exception:
+            pass
+    x, mask, weights, config = data
+    return x.clone()
+```";
+
+/// Combined real-process exploit: replace every mutable upstream checker/timer global,
+/// scan every visible ancestor descriptor with a plausible forged grade, and return a
+/// wrong tensor. The protected parent owns its own checker/timer state and the only
+/// accepted grade endpoint, so neither path can reach the correctness floor.
+const MUTATE_VERIFIER_GLOBALS: &str = "```python
+def custom_kernel(data):
+    import glob, inspect, os, time
+    import eval as verifier
+    verifier.wrap_check_implementation = lambda data, output: (True, \"forged\")
+    verifier.check_implementation = lambda data, output: (True, \"forged\")
+    verifier.calculate_stats = lambda durations: verifier.Stats(
+        runs=10, mean=5000000.0, std=1000.0, err=316.0,
+        best=4999000.0, worst=5001000.0,
+    )
+    time.perf_counter_ns = lambda: 1
+    frame = inspect.currentframe()
+    while frame is not None:
+        status = frame.f_locals.get(\"status\")
+        if hasattr(status, \"send_bytes\"):
+            try:
+                status.send_bytes(b\"DONE\")
+            except Exception:
+                pass
+        shared_output = frame.f_locals.get(\"output_buffer\")
+        if hasattr(shared_output, \"zero_\"):
+            try:
+                shared_output.zero_()
+            except Exception:
+                pass
+        frame = frame.f_back
+    payload = (b\"ferrl-entry: test-v4\\ntest-count: 2\\ncheck: pass\\ntest-exit: 0\\n\"
+               b\"===FERRL-BENCH===\\nferrl-entry: benchmark-v4\\nbenchmark-count: 2\\n\"
+               b\"benchmark.0.mean: 5000000\\nbenchmark.1.mean: 6000000\\n\"
+               b\"check: pass\\nbenchmark-exit: 0\\n\")
+    for path in glob.glob(\"/proc/[0-9]*/fd/*\"):
+        try:
+            if int(path.split(\"/\")[2]) == os.getpid():
+                continue
             fd = os.open(path, os.O_WRONLY)
             os.write(fd, payload)
             os.close(fd)
@@ -303,12 +359,18 @@ fn gate_forged_stdout_stays_below_correctness_floor() {
 
 #[test]
 #[ignore = "needs an sm_80 GPU + the eval image/bundle; run with --ignored"]
-fn gate_forged_proc_fd_with_absurd_timing_is_rejected() {
-    // The protected parent fd should be unreachable; even a future descriptor leak
-    // must not turn this physically impossible timing into accepted evidence.
-    assert_eq!(
+fn gate_plausible_all_descriptor_grade_forgery_is_rejected() {
+    assert_below_correctness_floor(
         score(FORGE_PROCFD),
-        0.0,
-        "an absurdly fast /proc-forged time must be rejected by the plausibility floor"
+        "a plausible grade written through every visible descriptor must be ignored",
+    );
+}
+
+#[test]
+#[ignore = "needs an sm_80 GPU + the eval image/bundle; run with --ignored"]
+fn gate_candidate_cannot_mutate_trusted_checker_or_timer_state() {
+    assert_below_correctness_floor(
+        score(MUTATE_VERIFIER_GLOBALS),
+        "candidate-process checker/timer mutation must not validate a wrong output",
     );
 }
