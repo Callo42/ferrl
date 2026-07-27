@@ -24,10 +24,11 @@
 //! - `--nv` only when [`RunSpec::gpu`] is set — GPU passthrough is opt-in;
 //! - read-only / read-write [`Bind`]s for exactly the reference harness and a
 //!   scratch directory, nothing else;
-//! - kernel-sealed anonymous verifier assets are copied only inside a private tmpfs
-//!   by one process that re-arms non-dumpability before creating its mount namespace,
-//!   remounts the stage read-only, authenticates every final byte/inode, and becomes
-//!   Apptainer via `exec`. No separate namespace-owning supervisor survives;
+//! - `--no-privs --drop-caps all` unconditionally removes payload privilege and
+//!   Linux capabilities. Direct [`ApptainerSandbox`] runs accept ordinary host
+//!   paths only; kernel-sealed verifier descriptors must use the dedicated-UID
+//!   [`crate::verifier_executor::VerifierExecutorSandbox`], which transfers them
+//!   with `SCM_RIGHTS` and copies them into service-private paths;
 //! - in-image `ulimit`s (CPU, address space, processes, file size), beneath a
 //!   **host-side wall-clock supervisor** that is the final authority on the time
 //!   budget — it owns a fresh process group and kills the complete launch tree if
@@ -47,8 +48,8 @@
 //! [`ApptainerSandbox::build_argv`] and the
 //! in-image-script builder encode every isolation flag and resource cap. Their tests
 //! are **security-invariant regression guards** — they fail if a future edit drops
-//! `--cleanenv`, opens the network, exposes a sealed descriptor through an ordinary
-//! host pathname, or stops capping processes. The host-side wall-clock supervisor is
+//! `--cleanenv`, restores payload capabilities, accepts a sealed descriptor on the
+//! direct path, or stops capping processes. The host-side wall-clock supervisor is
 //! tested against a plain subprocess (no container runtime needed). The proof that
 //! Apptainer *actually contains a hostile payload* — a malicious-probe battery —
 //! lives behind the off-by-default `gate` feature in `tests/sandbox_gate.rs`, run on
@@ -67,6 +68,8 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
+
 #[cfg(unix)]
 use std::os::unix::{
     fs::PermissionsExt as _,
@@ -76,7 +79,7 @@ use std::os::unix::{
 use std::{fs::File, os::fd::AsRawFd as _};
 
 /// How a host path is exposed inside the sandbox.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BindMode {
     /// Mounted read-only — the payload may read but not modify the source.
     ReadOnly,
@@ -95,7 +98,7 @@ impl BindMode {
 }
 
 /// A host directory or file bound into the sandbox at a fixed mount point.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Bind {
     /// Host path to expose.
     pub src: PathBuf,
@@ -152,7 +155,7 @@ impl Bind {
 }
 
 /// Whether the sandbox is given a network.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum NetworkPolicy {
     /// No network: a private network namespace with no interfaces
     /// (`--net --network none`). The default — generated code has no reason to
@@ -171,7 +174,7 @@ pub enum NetworkPolicy {
 /// notably `address_space`, which must usually be `None` for CUDA/GPU payloads,
 /// because the CUDA runtime reserves tens of gigabytes of *virtual* address space
 /// that an address-space cap would wrongly kill.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceLimits {
     /// Wall-clock budget; the host supervisor kills the run when it elapses.
     pub wall: Duration,
@@ -193,17 +196,21 @@ pub struct ResourceLimits {
 /// sandbox-visible pathname; the supervisor accepts only a peer whose kernel PID is
 /// a descendant of the process it spawned. Launcher, init, and shell processes never
 /// inherit the accepted stream, and the verifier must keep it close-on-exec before
-/// starting untrusted workers.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// starting untrusted workers. Both paths must be normalized absolute paths to the
+/// same non-empty relative file beneath exactly one read-write [`Bind`]; launch
+/// preflight rejects missing, ambiguous, or mismatched mappings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtectedOutput {
     /// Unix-socket pathname in the host scratch tree.
     pub host_socket: PathBuf,
-    /// The same socket as addressed inside the sandbox.
+    /// The same relative socket as addressed inside the sandbox's matching
+    /// read-write bind.
     pub sandbox_socket: PathBuf,
 }
 
 impl ProtectedOutput {
-    /// Describe the host and sandbox views of one protected output socket.
+    /// Describe the host and sandbox views of one protected output socket. The
+    /// corresponding [`RunSpec`] is validated before the listener is created.
     #[must_use]
     pub fn new(host_socket: impl Into<PathBuf>, sandbox_socket: impl Into<PathBuf>) -> Self {
         Self {
@@ -229,18 +236,18 @@ impl Default for ResourceLimits {
 
 /// A fully-specified sandboxed run: which image, which command, what is mounted,
 /// and the isolation / resource policy.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunSpec {
     /// The container image — an Apptainer `.sif`, or any reference `apptainer
-    /// exec` accepts. A descriptor-backed path must remain owned by the caller
-    /// until [`Sandbox::run`] returns and must never name standard fd 0, 1, or 2.
+    /// exec` accepts. Descriptor-backed images are accepted only by the protected
+    /// verifier executor.
     pub image: PathBuf,
     /// The command + args to run *inside* the sandbox (e.g. `["python",
     /// "/work/eval.py"]`). This is **ferrl-controlled**; untrusted model code is
     /// delivered as a *file* under a [`Bind`], never spliced into this argv.
     pub command: Vec<String>,
     /// Host directories / files exposed inside, with their modes. Descriptor-backed
-    /// sources have the same lifetime and standard-fd restrictions as [`Self::image`].
+    /// read-only sources are accepted only by the protected verifier executor.
     pub binds: Vec<Bind>,
     /// Working directory inside the sandbox (`--pwd`).
     pub workdir: PathBuf,
@@ -321,7 +328,7 @@ impl RunSpec {
 }
 
 /// How a sandboxed run ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RunStatus {
     /// The command exited on its own with this status code.
     Exited(i32),
@@ -351,7 +358,7 @@ struct ScratchLimit {
 }
 
 /// The result of a sandboxed run: how it ended, plus its captured output.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunOutcome {
     /// How the run ended.
     pub status: RunStatus,
@@ -393,13 +400,17 @@ pub enum SandboxError {
         /// Bounded wrapper/runtime diagnostics with the entry token removed.
         stderr: String,
     },
+    /// A protected verifier executor rejected or could not complete the request.
+    #[error("protected verifier executor failed: {0}")]
+    Executor(String),
 }
 
 /// A backend that runs a [`RunSpec`] under isolation and returns its [`RunOutcome`].
 ///
-/// The one production implementation is [`ApptainerSandbox`]. The trait is the seam
-/// a reward verifier depends on, so the reward path can be exercised in tests with
-/// a fake runner that needs no container runtime.
+/// Production verifier rewards use
+/// [`crate::verifier_executor::VerifierExecutorSandbox`]; direct path-backed tools
+/// may use [`ApptainerSandbox`]. The trait keeps reward policy separate from either
+/// launch mechanism.
 pub trait Sandbox {
     /// Run `spec` to completion, or until its wall-clock budget elapses.
     ///
@@ -421,8 +432,6 @@ pub struct ApptainerSandbox {
     bin: PathBuf,
     /// In-image shell used to apply `ulimit`s before `exec`-ing the command.
     shell: PathBuf,
-    /// Host Python used only for sealed-inode mount handoff.
-    stage_python: PathBuf,
 }
 
 impl Default for ApptainerSandbox {
@@ -430,7 +439,6 @@ impl Default for ApptainerSandbox {
         Self {
             bin: PathBuf::from("apptainer"),
             shell: PathBuf::from("/bin/bash"),
-            stage_python: PathBuf::from("python3"),
         }
     }
 }
@@ -443,15 +451,6 @@ impl ApptainerSandbox {
             bin: bin.into(),
             ..Self::default()
         }
-    }
-
-    /// Override the host Python used for descriptor-backed image/bind handoff.
-    ///
-    /// Ordinary path-backed runs do not invoke this executable.
-    #[must_use]
-    pub fn with_stage_python(mut self, python: impl Into<PathBuf>) -> Self {
-        self.stage_python = python.into();
-        self
     }
 
     /// Build the full `apptainer exec` argument vector for `spec`.
@@ -467,6 +466,9 @@ impl ApptainerSandbox {
         argv.push("--containall".into());
         argv.push("--no-home".into());
         argv.push("--cleanenv".into());
+        argv.push("--no-privs".into());
+        argv.push("--drop-caps".into());
+        argv.push("all".into());
         if spec.gpu {
             argv.push("--nv".into());
         }
@@ -495,46 +497,18 @@ impl ApptainerSandbox {
         argv
     }
 
-    /// Build the host command.
-    ///
-    /// Ordinary paths execute Apptainer directly. Descriptor-backed assets use a
-    /// non-dumpable single-process handoff that copies from sealed handles into
-    /// private tmpfs, remounts read-only, authenticates the final bytes/inodes, and
-    /// then `exec`s an authenticated execute-only Apptainer copy in place. The
-    /// unreadable-exec rule preserves non-dumpability across exec; no `unshare
-    /// --fork` supervisor survives.
+    /// Build the direct path-backed host command.
     fn build_host_command(&self, spec: &RunSpec) -> Command {
-        self.build_host_command_with_stage_fault(spec, "none")
-    }
-
-    /// Production-reaching fault seam for authentication/re-entry regressions.
-    /// Ordinary callers always select `none`.
-    fn build_host_command_with_stage_fault(&self, spec: &RunSpec, stage_fault: &str) -> Command {
-        let Some((staged_spec, mounts)) = stage_descriptor_paths(spec) else {
-            let mut command = Command::new(&self.bin);
-            command.args(self.build_argv(spec));
-            return command;
-        };
-
-        let mut apptainer_argv = self.build_argv(&staged_spec);
-        apptainer_argv.insert(1, "--userns".to_string());
-        let mut command = Command::new(&self.stage_python);
-        command.args(["-I", "-c", SEALED_DESCRIPTOR_MOUNT_SCRIPT]);
-        command.arg(mounts.len().to_string());
-        command.arg(stage_fault);
-        for (source, destination) in mounts {
-            command.arg(source);
-            command.arg(destination);
-        }
-        command.arg(&self.bin);
-        command.args(apptainer_argv);
+        let mut command = Command::new(&self.bin);
+        command.args(self.build_argv(spec));
         command
     }
 }
 
 impl Sandbox for ApptainerSandbox {
     fn run(&self, spec: &RunSpec) -> Result<RunOutcome, SandboxError> {
-        validate_private_mount_preflight(spec, &[&self.bin, &self.stage_python])?;
+        validate_direct_apptainer_spec(spec)?;
+        validate_protected_output_mapping(spec)?;
         let protected = ProtectedOutputListener::bind(spec.protected_output.as_ref())?;
         let command = self.build_host_command(spec);
         let scratch_limits = scratch_limits(spec);
@@ -548,358 +522,7 @@ impl Sandbox for ApptainerSandbox {
     }
 }
 
-const PRIVATE_DESCRIPTOR_ROOT: &str = "/mnt";
-
-/// One-process sealed-inode mount handoff.
-///
-/// Python opens every source while it is still the Rust owner's ordinary child,
-/// bootstraps an empty user namespace, re-arms non-dumpability, and only then creates
-/// the mount namespace. It copies from fully sealed regular inodes into private tmpfs,
-/// remounts the complete stage read-only, authenticates every final pathname, inode,
-/// and byte, and execs an authenticated execute-only Apptainer copy. Source handles
-/// are close-on-exec. No separate process owns the mount namespace, and an externally
-/// synchronized post-exec regression proves that a same-UID helper cannot re-enter
-/// and remount it after authentication.
-const SEALED_DESCRIPTOR_MOUNT_SCRIPT: &str = r#"
-import ctypes
-import fcntl
-import hashlib
-import os
-import stat
-import sys
-
-PR_SET_DUMPABLE = 4
-CLONE_NEWNS = 0x00020000
-CLONE_NEWUSER = 0x10000000
-MS_RDONLY = 1
-MS_NOSUID = 2
-MS_NODEV = 4
-MS_REMOUNT = 32
-MS_REC = 16384
-MS_PRIVATE = 1 << 18
-F_GET_SEALS = 1034
-REQUIRED_SEALS = 0x0F
-LINUX_CAPABILITY_VERSION_3 = 0x20080522
-CAP_DAC_OVERRIDE = 1
-CAP_DAC_READ_SEARCH = 2
-ROOT = "/mnt"
-libc = ctypes.CDLL(None, use_errno=True)
-
-
-class CapHeader(ctypes.Structure):
-    _fields_ = [("version", ctypes.c_uint32), ("pid", ctypes.c_int)]
-
-
-class CapData(ctypes.Structure):
-    _fields_ = [
-        ("effective", ctypes.c_uint32),
-        ("permitted", ctypes.c_uint32),
-        ("inheritable", ctypes.c_uint32),
-    ]
-
-
-def fail(message):
-    print(message, file=sys.stderr, flush=True)
-    raise SystemExit(125)
-
-
-def checked(call, message):
-    if call != 0:
-        error = ctypes.get_errno()
-        fail(f"{message}: errno {error}")
-
-
-def mount(source, target, filesystem, flags, data):
-    source = None if source is None else os.fsencode(source)
-    target = os.fsencode(target)
-    filesystem = None if filesystem is None else os.fsencode(filesystem)
-    data = None if data is None else os.fsencode(data)
-    checked(
-        libc.mount(source, target, filesystem, flags, data),
-        f"sealed verifier mount failed for {target!r}",
-    )
-
-
-checked(libc.prctl(PR_SET_DUMPABLE, 0, 0, 0, 0), "could not protect mount handoff")
-
-remaining = int(sys.argv[1])
-stage_fault = sys.argv[2]
-cursor = 3
-assets = []
-for _ in range(remaining):
-    source = sys.argv[cursor]
-    destination = sys.argv[cursor + 1]
-    cursor += 2
-    source_fd = os.open(source, os.O_RDONLY | os.O_CLOEXEC)
-    source_stat = os.fstat(source_fd)
-    if not stat.S_ISREG(source_stat.st_mode):
-        fail("sealed verifier source is not a regular inode")
-    if fcntl.fcntl(source_fd, F_GET_SEALS) & REQUIRED_SEALS != REQUIRED_SEALS:
-        fail("sealed verifier source is missing required kernel seals")
-    assets.append((source_fd, destination))
-
-command_argv = sys.argv[cursor:]
-if not command_argv:
-    fail("sealed verifier launch has no sandbox executable")
-
-
-def resolve_command(command):
-    if "/" in command:
-        candidate = os.path.abspath(command)
-        if os.access(candidate, os.X_OK):
-            return os.path.realpath(candidate)
-    else:
-        for directory in os.environ.get("PATH", "").split(os.pathsep):
-            candidate = os.path.join(directory or ".", command)
-            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-                return os.path.realpath(candidate)
-    fail("could not resolve sandbox executable before private staging")
-
-
-apptainer_source = resolve_command(command_argv[0])
-apptainer_source_fd = os.open(
-    apptainer_source, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
-)
-if not stat.S_ISREG(os.fstat(apptainer_source_fd).st_mode):
-    fail("sandbox executable is not a regular inode")
-
-probe_pid = None
-probe_start_write = None
-if stage_fault == "external-reentry":
-    probe_start_read, probe_start_write = os.pipe2(os.O_CLOEXEC)
-    target_pid = os.getpid()
-    probe_pid = os.fork()
-    if probe_pid == 0:
-        os.close(probe_start_write)
-        unsafe_reentry = False
-        try:
-            if os.read(probe_start_read, 1) == b"1":
-                with open(f"/proc/{target_pid}/comm", encoding="ascii") as handle:
-                    original_comm = handle.read().strip()
-                deadline = __import__("time").monotonic() + 5.0
-                saw_exec = False
-                while __import__("time").monotonic() < deadline:
-                    try:
-                        with open(
-                            f"/proc/{target_pid}/comm", encoding="ascii"
-                        ) as handle:
-                            saw_exec = handle.read().strip() != original_comm
-                    except OSError:
-                        break
-                    if saw_exec:
-                        try:
-                            user_namespace = os.open(
-                                f"/proc/{target_pid}/ns/user",
-                                os.O_RDONLY | os.O_CLOEXEC,
-                            )
-                            mount_namespace = os.open(
-                                f"/proc/{target_pid}/ns/mnt",
-                                os.O_RDONLY | os.O_CLOEXEC,
-                            )
-                            if (
-                                libc.setns(user_namespace, 0) == 0
-                                and libc.setns(mount_namespace, 0) == 0
-                            ):
-                                unsafe_reentry = True
-                                libc.mount(
-                                    None,
-                                    os.fsencode(ROOT),
-                                    None,
-                                    MS_REMOUNT | MS_NOSUID | MS_NODEV,
-                                    None,
-                                )
-                                try:
-                                    replacement = os.open(
-                                        assets[0][1],
-                                        os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW,
-                                    )
-                                    os.write(replacement, b"forged after authentication\n")
-                                    os.close(replacement)
-                                except OSError:
-                                    pass
-                                break
-                        except OSError:
-                            pass
-                    __import__("time").sleep(0.001)
-        except BaseException:
-            pass
-        marker = (
-            b"ferrl-external-reentry-unsafe-v1\n"
-            if unsafe_reentry
-            else b"ferrl-external-reentry-blocked-v1\n"
-        )
-        os.write(2, marker)
-        os._exit(90 if unsafe_reentry else 0)
-    os.close(probe_start_read)
-elif stage_fault not in ("none", "replace-first"):
-    fail("unknown sealed-stage fault selector")
-
-host_uid = os.getuid()
-host_gid = os.getgid()
-
-# Linux requires a dumpable target while an unprivileged process writes its own
-# fresh user-namespace maps. No mount namespace or staged pathname exists during
-# this bootstrap, and every retained source inode is already irrevocably sealed.
-checked(libc.prctl(PR_SET_DUMPABLE, 1, 0, 0, 0), "could not enter mapping bootstrap")
-checked(libc.unshare(CLONE_NEWUSER), "could not create private verifier user namespace")
-try:
-    with open("/proc/self/setgroups", "w", encoding="ascii") as handle:
-        handle.write("deny")
-except FileNotFoundError:
-    pass
-with open("/proc/self/uid_map", "w", encoding="ascii") as handle:
-    handle.write(f"0 {host_uid} 1")
-with open("/proc/self/gid_map", "w", encoding="ascii") as handle:
-    handle.write(f"0 {host_gid} 1")
-os.setresgid(0, 0, 0)
-os.setresuid(0, 0, 0)
-checked(libc.prctl(PR_SET_DUMPABLE, 0, 0, 0, 0), "could not re-protect mount handoff")
-checked(libc.unshare(CLONE_NEWNS), "could not create private verifier mount namespace")
-
-mount(None, "/", None, MS_REC | MS_PRIVATE, None)
-mount("tmpfs", ROOT, "tmpfs", MS_NOSUID | MS_NODEV, "mode=0700")
-
-staged = []
-for source_fd, destination in assets:
-    destination_write_fd = os.open(
-        destination,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
-        0o400,
-    )
-    os.lseek(source_fd, 0, os.SEEK_SET)
-    while True:
-        chunk = os.read(source_fd, 1024 * 1024)
-        if not chunk:
-            break
-        view = memoryview(chunk)
-        while view:
-            view = view[os.write(destination_write_fd, view):]
-    os.fchmod(destination_write_fd, 0o400)
-    os.close(destination_write_fd)
-    destination_fd = os.open(destination, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
-    staged.append((source_fd, destination, destination_fd, os.fstat(destination_fd)))
-
-# Exec resets PR_SET_DUMPABLE for an ordinary readable executable. Copy the
-# resolved runtime into the already-private stage, retain a read descriptor for
-# authentication, then make the pathname execute-only. Immediately before exec
-# we drop only the effective DAC-read capabilities. Linux therefore classifies
-# the executable as unreadable and preserves the kernel's non-dumpable state
-# across exec; uid-0 capability fixup restores the runtime's namespace caps.
-apptainer_destination = f"{ROOT}/ferrl-apptainer-exec"
-apptainer_write_fd = os.open(
-    apptainer_destination,
-    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
-    0o700,
-)
-os.lseek(apptainer_source_fd, 0, os.SEEK_SET)
-while True:
-    chunk = os.read(apptainer_source_fd, 1024 * 1024)
-    if not chunk:
-        break
-    view = memoryview(chunk)
-    while view:
-        view = view[os.write(apptainer_write_fd, view):]
-os.fchmod(apptainer_write_fd, 0o111)
-os.close(apptainer_write_fd)
-apptainer_destination_fd = os.open(
-    apptainer_destination, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
-)
-apptainer_retained = os.fstat(apptainer_destination_fd)
-
-if stage_fault == "replace-first":
-    replacement = os.open(staged[0][1], os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW)
-    os.write(replacement, b"forged staged verifier bytes\n")
-    os.close(replacement)
-
-os.chmod(ROOT, 0o500)
-mount(None, ROOT, None, MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV, None)
-root_device = os.stat(ROOT, follow_symlinks=False).st_dev
-
-
-def digest(fd):
-    value = hashlib.sha256()
-    os.lseek(fd, 0, os.SEEK_SET)
-    while True:
-        chunk = os.read(fd, 1024 * 1024)
-        if not chunk:
-            return value.digest()
-        value.update(chunk)
-
-
-for source_fd, destination, destination_fd, retained in staged:
-    visible = os.stat(destination, follow_symlinks=False)
-    if not stat.S_ISREG(visible.st_mode):
-        fail("staged verifier destination is not a regular inode")
-    if visible.st_nlink != 1 or visible.st_dev != root_device:
-        fail("staged verifier destination escaped private tmpfs")
-    if (visible.st_dev, visible.st_ino) != (retained.st_dev, retained.st_ino):
-        fail("staged verifier destination changed inode identity")
-    if digest(source_fd) != digest(destination_fd):
-        fail("staged verifier bytes failed final authentication")
-
-apptainer_visible = os.stat(apptainer_destination, follow_symlinks=False)
-if not stat.S_ISREG(apptainer_visible.st_mode):
-    fail("staged sandbox executable is not a regular inode")
-if apptainer_visible.st_nlink != 1 or apptainer_visible.st_dev != root_device:
-    fail("staged sandbox executable escaped private tmpfs")
-if (apptainer_visible.st_dev, apptainer_visible.st_ino) != (
-    apptainer_retained.st_dev,
-    apptainer_retained.st_ino,
-):
-    fail("staged sandbox executable changed inode identity")
-if digest(apptainer_source_fd) != digest(apptainer_destination_fd):
-    fail("staged sandbox executable failed final authentication")
-
-if stage_fault == "external-reentry":
-    os.write(probe_start_write, b"1")
-    os.close(probe_start_write)
-
-
-def make_exec_preserve_nondumpability():
-    header = CapHeader(LINUX_CAPABILITY_VERSION_3, 0)
-    data = (CapData * 2)()
-    checked(libc.capget(ctypes.byref(header), data), "could not read launch capabilities")
-    drop = (1 << CAP_DAC_OVERRIDE) | (1 << CAP_DAC_READ_SEARCH)
-    data[0].effective &= ~drop
-    checked(libc.capset(ctypes.byref(header), data), "could not restrict launch capabilities")
-    try:
-        descriptor = os.open(
-            apptainer_destination, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
-        )
-    except PermissionError:
-        return
-    os.close(descriptor)
-    fail("execute-only sandbox runtime remained readable before exec")
-
-make_exec_preserve_nondumpability()
-checked(libc.prctl(PR_SET_DUMPABLE, 0, 0, 0, 0), "could not seal exec boundary")
-os.execv(apptainer_destination, command_argv)
-"#;
-
-/// Replace owner-proc descriptor paths with private regular mount paths for one
-/// Apptainer launch.
-fn stage_descriptor_paths(spec: &RunSpec) -> Option<(RunSpec, Vec<(PathBuf, PathBuf)>)> {
-    let mut staged = spec.clone();
-    let mut mounts = Vec::new();
-
-    if is_owned_descriptor_path(&spec.image) {
-        let destination = private_descriptor_path(mounts.len(), Some("sif"));
-        mounts.push((spec.image.clone(), destination.clone()));
-        staged.image = destination;
-    }
-    for bind in &mut staged.binds {
-        if bind.mode != BindMode::ReadOnly || !is_owned_descriptor_path(&bind.src) {
-            continue;
-        }
-        let extension = bind.dst.extension().and_then(|value| value.to_str());
-        let destination = private_descriptor_path(mounts.len(), extension);
-        mounts.push((bind.src.clone(), destination.clone()));
-        bind.src = destination;
-    }
-    (!mounts.is_empty()).then_some((staged, mounts))
-}
-
-fn is_owned_descriptor_path(path: &Path) -> bool {
+pub(crate) fn is_owned_descriptor_path(path: &Path) -> bool {
     let Some(path) = path.to_str() else {
         return false;
     };
@@ -909,69 +532,93 @@ fn is_owned_descriptor_path(path: &Path) -> bool {
         .is_some_and(|fd| fd > 2)
 }
 
-fn private_descriptor_path(index: usize, extension: Option<&str>) -> PathBuf {
-    let suffix = extension.map_or_else(String::new, |value| format!(".{value}"));
-    PathBuf::from(format!(
-        "{PRIVATE_DESCRIPTOR_ROOT}/ferrl-verifier-asset-{index}{suffix}"
-    ))
-}
-
-/// Mounting private tmpfs over `/mnt` must never hide a path the runtime still
-/// needs. Descriptor destinations intentionally live there; ordinary configured
-/// sources and the host executables may not.
-fn validate_private_mount_preflight(
-    spec: &RunSpec,
-    executables: &[&Path],
-) -> Result<(), SandboxError> {
-    if stage_descriptor_paths(spec).is_none() {
-        return Ok(());
-    }
-    let hidden = Path::new(PRIVATE_DESCRIPTOR_ROOT);
-    for (label, path) in std::iter::once(("sandbox image", spec.image.as_path())).chain(
+fn validate_direct_apptainer_spec(spec: &RunSpec) -> Result<(), SandboxError> {
+    let descriptor = std::iter::once(("sandbox image", spec.image.as_path())).chain(
         spec.binds
             .iter()
             .map(|bind| ("bind source", bind.src.as_path())),
-    ) {
-        if !is_owned_descriptor_path(path) && resolves_within(path, hidden) {
-            return Err(SandboxError::InvalidSpec(format!(
-                "{label} {} would be hidden by the private verifier mount at {}",
-                path.display(),
-                hidden.display()
-            )));
-        }
-    }
-    for executable in executables {
-        if resolve_executable(executable).is_some_and(|path| resolves_within(&path, hidden)) {
-            return Err(SandboxError::InvalidSpec(format!(
-                "sandbox executable {} would be hidden by the private verifier mount at {}",
-                executable.display(),
-                hidden.display()
-            )));
-        }
+    );
+    if let Some((label, path)) = descriptor
+        .into_iter()
+        .find(|(_, path)| is_owned_descriptor_path(path))
+    {
+        return Err(SandboxError::InvalidSpec(format!(
+            "{label} {} is descriptor-backed; sealed verifier assets require VerifierExecutorSandbox",
+            path.display()
+        )));
     }
     Ok(())
 }
 
-fn resolves_within(path: &Path, root: &Path) -> bool {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
-    };
-    std::fs::canonicalize(&absolute)
-        .unwrap_or(absolute)
-        .starts_with(root)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProtectedOutputMapping {
+    pub(crate) bind_index: usize,
+    pub(crate) relative_path: PathBuf,
 }
 
-fn resolve_executable(bin: &Path) -> Option<PathBuf> {
-    if bin.components().count() > 1 {
-        return Some(bin.to_path_buf());
+pub(crate) fn validate_protected_output_mapping(
+    spec: &RunSpec,
+) -> Result<Option<ProtectedOutputMapping>, SandboxError> {
+    let Some(output) = &spec.protected_output else {
+        return Ok(None);
+    };
+    for (label, path) in [
+        ("protected output host socket", output.host_socket.as_path()),
+        (
+            "protected output sandbox socket",
+            output.sandbox_socket.as_path(),
+        ),
+    ] {
+        if !is_normal_absolute(path) {
+            return Err(SandboxError::InvalidSpec(format!(
+                "{label} must be an absolute path without '.' or '..': {}",
+                path.display()
+            )));
+        }
     }
-    std::env::var_os("PATH")
-        .into_iter()
-        .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
-        .map(|directory| directory.join(bin))
-        .find(|candidate| candidate.is_file())
+
+    let mut matches = spec
+        .binds
+        .iter()
+        .enumerate()
+        .filter(|(_, bind)| bind.mode == BindMode::ReadWrite)
+        .filter_map(|(index, bind)| {
+            if !is_normal_absolute(&bind.src) || !is_normal_absolute(&bind.dst) {
+                return None;
+            }
+            let host_relative = output.host_socket.strip_prefix(&bind.src).ok()?;
+            let sandbox_relative = output.sandbox_socket.strip_prefix(&bind.dst).ok()?;
+            (host_relative == sandbox_relative).then(|| ProtectedOutputMapping {
+                bind_index: index,
+                relative_path: host_relative.to_path_buf(),
+            })
+        });
+    let mapping = matches.next().ok_or_else(|| {
+        SandboxError::InvalidSpec(
+            "protected output socket does not map through a read-write bind".to_string(),
+        )
+    })?;
+    if matches.next().is_some() {
+        return Err(SandboxError::InvalidSpec(
+            "protected output socket maps through more than one read-write bind".to_string(),
+        ));
+    }
+    if mapping.relative_path.as_os_str().is_empty() {
+        return Err(SandboxError::InvalidSpec(
+            "protected output socket must name a file beneath its read-write bind".to_string(),
+        ));
+    }
+    Ok(Some(mapping))
+}
+
+fn is_normal_absolute(path: &Path) -> bool {
+    path.is_absolute()
+        && path.components().all(|component| {
+            matches!(
+                component,
+                std::path::Component::RootDir | std::path::Component::Normal(_)
+            )
+        })
 }
 
 #[cfg(unix)]
@@ -1606,18 +1253,21 @@ mod tests {
         argv.iter().position(|s| s.as_str() == needle)
     }
 
-    fn assert_contains_all(argv: &[String], required: &[&str]) {
-        for value in required {
-            assert!(pos(argv, value).is_some(), "host command missing {value:?}");
-        }
-    }
-
     #[test]
     fn argv_always_isolates_env_home_and_namespaces() {
         let argv = ApptainerSandbox::default().build_argv(&spec());
-        for flag in ["exec", "--containall", "--no-home", "--cleanenv"] {
+        for flag in [
+            "exec",
+            "--containall",
+            "--no-home",
+            "--cleanenv",
+            "--no-privs",
+            "--drop-caps",
+        ] {
             assert!(pos(&argv, flag).is_some(), "argv missing {flag}");
         }
+        let drop_caps = pos(&argv, "--drop-caps").unwrap();
+        assert_eq!(argv[drop_caps + 1], "all");
     }
 
     #[test]
@@ -1683,161 +1333,54 @@ mod tests {
         assert!(argv[n - 1].contains("exec 'python'"));
     }
 
-    fn descriptor_spec() -> (RunSpec, PathBuf, PathBuf, PathBuf) {
-        let pid = std::process::id();
-        let image = PathBuf::from(format!("/proc/{pid}/fd/10"));
-        let eval = PathBuf::from(format!("/proc/{pid}/fd/11"));
-        let scratch = PathBuf::from("/host/scratch");
-        let source_spec = RunSpec::new(&image, vec!["python".into(), "/eval.py".into()])
-            .with_binds(vec![
-                Bind::ro(&eval, "/eval.py"),
-                Bind::rw(&scratch, "/work"),
-            ]);
-        (source_spec, image, eval, scratch)
-    }
-
     #[test]
-    #[allow(clippy::cognitive_complexity)] // one assertion per encoded handoff invariant
-    fn descriptor_assets_remain_sealed_inodes_without_a_staging_supervisor() {
-        let (source_spec, image, eval, scratch) = descriptor_spec();
-        let command = ApptainerSandbox::default().build_host_command(&source_spec);
-        assert_eq!(command.get_program(), "python3");
-        let args = command
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-        assert_contains_all(
-            &args,
-            &[
-                image.to_str().unwrap(),
-                eval.to_str().unwrap(),
-                "apptainer",
-                "--userns",
-            ],
-        );
-        assert!(args
-            .iter()
-            .any(|arg| arg.starts_with(scratch.to_str().unwrap())));
-        assert!(args
-            .iter()
-            .any(|arg| arg == "/mnt/ferrl-verifier-asset-0.sif"));
-        assert!(args
-            .iter()
-            .any(|arg| arg == "/mnt/ferrl-verifier-asset-1.py"));
-        assert!(!args.iter().any(|arg| arg == "--fork"));
-        assert!(!args.iter().any(|arg| arg.contains("/usr/bin/python3")));
-
-        let protect = SEALED_DESCRIPTOR_MOUNT_SCRIPT
-            .find("libc.prctl(PR_SET_DUMPABLE, 0")
-            .expect("the handoff protects itself before namespace creation");
-        let user_namespace = SEALED_DESCRIPTOR_MOUNT_SCRIPT
-            .find("libc.unshare(CLONE_NEWUSER)")
-            .expect("the process bootstraps its own user namespace");
-        let reprotect = SEALED_DESCRIPTOR_MOUNT_SCRIPT
-            .find("could not re-protect mount handoff")
-            .expect("non-dumpability is restored before any mount namespace");
-        let mount_namespace = SEALED_DESCRIPTOR_MOUNT_SCRIPT
-            .find("libc.unshare(CLONE_NEWNS)")
-            .expect("only the re-protected process creates the mount namespace");
-        let exec = SEALED_DESCRIPTOR_MOUNT_SCRIPT
-            .find("os.execv")
-            .expect("the namespace owner becomes Apptainer in place");
-        assert!(protect < user_namespace);
-        assert!(user_namespace < reprotect && reprotect < mount_namespace);
-        assert!(mount_namespace < exec);
-        assert!(SEALED_DESCRIPTOR_MOUNT_SCRIPT.contains("F_GET_SEALS"));
-        assert!(SEALED_DESCRIPTOR_MOUNT_SCRIPT.contains("stage_fault == \"external-reentry\""));
-        assert!(SEALED_DESCRIPTOR_MOUNT_SCRIPT.contains("CAP_DAC_OVERRIDE"));
-        assert!(SEALED_DESCRIPTOR_MOUNT_SCRIPT.contains("0o111"));
-        assert!(!SEALED_DESCRIPTOR_MOUNT_SCRIPT.contains("shutil.copy"));
-    }
-
-    #[test]
-    fn ordinary_paths_execute_apptainer_without_the_mount_handoff() {
+    fn ordinary_paths_execute_apptainer_directly() {
         let command = ApptainerSandbox::default().build_host_command(&spec());
         assert_eq!(command.get_program(), "apptainer");
     }
 
     #[test]
-    fn private_mount_preflight_rejects_mnt_collisions() {
-        let (source_spec, _, _, _) = descriptor_spec();
-        let hidden = RunSpec {
-            binds: vec![Bind::rw("/mnt/colliding-scratch", "/work")],
-            ..source_spec.clone()
-        };
-        let error = validate_private_mount_preflight(
-            &hidden,
-            &[Path::new("/bin/true"), Path::new("python3")],
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(error.contains("bind source /mnt/colliding-scratch would be hidden"));
-
-        let error = validate_private_mount_preflight(
-            &source_spec,
-            &[Path::new("/mnt/colliding-apptainer"), Path::new("python3")],
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(error.contains("sandbox executable /mnt/colliding-apptainer would be hidden"));
+    fn direct_backend_rejects_descriptor_backed_assets() {
+        let descriptor = PathBuf::from(format!("/proc/{}/fd/10", std::process::id()));
+        let error = validate_direct_apptainer_spec(&RunSpec::new(descriptor, vec!["true".into()]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("require VerifierExecutorSandbox"));
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "requires Linux unprivileged user/mount namespaces"]
-    fn authenticated_sealed_asset_stage_executes_without_a_supervisor() {
-        use std::fs::File;
-        use std::io::Write as _;
-        use std::os::fd::AsRawFd as _;
-
-        let descriptor = rustix::fs::memfd_create(
-            "ferrl-sandbox-mount-handoff-test",
-            rustix::fs::MemfdFlags::ALLOW_SEALING | rustix::fs::MemfdFlags::CLOEXEC,
-        )
-        .unwrap();
-        let mut file = File::from(descriptor);
-        file.write_all(b"sealed test image bytes").unwrap();
-        rustix::fs::fcntl_add_seals(
-            &file,
-            rustix::fs::SealFlags::WRITE
-                | rustix::fs::SealFlags::GROW
-                | rustix::fs::SealFlags::SHRINK
-                | rustix::fs::SealFlags::SEAL,
-        )
-        .unwrap();
-        let image = PathBuf::from(format!(
-            "/proc/{}/fd/{}",
-            std::process::id(),
-            file.as_raw_fd()
-        ));
-        let spec = RunSpec::new(image, vec!["true".into()]);
-        let sandbox = ApptainerSandbox::with_bin("/bin/true");
-        let status = sandbox.build_host_command(&spec).status().unwrap();
-        assert!(status.success());
-
-        let replaced = sandbox
-            .build_host_command_with_stage_fault(&spec, "replace-first")
-            .output()
-            .unwrap();
-        assert!(!replaced.status.success());
-        assert!(String::from_utf8_lossy(&replaced.stderr)
-            .contains("staged verifier bytes failed final authentication"));
-
-        let mut reentry_command = ApptainerSandbox::with_bin("yes")
-            .build_host_command_with_stage_fault(&spec, "external-reentry");
-        reentry_command.stdout(Stdio::null()).stderr(Stdio::piped());
-        let mut reentry_child = reentry_command.spawn().unwrap();
-        std::thread::sleep(Duration::from_secs(1));
-        reentry_child.kill().unwrap();
-        let reentry = reentry_child.wait_with_output().unwrap();
-        assert!(
-            !String::from_utf8_lossy(&reentry.stderr).contains("ferrl-external-reentry-unsafe-v1"),
-            "external helper must not re-enter the authenticated mount namespace: {}",
-            String::from_utf8_lossy(&reentry.stderr)
+    fn protected_output_requires_exact_read_write_bind_mapping() {
+        let valid = spec()
+            .with_binds(vec![Bind::rw("/host/scratch", "/work")])
+            .with_protected_output(ProtectedOutput::new(
+                "/host/scratch/grade.sock",
+                "/work/grade.sock",
+            ));
+        assert_eq!(
+            validate_protected_output_mapping(&valid).unwrap(),
+            Some(ProtectedOutputMapping {
+                bind_index: 0,
+                relative_path: PathBuf::from("grade.sock"),
+            })
         );
-        assert!(
-            String::from_utf8_lossy(&reentry.stderr).contains("ferrl-external-reentry-blocked-v1")
-        );
+
+        let mismatched = RunSpec {
+            protected_output: Some(ProtectedOutput::new(
+                "/host/scratch/grade.sock",
+                "/work/other.sock",
+            )),
+            ..valid.clone()
+        };
+        assert!(validate_protected_output_mapping(&mismatched).is_err());
+
+        let traversal = RunSpec {
+            protected_output: Some(ProtectedOutput::new(
+                "/host/scratch/../grade.sock",
+                "/work/grade.sock",
+            )),
+            ..valid
+        };
+        assert!(validate_protected_output_mapping(&traversal).is_err());
     }
 
     #[test]

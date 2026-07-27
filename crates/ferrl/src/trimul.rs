@@ -4,7 +4,7 @@
 //! Multiplicative Update** (the GPUMODE `bioml/trimul` task — a core AlphaFold-family
 //! operator). Each completion is expected to contain a Python `custom_kernel`
 //! implementation; this reward **runs it** and scores it on **correctness** and
-//! **speed**.
+//! versioned ferrl **service latency**.
 //!
 //! ## Flow (per candidate)
 //!
@@ -14,24 +14,27 @@
 //! 2. Capture the candidate plus generated test/benchmark specs ([`render_spec`])
 //!    in kernel-sealed descriptors. They stay read-only and identical across both
 //!    phases; scratch contains only writable cache/output state.
-//! 3. Run the eval in the sandbox ([`crate::sandbox::ApptainerSandbox`]): the pinned
+//! 3. Send the eval to a dedicated-UID protected verifier executor
+//!    ([`crate::verifier_executor::VerifierExecutorSandbox`]): the pinned
 //!    GPUMODE eval files, Ferrl driver, candidate, and specs are bound **read-only**,
 //!    scratch is **read-write**, the GPU is exposed (`--nv`), and the **network is
-//!    denied**. The sealed driver runs `test` then `benchmark`. Candidate Python lives
-//!    in a separate spawned process; the protected parent owns hidden-seed input
-//!    generation and starts monotonic timing before handing it an input. Every result
-//!    is captured into a fresh parent-private buffer before the parent checks it or
-//!    records statistics. Its grade travels over a post-launch Unix socket
+//!    denied**. The sealed driver runs `test` then `benchmark`. A separate
+//!    non-dumpable controller owns trusted protocol connections, while candidate Python
+//!    lives in its own spawned payload process with independent CUDA allocations; only
+//!    bounded CPU bytes cross process boundaries, so no parent allocator block is exported.
+//!    The protected parent owns hidden-seed input generation and measures the versioned
+//!    end-to-end candidate service latency from byte handoff through result receipt.
+//!    Its grade travels over a post-launch Unix socket
 //!    owned only by the non-dumpable parent. Launcher/init/shell stdout descriptors are
 //!    untrusted diagnostics and can never become a grade.
 //! 4. Map the captured grade to a shaped training reward: missing submissions score
 //!    `0`, extracted-but-broken submissions get only a tiny format reward, runnable
 //!    candidates get a small floor, partially correct candidates scale below the
 //!    correctness floor, and test-passing candidates whose eval reaches a benchmark
-//!    exit marker score the correctness floor plus any capped speed component.
-//!    Implausibly fast timings (below the kernel-launch floor — a glitch or forged
+//!    exit marker score the correctness floor plus any capped latency component.
+//!    Implausibly fast timings (below the configured floor — a glitch or forged
 //!    grade) still score `0`. The final artifact gate remains stricter than the
-//!    training reward: held-out correctness plus repeated speedup audit.
+//!    training reward: held-out correctness plus repeated same-metric latency audit.
 //!
 //! ## What lives where
 //!
@@ -49,7 +52,7 @@
 //! through correctness and benchmark execution. Candidate code never shares memory
 //! with trusted checker/timer state. The grade and actual-import proof ride an
 //! exclusive post-launch socket owned by a non-dumpable trusted parent. An implausibly
-//! fast time is rejected, so forged scratch files, printed passes, and zero-time
+//! fast service latency is rejected, so forged scratch files, printed passes, and zero-time
 //! kernels cannot reach the correctness floor. The negative-control suite gates those
 //! cases.
 //!
@@ -73,9 +76,9 @@ use sha2::{Digest, Sha256};
 use crate::reward::{RewardError, RewardFn, RewardOutcome};
 use crate::sample::Sample;
 use crate::sandbox::{
-    ApptainerSandbox, Bind, ProtectedOutput, ResourceLimits, RunOutcome, RunSpec, RunStatus,
-    Sandbox, SandboxError,
+    Bind, ProtectedOutput, ResourceLimits, RunOutcome, RunSpec, RunStatus, Sandbox, SandboxError,
 };
+use crate::verifier_executor::VerifierExecutorSandbox;
 
 /// Versioned TriMul training-reward scheme identifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -355,8 +358,8 @@ pub fn test_passed(test_log: &str) -> bool {
     log_value(test_log, "check") == Some("pass")
 }
 
-/// The per-case mean runtimes (nanoseconds) from a `benchmark`-mode result log: every
-/// `benchmark.<i>.mean` value.
+/// The per-case mean service latencies (nanoseconds) from a `benchmark`-mode result
+/// log: every `benchmark.<i>.mean` value.
 fn benchmark_means_ns(bench_log: &str) -> Vec<f64> {
     bench_log
         .lines()
@@ -372,8 +375,18 @@ fn benchmark_means_ns(bench_log: &str) -> Vec<f64> {
         .collect()
 }
 
-/// The geometric mean of `xs`, or `None` if empty or any value is non-positive (the
-/// GPUMODE leaderboard ranks by the geometric mean of per-case runtimes).
+fn candidate_attempt_sentinels(log: &str) -> Vec<&str> {
+    log.lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once(": ")?;
+            key.trim()
+                .ends_with(".candidate-sentinel")
+                .then_some(value.trim())
+        })
+        .collect()
+}
+
+/// The geometric mean of `xs`, or `None` if empty or any value is non-positive.
 #[must_use]
 pub fn geomean(xs: &[f64]) -> Option<f64> {
     if xs.is_empty() || xs.iter().any(|&x| x <= 0.0 || x.is_nan()) {
@@ -1339,7 +1352,8 @@ fn parse_distribution(raw: Option<&String>) -> Result<Distribution, TrimulError>
 }
 
 /// The TriMul discovery reward: runs a candidate kernel in the sandboxed eval image
-/// and scores it on correctness + speed. Construct with [`TrimulReward::new`].
+/// and scores it on correctness plus versioned service latency. Construct with
+/// [`TrimulReward::new`].
 #[derive(Debug, Clone)]
 pub struct TrimulReward {
     /// Where per-candidate scratch dirs are created — node-local tmpfs is preferred
@@ -1354,9 +1368,9 @@ pub struct TrimulReward {
     /// The secret seed Cantor-combined with each case's public seed for held-out
     /// inputs (passed as `POPCORN_SEED`).
     secret_seed: u64,
-    /// Reference geometric-mean runtime (ns) on the target GPU; the speedup
-    /// denominator for the shaped reward's speed component. `None` falls back to an
-    /// inverse-time signal.
+    /// Reference geometric-mean service latency (ns) on the target GPU; the
+    /// same-metric ratio denominator for the shaped reward's latency component. `None`
+    /// falls back to an inverse-latency signal.
     baseline_ns: Option<f64>,
     /// Tunable training-reward profile.
     reward_profile: TrimulRewardProfile,
@@ -1377,8 +1391,8 @@ pub struct TrimulReward {
     verifier_parallelism: usize,
     /// Process cap applied to the verifier sandbox (`ulimit -u`).
     verifier_max_procs: u64,
-    /// The sandbox backend.
-    sandbox: ApptainerSandbox,
+    /// Dedicated-UID protected verifier executor client.
+    sandbox: VerifierExecutorSandbox,
     /// Immutable verifier assets captured before launch attestation. Construction
     /// cannot produce an execution-capable reward without this owner.
     verifier_assets: TrimulVerifierAssets,
@@ -1389,17 +1403,17 @@ pub struct TrimulReward {
 pub struct TrimulVerification {
     /// Whether the eval reported `check: pass`.
     pub correct: bool,
-    /// Per-benchmark mean runtimes in nanoseconds, after parsing the grade stream.
+    /// Per-benchmark mean service latencies in nanoseconds, after parsing the grade stream.
     pub benchmark_means_ns: Vec<f64>,
-    /// Plausibility-checked geometric-mean benchmark time (ns), if any.
+    /// Plausibility-checked geometric-mean service latency (ns), if any.
     pub geomean_ns: Option<f64>,
-    /// Speedup over the configured baseline, when both baseline and timing are present.
+    /// Same-metric baseline/candidate latency ratio, when both values are present.
     pub speedup: Option<f64>,
 }
 
 /// A `custom_kernel` that delegates to the bundled reference implementation. Used to
-/// **measure the speedup baseline**: the reference is correct by definition, so it
-/// passes correctness and its benchmark time *is* the reference runtime. The
+/// **measure the service-latency baseline**: the reference is correct by definition, so
+/// it passes correctness and its benchmark record supplies the reference latency. The
 /// `reference` module is bound read-only next to the sealed submission. This is the
 /// extracted code, not a fenced block — it is fed straight to the eval path,
 /// bypassing [`extract_submission`].
@@ -1438,7 +1452,7 @@ impl TrimulReward {
             verifier_cuda_device_pool: Vec::new(),
             verifier_parallelism: 1,
             verifier_max_procs: DEFAULT_VERIFIER_MAX_PROCS,
-            sandbox: ApptainerSandbox::default(),
+            sandbox: VerifierExecutorSandbox::default(),
             verifier_assets: assets,
         }
     }
@@ -1452,6 +1466,13 @@ impl TrimulReward {
     ) -> Self {
         self.test_cases = test_cases;
         self.benchmark_cases = benchmark_cases;
+        self
+    }
+
+    /// Override the protected verifier executor socket.
+    #[must_use]
+    pub fn with_verifier_executor_socket(mut self, socket: impl Into<PathBuf>) -> Self {
+        self.sandbox = VerifierExecutorSandbox::new(socket);
         self
     }
 
@@ -1580,8 +1601,8 @@ impl TrimulReward {
 
     /// Map a parsed `(correct, geom-mean ns)` outcome to the speed component of the
     /// training reward: `0` unless the candidate is correct and produced a positive
-    /// runtime; otherwise the speedup over the baseline (or an inverse-time proxy when
-    /// no baseline is set).
+    /// service latency; otherwise the same-metric ratio over the baseline (or an
+    /// inverse-latency proxy when no baseline is set).
     #[must_use]
     pub fn reward_value(&self, correct: bool, geomean_ns: Option<f64>) -> f32 {
         if !correct {
@@ -1606,6 +1627,7 @@ impl TrimulReward {
     /// Returns [`RewardError`] if the eval could not be carried out (scratch I/O or
     /// sandbox launch/supervision failure).
     pub fn verify_submission(&self, submission: &str) -> Result<TrimulVerification, RewardError> {
+        self.validate_case_sets()?;
         self.run_eval(submission)
     }
 
@@ -1699,6 +1721,7 @@ impl TrimulReward {
     /// I/O or the sandbox failing to launch) — a crashing or wrong candidate is a
     /// `0.0` reward, not an error.
     fn run_eval(&self, submission: &str) -> Result<TrimulVerification, RewardError> {
+        self.validate_case_sets()?;
         self.verify_verifier_assets()?;
         let scratch = self.make_scratch()?;
         let result = self
@@ -1710,11 +1733,12 @@ impl TrimulReward {
         result
     }
 
-    /// Measure the reference kernel's geometric-mean runtime (ns) on this node's GPU,
-    /// by running the bundled reference as the candidate over the configured
-    /// `benchmark_cases`. This is the value to pin as the speedup baseline
+    /// Measure the reference candidate's geometric-mean ferrl service latency (ns) on
+    /// this node's GPU by running the bundled reference over the configured
+    /// `benchmark_cases`. This is the value to pin as the same-metric baseline
     /// ([`with_baseline_ns`](Self::with_baseline_ns)) — a *guarded pin*: measure it once
-    /// on the target GPU, record it, and re-use it for runs on that same GPU.
+    /// on the target GPU through the same executor, record it, and re-use it only for
+    /// runs using [`TRIMUL_TIMING_METRIC`]. It is not a GPUMODE CUDA-event kernel runtime.
     ///
     /// Returns `None` if the reference somehow did not pass correctness or produced no
     /// plausible timing (it should always pass — it *is* the reference).
@@ -1824,6 +1848,7 @@ impl TrimulReward {
         completion: &str,
         worker_index: usize,
     ) -> Result<RewardOutcome, RewardError> {
+        self.validate_case_sets()?;
         let Some(code) = self.extract_submission(completion) else {
             return Ok(RewardOutcome {
                 reward: 0.0,
@@ -1884,6 +1909,8 @@ impl TrimulReward {
             "has_benchmark_section": eval.has_benchmark_section,
             "correct": eval.verification.correct,
             "benchmark_mean_count": eval.verification.benchmark_means_ns.len(),
+            "timing_metric": TRIMUL_TIMING_METRIC,
+            "candidate_attempt_sentinels": candidate_attempt_sentinels(&eval.output.stdout),
             "geomean_ns": eval.verification.geomean_ns,
             "speedup": eval.verification.speedup,
             "speed_reward_component": speed_component,
@@ -2018,10 +2045,28 @@ impl TrimulReward {
             .verify_current()
             .map_err(RewardError::verifier)
     }
+
+    fn validate_case_sets(&self) -> Result<(), RewardError> {
+        if self.test_cases.is_empty() {
+            return Err(RewardError::msg(
+                "trimul verifier requires at least one correctness case",
+            ));
+        }
+        if self.benchmark_cases.is_empty() {
+            return Err(RewardError::msg(
+                "trimul verifier requires at least one benchmark case",
+            ));
+        }
+        Ok(())
+    }
 }
 
 const TEST_VERIFIER_ENTRY: &str = "test-v4";
 const BENCHMARK_VERIFIER_ENTRY: &str = "benchmark-v4";
+/// Versioned protected end-to-end candidate service-latency metric.
+pub const TRIMUL_TIMING_METRIC: &str = "isolated-service-latency-v1";
+const TRIMUL_INFRASTRUCTURE_MARKER: &str = "ferrl-infrastructure: v1";
+const TRIMUL_INFRASTRUCTURE_EXIT: i32 = 114;
 
 /// Require records written by the sealed parent on the verifier-only socket after
 /// exact trusted initialization and either actual candidate-frame entry or an
@@ -2029,6 +2074,23 @@ const BENCHMARK_VERIFIER_ENTRY: &str = "benchmark-v4";
 /// the protected grade reached that phase, so a later platform failure cannot retain
 /// correctness credit.
 fn require_trimul_verifier_entry(outcome: RunOutcome) -> Result<RunOutcome, SandboxError> {
+    let infrastructure_record = outcome.protected_output.lines().find_map(|line| {
+        let line = line.trim();
+        (line == TRIMUL_INFRASTRUCTURE_MARKER || line.starts_with("ferrl-infrastructure: v1 "))
+            .then_some(line)
+    });
+    if outcome.status == RunStatus::Exited(TRIMUL_INFRASTRUCTURE_EXIT)
+        || infrastructure_record.is_some()
+    {
+        let record = infrastructure_record.unwrap_or("reserved exit 114");
+        return Err(SandboxError::Infrastructure {
+            status: outcome.status,
+            stderr: format!(
+                "TriMul protected parent reported authenticated infrastructure failure ({record}); sandbox stderr: {}",
+                outcome.stderr
+            ),
+        });
+    }
     let (test_log, benchmark_log) = split_result(&outcome.protected_output);
     if !phase_reached(test_log, TEST_VERIFIER_ENTRY, "test-import-v1") {
         return Err(missing_verifier_entry(&outcome, "test"));
@@ -2041,6 +2103,15 @@ fn require_trimul_verifier_entry(outcome: RunOutcome) -> Result<RunOutcome, Sand
         )
     {
         return Err(missing_verifier_entry(&outcome, "benchmark"));
+    }
+    if log_value(test_log, "ferrl-timing-metric") != Some(TRIMUL_TIMING_METRIC)
+        || (outcome.protected_output.contains(RESULT_SPLIT)
+            && log_value(benchmark_log, "ferrl-timing-metric") != Some(TRIMUL_TIMING_METRIC))
+    {
+        return Err(SandboxError::Infrastructure {
+            status: outcome.status,
+            stderr: "TriMul verifier did not authenticate the timing metric version".to_string(),
+        });
     }
     Ok(outcome)
 }
@@ -2136,12 +2207,6 @@ fn test_progress(test_log: &str) -> TestProgress {
             statuses.insert(index, passed);
         }
     }
-    if declared_count == Some(0) && test_passed(test_log) {
-        return TestProgress {
-            pass_count: 1,
-            case_count: 1,
-        };
-    }
     let pass_count = statuses
         .iter()
         .filter(|(index, passed)| {
@@ -2234,6 +2299,7 @@ impl RewardFn for TrimulReward {
     type Target = ();
 
     fn reward(&self, _sample: &Sample<()>, completion: &str) -> Result<f32, RewardError> {
+        self.validate_case_sets()?;
         self.verify_verifier_assets()?;
         let outcome = self.reward_outcome(completion);
         self.verify_verifier_assets()?;
@@ -2245,6 +2311,7 @@ impl RewardFn for TrimulReward {
         _sample: &Sample<()>,
         completions: &[String],
     ) -> Result<Vec<RewardOutcome>, RewardError> {
+        self.validate_case_sets()?;
         self.verify_verifier_assets()?;
         let outcomes = if self.verifier_parallelism <= 1 || completions.len() <= 1 {
             completions
@@ -2321,7 +2388,10 @@ mod tests {
             std::sync::OnceLock::new();
         let (_, image, eval, scratch) = FIXTURE.get_or_init(|| verifier_fixture("shared-reward"));
         let assets = TrimulVerifierAssets::capture(image, eval, scratch).unwrap();
-        TrimulReward::new(assets, scratch)
+        TrimulReward::new(assets, scratch).with_cases(
+            vec![case(8, true, Distribution::Normal)],
+            vec![case(16, false, Distribution::Cauchy)],
+        )
     }
 
     fn verifier_fixture(tag: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
@@ -2737,6 +2807,36 @@ mod tests {
     }
 
     #[test]
+    fn public_verifier_apis_reject_empty_test_or_benchmark_sets_before_launch() {
+        let sample = Sample::new("write a faster TriMul kernel", ());
+        let completion = "```python\ndef custom_kernel(data):\n    return data[0]\n```".to_string();
+        for (configured, expected) in [
+            (
+                reward().with_cases(Vec::new(), vec![case(16, false, Distribution::Normal)]),
+                "at least one correctness case",
+            ),
+            (
+                reward().with_cases(vec![case(8, true, Distribution::Normal)], Vec::new()),
+                "at least one benchmark case",
+            ),
+        ] {
+            let group_error = configured
+                .reward_group_detailed(&sample, std::slice::from_ref(&completion))
+                .unwrap_err()
+                .to_string();
+            assert!(group_error.contains(expected), "{group_error}");
+            let verification_error = configured
+                .verify_submission("def custom_kernel(data):\n    return data[0]\n")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                verification_error.contains(expected),
+                "{verification_error}"
+            );
+        }
+    }
+
+    #[test]
     fn verifier_max_procs_defaults_and_wires_to_run_spec() {
         let default_spec = reward().build_run_spec(Path::new("/tmp/scratch"));
         assert_eq!(
@@ -3095,8 +3195,12 @@ mod tests {
     fn pre_verifier_infrastructure_failure_never_earns_the_format_floor() {
         let (root, image, eval, scratch) = verifier_fixture("pre-entry-infrastructure");
         let assets = TrimulVerifierAssets::capture(&image, &eval, &scratch).unwrap();
-        let mut r = TrimulReward::new(assets, &scratch);
-        r.sandbox = ApptainerSandbox::with_bin("/bin/false");
+        let r = TrimulReward::new(assets, &scratch)
+            .with_cases(
+                vec![case(8, true, Distribution::Normal)],
+                vec![case(16, false, Distribution::Cauchy)],
+            )
+            .with_verifier_executor_socket("/no/such/ferrl-verifier-executor.sock");
         let sample = Sample::new("write a faster TriMul kernel", ());
         let completion = "final:\n```python\ndef custom_kernel(data):\n    return data\n```\n";
 
@@ -3105,7 +3209,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            error.contains("sandbox infrastructure failed before verifier entry"),
+            error.contains("protected verifier executor failed"),
             "{error}"
         );
         let _ = std::fs::remove_dir_all(root);
@@ -3136,20 +3240,24 @@ mod tests {
         let trusted_import = FERRL_EVAL_DRIVER
             .find("import eval as upstream")
             .expect("the sealed driver imports the attested verifier");
-        let worker = FERRL_EVAL_DRIVER
-            .split_once("def _candidate_worker")
-            .expect("candidate execution has a separate process target")
+        let payload = FERRL_EVAL_DRIVER
+            .split_once("def _candidate_payload")
+            .expect("candidate code has a separate payload-process target")
             .1;
-        let ready = worker
-            .find("_send_status(status, b\"READY\")")
-            .expect("the candidate process proves trusted CUDA initialization");
-        let ack = worker
-            .find("commands.recv() != (\"ack-v1\",")
-            .expect("candidate import follows the parent acknowledgement");
-        let traced_entry = worker
+        let payload = payload
+            .split_once("def _read_parent_pid")
+            .expect("the payload target has a bounded source region")
+            .0;
+        let ready = payload
+            .find("_send_payload(results, b\"READY\")")
+            .expect("the payload process proves CUDA initialization");
+        let ack = payload
+            .find("commands.recv_bytes(MAX_STATUS_BYTES) != b\"ACK-v2\"")
+            .expect("candidate import follows the controller acknowledgement");
+        let traced_entry = payload
             .find("frame.f_code.co_filename == SUBMISSION_PATH")
             .expect("entry is observed from the actual submission module frame");
-        let candidate_import = worker
+        let candidate_import = payload
             .find("importlib.import_module(\"submission\")")
             .expect("candidate import is explicit and deferred");
         assert!(protect < trusted_import);
@@ -3158,28 +3266,45 @@ mod tests {
         assert!(FERRL_EVAL_DRIVER.contains("time.perf_counter_ns()"));
         assert!(FERRL_EVAL_DRIVER.contains("_CHECK_IMPLEMENTATION(data, output)"));
         assert!(FERRL_EVAL_DRIVER.contains("_CALCULATE_STATS(durations)"));
-        assert!(FERRL_EVAL_DRIVER.contains("copy_tensor(output_buffer, output)"));
+        let controller = FERRL_EVAL_DRIVER
+            .split_once("def _candidate_worker")
+            .expect("trusted candidate protocol has a separate controller process")
+            .1
+            .split_once("class CandidateSession")
+            .expect("the controller target has a bounded source region")
+            .0;
+        assert!(!payload.contains("_send_status"));
+        assert!(!payload.contains("outputs.send_bytes"));
+        assert!(!controller.contains("importlib.import_module"));
+        assert!(!controller.contains("kernel(candidate_data)"));
+        assert!(controller.contains("_send_status(status, b\"OUTPUT_READY\")"));
+        assert!(controller.contains("outputs.send_bytes(payload)"));
+        assert!(payload.contains("_send_payload(results, b\"OUTPUT\", raw_output)"));
+        assert!(FERRL_EVAL_DRIVER.contains("_cpu_clone(value)"));
+        assert!(FERRL_EVAL_DRIVER.contains("torch.frombuffer("));
+        assert!(!FERRL_EVAL_DRIVER.contains("candidate_data, shared_output"));
+        assert!(!FERRL_EVAL_DRIVER.contains("torch.multiprocessing"));
         assert!(FERRL_EVAL_DRIVER.contains("trusted correctness checker failed"));
         assert!(!FERRL_EVAL_DRIVER.contains("upstream.run_testing"));
         assert!(!FERRL_EVAL_DRIVER.contains("multiprocessing.Pool"));
 
         let execute = FERRL_EVAL_DRIVER
-            .split_once("def execute(self, candidate_data, shared_output, checked_output):")
+            .split_once("def execute(self, candidate_data, checked_output):")
             .expect("the protected parent owns candidate handoff and output capture")
             .1;
         let timer = execute
             .find("started = time.perf_counter_ns()")
             .expect("protected timing starts explicitly");
         let handoff = execute
-            .find("self.commands.send((\"prepare-v1\", candidate_data, shared_output))")
-            .expect("the hidden input is handed off explicitly");
+            .find("self.commands.send_bytes(b\"RUN-v2\\0\" + payload)")
+            .expect("the CPU-only input bytes are handed off explicitly");
         let private_capture = execute
-            .find("_COPY_TENSOR(checked_output, shared_output)")
-            .expect("the parent captures a private result");
+            .find("_COPY_TENSOR(checked_output, cpu_output)")
+            .expect("the parent reconstructs a private result from CPU bytes");
         let elapsed = execute
-            .find("return time.perf_counter_ns() - started")
-            .expect("timing ends only after private capture");
-        assert!(timer < handoff && handoff < private_capture && private_capture < elapsed);
+            .find("elapsed = time.perf_counter_ns() - started")
+            .expect("timing ends after bounded result receipt");
+        assert!(timer < handoff && handoff < elapsed && elapsed < private_capture);
         assert!(FERRL_EVAL_DRIVER.contains("_wrap_check(data, checked_output)"));
 
         let main = FERRL_EVAL_DRIVER
@@ -3236,7 +3361,10 @@ mod tests {
             status: RunStatus::Exited(7),
             stdout: String::new(),
             stderr: "candidate failed\n".to_string(),
-            protected_output: format!("ferrl-entry: {TEST_VERIFIER_ENTRY}\ntest-exit: 7\n"),
+            protected_output: format!(
+                "ferrl-timing-metric: {TRIMUL_TIMING_METRIC}\n\
+                 ferrl-entry: {TEST_VERIFIER_ENTRY}\ntest-exit: 7\n"
+            ),
             wall: Duration::from_millis(1),
         })
         .unwrap();
@@ -3247,8 +3375,10 @@ mod tests {
             stdout: String::new(),
             stderr: "candidate benchmark failed\n".to_string(),
             protected_output: format!(
-                "ferrl-entry: {TEST_VERIFIER_ENTRY}\ncheck: pass\ntest-exit: 0\n\
-                 {RESULT_SPLIT}\nferrl-entry: {BENCHMARK_VERIFIER_ENTRY}\nbenchmark-exit: 7\n"
+                "ferrl-timing-metric: {TRIMUL_TIMING_METRIC}\n\
+                 ferrl-entry: {TEST_VERIFIER_ENTRY}\ncheck: pass\ntest-exit: 0\n\
+                 {RESULT_SPLIT}\nferrl-timing-metric: {TRIMUL_TIMING_METRIC}\n\
+                 ferrl-entry: {BENCHMARK_VERIFIER_ENTRY}\nbenchmark-exit: 7\n"
             ),
             wall: Duration::from_millis(1),
         })
@@ -3259,13 +3389,59 @@ mod tests {
             status: RunStatus::Exited(0),
             stdout: String::new(),
             stderr: String::new(),
-            protected_output:
-                "ferrl-candidate-rejected: test-import-v1\ncheck: fail\ntest-exit: 112\n"
-                    .to_string(),
+            protected_output: format!(
+                "ferrl-timing-metric: {TRIMUL_TIMING_METRIC}\n\
+                     ferrl-candidate-rejected: test-import-v1\ncheck: fail\ntest-exit: 112\n"
+            ),
             wall: Duration::from_millis(1),
         })
         .unwrap();
         assert_eq!(rejected_candidate.status, RunStatus::Exited(0));
+
+        for infrastructure in [
+            RunOutcome {
+                status: RunStatus::Exited(0),
+                stdout: String::new(),
+                stderr: "trusted checker failed".to_string(),
+                protected_output: format!(
+                    "ferrl-timing-metric: {TRIMUL_TIMING_METRIC}\n\
+                     ferrl-entry: {TEST_VERIFIER_ENTRY}\n\
+                     ferrl-infrastructure: v1 phase=test\n"
+                ),
+                wall: Duration::from_millis(1),
+            },
+            RunOutcome {
+                status: RunStatus::Exited(TRIMUL_INFRASTRUCTURE_EXIT),
+                stdout: String::new(),
+                stderr: "trusted parent exited".to_string(),
+                protected_output: String::new(),
+                wall: Duration::from_millis(1),
+            },
+            RunOutcome {
+                status: RunStatus::Exited(0),
+                stdout: String::new(),
+                stderr: "trusted statistics failed".to_string(),
+                protected_output: format!(
+                    "ferrl-timing-metric: {TRIMUL_TIMING_METRIC}\n\
+                     ferrl-entry: {TEST_VERIFIER_ENTRY}\ncheck: pass\ntest-exit: 0\n\
+                     {RESULT_SPLIT}\nferrl-timing-metric: {TRIMUL_TIMING_METRIC}\n\
+                     ferrl-entry: {BENCHMARK_VERIFIER_ENTRY}\n\
+                     ferrl-infrastructure: v1 phase=benchmark\n"
+                ),
+                wall: Duration::from_millis(1),
+            },
+        ] {
+            let expected = infrastructure
+                .protected_output
+                .lines()
+                .find(|line| line.trim_start().starts_with("ferrl-infrastructure: v1"))
+                .map_or("reserved exit 114", str::trim)
+                .to_string();
+            assert!(matches!(
+                require_trimul_verifier_entry(infrastructure),
+                Err(SandboxError::Infrastructure { stderr, .. }) if stderr.contains(&expected)
+            ));
+        }
     }
 
     #[test]
@@ -3562,6 +3738,13 @@ mod tests {
     fn protected_driver_reports_phase_status_after_candidate_teardown() {
         assert!(FERRL_EVAL_DRIVER.contains("logger.log(\"test-exit\""));
         assert!(FERRL_EVAL_DRIVER.contains("logger.log(\"benchmark-exit\""));
+        let preparation = FERRL_EVAL_DRIVER
+            .find("phase = \"preparation\"")
+            .expect("trusted preparation has an infrastructure phase");
+        let trusted_preparation = FERRL_EVAL_DRIVER
+            .find("_prctl(PR_SET_CHILD_SUBREAPER, 1)")
+            .expect("trusted preparation is explicit");
+        assert!(preparation < trusted_preparation);
         let final_kill = FERRL_EVAL_DRIVER
             .rfind("_kill_candidate_tree()")
             .expect("the driver has a final candidate-tree kill");
@@ -3610,6 +3793,27 @@ mod tests {
                 .unwrap(),
             0.0
         );
+    }
+
+    #[test]
+    fn empty_test_or_benchmark_sets_fail_before_candidate_scoring() {
+        let sample = Sample::new("write a faster TriMul kernel", ());
+        let completion = "Sorry, no code.";
+        let mut no_tests = reward();
+        no_tests.test_cases.clear();
+        let error = no_tests
+            .reward(&sample, completion)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("at least one correctness case"));
+
+        let mut no_benchmarks = reward();
+        no_benchmarks.benchmark_cases.clear();
+        let error = no_benchmarks
+            .reward_group_detailed(&sample, &[completion.to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("at least one benchmark case"));
     }
 
     #[test]

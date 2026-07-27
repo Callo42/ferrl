@@ -20,7 +20,8 @@
 //! the library — see `examples/minimal_task.rs` and the README's "Wire your own task".
 //!
 //! `trimul-baseline` runs the bundled reference kernel through the same sandboxed eval
-//! to measure its geometric-mean runtime on *this* node's GPU, and prints `{ns, gpu}`
+//! to measure its geometric-mean ferrl service latency on *this* node's GPU, and prints
+//! `{ns, gpu, metric}`
 //! to paste into the run config's `trimul.baseline` (the guarded-pin baseline — a
 //! `train` run refuses a baseline measured on a different GPU than it is running on).
 //!
@@ -67,7 +68,7 @@ use ferrl::{
     compare_distributed_metrics, compare_metrics, evaluate, read_jsonl, summarize,
     train_eval_split, BaseQuantization, CountdownReward, LoaderOpts, MathProblem, MathReward,
     RegressionBudget, RegressionReport, RewardFn, RunDir, RunStop, Sample, TensorParallelPlan,
-    TokenizerLike, Trainer, TrainerConfig, TrimulReward,
+    TokenizerLike, Trainer, TrainerConfig, TrimulReward, VerifierExecutorConfig,
 };
 
 /// A task's train/eval split: `(train, eval)` samples of the task's target type.
@@ -101,6 +102,8 @@ enum Command {
     Runreport(RunreportArgs),
     /// Compare two finished runs and fail on behavior/resource regression.
     PerfGate(PerfGateArgs),
+    /// Serve sealed verifier launches under a dedicated non-root service UID.
+    VerifierExecutor(VerifierExecutorArgs),
 }
 
 /// Arguments for `ferrl train`.
@@ -117,6 +120,33 @@ struct TrimulBaselineArgs {
     /// Path to the JSON run config (the same `trimul` block `ferrl train` reads).
     #[arg(long)]
     config: PathBuf,
+}
+
+/// Arguments for `ferrl verifier-executor`.
+#[derive(Debug, Args)]
+struct VerifierExecutorArgs {
+    /// Service-owned Unix socket path.
+    #[arg(long, default_value = ferrl::DEFAULT_VERIFIER_EXECUTOR_SOCKET)]
+    socket: PathBuf,
+    /// Service-private per-request work root.
+    #[arg(long, default_value = "/var/lib/ferrl/verifier-executor")]
+    work_root: PathBuf,
+    /// Only training-process UID accepted through `SO_PEERCRED`.
+    #[arg(long)]
+    client_uid: u32,
+    /// Apptainer executable owned by the service deployment.
+    #[arg(long, default_value = "apptainer")]
+    apptainer: PathBuf,
+    /// Socket permission bits in octal; world permissions are rejected.
+    #[arg(long, default_value = "0660", value_parser = parse_socket_mode)]
+    socket_mode: u32,
+}
+
+fn parse_socket_mode(value: &str) -> Result<u32, String> {
+    u32::from_str_radix(value, 8)
+        .ok()
+        .filter(|mode| *mode <= 0o777)
+        .ok_or_else(|| "socket mode must be three or four octal digits".to_string())
 }
 
 /// Arguments for `ferrl trimul-score`.
@@ -607,15 +637,15 @@ impl Default for DataCfg {
     }
 }
 
-/// The reference baseline pin for the TriMul speedup reward: the reference
-/// geometric-mean runtime (`ns`) and the GPU it was measured on (`gpu`). A *guarded
+/// The reference baseline pin for the TriMul latency reward: the reference
+/// geometric-mean service latency (`ns`), exact metric, and measurement GPU. A *guarded
 /// pin* — `gpu` must appear in this node's `nvidia-smi` product name, so a speedup is
 /// never scored against a baseline taken on different hardware. Produce it with
 /// `ferrl trimul-baseline`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct BaselineCfg {
-    /// Reference geometric-mean runtime in nanoseconds (the speedup denominator).
+    /// Reference geometric-mean service latency in nanoseconds (the ratio denominator).
     ns: f64,
     /// A label identifying the GPU the baseline was measured on. The intended value is
     /// the full product name `ferrl trimul-baseline` prints (e.g. `"NVIDIA H100 80GB
@@ -623,6 +653,8 @@ struct BaselineCfg {
     /// of a different card's name. Unknown keys are rejected so a typo can't silently
     /// disable the guard.
     gpu: String,
+    /// Exact protected timing metric used to produce `ns`.
+    metric: String,
 }
 
 /// TriMul task knobs (read only when `task == "trimul"`): the sandboxed eval image and
@@ -647,6 +679,8 @@ struct TrimulCfg {
     /// Node-local scratch root for per-candidate dirs; prefer a tmpfs root such as
     /// `/dev/shm/ferrl`.
     scratch_root: PathBuf,
+    /// Protected dedicated-UID verifier executor socket. Omit for the system default.
+    verifier_executor_socket: Option<PathBuf>,
     /// Host-supervised total byte cap for one candidate's writable scratch tree
     /// (`0` -> the reward default, 1 GiB).
     scratch_max_bytes: u64,
@@ -1503,6 +1537,13 @@ impl RunConfig {
             .map_err(|error| CliError::msg(error.to_string()))
     }
 
+    fn configure_verifier_executor(&self, reward: TrimulReward) -> TrimulReward {
+        match &self.trimul.verifier_executor_socket {
+            Some(socket) => reward.with_verifier_executor_socket(socket),
+            None => reward,
+        }
+    }
+
     fn build_trimul_reward_base_with_assets(
         &self,
         assets: ferrl::trimul::TrimulVerifierAssets,
@@ -1510,11 +1551,12 @@ impl RunConfig {
         let t = &self.trimul;
         let (tests, benches) = ferrl::trimul::parse_task_yml(assets.task_yml())?;
         let wall = Duration::from_secs(if t.wall_secs == 0 { 600 } else { t.wall_secs });
-        let mut reward = TrimulReward::new(assets, &t.scratch_root)
+        let reward = TrimulReward::new(assets, &t.scratch_root)
             .with_cases(tests, benches)
             .with_secret_seed(t.secret_seed)
             .with_wall(wall);
-        reward = reward
+        let mut reward = self
+            .configure_verifier_executor(reward)
             .with_reward_profile(t.reward)
             .map_err(CliError::msg)?;
         if let Some(devices) = &t.verifier_cuda_visible_devices {
@@ -1554,6 +1596,7 @@ impl RunConfig {
             .build_trimul_reward_base_with_assets(assets)?
             .with_submission_extract_mode(mode);
         if let Some(b) = &self.trimul.baseline {
+            guard_baseline_metric(&b.metric)?;
             guard_baseline_gpu(&b.gpu)?;
             reward = reward.with_baseline_ns(b.ns);
         }
@@ -2901,6 +2944,17 @@ fn guard_baseline_gpu(configured: &str) -> Result<(), CliError> {
     baseline_gpu_matches(configured, detect_gpu_name().as_deref()).map_err(CliError::Msg)
 }
 
+fn guard_baseline_metric(metric: &str) -> Result<(), CliError> {
+    if metric == ferrl::trimul::TRIMUL_TIMING_METRIC {
+        Ok(())
+    } else {
+        Err(CliError::msg(format!(
+            "trimul.baseline.metric must be {:?}; old or unversioned baselines must be re-measured",
+            ferrl::trimul::TRIMUL_TIMING_METRIC
+        )))
+    }
+}
+
 /// Dispatch `ferrl trimul-baseline`: run the bundled reference kernel through the
 /// sandboxed eval on this node's GPU, and print `{ "ns", "gpu" }` to paste into the run
 /// config's `trimul.baseline` (the guarded pin).
@@ -2920,13 +2974,26 @@ fn trimul_baseline(args: &TrimulBaselineArgs) -> Result<(), CliError> {
         .ok_or_else(|| {
             CliError::msg("the reference kernel produced no plausible benchmark time")
         })?;
-    let pin = serde_json::json!({ "ns": ns, "gpu": gpu });
+    let pin = serde_json::json!({
+        "ns": ns,
+        "gpu": gpu,
+        "metric": ferrl::trimul::TRIMUL_TIMING_METRIC,
+    });
     println!(
         "{}",
         serde_json::to_string_pretty(&pin).unwrap_or_else(|_| pin.to_string())
     );
     eprintln!("ferrl: paste the above into your run config's trimul.baseline");
     Ok(())
+}
+
+fn verifier_executor(args: &VerifierExecutorArgs) -> Result<(), CliError> {
+    ferrl::serve_verifier_executor(
+        &VerifierExecutorConfig::new(&args.socket, &args.work_root, args.client_uid)
+            .with_apptainer_bin(&args.apptainer)
+            .with_socket_mode(args.socket_mode),
+    )
+    .map_err(|error| CliError::msg(error.to_string()))
 }
 
 /// Dispatch `ferrl trimul-score`: score raw external completions with TriMul's
@@ -3293,11 +3360,13 @@ fn trimul_score_record(
 /// One clean artifact-verification run written under `verification/`.
 #[derive(Debug, Clone, Serialize)]
 struct ArtifactVerificationRun {
+    /// Versioned timing metric used for every benchmark mean.
+    timing_metric: String,
     /// Whether the candidate passed every correctness case.
     correct: bool,
     /// Per-benchmark means, in ns.
     benchmark_means_ns: Vec<f64>,
-    /// Geometric mean runtime, in ns.
+    /// Geometric mean service latency, in ns.
     geomean_ns: Option<f64>,
     /// Speedup over the baseline median.
     speedup: Option<f64>,
@@ -3470,11 +3539,13 @@ struct EvalManifest {
 /// Same-GPU baseline fields.
 #[derive(Debug, Serialize)]
 struct BaselineManifest {
+    /// Versioned timing metric used for every measurement.
+    metric: String,
     /// GPU product name seen during extraction.
     gpu: String,
     /// Raw baseline measurements, in ns.
     measurements_ns: Vec<f64>,
-    /// Median baseline runtime, in ns.
+    /// Median baseline service latency, in ns.
     median_ns: f64,
     /// Exact baseline command used for these measurements.
     command: String,
@@ -3970,6 +4041,7 @@ fn trimul_artifact_with_trust(
     let baseline = cfg.trimul.baseline.as_ref().ok_or_else(|| {
         CliError::msg("trimul-artifact requires trimul.baseline in the run config")
     })?;
+    guard_baseline_metric(&baseline.metric)?;
     let verifier_assets = capture_attested_trimul_verifier_assets(cfg, &bound.launch)?;
     let baseline_median = median_checked(&args.baseline_measurements_ns, "baseline-ns")?;
     require_baseline_matches_config(baseline_median, baseline.ns)?;
@@ -4059,7 +4131,7 @@ struct ArtifactInputs<'a> {
     prompt_bytes: &'a [u8],
     /// Extracted source.
     submission: &'a str,
-    /// Median baseline runtime, in ns.
+    /// Median baseline service latency, in ns.
     baseline_median: f64,
     /// Loaded correctness case count.
     test_cases: usize,
@@ -4130,6 +4202,7 @@ fn verify_submission_repeated(
                 .verify_submission(submission)
                 .map_err(|e| CliError::msg(format!("artifact verification failed: {e}")))?;
             Ok(ArtifactVerificationRun {
+                timing_metric: ferrl::trimul::TRIMUL_TIMING_METRIC.to_string(),
                 correct: v.correct,
                 benchmark_means_ns: v.benchmark_means_ns,
                 geomean_ns: v.geomean_ns,
@@ -4139,11 +4212,14 @@ fn verify_submission_repeated(
         .collect()
 }
 
-/// Mechanical artifact acceptance: every re-run correct and timed, and the median
-/// candidate runtime beats the median baseline.
+/// Mechanical artifact acceptance: every re-run correct and measured under the exact
+/// versioned metric, and the median candidate service latency beats the baseline.
 fn accepted_artifact(runs: &[ArtifactVerificationRun], baseline_median: f64) -> bool {
     let geos: Vec<f64> = runs.iter().filter_map(|r| r.geomean_ns).collect();
     geos.len() == runs.len()
+        && runs
+            .iter()
+            .all(|run| run.timing_metric == ferrl::trimul::TRIMUL_TIMING_METRIC)
         && runs.iter().all(|r| r.correct)
         && median_checked(&geos, "candidate geomean")
             .is_ok_and(|candidate| candidate < baseline_median)
@@ -4275,6 +4351,7 @@ fn build_manifest(
             benchmark_cases: inputs.benchmark_cases,
         },
         baseline: BaselineManifest {
+            metric: ferrl::trimul::TRIMUL_TIMING_METRIC.to_string(),
             gpu: inputs.gpu.clone(),
             measurements_ns: args.baseline_measurements_ns.clone(),
             median_ns: inputs.baseline_median,
@@ -4385,11 +4462,13 @@ fn artifact_report(
 
     writeln!(&mut out, "## 2. Baseline\n").expect("writing to String cannot fail");
     writeln!(&mut out, "- GPU: {}", manifest.baseline.gpu).expect("writing to String cannot fail");
+    writeln!(&mut out, "- Timing metric: {}", manifest.baseline.metric)
+        .expect("writing to String cannot fail");
     writeln!(&mut out, "- Raw measurements ns: {baseline_measurements}")
         .expect("writing to String cannot fail");
     writeln!(
         &mut out,
-        "- Median runtime ns: {:.6}",
+        "- Median service latency ns: {:.6}",
         manifest.baseline.median_ns
     )
     .expect("writing to String cannot fail");
@@ -4467,7 +4546,7 @@ fn artifact_report(
     writeln!(&mut out, "## 4. Candidate Table\n").expect("writing to String cannot fail");
     writeln!(
         &mut out,
-        "| source hash | training reward | source inspection | clean correctness | median runtime ns | speedup | accept/reject reason |"
+        "| source hash | training reward | source inspection | clean correctness | median service latency ns | same-metric ratio | accept/reject reason |"
     )
     .expect("writing to String cannot fail");
     writeln!(&mut out, "|---|---:|---|---:|---:|---:|---|").expect("writing to String cannot fail");
@@ -4539,6 +4618,16 @@ fn artifact_report(
         &mut out,
         manifest.baseline.gpu == manifest.verification.gpu,
         "baseline and verification GPU match",
+    );
+    push_check(
+        &mut out,
+        manifest.baseline.metric == ferrl::trimul::TRIMUL_TIMING_METRIC
+            && manifest
+                .verification
+                .runs
+                .iter()
+                .all(|run| run.timing_metric == manifest.baseline.metric),
+        "baseline and verification use the protected timing metric",
     );
     push_check(
         &mut out,
@@ -4623,7 +4712,7 @@ fn artifact_accept_reason(
     median_candidate: Option<f64>,
 ) -> &'static str {
     if manifest.verification.accepted {
-        "accepted: all clean runs correct and median runtime beats baseline"
+        "accepted: all clean runs correct and median service latency beats baseline"
     } else if manifest.candidate.source_inspection.result == SourceInspectionResult::Suspicious {
         "rejected: source inspection found process/file/env/network/path probing"
     } else if manifest.verification.runs.iter().any(|r| !r.correct) {
@@ -4636,7 +4725,7 @@ fn artifact_accept_reason(
     {
         "rejected: at least one clean verification run did not produce timing"
     } else if median_candidate.is_some_and(|v| v >= manifest.baseline.median_ns) {
-        "rejected: candidate median runtime does not beat baseline"
+        "rejected: candidate median service latency does not beat baseline"
     } else {
         "rejected: insufficient clean verification evidence"
     }
@@ -5425,6 +5514,7 @@ fn main() -> ExitCode {
         Command::TrimulArtifact(args) => trimul_artifact(args).map(|()| ExitCode::SUCCESS),
         Command::Runreport(args) => runreport(args),
         Command::PerfGate(args) => perf_gate(args),
+        Command::VerifierExecutor(args) => verifier_executor(args).map(|()| ExitCode::SUCCESS),
     };
     match result {
         Ok(code) => code,
@@ -9640,7 +9730,8 @@ mod tests {
                           "verifier_cuda_device_pool": ["1", "2"],
                           "verifier_parallelism": 2,
                           "verifier_max_procs": 2048,
-                          "baseline": { "ns": 5200000.0, "gpu": "H100" } },
+                          "baseline": { "ns": 5200000.0, "gpu": "H100",
+                            "metric": "isolated-service-latency-v1" } },
                         "trainer": { "steps": 1, "group_size": 2, "max_new_tokens": 8,
                           "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
                           "lr": 1e-5, "weight_decay": 0.0,
@@ -9659,6 +9750,7 @@ mod tests {
         assert_eq!(cfg.trimul.verifier_max_procs, 2048);
         let b = cfg.trimul.baseline.as_ref().expect("baseline present");
         assert_eq!((b.ns, b.gpu.as_str()), (5_200_000.0, "H100"));
+        assert_eq!(b.metric, ferrl::trimul::TRIMUL_TIMING_METRIC);
         // The single-prompt splits honour train_n / eval_n without deduping to one row.
         let (train, eval) = cfg.trimul_splits().unwrap();
         assert_eq!((train.len(), eval.len()), (8, 2));
@@ -9892,6 +9984,17 @@ benchmarks:
         assert!(baseline_gpu_matches("H100", Some("NVIDIA L40S")).is_err());
         // An unreadable GPU fails closed (never silently passes).
         assert!(baseline_gpu_matches("H100", None).is_err());
+    }
+
+    #[test]
+    fn baseline_metric_rejects_legacy_unversioned_and_upstream_timings() {
+        assert!(serde_json::from_str::<BaselineCfg>(r#"{"ns":1.0,"gpu":"H100"}"#).is_err());
+        assert!(guard_baseline_metric(ferrl::trimul::TRIMUL_TIMING_METRIC).is_ok());
+        for rejected in ["", "kernel-runtime-ns", "gpumode-cuda-events-v1"] {
+            let error = guard_baseline_metric(rejected).unwrap_err().to_string();
+            assert!(error.contains(ferrl::trimul::TRIMUL_TIMING_METRIC));
+            assert!(error.contains("must be re-measured"));
+        }
     }
 
     /// The guard is token-bounded (not a raw substring) and rejects an empty label, so a
@@ -10469,6 +10572,7 @@ benchmarks:
                 benchmark_cases: 2,
             },
             baseline: BaselineManifest {
+                metric: ferrl::trimul::TRIMUL_TIMING_METRIC.to_string(),
                 gpu: "H100".to_string(),
                 measurements_ns: vec![10.0, 11.0, 12.0],
                 median_ns: 11.0,
@@ -10478,18 +10582,21 @@ benchmarks:
                 gpu: "H100".to_string(),
                 runs: vec![
                     ArtifactVerificationRun {
+                        timing_metric: ferrl::trimul::TRIMUL_TIMING_METRIC.to_string(),
                         correct: true,
                         benchmark_means_ns: vec![8.0],
                         geomean_ns: Some(8.0),
                         speedup: Some(1.375),
                     },
                     ArtifactVerificationRun {
+                        timing_metric: ferrl::trimul::TRIMUL_TIMING_METRIC.to_string(),
                         correct: true,
                         benchmark_means_ns: vec![9.0],
                         geomean_ns: Some(9.0),
                         speedup: Some(1.222),
                     },
                     ArtifactVerificationRun {
+                        timing_metric: ferrl::trimul::TRIMUL_TIMING_METRIC.to_string(),
                         correct: true,
                         benchmark_means_ns: vec![10.0],
                         geomean_ns: Some(10.0),
@@ -10518,8 +10625,8 @@ benchmarks:
             "base_quantization=q8_0",
             "Budget: trainer_steps=100, group_size=4, scratch_max_bytes=1024, verifier_max_procs=1024",
             "Run health: healthy",
-            "| source hash | training reward | source inspection | clean correctness | median runtime ns | speedup | accept/reject reason |",
-            "| source-hash | 1.500000 | clean | 3/3 | 9.000000 | 1.222222 | accepted: all clean runs correct and median runtime beats baseline |",
+            "| source hash | training reward | source inspection | clean correctness | median service latency ns | same-metric ratio | accept/reject reason |",
+            "| source-hash | 1.500000 | clean | 3/3 | 9.000000 | 1.222222 | accepted: all clean runs correct and median service latency beats baseline |",
             "Source inspection notes: no process, file descriptor, environment, network, or out-of-input path probes",
             "Path: artifact",
             "Manifest SHA-256: manifest-hash",

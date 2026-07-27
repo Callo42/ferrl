@@ -1,19 +1,23 @@
-"""Ferrl-owned TriMul verifier boundary.
+"""Ferrl-owned TriMul protected verifier boundary.
 
-The protected parent owns input generation, correctness checking, elapsed-time
-measurement, statistics, and the machine-grade socket. Candidate Python executes
-only in a spawned child process. The child can corrupt its own interpreter and
-control pipes, but it cannot mutate the checker/timer process or write the grade.
-Every reported output is copied into a fresh parent-owned CUDA buffer and checked
-on a fresh hidden-seed input before a duration is accepted.
+The parent owns hidden inputs, checking, statistics, timing, and the grade socket. A
+non-dumpable controller owns the trusted status/output connections, and candidate
+Python runs in a separate payload process with independent CUDA allocations and only
+an untrusted request/result channel. Bounded CPU byte strings cross each process
+boundary: no parent CUDA allocation is ever exported through CUDA IPC. The versioned
+timing metric covers request handoff, controller/payload scheduling, candidate
+execution, device-to-host capture, and result receipt; trusted reconstruction and
+checking happen after the timer stops.
 """
 
 import ctypes
+import io
 import importlib
 import multiprocessing
 import os
 import signal
 import socket
+import stat
 import sys
 import time
 
@@ -22,8 +26,13 @@ PR_SET_DUMPABLE = 4
 PR_SET_CHILD_SUBREAPER = 36
 SUBMISSION_PATH = "/opt/ferrl-verifier/submission.py"
 RESULT_SPLIT = "===FERRL-BENCH==="
+TIMING_METRIC = "isolated-service-latency-v1"
 MAX_STATUS_BYTES = 256
 MAX_STATUS_EVENTS = 32
+MAX_INPUT_BYTES = 2 * 1024 * 1024 * 1024
+ATTEMPT_SENTINEL_PATH = "/work/cache/ferrl-attack-sentinel"
+PARENT_DEVICE_CANARY = b"ferrl-parent-private-cuda-v1-7f4c3a19"
+PAYLOAD_WIRE_PREFIX = b"FERRL-PAYLOAD-v1\0"
 
 
 def _prctl(option, value):
@@ -86,6 +95,33 @@ def _bounded_message(message):
     return text[:2048]
 
 
+def _consume_attempt_sentinel(logger, phase, index):
+    text = None
+    try:
+        descriptor = os.open(
+            ATTEMPT_SENTINEL_PATH,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )
+        try:
+            metadata = os.fstat(descriptor)
+            if stat.S_ISREG(metadata.st_mode) and 0 < metadata.st_size <= 256:
+                value = os.read(descriptor, 257)
+                if len(value) == metadata.st_size:
+                    candidate_text = value.decode("ascii")
+                    if not any(character in candidate_text for character in "\r\n\0"):
+                        text = candidate_text
+        finally:
+            os.close(descriptor)
+    except (OSError, UnicodeError):
+        pass
+    try:
+        os.unlink(ATTEMPT_SENTINEL_PATH)
+    except OSError:
+        pass
+    if text is not None:
+        logger.log(f"{phase}.{index}.candidate-sentinel", text)
+
+
 def _send_status(connection, value):
     try:
         connection.send_bytes(value)
@@ -93,7 +129,73 @@ def _send_status(connection, value):
         os._exit(115)
 
 
-def _candidate_worker(commands, status):
+def _send_payload(connection, event, payload=b""):
+    try:
+        connection.send_bytes(PAYLOAD_WIRE_PREFIX + event + b"\0" + payload)
+    except BaseException:
+        os._exit(115)
+
+
+def _recv_payload(connection, limit):
+    value = connection.recv_bytes(limit)
+    if not value.startswith(PAYLOAD_WIRE_PREFIX):
+        raise ValueError("candidate payload wire prefix mismatch")
+    event, separator, payload = value[len(PAYLOAD_WIRE_PREFIX) :].partition(b"\0")
+    if not separator or not event:
+        raise ValueError("candidate payload wire frame is malformed")
+    return event, payload
+
+
+def _cpu_clone(value):
+    if type(value) is _TENSOR_TYPE:
+        return value.detach().to(device="cpu").clone()
+    if isinstance(value, tuple):
+        return tuple(_cpu_clone(item) for item in value)
+    if isinstance(value, list):
+        return [_cpu_clone(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _cpu_clone(item) for key, item in value.items()}
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    raise InfrastructureFailure("trusted input contained an unsupported value")
+
+
+def _cuda_clone(value):
+    if type(value) is _TENSOR_TYPE:
+        return value.to(device="cuda")
+    if isinstance(value, tuple):
+        return tuple(_cuda_clone(item) for item in value)
+    if isinstance(value, list):
+        return [_cuda_clone(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _cuda_clone(item) for key, item in value.items()}
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    raise TypeError("candidate input contained an unsupported value")
+
+
+def _serialize_input(value):
+    buffer = io.BytesIO()
+    torch.save(_cpu_clone(value), buffer)
+    payload = buffer.getvalue()
+    if len(payload) > MAX_INPUT_BYTES:
+        raise InfrastructureFailure("trusted candidate input exceeds transport cap")
+    return payload
+
+
+def _deserialize_input(payload):
+    # The protected parent created these bytes. weights_only still narrows the
+    # accepted graph before it enters the disposable candidate interpreter.
+    value = torch.load(io.BytesIO(payload), map_location="cpu", weights_only=True)
+    return _cuda_clone(value)
+
+
+def _tensor_bytes(value):
+    cpu = value.detach().to(device="cpu").contiguous()
+    return cpu.view(torch.uint8).numpy().tobytes()
+
+
+def _candidate_payload(commands, results):
     _prctl(PR_SET_DUMPABLE, 0)
     try:
         os.setsid()
@@ -104,17 +206,16 @@ def _candidate_worker(commands, status):
     # globals in this disposable process.
     sync = _SYNC
     tensor_type = _TENSOR_TYPE
-    copy_tensor = _COPY_TENSOR
     try:
         torch.cuda.init()
         sync()
     except BaseException:
-        _send_status(status, b"TRUSTED_INIT_ERROR")
+        _send_payload(results, b"TRUSTED_INIT_ERROR")
         return
-    _send_status(status, b"READY")
+    _send_payload(results, b"READY")
 
     try:
-        if commands.recv() != ("ack-v1",):
+        if commands.recv_bytes(MAX_STATUS_BYTES) != b"ACK-v2":
             return
     except BaseException:
         return
@@ -130,7 +231,7 @@ def _candidate_worker(commands, status):
             and frame.f_code.co_filename == SUBMISSION_PATH
         ):
             entry_sent = True
-            _send_status(status, b"ENTRY")
+            _send_payload(results, b"ENTRY")
             sys.settrace(None)
             return None
         return trace_candidate_entry
@@ -145,52 +246,49 @@ def _candidate_worker(commands, status):
             raise TypeError("custom_kernel is not callable")
     except BaseException:
         sys.settrace(None)
-        _send_status(status, b"IMPORT_ERROR" if entry_sent else b"IMPORT_REJECTED")
+        _send_payload(results, b"IMPORT_ERROR" if entry_sent else b"IMPORT_REJECTED")
         return
     if not entry_sent:
-        _send_status(status, b"IMPORT_REJECTED")
+        _send_payload(results, b"IMPORT_REJECTED")
         return
-    _send_status(status, b"IMPORTED")
+    _send_payload(results, b"IMPORTED")
 
-    candidate_data = None
-    output_buffer = None
     while True:
         try:
-            command = commands.recv()
+            command = commands.recv_bytes(MAX_INPUT_BYTES + 16)
         except EOFError:
             return
         except BaseException:
-            _send_status(status, b"CONTROL_ERROR")
+            _send_payload(results, b"CONTROL_ERROR")
             return
-        if command == ("close-v1",):
+        if command == b"CLOSE-v2":
             return
-        if not isinstance(command, tuple) or not command:
-            _send_status(status, b"CONTROL_ERROR")
-            return
-        if command[0] == "prepare-v1" and len(command) == 3:
-            candidate_data = command[1]
-            output_buffer = command[2]
-            _send_status(status, b"PREPARED")
-            continue
-        if command != ("run-v1",) or candidate_data is None or output_buffer is None:
-            _send_status(status, b"CONTROL_ERROR")
+        prefix = b"RUN-v2\0"
+        if not command.startswith(prefix):
+            _send_payload(results, b"CONTROL_ERROR")
             return
         try:
+            candidate_data = _deserialize_input(command[len(prefix) :])
+            if not isinstance(candidate_data, (tuple, list)) or not candidate_data:
+                raise TypeError("candidate input schema mismatch")
+            expected = candidate_data[0]
+            if type(expected) is not tensor_type or not expected.is_cuda:
+                raise TypeError("candidate output schema source is not a CUDA tensor")
             output = kernel(candidate_data)
             if type(output) is not tensor_type:
                 raise TypeError("candidate output is not an exact torch.Tensor")
             if (
-                output.shape != output_buffer.shape
-                or output.dtype != output_buffer.dtype
-                or output.device != output_buffer.device
+                output.shape != expected.shape
+                or output.dtype != expected.dtype
+                or output.device != expected.device
             ):
                 raise ValueError("candidate output schema mismatch")
-            copy_tensor(output_buffer, output)
             sync()
+            raw_output = _tensor_bytes(output)
         except BaseException:
-            _send_status(status, b"CANDIDATE_ERROR")
+            _send_payload(results, b"CANDIDATE_ERROR")
             continue
-        _send_status(status, b"DONE")
+        _send_payload(results, b"OUTPUT", raw_output)
 
 
 def _read_parent_pid(pid):
@@ -241,6 +339,109 @@ def _kill_candidate_tree():
         time.sleep(0.01)
 
 
+def _candidate_worker(commands, status, outputs):
+    _prctl(PR_SET_DUMPABLE, 0)
+    try:
+        os.setsid()
+    except OSError:
+        pass
+
+    context = multiprocessing.get_context("spawn")
+    child_commands, payload_commands = context.Pipe(duplex=False)
+    payload_results, child_results = context.Pipe(duplex=False)
+    payload_process = context.Process(
+        target=_candidate_payload,
+        args=(child_commands, child_results),
+        daemon=False,
+    )
+    payload_process.start()
+    child_commands.close()
+    child_results.close()
+    try:
+        phase = "preparation"
+        try:
+            event, payload = _recv_payload(payload_results, MAX_STATUS_BYTES)
+        except BaseException:
+            _send_status(status, b"TRUSTED_INIT_ERROR")
+            return
+        if event != b"READY" or payload:
+            _send_status(status, b"TRUSTED_INIT_ERROR")
+            return
+        _send_status(status, b"READY")
+
+        try:
+            acknowledgement = commands.recv_bytes(MAX_STATUS_BYTES)
+        except BaseException:
+            return
+        if acknowledgement != b"ACK-v2":
+            return
+        payload_commands.send_bytes(acknowledgement)
+
+        entered = False
+        while True:
+            try:
+                event, payload = _recv_payload(payload_results, MAX_STATUS_BYTES)
+            except BaseException:
+                _send_status(status, b"IMPORT_ERROR" if entered else b"IMPORT_REJECTED")
+                return
+            if payload:
+                _send_status(status, b"IMPORT_REJECTED")
+                return
+            if event == b"ENTRY":
+                entered = True
+                _send_status(status, b"ENTRY")
+                continue
+            if event in (b"IMPORTED", b"IMPORT_REJECTED", b"IMPORT_ERROR"):
+                _send_status(status, event)
+                if event != b"IMPORTED":
+                    return
+                break
+            _send_status(status, b"IMPORT_REJECTED")
+            return
+
+        while True:
+            try:
+                command = commands.recv_bytes(MAX_INPUT_BYTES + 16)
+            except BaseException:
+                return
+            if command == b"CLOSE-v2":
+                try:
+                    payload_commands.send_bytes(command)
+                except BaseException:
+                    pass
+                return
+            if not command.startswith(b"RUN-v2\0"):
+                _send_status(status, b"CONTROL_ERROR")
+                return
+            try:
+                payload_commands.send_bytes(command)
+                event, payload = _recv_payload(
+                    payload_results,
+                    MAX_INPUT_BYTES + len(PAYLOAD_WIRE_PREFIX) + 32,
+                )
+            except BaseException:
+                _send_status(status, b"CANDIDATE_ERROR")
+                continue
+            if event == b"CANDIDATE_ERROR" and not payload:
+                _send_status(status, b"CANDIDATE_ERROR")
+                continue
+            if event != b"OUTPUT":
+                _send_status(status, b"CONTROL_ERROR")
+                return
+            _send_status(status, b"OUTPUT_READY")
+            try:
+                outputs.send_bytes(payload)
+            except BaseException:
+                return
+    finally:
+        payload_commands.close()
+        payload_results.close()
+        payload_process.join(0.25)
+        if payload_process.is_alive():
+            payload_process.kill()
+            payload_process.join(1)
+
+
 class CandidateSession:
     def __init__(self, mode, logger):
         self.mode = mode
@@ -251,18 +452,21 @@ class CandidateSession:
         context = multiprocessing.get_context("spawn")
         child_commands, self.commands = context.Pipe(duplex=False)
         self.status, child_status = context.Pipe(duplex=False)
+        self.outputs, child_outputs = context.Pipe(duplex=False)
         self.worker = context.Process(
             target=_candidate_worker,
-            args=(child_commands, child_status),
+            args=(child_commands, child_status, child_outputs),
             daemon=False,
         )
         self.worker.start()
         child_commands.close()
         child_status.close()
+        child_outputs.close()
         try:
             if self._recv(before_entry=True) != b"READY":
                 raise InfrastructureFailure("candidate worker trusted initialization failed")
-            self.commands.send(("ack-v1",))
+            self.logger.log("ferrl-timing-metric", TIMING_METRIC)
+            self.commands.send_bytes(b"ACK-v2")
             while True:
                 event = self._recv(before_entry=not self.entered)
                 if event == b"ENTRY":
@@ -294,34 +498,46 @@ class CandidateSession:
                 raise CandidateFailure("candidate worker exited after entry") from error
         raise CandidateFailure("candidate worker status flood")
 
-    def execute(self, candidate_data, shared_output, checked_output):
+    def execute(self, candidate_data, checked_output):
         if self.rejected:
             raise CandidateFailure("candidate import was rejected")
-        # The candidate must not see either the hidden-seed input or its writable
-        # result buffer before the protected timer starts. Candidate code can
-        # corrupt every object in its own interpreter, including the worker's
-        # control connection, so a DONE event is only a prompt for the protected
-        # parent to capture and synchronize a fresh private output.
+        try:
+            payload = _serialize_input(candidate_data)
+        except InfrastructureFailure:
+            raise
+        except BaseException as error:
+            raise InfrastructureFailure("trusted input serialization failed") from error
+
+        # No CUDA object crosses this boundary. A candidate may corrupt its own
+        # pipes or emit OUTPUT_READY early, but it cannot earn correctness without
+        # supplying an exact-size CPU result that passes the protected checker.
         started = time.perf_counter_ns()
         try:
-            self.commands.send(("prepare-v1", candidate_data, shared_output))
+            self.commands.send_bytes(b"RUN-v2\0" + payload)
         except BaseException as error:
             raise CandidateFailure("candidate input handoff failed") from error
-        if self._recv() != b"PREPARED":
-            raise CandidateFailure("candidate prepare protocol failed")
-        try:
-            self.commands.send(("run-v1",))
-        except BaseException as error:
-            raise CandidateFailure("candidate run handoff failed") from error
         status = self._recv()
-        if status != b"DONE":
+        if status != b"OUTPUT_READY":
             raise CandidateFailure("candidate execution failed")
+        expected_bytes = checked_output.numel() * checked_output.element_size()
         try:
-            _COPY_TENSOR(checked_output, shared_output)
+            raw_output = self.outputs.recv_bytes(expected_bytes)
+        except (EOFError, OSError) as error:
+            raise CandidateFailure("candidate output transport failed") from error
+        elapsed = time.perf_counter_ns() - started
+        if len(raw_output) != expected_bytes:
+            raise CandidateFailure("candidate output byte length mismatch")
+        try:
+            cpu_output = torch.frombuffer(
+                bytearray(raw_output),
+                dtype=checked_output.dtype,
+                count=checked_output.numel(),
+            ).reshape(checked_output.shape)
+            _COPY_TENSOR(checked_output, cpu_output)
             _SYNC()
         except BaseException as error:
-            raise InfrastructureFailure("trusted output capture failed") from error
-        return time.perf_counter_ns() - started
+            raise InfrastructureFailure("trusted output reconstruction failed") from error
+        return elapsed
 
     def close(self):
         if self.closed:
@@ -329,7 +545,7 @@ class CandidateSession:
         self.closed = True
         try:
             if self.worker.is_alive():
-                self.commands.send(("close-v1",))
+                self.commands.send_bytes(b"CLOSE-v2")
         except BaseException:
             pass
         self.worker.join(0.25)
@@ -338,6 +554,7 @@ class CandidateSession:
             self.worker.join(1)
         self.commands.close()
         self.status.close()
+        self.outputs.close()
         _kill_candidate_tree()
 
 
@@ -350,21 +567,27 @@ def _wrap_check(data, output):
 
 def _execute_checked(session, args):
     try:
+        parent_device_canary = torch.tensor(
+            list(PARENT_DEVICE_CANARY), dtype=torch.uint8, device="cuda"
+        )
         data = _GENERATE_INPUT(**args)
         candidate_data = _CLONE_DATA(data)
-        shared_output = torch.full_like(data[0], float("nan"))
         checked_output = torch.full_like(data[0], float("nan"))
     except BaseException as error:
         raise InfrastructureFailure("trusted input/output preparation failed") from error
-    elapsed = session.execute(candidate_data, shared_output, checked_output)
+    elapsed = session.execute(candidate_data, checked_output)
     try:
         good, message = _wrap_check(data, checked_output)
     except BaseException as error:
         raise InfrastructureFailure("trusted correctness checker failed") from error
+    if _tensor_bytes(parent_device_canary) != PARENT_DEVICE_CANARY:
+        raise InfrastructureFailure("parent-private CUDA canary changed")
     return bool(good), _bounded_message(message or ""), elapsed
 
 
 def _run_testing(logger, tests):
+    if not tests:
+        raise InfrastructureFailure("trusted test case set is empty")
     session = CandidateSession("test", logger)
     try:
         logger.log("test-count", len(tests))
@@ -379,6 +602,7 @@ def _run_testing(logger, tests):
                 good, message, _ = _execute_checked(session, dict(test.args))
             except CandidateFailure:
                 good, message = False, "candidate execution failed"
+            _consume_attempt_sentinel(logger, "test", index)
             logger.log(f"test.{index}.status", "pass" if good else "fail")
             if message:
                 logger.log(
@@ -423,6 +647,8 @@ def _run_benchmark_case(session, test):
 
 
 def _run_benchmarking(logger, tests):
+    if not tests:
+        raise InfrastructureFailure("trusted benchmark case set is empty")
     session = CandidateSession("benchmark", logger)
     try:
         logger.log("benchmark-count", len(tests))
@@ -437,6 +663,7 @@ def _run_benchmarking(logger, tests):
                 result = _run_benchmark_case(session, test)
             except CandidateFailure:
                 result = "candidate benchmark execution failed"
+            _consume_attempt_sentinel(logger, "benchmark", index)
             if isinstance(result, _STATS_TYPE):
                 for field in ("runs", "mean", "std", "err", "best", "worst"):
                     logger.log(f"benchmark.{index}.{field}", getattr(result, field))
@@ -464,25 +691,30 @@ def main():
         return 114
 
     try:
-        _prctl(PR_SET_CHILD_SUBREAPER, 1)
-        _SET_SEED(seed or 42)
-        torch.cuda.init()
-        _SYNC()
-        test_cases = _GET_TEST_CASES(sys.argv[1], seed)
-        benchmark_cases = _GET_TEST_CASES(sys.argv[2], seed)
         logger = GradeLogger(grade_socket)
     except BaseException:
         return 114
 
     try:
+        phase = "preparation"
         try:
+            _prctl(PR_SET_CHILD_SUBREAPER, 1)
+            _SET_SEED(seed or 42)
+            torch.cuda.init()
+            _SYNC()
+            test_cases = _GET_TEST_CASES(sys.argv[1], seed)
+            benchmark_cases = _GET_TEST_CASES(sys.argv[2], seed)
+            if not test_cases or not benchmark_cases:
+                raise InfrastructureFailure("trusted case set is empty")
+            phase = "test"
             if not _run_testing(logger, test_cases):
                 return 0
             logger.raw(RESULT_SPLIT)
+            phase = "benchmark"
             _run_benchmarking(logger, benchmark_cases)
             return 0
-        except InfrastructureFailure:
-            logger.log("ferrl-infrastructure", "v1")
+        except BaseException:
+            logger.log("ferrl-infrastructure", f"v1 phase={phase}")
             return 114
     finally:
         _kill_candidate_tree()

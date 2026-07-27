@@ -349,19 +349,43 @@ the reward ladder: `format_extracted <= runnable` and
 `runnable + partial_correctness <= correctness`; implausibly fast benchmark timings
 remain fail-closed at zero.
 
-The attested SIF, evaluator, submission, and rendered specifications are retained in
-Linux kernel-sealed descriptors. One process re-arms non-dumpability before creating
-its mount namespace, copies only from those handles into private tmpfs, remounts the
-complete stage read-only, authenticates every final inode and byte, and becomes
-Apptainer via an authenticated execute-only runtime copy. Dropping only effective
-DAC-read capabilities before that `exec` makes Linux preserve non-dumpability across
-the credential transition; no separate namespace-owning supervisor survives.
-The verifier's non-dumpable parent and the untrusted candidate use separate processes:
-the parent starts timing before input handoff, captures candidate output into a fresh
-parent-private tensor, and owns correctness checks, statistics, and the post-launch
-machine-grade socket. Candidate code inherits neither that socket nor any launcher
-stdout alias, so its interpreter state and descriptor scans cannot fabricate a passing
-grade.
+The training process retains the attested SIF, evaluator, submission, and rendered
+specifications in Linux kernel-sealed descriptors. It sends a path-free request plus
+those descriptors over `SCM_RIGHTS` to a protected verifier executor. That service must
+run as a dedicated non-root UID distinct from the training UID, authenticate the client
+with `SO_PEERCRED`, copy assets into a service-private request directory, create fresh
+scratch there, and own the Apptainer launch. Every payload launch includes
+`--no-privs --drop-caps all`; direct descriptor-backed launches are rejected. Candidate
+code therefore has neither `CAP_SYS_PTRACE`/`CAP_SYS_ADMIN` nor the training UID's
+namespace authority.
+
+The verifier parent, protocol controller, and untrusted payload are separate
+non-dumpable processes. Trusted inputs/check storage stay in the verifier parent. Only
+bounded CPU byte strings cross into or out of the payload, so no parent CUDA allocation
+is exported through CUDA IPC. The controller alone owns the trusted status/output
+connections, while the parent owns the clock, exact-size output reconstruction,
+correctness checks, statistics, and the post-launch grade socket. The versioned metric
+`isolated-service-latency-v1` measures protected request handoff through receipt of the
+candidate's device-to-host result bytes. It is an end-to-end ferrl service-latency
+metric, not the upstream GPUMODE CUDA-event kernel runtime; only baselines carrying this
+exact metric are comparable.
+
+An administrator must pre-create a service-owned socket directory and a mode-`0700`
+work root, then run the executor under the dedicated UID (normally through a service
+manager):
+
+```sh
+ferrl verifier-executor \
+  --socket /run/ferrl/verifier-executor.sock \
+  --work-root /var/lib/ferrl/verifier-executor \
+  --client-uid <training-uid> \
+  --apptainer /path/to/apptainer
+```
+
+Set `trimul.verifier_executor_socket` when deployment uses a non-default socket. The
+socket parent and socket must be owned by the executor UID and grant no world write or
+socket access; the work root must already be owned by that UID and grant no group/world
+permissions.
 
 ```jsonc
 "trimul": {

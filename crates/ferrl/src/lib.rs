@@ -177,6 +177,7 @@ pub mod tensor_parallel;
 pub mod tokenizer;
 pub mod trainer;
 pub mod trimul;
+pub mod verifier_executor;
 
 #[doc(inline)]
 pub use checkpoint::{
@@ -295,3 +296,8 @@ pub use trainer::{
 };
 #[doc(inline)]
 pub use trimul::{Distribution, TrimulCase, TrimulError, TrimulReward};
+#[doc(inline)]
+pub use verifier_executor::{
+    serve_verifier_executor, VerifierExecutorConfig, VerifierExecutorError,
+    VerifierExecutorSandbox, DEFAULT_VERIFIER_EXECUTOR_SOCKET,
+};

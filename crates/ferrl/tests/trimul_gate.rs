@@ -10,12 +10,14 @@
 //! submission, and rendered-case pathname during testing; the same exact sealed
 //! bytes must remain in force through benchmarking.
 //!
-//! Gated behind the off-by-default `gate` feature, so — like the GPU tests — CI never
-//! compiles it. Run on a node with an `sm_80` GPU and the eval bundle:
+//! Gated behind the off-by-default `gate` feature. CI compiles this target and runs
+//! its source-contract test; real isolation evidence remains an ignored GPU test
+//! suite against a deployed dedicated-UID executor:
 //!
 //! ```text
 //! FERRL_TRIMUL_IMAGE=/path/to/trimul-eval.sif \
 //! FERRL_TRIMUL_EVAL_DIR=/path/to/pinned/trimul \
+//! FERRL_VERIFIER_EXECUTOR_SOCKET=/run/ferrl/verifier-executor.sock \
 //!   cargo test --features gate --test trimul_gate -- --ignored --test-threads=1
 //! ```
 
@@ -26,7 +28,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use ferrl::trimul::TrimulVerifierAssets;
-use ferrl::{Distribution, RewardFn, Sample, TrimulCase, TrimulReward};
+use ferrl::{Distribution, RewardFn, RewardOutcome, Sample, TrimulCase, TrimulReward};
 
 /// A required path from the environment (the gate only runs with `--ignored`).
 fn env_path(key: &str) -> PathBuf {
@@ -69,12 +71,23 @@ fn reward() -> TrimulReward {
         .with_cases(cases.clone(), cases)
         .with_secret_seed(123)
         .with_wall(Duration::from_secs(300))
+        .with_verifier_executor_socket(env_path("FERRL_VERIFIER_EXECUTOR_SOCKET"))
+}
+
+fn evaluate(completion: &str) -> RewardOutcome {
+    reward()
+        .reward_group_detailed(
+            &Sample::new("write a faster TriMul kernel", ()),
+            &[completion.to_string()],
+        )
+        .expect("the eval should be carried out")
+        .into_iter()
+        .next()
+        .expect("one completion produces one detailed outcome")
 }
 
 fn score(completion: &str) -> f32 {
-    reward()
-        .reward(&Sample::new("write a faster TriMul kernel", ()), completion)
-        .expect("the eval should be carried out")
+    evaluate(completion).reward
 }
 
 fn assert_below_correctness_floor(value: f32, reason: &str) {
@@ -84,11 +97,57 @@ fn assert_below_correctness_floor(value: f32, reason: &str) {
     );
 }
 
+#[allow(clippy::cognitive_complexity)] // one evidence helper asserts every non-vacuity field
+fn assert_attack_reached_wrong_output(completion: &str, sentinel: &str, reason: &str) {
+    let outcome = evaluate(completion);
+    assert!(
+        (0.0..1.0).contains(&outcome.reward),
+        "{reason}; expected shaped failure reward in [0, 1), got {outcome:#?}"
+    );
+    let metadata = outcome
+        .metadata
+        .as_ref()
+        .expect("an executed attack must return detailed verifier metadata");
+    assert_eq!(metadata["submission_extracted"], serde_json::json!(true));
+    assert_eq!(metadata["correct"], serde_json::json!(false));
+    assert_eq!(metadata["test_case_count"], serde_json::json!(2));
+    assert_eq!(metadata["test_pass_count"], serde_json::json!(0));
+    assert_eq!(
+        metadata["timing_metric"],
+        serde_json::json!(ferrl::trimul::TRIMUL_TIMING_METRIC)
+    );
+    let sentinels = metadata["candidate_attempt_sentinels"]
+        .as_array()
+        .expect("attack sentinel metadata is an array");
+    assert_eq!(
+        sentinels.len(),
+        2,
+        "every test case must execute the attack"
+    );
+    assert!(
+        sentinels
+            .iter()
+            .all(|value| value.as_str() == Some(sentinel)),
+        "after-all-attempts sentinel mismatch: {sentinels:?}"
+    );
+}
+
 /// Correct: delegate to the reference already in the bound eval bundle. Trivially
 /// passes correctness and benchmark, so the reward reaches the correctness floor plus
 /// the inverse-runtime speed component (no baseline set).
 const CORRECT: &str = "```python
 def custom_kernel(data):
+    from reference import ref_kernel
+    return ref_kernel(data)
+```";
+
+/// Correct but deliberately slower than [`CORRECT`]. The protected parent clock
+/// must preserve the added latency even if the candidate mutates its own Python
+/// timing module.
+const SLOW_CORRECT: &str = "```python
+def custom_kernel(data):
+    import time
+    time.sleep(0.025)
     from reference import ref_kernel
     return ref_kernel(data)
 ```";
@@ -107,10 +166,17 @@ def custom_kernel(data):
 /// The shaped reward may still give the runnable floor, but not correctness credit.
 const MALICIOUS: &str = "```python
 def custom_kernel(data):
-    import socket
-    socket.create_connection((\"1.1.1.1\", 53), timeout=3).close()
-    from reference import ref_kernel
-    return ref_kernel(data)
+    import os, socket
+    try:
+        socket.create_connection((\"1.1.1.1\", 53), timeout=3).close()
+    except OSError:
+        pass
+    else:
+        raise RuntimeError(\"network unexpectedly reachable\")
+    with open(\"/work/cache/ferrl-attack-sentinel\", \"w\") as handle:
+        handle.write(\"network-denied-wrong-output-v1\")
+    x, mask, weights, config = data
+    return x.clone()
 ```";
 
 /// Mutation attempt: replace every byte-bearing input after the sandbox has opened
@@ -143,6 +209,8 @@ def custom_kernel(data):
     os.makedirs(\"/work/cache/candidate-output\", exist_ok=True)
     with open(\"/work/cache/candidate-output/marker\", \"w\") as handle:
         handle.write(\"candidate-controlled cache bytes\\n\")
+    with open(\"/work/cache/ferrl-attack-sentinel\", \"w\") as handle:
+        handle.write(\"sealed-path-writes-denied-v1\")
     from reference import ref_kernel
     return ref_kernel(data)
 ```";
@@ -199,13 +267,43 @@ fn gate_reference_baseline_is_measurable_and_positive() {
 
 #[test]
 #[ignore = "needs an sm_80 GPU + the eval image/bundle; run with --ignored"]
+fn gate_service_latency_orders_fast_and_slow_correct_candidates() {
+    let fast = evaluate(CORRECT);
+    let slow = evaluate(SLOW_CORRECT);
+    for outcome in [&fast, &slow] {
+        let metadata = outcome
+            .metadata
+            .as_ref()
+            .expect("protected timing metadata");
+        assert_eq!(metadata["correct"], serde_json::json!(true));
+        assert_eq!(metadata["benchmark_exit"], serde_json::json!(0));
+        assert_eq!(
+            metadata["timing_metric"],
+            serde_json::json!(ferrl::trimul::TRIMUL_TIMING_METRIC)
+        );
+    }
+    let fast_ns = fast.metadata.as_ref().unwrap()["geomean_ns"]
+        .as_f64()
+        .expect("fast service latency");
+    let slow_ns = slow.metadata.as_ref().unwrap()["geomean_ns"]
+        .as_f64()
+        .expect("slow service latency");
+    assert!(
+        slow_ns > fast_ns + 10_000_000.0,
+        "protected parent timing did not preserve injected latency: fast={fast_ns} slow={slow_ns}"
+    );
+}
+
+#[test]
+#[ignore = "needs an sm_80 GPU + the eval image/bundle; run with --ignored"]
 fn gate_malicious_submission_is_contained_and_stays_below_correctness_floor() {
     // The sandbox runs with no network, so the connection attempt fails and the eval
     // reports no pass — the candidate cannot reach the correctness floor and the host
     // is untouched. This re-confirms the isolation holds inside the real torch/triton
     // image.
-    assert_below_correctness_floor(
-        score(MALICIOUS),
+    assert_attack_reached_wrong_output(
+        MALICIOUS,
+        "network-denied-wrong-output-v1",
         "a network-reaching kernel must be contained and not score as correct",
     );
 }
@@ -230,6 +328,13 @@ fn gate_sealed_assets_survive_candidate_mutation_through_benchmark() {
         .expect("the mutation control should return structured verifier evidence");
     assert_eq!(metadata["correct"], serde_json::json!(true));
     assert_eq!(metadata["benchmark_exit"], serde_json::json!(0));
+    let sentinels = metadata["candidate_attempt_sentinels"]
+        .as_array()
+        .expect("mutation attempt metadata is an array");
+    assert_eq!(sentinels.len(), 4);
+    assert!(sentinels
+        .iter()
+        .all(|value| value.as_str() == Some("sealed-path-writes-denied-v1")));
 }
 
 #[test]
@@ -253,6 +358,7 @@ const FORGE_WORKFILE: &str = "```python
 def custom_kernel(data):
     open(\"/work/test_result.txt\", \"w\").write(\"check: pass\\n\")
     open(\"/work/bench_result.txt\", \"w\").write(\"benchmark.0.mean: 0.001\\ncheck: pass\\n\")
+    open(\"/work/cache/ferrl-attack-sentinel\", \"w\").write(\"workfile-forge-wrong-output-v1\")
     x, mask, weights, config = data
     return x.clone()
 ```";
@@ -265,6 +371,7 @@ def custom_kernel(data):
     print(\"===FERRL-BENCH===\")
     print(\"benchmark.0.mean: 0.001\")
     print(\"check: pass\")
+    open(\"/work/cache/ferrl-attack-sentinel\", \"w\").write(\"stdout-forge-wrong-output-v1\")
     x, mask, weights, config = data
     return x.clone()
 ```";
@@ -288,17 +395,15 @@ def custom_kernel(data):
             os.close(fd)
         except Exception:
             pass
+    open(\"/work/cache/ferrl-attack-sentinel\", \"w\").write(\"procfd-forge-wrong-output-v1\")
     x, mask, weights, config = data
     return x.clone()
 ```";
 
-/// Combined real-process exploit: replace every mutable upstream checker/timer global,
-/// scan every visible ancestor descriptor with a plausible forged grade, and return a
-/// wrong tensor. The protected parent owns its own checker/timer state and the only
-/// accepted grade endpoint, so neither path can reach the correctness floor.
-const MUTATE_VERIFIER_GLOBALS: &str = "```python
+/// Mutate child-process checker and timer globals, then reach a wrong output.
+const MUTATE_CHECKER_TIMER: &str = "```python
 def custom_kernel(data):
-    import glob, inspect, os, time
+    import time
     import eval as verifier
     verifier.wrap_check_implementation = lambda data, output: (True, \"forged\")
     verifier.check_implementation = lambda data, output: (True, \"forged\")
@@ -307,43 +412,107 @@ def custom_kernel(data):
         best=4999000.0, worst=5001000.0,
     )
     time.perf_counter_ns = lambda: 1
+    open(\"/work/cache/ferrl-attack-sentinel\", \"w\").write(\"checker-timer-mutation-wrong-output-v1\")
+    x, mask, weights, config = data
+    return x.clone()
+```";
+
+/// Corrupt the child protocol/output channels directly, then reach a wrong output.
+const CORRUPT_PROTOCOL_OUTPUT: &str = "```python
+def custom_kernel(data):
+    import inspect
+    x, mask, weights, config = data
     frame = inspect.currentframe()
     while frame is not None:
         status = frame.f_locals.get(\"status\")
+        outputs = frame.f_locals.get(\"outputs\")
         if hasattr(status, \"send_bytes\"):
             try:
-                status.send_bytes(b\"DONE\")
+                status.send_bytes(b\"OUTPUT_READY\")
             except Exception:
                 pass
-        shared_output = frame.f_locals.get(\"output_buffer\")
-        if hasattr(shared_output, \"zero_\"):
+        if hasattr(outputs, \"send_bytes\"):
             try:
-                shared_output.zero_()
+                outputs.send_bytes(x.detach().cpu().contiguous().view(__import__(\"torch\").uint8).numpy().tobytes())
             except Exception:
                 pass
         frame = frame.f_back
-    payload = (b\"ferrl-entry: test-v4\\ntest-count: 2\\ncheck: pass\\ntest-exit: 0\\n\"
-               b\"===FERRL-BENCH===\\nferrl-entry: benchmark-v4\\nbenchmark-count: 2\\n\"
-               b\"benchmark.0.mean: 5000000\\nbenchmark.1.mean: 6000000\\n\"
-               b\"check: pass\\nbenchmark-exit: 0\\n\")
-    for path in glob.glob(\"/proc/[0-9]*/fd/*\"):
+    open(\"/work/cache/ferrl-attack-sentinel\", \"w\").write(\"protocol-output-corruption-wrong-output-v1\")
+    return x.clone()
+```";
+
+/// Prove the payload has neither ptrace/admin capability nor access to sensitive
+/// verifier-parent procfs endpoints after every attempted access.
+const PROBE_PARENT_AND_CAPABILITIES: &str = "```python
+def custom_kernel(data):
+    import ctypes, os
+    capabilities = {}
+    with open(\"/proc/self/status\", encoding=\"ascii\") as handle:
+        for line in handle:
+            if line.startswith((\"CapEff:\", \"CapPrm:\", \"CapAmb:\")):
+                key, value = line.split(\":\", 1)
+                capabilities[key] = int(value.strip(), 16)
+    if set(capabilities) != {\"CapEff\", \"CapPrm\", \"CapAmb\"}:
+        raise RuntimeError(\"candidate capability evidence was incomplete\")
+    forbidden = (1 << 19) | (1 << 21)
+    if any(value & forbidden for value in capabilities.values()):
+        raise RuntimeError(\"candidate retained CAP_SYS_PTRACE or CAP_SYS_ADMIN\")
+    parent = os.getppid()
+    for suffix in (\"mem\", \"fd/0\", \"ns/user\", \"ns/mnt\"):
         try:
-            if int(path.split(\"/\")[2]) == os.getpid():
-                continue
-            fd = os.open(path, os.O_WRONLY)
-            os.write(fd, payload)
-            os.close(fd)
-        except Exception:
-            pass
+            descriptor = os.open(f\"/proc/{parent}/{suffix}\", os.O_RDONLY | os.O_CLOEXEC)
+        except OSError:
+            continue
+        os.close(descriptor)
+        raise RuntimeError(f\"candidate opened verifier parent endpoint {suffix}\")
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.ptrace.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
+    libc.ptrace.restype = ctypes.c_long
+    if libc.ptrace(16, parent, None, None) == 0:
+        libc.ptrace(17, parent, None, None)
+        raise RuntimeError(\"candidate attached to verifier parent\")
+    open(\"/work/cache/ferrl-attack-sentinel\", \"w\").write(\"caps-parent-access-denied-wrong-output-v1\")
     x, mask, weights, config = data
+    return x.clone()
+```";
+
+/// Use the raw CUDA driver to discover and copy the complete allocation that
+/// contains the child input. The protected parent's adjacent device canary must
+/// be absent because no parent allocation is exported through CUDA IPC.
+const PROBE_RAW_DEVICE_BOUNDARY: &str = "```python
+def custom_kernel(data):
+    import ctypes
+    x, mask, weights, config = data
+    driver = ctypes.CDLL(\"libcuda.so.1\")
+    driver.cuMemGetAddressRange_v2.argtypes = [
+        ctypes.POINTER(ctypes.c_ulonglong), ctypes.POINTER(ctypes.c_size_t), ctypes.c_ulonglong,
+    ]
+    driver.cuMemGetAddressRange_v2.restype = ctypes.c_int
+    driver.cuMemcpyDtoH_v2.argtypes = [ctypes.c_void_p, ctypes.c_ulonglong, ctypes.c_size_t]
+    driver.cuMemcpyDtoH_v2.restype = ctypes.c_int
+    base = ctypes.c_ulonglong()
+    size = ctypes.c_size_t()
+    if driver.cuMemGetAddressRange_v2(
+        ctypes.byref(base), ctypes.byref(size), ctypes.c_ulonglong(x.data_ptr())
+    ) != 0:
+        raise RuntimeError(\"cuMemGetAddressRange failed\")
+    if size.value == 0 or size.value > 512 * 1024 * 1024:
+        raise RuntimeError(\"unexpected child allocation boundary\")
+    copied = ctypes.create_string_buffer(size.value)
+    if driver.cuMemcpyDtoH_v2(copied, base.value, size.value) != 0:
+        raise RuntimeError(\"raw child allocation copy failed\")
+    if b\"ferrl-parent-private-cuda-v1-7f4c3a19\" in copied.raw:
+        raise RuntimeError(\"parent-private CUDA canary crossed the process boundary\")
+    open(\"/work/cache/ferrl-attack-sentinel\", \"w\").write(\"raw-device-boundary-absent-wrong-output-v1\")
     return x.clone()
 ```";
 
 #[test]
 #[ignore = "needs an sm_80 GPU + the eval image/bundle; run with --ignored"]
 fn gate_forged_result_files_stay_below_correctness_floor() {
-    assert_below_correctness_floor(
-        score(FORGE_WORKFILE),
+    assert_attack_reached_wrong_output(
+        FORGE_WORKFILE,
+        "workfile-forge-wrong-output-v1",
         "forged /work result files must not score as correct",
     );
 }
@@ -351,8 +520,9 @@ fn gate_forged_result_files_stay_below_correctness_floor() {
 #[test]
 #[ignore = "needs an sm_80 GPU + the eval image/bundle; run with --ignored"]
 fn gate_forged_stdout_stays_below_correctness_floor() {
-    assert_below_correctness_floor(
-        score(FORGE_STDOUT),
+    assert_attack_reached_wrong_output(
+        FORGE_STDOUT,
+        "stdout-forge-wrong-output-v1",
         "a printed fake grade must not score as correct",
     );
 }
@@ -360,8 +530,9 @@ fn gate_forged_stdout_stays_below_correctness_floor() {
 #[test]
 #[ignore = "needs an sm_80 GPU + the eval image/bundle; run with --ignored"]
 fn gate_plausible_all_descriptor_grade_forgery_is_rejected() {
-    assert_below_correctness_floor(
-        score(FORGE_PROCFD),
+    assert_attack_reached_wrong_output(
+        FORGE_PROCFD,
+        "procfd-forge-wrong-output-v1",
         "a plausible grade written through every visible descriptor must be ignored",
     );
 }
@@ -369,8 +540,143 @@ fn gate_plausible_all_descriptor_grade_forgery_is_rejected() {
 #[test]
 #[ignore = "needs an sm_80 GPU + the eval image/bundle; run with --ignored"]
 fn gate_candidate_cannot_mutate_trusted_checker_or_timer_state() {
-    assert_below_correctness_floor(
-        score(MUTATE_VERIFIER_GLOBALS),
+    assert_attack_reached_wrong_output(
+        MUTATE_CHECKER_TIMER,
+        "checker-timer-mutation-wrong-output-v1",
         "candidate-process checker/timer mutation must not validate a wrong output",
     );
+}
+
+#[test]
+#[ignore = "needs an sm_80 GPU + the eval image/bundle; run with --ignored"]
+fn gate_candidate_cannot_advance_protocol_or_replace_captured_output() {
+    assert_attack_reached_wrong_output(
+        CORRUPT_PROTOCOL_OUTPUT,
+        "protocol-output-corruption-wrong-output-v1",
+        "candidate-process protocol/output corruption must not validate a wrong output",
+    );
+}
+
+#[test]
+#[ignore = "needs an sm_80 GPU + the eval image/bundle; run with --ignored"]
+fn gate_candidate_has_no_ptrace_admin_caps_or_parent_access() {
+    assert_attack_reached_wrong_output(
+        PROBE_PARENT_AND_CAPABILITIES,
+        "caps-parent-access-denied-wrong-output-v1",
+        "candidate capabilities and verifier-parent access must be absent",
+    );
+}
+
+#[test]
+#[ignore = "needs an sm_80 GPU + the eval image/bundle; run with --ignored"]
+fn gate_raw_cuda_allocation_boundary_contains_no_parent_private_memory() {
+    assert_attack_reached_wrong_output(
+        PROBE_RAW_DEVICE_BOUNDARY,
+        "raw-device-boundary-absent-wrong-output-v1",
+        "raw CUDA allocation discovery must not expose protected-parent memory",
+    );
+}
+
+#[test]
+#[ignore = "needs the deployed dedicated-UID executor; run with --ignored"]
+fn gate_training_uid_cannot_reenter_executor_namespaces_or_memory() {
+    use std::os::unix::fs::MetadataExt as _;
+    use std::os::unix::net::UnixStream;
+
+    let socket = env_path("FERRL_VERIFIER_EXECUTOR_SOCKET");
+    let stream = UnixStream::connect(&socket).expect("connect to protected verifier executor");
+    let peer = rustix::net::sockopt::socket_peercred(&stream)
+        .expect("authenticate protected verifier executor peer");
+    assert_ne!(
+        peer.uid,
+        rustix::process::geteuid(),
+        "executor must run under a dedicated UID"
+    );
+    let socket_owner = std::fs::symlink_metadata(&socket)
+        .expect("inspect executor socket")
+        .uid();
+    assert_eq!(socket_owner, peer.uid.as_raw());
+
+    let pid = peer.pid.as_raw_nonzero().get();
+    for suffix in ["mem", "fd/0"] {
+        assert!(
+            std::fs::File::open(format!("/proc/{pid}/{suffix}")).is_err(),
+            "training UID unexpectedly opened executor {suffix}"
+        );
+    }
+    let user_namespace = format!("--user=/proc/{pid}/ns/user");
+    let mount_namespace = format!("--mount=/proc/{pid}/ns/mnt");
+    let status = std::process::Command::new("nsenter")
+        .args([
+            user_namespace,
+            mount_namespace,
+            "--".to_string(),
+            "true".to_string(),
+        ])
+        .status()
+        .expect("execute the namespace re-entry attempt");
+    assert!(
+        !status.success(),
+        "training UID unexpectedly entered executor user/mount namespaces"
+    );
+}
+
+#[test]
+fn gate_attack_sources_record_after_attempts_before_the_wrong_output() {
+    for (source, final_attempt, sentinel) in [
+        (
+            MALICIOUS,
+            "network unexpectedly reachable",
+            "network-denied-wrong-output-v1",
+        ),
+        (
+            FORGE_WORKFILE,
+            "benchmark.0.mean: 0.001",
+            "workfile-forge-wrong-output-v1",
+        ),
+        (
+            FORGE_STDOUT,
+            "benchmark.0.mean: 0.001",
+            "stdout-forge-wrong-output-v1",
+        ),
+        (
+            FORGE_PROCFD,
+            "except Exception",
+            "procfd-forge-wrong-output-v1",
+        ),
+        (
+            MUTATE_CHECKER_TIMER,
+            "time.perf_counter_ns = lambda: 1",
+            "checker-timer-mutation-wrong-output-v1",
+        ),
+        (
+            CORRUPT_PROTOCOL_OUTPUT,
+            "frame = frame.f_back",
+            "protocol-output-corruption-wrong-output-v1",
+        ),
+        (
+            PROBE_PARENT_AND_CAPABILITIES,
+            "libc.ptrace(16",
+            "caps-parent-access-denied-wrong-output-v1",
+        ),
+        (
+            PROBE_RAW_DEVICE_BOUNDARY,
+            "parent-private CUDA canary crossed",
+            "raw-device-boundary-absent-wrong-output-v1",
+        ),
+    ] {
+        let final_attempt_position = source
+            .rfind(final_attempt)
+            .unwrap_or_else(|| panic!("attack {sentinel} is missing its final attempt"));
+        let sentinel_position = source
+            .find(sentinel)
+            .unwrap_or_else(|| panic!("attack source is missing sentinel {sentinel}"));
+        let wrong_output_position = source
+            .rfind("return x.clone()")
+            .unwrap_or_else(|| panic!("attack {sentinel} is missing its wrong-output path"));
+        assert!(
+            final_attempt_position < sentinel_position && sentinel_position < wrong_output_position,
+            "attack {sentinel} does not record after all attempts and before wrong output"
+        );
+    }
 }

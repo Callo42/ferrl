@@ -249,8 +249,9 @@ with the final report:
 | reward profile | `trimul.reward`; defaults to `trimul_shaped_v1`, with custom ladder-preserving values allowed. |
 | run-health policy | `run_health`; post-run warn/fail policy, including the original top-level config passed to `ferrl runreport --config`. |
 | model | Loader-derived family, exact model/checkpoint policy SHA-256, exact tokenizer-file SHA-256, resolved EOS, LoRA rank/alpha, base dtype, and rollout seed, all sealed at launch. |
-| TriMul eval bundle | Attested SHA-256 over every ordered relative regular-file name and byte under `eval_dir`, plus the exact file count. Every captured file is held in a Linux kernel-sealed anonymous descriptor; after all seals are installed, the ordered descriptor contents are rehashed and required to equal the attested bundle identity. One process bootstraps an empty user namespace, re-arms non-dumpability before creating its private mount namespace, copies only from those sealed handles into private tmpfs, remounts the complete stage read-only, and authenticates every final pathname/inode/byte. It also authenticates an execute-only private copy of the configured Apptainer runtime; dropping only effective DAC-read capabilities makes Linux preserve non-dumpability when that process becomes Apptainer via `exec`. No separate namespace-owning supervisor exists, and an externally synchronized post-exec control proves a same-UID helper cannot re-enter and remount the authenticated stage. All source descriptors are close-on-exec, so launcher, init, shell, and candidate processes inherit no verifier handle. The configured path is informational only. |
-| sandbox image | Attested SHA-256 and byte length of the exact Apptainer image streamed into a kernel-sealed anonymous descriptor. After sealing, the descriptor is rehashed and required to equal the captured identity. Invocation checks validate the source identity, sealed descriptor, and length; the authenticated private stage supplies the regular read-only path Apptainer's SIF loader requires. The configured path is informational only. |
+| verifier executor | Protected Unix socket plus a dedicated non-root service UID distinct from the training UID. The service authenticates `SO_PEERCRED`, accepts only path-free requests with fully sealed read-only descriptors and fresh service-owned scratch, and launches Apptainer with `--no-privs --drop-caps all`. The socket parent/socket are service-owned with no world write/access; the pre-existing work root is service-owned mode `0700`. Record `trimul.verifier_executor_socket`. |
+| TriMul eval bundle | Attested SHA-256 over every ordered relative regular-file name and byte under `eval_dir`, plus the exact file count. Every captured file is held in a Linux kernel-sealed anonymous descriptor; after all seals are installed, the ordered descriptor contents are rehashed and required to equal the attested identity. Those descriptors cross only the authenticated executor socket via `SCM_RIGHTS`; the service revalidates the seals, copies and rehashes each asset into a unique service-private request directory, and supplies only the resulting read-only paths to Apptainer. The configured source path is informational only. |
+| sandbox image | Attested SHA-256 and byte length of the exact Apptainer image streamed into a kernel-sealed anonymous descriptor. After sealing, the descriptor is rehashed and required to equal the captured identity. The executor revalidates, copies, and rehashes it in service-private storage before launch. The configured source path is informational only. |
 | cases | Attested `task.yml` SHA-256 and byte length plus the loaded counts for `tests` and `benchmarks`. |
 | seeds | `data.seed`, `policy.seed`, trainer seed-bearing knobs, and the training `trimul.secret_seed`. |
 | scratch cap | `trimul.scratch_max_bytes`; `0` means the ferrl default, currently 1 GiB. |
@@ -261,9 +262,12 @@ with the final report:
 | budget | Trainer `steps`, `group_size`, wall-clock allocation, and the stop condition chosen below. |
 
 A discovery run must not start without a guarded same-GPU baseline in
-`trimul.baseline`. Measure it on the target GPU with `ferrl trimul-baseline --config
-<run.json>`. For the first run, take at least three baseline measurements and use the
-median `ns` in the config. Keep all raw baseline measurements in the report.
+`trimul.baseline`. Its `metric` must be exactly `isolated-service-latency-v1`; legacy,
+unversioned, or upstream CUDA-event baselines are rejected. Measure it on the target GPU
+through the deployed executor with `ferrl trimul-baseline --config <run.json>`. Take at
+least three measurements, use the median `ns` in the config, and keep every raw value in
+the report. This is a ferrl end-to-end service-latency baseline, not a GPUMODE kernel
+runtime.
 
 ## Artifact Definition
 
@@ -356,6 +360,7 @@ launch- and row-derived identities:
     "benchmark_cases": 0
   },
   "baseline": {
+    "metric": "isolated-service-latency-v1",
     "gpu": "<nvidia-smi product name>",
     "measurements_ns": [0.0, 0.0, 0.0],
     "median_ns": 0.0,
@@ -391,8 +396,8 @@ A TriMul run counts as a success only if one artifact candidate satisfies every 
    content identities, uses the same GPU product name, and uses a fresh scratch directory.
 4. Re-verification uses an audit `trimul.secret_seed` that was not used for training.
 5. At least three clean benchmark re-runs are recorded for the candidate.
-6. The median candidate geometric-mean runtime is lower than the median guarded
-   baseline runtime recorded in the manifest.
+6. Every run and the guarded baseline use `isolated-service-latency-v1`, and the median
+   candidate geometric-mean service latency is lower than the baseline median.
 7. The report states speedup as `baseline.median_ns / candidate.median_geomean_ns`.
 
 If any correctness re-run fails, or if the GPU product name does not match the baseline
@@ -401,12 +406,14 @@ pin, the candidate is rejected even if a prior training reward was high.
 ## Dynamic Reward-Hacking Checks
 
 The TriMul reward already keeps candidate scratch bounded, denies network by default,
-and rejects implausibly fast timings. A non-dumpable protected verifier process owns
-input generation, starts elapsed-time measurement before candidate input handoff,
-captures each result into a fresh parent-private tensor, and owns exact correctness
-checking, statistics, and the machine grade. Candidate Python runs in a separate
-spawned process and never inherits the post-launch grade socket; launcher/init/shell
-stdout is diagnostic only.
+and rejects implausibly fast timings. A dedicated-UID executor owns launch and strips
+all payload capabilities. A non-dumpable protected verifier process owns input
+generation, starts elapsed-time measurement before candidate input handoff, reconstructs
+each exact-size result from CPU bytes into parent-only storage, and owns correctness,
+statistics, and the machine grade. No CUDA tensor or allocator block crosses the process
+boundary. A separate non-dumpable controller owns the trusted status/output channels;
+candidate Python owns only its untrusted request/result channel and never inherits the
+grade socket. Launcher/init/shell stdout remains diagnostic only.
 The first discovery run still needs dynamic checks on top candidates because the
 training loop is optimizing against that reward.
 
@@ -423,7 +430,7 @@ For every candidate included in the final report:
 
 These checks are deliberately operator-facing. They are not a proof against arbitrary
 malicious code; they are the Phase-1 guardrail for deciding whether the first run found
-a real faster kernel or a reward artifact.
+a correct candidate with lower versioned ferrl service latency or a reward artifact.
 
 ## Stopping Rule
 
@@ -444,11 +451,11 @@ verification.
 The final report must fit this outline:
 
 1. Verdict: `accepted_artifact`, `no_win`, or `invalid_run`.
-2. Baseline: GPU, raw measurements, median runtime, and command used.
+2. Baseline: GPU, exact timing metric, raw measurements, median service latency, and command used.
 3. Training: ferrl commit, config hash, prompt copy/hash, model identity, seeds,
    budget, and run health.
 4. Candidate table: source hash, training reward, source-inspection result, clean
-   correctness, median runtime, speedup, and accept/reject reason.
+   correctness, median service latency, same-metric ratio, and accept/reject reason.
 5. Artifact bundle path and manifest hash, when accepted.
 6. Operator checklist: each acceptance and reward-hacking check marked pass/fail.
 
