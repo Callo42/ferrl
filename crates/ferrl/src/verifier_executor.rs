@@ -183,6 +183,7 @@ struct ExecutorBind {
     dst: PathBuf,
     mode: BindMode,
     total_limit: Option<u64>,
+    directories: Vec<PathBuf>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -219,7 +220,7 @@ mod linux {
     use std::fs::{self, File, OpenOptions};
     use std::io::{IoSlice, IoSliceMut, Read as _, Seek as _, SeekFrom, Write as _};
     use std::mem::MaybeUninit;
-    use std::os::fd::{AsFd as _, OwnedFd};
+    use std::os::fd::{AsFd as _, AsRawFd as _, OwnedFd};
     use std::os::unix::fs::{
         FileTypeExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
     };
@@ -236,7 +237,7 @@ mod linux {
 
     use super::*;
     use crate::sandbox::{
-        is_owned_descriptor_path, validate_protected_output_mapping, ApptainerSandbox,
+        is_owned_descriptor_path, validate_protected_output_mapping, ApptainerSandbox, CAPTURE_CAP,
     };
 
     const EXECUTOR_PROTOCOL_VERSION: u32 = 1;
@@ -244,6 +245,14 @@ mod linux {
     const MAX_BINDS: usize = 32;
     const MAX_REQUEST_BYTES: usize = 1024 * 1024;
     const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+    const JSON_CONTROL_ESCAPE_BYTES: usize = 6;
+    const OUTCOME_CAPTURE_FIELDS: usize = 3;
+    const RESPONSE_OVERHEAD_BYTES: usize = 1024 * 1024;
+    const _: () = assert!(
+        CAPTURE_CAP * JSON_CONTROL_ESCAPE_BYTES * OUTCOME_CAPTURE_FIELDS + RESPONSE_OVERHEAD_BYTES
+            <= MAX_RESPONSE_BYTES
+    );
+    const SCRATCH_DIRECTORY_ENV: [&str; 2] = ["HOME", "TRITON_CACHE_DIR"];
     const REQUIRED_SEALS: rustix::fs::SealFlags = rustix::fs::SealFlags::WRITE
         .union(rustix::fs::SealFlags::GROW)
         .union(rustix::fs::SealFlags::SHRINK)
@@ -486,8 +495,10 @@ mod linux {
                 dst: bind.dst.clone(),
                 mode: bind.mode,
                 total_limit: bind.total_limit,
+                directories: Vec::new(),
             });
         }
+        populate_scratch_directories(spec, &mut binds)?;
         if assets.len() > MAX_ASSETS {
             return Err(SandboxError::InvalidSpec(format!(
                 "protected verifier request exceeds {MAX_ASSETS} sealed assets"
@@ -535,6 +546,50 @@ mod linux {
             },
             assets,
         ))
+    }
+
+    fn populate_scratch_directories(
+        spec: &RunSpec,
+        binds: &mut [ExecutorBind],
+    ) -> Result<(), SandboxError> {
+        for key in SCRATCH_DIRECTORY_ENV {
+            let Some((_, value)) = spec.env.iter().find(|(name, _)| name == key) else {
+                continue;
+            };
+            let directory = Path::new(value);
+            if !is_normal_absolute(directory) {
+                return Err(SandboxError::InvalidSpec(format!(
+                    "protected verifier {key} must be an absolute normalized directory"
+                )));
+            }
+            let mut matches = binds
+                .iter()
+                .enumerate()
+                .filter(|(_, bind)| matches!(&bind.source, ExecutorBindSource::FreshScratch))
+                .filter_map(|(index, bind)| {
+                    directory
+                        .strip_prefix(&bind.dst)
+                        .ok()
+                        .filter(|relative| !relative.as_os_str().is_empty())
+                        .map(|relative| (index, relative.to_path_buf()))
+                });
+            let Some((index, relative)) = matches.next() else {
+                continue;
+            };
+            if matches.next().is_some()
+                || relative
+                    .components()
+                    .any(|component| !matches!(component, std::path::Component::Normal(_)))
+            {
+                return Err(SandboxError::InvalidSpec(format!(
+                    "protected verifier {key} does not map uniquely beneath fresh scratch"
+                )));
+            }
+            if !binds[index].directories.contains(&relative) {
+                binds[index].directories.push(relative);
+            }
+        }
+        Ok(())
     }
 
     fn validate_sandbox_path(path: &Path, label: &str) -> Result<(), SandboxError> {
@@ -752,7 +807,7 @@ mod linux {
         let request_root = create_request_root(&config.work_root)
             .map_err(|error| SandboxError::Executor(error.to_string()))?;
         let result = stage_and_run(&request_root, request, fds, config);
-        let cleanup = fs::remove_dir_all(&request_root);
+        let cleanup = remove_request_tree(&request_root);
         match (result, cleanup) {
             (Ok(outcome), Ok(())) => Ok(outcome),
             (Err(error), Ok(())) => Err(error),
@@ -761,6 +816,71 @@ mod linux {
                 request_root.display()
             ))),
         }
+    }
+
+    struct CleanupDirectory {
+        path: PathBuf,
+        directory: File,
+        entries: fs::ReadDir,
+    }
+
+    fn open_cleanup_directory(path: PathBuf) -> std::io::Result<CleanupDirectory> {
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+        let directory = File::open(&path)?;
+        let descriptor_path = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+        let entries = fs::read_dir(descriptor_path)?;
+        Ok(CleanupDirectory {
+            path,
+            directory,
+            entries,
+        })
+    }
+
+    fn remove_request_tree(path: &Path) -> std::io::Result<()> {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return fs::remove_file(path);
+        }
+
+        // The sandbox process tree has been reaped before this runs. Restore only
+        // owner access on directory inodes reached without following symlinks.
+        // Parent descriptors stay open while children are traversed through
+        // /proc/self/fd, so hostile depth cannot exceed PATH_MAX or the Rust stack.
+        let mut directories = vec![open_cleanup_directory(path.to_path_buf())?];
+        while !directories.is_empty() {
+            let entry = directories
+                .last_mut()
+                .expect("the cleanup stack was checked as nonempty")
+                .entries
+                .next()
+                .transpose()?;
+            if let Some(entry) = entry {
+                let child = entry.path();
+                let metadata = fs::symlink_metadata(&child)?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    fs::remove_file(child)?;
+                } else {
+                    directories.push(open_cleanup_directory(child)?);
+                }
+                continue;
+            }
+
+            let CleanupDirectory {
+                path,
+                directory,
+                entries,
+            } = directories
+                .pop()
+                .expect("the cleanup stack was checked as nonempty");
+            drop(entries);
+            drop(directory);
+            fs::remove_dir(path)?;
+        }
+        Ok(())
     }
 
     fn validate_wire_request(
@@ -801,11 +921,18 @@ mod linux {
             validate_sandbox_path(&bind.dst, "bind destination")?;
             match (&bind.source, bind.mode) {
                 (ExecutorBindSource::SealedAsset { fd_index }, BindMode::ReadOnly)
-                    if *fd_index < request.asset_count =>
+                    if *fd_index < request.asset_count && bind.directories.is_empty() =>
                 {
                     referenced[*fd_index] = true;
                 }
-                (ExecutorBindSource::FreshScratch, BindMode::ReadWrite) => {}
+                (ExecutorBindSource::FreshScratch, BindMode::ReadWrite)
+                    if bind.directories.iter().all(|directory| {
+                        !directory.as_os_str().is_empty()
+                            && !directory.is_absolute()
+                            && directory.components().all(|component| {
+                                matches!(component, std::path::Component::Normal(_))
+                            })
+                    }) => {}
                 _ => {
                     return Err(SandboxError::InvalidSpec(
                         "executor bind source/mode mismatch".to_string(),
@@ -896,6 +1023,9 @@ mod linux {
                         .map_err(|error| SandboxError::Executor(error.to_string()))?;
                     fs::set_permissions(&scratch, fs::Permissions::from_mode(0o700))
                         .map_err(|error| SandboxError::Executor(error.to_string()))?;
+                    for directory in &bind.directories {
+                        create_private_directory(&scratch, directory)?;
+                    }
                     scratch
                 }
             };
@@ -933,6 +1063,35 @@ mod linux {
             protected_output,
         };
         ApptainerSandbox::with_bin(&config.apptainer_bin).run(&spec)
+    }
+
+    fn create_private_directory(root: &Path, relative: &Path) -> Result<(), SandboxError> {
+        let mut directory = root.to_path_buf();
+        for component in relative.components() {
+            let std::path::Component::Normal(component) = component else {
+                return Err(SandboxError::InvalidSpec(
+                    "fresh scratch directory is not normalized".to_string(),
+                ));
+            };
+            directory.push(component);
+            match fs::create_dir(&directory) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let metadata = fs::symlink_metadata(&directory)
+                        .map_err(|error| SandboxError::Executor(error.to_string()))?;
+                    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                        return Err(SandboxError::Executor(format!(
+                            "fresh scratch path is not a directory: {}",
+                            directory.display()
+                        )));
+                    }
+                }
+                Err(error) => return Err(SandboxError::Executor(error.to_string())),
+            }
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+                .map_err(|error| SandboxError::Executor(error.to_string()))?;
+        }
+        Ok(())
     }
 
     fn stage_asset(mut source: File, destination: &Path) -> Result<(), SandboxError> {
@@ -1010,8 +1169,12 @@ mod linux {
     #[cfg(test)]
     mod tests {
         use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::symlink;
+        use std::time::Duration;
 
         use super::*;
+
+        const ENTRY_MARKER: &str = "ferrl-sandbox-verifier-entry-v1";
 
         fn sealed_asset(bytes: &[u8]) -> File {
             let descriptor = rustix::fs::memfd_create(
@@ -1033,6 +1196,55 @@ mod linux {
             ))
         }
 
+        fn test_root(label: &str) -> PathBuf {
+            let sequence = REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "ferrl-verifier-executor-{label}-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir(&root).unwrap();
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+            root
+        }
+
+        fn fake_apptainer(root: &Path, body: &str) -> PathBuf {
+            let path = root.join("fake-apptainer");
+            fs::write(&path, format!("#!/bin/sh\nset -eu\n{body}\n")).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            path
+        }
+
+        fn complete_request(spec: &RunSpec, config: &VerifierExecutorConfig) -> ExecutorResponse {
+            let (request, assets) = request_from_spec(spec).unwrap();
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let config = config.clone();
+            let service_uid = rustix::process::geteuid().as_raw();
+            let executor = thread::spawn(move || handle_connection(server, &config, service_uid));
+            send_request(&mut client, &request, &assets).unwrap();
+            let response = read_response(&mut client).unwrap();
+            executor.join().unwrap().unwrap();
+            response
+        }
+
+        fn scratch_probe_script(action: &str) -> String {
+            format!(
+                r#"scratch=''
+previous=''
+for argument in "$@"; do
+    if [ "$previous" = '--bind' ]; then
+        case "$argument" in
+            *:/work:rw) scratch=$(expr "$argument" : '\(.*\):/work:rw') ;;
+        esac
+    fi
+    previous=$argument
+done
+[ -n "$scratch" ]
+[ -d "$scratch/cache/triton" ]
+printf '%s\n' '{ENTRY_MARKER}' >&2
+{action}"#
+            )
+        }
+
         #[test]
         #[allow(clippy::cognitive_complexity)] // one request asserts every path-free source invariant
         fn request_requires_only_sealed_assets_and_fresh_scratch() {
@@ -1042,6 +1254,10 @@ mod linux {
                 .with_binds(vec![
                     Bind::ro(descriptor_path(&eval), "/opt/eval.py"),
                     Bind::rw("/untrusted/client/scratch", "/work"),
+                ])
+                .with_env(vec![
+                    ("HOME".into(), "/work/cache".into()),
+                    ("TRITON_CACHE_DIR".into(), "/work/cache/triton".into()),
                 ])
                 .with_protected_output(ProtectedOutput::new(
                     "/untrusted/client/scratch/grade.sock",
@@ -1058,6 +1274,10 @@ mod linux {
                 request.binds[1].source,
                 ExecutorBindSource::FreshScratch
             ));
+            assert_eq!(
+                request.binds[1].directories,
+                [PathBuf::from("cache"), PathBuf::from("cache/triton")]
+            );
             assert_eq!(
                 request.protected_output.unwrap().relative_path,
                 PathBuf::from("grade.sock")
@@ -1082,18 +1302,147 @@ mod linux {
         }
 
         #[test]
-        fn service_private_copy_matches_the_sealed_source() {
-            let root = std::env::temp_dir().join(format!(
-                "ferrl-verifier-executor-copy-{}",
-                std::process::id()
+        fn complete_request_returns_original_outcome_and_removes_staging_tree() {
+            let root = test_root("complete-request");
+            let work_root = root.join("work");
+            fs::create_dir(&work_root).unwrap();
+            fs::set_permissions(&work_root, fs::Permissions::from_mode(0o700)).unwrap();
+            let executable = fake_apptainer(&root, &scratch_probe_script("exit 23"));
+            let config = VerifierExecutorConfig::new(
+                root.join("executor.sock"),
+                &work_root,
+                rustix::process::geteuid().as_raw(),
+            )
+            .with_apptainer_bin(executable);
+            let image = sealed_asset(b"image");
+            let spec = RunSpec::new(descriptor_path(&image), vec!["true".into()])
+                .with_binds(vec![Bind::rw("/discarded/client/scratch", "/work")])
+                .with_env(vec![
+                    ("HOME".into(), "/work/cache".into()),
+                    ("TRITON_CACHE_DIR".into(), "/work/cache/triton".into()),
+                ]);
+
+            let response = complete_request(&spec, &config);
+            assert!(matches!(
+                response,
+                ExecutorResponse::Outcome {
+                    outcome: RunOutcome {
+                        status: RunStatus::Exited(23),
+                        ..
+                    },
+                    ..
+                }
             ));
-            let _ = fs::remove_dir_all(&root);
-            fs::create_dir(&root).unwrap();
+            assert!(fs::read_dir(&work_root).unwrap().next().is_none());
+            remove_request_tree(&root).unwrap();
+        }
+
+        #[test]
+        fn candidate_permission_changes_cannot_replace_the_sandbox_outcome() {
+            for (label, action) in [
+                ("root-mode-zero", "chmod 000 \"$scratch\"; exit 29"),
+                (
+                    "nested-mode-zero",
+                    "mkdir \"$scratch/locked\"; chmod 000 \"$scratch/locked\"; exit 29",
+                ),
+            ] {
+                let root = test_root(label);
+                let work_root = root.join("work");
+                fs::create_dir(&work_root).unwrap();
+                fs::set_permissions(&work_root, fs::Permissions::from_mode(0o700)).unwrap();
+                let executable = fake_apptainer(&root, &scratch_probe_script(action));
+                let config = VerifierExecutorConfig::new(
+                    root.join("executor.sock"),
+                    &work_root,
+                    rustix::process::geteuid().as_raw(),
+                )
+                .with_apptainer_bin(executable);
+                let image = sealed_asset(b"image");
+                let spec = RunSpec::new(descriptor_path(&image), vec!["true".into()])
+                    .with_binds(vec![
+                        Bind::rw("/discarded/client/scratch", "/work").with_total_limit(1 << 20)
+                    ])
+                    .with_env(vec![
+                        ("HOME".into(), "/work/cache".into()),
+                        ("TRITON_CACHE_DIR".into(), "/work/cache/triton".into()),
+                    ]);
+
+                let response = complete_request(&spec, &config);
+                let ExecutorResponse::Outcome { outcome, .. } = response else {
+                    panic!("candidate permission change became an executor error");
+                };
+                assert!(matches!(
+                    outcome.status,
+                    RunStatus::ScratchExceeded | RunStatus::Exited(29)
+                ));
+                assert!(fs::read_dir(&work_root).unwrap().next().is_none());
+                remove_request_tree(&root).unwrap();
+            }
+        }
+
+        #[test]
+        fn cleanup_restores_directories_without_following_symlinks() {
+            let root = test_root("cleanup-symlink");
+            let request = root.join("request");
+            let locked = request.join("locked");
+            let outside = root.join("outside");
+            fs::create_dir(&request).unwrap();
+            fs::create_dir(&locked).unwrap();
+            fs::create_dir(&outside).unwrap();
+            fs::write(outside.join("keep"), b"outside").unwrap();
+            symlink(&outside, locked.join("outside-link")).unwrap();
+            let mut deep = locked.clone();
+            for _ in 0..1024 {
+                deep.push("d");
+                fs::create_dir(&deep).unwrap();
+            }
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+            fs::set_permissions(&request, fs::Permissions::from_mode(0o000)).unwrap();
+
+            remove_request_tree(&request).unwrap();
+            assert!(!request.exists());
+            assert_eq!(fs::read(outside.join("keep")).unwrap(), b"outside");
+            remove_request_tree(&root).unwrap();
+        }
+
+        #[test]
+        fn worst_case_escaped_captures_fit_the_response_wire() {
+            let capture = "\0".repeat(CAPTURE_CAP);
+            let response = ExecutorResponse::Outcome {
+                service_uid: 123,
+                outcome: RunOutcome {
+                    status: RunStatus::Exited(0),
+                    stdout: capture.clone(),
+                    stderr: capture.clone(),
+                    protected_output: capture,
+                    wall: Duration::from_secs(1),
+                },
+            };
+            let (mut sender, mut receiver) = UnixStream::pair().unwrap();
+            let writer = thread::spawn(move || write_response(&mut sender, &response));
+            let received = read_response(&mut receiver).unwrap();
+            writer.join().unwrap().unwrap();
+            let ExecutorResponse::Outcome {
+                service_uid,
+                outcome,
+            } = received
+            else {
+                panic!("worst-case captures did not round-trip as an outcome");
+            };
+            assert_eq!(service_uid, 123);
+            assert_eq!(outcome.stdout.len(), CAPTURE_CAP);
+            assert_eq!(outcome.stderr.len(), CAPTURE_CAP);
+            assert_eq!(outcome.protected_output.len(), CAPTURE_CAP);
+        }
+
+        #[test]
+        fn service_private_copy_matches_the_sealed_source() {
+            let root = test_root("copy");
             let destination = root.join("asset");
             stage_asset(sealed_asset(b"authenticated bytes"), &destination).unwrap();
             assert_eq!(fs::read(&destination).unwrap(), b"authenticated bytes");
             assert_eq!(fs::metadata(&destination).unwrap().mode() & 0o777, 0o400);
-            fs::remove_dir_all(root).unwrap();
+            remove_request_tree(&root).unwrap();
         }
 
         #[test]

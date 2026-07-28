@@ -3277,9 +3277,15 @@ mod tests {
         assert!(!payload.contains("outputs.send_bytes"));
         assert!(!controller.contains("importlib.import_module"));
         assert!(!controller.contains("kernel(candidate_data)"));
+        assert!(controller.contains(
+            "_send_status(status, b\"IMPORT_ERROR\" if entered else b\"IMPORT_REJECTED\")"
+        ));
         assert!(controller.contains("_send_status(status, b\"OUTPUT_READY\")"));
         assert!(controller.contains("outputs.send_bytes(payload)"));
         assert!(payload.contains("_send_payload(results, b\"OUTPUT\", raw_output)"));
+        assert!(payload.contains(
+            "_send_payload(results, b\"IMPORT_ERROR\" if entry_sent else b\"IMPORT_REJECTED\")"
+        ));
         assert!(FERRL_EVAL_DRIVER.contains("_cpu_clone(value)"));
         assert!(FERRL_EVAL_DRIVER.contains("torch.frombuffer("));
         assert!(!FERRL_EVAL_DRIVER.contains("candidate_data, shared_output"));
@@ -3306,6 +3312,17 @@ mod tests {
             .expect("timing ends after bounded result receipt");
         assert!(timer < handoff && handoff < elapsed && elapsed < private_capture);
         assert!(FERRL_EVAL_DRIVER.contains("_wrap_check(data, checked_output)"));
+        let session = FERRL_EVAL_DRIVER
+            .split_once("class CandidateSession")
+            .expect("the protected parent owns candidate-session classification")
+            .1
+            .split_once("def _wrap_check")
+            .expect("the candidate session has a bounded source region")
+            .0;
+        assert!(session.contains("except CandidateFailure:"));
+        assert!(session.contains("if not self.entered:"));
+        assert!(session
+            .contains("self.logger.log(\"ferrl-candidate-rejected\", f\"{self.mode}-import-v1\")"));
 
         let main = FERRL_EVAL_DRIVER
             .split_once("def main():")

@@ -132,6 +132,25 @@ fn assert_attack_reached_wrong_output(completion: &str, sentinel: &str, reason: 
     );
 }
 
+fn assert_import_attack_is_candidate_failure(completion: &str, sentinel: &str, reason: &str) {
+    let outcome = evaluate(completion);
+    assert!(
+        (0.0..1.0).contains(&outcome.reward),
+        "{reason}; expected a low candidate reward, got {outcome:#?}"
+    );
+    let metadata = outcome
+        .metadata
+        .as_ref()
+        .expect("an import attack must return candidate metadata, not RewardError");
+    assert_eq!(metadata["submission_extracted"], serde_json::json!(true));
+    assert_eq!(metadata["correct"], serde_json::json!(false));
+    assert_eq!(metadata["test_exit"], serde_json::json!(112));
+    assert_eq!(
+        metadata["candidate_attempt_sentinels"],
+        serde_json::json!([sentinel])
+    );
+}
+
 /// Correct: delegate to the reference already in the bound eval bundle. Trivially
 /// passes correctness and benchmark, so the reward reaches the correctness floor plus
 /// the inverse-runtime speed component (no baseline set).
@@ -417,27 +436,35 @@ def custom_kernel(data):
     return x.clone()
 ```";
 
-/// Corrupt the child protocol/output channels directly, then reach a wrong output.
-const CORRUPT_PROTOCOL_OUTPUT: &str = "```python
+/// Corrupt the real payload result channel during module import, after the sealed
+/// driver has authenticated candidate entry but before `custom_kernel` exists.
+const CORRUPT_IMPORT_PROTOCOL: &str = "```python
+import inspect
+frame = inspect.currentframe()
+while frame is not None:
+    results = frame.f_locals.get(\"results\")
+    if hasattr(results, \"send_bytes\"):
+        results.send_bytes(b\"FERRL-PAYLOAD-v1\\0IMPORT_REJECTED\\0\")
+        break
+    frame = frame.f_back
+open(\"/work/cache/ferrl-attack-sentinel\", \"w\").write(\"import-protocol-corruption-rejected-v1\")
+
 def custom_kernel(data):
-    import inspect
     x, mask, weights, config = data
-    frame = inspect.currentframe()
-    while frame is not None:
-        status = frame.f_locals.get(\"status\")
-        outputs = frame.f_locals.get(\"outputs\")
-        if hasattr(status, \"send_bytes\"):
-            try:
-                status.send_bytes(b\"OUTPUT_READY\")
-            except Exception:
-                pass
-        if hasattr(outputs, \"send_bytes\"):
-            try:
-                outputs.send_bytes(x.detach().cpu().contiguous().view(__import__(\"torch\").uint8).numpy().tobytes())
-            except Exception:
-                pass
-        frame = frame.f_back
-    open(\"/work/cache/ferrl-attack-sentinel\", \"w\").write(\"protocol-output-corruption-wrong-output-v1\")
+    return x.clone()
+```";
+
+/// Kill the trusted controller during candidate import. Once `ENTRY` was recorded,
+/// loss of this candidate-reachable process must remain a low candidate outcome.
+const KILL_IMPORT_CONTROLLER: &str = "```python
+import os, signal
+sentinel = os.open(\"/work/cache/ferrl-attack-sentinel\", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+os.kill(os.getppid(), signal.SIGKILL)
+os.write(sentinel, b\"import-controller-loss-rejected-v1\")
+os.close(sentinel)
+
+def custom_kernel(data):
+    x, mask, weights, config = data
     return x.clone()
 ```";
 
@@ -549,11 +576,21 @@ fn gate_candidate_cannot_mutate_trusted_checker_or_timer_state() {
 
 #[test]
 #[ignore = "needs an sm_80 GPU + the eval image/bundle; run with --ignored"]
-fn gate_candidate_cannot_advance_protocol_or_replace_captured_output() {
-    assert_attack_reached_wrong_output(
-        CORRUPT_PROTOCOL_OUTPUT,
-        "protocol-output-corruption-wrong-output-v1",
-        "candidate-process protocol/output corruption must not validate a wrong output",
+fn gate_import_protocol_corruption_is_a_low_candidate_outcome() {
+    assert_import_attack_is_candidate_failure(
+        CORRUPT_IMPORT_PROTOCOL,
+        "import-protocol-corruption-rejected-v1",
+        "candidate import-time result-channel corruption must not become infrastructure failure",
+    );
+}
+
+#[test]
+#[ignore = "needs an sm_80 GPU + the eval image/bundle; run with --ignored"]
+fn gate_import_controller_loss_is_a_low_candidate_outcome() {
+    assert_import_attack_is_candidate_failure(
+        KILL_IMPORT_CONTROLLER,
+        "import-controller-loss-rejected-v1",
+        "candidate-induced controller loss must not become infrastructure failure",
     );
 }
 
@@ -650,9 +687,14 @@ fn gate_attack_sources_record_after_attempts_before_the_wrong_output() {
             "checker-timer-mutation-wrong-output-v1",
         ),
         (
-            CORRUPT_PROTOCOL_OUTPUT,
-            "frame = frame.f_back",
-            "protocol-output-corruption-wrong-output-v1",
+            CORRUPT_IMPORT_PROTOCOL,
+            "results.send_bytes",
+            "import-protocol-corruption-rejected-v1",
+        ),
+        (
+            KILL_IMPORT_CONTROLLER,
+            "os.kill(os.getppid(), signal.SIGKILL)",
+            "import-controller-loss-rejected-v1",
         ),
         (
             PROBE_PARENT_AND_CAPABILITIES,

@@ -378,25 +378,30 @@ def _candidate_worker(commands, status, outputs):
         payload_commands.send_bytes(acknowledgement)
 
         entered = False
+
+        def reject_import_protocol():
+            _send_status(status, b"IMPORT_ERROR" if entered else b"IMPORT_REJECTED")
+
         while True:
             try:
                 event, payload = _recv_payload(payload_results, MAX_STATUS_BYTES)
             except BaseException:
-                _send_status(status, b"IMPORT_ERROR" if entered else b"IMPORT_REJECTED")
+                reject_import_protocol()
                 return
             if payload:
-                _send_status(status, b"IMPORT_REJECTED")
+                reject_import_protocol()
                 return
             if event == b"ENTRY":
                 entered = True
                 _send_status(status, b"ENTRY")
                 continue
-            if event in (b"IMPORTED", b"IMPORT_REJECTED", b"IMPORT_ERROR"):
+            if event == b"IMPORTED":
                 _send_status(status, event)
-                if event != b"IMPORTED":
-                    return
                 break
-            _send_status(status, b"IMPORT_REJECTED")
+            if event in (b"IMPORT_REJECTED", b"IMPORT_ERROR"):
+                reject_import_protocol()
+                return
+            reject_import_protocol()
             return
 
         while True:
@@ -484,6 +489,13 @@ class CandidateSession:
                     self.logger.log("ferrl-candidate-rejected", f"{self.mode}-import-v1")
                     break
                 raise InfrastructureFailure("candidate worker import protocol failed")
+        except CandidateFailure:
+            if not self.entered:
+                self.close()
+                raise
+            self.rejected = True
+            self.logger.log("ferrl-candidate-rejected", f"{self.mode}-import-v1")
+            self.close()
         except BaseException:
             self.close()
             raise
@@ -592,6 +604,7 @@ def _run_testing(logger, tests):
     try:
         logger.log("test-count", len(tests))
         if session.rejected:
+            _consume_attempt_sentinel(logger, "test", "import")
             logger.log("check", "fail")
             logger.log("test-exit", 112)
             return False

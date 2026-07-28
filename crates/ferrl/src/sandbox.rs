@@ -764,13 +764,13 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// pipe open, so the supervisor returns promptly instead of blocking on it.
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
-/// Largest captured stream kept per pipe (8 MiB). Untrusted output is otherwise
+/// Largest captured stream kept per pipe (1 MiB). Untrusted output is otherwise
 /// unbounded — a payload spewing to stdout could exhaust host memory well within the
 /// wall budget — so each drain stops reading here and drops the pipe, leaving the
 /// writer to block on a full pipe (then be reaped by the wall-clock supervisor). The
 /// eval's machine-read *result* travels via the verifier-only protected channel,
 /// not this log stream.
-const CAPTURE_CAP: usize = 8 << 20;
+pub(crate) const CAPTURE_CAP: usize = 1 << 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EntryProtocol {
