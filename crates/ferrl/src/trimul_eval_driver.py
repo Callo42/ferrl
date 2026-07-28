@@ -29,6 +29,7 @@ RESULT_SPLIT = "===FERRL-BENCH==="
 TIMING_METRIC = "isolated-service-latency-v1"
 MAX_STATUS_BYTES = 256
 MAX_STATUS_EVENTS = 32
+ENTRY_ACK = b"ENTRY-ACK-v3"
 MAX_INPUT_BYTES = 2 * 1024 * 1024 * 1024
 ATTEMPT_SENTINEL_PATH = "/work/cache/ferrl-attack-sentinel"
 PARENT_DEVICE_CANARY = b"ferrl-parent-private-cuda-v1-7f4c3a19"
@@ -232,6 +233,11 @@ def _candidate_payload(commands, results):
         ):
             entry_sent = True
             _send_payload(results, b"ENTRY")
+            try:
+                if commands.recv_bytes(MAX_STATUS_BYTES) != ENTRY_ACK:
+                    raise RuntimeError("candidate entry acknowledgement failed")
+            except BaseException as error:
+                raise RuntimeError("candidate entry was not acknowledged") from error
             sys.settrace(None)
             return None
         return trace_candidate_entry
@@ -378,11 +384,16 @@ def _candidate_worker(commands, status, outputs):
         payload_commands.send_bytes(acknowledgement)
 
         entered = False
+        import_events = 0
 
         def reject_import_protocol():
             _send_status(status, b"IMPORT_ERROR" if entered else b"IMPORT_REJECTED")
 
         while True:
+            import_events += 1
+            if import_events > MAX_STATUS_EVENTS:
+                reject_import_protocol()
+                return
             try:
                 event, payload = _recv_payload(payload_results, MAX_STATUS_BYTES)
             except BaseException:
@@ -392,8 +403,19 @@ def _candidate_worker(commands, status, outputs):
                 reject_import_protocol()
                 return
             if event == b"ENTRY":
+                if entered:
+                    reject_import_protocol()
+                    return
                 entered = True
                 _send_status(status, b"ENTRY")
+                try:
+                    acknowledgement = commands.recv_bytes(MAX_STATUS_BYTES)
+                    if acknowledgement != ENTRY_ACK:
+                        reject_import_protocol()
+                        return
+                    payload_commands.send_bytes(acknowledgement)
+                except BaseException:
+                    return
                 continue
             if event == b"IMPORTED":
                 _send_status(status, event)
@@ -454,6 +476,7 @@ class CandidateSession:
         self.entered = False
         self.rejected = False
         self.closed = False
+        self.import_status_events = 0
         context = multiprocessing.get_context("spawn")
         child_commands, self.commands = context.Pipe(duplex=False)
         self.status, child_status = context.Pipe(duplex=False)
@@ -468,16 +491,19 @@ class CandidateSession:
         child_status.close()
         child_outputs.close()
         try:
-            if self._recv(before_entry=True) != b"READY":
+            if self._recv_import(before_entry=True) != b"READY":
                 raise InfrastructureFailure("candidate worker trusted initialization failed")
             self.logger.log("ferrl-timing-metric", TIMING_METRIC)
             self.commands.send_bytes(b"ACK-v2")
             while True:
-                event = self._recv(before_entry=not self.entered)
-                if event == b"ENTRY":
+                event = self._recv_import(before_entry=not self.entered)
+                if event == b"ENTRY" and not self.entered:
                     self.entered = True
                     self.logger.log("ferrl-entry", f"{self.mode}-v4")
+                    self.commands.send_bytes(ENTRY_ACK)
                     continue
+                if event == b"ENTRY":
+                    raise CandidateFailure("candidate worker sent duplicate entry")
                 if event == b"IMPORTED" and self.entered:
                     break
                 if event == b"IMPORT_REJECTED" and not self.entered:
@@ -487,28 +513,39 @@ class CandidateSession:
                 if event == b"IMPORT_ERROR" and self.entered:
                     self.rejected = True
                     self.logger.log("ferrl-candidate-rejected", f"{self.mode}-import-v1")
+                    self.logger.log("ferrl-candidate-rejection-reason", "protocol-v1")
                     break
                 raise InfrastructureFailure("candidate worker import protocol failed")
-        except CandidateFailure:
+        except CandidateFailure as error:
             if not self.entered:
                 self.close()
                 raise
             self.rejected = True
             self.logger.log("ferrl-candidate-rejected", f"{self.mode}-import-v1")
+            reason = (
+                "controller-loss-v1"
+                if str(error) == "candidate worker exited after acknowledged entry"
+                else "protocol-v1"
+            )
+            self.logger.log("ferrl-candidate-rejection-reason", reason)
             self.close()
         except BaseException:
             self.close()
             raise
 
+    def _recv_import(self, before_entry=False):
+        self.import_status_events += 1
+        if self.import_status_events > MAX_STATUS_EVENTS:
+            raise CandidateFailure("candidate worker status flood")
+        return self._recv(before_entry=before_entry)
+
     def _recv(self, before_entry=False):
-        for _ in range(MAX_STATUS_EVENTS):
-            try:
-                return self.status.recv_bytes(MAX_STATUS_BYTES)
-            except (EOFError, OSError) as error:
-                if before_entry:
-                    raise InfrastructureFailure("candidate worker exited before entry") from error
-                raise CandidateFailure("candidate worker exited after entry") from error
-        raise CandidateFailure("candidate worker status flood")
+        try:
+            return self.status.recv_bytes(MAX_STATUS_BYTES)
+        except (EOFError, OSError) as error:
+            if before_entry:
+                raise InfrastructureFailure("candidate worker exited before entry") from error
+            raise CandidateFailure("candidate worker exited after acknowledged entry") from error
 
     def execute(self, candidate_data, checked_output):
         if self.rejected:

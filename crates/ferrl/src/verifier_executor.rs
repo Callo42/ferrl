@@ -74,7 +74,7 @@ pub struct VerifierExecutorConfig {
     pub work_root: PathBuf,
     /// The only training-process UID accepted by `SO_PEERCRED`.
     pub client_uid: u32,
-    /// Apptainer executable used by the service.
+    /// Absolute, root-owned Apptainer executable used by the service.
     pub apptainer_bin: PathBuf,
     /// Socket permission bits, normally `0o660` with an administrator-managed
     /// service group shared with the training UID.
@@ -82,7 +82,7 @@ pub struct VerifierExecutorConfig {
 }
 
 impl VerifierExecutorConfig {
-    /// Construct a service configuration with `apptainer` from `PATH` and a
+    /// Construct a service configuration with `/usr/bin/apptainer` and a
     /// group-accessible, non-world-accessible socket.
     #[must_use]
     pub fn new(
@@ -94,7 +94,7 @@ impl VerifierExecutorConfig {
             socket_path: socket_path.into(),
             work_root: work_root.into(),
             client_uid,
-            apptainer_bin: PathBuf::from("apptainer"),
+            apptainer_bin: PathBuf::from("/usr/bin/apptainer"),
             socket_mode: 0o660,
         }
     }
@@ -220,13 +220,14 @@ mod linux {
     use std::fs::{self, File, OpenOptions};
     use std::io::{IoSlice, IoSliceMut, Read as _, Seek as _, SeekFrom, Write as _};
     use std::mem::MaybeUninit;
-    use std::os::fd::{AsFd as _, AsRawFd as _, OwnedFd};
+    use std::os::fd::{AsFd as _, OwnedFd};
     use std::os::unix::fs::{
         FileTypeExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
     };
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
+    use std::time::Duration;
 
     use rustix::net::{
         recvmsg, sendmsg, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags,
@@ -248,11 +249,18 @@ mod linux {
     // Three captures at six JSON bytes per escaped input byte, plus frame metadata.
     const _: () = assert!(CAPTURE_CAP * 6 * 3 + 1024 * 1024 <= MAX_RESPONSE_BYTES);
     const SCRATCH_DIRECTORY_ENV: [&str; 2] = ["HOME", "TRITON_CACHE_DIR"];
+    const EXECUTOR_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+    const EXECUTOR_WIRE_GRACE: Duration = Duration::from_secs(30);
     const REQUIRED_SEALS: rustix::fs::SealFlags = rustix::fs::SealFlags::WRITE
         .union(rustix::fs::SealFlags::GROW)
         .union(rustix::fs::SealFlags::SHRINK)
         .union(rustix::fs::SealFlags::SEAL);
     static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    fn executor_wire_timeout(wall: Duration) -> Duration {
+        wall.max(Duration::from_secs(1))
+            .saturating_add(EXECUTOR_WIRE_GRACE)
+    }
 
     pub(super) fn run_client(
         socket_path: &Path,
@@ -266,6 +274,17 @@ mod linux {
                 socket_path.display()
             ))
         })?;
+        let wire_timeout = executor_wire_timeout(spec.limits.wall);
+        stream
+            .set_read_timeout(Some(wire_timeout))
+            .map_err(|source| {
+                SandboxError::Executor(format!("could not set executor read deadline: {source}"))
+            })?;
+        stream
+            .set_write_timeout(Some(wire_timeout))
+            .map_err(|source| {
+                SandboxError::Executor(format!("could not set executor write deadline: {source}"))
+            })?;
         let peer = rustix::net::sockopt::socket_peercred(&stream).map_err(|source| {
             SandboxError::Executor(format!("could not authenticate executor peer: {source}"))
         })?;
@@ -375,7 +394,7 @@ mod linux {
         if parent_metadata.file_type().is_symlink()
             || !parent_metadata.is_dir()
             || parent_metadata.uid() != metadata.uid()
-            || parent_metadata.mode() & 0o007 != 0
+            || parent_metadata.mode() & 0o027 != 0
         {
             return Err(SandboxError::Executor(
                 "executor socket parent is not a protected service-owned directory".to_string(),
@@ -399,6 +418,7 @@ mod linux {
                 "socket_path and work_root must be absolute without '.' or '..'".to_string(),
             ));
         }
+        validate_trusted_executor_binary(&config.apptainer_bin)?;
         if config.socket_mode & 0o007 != 0 || config.socket_mode & !0o777 != 0 {
             return Err(VerifierExecutorError::InvalidConfig(
                 "socket_mode must contain permission bits with no world access".to_string(),
@@ -439,10 +459,34 @@ mod linux {
             || !metadata.is_dir()
             || metadata.uid() != service_uid
             || (require_private && metadata.mode() & 0o777 != 0o700)
-            || (!require_private && metadata.mode() & 0o007 != 0)
+            || (!require_private && metadata.mode() & 0o027 != 0)
         {
             return Err(VerifierExecutorError::InvalidConfig(format!(
                 "executor {label} {} is not a protected service-owned directory",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_trusted_executor_binary(path: &Path) -> Result<(), VerifierExecutorError> {
+        if !is_normal_absolute(path) {
+            return Err(VerifierExecutorError::InvalidConfig(
+                "apptainer executable must be an absolute normalized path".to_string(),
+            ));
+        }
+        let metadata = fs::symlink_metadata(path).map_err(|source| VerifierExecutorError::Io {
+            operation: "inspecting apptainer executable",
+            source,
+        })?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.uid() != 0
+            || metadata.mode() & 0o022 != 0
+            || metadata.mode() & 0o111 == 0
+        {
+            return Err(VerifierExecutorError::InvalidConfig(format!(
+                "apptainer executable {} is not a root-owned, non-writable executable",
                 path.display()
             )));
         }
@@ -754,10 +798,17 @@ mod linux {
         config: &VerifierExecutorConfig,
         service_uid: u32,
     ) -> std::io::Result<()> {
+        stream.set_read_timeout(Some(EXECUTOR_HANDSHAKE_TIMEOUT))?;
+        stream.set_write_timeout(Some(EXECUTOR_HANDSHAKE_TIMEOUT))?;
         let response = match authenticate_client(&stream, config.client_uid)
             .and_then(|()| receive_request(&mut stream))
         {
-            Ok((request, fds)) => execute_request(request, fds, config, service_uid),
+            Ok((request, fds)) => {
+                let wire_timeout = executor_wire_timeout(request.limits.wall);
+                stream.set_read_timeout(Some(wire_timeout))?;
+                stream.set_write_timeout(Some(wire_timeout))?;
+                execute_request(request, fds, config, service_uid)
+            }
             Err(error) => ExecutorResponse::Error(ExecutorWireError::Executor(error.to_string())),
         };
         write_response(&mut stream, &response)
@@ -813,22 +864,47 @@ mod linux {
         }
     }
 
-    struct CleanupDirectory {
-        path: PathBuf,
-        directory: File,
-        entries: fs::ReadDir,
+    fn open_cleanup_directory<Fd: std::os::fd::AsFd>(
+        parent: Fd,
+        name: &std::ffi::CStr,
+    ) -> std::io::Result<OwnedFd> {
+        rustix::fs::chmodat(
+            &parent,
+            name,
+            rustix::fs::Mode::from_bits_truncate(0o700),
+            rustix::fs::AtFlags::empty(),
+        )?;
+        Ok(rustix::fs::openat(
+            parent,
+            name,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )?)
     }
 
-    fn open_cleanup_directory(path: PathBuf) -> std::io::Result<CleanupDirectory> {
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
-        let directory = File::open(&path)?;
-        let descriptor_path = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
-        let entries = fs::read_dir(descriptor_path)?;
-        Ok(CleanupDirectory {
-            path,
+    fn first_cleanup_entry(directory: &OwnedFd) -> std::io::Result<Option<std::ffi::CString>> {
+        let scan = rustix::fs::openat(
             directory,
-            entries,
-        })
+            rustix::cstr!("."),
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )?;
+        let mut buffer = [MaybeUninit::<u8>::uninit(); 8192];
+        let mut entries = rustix::fs::RawDir::new(scan, &mut buffer);
+        while let Some(entry) = entries.next() {
+            let entry = entry?;
+            let name = entry.file_name();
+            if name.to_bytes() != b"." && name.to_bytes() != b".." {
+                return Ok(Some(name.to_owned()));
+            }
+        }
+        Ok(None)
     }
 
     fn remove_request_tree(path: &Path) -> std::io::Result<()> {
@@ -841,41 +917,51 @@ mod linux {
             return fs::remove_file(path);
         }
 
-        // The sandbox process tree has been reaped before this runs. Restore only
-        // owner access on directory inodes reached without following symlinks.
-        // Parent descriptors stay open while children are traversed through
-        // /proc/self/fd, so hostile depth cannot exceed PATH_MAX or the Rust stack.
-        let mut directories = vec![open_cleanup_directory(path.to_path_buf())?];
-        while !directories.is_empty() {
-            let entry = directories
-                .last_mut()
-                .expect("the cleanup stack was checked as nonempty")
-                .entries
-                .next()
-                .transpose()?;
-            if let Some(entry) = entry {
-                let child = entry.path();
-                let metadata = fs::symlink_metadata(&child)?;
-                if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                    fs::remove_file(child)?;
+        // The sandbox process tree has been reaped before this runs, so names can
+        // no longer race. Keep one anchor plus one scan/child descriptor: return
+        // through `..` instead of retaining a descriptor for every depth level.
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        let mut directory = rustix::fs::openat(
+            rustix::fs::CWD,
+            path,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )?;
+        let mut ancestors = Vec::new();
+        loop {
+            if let Some(name) = first_cleanup_entry(&directory)? {
+                let metadata =
+                    rustix::fs::statat(&directory, &name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)?;
+                if rustix::fs::FileType::from_raw_mode(metadata.st_mode).is_dir() {
+                    let child = open_cleanup_directory(&directory, &name)?;
+                    ancestors.push(name);
+                    directory = child;
                 } else {
-                    directories.push(open_cleanup_directory(child)?);
+                    rustix::fs::unlinkat(&directory, &name, rustix::fs::AtFlags::empty())?;
                 }
                 continue;
             }
 
-            let CleanupDirectory {
-                path,
-                directory,
-                entries,
-            } = directories
-                .pop()
-                .expect("the cleanup stack was checked as nonempty");
-            drop(entries);
+            let Some(name) = ancestors.pop() else {
+                drop(directory);
+                return fs::remove_dir(path);
+            };
+            let parent = rustix::fs::openat(
+                &directory,
+                rustix::cstr!(".."),
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )?;
             drop(directory);
-            fs::remove_dir(path)?;
+            rustix::fs::unlinkat(&parent, &name, rustix::fs::AtFlags::REMOVEDIR)?;
+            directory = parent;
         }
-        Ok(())
     }
 
     fn validate_wire_request(
@@ -1401,6 +1487,45 @@ printf '%s\n' '{ENTRY_MARKER}' >&2
         }
 
         #[test]
+        fn cleanup_succeeds_under_constrained_nofile_limit() {
+            const CHILD_ENV: &str = "FERRL_TEST_CONSTRAINED_CLEANUP_CHILD";
+            if std::env::var_os(CHILD_ENV).is_some() {
+                let root = test_root("cleanup-low-nofile");
+                let request = root.join("request");
+                fs::create_dir(&request).unwrap();
+                let mut deep = request.clone();
+                for _ in 0..256 {
+                    deep.push("d");
+                    fs::create_dir(&deep).unwrap();
+                }
+                fs::set_permissions(&request, fs::Permissions::from_mode(0o000)).unwrap();
+                remove_request_tree(&request).unwrap();
+                assert!(!request.exists());
+                remove_request_tree(&root).unwrap();
+                return;
+            }
+
+            let executable = std::env::current_exe().unwrap();
+            let mut child = std::process::Command::new("/bin/sh");
+            child
+                .arg("-c")
+                .arg("ulimit -n 32\nexec \"$@\"")
+                .arg("ferrl-cleanup-test")
+                .arg(executable)
+                .arg("cleanup_succeeds_under_constrained_nofile_limit")
+                .arg("--nocapture")
+                .arg("--test-threads=1")
+                .env(CHILD_ENV, "1");
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "low-RLIMIT cleanup child failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        #[test]
         fn worst_case_escaped_captures_fit_the_response_wire() {
             let capture = "\0".repeat(CAPTURE_CAP);
             let response = ExecutorResponse::Outcome {
@@ -1428,6 +1553,62 @@ printf '%s\n' '{ENTRY_MARKER}' >&2
             assert_eq!(outcome.stdout.len(), CAPTURE_CAP);
             assert_eq!(outcome.stderr.len(), CAPTURE_CAP);
             assert_eq!(outcome.protected_output.len(), CAPTURE_CAP);
+        }
+
+        #[test]
+        fn infrastructure_error_round_trips_the_response_wire() {
+            let response = ExecutorResponse::Error(ExecutorWireError::Infrastructure {
+                status: RunStatus::TimedOut,
+                stderr: "trusted runtime failed".to_string(),
+            });
+            let (mut sender, mut receiver) = UnixStream::pair().unwrap();
+            let writer = thread::spawn(move || write_response(&mut sender, &response));
+            let received = read_response(&mut receiver).unwrap();
+            writer.join().unwrap().unwrap();
+            let ExecutorResponse::Error(error) = received else {
+                panic!("infrastructure error became an executor outcome");
+            };
+            assert!(matches!(
+                wire_error_to_sandbox(error),
+                SandboxError::Infrastructure {
+                    status: RunStatus::TimedOut,
+                    ref stderr,
+                } if stderr == "trusted runtime failed"
+            ));
+        }
+
+        #[test]
+        fn executor_deadline_includes_the_run_budget_and_transport_grace() {
+            assert_eq!(
+                executor_wire_timeout(Duration::from_secs(7)),
+                Duration::from_secs(37)
+            );
+            assert_eq!(
+                executor_wire_timeout(Duration::ZERO),
+                Duration::from_secs(31)
+            );
+        }
+
+        #[test]
+        fn service_rejects_relative_binary_and_group_writable_socket_parent() {
+            let binary_error = validate_trusted_executor_binary(Path::new("apptainer"))
+                .unwrap_err()
+                .to_string();
+            assert!(binary_error.contains("absolute normalized path"));
+
+            let root = test_root("group-writable-parent");
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o770)).unwrap();
+            let directory_error = validate_service_directory(
+                &root,
+                rustix::process::geteuid().as_raw(),
+                false,
+                "socket parent",
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(directory_error.contains("protected service-owned directory"));
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+            remove_request_tree(&root).unwrap();
         }
 
         #[test]

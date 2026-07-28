@@ -370,22 +370,25 @@ candidate's device-to-host result bytes. It is an end-to-end ferrl service-laten
 metric, not the upstream GPUMODE CUDA-event kernel runtime; only baselines carrying this
 exact metric are comparable.
 
-An administrator must pre-create a service-owned socket directory and a mode-`0700`
-work root, then run the executor under the dedicated UID (normally through a service
-manager):
+An administrator must pre-create a service-owned, non-group-writable socket directory
+and a mode-`0700` work root, then run the executor under the dedicated UID (normally
+through a service manager). The Apptainer path must be absolute, root-owned,
+non-group/world-writable, and executable:
 
 ```sh
 ferrl verifier-executor \
   --socket /run/ferrl/verifier-executor.sock \
   --work-root /var/lib/ferrl/verifier-executor \
   --client-uid <training-uid> \
-  --apptainer /path/to/apptainer
+  --apptainer /usr/bin/apptainer
 ```
 
 Set `trimul.verifier_executor_socket` when deployment uses a non-default socket. The
 socket parent and socket must be owned by the executor UID and grant no world write or
-socket access; the work root must already be owned by that UID and grant no group/world
-permissions.
+socket access; the socket parent must not be group-writable, and the work root must
+already be owned by that UID and grant no group/world permissions. Executor socket I/O
+uses deadlines derived from the requested wall budget, so a stalled service cannot hold
+a training rank indefinitely.
 
 ```jsonc
 "trimul": {

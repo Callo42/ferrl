@@ -135,7 +135,7 @@ struct VerifierExecutorArgs {
     #[arg(long)]
     client_uid: u32,
     /// Apptainer executable owned by the service deployment.
-    #[arg(long, default_value = "apptainer")]
+    #[arg(long, default_value = "/usr/bin/apptainer")]
     apptainer: PathBuf,
     /// Socket permission bits in octal; world permissions are rejected.
     #[arg(long, default_value = "0660", value_parser = parse_socket_mode)]

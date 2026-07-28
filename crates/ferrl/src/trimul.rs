@@ -1911,6 +1911,10 @@ impl TrimulReward {
             "benchmark_mean_count": eval.verification.benchmark_means_ns.len(),
             "timing_metric": TRIMUL_TIMING_METRIC,
             "candidate_attempt_sentinels": candidate_attempt_sentinels(&eval.output.stdout),
+            "candidate_rejection_reason": log_value(
+                &eval.output.stdout,
+                "ferrl-candidate-rejection-reason",
+            ),
             "geomean_ns": eval.verification.geomean_ns,
             "speedup": eval.verification.speedup,
             "speed_reward_component": speed_component,
@@ -3257,11 +3261,21 @@ mod tests {
         let traced_entry = payload
             .find("frame.f_code.co_filename == SUBMISSION_PATH")
             .expect("entry is observed from the actual submission module frame");
+        let entry_event = payload
+            .find("_send_payload(results, b\"ENTRY\")")
+            .expect("payload announces candidate entry");
+        let entry_ack = payload
+            .find("commands.recv_bytes(MAX_STATUS_BYTES) != ENTRY_ACK")
+            .expect("candidate execution waits for protected-parent entry acknowledgement");
+        let trace_release = payload
+            .find("sys.settrace(None)\n            return None")
+            .expect("candidate tracing is released only after acknowledgement");
         let candidate_import = payload
             .find("importlib.import_module(\"submission\")")
             .expect("candidate import is explicit and deferred");
         assert!(protect < trusted_import);
         assert!(ready < ack && ack < traced_entry && traced_entry < candidate_import);
+        assert!(traced_entry < entry_event && entry_event < entry_ack && entry_ack < trace_release);
         assert!(FERRL_EVAL_DRIVER.contains("multiprocessing.get_context(\"spawn\")"));
         assert!(FERRL_EVAL_DRIVER.contains("time.perf_counter_ns()"));
         assert!(FERRL_EVAL_DRIVER.contains("_CHECK_IMPLEMENTATION(data, output)"));
@@ -3280,6 +3294,12 @@ mod tests {
         assert!(controller.contains(
             "_send_status(status, b\"IMPORT_ERROR\" if entered else b\"IMPORT_REJECTED\")"
         ));
+        assert!(controller.contains("if entered:\n                    reject_import_protocol()"));
+        assert!(controller.contains("if import_events > MAX_STATUS_EVENTS:"));
+        assert!(controller.contains("payload_commands.send_bytes(acknowledgement)"));
+        assert!(FERRL_EVAL_DRIVER.contains("self.commands.send_bytes(ENTRY_ACK)"));
+        assert!(FERRL_EVAL_DRIVER.contains("self.import_status_events += 1"));
+        assert!(FERRL_EVAL_DRIVER.contains("candidate worker sent duplicate entry"));
         assert!(controller.contains("_send_status(status, b\"OUTPUT_READY\")"));
         assert!(controller.contains("outputs.send_bytes(payload)"));
         assert!(payload.contains("_send_payload(results, b\"OUTPUT\", raw_output)"));
@@ -3319,7 +3339,7 @@ mod tests {
             .split_once("def _wrap_check")
             .expect("the candidate session has a bounded source region")
             .0;
-        assert!(session.contains("except CandidateFailure:"));
+        assert!(session.contains("except CandidateFailure as error:"));
         assert!(session.contains("if not self.entered:"));
         assert!(session
             .contains("self.logger.log(\"ferrl-candidate-rejected\", f\"{self.mode}-import-v1\")"));

@@ -102,6 +102,8 @@ jobs:
           --fail-under-lines 90
       - name: cargo test --doc (doctests, not covered by llvm-cov)
         run: cargo test --workspace --doc
+      - name: Python verifier driver syntax
+        run: python3 -m py_compile crates/ferrl/src/trimul_eval_driver.py
       - name: cargo test --features gate --test trimul_gate
         run: cargo test --features gate --test trimul_gate
       - name: Upload lcov coverage artifact

@@ -132,7 +132,12 @@ fn assert_attack_reached_wrong_output(completion: &str, sentinel: &str, reason: 
     );
 }
 
-fn assert_import_attack_is_candidate_failure(completion: &str, sentinel: &str, reason: &str) {
+fn assert_import_attack_is_candidate_failure(
+    completion: &str,
+    sentinel: &str,
+    rejection_reason: &str,
+    reason: &str,
+) {
     let outcome = evaluate(completion);
     assert!(
         (0.0..1.0).contains(&outcome.reward),
@@ -145,6 +150,10 @@ fn assert_import_attack_is_candidate_failure(completion: &str, sentinel: &str, r
     assert_eq!(metadata["submission_extracted"], serde_json::json!(true));
     assert_eq!(metadata["correct"], serde_json::json!(false));
     assert_eq!(metadata["test_exit"], serde_json::json!(112));
+    assert_eq!(
+        metadata["candidate_rejection_reason"],
+        serde_json::json!(rejection_reason)
+    );
     assert_eq!(
         metadata["candidate_attempt_sentinels"],
         serde_json::json!([sentinel])
@@ -441,12 +450,16 @@ def custom_kernel(data):
 const CORRUPT_IMPORT_PROTOCOL: &str = "```python
 import inspect
 frame = inspect.currentframe()
+used_results_channel = False
 while frame is not None:
     results = frame.f_locals.get(\"results\")
     if hasattr(results, \"send_bytes\"):
         results.send_bytes(b\"FERRL-PAYLOAD-v1\\0IMPORT_REJECTED\\0\")
+        used_results_channel = True
         break
     frame = frame.f_back
+if not used_results_channel:
+    raise RuntimeError(\"payload results channel was not found\")
 open(\"/work/cache/ferrl-attack-sentinel\", \"w\").write(\"import-protocol-corruption-rejected-v1\")
 
 def custom_kernel(data):
@@ -459,9 +472,11 @@ def custom_kernel(data):
 const KILL_IMPORT_CONTROLLER: &str = "```python
 import os, signal
 sentinel = os.open(\"/work/cache/ferrl-attack-sentinel\", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-os.kill(os.getppid(), signal.SIGKILL)
-os.write(sentinel, b\"import-controller-loss-rejected-v1\")
+os.write(sentinel, b\"import-controller-loss-after-ack-v2\")
+os.fsync(sentinel)
 os.close(sentinel)
+os.kill(os.getppid(), signal.SIGKILL)
+raise RuntimeError(\"controller survived SIGKILL\")
 
 def custom_kernel(data):
     x, mask, weights, config = data
@@ -474,13 +489,18 @@ const PROBE_PARENT_AND_CAPABILITIES: &str = "```python
 def custom_kernel(data):
     import ctypes, os
     capabilities = {}
+    no_new_privs = None
     with open(\"/proc/self/status\", encoding=\"ascii\") as handle:
         for line in handle:
-            if line.startswith((\"CapEff:\", \"CapPrm:\", \"CapAmb:\")):
+            if line.startswith((\"CapEff:\", \"CapPrm:\", \"CapAmb:\", \"CapBnd:\")):
                 key, value = line.split(\":\", 1)
                 capabilities[key] = int(value.strip(), 16)
-    if set(capabilities) != {\"CapEff\", \"CapPrm\", \"CapAmb\"}:
+            elif line.startswith(\"NoNewPrivs:\"):
+                no_new_privs = int(line.split(\":\", 1)[1].strip())
+    if set(capabilities) != {\"CapEff\", \"CapPrm\", \"CapAmb\", \"CapBnd\"}:
         raise RuntimeError(\"candidate capability evidence was incomplete\")
+    if no_new_privs != 1:
+        raise RuntimeError(\"candidate did not retain NoNewPrivs\")
     forbidden = (1 << 19) | (1 << 21)
     if any(value & forbidden for value in capabilities.values()):
         raise RuntimeError(\"candidate retained CAP_SYS_PTRACE or CAP_SYS_ADMIN\")
@@ -498,7 +518,7 @@ def custom_kernel(data):
     if libc.ptrace(16, parent, None, None) == 0:
         libc.ptrace(17, parent, None, None)
         raise RuntimeError(\"candidate attached to verifier parent\")
-    open(\"/work/cache/ferrl-attack-sentinel\", \"w\").write(\"caps-parent-access-denied-wrong-output-v1\")
+    open(\"/work/cache/ferrl-attack-sentinel\", \"w\").write(\"caps-nnp-parent-access-denied-wrong-output-v2\")
     x, mask, weights, config = data
     return x.clone()
 ```";
@@ -580,6 +600,7 @@ fn gate_import_protocol_corruption_is_a_low_candidate_outcome() {
     assert_import_attack_is_candidate_failure(
         CORRUPT_IMPORT_PROTOCOL,
         "import-protocol-corruption-rejected-v1",
+        "protocol-v1",
         "candidate import-time result-channel corruption must not become infrastructure failure",
     );
 }
@@ -589,7 +610,8 @@ fn gate_import_protocol_corruption_is_a_low_candidate_outcome() {
 fn gate_import_controller_loss_is_a_low_candidate_outcome() {
     assert_import_attack_is_candidate_failure(
         KILL_IMPORT_CONTROLLER,
-        "import-controller-loss-rejected-v1",
+        "import-controller-loss-after-ack-v2",
+        "controller-loss-v1",
         "candidate-induced controller loss must not become infrastructure failure",
     );
 }
@@ -599,7 +621,7 @@ fn gate_import_controller_loss_is_a_low_candidate_outcome() {
 fn gate_candidate_has_no_ptrace_admin_caps_or_parent_access() {
     assert_attack_reached_wrong_output(
         PROBE_PARENT_AND_CAPABILITIES,
-        "caps-parent-access-denied-wrong-output-v1",
+        "caps-nnp-parent-access-denied-wrong-output-v2",
         "candidate capabilities and verifier-parent access must be absent",
     );
 }
@@ -688,18 +710,13 @@ fn gate_attack_sources_record_after_attempts_before_the_wrong_output() {
         ),
         (
             CORRUPT_IMPORT_PROTOCOL,
-            "results.send_bytes",
+            "if not used_results_channel",
             "import-protocol-corruption-rejected-v1",
-        ),
-        (
-            KILL_IMPORT_CONTROLLER,
-            "os.kill(os.getppid(), signal.SIGKILL)",
-            "import-controller-loss-rejected-v1",
         ),
         (
             PROBE_PARENT_AND_CAPABILITIES,
             "libc.ptrace(16",
-            "caps-parent-access-denied-wrong-output-v1",
+            "caps-nnp-parent-access-denied-wrong-output-v2",
         ),
         (
             PROBE_RAW_DEVICE_BOUNDARY,
@@ -721,4 +738,18 @@ fn gate_attack_sources_record_after_attempts_before_the_wrong_output() {
             "attack {sentinel} does not record after all attempts and before wrong output"
         );
     }
+
+    let sentinel = KILL_IMPORT_CONTROLLER
+        .find("import-controller-loss-after-ack-v2")
+        .expect("controller-loss control records acknowledged entry before the kill");
+    let durable = KILL_IMPORT_CONTROLLER
+        .find("os.fsync(sentinel)")
+        .expect("controller-loss sentinel is durable before the kill");
+    let kill = KILL_IMPORT_CONTROLLER
+        .find("os.kill(os.getppid(), signal.SIGKILL)")
+        .expect("controller-loss control sends SIGKILL");
+    let survived = KILL_IMPORT_CONTROLLER
+        .find("controller survived SIGKILL")
+        .expect("a failed kill cannot fall through to ordinary wrong output");
+    assert!(sentinel < durable && durable < kill && kill < survived);
 }
