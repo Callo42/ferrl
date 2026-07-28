@@ -245,13 +245,8 @@ mod linux {
     const MAX_BINDS: usize = 32;
     const MAX_REQUEST_BYTES: usize = 1024 * 1024;
     const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
-    const JSON_CONTROL_ESCAPE_BYTES: usize = 6;
-    const OUTCOME_CAPTURE_FIELDS: usize = 3;
-    const RESPONSE_OVERHEAD_BYTES: usize = 1024 * 1024;
-    const _: () = assert!(
-        CAPTURE_CAP * JSON_CONTROL_ESCAPE_BYTES * OUTCOME_CAPTURE_FIELDS + RESPONSE_OVERHEAD_BYTES
-            <= MAX_RESPONSE_BYTES
-    );
+    // Three captures at six JSON bytes per escaped input byte, plus frame metadata.
+    const _: () = assert!(CAPTURE_CAP * 6 * 3 + 1024 * 1024 <= MAX_RESPONSE_BYTES);
     const SCRATCH_DIRECTORY_ENV: [&str; 2] = ["HOME", "TRITON_CACHE_DIR"];
     const REQUIRED_SEALS: rustix::fs::SealFlags = rustix::fs::SealFlags::WRITE
         .union(rustix::fs::SealFlags::GROW)
