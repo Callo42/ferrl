@@ -9,23 +9,25 @@ The contract applies to runs of `ferrl train --config <run.json>` where `task` i
 `trainer.candidate_log_top_k` high enough to persist the best sampled completions
 in `candidates.jsonl`; every production row is integrity-bound to the immutable
 launch payload, carries its own `record_sha256`, and is authenticated by the
-process-local Ed25519 key whose public half is committed in an externally attested
-launch. A later
+process-local Ed25519 key whose public half is committed in the launch. A later
 process cannot recover that capability: launch-bound candidate logging rejects
 a non-empty ledger before append, so checkpoint continuation must use a new run
 identity or disable candidate logging. TriMul candidate rows may also include
 `reward_diagnostic` (for example no submission, test failure, no pass grade, sandbox
 timeout, or missing/implausible benchmark data); preserve it in the run report when
 explaining low- or zero-reward tails. For reward-tail triage, set `candidate_log_top_k >=
-group_size` so every sampled completion is retained. At launch, `ferrl train`
-obtains a detached signature from the protected launch attestor, verifies it against
-the external trust policy, and only then commits `<run-dir>/launch.json` before
-Trainer publication. The attested payload binds the full resolved config,
+group_size` so every sampled completion is retained. At launch, `ferrl train` uses the
+explicit top-level `launch_authentication` mode. The default `local_ephemeral_v1`
+commits an unsigned launch for no-admin discovery; `external_attested_v1` obtains a
+detached signature from the protected launch attestor and verifies it against the
+external trust policy. There is no fallback between them. The launch payload binds the full resolved config,
 synchronized run identity, build-embedded training commit,
 exact model/checkpoint loader identity, exact tokenizer bytes, prompt, and candidate
 ledger contract. For TriMul it also binds the SHA-256 and byte length of the sandbox
 image, a digest and file count for the complete ordered eval tree, and the exact
-`task.yml` SHA-256 and byte length. Ferrl streams and hashes the image once into a
+`task.yml` SHA-256 and byte length, plus the selected verifier isolation tier, backend
+preflight evidence, timing metric, and protected runtime-control probe. Ferrl streams
+and hashes the image once into a
 kernel-sealed anonymous descriptor, gives every eval-tree file the same sealed
 storage, binds those exact descriptors rather than writable pathnames, revalidates
 source identities and kernel seals after attestation and around verifier use, and
@@ -44,12 +46,22 @@ requires `launch.json` to have the exact production-canonical encoding, then val
 its attestation, every candidate row, the exact selected row, the frozen prompt, and the
 live verifier assets before GPU detection or audit verification. It does not accept operator-authored
 completion, coordinate, reward, run, commit, model, tokenizer, eval, or sandbox
-provenance fields.
+provenance fields. The current artifact command accepts only an
+`external_attested_v1` launch audited under `dedicated_uid_service_v1`; a local or
+same-UID discovery run remains training evidence and returns a clear higher-assurance
+audit-required error.
 
-## External Launch Attestation
+## Launch Authentication
 
-Candidate-producing training and artifact extraction deliberately have no CLI or
-run-config override for the trust root. Deployment provides two protected system
+`local_ephemeral_v1` is the default discovery mode. It requires no system trust policy
+or attestor socket and permits launch-bound, signed candidate ledgers. It protects the
+run against accidental drift, cross-run substitution, and later loss of the ephemeral
+candidate signing key. It does not authenticate the launch against a process already
+controlling the same host account, so it cannot authorize artifact publication.
+
+`external_attested_v1` is the optional higher-assurance launch mode used for accepted
+publication. Candidate-producing training in this mode and artifact extraction have no
+CLI or run-config override for the trust root. Deployment provides two protected system
 surfaces:
 
 - `/etc/ferrl/launch-trust.json`: a root-owned regular file whose parent chain and
@@ -124,7 +136,7 @@ The wire shapes are:
 
 Domain hashes use SHA-256 over `u64_le(domain_length) || domain ||
 u64_le(field_length) || field` for each ordered field. The payload domain is
-`ferrl.run-launch.payload.v1` with the exact compact JSON bytes as its sole field.
+`ferrl.run-launch.payload.v2` with the exact compact JSON bytes as its sole field.
 The attestation message is the 64-byte lowercase hexadecimal result of the same
 construction under domain `ferrl.run-launch-attestation.v1`, with the ASCII launch
 payload digest as its sole field. Ed25519 signs those 64 message bytes directly.
@@ -188,7 +200,10 @@ discovery density. Custom profiles must preserve the reward ladder:
 remain fail-closed at zero.
 
 ```jsonc
+"launch_authentication": "local_ephemeral_v1",
 "trimul": {
+  "verifier_isolation_tier": "same_uid_apptainer_v1",
+  "verifier_apptainer_bin": "/usr/bin/apptainer",
   "reward": {
     "scheme": "trimul_shaped_v1",
     "format_extracted": 0.02,
@@ -200,6 +215,11 @@ remain fail-closed at zero.
   }
 }
 ```
+
+Omit `verifier_apptainer_bin` to use `/usr/bin/apptainer`. For the optional stronger
+backend, set `verifier_isolation_tier` to `dedicated_uid_service_v1`, omit
+`verifier_apptainer_bin`, and optionally set `verifier_executor_socket`. Mixed backend
+fields are rejected, and an unavailable selected backend never falls back.
 
 The top-level `run_health` schema configures post-run reward/correctness collapse,
 dropped-row, grad-spike, dark-telemetry, and source-dominance policies. `warn` reports a
@@ -242,16 +262,16 @@ with the final report:
 | Field | Required value |
 |---|---|
 | ferrl revision | Full git commit SHA embedded when the binary is built from a clean Git tree and sealed in `launch.json`; no runtime revision claim is accepted. |
-| launch attestation | Trusted external `key_id`, Ed25519 algorithm, and detached launch signature verified through `/etc/ferrl/launch-trust.json`; the private key and signing authority stay outside ferrl and the operator-writable run directory. |
+| launch authentication | Exact `launch_authentication` mode. `local_ephemeral_v1` needs no external service and is discovery-only. `external_attested_v1` additionally records a trusted external `key_id`, Ed25519 algorithm, and detached launch signature verified through `/etc/ferrl/launch-trust.json`; the private key and signing authority stay outside ferrl and the operator-writable run directory. |
 | run config | Original file SHA-256 plus the complete canonical resolved config stored in `launch.json`. |
 | prompt | The exact rendered model prompt bytes, frozen as `<run-dir>/prompt.txt` and sealed in `launch.json`; `prompt.sha256` remains a compatibility sidecar. Do not rely on a mutable local `trimul.prompt_path` for provenance. |
 | submission extraction | `trimul.submission_extract_mode` (`final_fence` or `thinking_after_think`); this controls parsing only and must not construct prompt text. |
 | reward profile | `trimul.reward`; defaults to `trimul_shaped_v1`, with custom ladder-preserving values allowed. |
 | run-health policy | `run_health`; post-run warn/fail policy, including the original top-level config passed to `ferrl runreport --config`. |
 | model | Loader-derived family, exact model/checkpoint policy SHA-256, exact tokenizer-file SHA-256, resolved EOS, LoRA rank/alpha, base dtype, and rollout seed, all sealed at launch. |
-| verifier executor | Protected Unix socket plus a dedicated non-root service UID distinct from the training UID. The service authenticates `SO_PEERCRED`, accepts only path-free requests with fully sealed read-only descriptors and fresh service-owned scratch, and launches a root-owned absolute Apptainer executable with `--no-privs --drop-caps all`. The socket parent/socket are service-owned with no world access, the parent is not group-writable, the pre-existing work root is service-owned mode `0700`, and socket I/O deadlines derive from the run wall budget. Record `trimul.verifier_executor_socket`. |
-| TriMul eval bundle | Attested SHA-256 over every ordered relative regular-file name and byte under `eval_dir`, plus the exact file count. Every captured file is held in a Linux kernel-sealed anonymous descriptor; after all seals are installed, the ordered descriptor contents are rehashed and required to equal the attested identity. Those descriptors cross only the authenticated executor socket via `SCM_RIGHTS`; the service revalidates the seals, copies and rehashes each asset into a unique service-private request directory, and supplies only the resulting read-only paths to Apptainer. The configured source path is informational only. |
-| sandbox image | Attested SHA-256 and byte length of the exact Apptainer image streamed into a kernel-sealed anonymous descriptor. After sealing, the descriptor is rehashed and required to equal the captured identity. The executor revalidates, copies, and rehashes it in service-private storage before launch. The configured source path is informational only. |
+| verifier assurance | Exact `trimul.verifier_isolation_tier`, backend preflight evidence and digest, tier-specific timing metric, and protected runtime-control evidence. `same_uid_apptainer_v1` is the default no-admin training tier: it uses a private user-owned mode-`0700` work root and a canonical root-owned Apptainer executable, but explicitly does not resist arbitrary hostile peers under the same host UID. `dedicated_uid_service_v1` uses a protected Unix socket and a distinct non-root service UID that authenticates `SO_PEERCRED`; it is the only audit tier accepted by the current artifact command. Neither tier falls back to the other. |
+| TriMul eval bundle | SHA-256 over every ordered relative regular-file name and byte under `eval_dir`, plus the exact file count. Every captured file is held in a Linux kernel-sealed anonymous descriptor; after all seals are installed, the ordered descriptor contents are rehashed and required to equal the launch identity. The selected backend copies and rehashes each asset into a unique private request directory and supplies only the resulting read-only paths to Apptainer. The dedicated backend receives descriptors over `SCM_RIGHTS`; the same-UID backend stages them in process. The configured source path is informational only. |
+| sandbox image | SHA-256 and byte length of the exact Apptainer image streamed into a kernel-sealed anonymous descriptor. After sealing, the descriptor is rehashed and required to equal the captured identity. The selected backend copies and rehashes it in private storage before launch. The configured source path is informational only. |
 | cases | Attested `task.yml` SHA-256 and byte length plus the loaded counts for `tests` and `benchmarks`. |
 | seeds | `data.seed`, `policy.seed`, trainer seed-bearing knobs, and the training `trimul.secret_seed`. |
 | scratch cap | `trimul.scratch_max_bytes`; `0` means the ferrl default, currently 1 GiB. |
@@ -262,12 +282,15 @@ with the final report:
 | budget | Trainer `steps`, `group_size`, wall-clock allocation, and the stop condition chosen below. |
 
 A discovery run must not start without a guarded same-GPU baseline in
-`trimul.baseline`. Its `metric` must be exactly `isolated-service-latency-v1`; legacy,
-unversioned, or upstream CUDA-event baselines are rejected. Measure it on the target GPU
-through the deployed executor with `ferrl trimul-baseline --config <run.json>`. Take at
-least three measurements, use the median `ns` in the config, and keep every raw value in
-the report. This is a ferrl end-to-end service-latency baseline, not a GPUMODE kernel
-runtime.
+`trimul.baseline`. Its `metric`, `isolation_tier`, and
+`isolation_evidence_sha256` must exactly match the active preflight. The metric is
+`same-uid-apptainer-latency-v1` for `same_uid_apptainer_v1` and
+`isolated-service-latency-v1` for `dedicated_uid_service_v1`; legacy, unversioned,
+upstream CUDA-event, cross-tier, or changed-backend baselines are rejected. Measure it
+on the target GPU through the selected backend with `ferrl trimul-baseline --config
+<run.json>`. Take at least three measurements, use the median `ns` in the config, and
+keep every raw value in the report. These are ferrl end-to-end latency baselines, not
+GPUMODE kernel runtimes.
 
 ## Artifact Definition
 
@@ -282,12 +305,12 @@ A candidate is an accepted artifact only when the final bundle contains all of:
 - `verification/`: the clean re-verification logs and benchmark summaries.
 - `report.md`: the human summary and operator checklist outcome.
 
-Artifact contract v2 replaces operator-composed candidate/model provenance with
-launch- and row-derived identities:
+Artifact contract v3 extends the launch- and row-derived v2 identities with the exact
+verifier tier and protected preflight/run evidence used for timing and correctness:
 
 ```json
 {
-  "contract_version": 2,
+  "contract_version": 3,
   "task": "trimul",
   "ferrl_commit": "<full git sha>",
   "run_id": "<run directory name>",
@@ -361,6 +384,8 @@ launch- and row-derived identities:
   },
   "baseline": {
     "metric": "isolated-service-latency-v1",
+    "isolation_tier": "dedicated_uid_service_v1",
+    "isolation_evidence_sha256": "<backend preflight evidence digest>",
     "gpu": "<nvidia-smi product name>",
     "measurements_ns": [0.0, 0.0, 0.0],
     "median_ns": 0.0,
@@ -368,8 +393,20 @@ launch- and row-derived identities:
   },
   "verification": {
     "gpu": "<nvidia-smi product name>",
+    "isolation_tier": "dedicated_uid_service_v1",
+    "isolation_evidence_sha256": "<backend preflight evidence digest>",
     "runs": [
       {
+        "isolation_tier": "dedicated_uid_service_v1",
+        "isolation_evidence_sha256": "<backend preflight evidence digest>",
+        "runtime_hardening_evidence_sha256": "<protected hardening digest>",
+        "runtime_hardening": [{
+          "contract": "ferrl.candidate-hardening.v1",
+          "no_new_privs": 1,
+          "seccomp_mode": 2,
+          "seccomp_tsync": true
+        }],
+        "timing_metric": "isolated-service-latency-v1",
         "correct": true,
         "geomean_ns": 0.0,
         "speedup": 0.0
@@ -381,7 +418,7 @@ launch- and row-derived identities:
 ```
 
 The remaining reward, eval, baseline, verification, and run-health fields retain their
-v1 meanings. Candidate completion, coordinates, training reward, run id, commit,
+prior meanings. Candidate completion, coordinates, training reward, run id, commit,
 model/checkpoint, tokenizer, prompt, eval path, and sandbox path are all derived from
 the verified run; only audit-time measurements and inspection evidence remain command
 inputs.
@@ -391,14 +428,20 @@ inputs.
 A TriMul run counts as a success only if one artifact candidate satisfies every rule:
 
 1. The candidate is extracted from a model completion, not hand-authored after the run.
-2. The candidate passes every correctness case in a clean re-verification run.
-3. Re-verification matches the attested eval-bundle, sandbox-image, and `task.yml`
+2. The immutable launch uses `external_attested_v1`; local-ephemeral discovery evidence
+   cannot authorize publication.
+3. The audit backend is `dedicated_uid_service_v1`, and its authenticated preflight and
+   protected runtime evidence are preserved in every verification run. Same-UID evidence
+   may drive training but cannot be relabeled or accepted here.
+4. The candidate passes every correctness case in a clean re-verification run.
+5. Re-verification matches the attested eval-bundle, sandbox-image, and `task.yml`
    content identities, uses the same GPU product name, and uses a fresh scratch directory.
-4. Re-verification uses an audit `trimul.secret_seed` that was not used for training.
-5. At least three clean benchmark re-runs are recorded for the candidate.
-6. Every run and the guarded baseline use `isolated-service-latency-v1`, and the median
+6. Re-verification uses an audit `trimul.secret_seed` that was not used for training.
+7. At least three clean benchmark re-runs are recorded for the candidate.
+8. Every audit run and the guarded baseline use `isolated-service-latency-v1`, carry
+   matching dedicated-tier preflight evidence, and the median
    candidate geometric-mean service latency is lower than the baseline median.
-7. The report states speedup as `baseline.median_ns / candidate.median_geomean_ns`.
+9. The report states speedup as `baseline.median_ns / candidate.median_geomean_ns`.
 
 If any correctness re-run fails, or if the GPU product name does not match the baseline
 pin, the candidate is rejected even if a prior training reward was high.
@@ -406,8 +449,11 @@ pin, the candidate is rejected even if a prior training reward was high.
 ## Dynamic Reward-Hacking Checks
 
 The TriMul reward already keeps candidate scratch bounded, denies network by default,
-and rejects implausibly fast timings. A dedicated-UID executor owns launch and strips
-all payload capabilities. A non-dumpable protected verifier process owns input
+and rejects implausibly fast timings. Both tiers strip active payload capabilities,
+install `NoNewPrivs`, and install a TSYNC seccomp deny policy before candidate entry.
+The dedicated tier additionally places staging and launch under a distinct service UID;
+the same-UID tier does not resist arbitrary malicious peers already running as the
+training user. A non-dumpable protected verifier process owns input
 generation, starts elapsed-time measurement before candidate input handoff, reconstructs
 each exact-size result from CPU bytes into parent-only storage, and owns correctness,
 statistics, and the machine grade. No CUDA tensor or allocator block crosses the process
@@ -428,9 +474,10 @@ For every candidate included in the final report:
 - Include rejected high-reward candidates in the report when they explain why the
   accepted candidate was not simply the highest training reward.
 
-These checks are deliberately operator-facing. They are not a proof against arbitrary
-malicious code; they are the Phase-1 guardrail for deciding whether the first run found
-a correct candidate with lower versioned ferrl service latency or a reward artifact.
+These checks are deliberately operator-facing. Same-UID discovery is not proof against
+an arbitrary malicious same-account peer; accepted publication requires the dedicated
+audit boundary above. The checks decide whether the run found a correct candidate with
+lower versioned ferrl latency or a reward artifact.
 
 ## Stopping Rule
 

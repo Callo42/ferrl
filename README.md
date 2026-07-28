@@ -305,23 +305,29 @@ reward curve. Before spending GPU time on a TriMul run, use the
 [TriMul Discovery Run Contract](docs/trimul-discovery-run-contract.md). It defines the
 artifact bundle, provenance fields, same-GPU baseline pin, held-out verification,
 dynamic reward-hacking checks, and the no-win stopping report that the operator audits.
-`ferrl train` refuses candidate-producing runs unless the binary embeds a clean,
-exact source commit and a protected external attestor authenticates `launch.json`
-before rollout. The launch payload integrity-binds the synchronized run identity, complete
-resolved config, model/checkpoint loader identity, exact tokenizer bytes, rendered
-prompt, per-run candidate key, and candidate-ledger contract. The attestor private key
-never enters ferrl or the run directory: deployment pins its public key in the protected
-`/etc/ferrl/launch-trust.json` policy and exposes the one-launch service at the protected
-`/run/ferrl/launch-attestor.sock`. Set `trainer.candidate_log_top_k` to a positive
-value for discovery runs so the best sampled completions are persisted in
-`candidates.jsonl`; every production row carries the externally attested launch digest,
-a digest over all candidate fields, and a signature from the attested per-run key.
+`ferrl train` requires a binary with a clean, exact embedded source commit. The default
+top-level `launch_authentication = "local_ephemeral_v1"` needs no administrator service:
+ferrl integrity-binds the synchronized run identity, complete resolved config,
+model/checkpoint loader identity, exact tokenizer bytes, rendered prompt, selected
+verifier tier and preflight evidence, per-run candidate key, and candidate-ledger
+contract in `launch.json`. This mode detects accidental drift and cross-run row
+substitution, but it is not external authenticity against a process already controlling
+the training account. Set `launch_authentication = "external_attested_v1"` to require
+the protected `/run/ferrl/launch-attestor.sock` service and
+`/etc/ferrl/launch-trust.json` policy before rollout; there is no fallback to local
+authentication. Set `trainer.candidate_log_top_k` to a positive value for discovery
+runs so the best sampled completions are persisted in `candidates.jsonl`; every row
+carries the launch digest, a digest over all candidate fields, and a signature from the
+launch-bound per-run key.
 Promote exactly one row with `ferrl trimul-artifact --run-dir
 <run-dir> --candidate-sha256 <record_sha256> ...`. The extractor validates the whole
 ledger and the external attestation against the protected trust policy, selects that exact row, and derives completion, coordinates, reward, model,
 tokenizer, config, run id, prompt, and training commit from immutable run evidence.
 The artifact bundle retains the exact verified `launch.json` and selected row bytes,
-with hashes for both in `manifest.json`.
+with hashes for both in `manifest.json`. Local-ephemeral launches and
+`same_uid_apptainer_v1` verifier evidence are valid for training and discovery, but
+`trimul-artifact` rejects them: accepted publication currently requires an externally
+attested launch whose audit runs use `dedicated_uid_service_v1`.
 For rollout-only diagnostics from an external inference runtime, use
 `ferrl trimul-score --config <run.json> --prompt-copy <prompt.txt>
 --completion <raw.txt> --out <scores.jsonl> --score-secret-seed <seed>` (or
@@ -349,31 +355,49 @@ the reward ladder: `format_extracted <= runnable` and
 `runnable + partial_correctness <= correctness`; implausibly fast benchmark timings
 remain fail-closed at zero.
 
-The training process retains the attested SIF, evaluator, submission, and rendered
-specifications in Linux kernel-sealed descriptors. It sends a path-free request plus
-those descriptors over `SCM_RIGHTS` to a protected verifier executor. That service must
-run as a dedicated non-root UID distinct from the training UID, authenticate the client
-with `SO_PEERCRED`, copy assets into a service-private request directory, create fresh
-scratch there, and own the Apptainer launch. Every payload launch includes
-`--no-privs --drop-caps all`; direct descriptor-backed launches are rejected. Candidate
-code therefore has neither `CAP_SYS_PTRACE`/`CAP_SYS_ADMIN` nor the training UID's
-namespace authority.
+The training process retains the SIF, evaluator, submission, and rendered specifications
+in Linux kernel-sealed descriptors. `trimul.verifier_isolation_tier` selects one of two
+non-interchangeable backends, with no fallback:
+
+- `same_uid_apptainer_v1` (default) is the no-admin discovery tier. Ferrl copies and
+  rehashes sealed assets into a fresh directory below a private mode-`0700` work root,
+  creates fresh scratch, and launches an absolute, root-owned, non-writable Apptainer
+  executable as the training UID.
+- `dedicated_uid_service_v1` sends a path-free request and the sealed descriptors over
+  `SCM_RIGHTS` to a protected non-root UID distinct from the training UID. The service
+  authenticates `SO_PEERCRED`, owns staging/scratch, and owns the Apptainer launch.
+
+Every payload launch uses `--userns`, `--containall`, `--no-home`, `--cleanenv`,
+`--no-eval`, `--disable-cache`, `--no-privs`, and `--drop-caps all`; disables
+ambient host/admin binds; and uses a network namespace with no network. The
+candidate payload then installs
+`NoNewPrivs` plus a TSYNC seccomp policy that denies ptrace/process-memory,
+mount/namespace, non-AF_UNIX socket, and other kernel attack surfaces. Launch-time
+preflight evidence and per-run protected hardening records are bound into the launch and
+candidate rows. The same-UID tier is nevertheless **not** a security boundary against an
+arbitrary malicious peer process already running under the same host UID; use a separate
+account/service or externally isolated runner when that threat is in scope.
 
 The verifier parent, protocol controller, and untrusted payload are separate
 non-dumpable processes. Trusted inputs/check storage stay in the verifier parent. Only
 bounded CPU byte strings cross into or out of the payload, so no parent CUDA allocation
 is exported through CUDA IPC. The controller alone owns the trusted status/output
 connections, while the parent owns the clock, exact-size output reconstruction,
-correctness checks, statistics, and the post-launch grade socket. The versioned metric
-`isolated-service-latency-v1` measures protected request handoff through receipt of the
-candidate's device-to-host result bytes. It is an end-to-end ferrl service-latency
-metric, not the upstream GPUMODE CUDA-event kernel runtime; only baselines carrying this
-exact metric are comparable.
+correctness checks, statistics, and the post-launch grade socket. The versioned metrics
+`same-uid-apptainer-latency-v1` and `isolated-service-latency-v1` measure protected
+request handoff through receipt of the candidate's device-to-host result bytes for the
+same-UID and dedicated tiers respectively. They are end-to-end ferrl latency metrics,
+not upstream GPUMODE CUDA-event kernel runtimes. A baseline binds its exact tier and
+preflight-evidence digest; metrics and evidence from different tiers are not comparable.
 
-An administrator must pre-create a service-owned, non-group-writable socket directory
-and a mode-`0700` work root, then run the executor under the dedicated UID (normally
-through a service manager). The Apptainer path must be absolute, root-owned,
-non-group/world-writable, and executable:
+No administrator setup is required for the default tier. Its work root defaults to
+`<trimul.scratch_root>/.ferrl-verifier`, is created mode `0700`, and must remain owned by
+the training UID. `trimul.verifier_apptainer_bin` may override `/usr/bin/apptainer` with
+another absolute, canonical, root-owned, non-group/world-writable executable.
+
+The optional dedicated tier requires an administrator to pre-create a service-owned,
+non-group-writable socket directory and a mode-`0700` work root, then run the executor
+under the dedicated UID (normally through a service manager):
 
 ```sh
 ferrl verifier-executor \
@@ -383,7 +407,8 @@ ferrl verifier-executor \
   --apptainer /usr/bin/apptainer
 ```
 
-Set `trimul.verifier_executor_socket` when deployment uses a non-default socket. The
+Set `trimul.verifier_isolation_tier = "dedicated_uid_service_v1"` and optionally
+`trimul.verifier_executor_socket` when deployment uses a non-default socket. The
 socket parent and socket must be owned by the executor UID and grant no world write or
 socket access; the socket parent must not be group-writable, and the work root must
 already be owned by that UID and grant no group/world permissions. Executor socket I/O
@@ -391,7 +416,10 @@ uses deadlines derived from the requested wall budget, so a stalled service cann
 a training rank indefinitely.
 
 ```jsonc
+"launch_authentication": "local_ephemeral_v1",
 "trimul": {
+  "verifier_isolation_tier": "same_uid_apptainer_v1",
+  "verifier_apptainer_bin": "/usr/bin/apptainer",
   "reward": {
     "scheme": "trimul_shaped_v1",
     "format_extracted": 0.02,

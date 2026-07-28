@@ -16,9 +16,13 @@
 //! unprivileged container runtime on HPC clusters. A run is one
 //! `apptainer exec` of a pinned image with:
 //!
-//! - `--containall` + `--no-home` + `--cleanenv` — private PID/IPC/env
-//!   namespaces and a minimal, read-only rootfs with **no host `$HOME`**, so no
-//!   ambient credentials or SSH keys are reachable;
+//! - `--userns` + `--containall` + `--no-home` + `--cleanenv` — an explicitly
+//!   unprivileged user-namespace launch, private PID/IPC/env namespaces, and a
+//!   minimal, read-only rootfs with **no host `$HOME`**;
+//! - `--no-eval --disable-cache --no-mount home,cwd,hostfs,bind-paths` beneath a
+//!   launcher environment cleared to a fixed operational allow-list, so ambient
+//!   Apptainer variables, configured binds, credentials, and shell evaluation
+//!   cannot alter the requested launch;
 //! - `--net --network none` (the default [`NetworkPolicy`]) — no network, removing
 //!   the exfiltration channel;
 //! - `--nv` only when [`RunSpec::gpu`] is set — GPU passthrough is opt-in;
@@ -26,9 +30,11 @@
 //!   scratch directory, nothing else;
 //! - `--no-privs --drop-caps all` unconditionally removes payload privilege and
 //!   Linux capabilities. Direct [`ApptainerSandbox`] runs accept ordinary host
-//!   paths only; kernel-sealed verifier descriptors must use the dedicated-UID
-//!   [`crate::verifier_executor::VerifierExecutorSandbox`], which transfers them
-//!   with `SCM_RIGHTS` and copies them into service-private paths;
+//!   paths only; kernel-sealed verifier descriptors must use a staged backend:
+//!   [`crate::verifier_executor::SameUidApptainerSandbox`] copies them into a private
+//!   caller-owned request root, while the dedicated-UID
+//!   [`crate::verifier_executor::VerifierExecutorSandbox`] transfers them with
+//!   `SCM_RIGHTS` and copies them into service-private paths;
 //! - in-image `ulimit`s (CPU, address space, processes, file size), beneath a
 //!   **host-side wall-clock supervisor** that is the final authority on the time
 //!   budget — it owns a fresh process group and kills the complete launch tree if
@@ -41,6 +47,11 @@
 //! - **bounded output capture** — at most `CAPTURE_CAP` bytes per stream are read
 //!   into host memory, so a payload spewing to stdout cannot exhaust the host;
 //!   past the cap the writer blocks on a full pipe and the supervisor reaps it.
+//!
+//! These controls constrain the launched payload. When staging and Apptainer run
+//! under the caller's UID, they do not isolate it from an arbitrary malicious peer
+//! process already running under that same host UID; the distinct-UID verifier
+//! service is the stronger boundary for that threat.
 //!
 //! ## Testing split (the same shape as [`crate::cuda_compat`])
 //!
@@ -239,15 +250,15 @@ impl Default for ResourceLimits {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunSpec {
     /// The container image — an Apptainer `.sif`, or any reference `apptainer
-    /// exec` accepts. Descriptor-backed images are accepted only by the protected
-    /// verifier executor.
+    /// exec` accepts. Descriptor-backed images are accepted only by a staged
+    /// verifier backend.
     pub image: PathBuf,
     /// The command + args to run *inside* the sandbox (e.g. `["python",
     /// "/work/eval.py"]`). This is **ferrl-controlled**; untrusted model code is
     /// delivered as a *file* under a [`Bind`], never spliced into this argv.
     pub command: Vec<String>,
     /// Host directories / files exposed inside, with their modes. Descriptor-backed
-    /// read-only sources are accepted only by the protected verifier executor.
+    /// read-only sources are accepted only by a staged verifier backend.
     pub binds: Vec<Bind>,
     /// Working directory inside the sandbox (`--pwd`).
     pub workdir: PathBuf,
@@ -400,17 +411,17 @@ pub enum SandboxError {
         /// Bounded wrapper/runtime diagnostics with the entry token removed.
         stderr: String,
     },
-    /// A protected verifier executor rejected or could not complete the request.
-    #[error("protected verifier executor failed: {0}")]
+    /// A staged verifier backend rejected or could not complete the request.
+    #[error("staged verifier execution failed: {0}")]
     Executor(String),
 }
 
 /// A backend that runs a [`RunSpec`] under isolation and returns its [`RunOutcome`].
 ///
-/// Production verifier rewards use
-/// [`crate::verifier_executor::VerifierExecutorSandbox`]; direct path-backed tools
-/// may use [`ApptainerSandbox`]. The trait keeps reward policy separate from either
-/// launch mechanism.
+/// Production verifier rewards use one of the staged backends in
+/// [`crate::verifier_executor`]; direct path-backed tools may use
+/// [`ApptainerSandbox`]. The trait keeps reward policy separate from either launch
+/// mechanism.
 pub trait Sandbox {
     /// Run `spec` to completion, or until its wall-clock budget elapses.
     ///
@@ -460,12 +471,23 @@ impl ApptainerSandbox {
     #[must_use]
     pub fn build_argv(&self, spec: &RunSpec) -> Vec<String> {
         let mut argv: Vec<String> = vec!["exec".into()];
+        // Force the unprivileged user-namespace path even when the installed
+        // Apptainer also has a setuid launcher. Unsupported kernels/runtimes fail
+        // before the verifier-entry marker instead of silently weakening the run.
+        argv.push("--userns".into());
         // Strong isolation: private PID/IPC/env namespaces + a minimal, read-only
         // rootfs, and crucially no host `$HOME` — so credentials and keys cannot
-        // be read. These three are unconditional.
+        // be read. These are unconditional.
         argv.push("--containall".into());
         argv.push("--no-home".into());
         argv.push("--cleanenv".into());
+        // Do not evaluate image/host environment values through Apptainer's
+        // embedded shell, consult its cache, or accept ambient CWD/hostfs/admin
+        // bind entries. Ferrl's explicit --bind arguments remain authoritative.
+        argv.push("--no-eval".into());
+        argv.push("--disable-cache".into());
+        argv.push("--no-mount".into());
+        argv.push("home,cwd,hostfs,bind-paths".into());
         argv.push("--no-privs".into());
         argv.push("--drop-caps".into());
         argv.push("all".into());
@@ -501,6 +523,21 @@ impl ApptainerSandbox {
     fn build_host_command(&self, spec: &RunSpec) -> Command {
         let mut command = Command::new(&self.bin);
         command.args(self.build_argv(spec));
+        // `--cleanenv` applies to the container payload, not to the Apptainer
+        // launcher itself. Clear APPTAINER_BIND*, APPTAINER_MOUNT,
+        // APPTAINERENV_*, SINGULARITY_*, LD_*, proxy, credential, and scheduler
+        // variables rather than letting ambient process state alter the launch.
+        // CUDA selection remains explicit in RunSpec::env via --env.
+        command.env_clear().envs([
+            (
+                "PATH",
+                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            ),
+            ("LANG", "C"),
+            ("LC_ALL", "C"),
+            ("HOME", "/nonexistent"),
+            ("TMPDIR", "/tmp"),
+        ]);
         command
     }
 }
@@ -543,7 +580,7 @@ fn validate_direct_apptainer_spec(spec: &RunSpec) -> Result<(), SandboxError> {
         .find(|(_, path)| is_owned_descriptor_path(path))
     {
         return Err(SandboxError::InvalidSpec(format!(
-            "{label} {} is descriptor-backed; sealed verifier assets require VerifierExecutorSandbox",
+            "{label} {} is descriptor-backed; sealed verifier assets require SameUidApptainerSandbox or VerifierExecutorSandbox",
             path.display()
         )));
     }
@@ -714,24 +751,25 @@ fn scratch_limits(spec: &RunSpec) -> Vec<ScratchLimit> {
 }
 
 /// The `bash -c` script run *inside* the image: apply the requested `ulimit`s, then
-/// `exec` the command. Each `ulimit` is `|| true` so a shell lacking one option does
-/// not abort an otherwise-benign run; the malicious-probe gate verifies the caps that
-/// matter are actually enforced. The wall-clock budget is **not** enforced here — the
-/// host-side supervisor owns it, so an in-container process cannot evade it.
+/// `exec` the command. A requested limit is mandatory: if the image shell cannot
+/// install it, the shell exits before the verifier-entry marker and the run is an
+/// infrastructure failure rather than silently running with a weaker policy. The
+/// wall-clock budget is **not** enforced here — the host-side supervisor owns it, so
+/// an in-container process cannot evade it.
 fn in_container_script(spec: &RunSpec) -> String {
     let limits = &spec.limits;
-    let mut script = String::new();
+    let mut script = String::from("umask 077; ");
     if let Some(cpu) = limits.cpu {
-        script.push_str(&format!("ulimit -t {} || true; ", cpu.as_secs().max(1)));
+        script.push_str(&format!("ulimit -t {} || exit 114; ", cpu.as_secs().max(1)));
     }
     if let Some(bytes) = limits.address_space {
-        script.push_str(&format!("ulimit -v {} || true; ", bytes / 1024));
+        script.push_str(&format!("ulimit -v {} || exit 114; ", bytes / 1024));
     }
     if let Some(procs) = limits.max_procs {
-        script.push_str(&format!("ulimit -u {procs} || true; "));
+        script.push_str(&format!("ulimit -u {procs} || exit 114; "));
     }
     if let Some(bytes) = limits.max_file {
-        script.push_str(&format!("ulimit -f {} || true; ", bytes / 1024));
+        script.push_str(&format!("ulimit -f {} || exit 114; ", bytes / 1024));
     }
     let quoted: Vec<String> = spec.command.iter().map(|word| shell_quote(word)).collect();
     script.push_str(&format!(
@@ -1258,14 +1296,20 @@ mod tests {
         let argv = ApptainerSandbox::default().build_argv(&spec());
         for flag in [
             "exec",
+            "--userns",
             "--containall",
             "--no-home",
             "--cleanenv",
+            "--no-eval",
+            "--disable-cache",
+            "--no-mount",
             "--no-privs",
             "--drop-caps",
         ] {
             assert!(pos(&argv, flag).is_some(), "argv missing {flag}");
         }
+        let no_mount = pos(&argv, "--no-mount").unwrap();
+        assert_eq!(argv[no_mount + 1], "home,cwd,hostfs,bind-paths");
         let drop_caps = pos(&argv, "--drop-caps").unwrap();
         assert_eq!(argv[drop_caps + 1], "all");
     }
@@ -1340,12 +1384,50 @@ mod tests {
     }
 
     #[test]
+    fn host_launcher_environment_is_an_exact_allowlist() {
+        use std::collections::BTreeMap;
+
+        let command = ApptainerSandbox::default().build_host_command(
+            &spec().with_env(vec![("CUDA_VISIBLE_DEVICES".into(), "2,3".into())]),
+        );
+        let environment = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            environment,
+            BTreeMap::from([
+                ("HOME".into(), Some("/nonexistent".into())),
+                ("LANG".into(), Some("C".into())),
+                ("LC_ALL".into(), Some("C".into())),
+                (
+                    "PATH".into(),
+                    Some("/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into())
+                ),
+                ("TMPDIR".into(), Some("/tmp".into())),
+            ])
+        );
+        let argv = command
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(argv
+            .windows(2)
+            .any(|words| words[0] == "--env" && words[1] == "CUDA_VISIBLE_DEVICES=2,3"));
+    }
+
+    #[test]
     fn direct_backend_rejects_descriptor_backed_assets() {
         let descriptor = PathBuf::from(format!("/proc/{}/fd/10", std::process::id()));
         let error = validate_direct_apptainer_spec(&RunSpec::new(descriptor, vec!["true".into()]))
             .unwrap_err()
             .to_string();
-        assert!(error.contains("require VerifierExecutorSandbox"));
+        assert!(error.contains("require SameUidApptainerSandbox or VerifierExecutorSandbox"));
     }
 
     #[test]
@@ -1397,7 +1479,9 @@ mod tests {
         assert!(script.contains("ulimit -v 2097152")); // 2 GiB / 1 KiB
         assert!(script.contains("ulimit -u 64"));
         assert!(script.contains("ulimit -f 8192")); // 8 MiB / 1 KiB
-                                                    // No in-image timeout: the host supervisor owns the wall-clock budget.
+        assert_eq!(script.matches("|| exit 114").count(), 4);
+        assert!(script.starts_with("umask 077; "));
+        // No in-image timeout: the host supervisor owns the wall-clock budget.
         assert!(!script.contains("timeout"));
         assert!(script.contains(SANDBOX_ENTRY_MARKER));
         assert!(script.contains("exec 'python' '/work/eval.py'"));
@@ -1415,7 +1499,9 @@ mod tests {
         assert!(!script.contains("ulimit"));
         assert_eq!(
             script,
-            format!("printf '%s\\n' '{SANDBOX_ENTRY_MARKER}' >&2; exec 'python' '/work/eval.py'")
+            format!(
+                "umask 077; printf '%s\\n' '{SANDBOX_ENTRY_MARKER}' >&2; exec 'python' '/work/eval.py'"
+            )
         );
     }
 

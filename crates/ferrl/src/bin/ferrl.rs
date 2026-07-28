@@ -655,6 +655,10 @@ struct BaselineCfg {
     gpu: String,
     /// Exact protected timing metric used to produce `ns`.
     metric: String,
+    /// Verifier isolation tier under which this baseline was measured.
+    isolation_tier: ferrl::VerifierIsolationTier,
+    /// SHA-256 of the canonical verifier preflight evidence used for this baseline.
+    isolation_evidence_sha256: String,
 }
 
 /// TriMul task knobs (read only when `task == "trimul"`): the sandboxed eval image and
@@ -679,7 +683,14 @@ struct TrimulCfg {
     /// Node-local scratch root for per-candidate dirs; prefer a tmpfs root such as
     /// `/dev/shm/ferrl`.
     scratch_root: PathBuf,
-    /// Protected dedicated-UID verifier executor socket. Omit for the system default.
+    /// Explicit verifier assurance tier. The no-admin same-UID Apptainer tier is the
+    /// default; selecting the dedicated tier never falls back to it.
+    verifier_isolation_tier: ferrl::VerifierIsolationTier,
+    /// Trusted absolute Apptainer executable for the same-UID tier. Omit for
+    /// `/usr/bin/apptainer`.
+    verifier_apptainer_bin: Option<PathBuf>,
+    /// Protected dedicated-UID verifier executor socket. Valid only with
+    /// `dedicated_uid_service_v1`; omit for that tier's system default.
     verifier_executor_socket: Option<PathBuf>,
     /// Host-supervised total byte cap for one candidate's writable scratch tree
     /// (`0` -> the reward default, 1 GiB).
@@ -700,6 +711,18 @@ struct TrimulCfg {
     baseline: Option<BaselineCfg>,
     /// Versioned shaped training-reward profile.
     reward: ferrl::trimul::TrimulRewardProfile,
+}
+
+/// How the immutable launch is authenticated before candidate rows are published.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum LaunchAuthenticationMode {
+    /// Process-local discovery integrity. This mode requires no administrator service
+    /// and is deliberately ineligible for accepted artifact publication.
+    #[default]
+    LocalEphemeralV1,
+    /// Root-trusted external launch attestation used by publication-grade audits.
+    ExternalAttestedV1,
 }
 
 /// Discovery-health policy schema.
@@ -1092,6 +1115,9 @@ struct RunConfig {
     device: DeviceSel,
     /// Where run directories are written (default `runs/`).
     out_dir: PathBuf,
+    /// Launch-authentication boundary. Local ephemeral authentication is sufficient
+    /// for no-admin discovery but cannot authorize artifact publication.
+    launch_authentication: LaunchAuthenticationMode,
     /// Policy-load knobs.
     policy: PolicyCfg,
     /// Dataset knobs.
@@ -1138,11 +1164,12 @@ impl Serialize for RunConfig {
             }
         }
 
-        let mut state = serializer.serialize_struct("RunConfig", 11)?;
+        let mut state = serializer.serialize_struct("RunConfig", 12)?;
         state.serialize_field("task", &self.task)?;
         state.serialize_field("model_dir", &self.model_dir)?;
         state.serialize_field("device", &self.device)?;
         state.serialize_field("out_dir", &self.out_dir)?;
+        state.serialize_field("launch_authentication", &self.launch_authentication)?;
         state.serialize_field("policy", &self.policy)?;
         state.serialize_field("data", &self.data)?;
         state.serialize_field("distributed", &self.distributed)?;
@@ -1174,6 +1201,8 @@ struct RunConfigWire {
     device: DeviceSel,
     #[serde(default = "default_out_dir")]
     out_dir: PathBuf,
+    #[serde(default)]
+    launch_authentication: LaunchAuthenticationMode,
     #[serde(default)]
     policy: PolicyCfg,
     #[serde(default)]
@@ -1226,6 +1255,7 @@ impl<'de> Deserialize<'de> for RunConfig {
             model_dir: wire.model_dir,
             device: wire.device,
             out_dir: wire.out_dir,
+            launch_authentication: wire.launch_authentication,
             policy: wire.policy,
             data: wire.data,
             distributed: wire.distributed,
@@ -1312,6 +1342,34 @@ impl RunConfig {
                 "task {:?} requires data.train_n >= 1",
                 self.task
             )));
+        }
+        if self.task == "trimul" {
+            match self.trimul.verifier_isolation_tier {
+                ferrl::VerifierIsolationTier::SameUidApptainerV1 => {
+                    if self.trimul.verifier_executor_socket.is_some() {
+                        return Err(CliError::msg(
+                            "trimul.verifier_executor_socket is valid only with \"dedicated_uid_service_v1\"; same-UID verification never falls back to or contacts the executor service",
+                        ));
+                    }
+                    if self
+                        .trimul
+                        .verifier_apptainer_bin
+                        .as_ref()
+                        .is_some_and(|path| !path.is_absolute())
+                    {
+                        return Err(CliError::msg(
+                            "trimul.verifier_apptainer_bin must be an absolute path",
+                        ));
+                    }
+                }
+                ferrl::VerifierIsolationTier::DedicatedUidServiceV1 => {
+                    if self.trimul.verifier_apptainer_bin.is_some() {
+                        return Err(CliError::msg(
+                            "trimul.verifier_apptainer_bin is valid only with \"same_uid_apptainer_v1\"; the dedicated service owns its Apptainer executable",
+                        ));
+                    }
+                }
+            }
         }
         if self.task == "countdown" {
             self.data
@@ -1537,10 +1595,22 @@ impl RunConfig {
             .map_err(|error| CliError::msg(error.to_string()))
     }
 
-    fn configure_verifier_executor(&self, reward: TrimulReward) -> TrimulReward {
-        match &self.trimul.verifier_executor_socket {
-            Some(socket) => reward.with_verifier_executor_socket(socket),
-            None => reward,
+    fn configure_verifier_isolation(&self, reward: TrimulReward) -> TrimulReward {
+        match self.trimul.verifier_isolation_tier {
+            ferrl::VerifierIsolationTier::SameUidApptainerV1 => reward.with_same_uid_apptainer(
+                self.trimul.scratch_root.join(".ferrl-verifier"),
+                self.trimul
+                    .verifier_apptainer_bin
+                    .as_deref()
+                    .unwrap_or_else(|| Path::new("/usr/bin/apptainer")),
+            ),
+            ferrl::VerifierIsolationTier::DedicatedUidServiceV1 => reward
+                .with_verifier_executor_socket(
+                    self.trimul
+                        .verifier_executor_socket
+                        .as_deref()
+                        .unwrap_or_else(|| Path::new(ferrl::DEFAULT_VERIFIER_EXECUTOR_SOCKET)),
+                ),
         }
     }
 
@@ -1556,7 +1626,7 @@ impl RunConfig {
             .with_secret_seed(t.secret_seed)
             .with_wall(wall);
         let mut reward = self
-            .configure_verifier_executor(reward)
+            .configure_verifier_isolation(reward)
             .with_reward_profile(t.reward)
             .map_err(CliError::msg)?;
         if let Some(devices) = &t.verifier_cuda_visible_devices {
@@ -1596,9 +1666,41 @@ impl RunConfig {
             .build_trimul_reward_base_with_assets(assets)?
             .with_submission_extract_mode(mode);
         if let Some(b) = &self.trimul.baseline {
-            guard_baseline_metric(&b.metric)?;
+            guard_baseline_metric(&b.metric, self.trimul.verifier_isolation_tier)?;
+            validate_lower_sha256(
+                "trimul.baseline.isolation_evidence_sha256",
+                &b.isolation_evidence_sha256,
+            )?;
+            if b.isolation_tier != self.trimul.verifier_isolation_tier {
+                return Err(CliError::msg(
+                    "trimul.baseline.isolation_tier does not match trimul.verifier_isolation_tier",
+                ));
+            }
             guard_baseline_gpu(&b.gpu)?;
             reward = reward.with_baseline_ns(b.ns);
+        }
+        Ok(reward)
+    }
+
+    fn preflight_trimul_reward(&self, reward: TrimulReward) -> Result<TrimulReward, CliError> {
+        let reward = reward.with_verified_isolation().map_err(|error| {
+            CliError::msg(format!("verifier isolation preflight failed: {error}"))
+        })?;
+        let reward = reward.with_verified_runtime().map_err(|error| {
+            CliError::msg(format!("verifier runtime preflight failed: {error}"))
+        })?;
+        if let Some(baseline) = &self.trimul.baseline {
+            let isolation = reward
+                .verifier_isolation_evidence()
+                .map_err(|error| CliError::msg(error.to_string()))?;
+            if baseline.isolation_tier != isolation.tier
+                || baseline.isolation_evidence_sha256
+                    != verifier_isolation_evidence_sha256(&isolation)
+            {
+                return Err(CliError::msg(
+                    "trimul.baseline isolation tier/evidence does not match the active verifier; re-measure the baseline through this exact backend",
+                ));
+            }
         }
         Ok(reward)
     }
@@ -1610,7 +1712,7 @@ struct LoadedRunConfig {
     consensus_digest: [u8; 32],
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LaunchConfigSnapshot {
     source_sha256: String,
@@ -1618,8 +1720,9 @@ struct LaunchConfigSnapshot {
     resolved: serde_json::Value,
 }
 
-const LAUNCH_CONTRACT_VERSION: u32 = 1;
+const LAUNCH_CONTRACT_VERSION: u32 = 2;
 const LAUNCH_KIND: &str = "ferrl.run-launch";
+const LAUNCH_PAYLOAD_DOMAIN: &str = "ferrl.run-launch.payload.v2";
 const CANDIDATE_RECORD_DOMAIN: &str = CandidateRecord::DIGEST_DOMAIN;
 const LAUNCH_ATTESTATION_CONTRACT_VERSION: u32 = 1;
 const LAUNCH_ATTESTATION_KIND: &str = "ferrl.run-launch-attestation";
@@ -1647,14 +1750,90 @@ struct LaunchManifest {
 struct LaunchPayload {
     task: String,
     ferrl_commit: String,
+    authentication: LaunchAuthenticationMode,
     run: LaunchRunIdentity,
     config: LaunchConfigSnapshot,
     model: LaunchModelIdentity,
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt: Option<LaunchPromptIdentity>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    verifier: Option<ferrl::trimul::TrimulVerifierIdentity>,
+    verifier: Option<LaunchVerifierIdentity>,
     candidate_ledger: LaunchCandidateLedger,
+}
+
+/// Launch-bound TriMul assets and selected verifier assurance evidence.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LaunchVerifierIdentity {
+    assets: ferrl::trimul::TrimulVerifierIdentity,
+    isolation: ferrl::VerifierIsolationEvidence,
+    isolation_evidence_sha256: String,
+    timing_metric: String,
+    runtime_hardening_contract: String,
+    runtime_preflight: ferrl::trimul::TrimulRuntimePreflightEvidence,
+    runtime_preflight_evidence_sha256: String,
+}
+
+fn verifier_isolation_evidence_sha256(evidence: &ferrl::VerifierIsolationEvidence) -> String {
+    ferrl::trimul::verifier_isolation_evidence_sha256(evidence)
+}
+
+fn runtime_hardening_evidence_sha256(records: &[serde_json::Value]) -> Result<String, CliError> {
+    let encoded = records
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            CliError::msg(format!(
+                "serialize candidate runtime hardening evidence: {error}"
+            ))
+        })?;
+    let fields = encoded.iter().map(String::as_bytes).collect::<Vec<_>>();
+    Ok(domain_sha256(
+        "ferrl.trimul-runtime-hardening-evidence.v1",
+        &fields,
+    ))
+}
+
+fn launch_verifier_identity(
+    reward: &TrimulReward,
+    assets: &ferrl::trimul::TrimulVerifierAssets,
+) -> Result<LaunchVerifierIdentity, CliError> {
+    let isolation = reward.verifier_isolation_evidence().map_err(|error| {
+        CliError::msg(format!("verifier preflight revalidation failed: {error}"))
+    })?;
+    let runtime_preflight = reward
+        .runtime_preflight_evidence()
+        .map_err(|error| CliError::msg(format!("runtime control preflight failed: {error}")))?;
+    Ok(LaunchVerifierIdentity {
+        assets: assets.identity().clone(),
+        isolation_evidence_sha256: verifier_isolation_evidence_sha256(&isolation),
+        timing_metric: ferrl::trimul::timing_metric_for_tier(isolation.tier).to_string(),
+        runtime_hardening_contract: ferrl::trimul::TRIMUL_RUNTIME_HARDENING_CONTRACT.to_string(),
+        runtime_preflight_evidence_sha256: ferrl::trimul::runtime_preflight_evidence_sha256(
+            &runtime_preflight,
+        ),
+        runtime_preflight,
+        isolation,
+    })
+}
+
+fn portable_verifier_consensus(identity: &LaunchVerifierIdentity) -> Result<Vec<u8>, CliError> {
+    serde_json::to_vec(&(
+        identity.isolation.contract_version,
+        identity.isolation.tier,
+        identity.isolation.uid_boundary,
+        identity.isolation.asset_transport,
+        &identity.isolation.apptainer_sha256,
+        identity.isolation.apptainer_len_bytes,
+        &identity.isolation.apptainer_version,
+        &identity.timing_metric,
+        &identity.runtime_hardening_contract,
+        identity.runtime_preflight.contract_version,
+        &identity.runtime_preflight.probe_submission_sha256,
+        &identity.runtime_preflight.runtime_hardening,
+    ))
+    .map_err(|error| CliError::msg(format!("serialize verifier consensus evidence: {error}")))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1783,7 +1962,7 @@ impl LaunchManifest {
         Ok(Self {
             contract_version: LAUNCH_CONTRACT_VERSION,
             kind: LAUNCH_KIND.to_owned(),
-            payload_sha256: domain_sha256("ferrl.run-launch.payload.v1", &[&payload_bytes]),
+            payload_sha256: domain_sha256(LAUNCH_PAYLOAD_DOMAIN, &[&payload_bytes]),
             payload,
             attestation: None,
         })
@@ -2161,6 +2340,7 @@ fn train_with_launch_runtime_and_source_result(
                 &eval,
                 None,
                 None,
+                None,
                 &launch,
                 launch_runtime,
             )
@@ -2179,12 +2359,13 @@ fn train_with_launch_runtime_and_source_result(
                 &eval,
                 None,
                 None,
+                None,
                 &launch,
                 launch_runtime,
             )
         }
         "trimul" => {
-            let (prompt_file_bytes, train, eval, reward, verifier_assets) =
+            let (prompt_file_bytes, train, eval, reward, verifier_assets, verifier_identity) =
                 coordinate_distributed_result(
                     launch_comm,
                     "TriMul reward and dataset setup",
@@ -2193,9 +2374,19 @@ fn train_with_launch_runtime_and_source_result(
                         let prompt = cfg.trimul_prompt_text(&prompt_file_bytes)?;
                         let (train, eval) = cfg.trimul_splits_from_prompt(&prompt);
                         let verifier_assets = cfg.capture_trimul_verifier_assets()?;
-                        let reward =
-                            cfg.build_trimul_reward_with_assets(verifier_assets.clone())?;
-                        Ok((prompt_file_bytes, train, eval, reward, verifier_assets))
+                        let reward = cfg.preflight_trimul_reward(
+                            cfg.build_trimul_reward_with_assets(verifier_assets.clone())?,
+                        )?;
+                        let verifier_identity =
+                            launch_verifier_identity(&reward, &verifier_assets)?;
+                        Ok((
+                            prompt_file_bytes,
+                            train,
+                            eval,
+                            reward,
+                            verifier_assets,
+                            verifier_identity,
+                        ))
                     })(),
                 )?;
             run_training(
@@ -2206,6 +2397,7 @@ fn train_with_launch_runtime_and_source_result(
                 &eval,
                 Some(&prompt_file_bytes),
                 Some(&verifier_assets),
+                Some(&verifier_identity),
                 &launch,
                 launch_runtime,
             )
@@ -2229,10 +2421,15 @@ fn run_training<R: RewardFn>(
     eval: &[Sample<R::Target>],
     rendered_prompt_bytes: Option<&[u8]>,
     verifier_assets: Option<&ferrl::trimul::TrimulVerifierAssets>,
+    verifier_identity: Option<&LaunchVerifierIdentity>,
     launch: &LaunchContext,
     launch_runtime: Option<LaunchRuntime>,
 ) -> Result<(), CliError> {
     let launch_attestor = SystemLaunchAttestor;
+    let launch_attestor: Option<&dyn LaunchAttestor> = match cfg.launch_authentication {
+        LaunchAuthenticationMode::LocalEphemeralV1 => None,
+        LaunchAuthenticationMode::ExternalAttestedV1 => Some(&launch_attestor),
+    };
     run_training_with_loader(
         cfg,
         device,
@@ -2241,9 +2438,10 @@ fn run_training<R: RewardFn>(
         eval,
         rendered_prompt_bytes,
         verifier_assets,
+        verifier_identity,
         launch,
         launch_runtime,
-        Some(&launch_attestor),
+        launch_attestor,
         |model_dir, device, opts| {
             ferrl::load_auto_policy_with_identity(model_dir, device, opts).map_err(CliError::from)
         },
@@ -2273,6 +2471,7 @@ fn run_training_with_loader<P, R>(
     eval: &[Sample<R::Target>],
     rendered_prompt_bytes: Option<&[u8]>,
     verifier_assets: Option<&ferrl::trimul::TrimulVerifierAssets>,
+    verifier_identity: Option<&LaunchVerifierIdentity>,
     launch: &LaunchContext,
     launch_runtime: Option<LaunchRuntime>,
     launch_attestor: Option<&dyn LaunchAttestor>,
@@ -2348,7 +2547,17 @@ where
         coordinate_distributed_result(launch_comm, "model and EOS setup", model_setup)?;
     validate_resolved_eos_consensus(tcfg.eos_token_id, launch_comm)?;
     let prompt_sha256 = rendered_prompt_bytes.map(sha256_hex);
-    let verifier_identity = verifier_assets.map(|assets| assets.identity().clone());
+    let verifier_assets_identity = verifier_assets.map(|assets| assets.identity().clone());
+    if (verifier_assets.is_some() || verifier_identity.is_some()) != (cfg.task == "trimul")
+        || verifier_assets.is_some() != verifier_identity.is_some()
+    {
+        return Err(CliError::msg(
+            "TriMul launch requires both verifier assets and isolation evidence, while non-TriMul launches require neither",
+        ));
+    }
+    let portable_verifier = verifier_identity
+        .map(portable_verifier_consensus)
+        .transpose()?;
     let common_provenance = serde_json::to_vec(&(
         &launch.ferrl_commit,
         &launch.run.group_id,
@@ -2356,7 +2565,8 @@ where
         &policy_identity.tokenizer_sha256,
         policy_identity.model_family,
         &prompt_sha256,
-        &verifier_identity,
+        &verifier_assets_identity,
+        &portable_verifier,
     ))
     .map_err(|error| CliError::msg(format!("serialize launch provenance: {error}")))?;
     validate_launch_value_consensus(
@@ -2372,6 +2582,7 @@ where
         let manifest = LaunchManifest::new(LaunchPayload {
             task: cfg.task.clone(),
             ferrl_commit: launch.ferrl_commit.clone(),
+            authentication: cfg.launch_authentication,
             run: launch.run.clone(),
             config: launch.config.clone(),
             model: LaunchModelIdentity {
@@ -2385,7 +2596,7 @@ where
                 sha256: sha256_hex(bytes),
                 len_bytes: bytes.len(),
             }),
-            verifier: verifier_identity,
+            verifier: verifier_identity.cloned(),
             candidate_ledger: LaunchCandidateLedger {
                 file: RunDir::CANDIDATES_FILE.to_owned(),
                 format_version: 1,
@@ -2394,26 +2605,24 @@ where
                 signing_public_key,
             },
         })?;
-        let manifest = if cfg.trainer.candidate_log_top_k > 0 {
-            let attestor = launch_attestor.ok_or_else(|| {
-                CliError::msg(
-                    "launch-authenticated candidate logging requires an external attestor",
-                )
-            })?;
-            manifest.attest(attestor)?
-        } else {
-            manifest
+        let manifest = match cfg.launch_authentication {
+            LaunchAuthenticationMode::LocalEphemeralV1 => manifest,
+            LaunchAuthenticationMode::ExternalAttestedV1 => {
+                let attestor = launch_attestor.ok_or_else(|| {
+                    CliError::msg(
+                        "launch_authentication = \"external_attested_v1\" requires the protected external launch attestor",
+                    )
+                })?;
+                manifest.attest(attestor)?
+            }
         };
         Ok((candidate_signer, manifest))
     })();
-    let (candidate_signer, manifest) = coordinate_distributed_result(
-        launch_comm,
-        "external launch attestation",
-        attestation_setup,
-    )?;
+    let (candidate_signer, manifest) =
+        coordinate_distributed_result(launch_comm, "launch authentication", attestation_setup)?;
     coordinate_distributed_result(
         launch_comm,
-        "attested verifier asset revalidation",
+        "launch-bound verifier revalidation",
         verifier_assets.map_or(Ok(()), |assets| {
             assets
                 .verify_current()
@@ -2944,25 +3153,29 @@ fn guard_baseline_gpu(configured: &str) -> Result<(), CliError> {
     baseline_gpu_matches(configured, detect_gpu_name().as_deref()).map_err(CliError::Msg)
 }
 
-fn guard_baseline_metric(metric: &str) -> Result<(), CliError> {
-    if metric == ferrl::trimul::TRIMUL_TIMING_METRIC {
+fn guard_baseline_metric(metric: &str, tier: ferrl::VerifierIsolationTier) -> Result<(), CliError> {
+    let expected = ferrl::trimul::timing_metric_for_tier(tier);
+    if metric == expected {
         Ok(())
     } else {
         Err(CliError::msg(format!(
-            "trimul.baseline.metric must be {:?}; old or unversioned baselines must be re-measured",
-            ferrl::trimul::TRIMUL_TIMING_METRIC
+            "trimul.baseline.metric must be {expected:?}; old or unversioned baselines must be re-measured"
         )))
     }
 }
 
 /// Dispatch `ferrl trimul-baseline`: run the bundled reference kernel through the
-/// sandboxed eval on this node's GPU, and print `{ "ns", "gpu" }` to paste into the run
-/// config's `trimul.baseline` (the guarded pin).
+/// sandboxed eval on this node's GPU, and print the latency, GPU, tier, metric, and
+/// preflight-evidence digest to paste into the run config's `trimul.baseline`.
 fn trimul_baseline(args: &TrimulBaselineArgs) -> Result<(), CliError> {
     let _ = ferrl::init_tracing();
     let cfg = RunConfig::load(&args.config)?;
     // Measure against the un-pinned reward (we are producing the baseline, not using one).
-    let reward = cfg.build_trimul_reward_base()?;
+    let reward = cfg.preflight_trimul_reward(cfg.build_trimul_reward_base()?)?;
+    let isolation = reward
+        .verifier_isolation_evidence()
+        .map_err(|error| CliError::msg(format!("baseline verifier preflight failed: {error}")))?;
+    let isolation_evidence_sha256 = verifier_isolation_evidence_sha256(&isolation);
     let gpu = detect_gpu_name().ok_or_else(|| {
         CliError::msg(
             "cannot read this node's GPU (nvidia-smi unavailable); run on the target GPU node",
@@ -2977,7 +3190,9 @@ fn trimul_baseline(args: &TrimulBaselineArgs) -> Result<(), CliError> {
     let pin = serde_json::json!({
         "ns": ns,
         "gpu": gpu,
-        "metric": ferrl::trimul::TRIMUL_TIMING_METRIC,
+        "metric": ferrl::trimul::timing_metric_for_tier(isolation.tier),
+        "isolation_tier": isolation.tier,
+        "isolation_evidence_sha256": isolation_evidence_sha256,
     });
     println!(
         "{}",
@@ -3024,7 +3239,7 @@ fn trimul_score(args: &TrimulScoreArgs) -> Result<(), CliError> {
     validate_trimul_score_inputs(&inputs)?;
 
     let reward = cfg
-        .build_trimul_reward()?
+        .preflight_trimul_reward(cfg.build_trimul_reward()?)?
         .with_secret_seed(args.score_secret_seed);
     let sample = Sample::new(String::new(), ());
     let completions: Vec<String> = inputs.iter().map(|i| i.completion.clone()).collect();
@@ -3360,6 +3575,14 @@ fn trimul_score_record(
 /// One clean artifact-verification run written under `verification/`.
 #[derive(Debug, Clone, Serialize)]
 struct ArtifactVerificationRun {
+    /// Verifier isolation tier that produced this protected result.
+    isolation_tier: ferrl::VerifierIsolationTier,
+    /// Digest of the exact backend preflight evidence checked for this run.
+    isolation_evidence_sha256: String,
+    /// Digest of the protected in-container hardening record.
+    runtime_hardening_evidence_sha256: String,
+    /// Canonical protected hardening records retained for independent inspection.
+    runtime_hardening: Vec<serde_json::Value>,
     /// Versioned timing metric used for every benchmark mean.
     timing_metric: String,
     /// Whether the candidate passed every correctness case.
@@ -3541,6 +3764,10 @@ struct EvalManifest {
 struct BaselineManifest {
     /// Versioned timing metric used for every measurement.
     metric: String,
+    /// Verifier isolation tier used to measure the baseline.
+    isolation_tier: ferrl::VerifierIsolationTier,
+    /// Digest of the exact verifier preflight evidence used for the baseline.
+    isolation_evidence_sha256: String,
     /// GPU product name seen during extraction.
     gpu: String,
     /// Raw baseline measurements, in ns.
@@ -3556,6 +3783,10 @@ struct BaselineManifest {
 struct VerificationManifest {
     /// GPU product name seen during extraction.
     gpu: String,
+    /// Higher-assurance tier used for artifact audit runs.
+    isolation_tier: ferrl::VerifierIsolationTier,
+    /// Digest of the audit verifier preflight evidence.
+    isolation_evidence_sha256: String,
     /// Clean re-verification runs.
     runs: Vec<ArtifactVerificationRun>,
     /// Whether this bundle satisfies the mechanical artifact acceptance checks.
@@ -3676,6 +3907,7 @@ fn load_bound_run_candidate_with_trust(
                 index + 1
             )));
         }
+        verify_candidate_verifier_provenance(&record, &launch, index + 1)?;
         if record.rank != launch.payload.run.data_parallel_rank
             || record.world_size != launch.payload.run.data_parallel_world_size
         {
@@ -3719,6 +3951,98 @@ fn load_bound_run_candidate_with_trust(
         candidate,
         candidate_row_bytes,
     })
+}
+
+fn verify_candidate_verifier_provenance(
+    record: &CandidateRecord,
+    launch: &LaunchManifest,
+    row_number: usize,
+) -> Result<(), CliError> {
+    let verifier = launch.payload.verifier.as_ref().ok_or_else(|| {
+        CliError::msg("TriMul launch manifest is missing verifier isolation evidence")
+    })?;
+    let metadata = record
+        .reward_metadata
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            CliError::msg(format!(
+                "candidate ledger row {row_number} is missing structured verifier reward metadata"
+            ))
+        })?;
+    let expected_tier = verifier.isolation.tier.as_str();
+    let expected_metric = ferrl::trimul::timing_metric_for_tier(verifier.isolation.tier);
+    if metadata
+        .get("verifier_isolation_tier")
+        .and_then(serde_json::Value::as_str)
+        != Some(expected_tier)
+        || metadata
+            .get("verifier_isolation_evidence_sha256")
+            .and_then(serde_json::Value::as_str)
+            != Some(verifier.isolation_evidence_sha256.as_str())
+        || metadata
+            .get("timing_metric")
+            .and_then(serde_json::Value::as_str)
+            != Some(expected_metric)
+        || metadata
+            .get("runtime_preflight_evidence_sha256")
+            .and_then(serde_json::Value::as_str)
+            != Some(verifier.runtime_preflight_evidence_sha256.as_str())
+    {
+        return Err(CliError::msg(format!(
+            "candidate ledger row {row_number} verifier tier/evidence does not match launch.json"
+        )));
+    }
+    let extracted = metadata
+        .get("submission_extracted")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| {
+            CliError::msg(format!(
+                "candidate ledger row {row_number} omits submission extraction evidence"
+            ))
+        })?;
+    let executed = metadata
+        .get("verification_executed")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| {
+            CliError::msg(format!(
+                "candidate ledger row {row_number} omits verification execution evidence"
+            ))
+        })?;
+    if extracted != executed {
+        return Err(CliError::msg(format!(
+            "candidate ledger row {row_number} has inconsistent extraction/execution evidence"
+        )));
+    }
+    if executed {
+        let runtime_hardening = metadata
+            .get("runtime_hardening")
+            .and_then(serde_json::Value::as_array);
+        let runtime_digest = runtime_hardening
+            .map(|records| runtime_hardening_evidence_sha256(records))
+            .transpose()?;
+        let expected_runtime = verifier.runtime_preflight.runtime_hardening.first();
+        if metadata.get("verifier_isolation_evidence")
+            != Some(&serde_json::to_value(&verifier.isolation).map_err(|error| {
+                CliError::msg(format!("serialize launch verifier evidence: {error}"))
+            })?)
+            || runtime_hardening.is_none_or(Vec::is_empty)
+            || runtime_hardening.is_some_and(|records| {
+                records
+                    .iter()
+                    .any(|record| Some(record) != expected_runtime)
+            })
+            || metadata
+                .get("runtime_hardening_evidence_sha256")
+                .and_then(serde_json::Value::as_str)
+                != runtime_digest.as_deref()
+        {
+            return Err(CliError::msg(format!(
+                "candidate ledger row {row_number} omits or changes protected verifier run evidence"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn parse_exact_launch_manifest(
@@ -3806,6 +4130,22 @@ fn verify_launch_config_identity(
     launch: &LaunchManifest,
     config: &RunConfig,
 ) -> Result<(), CliError> {
+    if launch.payload.authentication != config.launch_authentication {
+        return Err(CliError::msg(
+            "launch authentication mode disagrees with the resolved run config",
+        ));
+    }
+    if config.task == "trimul"
+        && launch
+            .payload
+            .verifier
+            .as_ref()
+            .is_none_or(|verifier| verifier.isolation.tier != config.trimul.verifier_isolation_tier)
+    {
+        return Err(CliError::msg(
+            "launch verifier isolation tier disagrees with the resolved run config",
+        ));
+    }
     let run = &launch.payload.run;
     let tensor_parallel = config.tensor_parallel_plan();
     if run.tensor_parallel_rank != tensor_parallel.rank()
@@ -3884,23 +4224,121 @@ fn verify_launch_manifest_payload(manifest: &LaunchManifest) -> Result<(), CliEr
         &manifest.payload.candidate_ledger.signing_public_key,
         32,
     )?;
+    if manifest.payload.authentication == LaunchAuthenticationMode::LocalEphemeralV1
+        && manifest.attestation.is_some()
+    {
+        return Err(CliError::msg(
+            "local_ephemeral_v1 launch must not carry an external attestation that could upgrade its authentication label",
+        ));
+    }
     if let Some(prompt) = &manifest.payload.prompt {
         validate_lower_sha256("launch prompt sha256", &prompt.sha256)?;
     }
     match (&manifest.payload.verifier, manifest.payload.task.as_str()) {
         (Some(verifier), "trimul") => {
-            validate_lower_sha256("launch verifier image_sha256", &verifier.image_sha256)?;
+            let assets = &verifier.assets;
+            validate_lower_sha256("launch verifier image_sha256", &assets.image_sha256)?;
             validate_lower_sha256(
                 "launch verifier eval_bundle_sha256",
-                &verifier.eval_bundle_sha256,
+                &assets.eval_bundle_sha256,
             )?;
-            validate_lower_sha256("launch verifier task_yml_sha256", &verifier.task_yml_sha256)?;
-            if verifier.image_len_bytes == 0
-                || verifier.eval_file_count == 0
-                || verifier.task_yml_len_bytes == 0
+            validate_lower_sha256("launch verifier task_yml_sha256", &assets.task_yml_sha256)?;
+            validate_lower_sha256(
+                "launch verifier isolation_evidence_sha256",
+                &verifier.isolation_evidence_sha256,
+            )?;
+            validate_lower_sha256(
+                "launch verifier runtime_preflight_evidence_sha256",
+                &verifier.runtime_preflight_evidence_sha256,
+            )?;
+            validate_lower_sha256(
+                "launch verifier preflight probe_submission_sha256",
+                &verifier.runtime_preflight.probe_submission_sha256,
+            )?;
+            validate_lower_sha256(
+                "launch verifier preflight runtime_hardening_evidence_sha256",
+                &verifier.runtime_preflight.runtime_hardening_evidence_sha256,
+            )?;
+            if assets.image_len_bytes == 0
+                || assets.eval_file_count == 0
+                || assets.task_yml_len_bytes == 0
             {
                 return Err(CliError::msg(
                     "TriMul launch verifier identity has an empty required asset",
+                ));
+            }
+            let runtime_hardening_sha256 =
+                runtime_hardening_evidence_sha256(&verifier.runtime_preflight.runtime_hardening)?;
+            if verifier.isolation.contract_version != ferrl::VERIFIER_ISOLATION_EVIDENCE_VERSION
+                || verifier.isolation_evidence_sha256
+                    != verifier_isolation_evidence_sha256(&verifier.isolation)
+                || verifier.timing_metric
+                    != ferrl::trimul::timing_metric_for_tier(verifier.isolation.tier)
+                || verifier.runtime_hardening_contract
+                    != ferrl::trimul::TRIMUL_RUNTIME_HARDENING_CONTRACT
+                || verifier.runtime_preflight.contract_version != 1
+                || verifier.runtime_preflight.isolation_tier != verifier.isolation.tier
+                || verifier.runtime_preflight.isolation_evidence_sha256
+                    != verifier.isolation_evidence_sha256
+                || verifier.runtime_preflight.runtime_hardening.is_empty()
+                || verifier.runtime_preflight.runtime_hardening_evidence_sha256
+                    != runtime_hardening_sha256
+                || verifier
+                    .runtime_preflight
+                    .runtime_hardening
+                    .iter()
+                    .any(|record| {
+                        record.get("contract").and_then(serde_json::Value::as_str)
+                            != Some(ferrl::trimul::TRIMUL_RUNTIME_HARDENING_CONTRACT)
+                    })
+                || verifier.runtime_preflight_evidence_sha256
+                    != ferrl::trimul::runtime_preflight_evidence_sha256(&verifier.runtime_preflight)
+            {
+                return Err(CliError::msg(
+                    "TriMul launch verifier isolation evidence is unsupported or inconsistent",
+                ));
+            }
+            let boundary_matches = matches!(
+                (
+                    verifier.isolation.tier,
+                    verifier.isolation.uid_boundary,
+                    verifier.isolation.asset_transport,
+                ),
+                (
+                    ferrl::VerifierIsolationTier::SameUidApptainerV1,
+                    ferrl::VerifierUidBoundary::SameHostUid,
+                    ferrl::VerifierAssetTransport::InProcessSealedCopy,
+                ) | (
+                    ferrl::VerifierIsolationTier::DedicatedUidServiceV1,
+                    ferrl::VerifierUidBoundary::DistinctHostUid,
+                    ferrl::VerifierAssetTransport::ScmRightsSealedCopy,
+                )
+            );
+            validate_lower_sha256(
+                "launch verifier apptainer_sha256",
+                &verifier.isolation.apptainer_sha256,
+            )?;
+            if !boundary_matches
+                || verifier.isolation.requester_uid == 0
+                || verifier.isolation.launcher_uid == 0
+                || verifier.isolation.work_root_uid != verifier.isolation.launcher_uid
+                || match verifier.isolation.tier {
+                    ferrl::VerifierIsolationTier::SameUidApptainerV1 => {
+                        verifier.isolation.requester_uid != verifier.isolation.launcher_uid
+                    }
+                    ferrl::VerifierIsolationTier::DedicatedUidServiceV1 => {
+                        verifier.isolation.requester_uid == verifier.isolation.launcher_uid
+                    }
+                }
+                || !verifier.isolation.apptainer_path.is_absolute()
+                || !verifier.isolation.work_root.is_absolute()
+                || verifier.isolation.apptainer_len_bytes == 0
+                || verifier.isolation.apptainer_version.trim().is_empty()
+                || verifier.isolation.work_root_mode != 0o700
+                || verifier.isolation.work_root_inode == 0
+            {
+                return Err(CliError::msg(
+                    "TriMul launch verifier evidence does not prove its declared tier",
                 ));
             }
         }
@@ -3938,7 +4376,7 @@ fn verify_launch_manifest_payload(manifest: &LaunchManifest) -> Result<(), CliEr
     }
     let payload_bytes = serde_json::to_vec(&manifest.payload)
         .map_err(|error| CliError::msg(format!("serialize launch payload: {error}")))?;
-    let expected = domain_sha256("ferrl.run-launch.payload.v1", &[&payload_bytes]);
+    let expected = domain_sha256(LAUNCH_PAYLOAD_DOMAIN, &[&payload_bytes]);
     if manifest.payload_sha256 != expected {
         return Err(CliError::msg(format!(
             "launch payload hash mismatch: recorded {}, computed {expected}",
@@ -4016,8 +4454,34 @@ fn validate_lower_hex(label: &str, value: &str, bytes: usize) -> Result<(), CliE
 /// Dispatch `ferrl trimul-artifact`: extract `custom_kernel` from a model completion,
 /// re-verify it with an audit seed, and write the contract artifact bundle.
 fn trimul_artifact(args: &TrimulArtifactArgs) -> Result<(), CliError> {
+    require_publication_eligible_launch(&args.run_dir)?;
     let trust_policy = load_system_launch_trust_policy()?;
     trimul_artifact_with_trust(args, &trust_policy)
+}
+
+fn require_publication_eligible_launch(run_dir: &Path) -> Result<(), CliError> {
+    let launch_path = run_dir.join(RunDir::LAUNCH_FILE);
+    let launch_bytes = read_regular_bytes(&launch_path)?;
+    let launch = parse_exact_launch_manifest(&launch_path, &launch_bytes)?;
+    verify_launch_manifest_payload(&launch)?;
+    require_publication_eligible_manifest(&launch)
+}
+
+fn require_publication_eligible_manifest(launch: &LaunchManifest) -> Result<(), CliError> {
+    if launch.payload.authentication != LaunchAuthenticationMode::ExternalAttestedV1 {
+        return Err(CliError::msg(
+            "this candidate was discovered under local_ephemeral_v1 launch authentication; accepted artifact publication requires an independent externally attested higher-assurance audit",
+        ));
+    }
+    let verifier = launch.payload.verifier.as_ref().ok_or_else(|| {
+        CliError::msg("TriMul launch manifest is missing verifier isolation evidence")
+    })?;
+    if verifier.isolation.tier != ferrl::VerifierIsolationTier::DedicatedUidServiceV1 {
+        return Err(CliError::msg(
+            "same_uid_apptainer_v1 evidence may drive discovery but cannot publish an accepted artifact; rerun the candidate under dedicated_uid_service_v1 or a separately versioned stronger audit boundary",
+        ));
+    }
+    Ok(())
 }
 
 fn trimul_artifact_with_trust(
@@ -4032,6 +4496,7 @@ fn trimul_artifact_with_trust(
     }
     let bound =
         load_bound_run_candidate_with_trust(&args.run_dir, &args.candidate_sha256, trust_policy)?;
+    require_publication_eligible_manifest(&bound.launch)?;
     let cfg = &bound.config;
     if args.audit_secret_seed == cfg.trimul.secret_seed {
         return Err(CliError::msg(
@@ -4041,7 +4506,7 @@ fn trimul_artifact_with_trust(
     let baseline = cfg.trimul.baseline.as_ref().ok_or_else(|| {
         CliError::msg("trimul-artifact requires trimul.baseline in the run config")
     })?;
-    guard_baseline_metric(&baseline.metric)?;
+    guard_baseline_metric(&baseline.metric, cfg.trimul.verifier_isolation_tier)?;
     let verifier_assets = capture_attested_trimul_verifier_assets(cfg, &bound.launch)?;
     let baseline_median = median_checked(&args.baseline_measurements_ns, "baseline-ns")?;
     require_baseline_matches_config(baseline_median, baseline.ns)?;
@@ -4055,8 +4520,29 @@ fn trimul_artifact_with_trust(
     let raw_completion = &bound.candidate.completion;
     let extract_mode = cfg.trimul_submission_extract_mode()?;
     let mut reward = cfg
-        .build_trimul_reward_base_with_assets(verifier_assets.clone())?
+        .preflight_trimul_reward(
+            cfg.build_trimul_reward_base_with_assets(verifier_assets.clone())?,
+        )?
         .with_submission_extract_mode(extract_mode);
+    let audit_verifier = launch_verifier_identity(&reward, &verifier_assets)?;
+    let launch_verifier = bound
+        .launch
+        .payload
+        .verifier
+        .as_ref()
+        .expect("publication eligibility requires verifier evidence");
+    if &audit_verifier != launch_verifier {
+        return Err(CliError::msg(
+            "dedicated verifier preflight evidence differs from the launch-bound training evidence; blocker-6 audit handoff is not yet available",
+        ));
+    }
+    if baseline.isolation_tier != audit_verifier.isolation.tier
+        || baseline.isolation_evidence_sha256 != audit_verifier.isolation_evidence_sha256
+    {
+        return Err(CliError::msg(
+            "trimul.baseline verifier isolation evidence differs from the dedicated audit backend",
+        ));
+    }
     let submission = reward.extract_submission(raw_completion).ok_or_else(|| {
         CliError::msg("completion does not contain a closed non-empty fenced code block")
     })?;
@@ -4102,7 +4588,7 @@ fn capture_attested_trimul_verifier_assets(
         CliError::msg("TriMul launch manifest is missing verifier asset identity")
     })?;
     let assets = cfg.capture_trimul_verifier_assets()?;
-    if assets.identity() != expected {
+    if assets.identity() != &expected.assets {
         return Err(CliError::msg(
             "live TriMul verifier assets do not match the attested launch identity",
         ));
@@ -4199,14 +4685,18 @@ fn verify_submission_repeated(
     (0..repeats)
         .map(|_| {
             let v = reward
-                .verify_submission(submission)
+                .verify_submission_with_evidence(submission)
                 .map_err(|e| CliError::msg(format!("artifact verification failed: {e}")))?;
             Ok(ArtifactVerificationRun {
-                timing_metric: ferrl::trimul::TRIMUL_TIMING_METRIC.to_string(),
-                correct: v.correct,
-                benchmark_means_ns: v.benchmark_means_ns,
-                geomean_ns: v.geomean_ns,
-                speedup: v.speedup,
+                isolation_tier: v.isolation.tier,
+                isolation_evidence_sha256: v.isolation_evidence_sha256,
+                runtime_hardening_evidence_sha256: v.runtime_hardening_evidence_sha256,
+                runtime_hardening: v.runtime_hardening,
+                timing_metric: ferrl::trimul::timing_metric_for_tier(v.isolation.tier).to_string(),
+                correct: v.verification.correct,
+                benchmark_means_ns: v.verification.benchmark_means_ns,
+                geomean_ns: v.verification.geomean_ns,
+                speedup: v.verification.speedup,
             })
         })
         .collect()
@@ -4217,9 +4707,13 @@ fn verify_submission_repeated(
 fn accepted_artifact(runs: &[ArtifactVerificationRun], baseline_median: f64) -> bool {
     let geos: Vec<f64> = runs.iter().filter_map(|r| r.geomean_ns).collect();
     geos.len() == runs.len()
-        && runs
-            .iter()
-            .all(|run| run.timing_metric == ferrl::trimul::TRIMUL_TIMING_METRIC)
+        && runs.iter().all(|run| {
+            run.isolation_tier == ferrl::VerifierIsolationTier::DedicatedUidServiceV1
+                && run.timing_metric == ferrl::trimul::timing_metric_for_tier(run.isolation_tier)
+                && !run.isolation_evidence_sha256.is_empty()
+                && !run.runtime_hardening_evidence_sha256.is_empty()
+                && !run.runtime_hardening.is_empty()
+        })
         && runs.iter().all(|r| r.correct)
         && median_checked(&geos, "candidate geomean")
             .is_ok_and(|candidate| candidate < baseline_median)
@@ -4274,7 +4768,7 @@ fn build_manifest(
         .expect("verified TriMul launch must bind verifier assets");
     let candidate = inputs.candidate;
     ArtifactManifest {
-        contract_version: 2,
+        contract_version: 3,
         task: "trimul",
         ferrl_commit: launch.ferrl_commit.clone(),
         run_id: launch.run.run_id.clone(),
@@ -4340,18 +4834,20 @@ fn build_manifest(
         },
         eval: EvalManifest {
             bundle_path: cfg.trimul.eval_dir.display().to_string(),
-            bundle_sha256: verifier.eval_bundle_sha256.clone(),
-            bundle_file_count: verifier.eval_file_count,
+            bundle_sha256: verifier.assets.eval_bundle_sha256.clone(),
+            bundle_file_count: verifier.assets.eval_file_count,
             sandbox_image_path: cfg.trimul.image.display().to_string(),
-            sandbox_image_sha256: verifier.image_sha256.clone(),
-            sandbox_image_len_bytes: verifier.image_len_bytes,
-            task_yml_sha256: verifier.task_yml_sha256.clone(),
-            task_yml_len_bytes: verifier.task_yml_len_bytes,
+            sandbox_image_sha256: verifier.assets.image_sha256.clone(),
+            sandbox_image_len_bytes: verifier.assets.image_len_bytes,
+            task_yml_sha256: verifier.assets.task_yml_sha256.clone(),
+            task_yml_len_bytes: verifier.assets.task_yml_len_bytes,
             test_cases: inputs.test_cases,
             benchmark_cases: inputs.benchmark_cases,
         },
         baseline: BaselineManifest {
-            metric: ferrl::trimul::TRIMUL_TIMING_METRIC.to_string(),
+            metric: ferrl::trimul::timing_metric_for_tier(verifier.isolation.tier).to_string(),
+            isolation_tier: verifier.isolation.tier,
+            isolation_evidence_sha256: verifier.isolation_evidence_sha256.clone(),
             gpu: inputs.gpu.clone(),
             measurements_ns: args.baseline_measurements_ns.clone(),
             median_ns: inputs.baseline_median,
@@ -4362,6 +4858,8 @@ fn build_manifest(
         },
         verification: VerificationManifest {
             gpu: inputs.gpu.clone(),
+            isolation_tier: verifier.isolation.tier,
+            isolation_evidence_sha256: verifier.isolation_evidence_sha256.clone(),
             runs: inputs.runs.clone(),
             accepted: inputs.accepted,
         },
@@ -4621,7 +5119,12 @@ fn artifact_report(
     );
     push_check(
         &mut out,
-        manifest.baseline.metric == ferrl::trimul::TRIMUL_TIMING_METRIC
+        manifest.baseline.isolation_tier == ferrl::VerifierIsolationTier::DedicatedUidServiceV1
+            && manifest.verification.isolation_tier == manifest.baseline.isolation_tier
+            && manifest.verification.isolation_evidence_sha256
+                == manifest.baseline.isolation_evidence_sha256
+            && manifest.baseline.metric
+                == ferrl::trimul::timing_metric_for_tier(manifest.baseline.isolation_tier)
             && manifest
                 .verification
                 .runs
@@ -5874,6 +6377,87 @@ mod tests {
         }
     }
 
+    fn test_runtime_hardening_record() -> serde_json::Value {
+        serde_json::json!({
+            "arch": "x86_64",
+            "cap_amb": "0000000000000000",
+            "cap_bnd": "00000000a80425fb",
+            "cap_eff": "0000000000000000",
+            "cap_inh": "0000000000000000",
+            "cap_prm": "0000000000000000",
+            "cgroup": false,
+            "contract": ferrl::trimul::TRIMUL_RUNTIME_HARDENING_CONTRACT,
+            "denial_probes": ["bpf", "io_uring", "namespace", "network", "parent_proc", "pidfd_getfd", "process_vm", "ptrace"],
+            "dumpable": 0,
+            "landlock": false,
+            "network_socket_policy": "af_unix_only",
+            "no_new_privs": 1,
+            "physical_gpu_isolation": false,
+            "seccomp_filters": 1,
+            "seccomp_mode": 2,
+            "seccomp_policy": "x86_64-tsync-af-unix-v1",
+            "seccomp_tsync": true,
+            "unix_socket_probe": true,
+        })
+    }
+
+    fn test_launch_verifier_identity(
+        assets: ferrl::trimul::TrimulVerifierIdentity,
+        tier: ferrl::VerifierIsolationTier,
+    ) -> LaunchVerifierIdentity {
+        let dedicated = tier == ferrl::VerifierIsolationTier::DedicatedUidServiceV1;
+        let isolation = ferrl::VerifierIsolationEvidence {
+            contract_version: ferrl::VERIFIER_ISOLATION_EVIDENCE_VERSION,
+            tier,
+            requester_uid: 1000,
+            launcher_uid: if dedicated { 1001 } else { 1000 },
+            uid_boundary: if dedicated {
+                ferrl::VerifierUidBoundary::DistinctHostUid
+            } else {
+                ferrl::VerifierUidBoundary::SameHostUid
+            },
+            asset_transport: if dedicated {
+                ferrl::VerifierAssetTransport::ScmRightsSealedCopy
+            } else {
+                ferrl::VerifierAssetTransport::InProcessSealedCopy
+            },
+            apptainer_path: PathBuf::from("/usr/bin/apptainer"),
+            apptainer_sha256: "88".repeat(32),
+            apptainer_len_bytes: 123,
+            apptainer_version: "apptainer version 1.4.0".to_string(),
+            work_root: PathBuf::from("/var/tmp/ferrl-verifier"),
+            work_root_uid: if dedicated { 1001 } else { 1000 },
+            work_root_device: 1,
+            work_root_inode: 2,
+            work_root_mode: 0o700,
+        };
+        let isolation_evidence_sha256 = verifier_isolation_evidence_sha256(&isolation);
+        let runtime_hardening = vec![test_runtime_hardening_record()];
+        let runtime_preflight = ferrl::trimul::TrimulRuntimePreflightEvidence {
+            contract_version: 1,
+            isolation_tier: tier,
+            isolation_evidence_sha256: isolation_evidence_sha256.clone(),
+            probe_submission_sha256: "99".repeat(32),
+            runtime_hardening_evidence_sha256: runtime_hardening_evidence_sha256(
+                &runtime_hardening,
+            )
+            .unwrap(),
+            runtime_hardening,
+        };
+        LaunchVerifierIdentity {
+            assets,
+            isolation,
+            isolation_evidence_sha256,
+            timing_metric: ferrl::trimul::timing_metric_for_tier(tier).to_string(),
+            runtime_hardening_contract: ferrl::trimul::TRIMUL_RUNTIME_HARDENING_CONTRACT
+                .to_string(),
+            runtime_preflight_evidence_sha256: ferrl::trimul::runtime_preflight_evidence_sha256(
+                &runtime_preflight,
+            ),
+            runtime_preflight,
+        }
+    }
+
     fn launch_context_for_test(
         cfg: &RunConfig,
         run_id: String,
@@ -5970,6 +6554,7 @@ mod tests {
         std::fs::write(&prompt, b"exact prompt").unwrap();
         let mut value: serde_json::Value =
             serde_json::from_str(&trimul_score_test_config(4242)).unwrap();
+        value["launch_authentication"] = serde_json::json!("external_attested_v1");
         value["model_dir"] = serde_json::json!(model_dir);
         value["out_dir"] = serde_json::json!(out_dir);
         value["trimul"]["prompt_path"] = serde_json::json!(prompt);
@@ -6024,34 +6609,44 @@ mod tests {
     ) -> (LaunchManifest, CandidateSigner) {
         let context = launch_context_for_test(cfg, run_id.to_owned(), 0, 1);
         let signer = CandidateSigner::generate().unwrap();
-        let manifest = attest_launch_for_test(
-            LaunchManifest::new(LaunchPayload {
-                task: cfg.task.clone(),
-                ferrl_commit: context.ferrl_commit,
-                run: context.run,
-                config: context.config,
-                model: LaunchModelIdentity {
-                    family: "gemma4".to_owned(),
-                    checkpoint_policy_sha256: "33".repeat(32),
-                    tokenizer_sha256: "44".repeat(32),
-                    resolved_eos_token_id: None,
-                },
-                prompt: Some(LaunchPromptIdentity {
-                    file: RunDir::PROMPT_FILE.to_owned(),
-                    sha256: sha256_hex(prompt),
-                    len_bytes: prompt.len(),
-                }),
-                verifier: (cfg.task == "trimul").then(test_trimul_verifier_identity),
-                candidate_ledger: LaunchCandidateLedger {
-                    file: RunDir::CANDIDATES_FILE.to_owned(),
-                    format_version: 1,
-                    row_digest_domain: CANDIDATE_RECORD_DOMAIN.to_owned(),
-                    row_signature_algorithm: "ed25519".to_owned(),
-                    signing_public_key: signer.public_key_hex(),
-                },
-            })
-            .unwrap(),
-        );
+        let manifest = LaunchManifest::new(LaunchPayload {
+            task: cfg.task.clone(),
+            ferrl_commit: context.ferrl_commit,
+            authentication: cfg.launch_authentication,
+            run: context.run,
+            config: context.config,
+            model: LaunchModelIdentity {
+                family: "gemma4".to_owned(),
+                checkpoint_policy_sha256: "33".repeat(32),
+                tokenizer_sha256: "44".repeat(32),
+                resolved_eos_token_id: None,
+            },
+            prompt: Some(LaunchPromptIdentity {
+                file: RunDir::PROMPT_FILE.to_owned(),
+                sha256: sha256_hex(prompt),
+                len_bytes: prompt.len(),
+            }),
+            verifier: (cfg.task == "trimul").then(|| {
+                test_launch_verifier_identity(
+                    test_trimul_verifier_identity(),
+                    cfg.trimul.verifier_isolation_tier,
+                )
+            }),
+            candidate_ledger: LaunchCandidateLedger {
+                file: RunDir::CANDIDATES_FILE.to_owned(),
+                format_version: 1,
+                row_digest_domain: CANDIDATE_RECORD_DOMAIN.to_owned(),
+                row_signature_algorithm: "ed25519".to_owned(),
+                signing_public_key: signer.public_key_hex(),
+            },
+        })
+        .unwrap();
+        let manifest = if cfg.launch_authentication == LaunchAuthenticationMode::ExternalAttestedV1
+        {
+            attest_launch_for_test(manifest)
+        } else {
+            manifest
+        };
         (manifest, signer)
     }
 
@@ -6061,7 +6656,23 @@ mod tests {
         completion: &str,
     ) -> CandidateRecord {
         let mut candidate = CandidateRecord::new(0, 0, 1, 12, 1, 1.5, 3, completion.to_owned());
-        candidate.reward_metadata = Some(serde_json::json!({ "correct": true }));
+        let verifier = launch
+            .payload
+            .verifier
+            .as_ref()
+            .expect("TriMul test launch carries verifier evidence");
+        candidate.reward_metadata = Some(serde_json::json!({
+            "correct": true,
+            "submission_extracted": true,
+            "verification_executed": true,
+            "verifier_isolation_tier": verifier.isolation.tier.as_str(),
+            "verifier_isolation_evidence": verifier.isolation,
+            "verifier_isolation_evidence_sha256": verifier.isolation_evidence_sha256,
+            "runtime_preflight_evidence_sha256": verifier.runtime_preflight_evidence_sha256,
+            "runtime_hardening": verifier.runtime_preflight.runtime_hardening,
+            "runtime_hardening_evidence_sha256": verifier.runtime_preflight.runtime_hardening_evidence_sha256,
+            "timing_metric": verifier.timing_metric,
+        }));
         signer
             .sign_candidate(&candidate, &launch.payload_sha256)
             .unwrap()
@@ -6082,6 +6693,7 @@ mod tests {
         };
         let mut config_value: serde_json::Value =
             serde_json::from_str(&trimul_score_test_config(4242)).unwrap();
+        config_value["launch_authentication"] = serde_json::json!("external_attested_v1");
         if launch_world > 1 {
             config_value["distributed"] = serde_json::json!({ "enabled": true });
         }
@@ -7422,17 +8034,19 @@ mod tests {
     #[test]
     fn discovery_control_validation_reaches_score_and_artifact_paths() {
         let tmp = TestDir::new("discovery-control-cli-paths");
+        let mut config: serde_json::Value =
+            serde_json::from_str(&trimul_invalid_reward_test_config(4242)).unwrap();
+        config["launch_authentication"] = serde_json::json!("external_attested_v1");
         std::fs::write(
             tmp.path().join("run.json"),
-            trimul_invalid_reward_test_config(4242),
+            serde_json::to_vec(&config).unwrap(),
         )
         .unwrap();
 
         let score_err = trimul_score(&trimul_score_args_for_test(tmp.path()))
             .unwrap_err()
             .to_string();
-        let cfg: RunConfig =
-            serde_json::from_str(&trimul_invalid_reward_test_config(4242)).unwrap();
+        let cfg: RunConfig = serde_json::from_value(config).unwrap();
         let (launch, signer) = launch_manifest_for_test(&cfg, "test-run", b"prompt");
         let candidate = candidate_for_test(&launch, &signer, "```python\npass\n```\n");
         let run = RunDir::create(tmp.path(), "test-run").unwrap();
@@ -7713,7 +8327,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::cognitive_complexity)] // one production seam with exact persisted assertions
-    fn production_training_setup_threads_resolved_eos_to_trainer_eval_and_persistence() {
+    fn local_ephemeral_production_training_needs_no_attestor_and_persists_signed_rows() {
         let tmp = TestDir::new("production-checkpoint-eos-resolution");
         let model_dir = tmp.path().join("model");
         let out_dir = tmp.path().join("runs");
@@ -7741,9 +8355,10 @@ mod tests {
             &[Sample::new("hello", ())],
             None,
             None,
+            None,
             &launch,
             None,
-            Some(&TEST_LAUNCH_ATTESTOR),
+            None,
             move |model_dir, _device, _opts| {
                 let tokenizer = ferrl::HfTokenizer::from_file(model_dir.join("tokenizer.json"))
                     .map_err(|error| CliError::msg(error.to_string()))?;
@@ -7778,7 +8393,11 @@ mod tests {
             serde_json::from_slice(&std::fs::read(run_root.join(RunDir::LAUNCH_FILE)).unwrap())
                 .unwrap();
         verify_launch_manifest_payload(&launch).unwrap();
-        verify_launch_attestation(&launch, &test_launch_trust_policy()).unwrap();
+        assert_eq!(
+            launch.payload.authentication,
+            LaunchAuthenticationMode::LocalEphemeralV1
+        );
+        assert!(launch.attestation.is_none());
         assert_eq!(launch.payload.ferrl_commit, "01".repeat(20));
         assert_eq!(launch.payload.model.resolved_eos_token_id, Some(3));
         assert_eq!(launch.payload.model.tokenizer_sha256, "11".repeat(32));
@@ -7814,6 +8433,7 @@ mod tests {
             serde_json::from_str(&countdown_train_config("")).unwrap();
         value["model_dir"] = serde_json::json!(model_dir);
         value["out_dir"] = serde_json::json!(&out_dir);
+        value["launch_authentication"] = serde_json::json!("external_attested_v1");
         value["trainer"]["max_new_tokens"] = serde_json::json!(2);
         value["trainer"]["candidate_log_top_k"] = serde_json::json!(1);
         let cfg: RunConfig = serde_json::from_value(value).unwrap();
@@ -7827,6 +8447,7 @@ mod tests {
             &EosSetupReward,
             &[Sample::new("hello", ())],
             &[],
+            None,
             None,
             None,
             &launch,
@@ -7860,6 +8481,58 @@ mod tests {
     }
 
     #[test]
+    fn external_attestation_mode_never_falls_back_when_attestor_is_missing() {
+        let tmp = TestDir::new("production-missing-attestor");
+        let model_dir = tmp.path().join("model");
+        let out_dir = tmp.path().join("runs-must-not-exist");
+        write_generation_metadata_fixture(
+            &model_dir,
+            Some(serde_json::json!(3)),
+            &serde_json::json!(4),
+        );
+        let mut value: serde_json::Value =
+            serde_json::from_str(&countdown_train_config("")).unwrap();
+        value["model_dir"] = serde_json::json!(model_dir);
+        value["out_dir"] = serde_json::json!(&out_dir);
+        value["launch_authentication"] = serde_json::json!("external_attested_v1");
+        value["trainer"]["max_new_tokens"] = serde_json::json!(2);
+        value["trainer"]["candidate_log_top_k"] = serde_json::json!(1);
+        let cfg: RunConfig = serde_json::from_value(value).unwrap();
+        let launch = launch_context_for_test(&cfg, "test-run".to_owned(), 0, 1);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let loader_seen = Arc::clone(&seen);
+
+        let error = run_training_with_loader(
+            &cfg,
+            &Device::Cpu,
+            &EosSetupReward,
+            &[Sample::new("hello", ())],
+            &[],
+            None,
+            None,
+            None,
+            &launch,
+            None,
+            None,
+            move |model_dir, _device, _opts| {
+                let tokenizer = ferrl::HfTokenizer::from_file(model_dir.join("tokenizer.json"))
+                    .map_err(|error| CliError::msg(error.to_string()))?;
+                Ok((
+                    EosRecordingPolicy::new(loader_seen),
+                    tokenizer,
+                    test_policy_identity(),
+                ))
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("requires the protected external launch attestor"));
+        assert!(seen.lock().unwrap().is_empty(), "fallback reached rollout");
+        assert!(!out_dir.exists(), "fallback published a run directory");
+    }
+
+    #[test]
     fn distributed_training_coordinates_attestation_failure_before_rollout_or_publication() {
         let tmp = TestDir::new("distributed-attestation-rejection");
         let model_dir = tmp.path().join("model");
@@ -7880,6 +8553,7 @@ mod tests {
                             serde_json::from_str(&countdown_train_config("")).unwrap();
                         value["model_dir"] = serde_json::json!(model_dir);
                         value["out_dir"] = serde_json::json!(&out_dir);
+                        value["launch_authentication"] = serde_json::json!("external_attested_v1");
                         value["distributed"] = serde_json::json!({ "enabled": true });
                         value["trainer"]["max_new_tokens"] = serde_json::json!(2);
                         value["trainer"]["candidate_log_top_k"] = serde_json::json!(1);
@@ -7898,6 +8572,7 @@ mod tests {
                             &EosSetupReward,
                             &[Sample::new("hello", ())],
                             &[],
+                            None,
                             None,
                             None,
                             &launch,
@@ -7941,7 +8616,7 @@ mod tests {
                 );
             } else {
                 assert!(
-                    error.contains("external launch attestation"),
+                    error.contains("launch authentication failed on a peer distributed rank"),
                     "rank {rank}: {error}"
                 );
             }
@@ -7963,6 +8638,10 @@ mod tests {
             );
             let cfg = trimul_config_with_verifier_fixture(tmp.path(), &model_dir, &out_dir);
             let verifier_assets = cfg.capture_trimul_verifier_assets().unwrap();
+            let verifier_identity = test_launch_verifier_identity(
+                verifier_assets.identity().clone(),
+                cfg.trimul.verifier_isolation_tier,
+            );
             let launch = launch_context_for_test(&cfg, "test-run".to_owned(), 0, 1);
             let seen = Arc::new(Mutex::new(Vec::new()));
             let loader_seen = Arc::clone(&seen);
@@ -7980,6 +8659,7 @@ mod tests {
                 &[],
                 Some(b"exact prompt"),
                 Some(&verifier_assets),
+                Some(&verifier_identity),
                 &launch,
                 None,
                 Some(&attestor),
@@ -8028,6 +8708,10 @@ mod tests {
                             trimul_config_with_verifier_fixture(&root, &model_dir, &out_dir);
                         cfg.distributed.enabled = true;
                         let verifier_assets = cfg.capture_trimul_verifier_assets().unwrap();
+                        let verifier_identity = test_launch_verifier_identity(
+                            verifier_assets.identity().clone(),
+                            cfg.trimul.verifier_isolation_tier,
+                        );
                         let launch = launch_context_for_test(
                             &cfg,
                             format!("test-group-rank{rank}"),
@@ -8049,6 +8733,7 @@ mod tests {
                             &[],
                             Some(b"exact prompt"),
                             Some(&verifier_assets),
+                            Some(&verifier_identity),
                             &launch,
                             Some(LaunchRuntime {
                                 device: Device::Cpu,
@@ -8090,7 +8775,9 @@ mod tests {
                 );
             } else {
                 assert!(
-                    error.contains("attested verifier asset revalidation"),
+                    error.contains(
+                        "launch-bound verifier revalidation failed on a peer distributed rank"
+                    ),
                     "{error}"
                 );
             }
@@ -8127,6 +8814,7 @@ mod tests {
             &EosSetupReward,
             &[Sample::new("hello", ())],
             &[],
+            None,
             None,
             None,
             &launch,
@@ -8196,6 +8884,7 @@ mod tests {
                             &EosSetupReward,
                             &[Sample::new("hello", ())],
                             &[],
+                            None,
                             None,
                             None,
                             &launch,
@@ -8284,6 +8973,7 @@ mod tests {
                             &EosSetupReward,
                             &[Sample::new("hello", ())],
                             &[],
+                            None,
                             None,
                             None,
                             &launch,
@@ -9731,7 +10421,9 @@ mod tests {
                           "verifier_parallelism": 2,
                           "verifier_max_procs": 2048,
                           "baseline": { "ns": 5200000.0, "gpu": "H100",
-                            "metric": "isolated-service-latency-v1" } },
+                            "metric": "same-uid-apptainer-latency-v1",
+                            "isolation_tier": "same_uid_apptainer_v1",
+                            "isolation_evidence_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } },
                         "trainer": { "steps": 1, "group_size": 2, "max_new_tokens": 8,
                           "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
                           "lr": 1e-5, "weight_decay": 0.0,
@@ -9748,14 +10440,59 @@ mod tests {
         assert_eq!(cfg.trimul.verifier_cuda_device_pool, ["1", "2"]);
         assert_eq!(cfg.trimul.verifier_parallelism, 2);
         assert_eq!(cfg.trimul.verifier_max_procs, 2048);
+        assert_eq!(
+            cfg.trimul.verifier_isolation_tier,
+            ferrl::VerifierIsolationTier::SameUidApptainerV1
+        );
+        assert_eq!(
+            cfg.launch_authentication,
+            LaunchAuthenticationMode::LocalEphemeralV1
+        );
         let b = cfg.trimul.baseline.as_ref().expect("baseline present");
         assert_eq!((b.ns, b.gpu.as_str()), (5_200_000.0, "H100"));
         assert_eq!(b.metric, ferrl::trimul::TRIMUL_TIMING_METRIC);
+        assert_eq!(
+            b.isolation_tier,
+            ferrl::VerifierIsolationTier::SameUidApptainerV1
+        );
         // The single-prompt splits honour train_n / eval_n without deduping to one row.
         let (train, eval) = cfg.trimul_splits().unwrap();
         assert_eq!((train.len(), eval.len()), (8, 2));
         assert_eq!(train[0].prompt, "Parse-test custom_kernel(data) prompt.\n");
         std::fs::remove_file(prompt_path).unwrap();
+    }
+
+    #[test]
+    fn trimul_verifier_config_rejects_mixed_tier_fields_without_fallback() {
+        let base: serde_json::Value =
+            serde_json::from_str(&trimul_score_test_config(4242)).unwrap();
+
+        let mut same_uid_with_socket = base.clone();
+        same_uid_with_socket["trimul"]["verifier_executor_socket"] =
+            serde_json::json!("/run/ferrl/verifier-executor.sock");
+        let cfg: RunConfig = serde_json::from_value(same_uid_with_socket).unwrap();
+        let error = cfg
+            .validate_current_config_support()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("valid only with \"dedicated_uid_service_v1\""));
+
+        let mut dedicated_with_local_binary = base.clone();
+        dedicated_with_local_binary["trimul"]["verifier_isolation_tier"] =
+            serde_json::json!("dedicated_uid_service_v1");
+        dedicated_with_local_binary["trimul"]["verifier_apptainer_bin"] =
+            serde_json::json!("/usr/bin/apptainer");
+        let cfg: RunConfig = serde_json::from_value(dedicated_with_local_binary).unwrap();
+        let error = cfg
+            .validate_current_config_support()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("valid only with \"same_uid_apptainer_v1\""));
+
+        let mut unknown_tier = base;
+        unknown_tier["trimul"]["verifier_isolation_tier"] =
+            serde_json::json!("operator_claimed_stronger_v1");
+        assert!(serde_json::from_value::<RunConfig>(unknown_tier).is_err());
     }
 
     /// The verifier sandbox settings are not just parsed: they reach the run spec.
@@ -9987,11 +10724,21 @@ benchmarks:
     }
 
     #[test]
+    #[allow(clippy::cognitive_complexity)]
     fn baseline_metric_rejects_legacy_unversioned_and_upstream_timings() {
         assert!(serde_json::from_str::<BaselineCfg>(r#"{"ns":1.0,"gpu":"H100"}"#).is_err());
-        assert!(guard_baseline_metric(ferrl::trimul::TRIMUL_TIMING_METRIC).is_ok());
+        let tier = ferrl::VerifierIsolationTier::SameUidApptainerV1;
+        assert!(guard_baseline_metric(ferrl::trimul::TRIMUL_TIMING_METRIC, tier).is_ok());
+        let dedicated = ferrl::VerifierIsolationTier::DedicatedUidServiceV1;
+        assert!(
+            guard_baseline_metric(ferrl::trimul::DEDICATED_TRIMUL_TIMING_METRIC, dedicated,)
+                .is_ok()
+        );
+        assert!(guard_baseline_metric(ferrl::trimul::TRIMUL_TIMING_METRIC, dedicated).is_err());
         for rejected in ["", "kernel-runtime-ns", "gpumode-cuda-events-v1"] {
-            let error = guard_baseline_metric(rejected).unwrap_err().to_string();
+            let error = guard_baseline_metric(rejected, tier)
+                .unwrap_err()
+                .to_string();
             assert!(error.contains(ferrl::trimul::TRIMUL_TIMING_METRIC));
             assert!(error.contains("must be re-measured"));
         }
@@ -10082,6 +10829,38 @@ benchmarks:
     }
 
     #[test]
+    fn artifact_publication_rejects_local_or_same_uid_discovery_evidence() {
+        let local_cfg: RunConfig = serde_json::from_str(&trimul_score_test_config(4242)).unwrap();
+        let (local_launch, _) = launch_manifest_for_test(&local_cfg, "test-run", b"prompt");
+        let error = require_publication_eligible_manifest(&local_launch)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("local_ephemeral_v1"));
+
+        let mut same_uid_external_value: serde_json::Value =
+            serde_json::from_str(&trimul_score_test_config(4242)).unwrap();
+        same_uid_external_value["launch_authentication"] =
+            serde_json::json!("external_attested_v1");
+        let same_uid_external_cfg: RunConfig =
+            serde_json::from_value(same_uid_external_value).unwrap();
+        let (same_uid_external_launch, _) =
+            launch_manifest_for_test(&same_uid_external_cfg, "test-run", b"prompt");
+        let error = require_publication_eligible_manifest(&same_uid_external_launch)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("same_uid_apptainer_v1"));
+
+        let mut dedicated_value: serde_json::Value =
+            serde_json::from_str(&trimul_score_test_config(4242)).unwrap();
+        dedicated_value["launch_authentication"] = serde_json::json!("external_attested_v1");
+        dedicated_value["trimul"]["verifier_isolation_tier"] =
+            serde_json::json!("dedicated_uid_service_v1");
+        let dedicated_cfg: RunConfig = serde_json::from_value(dedicated_value).unwrap();
+        let (dedicated_launch, _) = launch_manifest_for_test(&dedicated_cfg, "test-run", b"prompt");
+        require_publication_eligible_manifest(&dedicated_launch).unwrap();
+    }
+
+    #[test]
     fn launch_bound_candidate_rejects_completion_and_coordinate_mutation() {
         let cfg: RunConfig = serde_json::from_str(&trimul_score_test_config(4242)).unwrap();
         let (launch, signer) = launch_manifest_for_test(&cfg, "test-run", b"prompt");
@@ -10094,9 +10873,33 @@ benchmarks:
         completion_mutation.completion.push_str("# changed");
         assert!(completion_mutation.verify_provenance().is_err());
 
+        let mut evidence_mutation = candidate.clone();
+        evidence_mutation.reward_metadata.as_mut().unwrap()["verifier_isolation_tier"] =
+            serde_json::json!("dedicated_uid_service_v1");
+        assert!(evidence_mutation.verify_provenance().is_err());
+
         let mut coordinate_mutation = candidate;
         coordinate_mutation.group_index += 1;
         assert!(coordinate_mutation.verify_provenance().is_err());
+    }
+
+    #[test]
+    fn verifier_preflight_mutation_changes_the_launch_digest() {
+        let cfg: RunConfig = serde_json::from_str(&trimul_score_test_config(4242)).unwrap();
+        let (launch, _) = launch_manifest_for_test(&cfg, "test-run", b"prompt");
+        let mut payload = launch.payload.clone();
+        let verifier = payload.verifier.as_mut().unwrap();
+        verifier.isolation.apptainer_version.push_str("-changed");
+        verifier.isolation_evidence_sha256 =
+            verifier_isolation_evidence_sha256(&verifier.isolation);
+        verifier.runtime_preflight.isolation_evidence_sha256 =
+            verifier.isolation_evidence_sha256.clone();
+        verifier.runtime_preflight_evidence_sha256 =
+            ferrl::trimul::runtime_preflight_evidence_sha256(&verifier.runtime_preflight);
+
+        let changed = LaunchManifest::new(payload).unwrap();
+        verify_launch_manifest_payload(&changed).unwrap();
+        assert_ne!(changed.payload_sha256, launch.payload_sha256);
     }
 
     #[test]
@@ -10218,7 +11021,12 @@ benchmarks:
             let assets = cfg.capture_trimul_verifier_assets().unwrap();
             let (launch, _signer) = launch_manifest_for_test(&cfg, "test-run", b"exact prompt");
             let mut payload = launch.payload;
-            payload.verifier = Some(assets.identity().clone());
+            let mut verifier = payload
+                .verifier
+                .take()
+                .expect("TriMul launch carries verifier evidence");
+            verifier.assets = assets.identity().clone();
+            payload.verifier = Some(verifier);
             let launch = attest_launch_for_test(LaunchManifest::new(payload).unwrap());
             std::fs::write(tmp.path().join(target), b"post-attestation replacement").unwrap();
 
@@ -10454,6 +11262,7 @@ benchmarks:
             r#"{
                 "task": "trimul",
                 "model_dir": "/m",
+                "launch_authentication": "external_attested_v1",
                 "policy": {
                     "base_dtype": "bf16",
                     "base_quantization": "q8_0"
@@ -10505,8 +11314,12 @@ benchmarks:
 
     #[test]
     fn artifact_report_matches_the_contract_outline() {
+        let verifier = test_launch_verifier_identity(
+            test_trimul_verifier_identity(),
+            ferrl::VerifierIsolationTier::DedicatedUidServiceV1,
+        );
         let manifest = ArtifactManifest {
-            contract_version: 2,
+            contract_version: 3,
             task: "trimul",
             ferrl_commit: "01".repeat(20),
             run_id: "trimul-1".to_string(),
@@ -10572,7 +11385,9 @@ benchmarks:
                 benchmark_cases: 2,
             },
             baseline: BaselineManifest {
-                metric: ferrl::trimul::TRIMUL_TIMING_METRIC.to_string(),
+                metric: verifier.timing_metric.clone(),
+                isolation_tier: verifier.isolation.tier,
+                isolation_evidence_sha256: verifier.isolation_evidence_sha256.clone(),
                 gpu: "H100".to_string(),
                 measurements_ns: vec![10.0, 11.0, 12.0],
                 median_ns: 11.0,
@@ -10580,23 +11395,46 @@ benchmarks:
             },
             verification: VerificationManifest {
                 gpu: "H100".to_string(),
+                isolation_tier: verifier.isolation.tier,
+                isolation_evidence_sha256: verifier.isolation_evidence_sha256.clone(),
                 runs: vec![
                     ArtifactVerificationRun {
-                        timing_metric: ferrl::trimul::TRIMUL_TIMING_METRIC.to_string(),
+                        isolation_tier: verifier.isolation.tier,
+                        isolation_evidence_sha256: verifier.isolation_evidence_sha256.clone(),
+                        runtime_hardening_evidence_sha256: verifier
+                            .runtime_preflight
+                            .runtime_hardening_evidence_sha256
+                            .clone(),
+                        runtime_hardening: verifier.runtime_preflight.runtime_hardening.clone(),
+                        timing_metric: verifier.timing_metric.clone(),
                         correct: true,
                         benchmark_means_ns: vec![8.0],
                         geomean_ns: Some(8.0),
                         speedup: Some(1.375),
                     },
                     ArtifactVerificationRun {
-                        timing_metric: ferrl::trimul::TRIMUL_TIMING_METRIC.to_string(),
+                        isolation_tier: verifier.isolation.tier,
+                        isolation_evidence_sha256: verifier.isolation_evidence_sha256.clone(),
+                        runtime_hardening_evidence_sha256: verifier
+                            .runtime_preflight
+                            .runtime_hardening_evidence_sha256
+                            .clone(),
+                        runtime_hardening: verifier.runtime_preflight.runtime_hardening.clone(),
+                        timing_metric: verifier.timing_metric.clone(),
                         correct: true,
                         benchmark_means_ns: vec![9.0],
                         geomean_ns: Some(9.0),
                         speedup: Some(1.222),
                     },
                     ArtifactVerificationRun {
-                        timing_metric: ferrl::trimul::TRIMUL_TIMING_METRIC.to_string(),
+                        isolation_tier: verifier.isolation.tier,
+                        isolation_evidence_sha256: verifier.isolation_evidence_sha256.clone(),
+                        runtime_hardening_evidence_sha256: verifier
+                            .runtime_preflight
+                            .runtime_hardening_evidence_sha256
+                            .clone(),
+                        runtime_hardening: verifier.runtime_preflight.runtime_hardening.clone(),
+                        timing_metric: verifier.timing_metric.clone(),
                         correct: true,
                         benchmark_means_ns: vec![10.0],
                         geomean_ns: Some(10.0),

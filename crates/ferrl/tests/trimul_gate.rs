@@ -12,14 +12,17 @@
 //!
 //! Gated behind the off-by-default `gate` feature. CI compiles this target and runs
 //! its source-contract test; real isolation evidence remains an ignored GPU test
-//! suite against a deployed dedicated-UID executor:
+//! suite. The default exercises the no-admin same-UID tier:
 //!
 //! ```text
 //! FERRL_TRIMUL_IMAGE=/path/to/trimul-eval.sif \
 //! FERRL_TRIMUL_EVAL_DIR=/path/to/pinned/trimul \
-//! FERRL_VERIFIER_EXECUTOR_SOCKET=/run/ferrl/verifier-executor.sock \
 //!   cargo test --features gate --test trimul_gate -- --ignored --test-threads=1
 //! ```
+//!
+//! Set `FERRL_VERIFIER_EXECUTOR_SOCKET` to run the same controls through an optional
+//! deployed dedicated-UID service. `FERRL_APPTAINER_BIN` overrides
+//! `/usr/bin/apptainer` for the same-UID tier.
 
 #![cfg(feature = "gate")]
 
@@ -28,7 +31,9 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use ferrl::trimul::TrimulVerifierAssets;
-use ferrl::{Distribution, RewardFn, RewardOutcome, Sample, TrimulCase, TrimulReward};
+use ferrl::{
+    Distribution, RewardFn, RewardOutcome, Sample, TrimulCase, TrimulReward, VerifierIsolationTier,
+};
 
 /// A required path from the environment (the gate only runs with `--ignored`).
 fn env_path(key: &str) -> PathBuf {
@@ -37,6 +42,23 @@ fn env_path(key: &str) -> PathBuf {
 
 /// A reward over a couple of small, generic cases (not GPU Mode's specific sizes).
 fn reward() -> TrimulReward {
+    static VERIFIED_REWARD: OnceLock<TrimulReward> = OnceLock::new();
+    VERIFIED_REWARD.get_or_init(build_verified_reward).clone()
+}
+
+fn selected_tier() -> VerifierIsolationTier {
+    if std::env::var_os("FERRL_VERIFIER_EXECUTOR_SOCKET").is_some() {
+        VerifierIsolationTier::DedicatedUidServiceV1
+    } else {
+        VerifierIsolationTier::SameUidApptainerV1
+    }
+}
+
+fn expected_timing_metric() -> &'static str {
+    ferrl::trimul::timing_metric_for_tier(selected_tier())
+}
+
+fn build_verified_reward() -> TrimulReward {
     let scratch = std::env::var("FERRL_TRIMUL_SCRATCH").unwrap_or_else(|_| "/tmp".to_string());
     static VERIFIER_ASSETS: OnceLock<TrimulVerifierAssets> = OnceLock::new();
     let verifier_assets = VERIFIER_ASSETS
@@ -67,11 +89,25 @@ fn reward() -> TrimulReward {
             distribution: Distribution::Normal,
         },
     ];
-    TrimulReward::new(verifier_assets, scratch)
+    let reward = TrimulReward::new(verifier_assets, &scratch)
         .with_cases(cases.clone(), cases)
         .with_secret_seed(123)
-        .with_wall(Duration::from_secs(300))
-        .with_verifier_executor_socket(env_path("FERRL_VERIFIER_EXECUTOR_SOCKET"))
+        .with_wall(Duration::from_secs(300));
+    let reward = if let Some(socket) = std::env::var_os("FERRL_VERIFIER_EXECUTOR_SOCKET") {
+        reward.with_verifier_executor_socket(socket)
+    } else {
+        let apptainer = std::env::var_os("FERRL_APPTAINER_BIN")
+            .map_or_else(|| PathBuf::from("/usr/bin/apptainer"), PathBuf::from);
+        reward.with_same_uid_apptainer(
+            PathBuf::from(&scratch).join(format!("ferrl-verifier-{}", std::process::id())),
+            apptainer,
+        )
+    };
+    reward
+        .with_verified_isolation()
+        .expect("selected verifier isolation preflight")
+        .with_verified_runtime()
+        .expect("protected in-container runtime preflight")
 }
 
 fn evaluate(completion: &str) -> RewardOutcome {
@@ -114,8 +150,13 @@ fn assert_attack_reached_wrong_output(completion: &str, sentinel: &str, reason: 
     assert_eq!(metadata["test_pass_count"], serde_json::json!(0));
     assert_eq!(
         metadata["timing_metric"],
-        serde_json::json!(ferrl::trimul::TRIMUL_TIMING_METRIC)
+        serde_json::json!(expected_timing_metric())
     );
+    assert_eq!(
+        metadata["verifier_isolation_tier"],
+        serde_json::json!(selected_tier().as_str())
+    );
+    assert!(metadata["runtime_preflight_evidence_sha256"].is_string());
     let sentinels = metadata["candidate_attempt_sentinels"]
         .as_array()
         .expect("attack sentinel metadata is an array");
@@ -187,6 +228,33 @@ const WRONG: &str = "```python
 def custom_kernel(data):
     x, mask, weights, config = data
     return x.clone()
+```";
+
+/// Wrong but operationally representative: compile and launch a real Triton JIT
+/// kernel after payload hardening, then record success before returning copied input.
+/// This proves the seccomp policy still permits the candidate toolchain Ferrl trains.
+const TRITON_COPY_WRONG: &str = "```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _ferrl_copy(source, output, n_elements, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n_elements
+    values = tl.load(source + offsets, mask=mask)
+    tl.store(output + offsets, values, mask=mask)
+
+def custom_kernel(data):
+    x, mask, weights, config = data
+    source = x.contiguous()
+    output = torch.empty_like(source)
+    n_elements = source.numel()
+    grid = (triton.cdiv(n_elements, 256),)
+    _ferrl_copy[grid](source, output, n_elements, BLOCK=256)
+    torch.cuda.synchronize()
+    open(\"/work/cache/ferrl-attack-sentinel\", \"w\").write(\"triton-jit-launched-wrong-output-v1\")
+    return output
 ```";
 
 /// Hostile: try to open a network connection (then compute correctly). The sandbox
@@ -280,6 +348,16 @@ fn gate_wrong_submission_stays_below_correctness_floor() {
 
 #[test]
 #[ignore = "needs an sm_80 GPU + the eval image/bundle; run with --ignored"]
+fn gate_triton_jit_compiles_and_launches_after_candidate_hardening() {
+    assert_attack_reached_wrong_output(
+        TRITON_COPY_WRONG,
+        "triton-jit-launched-wrong-output-v1",
+        "a real Triton candidate must compile and launch under the payload hardening policy",
+    );
+}
+
+#[test]
+#[ignore = "needs an sm_80 GPU + the eval image/bundle; run with --ignored"]
 fn gate_reference_baseline_is_measurable_and_positive() {
     // The guarded-pin baseline: run the bundled reference through the eval and read its
     // geometric-mean runtime. It must pass correctness (it *is* the reference) and yield
@@ -307,7 +385,7 @@ fn gate_service_latency_orders_fast_and_slow_correct_candidates() {
         assert_eq!(metadata["benchmark_exit"], serde_json::json!(0));
         assert_eq!(
             metadata["timing_metric"],
-            serde_json::json!(ferrl::trimul::TRIMUL_TIMING_METRIC)
+            serde_json::json!(expected_timing_metric())
         );
     }
     let fast_ns = fast.metadata.as_ref().unwrap()["geomean_ns"]
@@ -445,22 +523,25 @@ def custom_kernel(data):
     return x.clone()
 ```";
 
-/// Corrupt the real payload result channel during module import, after the sealed
-/// driver has authenticated candidate entry but before `custom_kernel` exists.
+/// Find the real payload result channel during module import, durably record that
+/// acquisition, and then corrupt it after the sealed driver has acknowledged entry.
 const CORRUPT_IMPORT_PROTOCOL: &str = "```python
-import inspect
+import inspect, os
 frame = inspect.currentframe()
-used_results_channel = False
+results_channel = None
 while frame is not None:
     results = frame.f_locals.get(\"results\")
     if hasattr(results, \"send_bytes\"):
-        results.send_bytes(b\"FERRL-PAYLOAD-v1\\0IMPORT_REJECTED\\0\")
-        used_results_channel = True
+        results_channel = results
         break
     frame = frame.f_back
-if not used_results_channel:
+if results_channel is None:
     raise RuntimeError(\"payload results channel was not found\")
-open(\"/work/cache/ferrl-attack-sentinel\", \"w\").write(\"import-protocol-corruption-rejected-v1\")
+sentinel = os.open(\"/work/cache/ferrl-attack-sentinel\", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+os.write(sentinel, b\"import-protocol-corruption-rejected-v1\")
+os.fsync(sentinel)
+os.close(sentinel)
+results_channel.send_bytes(b\"FERRL-PAYLOAD-v1\\0IMPORT_REJECTED\\0\")
 
 def custom_kernel(data):
     x, mask, weights, config = data
@@ -600,7 +681,7 @@ fn gate_import_protocol_corruption_is_a_low_candidate_outcome() {
     assert_import_attack_is_candidate_failure(
         CORRUPT_IMPORT_PROTOCOL,
         "import-protocol-corruption-rejected-v1",
-        "protocol-v1",
+        "payload-results-channel-v1",
         "candidate import-time result-channel corruption must not become infrastructure failure",
     );
 }
@@ -709,11 +790,6 @@ fn gate_attack_sources_record_after_attempts_before_the_wrong_output() {
             "checker-timer-mutation-wrong-output-v1",
         ),
         (
-            CORRUPT_IMPORT_PROTOCOL,
-            "if not used_results_channel",
-            "import-protocol-corruption-rejected-v1",
-        ),
-        (
             PROBE_PARENT_AND_CAPABILITIES,
             "libc.ptrace(16",
             "caps-nnp-parent-access-denied-wrong-output-v2",
@@ -738,6 +814,38 @@ fn gate_attack_sources_record_after_attempts_before_the_wrong_output() {
             "attack {sentinel} does not record after all attempts and before wrong output"
         );
     }
+
+    // The durable sentinel proves channel acquisition without racing controller
+    // teardown. The dynamic rejection-reason assertion above proves the later
+    // forged frame actually crossed that channel.
+    let channel = CORRUPT_IMPORT_PROTOCOL
+        .find("if results_channel is None")
+        .expect("import corruption proves the real results channel was found");
+    let durable = CORRUPT_IMPORT_PROTOCOL
+        .find("os.fsync(sentinel)")
+        .expect("import corruption records durable channel-acquisition evidence");
+    let corruption = CORRUPT_IMPORT_PROTOCOL
+        .find("results_channel.send_bytes")
+        .expect("import corruption writes the real results channel");
+    assert!(channel < durable && durable < corruption);
+
+    let triton_launch = TRITON_COPY_WRONG
+        .find("_ferrl_copy[grid]")
+        .expect("Triton control launches its compiled kernel");
+    let triton_sync = TRITON_COPY_WRONG
+        .find("torch.cuda.synchronize()")
+        .expect("Triton control waits for kernel completion");
+    let triton_sentinel = TRITON_COPY_WRONG
+        .find("triton-jit-launched-wrong-output-v1")
+        .expect("Triton control records successful JIT execution");
+    let triton_wrong_output = TRITON_COPY_WRONG
+        .find("return output")
+        .expect("Triton control reaches a wrong-output path");
+    assert!(
+        triton_launch < triton_sync
+            && triton_sync < triton_sentinel
+            && triton_sentinel < triton_wrong_output
+    );
 
     let sentinel = KILL_IMPORT_CONTROLLER
         .find("import-controller-loss-after-ack-v2")

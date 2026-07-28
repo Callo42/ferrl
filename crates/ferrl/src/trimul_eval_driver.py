@@ -11,8 +11,10 @@ checking happen after the timer stops.
 """
 
 import ctypes
+import errno
 import io
 import importlib
+import json
 import multiprocessing
 import os
 import signal
@@ -22,23 +24,44 @@ import sys
 import time
 
 
+PR_GET_DUMPABLE = 3
 PR_SET_DUMPABLE = 4
+PR_SET_NO_NEW_PRIVS = 38
+PR_GET_NO_NEW_PRIVS = 39
 PR_SET_CHILD_SUBREAPER = 36
 SUBMISSION_PATH = "/opt/ferrl-verifier/submission.py"
 RESULT_SPLIT = "===FERRL-BENCH==="
-TIMING_METRIC = "isolated-service-latency-v1"
-MAX_STATUS_BYTES = 256
+ISOLATION_TIMING_METRICS = {
+    "same_uid_apptainer_v1": "same-uid-apptainer-latency-v1",
+    "dedicated_uid_service_v1": "isolated-service-latency-v1",
+}
+MAX_STATUS_BYTES = 1024
 MAX_STATUS_EVENTS = 32
 ENTRY_ACK = b"ENTRY-ACK-v3"
 MAX_INPUT_BYTES = 2 * 1024 * 1024 * 1024
 ATTEMPT_SENTINEL_PATH = "/work/cache/ferrl-attack-sentinel"
 PARENT_DEVICE_CANARY = b"ferrl-parent-private-cuda-v1-7f4c3a19"
 PAYLOAD_WIRE_PREFIX = b"FERRL-PAYLOAD-v1\0"
+HARDENING_WIRE_PREFIX = b"HARDENED-v1\0"
+HARDENING_CONTRACT = "ferrl.candidate-hardening.v1"
+SECCOMP_POLICY = "x86_64-tsync-af-unix-v1"
+
+
+_LIBC = ctypes.CDLL(None, use_errno=True)
+_LIBC.prctl.restype = ctypes.c_int
+_LIBC.syscall.restype = ctypes.c_long
 
 
 def _prctl(option, value):
-    if ctypes.CDLL(None, use_errno=True).prctl(option, value, 0, 0, 0) != 0:
+    if _LIBC.prctl(option, value, 0, 0, 0) != 0:
         raise SystemExit(114)
+
+
+def _prctl_value(option):
+    value = _LIBC.prctl(option, 0, 0, 0, 0)
+    if value < 0:
+        raise RuntimeError(f"prctl query {option} failed with errno {ctypes.get_errno()}")
+    return value
 
 
 # Arm procfs protection before any verifier imports. Spawned candidate workers
@@ -147,6 +170,361 @@ def _recv_payload(connection, limit):
     return event, payload
 
 
+class _SockFilter(ctypes.Structure):
+    _fields_ = [
+        ("code", ctypes.c_ushort),
+        ("jt", ctypes.c_ubyte),
+        ("jf", ctypes.c_ubyte),
+        ("k", ctypes.c_uint32),
+    ]
+
+
+class _SockFprog(ctypes.Structure):
+    _fields_ = [
+        ("length", ctypes.c_ushort),
+        ("filters", ctypes.POINTER(_SockFilter)),
+    ]
+
+
+def _candidate_seccomp_filter():
+    # Classic BPF over `struct seccomp_data`. This policy is intentionally a
+    # narrow deny list: CUDA, PyTorch, Triton, ptxas, and their compiler children
+    # retain ordinary compute/file/process syscalls, while cross-process access,
+    # namespace changes, kernel attack surfaces, and non-AF_UNIX sockets are
+    # removed. The architecture check prevents syscall-number confusion.
+    bpf_ld_w_abs = 0x20
+    bpf_jmp_jeq_k = 0x15
+    bpf_jmp_jset_k = 0x45
+    bpf_ret_k = 0x06
+    seccomp_ret_kill_process = 0x80000000
+    seccomp_ret_errno = 0x00050000
+    seccomp_ret_allow = 0x7FFF0000
+    audit_arch_x86_64 = 0xC000003E
+    x32_syscall_bit = 0x40000000
+    errno_eperm = 1
+    errno_enosys = 38
+
+    def stmt(code, value):
+        return (code, 0, 0, value)
+
+    def jump(code, value, yes, no):
+        return (code, yes, no, value)
+
+    deny = [
+        101,  # ptrace
+        155,  # pivot_root
+        161,  # chroot
+        165,  # mount
+        166,  # umount2
+        248,  # add_key
+        249,  # request_key
+        250,  # keyctl
+        272,  # unshare
+        298,  # perf_event_open
+        303,  # name_to_handle_at
+        304,  # open_by_handle_at
+        308,  # setns
+        310,  # process_vm_readv
+        311,  # process_vm_writev
+        312,  # kcmp
+        321,  # bpf
+        323,  # userfaultfd
+        424,  # pidfd_send_signal
+        425,  # io_uring_setup
+        426,  # io_uring_enter
+        427,  # io_uring_register
+        428,  # open_tree
+        429,  # move_mount
+        430,  # fsopen
+        431,  # fsconfig
+        432,  # fsmount
+        433,  # fspick
+        434,  # pidfd_open
+        438,  # pidfd_getfd
+        440,  # process_madvise
+        442,  # mount_setattr
+        448,  # process_mrelease
+    ]
+    instructions = [
+        stmt(bpf_ld_w_abs, 4),
+        jump(bpf_jmp_jeq_k, audit_arch_x86_64, 1, 0),
+        stmt(bpf_ret_k, seccomp_ret_kill_process),
+        stmt(bpf_ld_w_abs, 0),
+        # Reject x32 syscalls, which share AUDIT_ARCH_X86_64 but use a distinct
+        # syscall-number space not covered by the x86_64 table below.
+        jump(bpf_jmp_jset_k, x32_syscall_bit, 0, 1),
+        stmt(bpf_ret_k, seccomp_ret_errno | errno_eperm),
+    ]
+    for syscall_number in deny:
+        instructions.extend(
+            [
+                jump(bpf_jmp_jeq_k, syscall_number, 0, 1),
+                stmt(bpf_ret_k, seccomp_ret_errno | errno_eperm),
+            ]
+        )
+
+    # clone3 hides its flags behind a user pointer, which classic seccomp BPF
+    # cannot inspect. Report ENOSYS so libc/subprocess falls back to clone/vfork;
+    # clone's direct flag argument is filtered below.
+    instructions.extend(
+        [
+            jump(bpf_jmp_jeq_k, 435, 0, 1),
+            stmt(bpf_ret_k, seccomp_ret_errno | errno_enosys),
+        ]
+    )
+
+    clone_new_namespace_mask = 0x7E020000
+    instructions.extend(
+        [
+            # If this is not clone(2), skip the argument check and reload the
+            # syscall number for the socket checks.
+            jump(bpf_jmp_jeq_k, 56, 0, 3),
+            stmt(bpf_ld_w_abs, 16),
+            jump(bpf_jmp_jset_k, clone_new_namespace_mask, 0, 1),
+            stmt(bpf_ret_k, seccomp_ret_errno | errno_eperm),
+            stmt(bpf_ld_w_abs, 0),
+            # socket(2) and socketpair(2) are permitted only for AF_UNIX. The
+            # verifier protocol and multiprocessing pipes need local sockets;
+            # no IP, packet, or netlink socket can be created after this point.
+            jump(bpf_jmp_jeq_k, 41, 1, 0),
+            jump(bpf_jmp_jeq_k, 53, 0, 3),
+            stmt(bpf_ld_w_abs, 16),
+            jump(bpf_jmp_jeq_k, socket.AF_UNIX, 1, 0),
+            stmt(bpf_ret_k, seccomp_ret_errno | errno_eperm),
+            stmt(bpf_ret_k, seccomp_ret_allow),
+        ]
+    )
+    return instructions
+
+
+def _read_process_status():
+    wanted = {
+        "CapInh",
+        "CapPrm",
+        "CapEff",
+        "CapBnd",
+        "CapAmb",
+        "NoNewPrivs",
+        "Seccomp",
+        "Seccomp_filters",
+    }
+    values = {}
+    with open("/proc/self/status", encoding="ascii") as handle:
+        for line in handle:
+            key, separator, value = line.partition(":")
+            if separator and key in wanted:
+                values[key] = value.strip()
+    return values
+
+
+def _validated_hardening_record(payload):
+    if len(payload) > MAX_STATUS_BYTES - len(HARDENING_WIRE_PREFIX):
+        raise ValueError("candidate hardening evidence exceeds its wire cap")
+    try:
+        text = payload.decode("ascii")
+        evidence = json.loads(text)
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("candidate hardening evidence is malformed") from error
+    expected_keys = {
+        "arch",
+        "cap_amb",
+        "cap_bnd",
+        "cap_eff",
+        "cap_inh",
+        "cap_prm",
+        "cgroup",
+        "contract",
+        "dumpable",
+        "denial_probes",
+        "landlock",
+        "network_socket_policy",
+        "no_new_privs",
+        "physical_gpu_isolation",
+        "seccomp_filters",
+        "seccomp_mode",
+        "seccomp_policy",
+        "seccomp_tsync",
+        "unix_socket_probe",
+    }
+    if not isinstance(evidence, dict) or set(evidence) != expected_keys:
+        raise ValueError("candidate hardening evidence schema mismatch")
+    if any(
+        type(evidence[key]) is not int
+        for key in ("dumpable", "no_new_privs", "seccomp_mode")
+    ):
+        raise ValueError("candidate hardening evidence has a non-integer kernel field")
+    if (
+        evidence["contract"] != HARDENING_CONTRACT
+        or evidence["arch"] != "x86_64"
+        or evidence["dumpable"] != 0
+        or evidence["no_new_privs"] != 1
+        or evidence["seccomp_mode"] != 2
+        or evidence["seccomp_policy"] != SECCOMP_POLICY
+        or evidence["seccomp_tsync"] is not True
+        or evidence["denial_probes"]
+        != [
+            "bpf",
+            "io_uring",
+            "namespace",
+            "network",
+            "parent_proc",
+            "pidfd_getfd",
+            "process_vm",
+            "ptrace",
+        ]
+        or evidence["unix_socket_probe"] is not True
+        or evidence["network_socket_policy"] != "af_unix_only"
+        or evidence["landlock"] is not False
+        or evidence["cgroup"] is not False
+        or evidence["physical_gpu_isolation"] is not False
+    ):
+        raise ValueError("candidate hardening evidence did not prove the required controls")
+    if evidence["seccomp_filters"] is not None and (
+        type(evidence["seccomp_filters"]) is not int or evidence["seccomp_filters"] < 1
+    ):
+        raise ValueError("candidate hardening evidence has an invalid filter count")
+    for key in ("cap_amb", "cap_bnd", "cap_eff", "cap_inh", "cap_prm"):
+        value = evidence[key]
+        if (
+            not isinstance(value, str)
+            or len(value) != 16
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise ValueError("candidate hardening capability evidence is malformed")
+    if any(int(evidence[key], 16) != 0 for key in ("cap_amb", "cap_eff", "cap_inh", "cap_prm")):
+        raise ValueError("candidate retained an active or inheritable capability")
+    forbidden_bounding_caps = (1 << 19) | (1 << 21)  # CAP_SYS_PTRACE | CAP_SYS_ADMIN
+    if int(evidence["cap_bnd"], 16) & forbidden_bounding_caps:
+        raise ValueError("candidate bounding set retained ptrace or admin capability")
+    canonical = json.dumps(evidence, sort_keys=True, separators=(",", ":"))
+    if canonical != text:
+        raise ValueError("candidate hardening evidence is not canonical JSON")
+    return text
+
+
+def _install_candidate_hardening():
+    if os.uname().machine != "x86_64":
+        raise RuntimeError("candidate seccomp policy requires x86_64")
+    _prctl(PR_SET_NO_NEW_PRIVS, 1)
+    if _prctl_value(PR_GET_NO_NEW_PRIVS) != 1:
+        raise RuntimeError("candidate no_new_privs did not become irreversible")
+
+    policy = _candidate_seccomp_filter()
+    filters = (_SockFilter * len(policy))(*(_SockFilter(*instruction) for instruction in policy))
+    program = _SockFprog(
+        length=len(filters),
+        filters=ctypes.cast(filters, ctypes.POINTER(_SockFilter)),
+    )
+    sys_seccomp = 317
+    seccomp_set_mode_filter = 1
+    seccomp_filter_flag_tsync = 1
+    ctypes.set_errno(0)
+    result = _LIBC.syscall(
+        ctypes.c_long(sys_seccomp),
+        ctypes.c_ulong(seccomp_set_mode_filter),
+        ctypes.c_ulong(seccomp_filter_flag_tsync),
+        ctypes.byref(program),
+    )
+    if result != 0:
+        raise RuntimeError(f"candidate seccomp TSYNC failed with errno {ctypes.get_errno()}")
+
+    def require_eperm(syscall_number, *arguments):
+        ctypes.set_errno(0)
+        value = _LIBC.syscall(
+            ctypes.c_long(syscall_number),
+            *(ctypes.c_long(argument) for argument in arguments),
+        )
+        if value >= 0:
+            # The socket probe could otherwise leak a live network descriptor
+            # before this trusted initialization aborts.
+            if syscall_number == 41:
+                os.close(value)
+            raise RuntimeError(f"candidate syscall {syscall_number} escaped seccomp")
+        if ctypes.get_errno() != 1:
+            raise RuntimeError(
+                f"candidate syscall {syscall_number} returned unexpected errno {ctypes.get_errno()}"
+            )
+
+    # Non-vacuous probes execute representative rules after TSYNC. Arguments are
+    # chosen to have no side effect if a rule were accidentally omitted.
+    require_eperm(101, -1, 0, 0, 0)  # invalid ptrace request
+    require_eperm(310, os.getpid(), 0, 0, 0, 0, 0)  # process_vm_readv
+    require_eperm(438, -1, -1, 0)  # pidfd_getfd
+    require_eperm(272, 0)  # unshare with an empty flag set
+    require_eperm(321, -1, 0, 0)  # invalid bpf command
+    require_eperm(425, 0, 0)  # io_uring_setup
+    require_eperm(41, socket.AF_INET, socket.SOCK_STREAM, 0)
+    unix_left, unix_right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    unix_left.close()
+    unix_right.close()
+
+    parent_mem = f"/proc/{os.getppid()}/mem"
+    try:
+        descriptor = os.open(
+            parent_mem,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )
+    except OSError as error:
+        if error.errno not in (errno.EACCES, errno.EPERM):
+            raise RuntimeError(
+                f"candidate parent-memory probe returned unexpected errno {error.errno}"
+            ) from error
+    else:
+        os.close(descriptor)
+        raise RuntimeError("candidate could open controller process memory")
+
+    status = _read_process_status()
+    required = {"CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb", "NoNewPrivs", "Seccomp"}
+    if not required.issubset(status):
+        raise RuntimeError("candidate privilege evidence is incomplete")
+    if int(status["NoNewPrivs"]) != 1 or int(status["Seccomp"]) != 2:
+        raise RuntimeError("candidate kernel hardening is not active")
+    for key in ("CapInh", "CapPrm", "CapEff", "CapAmb"):
+        if int(status[key], 16) != 0:
+            raise RuntimeError(f"candidate retained capability set {key}")
+    forbidden_bounding_caps = (1 << 19) | (1 << 21)  # CAP_SYS_PTRACE | CAP_SYS_ADMIN
+    if int(status["CapBnd"], 16) & forbidden_bounding_caps:
+        raise RuntimeError("candidate bounding set retained ptrace or admin capability")
+    seccomp_filters = status.get("Seccomp_filters")
+    if seccomp_filters is not None:
+        seccomp_filters = int(seccomp_filters)
+        if seccomp_filters < 1:
+            raise RuntimeError("candidate seccomp filter count is invalid")
+    evidence = {
+        "arch": "x86_64",
+        "cap_amb": status["CapAmb"].lower().zfill(16),
+        "cap_bnd": status["CapBnd"].lower().zfill(16),
+        "cap_eff": status["CapEff"].lower().zfill(16),
+        "cap_inh": status["CapInh"].lower().zfill(16),
+        "cap_prm": status["CapPrm"].lower().zfill(16),
+        "cgroup": False,
+        "contract": HARDENING_CONTRACT,
+        "denial_probes": [
+            "bpf",
+            "io_uring",
+            "namespace",
+            "network",
+            "parent_proc",
+            "pidfd_getfd",
+            "process_vm",
+            "ptrace",
+        ],
+        "dumpable": _prctl_value(PR_GET_DUMPABLE),
+        "landlock": False,
+        "network_socket_policy": "af_unix_only",
+        "no_new_privs": int(status["NoNewPrivs"]),
+        "physical_gpu_isolation": False,
+        "seccomp_filters": seccomp_filters,
+        "seccomp_mode": int(status["Seccomp"]),
+        "seccomp_policy": SECCOMP_POLICY,
+        "seccomp_tsync": True,
+        "unix_socket_probe": True,
+    }
+    payload = json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode("ascii")
+    _validated_hardening_record(payload)
+    return payload
+
+
 def _cpu_clone(value):
     if type(value) is _TENSOR_TYPE:
         return value.detach().to(device="cpu").clone()
@@ -213,6 +591,12 @@ def _candidate_payload(commands, results):
     except BaseException:
         _send_payload(results, b"TRUSTED_INIT_ERROR")
         return
+    try:
+        hardening = _install_candidate_hardening()
+    except BaseException:
+        _send_payload(results, b"HARDENING_ERROR")
+        return
+    _send_payload(results, b"HARDENED", hardening)
     _send_payload(results, b"READY")
 
     try:
@@ -370,6 +754,21 @@ def _candidate_worker(commands, status, outputs):
         except BaseException:
             _send_status(status, b"TRUSTED_INIT_ERROR")
             return
+        if event != b"HARDENED":
+            _send_status(status, b"TRUSTED_INIT_ERROR")
+            return
+        try:
+            hardening = _validated_hardening_record(payload).encode("ascii")
+        except BaseException:
+            _send_status(status, b"TRUSTED_INIT_ERROR")
+            return
+        _send_status(status, HARDENING_WIRE_PREFIX + hardening)
+
+        try:
+            event, payload = _recv_payload(payload_results, MAX_STATUS_BYTES)
+        except BaseException:
+            _send_status(status, b"TRUSTED_INIT_ERROR")
+            return
         if event != b"READY" or payload:
             _send_status(status, b"TRUSTED_INIT_ERROR")
             return
@@ -420,6 +819,12 @@ def _candidate_worker(commands, status, outputs):
             if event == b"IMPORTED":
                 _send_status(status, event)
                 break
+            # The sealed payload wrapper emits IMPORT_REJECTED only before its
+            # traced submission entry. Seeing it after acknowledged entry proves
+            # candidate code wrote the real payload-results channel.
+            if event == b"IMPORT_REJECTED" and entered:
+                _send_status(status, b"IMPORT_CHANNEL_CORRUPTED")
+                return
             if event in (b"IMPORT_REJECTED", b"IMPORT_ERROR"):
                 reject_import_protocol()
                 return
@@ -470,9 +875,11 @@ def _candidate_worker(commands, status, outputs):
 
 
 class CandidateSession:
-    def __init__(self, mode, logger):
+    def __init__(self, mode, logger, isolation_tier, timing_metric):
         self.mode = mode
         self.logger = logger
+        self.isolation_tier = isolation_tier
+        self.timing_metric = timing_metric
         self.entered = False
         self.rejected = False
         self.closed = False
@@ -491,9 +898,16 @@ class CandidateSession:
         child_status.close()
         child_outputs.close()
         try:
+            hardening = self._recv_import(before_entry=True)
+            if not hardening.startswith(HARDENING_WIRE_PREFIX):
+                raise InfrastructureFailure("candidate worker hardening proof was missing")
+            hardening = hardening[len(HARDENING_WIRE_PREFIX) :]
+            hardening = _validated_hardening_record(hardening)
+            self.logger.log("ferrl-candidate-hardening", hardening)
             if self._recv_import(before_entry=True) != b"READY":
                 raise InfrastructureFailure("candidate worker trusted initialization failed")
-            self.logger.log("ferrl-timing-metric", TIMING_METRIC)
+            self.logger.log("ferrl-verifier-isolation-tier", self.isolation_tier)
+            self.logger.log("ferrl-timing-metric", self.timing_metric)
             self.commands.send_bytes(b"ACK-v2")
             while True:
                 event = self._recv_import(before_entry=not self.entered)
@@ -509,6 +923,14 @@ class CandidateSession:
                 if event == b"IMPORT_REJECTED" and not self.entered:
                     self.rejected = True
                     self.logger.log("ferrl-candidate-rejected", f"{self.mode}-import-v1")
+                    break
+                if event == b"IMPORT_CHANNEL_CORRUPTED" and self.entered:
+                    self.rejected = True
+                    self.logger.log("ferrl-candidate-rejected", f"{self.mode}-import-v1")
+                    self.logger.log(
+                        "ferrl-candidate-rejection-reason",
+                        "payload-results-channel-v1",
+                    )
                     break
                 if event == b"IMPORT_ERROR" and self.entered:
                     self.rejected = True
@@ -634,10 +1056,10 @@ def _execute_checked(session, args):
     return bool(good), _bounded_message(message or ""), elapsed
 
 
-def _run_testing(logger, tests):
+def _run_testing(logger, tests, isolation_tier, timing_metric):
     if not tests:
         raise InfrastructureFailure("trusted test case set is empty")
-    session = CandidateSession("test", logger)
+    session = CandidateSession("test", logger, isolation_tier, timing_metric)
     try:
         logger.log("test-count", len(tests))
         if session.rejected:
@@ -696,10 +1118,10 @@ def _run_benchmark_case(session, test):
     return _CALCULATE_STATS(durations)
 
 
-def _run_benchmarking(logger, tests):
+def _run_benchmarking(logger, tests, isolation_tier, timing_metric):
     if not tests:
         raise InfrastructureFailure("trusted benchmark case set is empty")
-    session = CandidateSession("benchmark", logger)
+    session = CandidateSession("benchmark", logger, isolation_tier, timing_metric)
     try:
         logger.log("benchmark-count", len(tests))
         if session.rejected:
@@ -734,6 +1156,8 @@ def main():
     grade_socket = os.environ.pop("FERRL_GRADE_SOCKET", None)
     if not grade_socket:
         return 114
+    isolation_tier = os.environ.pop("FERRL_VERIFIER_ISOLATION_TIER", None)
+    timing_metric = os.environ.pop("FERRL_TIMING_METRIC", None)
     seed = os.environ.pop("POPCORN_SEED", None)
     try:
         seed = int(seed) if seed else None
@@ -748,6 +1172,11 @@ def main():
     try:
         phase = "preparation"
         try:
+            if (
+                isolation_tier not in ISOLATION_TIMING_METRICS
+                or ISOLATION_TIMING_METRICS[isolation_tier] != timing_metric
+            ):
+                raise InfrastructureFailure("trusted verifier isolation/timing contract mismatch")
             _prctl(PR_SET_CHILD_SUBREAPER, 1)
             _SET_SEED(seed or 42)
             torch.cuda.init()
@@ -757,11 +1186,11 @@ def main():
             if not test_cases or not benchmark_cases:
                 raise InfrastructureFailure("trusted case set is empty")
             phase = "test"
-            if not _run_testing(logger, test_cases):
+            if not _run_testing(logger, test_cases, isolation_tier, timing_metric):
                 return 0
             logger.raw(RESULT_SPLIT)
             phase = "benchmark"
-            _run_benchmarking(logger, benchmark_cases)
+            _run_benchmarking(logger, benchmark_cases, isolation_tier, timing_metric)
             return 0
         except BaseException:
             logger.log("ferrl-infrastructure", f"v1 phase={phase}")
