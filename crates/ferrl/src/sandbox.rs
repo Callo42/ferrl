@@ -70,10 +70,9 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::mpsc::{self, Receiver};
-#[cfg(unix)]
 use std::sync::{
     atomic::{AtomicBool, Ordering},
+    mpsc::{self, Receiver},
     Arc,
 };
 use std::thread;
@@ -87,7 +86,11 @@ use std::os::unix::{
     net::{UnixListener, UnixStream},
 };
 #[cfg(target_os = "linux")]
-use std::{fs::File, os::fd::AsRawFd as _};
+use std::{
+    fs::File,
+    mem::MaybeUninit,
+    os::fd::{AsRawFd as _, OwnedFd},
+};
 
 /// How a host path is exposed inside the sandbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -362,8 +365,12 @@ impl RunStatus {
 /// A host path whose total disk usage is capped during a sandboxed run.
 #[derive(Debug, Clone)]
 struct ScratchLimit {
-    /// Host path to monitor.
+    /// Host path retained for diagnostics and non-Linux fallback traversal.
+    #[cfg(not(target_os = "linux"))]
     path: PathBuf,
+    /// Directory identity captured before the untrusted process starts.
+    #[cfg(target_os = "linux")]
+    directory: Arc<OwnedFd>,
     /// Maximum total bytes allowed beneath `path`.
     bytes: u64,
 }
@@ -548,7 +555,7 @@ impl Sandbox for ApptainerSandbox {
         validate_protected_output_mapping(spec)?;
         let protected = ProtectedOutputListener::bind(spec.protected_output.as_ref())?;
         let command = self.build_host_command(spec);
-        let scratch_limits = scratch_limits(spec);
+        let scratch_limits = scratch_limits(spec)?;
         supervise_with_protected_output(
             command,
             spec.limits.wall,
@@ -735,19 +742,42 @@ impl ProtectedOutputListener {
 }
 
 /// Extract writable bind limits from the run spec.
-fn scratch_limits(spec: &RunSpec) -> Vec<ScratchLimit> {
+fn scratch_limits(spec: &RunSpec) -> Result<Vec<ScratchLimit>, SandboxError> {
     spec.binds
         .iter()
         .filter_map(|bind| {
             (bind.mode == BindMode::ReadWrite)
                 .then_some(bind.total_limit)
                 .flatten()
-                .map(|bytes| ScratchLimit {
-                    path: bind.src.clone(),
-                    bytes,
-                })
+                .map(|bytes| open_scratch_limit(&bind.src, bytes))
         })
         .collect()
+}
+
+fn open_scratch_limit(path: &Path, bytes: u64) -> Result<ScratchLimit, SandboxError> {
+    #[cfg(target_os = "linux")]
+    let directory = rustix::fs::openat(
+        rustix::fs::CWD,
+        path,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|error| {
+        SandboxError::InvalidSpec(format!(
+            "could not anchor writable bind {} for scratch accounting: {error}",
+            path.display()
+        ))
+    })?;
+    Ok(ScratchLimit {
+        #[cfg(not(target_os = "linux"))]
+        path: path.to_path_buf(),
+        #[cfg(target_os = "linux")]
+        directory: Arc::new(directory),
+        bytes,
+    })
 }
 
 /// The `bash -c` script run *inside* the image: apply the requested `ulimit`s, then
@@ -1047,6 +1077,7 @@ fn supervise_with_post_spawn_hook_and_protected_output(
     let out = drain(child.child_mut().stdout.take());
     let err = drain(child.child_mut().stderr.take());
     let protected = ProtectedDrain::start(protected_output, child.id(), deadline);
+    let scratch_monitor = ScratchMonitor::start(scratch_limits);
 
     let mut timed_out = false;
     let mut scratch_exceeded = false;
@@ -1056,11 +1087,12 @@ fn supervise_with_post_spawn_hook_and_protected_output(
             .try_wait()
             .map_err(SandboxError::Supervise)?
         {
-            scratch_exceeded = scratch_over_limit(scratch_limits);
             // A launcher may exit while a descendant still holds output pipes,
             // descriptors, or its mount namespace. Reap the residual group on
             // every terminal path, not only timeout/scratch enforcement.
             child.terminate_residuals();
+            scratch_monitor.stop();
+            scratch_exceeded = scratch_over_limit(scratch_limits);
             child.disarm();
             break status;
         }
@@ -1070,7 +1102,7 @@ fn supervise_with_post_spawn_hook_and_protected_output(
                 .terminate_and_wait()
                 .map_err(SandboxError::Supervise)?;
         }
-        if scratch_over_limit(scratch_limits) {
+        if scratch_monitor.over_limit() {
             scratch_exceeded = true;
             break child
                 .terminate_and_wait()
@@ -1078,6 +1110,7 @@ fn supervise_with_post_spawn_hook_and_protected_output(
         }
         thread::sleep(POLL_INTERVAL);
     };
+    scratch_monitor.stop();
 
     let status = classify_exit(status, timed_out, scratch_exceeded);
     let stdout = collect_output(&out);
@@ -1180,31 +1213,266 @@ fn consume_entry_marker(stderr: &mut String) -> bool {
     true
 }
 
-/// `true` if any monitored path's current tree size is over its cap. Missing
-/// paths count as empty, but other I/O errors fail closed: a payload should not
-/// be able to hide scratch usage by changing permissions or racing traversal.
-fn scratch_over_limit(limits: &[ScratchLimit]) -> bool {
-    limits
-        .iter()
-        .any(|limit| dir_size(&limit.path).map_or(true, |bytes| bytes > limit.bytes))
+const SCRATCH_SCAN_ENTRY_BUDGET: usize = 16_384;
+const SCRATCH_SCAN_DEPTH_BUDGET: usize = 64;
+const SCRATCH_SCAN_TIME_BUDGET: Duration = Duration::from_millis(100);
+
+struct ScratchMonitor {
+    stop: Arc<AtomicBool>,
+    exceeded: Receiver<()>,
+    enabled: bool,
 }
 
-/// Total bytes used by `path`, summing regular files and directory entries without
-/// following symlinks.
-fn dir_size(path: &Path) -> std::io::Result<u64> {
-    let meta = match std::fs::symlink_metadata(path) {
-        Ok(meta) => meta,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(err) => return Err(err),
+impl ScratchMonitor {
+    fn start(limits: &[ScratchLimit]) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (sender, exceeded) = mpsc::channel();
+        let enabled = !limits.is_empty();
+        if enabled {
+            let limits = limits.to_vec();
+            let monitor_stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                while !monitor_stop.load(Ordering::Acquire) {
+                    if scratch_over_limit_with_stop(&limits, &monitor_stop) {
+                        let _ = sender.send(());
+                        return;
+                    }
+                    thread::sleep(POLL_INTERVAL);
+                }
+            });
+        }
+        Self {
+            stop,
+            exceeded,
+            enabled,
+        }
+    }
+
+    fn over_limit(&self) -> bool {
+        match self.exceeded.try_recv() {
+            Ok(()) => true,
+            Err(mpsc::TryRecvError::Empty) => false,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.enabled && !self.stop.load(Ordering::Acquire)
+            }
+        }
+    }
+
+    fn stop(&self) {
+        self.stop.store(true, Ordering::Release);
+    }
+}
+
+impl Drop for ScratchMonitor {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// `true` if a monitored tree exceeds its byte cap or cannot be proven within
+/// strict traversal budgets. The scan runs off the wall-clock supervisor thread;
+/// blocking filesystem work can therefore never defer process-tree termination.
+fn scratch_over_limit(limits: &[ScratchLimit]) -> bool {
+    let limits = limits.to_vec();
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let exceeded = scratch_over_limit_with_stop(&limits, &AtomicBool::new(false));
+        let _ = sender.send(exceeded);
+    });
+    receiver
+        .recv_timeout(SCRATCH_SCAN_TIME_BUDGET + POLL_INTERVAL)
+        .unwrap_or(true)
+}
+
+fn scratch_over_limit_with_stop(limits: &[ScratchLimit], stop: &AtomicBool) -> bool {
+    let mut budget = ScratchScanBudget {
+        entries_left: SCRATCH_SCAN_ENTRY_BUDGET,
+        deadline: Instant::now() + SCRATCH_SCAN_TIME_BUDGET,
+        stop,
     };
-    if !meta.is_dir() {
-        return Ok(meta.len());
+    limits
+        .iter()
+        .any(|limit| match scratch_tree_size(limit, &mut budget, 0) {
+            ScratchScan::Complete(bytes) => bytes > limit.bytes,
+            ScratchScan::Stopped => false,
+            ScratchScan::Exceeded => true,
+        })
+}
+
+struct ScratchScanBudget<'a> {
+    entries_left: usize,
+    deadline: Instant,
+    stop: &'a AtomicBool,
+}
+
+enum ScratchScan {
+    Complete(u64),
+    Exceeded,
+    Stopped,
+}
+
+impl ScratchScanBudget<'_> {
+    fn checkpoint(&mut self) -> ScratchScan {
+        if self.stop.load(Ordering::Acquire) {
+            ScratchScan::Stopped
+        } else if self.entries_left == 0 || Instant::now() >= self.deadline {
+            ScratchScan::Exceeded
+        } else {
+            self.entries_left -= 1;
+            ScratchScan::Complete(0)
+        }
     }
-    let mut total = meta.len();
-    for entry in std::fs::read_dir(path)? {
-        total = total.saturating_add(dir_size(&entry?.path())?);
+}
+
+#[cfg(target_os = "linux")]
+fn scratch_tree_size(
+    limit: &ScratchLimit,
+    budget: &mut ScratchScanBudget<'_>,
+    depth: usize,
+) -> ScratchScan {
+    scratch_directory_size(limit.directory.as_ref(), limit.bytes, budget, depth)
+}
+
+#[cfg(target_os = "linux")]
+fn scratch_directory_size(
+    directory: &OwnedFd,
+    cap: u64,
+    budget: &mut ScratchScanBudget<'_>,
+    depth: usize,
+) -> ScratchScan {
+    if depth > SCRATCH_SCAN_DEPTH_BUDGET {
+        return ScratchScan::Exceeded;
     }
-    Ok(total)
+    match budget.checkpoint() {
+        ScratchScan::Complete(_) => {}
+        outcome => return outcome,
+    }
+    let Ok(stat) = rustix::fs::fstat(directory) else {
+        return ScratchScan::Exceeded;
+    };
+    let mut total = u64::try_from(stat.st_size).unwrap_or(u64::MAX);
+    if total > cap {
+        return ScratchScan::Complete(total);
+    }
+    let Ok(scan) = rustix::fs::openat(
+        directory,
+        rustix::cstr!("."),
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    ) else {
+        return ScratchScan::Exceeded;
+    };
+    let mut buffer = [MaybeUninit::<u8>::uninit(); 8192];
+    let mut entries = rustix::fs::RawDir::new(scan, &mut buffer);
+    while let Some(entry) = entries.next() {
+        match budget.checkpoint() {
+            ScratchScan::Complete(_) => {}
+            outcome => return outcome,
+        }
+        let Ok(entry) = entry else {
+            return ScratchScan::Exceeded;
+        };
+        let name = entry.file_name();
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        let entry_size =
+            match scratch_entry_size(directory, name, cap.saturating_sub(total), budget, depth) {
+                ScratchScan::Complete(bytes) => bytes,
+                outcome => return outcome,
+            };
+        total = total.saturating_add(entry_size);
+        if total > cap {
+            return ScratchScan::Complete(total);
+        }
+    }
+    ScratchScan::Complete(total)
+}
+
+#[cfg(target_os = "linux")]
+fn scratch_entry_size(
+    directory: &OwnedFd,
+    name: &std::ffi::CStr,
+    cap: u64,
+    budget: &mut ScratchScanBudget<'_>,
+    depth: usize,
+) -> ScratchScan {
+    let Ok(stat) = rustix::fs::statat(directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+    else {
+        return ScratchScan::Exceeded;
+    };
+    if !rustix::fs::FileType::from_raw_mode(stat.st_mode).is_dir() {
+        return ScratchScan::Complete(u64::try_from(stat.st_size).unwrap_or(u64::MAX));
+    }
+    if depth == SCRATCH_SCAN_DEPTH_BUDGET {
+        return ScratchScan::Exceeded;
+    }
+    let Ok(child) = rustix::fs::openat(
+        directory,
+        name,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    ) else {
+        return ScratchScan::Exceeded;
+    };
+    scratch_directory_size(&child, cap, budget, depth + 1)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn scratch_tree_size(
+    limit: &ScratchLimit,
+    budget: &mut ScratchScanBudget<'_>,
+    depth: usize,
+) -> ScratchScan {
+    scratch_path_size(&limit.path, limit.bytes, budget, depth)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn scratch_path_size(
+    path: &Path,
+    cap: u64,
+    budget: &mut ScratchScanBudget<'_>,
+    depth: usize,
+) -> ScratchScan {
+    if depth > SCRATCH_SCAN_DEPTH_BUDGET {
+        return ScratchScan::Exceeded;
+    }
+    match budget.checkpoint() {
+        ScratchScan::Complete(_) => {}
+        outcome => return outcome,
+    }
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(_) => return ScratchScan::Exceeded,
+    };
+    let mut total = metadata.len();
+    if !metadata.is_dir() || total > cap {
+        return ScratchScan::Complete(total);
+    }
+    let entries = match std::fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(_) => return ScratchScan::Exceeded,
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => return ScratchScan::Exceeded,
+        };
+        match scratch_path_size(&entry.path(), cap.saturating_sub(total), budget, depth + 1) {
+            ScratchScan::Complete(bytes) => total = total.saturating_add(bytes),
+            outcome => return outcome,
+        }
+        if total > cap {
+            return ScratchScan::Complete(total);
+        }
+    }
+    ScratchScan::Complete(total)
 }
 
 /// Read a child pipe on a detached thread, capturing at most [`CAPTURE_CAP`] bytes
@@ -1864,13 +2132,11 @@ mod tests {
             "dd if=/dev/zero of={}/big bs=1024 count=2048 2>/dev/null; sleep 30",
             shell_quote(&dir.display().to_string())
         );
+        let limit = open_scratch_limit(&dir, 1 << 20).unwrap();
         let outcome = supervise(
             sh(&script),
             Duration::from_secs(10),
-            &[ScratchLimit {
-                path: dir.clone(),
-                bytes: 1 << 20,
-            }],
+            &[limit],
             EntryProtocol::NotRequired,
         )
         .unwrap();
@@ -1896,18 +2162,117 @@ mod tests {
             "dd if=/dev/zero of={}/big bs=1024 count=2048 2>/dev/null; exit 0",
             shell_quote(&dir.display().to_string())
         );
+        let limit = open_scratch_limit(&dir, 1 << 20).unwrap();
         let outcome = supervise(
             sh(&script),
             Duration::from_secs(10),
-            &[ScratchLimit {
-                path: dir.clone(),
-                bytes: 1 << 20,
-            }],
+            &[limit],
             EntryProtocol::NotRequired,
         )
         .unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(outcome.status, RunStatus::ScratchExceeded);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mutating_scratch_tree_cannot_delay_wallclock_enforcement() {
+        let root = std::env::temp_dir().join(format!(
+            "ferrl-scratch-mutation-deadline-test-{}",
+            std::process::id()
+        ));
+        let outside = std::env::temp_dir().join(format!(
+            "ferrl-scratch-mutation-outside-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("keep"), b"outside").unwrap();
+        let limit = open_scratch_limit(&root, u64::MAX).unwrap();
+        let root_arg = shell_quote(&root.display().to_string());
+        let outside_arg = shell_quote(&outside.display().to_string());
+        let script = format!(
+            r#"root={root_arg}
+outside={outside_arg}
+while :; do
+    mkdir "$root/race" 2>/dev/null || true
+    ln -s "$outside" "$root/link.new" 2>/dev/null || true
+    mv -f "$root/link.new" "$root/race/link" 2>/dev/null || true
+    rm -f "$root/race/link"
+    rmdir "$root/race" 2>/dev/null || true
+done"#
+        );
+        let outcome = supervise(
+            sh(&script),
+            Duration::from_millis(300),
+            &[limit],
+            EntryProtocol::NotRequired,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                outcome.status,
+                RunStatus::TimedOut | RunStatus::ScratchExceeded
+            ),
+            "mutating tree returned unexpected status {:?}",
+            outcome.status
+        );
+        assert!(
+            outcome.wall < Duration::from_secs(2),
+            "scratch traversal delayed wall-clock enforcement: {:?}",
+            outcome.wall
+        );
+        assert_eq!(std::fs::read(outside.join("keep")).unwrap(), b"outside");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scratch_scan_does_not_follow_a_symlink_outside_its_anchor() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "ferrl-scratch-nofollow-test-{}",
+            std::process::id()
+        ));
+        let outside = std::env::temp_dir().join(format!(
+            "ferrl-scratch-nofollow-outside-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("large"), vec![0_u8; 1 << 20]).unwrap();
+        symlink(&outside, root.join("outside-link")).unwrap();
+
+        let limit = open_scratch_limit(&root, 64 << 10).unwrap();
+        assert!(!scratch_over_limit(&[limit]));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scratch_scan_fails_closed_beyond_the_depth_budget() {
+        let root = std::env::temp_dir().join(format!(
+            "ferrl-scratch-depth-budget-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut deep = root.clone();
+        for _ in 0..=SCRATCH_SCAN_DEPTH_BUDGET {
+            deep.push("d");
+            std::fs::create_dir(&deep).unwrap();
+        }
+
+        let limit = open_scratch_limit(&root, u64::MAX).unwrap();
+        assert!(scratch_over_limit(&[limit]));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[cfg(unix)]

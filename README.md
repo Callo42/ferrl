@@ -396,8 +396,9 @@ the training UID. `trimul.verifier_apptainer_bin` may override `/usr/bin/apptain
 another absolute, canonical, root-owned, non-group/world-writable executable.
 
 The optional dedicated tier requires an administrator to pre-create a service-owned,
-non-group-writable socket directory and a mode-`0700` work root, then run the executor
-under the dedicated UID (normally through a service manager):
+non-group-writable socket directory and a mode-`0700` work root beneath ancestors that
+are owned by root or the service UID and grant no group/world write access, then run the
+executor under the dedicated UID (normally through a service manager):
 
 ```sh
 ferrl verifier-executor \
@@ -411,9 +412,10 @@ Set `trimul.verifier_isolation_tier = "dedicated_uid_service_v1"` and optionally
 `trimul.verifier_executor_socket` when deployment uses a non-default socket. The
 socket parent and socket must be owned by the executor UID and grant no world write or
 socket access; the socket parent must not be group-writable, and the work root must
-already be owned by that UID and grant no group/world permissions. Executor socket I/O
-uses deadlines derived from the requested wall budget, so a stalled service cannot hold
-a training rank indefinitely.
+already be owned by that UID and grant no group/world permissions. The service retains
+the authenticated work root as an open directory descriptor and creates/stages requests
+descriptor-relatively. Executor socket I/O uses deadlines derived from the requested wall
+budget, so a stalled service cannot hold a training rank indefinitely.
 
 ```jsonc
 "launch_authentication": "local_ephemeral_v1",

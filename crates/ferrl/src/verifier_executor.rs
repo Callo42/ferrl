@@ -278,7 +278,8 @@ pub struct VerifierExecutorConfig {
     /// Unix socket clients connect to.
     pub socket_path: PathBuf,
     /// Pre-existing service-private root for per-request assets and scratch
-    /// directories. It must be owned by the executor UID with mode `0700`.
+    /// directories. It must be owned by the executor UID with mode `0700`, beneath
+    /// ancestors owned by root or the executor and protected from group/world writes.
     pub work_root: PathBuf,
     /// The only training-process UID accepted by `SO_PEERCRED`.
     pub client_uid: u32,
@@ -349,7 +350,9 @@ pub enum VerifierExecutorError {
 /// The process must already be launched under a dedicated non-root service UID.
 /// The socket parent is administrator-managed; it must be owned by the service
 /// UID and must not be world-writable. `work_root` must already be service-owned
-/// with mode `0700`; the executor does not create deployment directories.
+/// with mode `0700`, and both deployment paths must have root/service-owned,
+/// non-group/world-writable ancestors. The executor retains an authenticated root
+/// descriptor and does not create deployment directories.
 ///
 /// # Errors
 ///
@@ -435,16 +438,18 @@ enum ExecutorWireError {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use std::fs::{self, File, OpenOptions};
+    use std::ffi::{CStr, CString};
+    use std::fs::{self, File};
     use std::io::{IoSlice, IoSliceMut, Read as _, Seek as _, SeekFrom, Write as _};
     use std::mem::MaybeUninit;
     use std::os::fd::{AsFd as _, OwnedFd};
+    use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::{
-        DirBuilderExt as _, FileTypeExt as _, MetadataExt as _, OpenOptionsExt as _,
-        PermissionsExt as _,
+        DirBuilderExt as _, FileTypeExt as _, MetadataExt as _, PermissionsExt as _,
     };
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
 
@@ -475,6 +480,28 @@ mod linux {
         .union(rustix::fs::SealFlags::SHRINK)
         .union(rustix::fs::SealFlags::SEAL);
     static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Debug)]
+    struct WorkRootHandle {
+        path: PathBuf,
+        directory: OwnedFd,
+    }
+
+    #[derive(Debug)]
+    struct ServiceWorkRoot {
+        handle: WorkRootHandle,
+        uid: u32,
+        device: u64,
+        inode: u64,
+        mode: u32,
+    }
+
+    #[derive(Debug)]
+    struct RequestRoot {
+        path: PathBuf,
+        name: CString,
+        directory: OwnedFd,
+    }
 
     fn executor_wire_timeout(wall: Duration) -> Duration {
         wall.max(Duration::from_secs(1))
@@ -630,7 +657,8 @@ mod linux {
     }
 
     pub(super) fn serve(config: &VerifierExecutorConfig) -> Result<(), VerifierExecutorError> {
-        let service_uid = validate_service_config(config)?;
+        let (service_uid, work_root) = validate_service_config(config)?;
+        let work_root = Arc::new(work_root);
         rustix::process::set_dumpable_behavior(DumpableBehavior::NotDumpable).map_err(
             |source| VerifierExecutorError::Io {
                 operation: "disabling executor dumpability",
@@ -658,8 +686,9 @@ mod linux {
                 source,
             })?;
             let request_config = (*config).clone();
+            let request_work_root = Arc::clone(&work_root);
             let _request = thread::spawn(move || {
-                let _ = handle_connection(stream, &request_config, service_uid);
+                let _ = handle_connection(stream, &request_config, service_uid, &request_work_root);
             });
         }
         Err(VerifierExecutorError::InvalidConfig(
@@ -720,7 +749,7 @@ mod linux {
 
     fn validate_service_config(
         config: &VerifierExecutorConfig,
-    ) -> Result<u32, VerifierExecutorError> {
+    ) -> Result<(u32, ServiceWorkRoot), VerifierExecutorError> {
         let service_uid = rustix::process::geteuid().as_raw();
         if service_uid == 0 || config.client_uid == 0 || service_uid == config.client_uid {
             return Err(VerifierExecutorError::InvalidConfig(
@@ -744,21 +773,18 @@ mod linux {
                 config.socket_path.display()
             )));
         }
-        validate_service_directory(
-            config.socket_path.parent().ok_or_else(|| {
-                VerifierExecutorError::InvalidConfig(
-                    "executor socket has no parent directory".to_string(),
-                )
-            })?,
-            service_uid,
-            false,
-            "socket parent",
-        )?;
+        let socket_parent = config.socket_path.parent().ok_or_else(|| {
+            VerifierExecutorError::InvalidConfig(
+                "executor socket has no parent directory".to_string(),
+            )
+        })?;
+        validate_service_directory(socket_parent, service_uid, false, "socket parent")?;
+        validate_protected_ancestors(socket_parent, service_uid, "socket parent")?;
 
-        validate_service_directory(&config.work_root, service_uid, true, "work root")?;
-        service_isolation_evidence(config, service_uid)
+        let work_root = open_service_work_root(&config.work_root, service_uid)?;
+        service_isolation_evidence(config, service_uid, &work_root)
             .map_err(|error| VerifierExecutorError::InvalidConfig(error.to_string()))?;
-        Ok(service_uid)
+        Ok((service_uid, work_root))
     }
 
     fn validate_same_uid_config(
@@ -1008,6 +1034,7 @@ mod linux {
     fn service_isolation_evidence(
         config: &VerifierExecutorConfig,
         service_uid: u32,
+        work_root: &ServiceWorkRoot,
     ) -> Result<VerifierIsolationEvidence, SandboxError> {
         let observed_uid = rustix::process::geteuid().as_raw();
         if service_uid != observed_uid
@@ -1020,8 +1047,7 @@ mod linux {
                     .to_string(),
             ));
         }
-        let (canonical_work_root, work_root_metadata) =
-            service_work_root_identity(&config.work_root, service_uid)?;
+        validate_service_work_root(work_root, service_uid)?;
         let binary = trusted_binary_identity(&config.apptainer_bin, "dedicated verifier Apptainer")
             .map_err(|error| SandboxError::Executor(error.to_string()))?;
 
@@ -1036,45 +1062,67 @@ mod linux {
             apptainer_sha256: binary.sha256,
             apptainer_len_bytes: binary.len_bytes,
             apptainer_version: binary.version,
-            work_root: canonical_work_root,
-            work_root_uid: work_root_metadata.uid(),
-            work_root_device: work_root_metadata.dev(),
-            work_root_inode: work_root_metadata.ino(),
-            work_root_mode: work_root_metadata.mode() & 0o777,
+            work_root: work_root.handle.path.clone(),
+            work_root_uid: work_root.uid,
+            work_root_device: work_root.device,
+            work_root_inode: work_root.inode,
+            work_root_mode: work_root.mode,
         })
     }
 
-    fn service_work_root_identity(
+    fn open_service_work_root(
         work_root: &Path,
         service_uid: u32,
-    ) -> Result<(PathBuf, fs::Metadata), SandboxError> {
+    ) -> Result<ServiceWorkRoot, VerifierExecutorError> {
         if !is_normal_absolute(work_root) {
-            return Err(SandboxError::Executor(
+            return Err(VerifierExecutorError::InvalidConfig(
                 "dedicated verifier work_root must be an absolute normalized path".to_string(),
             ));
         }
-        validate_service_directory(work_root, service_uid, true, "work root")
-            .map_err(|error| SandboxError::Executor(error.to_string()))?;
-        let canonical = fs::canonicalize(work_root).map_err(|source| {
-            SandboxError::Executor(format!(
-                "could not canonicalize dedicated verifier work_root {}: {source}",
-                work_root.display()
-            ))
-        })?;
+        validate_service_directory(work_root, service_uid, true, "work root")?;
+        validate_protected_ancestors(work_root, service_uid, "work root")?;
+        let canonical =
+            fs::canonicalize(work_root).map_err(|source| VerifierExecutorError::Io {
+                operation: "canonicalizing executor work root",
+                source,
+            })?;
         if canonical != work_root {
-            return Err(SandboxError::Executor(format!(
+            return Err(VerifierExecutorError::InvalidConfig(format!(
                 "dedicated verifier work_root must already be canonical: configured {}, resolved {}",
                 work_root.display(),
                 canonical.display()
             )));
         }
-        let metadata = fs::symlink_metadata(&canonical).map_err(|source| {
-            SandboxError::Executor(format!(
-                "could not inspect dedicated verifier work_root {}: {source}",
-                canonical.display()
-            ))
+        let handle = open_work_root(&canonical).map_err(|source| VerifierExecutorError::Io {
+            operation: "opening executor work root",
+            source,
         })?;
-        Ok((canonical, metadata))
+        let stat =
+            rustix::fs::fstat(&handle.directory).map_err(|source| VerifierExecutorError::Io {
+                operation: "authenticating executor work-root descriptor",
+                source: source.into(),
+            })?;
+        let metadata =
+            fs::symlink_metadata(&canonical).map_err(|source| VerifierExecutorError::Io {
+                operation: "rechecking executor work-root pathname",
+                source,
+            })?;
+        if metadata.dev() != stat.st_dev
+            || metadata.ino() != stat.st_ino
+            || stat.st_uid != service_uid
+            || stat.st_mode & 0o777 != 0o700
+        {
+            return Err(VerifierExecutorError::InvalidConfig(
+                "executor work_root changed while its descriptor was authenticated".to_string(),
+            ));
+        }
+        Ok(ServiceWorkRoot {
+            handle,
+            uid: stat.st_uid,
+            device: stat.st_dev,
+            inode: stat.st_ino,
+            mode: stat.st_mode & 0o777,
+        })
     }
 
     fn validate_service_directory(
@@ -1097,6 +1145,76 @@ mod linux {
                 "executor {label} {} is not a protected service-owned directory",
                 path.display()
             )));
+        }
+        Ok(())
+    }
+
+    fn validate_protected_ancestors(
+        path: &Path,
+        service_uid: u32,
+        label: &str,
+    ) -> Result<(), VerifierExecutorError> {
+        for ancestor in path.ancestors().skip(1) {
+            let metadata =
+                fs::symlink_metadata(ancestor).map_err(|source| VerifierExecutorError::Io {
+                    operation: "inspecting executor service-directory ancestors",
+                    source,
+                })?;
+            if metadata.file_type().is_symlink()
+                || !metadata.is_dir()
+                || (metadata.uid() != 0 && metadata.uid() != service_uid)
+                || metadata.mode() & 0o022 != 0
+            {
+                return Err(VerifierExecutorError::InvalidConfig(format!(
+                    "executor {label} ancestor {} is not root/service-owned, non-symlink, and protected from group/world writes",
+                    ancestor.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn open_work_root(path: &Path) -> std::io::Result<WorkRootHandle> {
+        let directory = rustix::fs::openat(
+            rustix::fs::CWD,
+            path,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )?;
+        Ok(WorkRootHandle {
+            path: path.to_path_buf(),
+            directory,
+        })
+    }
+
+    fn validate_service_work_root(
+        work_root: &ServiceWorkRoot,
+        _service_uid: u32,
+    ) -> Result<(), SandboxError> {
+        let metadata = fs::symlink_metadata(&work_root.handle.path).map_err(|source| {
+            SandboxError::Executor(format!(
+                "could not recheck dedicated verifier work_root {}: {source}",
+                work_root.handle.path.display()
+            ))
+        })?;
+        let stat = rustix::fs::fstat(&work_root.handle.directory)
+            .map_err(|source| SandboxError::Executor(source.to_string()))?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || metadata.dev() != work_root.device
+            || metadata.ino() != work_root.inode
+            || stat.st_uid != work_root.uid
+            || stat.st_dev != work_root.device
+            || stat.st_ino != work_root.inode
+            || stat.st_mode & 0o777 != work_root.mode
+        {
+            return Err(SandboxError::Executor(
+                "dedicated verifier work_root pathname no longer matches its authenticated descriptor"
+                    .to_string(),
+            ));
         }
         Ok(())
     }
@@ -1437,6 +1555,7 @@ mod linux {
         mut stream: UnixStream,
         config: &VerifierExecutorConfig,
         service_uid: u32,
+        work_root: &ServiceWorkRoot,
     ) -> std::io::Result<()> {
         stream.set_read_timeout(Some(EXECUTOR_HANDSHAKE_TIMEOUT))?;
         stream.set_write_timeout(Some(EXECUTOR_HANDSHAKE_TIMEOUT))?;
@@ -1447,7 +1566,7 @@ mod linux {
                 let wire_timeout = executor_wire_timeout(request.limits.wall);
                 stream.set_read_timeout(Some(wire_timeout))?;
                 stream.set_write_timeout(Some(wire_timeout))?;
-                execute_request(*request, fds, config, service_uid)
+                execute_request(*request, fds, config, service_uid, work_root)
             }
             Ok((ExecutorWireRequest::Preflight { version }, _))
                 if version != EXECUTOR_PROTOCOL_VERSION =>
@@ -1462,7 +1581,7 @@ mod linux {
                 ))
             }
             Ok((ExecutorWireRequest::Preflight { .. }, _)) => {
-                match service_isolation_evidence(config, service_uid) {
+                match service_isolation_evidence(config, service_uid, work_root) {
                     Ok(evidence) => ExecutorResponse::Preflight {
                         service_uid,
                         evidence,
@@ -1496,8 +1615,15 @@ mod linux {
         fds: Vec<OwnedFd>,
         config: &VerifierExecutorConfig,
         service_uid: u32,
+        work_root: &ServiceWorkRoot,
     ) -> ExecutorResponse {
-        let result = execute_request_inner(request, fds, &config.work_root, &config.apptainer_bin);
+        let result = validate_service_work_root(work_root, service_uid).and_then(|()| {
+            execute_request_inner_at(request, fds, &work_root.handle, &config.apptainer_bin)
+        });
+        let result = match (result, validate_service_work_root(work_root, service_uid)) {
+            (Ok(outcome), Ok(())) => Ok(outcome),
+            (Err(error), Ok(())) | (_, Err(error)) => Err(error),
+        };
         match result {
             Ok(outcome) => ExecutorResponse::Outcome {
                 service_uid,
@@ -1513,17 +1639,28 @@ mod linux {
         work_root: &Path,
         apptainer_bin: &Path,
     ) -> Result<RunOutcome, SandboxError> {
+        let work_root =
+            open_work_root(work_root).map_err(|error| SandboxError::Executor(error.to_string()))?;
+        execute_request_inner_at(request, fds, &work_root, apptainer_bin)
+    }
+
+    fn execute_request_inner_at(
+        request: ExecutorRequest,
+        fds: Vec<OwnedFd>,
+        work_root: &WorkRootHandle,
+        apptainer_bin: &Path,
+    ) -> Result<RunOutcome, SandboxError> {
         validate_wire_request(&request, fds.len())?;
         let request_root = create_request_root(work_root)
             .map_err(|error| SandboxError::Executor(error.to_string()))?;
         let result = stage_and_run(&request_root, request, fds, apptainer_bin);
-        let cleanup = remove_request_tree(&request_root);
+        let cleanup = remove_request_tree_at(&work_root.directory, &request_root.name);
         match (result, cleanup) {
             (Ok(outcome), Ok(())) => Ok(outcome),
             (Err(error), Ok(())) => Err(error),
             (_, Err(error)) => Err(SandboxError::Executor(format!(
                 "could not remove protected request directory {}: {error}",
-                request_root.display()
+                request_root.path.display()
             ))),
         }
     }
@@ -1571,6 +1708,7 @@ mod linux {
         Ok(None)
     }
 
+    #[cfg(test)]
     fn remove_request_tree(path: &Path) -> std::io::Result<()> {
         let metadata = match fs::symlink_metadata(path) {
             Ok(metadata) => metadata,
@@ -1581,19 +1719,33 @@ mod linux {
             return fs::remove_file(path);
         }
 
-        // The sandbox process tree has been reaped before this runs, so names can
-        // no longer race. Keep one anchor plus one scan/child descriptor: return
-        // through `..` instead of retaining a descriptor for every depth level.
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-        let mut directory = rustix::fs::openat(
+        let parent_path = path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("request tree has no parent"))?;
+        let name = cstring_name(
+            path.file_name()
+                .ok_or_else(|| std::io::Error::other("request tree has no name"))?,
+        )?;
+        let parent = rustix::fs::openat(
             rustix::fs::CWD,
-            path,
+            parent_path,
             rustix::fs::OFlags::RDONLY
                 | rustix::fs::OFlags::DIRECTORY
                 | rustix::fs::OFlags::NOFOLLOW
                 | rustix::fs::OFlags::CLOEXEC,
             rustix::fs::Mode::empty(),
         )?;
+        remove_request_tree_at(&parent, &name)
+    }
+
+    fn remove_request_tree_at<Fd: std::os::fd::AsFd>(
+        parent: Fd,
+        name: &CStr,
+    ) -> std::io::Result<()> {
+        // The sandbox process tree has been reaped before this runs, so names can
+        // no longer race. Keep one anchor plus one scan/child descriptor: return
+        // through `..` instead of retaining a descriptor for every depth level.
+        let mut directory = open_cleanup_directory(&parent, name)?;
         let mut ancestors = Vec::new();
         loop {
             if let Some(name) = first_cleanup_entry(&directory)? {
@@ -1611,7 +1763,8 @@ mod linux {
 
             let Some(name) = ancestors.pop() else {
                 drop(directory);
-                return fs::remove_dir(path);
+                rustix::fs::unlinkat(&parent, name, rustix::fs::AtFlags::REMOVEDIR)?;
+                return Ok(());
             };
             let parent = rustix::fs::openat(
                 &directory,
@@ -1626,6 +1779,15 @@ mod linux {
             rustix::fs::unlinkat(&parent, &name, rustix::fs::AtFlags::REMOVEDIR)?;
             directory = parent;
         }
+    }
+
+    fn cstring_name(name: &std::ffi::OsStr) -> std::io::Result<CString> {
+        CString::new(name.as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "filesystem component contains NUL",
+            )
+        })
     }
 
     fn validate_wire_request(
@@ -1716,17 +1878,37 @@ mod linux {
         Ok(())
     }
 
-    fn create_request_root(work_root: &Path) -> std::io::Result<PathBuf> {
+    fn create_request_root(work_root: &WorkRootHandle) -> std::io::Result<RequestRoot> {
         for _ in 0..1024 {
             let sequence = REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let path = work_root.join(format!("request-{}-{sequence}", std::process::id()));
-            match fs::create_dir(&path) {
+            let name = CString::new(format!("request-{}-{sequence}", std::process::id()))
+                .expect("fixed request-directory name contains no NUL");
+            match rustix::fs::mkdirat(
+                &work_root.directory,
+                &name,
+                rustix::fs::Mode::from_bits_truncate(0o700),
+            ) {
                 Ok(()) => {
-                    fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
-                    return Ok(path);
+                    let directory = rustix::fs::openat(
+                        &work_root.directory,
+                        &name,
+                        rustix::fs::OFlags::RDONLY
+                            | rustix::fs::OFlags::DIRECTORY
+                            | rustix::fs::OFlags::NOFOLLOW
+                            | rustix::fs::OFlags::CLOEXEC,
+                        rustix::fs::Mode::empty(),
+                    )?;
+                    rustix::fs::fchmod(&directory, rustix::fs::Mode::from_bits_truncate(0o700))?;
+                    return Ok(RequestRoot {
+                        path: work_root
+                            .path
+                            .join(std::ffi::OsStr::from_bytes(name.to_bytes())),
+                        name,
+                        directory,
+                    });
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error),
+                Err(rustix::io::Errno::EXIST) => {}
+                Err(error) => return Err(error.into()),
             }
         }
         Err(std::io::Error::other(
@@ -1735,121 +1917,216 @@ mod linux {
     }
 
     fn stage_and_run(
-        request_root: &Path,
+        request_root: &RequestRoot,
         request: ExecutorRequest,
         fds: Vec<OwnedFd>,
         apptainer_bin: &Path,
     ) -> Result<RunOutcome, SandboxError> {
-        let assets_root = request_root.join("assets");
-        fs::create_dir(&assets_root).map_err(|error| SandboxError::Executor(error.to_string()))?;
-        fs::set_permissions(&assets_root, fs::Permissions::from_mode(0o700))
-            .map_err(|error| SandboxError::Executor(error.to_string()))?;
-        let mut staged_assets = Vec::with_capacity(fds.len());
-        for (index, fd) in fds.into_iter().enumerate() {
-            let name = if index == request.image_fd {
-                "image.sif".to_string()
-            } else {
-                format!("asset-{index}")
-            };
-            let path = assets_root.join(name);
-            stage_asset(File::from(fd), &path)?;
-            staged_assets.push(path);
-        }
-        fs::set_permissions(&assets_root, fs::Permissions::from_mode(0o500))
-            .map_err(|error| SandboxError::Executor(error.to_string()))?;
-
-        let mut binds = Vec::with_capacity(request.binds.len());
-        for (index, bind) in request.binds.into_iter().enumerate() {
-            let src = match bind.source {
-                ExecutorBindSource::SealedAsset { fd_index } => staged_assets[fd_index].clone(),
-                ExecutorBindSource::FreshScratch => {
-                    let scratch = request_root.join(format!("scratch-{index}"));
-                    fs::create_dir(&scratch)
-                        .map_err(|error| SandboxError::Executor(error.to_string()))?;
-                    fs::set_permissions(&scratch, fs::Permissions::from_mode(0o700))
-                        .map_err(|error| SandboxError::Executor(error.to_string()))?;
-                    for directory in &bind.directories {
-                        create_private_directory(&scratch, directory)?;
-                    }
-                    scratch
-                }
-            };
-            binds.push(Bind {
-                src,
-                dst: bind.dst,
-                mode: bind.mode,
-                total_limit: bind.total_limit,
-            });
-        }
-        let protected_output = request.protected_output.map(|output| {
+        let ExecutorRequest {
+            image_fd,
+            command,
+            binds: request_binds,
+            workdir,
+            env,
+            gpu,
+            network,
+            limits,
+            protected_output: protected_mapping,
+            ..
+        } = request;
+        let staged_assets = stage_request_assets(request_root, image_fd, fds)?;
+        let binds = stage_request_binds(
+            request_root,
+            request_binds,
+            protected_mapping.as_ref(),
+            &staged_assets,
+        )?;
+        let protected_output = protected_mapping.map(|output| {
             let host_socket = binds[output.bind_index].src.join(output.relative_path);
             ProtectedOutput::new(host_socket, output.sandbox_socket)
         });
-        if let Some(output) = &protected_output {
-            let parent = output.host_socket.parent().ok_or_else(|| {
-                SandboxError::InvalidSpec(
-                    "protected output socket has no service-private parent".to_string(),
-                )
-            })?;
-            fs::create_dir_all(parent)
-                .map_err(|error| SandboxError::Executor(error.to_string()))?;
-            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
-                .map_err(|error| SandboxError::Executor(error.to_string()))?;
-        }
         let spec = RunSpec {
-            image: staged_assets[request.image_fd].clone(),
-            command: request.command,
+            image: staged_assets[image_fd].clone(),
+            command,
             binds,
-            workdir: request.workdir,
-            env: request.env,
-            gpu: request.gpu,
-            network: request.network,
-            limits: request.limits,
+            workdir,
+            env,
+            gpu,
+            network,
+            limits,
             protected_output,
         };
         ApptainerSandbox::with_bin(apptainer_bin).run(&spec)
     }
 
-    fn create_private_directory(root: &Path, relative: &Path) -> Result<(), SandboxError> {
-        let mut directory = root.to_path_buf();
+    fn stage_request_assets(
+        request_root: &RequestRoot,
+        image_fd: usize,
+        fds: Vec<OwnedFd>,
+    ) -> Result<Vec<PathBuf>, SandboxError> {
+        let assets_name = rustix::cstr!("assets");
+        let assets = create_private_child(&request_root.directory, assets_name)?;
+        let assets_root = request_root.path.join("assets");
+        let mut staged_assets = Vec::with_capacity(fds.len());
+        for (index, fd) in fds.into_iter().enumerate() {
+            let name = if index == image_fd {
+                "image.sif".to_string()
+            } else {
+                format!("asset-{index}")
+            };
+            let name = CString::new(name).expect("fixed asset name contains no NUL");
+            let path = assets_root.join(std::ffi::OsStr::from_bytes(name.to_bytes()));
+            stage_asset_at(File::from(fd), &assets, &name)?;
+            staged_assets.push(path);
+        }
+        rustix::fs::fchmod(&assets, rustix::fs::Mode::from_bits_truncate(0o500))
+            .map_err(|error| SandboxError::Executor(error.to_string()))?;
+        Ok(staged_assets)
+    }
+
+    fn stage_request_binds(
+        request_root: &RequestRoot,
+        request_binds: Vec<ExecutorBind>,
+        protected_mapping: Option<&ExecutorProtectedOutput>,
+        staged_assets: &[PathBuf],
+    ) -> Result<Vec<Bind>, SandboxError> {
+        let mut binds = Vec::with_capacity(request_binds.len());
+        for (index, bind) in request_binds.into_iter().enumerate() {
+            let ExecutorBind {
+                source,
+                dst,
+                mode,
+                total_limit,
+                directories,
+            } = bind;
+            let src = match source {
+                ExecutorBindSource::SealedAsset { fd_index } => staged_assets[fd_index].clone(),
+                ExecutorBindSource::FreshScratch => {
+                    stage_fresh_scratch(request_root, index, &directories, protected_mapping)?
+                }
+            };
+            binds.push(Bind {
+                src,
+                dst,
+                mode,
+                total_limit,
+            });
+        }
+        Ok(binds)
+    }
+
+    fn stage_fresh_scratch(
+        request_root: &RequestRoot,
+        index: usize,
+        directories: &[PathBuf],
+        protected_mapping: Option<&ExecutorProtectedOutput>,
+    ) -> Result<PathBuf, SandboxError> {
+        let scratch_name =
+            CString::new(format!("scratch-{index}")).expect("fixed scratch name contains no NUL");
+        let scratch_directory = create_private_child(&request_root.directory, &scratch_name)?;
+        let scratch = request_root
+            .path
+            .join(std::ffi::OsStr::from_bytes(scratch_name.to_bytes()));
+        for directory in directories {
+            create_private_directory_at(&scratch_directory, directory)?;
+        }
+        if let Some(output) = protected_mapping.filter(|output| output.bind_index == index) {
+            if let Some(parent) = output.relative_path.parent() {
+                create_private_directory_at(&scratch_directory, parent)?;
+            }
+        }
+        Ok(scratch)
+    }
+
+    fn create_private_child<Fd: std::os::fd::AsFd>(
+        parent: Fd,
+        name: &CStr,
+    ) -> Result<OwnedFd, SandboxError> {
+        rustix::fs::mkdirat(&parent, name, rustix::fs::Mode::from_bits_truncate(0o700))
+            .map_err(|error| SandboxError::Executor(error.to_string()))?;
+        let directory = rustix::fs::openat(
+            &parent,
+            name,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(|error| SandboxError::Executor(error.to_string()))?;
+        rustix::fs::fchmod(&directory, rustix::fs::Mode::from_bits_truncate(0o700))
+            .map_err(|error| SandboxError::Executor(error.to_string()))?;
+        Ok(directory)
+    }
+
+    fn create_private_directory_at<Fd: std::os::fd::AsFd>(
+        root: Fd,
+        relative: &Path,
+    ) -> Result<(), SandboxError> {
+        let mut directory = rustix::fs::openat(
+            &root,
+            rustix::cstr!("."),
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(|error| SandboxError::Executor(error.to_string()))?;
         for component in relative.components() {
             let std::path::Component::Normal(component) = component else {
                 return Err(SandboxError::InvalidSpec(
                     "fresh scratch directory is not normalized".to_string(),
                 ));
             };
-            directory.push(component);
-            match fs::create_dir(&directory) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let metadata = fs::symlink_metadata(&directory)
-                        .map_err(|error| SandboxError::Executor(error.to_string()))?;
-                    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                        return Err(SandboxError::Executor(format!(
-                            "fresh scratch path is not a directory: {}",
-                            directory.display()
-                        )));
-                    }
-                }
+            let component = cstring_name(component)
+                .map_err(|error| SandboxError::Executor(error.to_string()))?;
+            match rustix::fs::mkdirat(
+                &directory,
+                &component,
+                rustix::fs::Mode::from_bits_truncate(0o700),
+            ) {
+                Ok(()) | Err(rustix::io::Errno::EXIST) => {}
                 Err(error) => return Err(SandboxError::Executor(error.to_string())),
             }
-            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+            let child = rustix::fs::openat(
+                &directory,
+                &component,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map_err(|error| SandboxError::Executor(error.to_string()))?;
+            rustix::fs::fchmod(&child, rustix::fs::Mode::from_bits_truncate(0o700))
                 .map_err(|error| SandboxError::Executor(error.to_string()))?;
+            directory = child;
         }
         Ok(())
     }
 
-    fn stage_asset(mut source: File, destination: &Path) -> Result<(), SandboxError> {
+    fn stage_asset_at<Fd: std::os::fd::AsFd>(
+        mut source: File,
+        destination_parent: Fd,
+        destination_name: &CStr,
+    ) -> Result<(), SandboxError> {
         validate_sealed_asset(&source).map_err(SandboxError::InvalidSpec)?;
         source
             .seek(SeekFrom::Start(0))
             .map_err(|error| SandboxError::Executor(error.to_string()))?;
-        let mut destination_file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o400)
-            .open(destination)
-            .map_err(|error| SandboxError::Executor(error.to_string()))?;
+        let destination = rustix::fs::openat(
+            destination_parent,
+            destination_name,
+            rustix::fs::OFlags::RDWR
+                | rustix::fs::OFlags::CREATE
+                | rustix::fs::OFlags::EXCL
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::from_bits_truncate(0o600),
+        )
+        .map_err(|error| SandboxError::Executor(error.to_string()))?;
+        let mut destination_file = File::from(destination);
         let mut source_hash = Sha256::new();
         let mut buffer = [0_u8; 1024 * 1024];
         loop {
@@ -1867,15 +2144,17 @@ mod linux {
         destination_file
             .sync_all()
             .map_err(|error| SandboxError::Executor(error.to_string()))?;
-        drop(destination_file);
-        fs::set_permissions(destination, fs::Permissions::from_mode(0o400))
+        rustix::fs::fchmod(
+            &destination_file,
+            rustix::fs::Mode::from_bits_truncate(0o400),
+        )
+        .map_err(|error| SandboxError::Executor(error.to_string()))?;
+        destination_file
+            .seek(SeekFrom::Start(0))
             .map_err(|error| SandboxError::Executor(error.to_string()))?;
-
-        let mut staged =
-            File::open(destination).map_err(|error| SandboxError::Executor(error.to_string()))?;
         let mut staged_hash = Sha256::new();
         loop {
-            let count = staged
+            let count = destination_file
                 .read(&mut buffer)
                 .map_err(|error| SandboxError::Executor(error.to_string()))?;
             if count == 0 {
@@ -1987,12 +2266,26 @@ mod linux {
             }
         }
 
+        fn test_service_work_root(path: &Path) -> ServiceWorkRoot {
+            let handle = open_work_root(path).unwrap();
+            let stat = rustix::fs::fstat(&handle.directory).unwrap();
+            ServiceWorkRoot {
+                handle,
+                uid: stat.st_uid,
+                device: stat.st_dev,
+                inode: stat.st_ino,
+                mode: stat.st_mode & 0o777,
+            }
+        }
+
         fn complete_request(spec: &RunSpec, config: &VerifierExecutorConfig) -> ExecutorResponse {
             let (request, assets) = request_from_spec(spec).unwrap();
             let (mut client, server) = UnixStream::pair().unwrap();
             let config = config.clone();
             let service_uid = rustix::process::geteuid().as_raw();
-            let executor = thread::spawn(move || handle_connection(server, &config, service_uid));
+            let work_root = test_service_work_root(&config.work_root);
+            let executor =
+                thread::spawn(move || handle_connection(server, &config, service_uid, &work_root));
             send_request(
                 &mut client,
                 &ExecutorWireRequest::Run(Box::new(request)),
@@ -2315,8 +2608,10 @@ printf '%s\n' '{ENTRY_MARKER}' >&2
             let config =
                 VerifierExecutorConfig::new(root.join("executor.sock"), &root, current_uid)
                     .with_apptainer_bin("/usr/bin/true");
+            let work_root = test_service_work_root(&root);
             let (mut client, server) = UnixStream::pair().unwrap();
-            let executor = thread::spawn(move || handle_connection(server, &config, current_uid));
+            let executor =
+                thread::spawn(move || handle_connection(server, &config, current_uid, &work_root));
             send_request(
                 &mut client,
                 &ExecutorWireRequest::Preflight {
@@ -2567,7 +2862,13 @@ printf '%s\n' '{ENTRY_MARKER}' >&2
         fn service_private_copy_matches_the_sealed_source() {
             let root = test_root("copy");
             let destination = root.join("asset");
-            stage_asset(sealed_asset(b"authenticated bytes"), &destination).unwrap();
+            let root_handle = open_work_root(&root).unwrap();
+            stage_asset_at(
+                sealed_asset(b"authenticated bytes"),
+                &root_handle.directory,
+                rustix::cstr!("asset"),
+            )
+            .unwrap();
             assert_eq!(fs::read(&destination).unwrap(), b"authenticated bytes");
             assert_eq!(fs::metadata(&destination).unwrap().mode() & 0o777, 0o400);
             remove_request_tree(&root).unwrap();
@@ -2583,6 +2884,52 @@ printf '%s\n' '{ENTRY_MARKER}' >&2
             );
             let error = validate_service_config(&config).unwrap_err().to_string();
             assert!(error.contains("distinct non-root UIDs"));
+        }
+
+        #[test]
+        fn dedicated_service_rejects_a_client_writable_work_root_ancestor() {
+            let root = test_root("untrusted-ancestor");
+            let client_writable = root.join("client-writable");
+            fs::create_dir(&client_writable).unwrap();
+            fs::set_permissions(&client_writable, fs::Permissions::from_mode(0o770)).unwrap();
+            let work_root = client_writable.join("work");
+            fs::create_dir(&work_root).unwrap();
+            fs::set_permissions(&work_root, fs::Permissions::from_mode(0o700)).unwrap();
+
+            let error = open_service_work_root(&work_root, rustix::process::geteuid().as_raw())
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("ancestor"), "{error}");
+            assert!(error.contains("group/world writes"), "{error}");
+            remove_request_tree(&root).unwrap();
+        }
+
+        #[test]
+        fn authenticated_work_root_descriptor_defeats_path_replacement_and_restore() {
+            let root = test_root("work-root-replacement");
+            let configured = root.join("work");
+            let authenticated = root.join("authenticated-work");
+            let replacement = root.join("replacement-work");
+            fs::create_dir(&configured).unwrap();
+            fs::set_permissions(&configured, fs::Permissions::from_mode(0o700)).unwrap();
+            let service_root = test_service_work_root(&configured);
+
+            fs::rename(&configured, &authenticated).unwrap();
+            fs::create_dir(&replacement).unwrap();
+            fs::rename(&replacement, &configured).unwrap();
+
+            let request = create_request_root(&service_root.handle).unwrap();
+            let request_name = request.name.to_string_lossy();
+            assert!(authenticated.join(request_name.as_ref()).is_dir());
+            assert!(!configured.join(request_name.as_ref()).exists());
+
+            fs::rename(&configured, &replacement).unwrap();
+            fs::rename(&authenticated, &configured).unwrap();
+            validate_service_work_root(&service_root, rustix::process::geteuid().as_raw()).unwrap();
+            assert!(configured.join(request_name.as_ref()).is_dir());
+            assert!(!replacement.join(request_name.as_ref()).exists());
+            remove_request_tree_at(&service_root.handle.directory, &request.name).unwrap();
+            remove_request_tree(&root).unwrap();
         }
     }
 }

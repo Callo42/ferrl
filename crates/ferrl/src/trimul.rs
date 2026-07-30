@@ -69,7 +69,8 @@
 //! The pure pieces — submission extraction, spec rendering, result parsing, the
 //! run-spec builder, and the reward math — are unit-tested in CI. The real GPU eval
 //! is a `gate`-feature integration test (`tests/trimul_gate.rs`), run on an `sm_80`
-//! node against the eval image; like the GPU tests it is never compiled in CI.
+//! node against the eval image. CI clippies that target and runs its non-ignored
+//! source-contract test; only the ignored Apptainer/GPU controls are deployment-only.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
