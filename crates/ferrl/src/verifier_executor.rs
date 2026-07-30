@@ -2372,11 +2372,14 @@ printf '%s\n' '{ENTRY_MARKER}' >&2
             );
 
             let root = test_root("same-uid-config");
-            let backend = SameUidApptainerSandbox::new(&root).with_apptainer_bin("/usr/bin/true");
+            let system_binary = Path::new("/usr/bin/true");
+            let system_binary_is_trusted =
+                trusted_binary_identity(system_binary, "same-UID verifier test").is_ok();
+            let backend = SameUidApptainerSandbox::new(&root).with_apptainer_bin(system_binary);
             if rustix::process::geteuid().as_raw() == 0 {
                 let error = backend.preflight().unwrap_err().to_string();
                 assert!(error.contains("non-root UID"), "{error}");
-            } else {
+            } else if system_binary_is_trusted {
                 let evidence = backend.preflight().unwrap();
                 assert_eq!(
                     evidence.contract_version,
@@ -2401,8 +2404,19 @@ printf '%s\n' '{ENTRY_MARKER}' >&2
                 let round_trip: VerifierIsolationEvidence =
                     serde_json::from_slice(&serde_json::to_vec(&evidence).unwrap()).unwrap();
                 assert_eq!(round_trip, evidence);
-                fs::set_permissions(&root, fs::Permissions::from_mode(0o770)).unwrap();
+            } else {
                 let error = backend.preflight().unwrap_err().to_string();
+                assert!(error.contains("not trusted"), "{error}");
+                let metadata = fs::symlink_metadata(&root).unwrap();
+                assert_eq!(metadata.uid(), rustix::process::geteuid().as_raw());
+                assert_eq!(metadata.mode() & 0o777, 0o700);
+            }
+
+            if rustix::process::geteuid().as_raw() != 0 {
+                fs::set_permissions(&root, fs::Permissions::from_mode(0o770)).unwrap();
+                let error = prepare_same_uid_work_root(&root, rustix::process::geteuid().as_raw())
+                    .unwrap_err()
+                    .to_string();
                 assert!(error.contains("mode 0700"), "{error}");
                 fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
 
@@ -2420,23 +2434,19 @@ printf '%s\n' '{ENTRY_MARKER}' >&2
 
         #[test]
         #[allow(clippy::cognitive_complexity)]
-        fn same_uid_preflight_creates_a_private_canonical_work_root() {
+        fn same_uid_work_root_preparation_creates_a_private_canonical_directory() {
             if rustix::process::geteuid().as_raw() == 0 {
                 return;
             }
             let parent = test_root("same-uid-create-root");
             let work_root = parent.join("work");
-            let evidence = SameUidApptainerSandbox::new(&work_root)
-                .with_apptainer_bin("/usr/bin/true")
-                .preflight()
-                .unwrap();
-            let metadata = fs::symlink_metadata(&work_root).unwrap();
+            let (canonical, metadata) =
+                prepare_same_uid_work_root(&work_root, rustix::process::geteuid().as_raw())
+                    .unwrap();
             assert!(metadata.is_dir());
             assert_eq!(metadata.uid(), rustix::process::geteuid().as_raw());
             assert_eq!(metadata.mode() & 0o777, 0o700);
-            assert_eq!(evidence.work_root, work_root);
-            assert_eq!(evidence.work_root_device, metadata.dev());
-            assert_eq!(evidence.work_root_inode, metadata.ino());
+            assert_eq!(canonical, work_root);
             remove_request_tree(&parent).unwrap();
         }
 
