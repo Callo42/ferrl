@@ -38,7 +38,10 @@ ISOLATION_TIMING_METRICS = {
 MAX_STATUS_BYTES = 1024
 MAX_STATUS_EVENTS = 32
 ENTRY_ACK = b"ENTRY-ACK-v3"
-MAX_INPUT_BYTES = 2 * 1024 * 1024 * 1024
+# The pinned task's largest float32 input is 3 GiB before its small mask,
+# weights, config, and serialization envelope. Keep the transport bounded while
+# admitting that complete launch-bound case.
+MAX_INPUT_BYTES = 4 * 1024 * 1024 * 1024
 ATTEMPT_SENTINEL_PATH = "/work/cache/ferrl-attack-sentinel"
 PARENT_DEVICE_CANARY = b"ferrl-parent-private-cuda-v1-7f4c3a19"
 PAYLOAD_WIRE_PREFIX = b"FERRL-PAYLOAD-v1\0"
@@ -1281,8 +1284,12 @@ def main():
                 device_identity,
             )
             return 0
-        except BaseException:
-            logger.log("ferrl-infrastructure", f"v1 phase={phase}")
+        except BaseException as error:
+            reason = _bounded_message(f"{type(error).__name__}: {error}")
+            logger.log(
+                "ferrl-infrastructure",
+                f"v1 phase={phase} reason={json.dumps(reason, separators=(',', ':'))}",
+            )
             return 114
     finally:
         _kill_candidate_tree()

@@ -4447,6 +4447,7 @@ mod tests {
         ));
         assert!(FERRL_EVAL_DRIVER.contains("_cpu_clone(value)"));
         assert!(FERRL_EVAL_DRIVER.contains("torch.frombuffer("));
+        assert!(FERRL_EVAL_DRIVER.contains("MAX_INPUT_BYTES = 4 * 1024 * 1024 * 1024"));
         assert!(!FERRL_EVAL_DRIVER.contains("candidate_data, shared_output"));
         assert!(!FERRL_EVAL_DRIVER.contains("torch.multiprocessing"));
         assert!(FERRL_EVAL_DRIVER.contains("trusted correctness checker failed"));
@@ -4497,6 +4498,7 @@ mod tests {
             .find("if not _run_testing(")
             .expect("candidate test execution is explicit");
         assert!(grade_connect < device_identity && device_identity < candidate_start);
+        assert!(main.contains("reason = _bounded_message(f\"{type(error).__name__}: {error}\")"));
         assert_eq!(
             FERRL_EVAL_DRIVER
                 .matches("logger.log(\"ferrl-executing-device\", device_identity)")
