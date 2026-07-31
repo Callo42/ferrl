@@ -303,8 +303,9 @@ The built-in `trimul` task is ferrl's first discovery task: training samples are
 candidate GPU kernels, and success is an emitted artifact rather than just a rising
 reward curve. Before spending GPU time on a TriMul run, use the
 [TriMul Discovery Run Contract](docs/trimul-discovery-run-contract.md). It defines the
-artifact bundle, provenance fields, same-GPU baseline pin, held-out verification,
-dynamic reward-hacking checks, and the no-win stopping report that the operator audits.
+artifact bundle, provenance fields, discovery-time baseline pin, independent same-device
+paired audit, dynamic reward-hacking checks, and the no-win stopping report that the
+operator audits.
 `ferrl train` requires a binary with a clean, exact embedded source commit. The default
 top-level `launch_authentication = "local_ephemeral_v1"` needs no administrator service:
 ferrl integrity-binds the synchronized run identity, complete resolved config,
@@ -320,14 +321,18 @@ runs so the best sampled completions are persisted in `candidates.jsonl`; every 
 carries the launch digest, a digest over all candidate fields, and a signature from the
 launch-bound per-run key.
 Promote exactly one row with `ferrl trimul-artifact --run-dir
-<run-dir> --candidate-sha256 <record_sha256> ...`. The extractor validates the whole
-ledger and the external attestation against the protected trust policy, selects that exact row, and derives completion, coordinates, reward, model,
+<run-dir> --candidate-sha256 <record_sha256> --audit-secret-seed <seed>
+--audit-cuda-visible-device <device> ...`. The extractor validates the whole
+ledger and, when present, the external attestation against the protected trust policy,
+selects that exact row, and derives completion, coordinates, reward, model,
 tokenizer, config, run id, prompt, and training commit from immutable run evidence.
 The artifact bundle retains the exact verified `launch.json` and selected row bytes,
 with hashes for both in `manifest.json`. Local-ephemeral launches and
-`same_uid_apptainer_v1` verifier evidence are valid for training and discovery, but
-`trimul-artifact` rejects them: accepted publication currently requires an externally
-attested launch whose audit runs use `dedicated_uid_service_v1`.
+`same_uid_apptainer_v1` verifier evidence remain discovery provenance; they are never
+relabeled as publication evidence. Artifact acceptance instead requires a new serialized
+`dedicated_uid_service_v1` audit on one explicitly selected CUDA device: eleven
+alternating reference/candidate pairs, complete recomputable preflight and raw protected
+evidence, exact case coverage, and at least nine strict speedups above `1.02x`.
 For rollout-only diagnostics from an external inference runtime, use
 `ferrl trimul-score --config <run.json> --prompt-copy <prompt.txt>
 --completion <raw.txt> --out <scores.jsonl> --score-secret-seed <seed>` (or
@@ -347,8 +352,8 @@ low or zero rewards remain explainable without re-running the whole training ste
 reward-tail triage, set `candidate_log_top_k` at least as high as `group_size` so every
 sampled completion is retained. TriMul's training reward is shaped for search density;
 test-passing candidates whose eval reaches a benchmark marker get a correctness floor,
-and artifact acceptance still requires clean held-out correctness plus repeated measured
-speedup through `ferrl trimul-artifact`. The run-config schema accepts the explicit
+and artifact acceptance still requires clean held-out correctness plus the fixed
+same-device paired decision through `ferrl trimul-artifact`. The run-config schema accepts the explicit
 reward profile below. Omit `trimul.reward` to use these `trimul_shaped_v1` defaults,
 or tune the numeric values to adjust discovery density. Custom profiles must preserve
 the reward ladder: `format_extracted <= runnable` and

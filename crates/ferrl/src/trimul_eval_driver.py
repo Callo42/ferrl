@@ -44,12 +44,17 @@ PARENT_DEVICE_CANARY = b"ferrl-parent-private-cuda-v1-7f4c3a19"
 PAYLOAD_WIRE_PREFIX = b"FERRL-PAYLOAD-v1\0"
 HARDENING_WIRE_PREFIX = b"HARDENED-v1\0"
 HARDENING_CONTRACT = "ferrl.candidate-hardening.v1"
+DEVICE_IDENTITY_CONTRACT = "ferrl.executing-device.v1"
 SECCOMP_POLICY = "x86_64-tsync-af-unix-v1"
 
 
 _LIBC = ctypes.CDLL(None, use_errno=True)
 _LIBC.prctl.restype = ctypes.c_int
 _LIBC.syscall.restype = ctypes.c_long
+
+
+class _CUuuid(ctypes.Structure):
+    _fields_ = [("bytes", ctypes.c_ubyte * 16)]
 
 
 def _prctl(option, value):
@@ -62,6 +67,75 @@ def _prctl_value(option):
     if value < 0:
         raise RuntimeError(f"prctl query {option} failed with errno {ctypes.get_errno()}")
     return value
+
+
+def _cuda_driver_call(function, *args):
+    result = function(*args)
+    if result != 0:
+        raise InfrastructureFailure(f"CUDA driver identity query failed with code {result}")
+
+
+def _executing_device_identity():
+    """Return canonical identity for the CUDA device used by the trusted controller."""
+    try:
+        logical_ordinal = int(torch.cuda.current_device())
+        driver = ctypes.CDLL("libcuda.so.1")
+        driver.cuInit.argtypes = [ctypes.c_uint]
+        driver.cuInit.restype = ctypes.c_int
+        driver.cuDeviceGet.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int]
+        driver.cuDeviceGet.restype = ctypes.c_int
+        driver.cuDeviceGetName.argtypes = [
+            ctypes.POINTER(ctypes.c_char),
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
+        driver.cuDeviceGetName.restype = ctypes.c_int
+        driver.cuDeviceGetPCIBusId.argtypes = [
+            ctypes.POINTER(ctypes.c_char),
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
+        driver.cuDeviceGetPCIBusId.restype = ctypes.c_int
+        uuid_query = getattr(driver, "cuDeviceGetUuid_v2", None)
+        if uuid_query is None:
+            uuid_query = driver.cuDeviceGetUuid
+        uuid_query.argtypes = [ctypes.POINTER(_CUuuid), ctypes.c_int]
+        uuid_query.restype = ctypes.c_int
+
+        _cuda_driver_call(driver.cuInit, 0)
+        device = ctypes.c_int()
+        _cuda_driver_call(driver.cuDeviceGet, ctypes.byref(device), logical_ordinal)
+        name_buffer = ctypes.create_string_buffer(256)
+        pci_buffer = ctypes.create_string_buffer(64)
+        uuid_value = _CUuuid()
+        _cuda_driver_call(driver.cuDeviceGetName, name_buffer, len(name_buffer), device)
+        _cuda_driver_call(
+            driver.cuDeviceGetPCIBusId,
+            pci_buffer,
+            len(pci_buffer),
+            device,
+        )
+        _cuda_driver_call(uuid_query, ctypes.byref(uuid_value), device)
+        name = name_buffer.value.decode("utf-8", errors="strict").strip()
+        pci_bus_id = pci_buffer.value.decode("ascii", errors="strict").strip().lower()
+        uuid = bytes(uuid_value.bytes).hex()
+        if not name or not pci_bus_id or len(uuid) != 32:
+            raise InfrastructureFailure("CUDA driver returned incomplete device identity")
+        return json.dumps(
+            {
+                "contract": DEVICE_IDENTITY_CONTRACT,
+                "cuda_logical_ordinal": logical_ordinal,
+                "name": name,
+                "pci_bus_id": pci_bus_id,
+                "uuid": uuid,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except InfrastructureFailure:
+        raise
+    except BaseException as error:
+        raise InfrastructureFailure("trusted CUDA device identity query failed") from error
 
 
 # Arm procfs protection before any verifier imports. Spawned candidate workers
@@ -1056,11 +1130,12 @@ def _execute_checked(session, args):
     return bool(good), _bounded_message(message or ""), elapsed
 
 
-def _run_testing(logger, tests, isolation_tier, timing_metric):
+def _run_testing(logger, tests, isolation_tier, timing_metric, device_identity):
     if not tests:
         raise InfrastructureFailure("trusted test case set is empty")
     session = CandidateSession("test", logger, isolation_tier, timing_metric)
     try:
+        logger.log("ferrl-executing-device", device_identity)
         logger.log("test-count", len(tests))
         if session.rejected:
             _consume_attempt_sentinel(logger, "test", "import")
@@ -1118,11 +1193,12 @@ def _run_benchmark_case(session, test):
     return _CALCULATE_STATS(durations)
 
 
-def _run_benchmarking(logger, tests, isolation_tier, timing_metric):
+def _run_benchmarking(logger, tests, isolation_tier, timing_metric, device_identity):
     if not tests:
         raise InfrastructureFailure("trusted benchmark case set is empty")
     session = CandidateSession("benchmark", logger, isolation_tier, timing_metric)
     try:
+        logger.log("ferrl-executing-device", device_identity)
         logger.log("benchmark-count", len(tests))
         if session.rejected:
             logger.log("check", "fail")
@@ -1181,16 +1257,29 @@ def main():
             _SET_SEED(seed or 42)
             torch.cuda.init()
             _SYNC()
+            device_identity = _executing_device_identity()
             test_cases = _GET_TEST_CASES(sys.argv[1], seed)
             benchmark_cases = _GET_TEST_CASES(sys.argv[2], seed)
             if not test_cases or not benchmark_cases:
                 raise InfrastructureFailure("trusted case set is empty")
             phase = "test"
-            if not _run_testing(logger, test_cases, isolation_tier, timing_metric):
+            if not _run_testing(
+                logger,
+                test_cases,
+                isolation_tier,
+                timing_metric,
+                device_identity,
+            ):
                 return 0
             logger.raw(RESULT_SPLIT)
             phase = "benchmark"
-            _run_benchmarking(logger, benchmark_cases, isolation_tier, timing_metric)
+            _run_benchmarking(
+                logger,
+                benchmark_cases,
+                isolation_tier,
+                timing_metric,
+                device_identity,
+            )
             return 0
         except BaseException:
             logger.log("ferrl-infrastructure", f"v1 phase={phase}")

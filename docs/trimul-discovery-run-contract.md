@@ -39,17 +39,18 @@ prompt text. Select completion parsing separately with
 `trimul.submission_extract_mode`, which must be either `final_fence` or
 `thinking_after_think` and never changes prompt bytes. The extraction command is `ferrl
 trimul-artifact --run-dir <run-dir> --candidate-sha256 <record_sha256>
---out <artifact-dir> --audit-secret-seed <seed> --baseline-ns <ns>
---baseline-ns <ns> --baseline-ns <ns> --run-health <summary>
+--out <artifact-dir> --audit-secret-seed <seed>
+--audit-verifier-executor-socket <dedicated-service.sock>
+--audit-cuda-visible-device <one-device-token> --run-health <summary>
 --source-inspection clean --source-inspection-notes <notes>`. Artifact extraction
 requires `launch.json` to have the exact production-canonical encoding, then validates
-its attestation, every candidate row, the exact selected row, the frozen prompt, and the
+its authentication contract and any required external attestation, every candidate row,
+the exact selected row, the frozen prompt, and the
 live verifier assets before GPU detection or audit verification. It does not accept operator-authored
 completion, coordinate, reward, run, commit, model, tokenizer, eval, or sandbox
-provenance fields. The current artifact command accepts only an
-`external_attested_v1` launch audited under `dedicated_uid_service_v1`; a local or
-same-UID discovery run remains training evidence and returns a clear higher-assurance
-audit-required error.
+provenance fields. Both launch-authentication modes may hand a launch-bound native row
+to the artifact command. The discovery mode and verifier tier remain recorded without
+upgrade; acceptance requires a separate `dedicated_uid_service_v1` audit.
 
 ## Launch Authentication
 
@@ -59,8 +60,13 @@ run against accidental drift, cross-run substitution, and later loss of the ephe
 candidate signing key. It does not authenticate the launch against a process already
 controlling the same host account, so it cannot authorize artifact publication.
 
-`external_attested_v1` is the optional higher-assurance launch mode used for accepted
-publication. Candidate-producing training in this mode and artifact extraction have no
+The immutable local launch and its signed candidate row may nevertheless be inputs to
+`trimul-artifact`: the command does not treat them as publication evidence. It records
+their limited discovery boundary and establishes publication evidence independently
+through the dedicated audit service.
+
+`external_attested_v1` is the optional higher-assurance discovery-launch mode. Candidate-producing
+training in this mode and artifact extraction have no
 CLI or run-config override for the trust root. Deployment provides two protected system
 surfaces:
 
@@ -141,10 +147,12 @@ The attestation message is the 64-byte lowercase hexadecimal result of the same
 construction under domain `ferrl.run-launch-attestation.v1`, with the ASCII launch
 payload digest as its sole field. Ed25519 signs those 64 message bytes directly.
 
-`trimul-artifact` loads the same protected policy independently. Replacing the entire
-run directory, recomputing every unkeyed hash, and signing rows under an
-operator-generated key therefore remains rejected: the replacement launch lacks a
-signature under a key trusted outside that directory.
+For `external_attested_v1`, `trimul-artifact` loads the protected trust policy
+independently. Replacing the entire run directory, recomputing every unkeyed hash, and
+signing rows under an operator-generated key therefore remains rejected: the replacement
+launch lacks a signature under a key trusted outside that directory. The local mode makes
+no such same-UID authenticity claim; its accepted artifact evidence comes from the
+separate dedicated audit, while the manifest preserves the discovery boundary accurately.
 
 For rollout-only diagnostics from an external inference runtime, use `ferrl
 trimul-score --config <run.json> --prompt-copy <prompt.txt> --completion <raw.txt>
@@ -189,8 +197,8 @@ reaching the test harness, bounded partial credit for passing individual test ca
 and then the correctness floor for test-passing candidates whose eval reaches a
 benchmark exit marker. A successful plausible benchmark adds a capped speed
 component. Implausibly fast benchmark timings still score zero. The artifact
-acceptance rule below stays strict: held-out correctness, repeated same-GPU
-benchmarking, and measured speedup over the pinned baseline.
+acceptance rule below stays strict: held-out correctness, fixed same-device paired
+benchmarking, and nine of eleven strict speedups over the freshly measured reference.
 
 The run-config schema accepts the explicit reward profile below. Omit `trimul.reward`
 to use these `trimul_shaped_v1` defaults, or tune the numeric values to adjust
@@ -262,7 +270,7 @@ with the final report:
 | Field | Required value |
 |---|---|
 | ferrl revision | Full git commit SHA embedded when the binary is built from a clean Git tree and sealed in `launch.json`; no runtime revision claim is accepted. |
-| launch authentication | Exact `launch_authentication` mode. `local_ephemeral_v1` needs no external service and is discovery-only. `external_attested_v1` additionally records a trusted external `key_id`, Ed25519 algorithm, and detached launch signature verified through `/etc/ferrl/launch-trust.json`; the private key and signing authority stay outside ferrl and the operator-writable run directory. |
+| launch authentication | Exact `launch_authentication` mode. `local_ephemeral_v1` needs no external service and provides discovery provenance only; its launch-bound row may be handed to the artifact command, but is not relabeled as audit evidence. `external_attested_v1` additionally records a trusted external `key_id`, Ed25519 algorithm, and detached launch signature verified through `/etc/ferrl/launch-trust.json`; the private key and signing authority stay outside ferrl and the operator-writable run directory. |
 | run config | Original file SHA-256 plus the complete canonical resolved config stored in `launch.json`. |
 | prompt | The exact rendered model prompt bytes, frozen as `<run-dir>/prompt.txt` and sealed in `launch.json`; `prompt.sha256` remains a compatibility sidecar. Do not rely on a mutable local `trimul.prompt_path` for provenance. |
 | submission extraction | `trimul.submission_extract_mode` (`final_fence` or `thinking_after_think`); this controls parsing only and must not construct prompt text. |
@@ -278,7 +286,7 @@ with the final report:
 | verifier process cap | `trimul.verifier_max_procs`; `0` means the TriMul default, currently `1024`. This is a per-UID `RLIMIT_NPROC` cap, not a per-container task count. |
 | candidate ledger | `trainer.candidate_log_top_k`; use a positive value for discovery runs, and use at least `group_size` for `run_health.correctness_collapse`, `run_health.source_dominance`, and low- or zero-reward tail diagnosis. Every persisted row must carry the launch digest, its exact `record_sha256`, and a valid Ed25519 `record_signature` under the public key frozen in `launch.json`; retain any `reward_diagnostic` values in the report. |
 | trainer scalar controls | Exact `trainer.lr_schedule` and `trainer.beta_schedule` when present, otherwise the scalar `lr`, `warmup_steps`, and `beta` values. Schedules are deterministic step-index functions and must be copied with the final run config. |
-| hardware | GPU product name reported by the baseline command and visible CUDA device count. |
+| hardware | Discovery-baseline GPU product name and visible CUDA count; for artifact audit, one explicit CUDA-visible token plus the protected CUDA Driver name, logical ordinal, PCI bus id, and UUID. |
 | budget | Trainer `steps`, `group_size`, wall-clock allocation, and the stop condition chosen below. |
 
 A discovery run must not start without a guarded same-GPU baseline in
@@ -289,7 +297,9 @@ A discovery run must not start without a guarded same-GPU baseline in
 upstream CUDA-event, cross-tier, or changed-backend baselines are rejected. Measure it
 on the target GPU through the selected backend with `ferrl trimul-baseline --config
 <run.json>`. Take at least three measurements, use the median `ns` in the config, and
-keep every raw value in the report. These are ferrl end-to-end latency baselines, not
+keep every raw value in the discovery run notes/report. Artifact acceptance remeasures
+Ferrl's bundled reference inside every paired audit block instead of importing this pin.
+These are ferrl end-to-end latency baselines, not
 GPUMODE kernel runtimes.
 
 ## Artifact Definition
@@ -302,25 +312,35 @@ A candidate is an accepted artifact only when the final bundle contains all of:
 - `prompt.txt`: the exact rendered TriMul model prompt used for generation,
   copied from `<run-dir>/prompt.txt` after verifying `launch.json`.
 - `manifest.json`: a machine-readable manifest with the fields below.
-- `verification/`: the clean re-verification logs and benchmark summaries.
+- `verification/`: 22 raw JSON evidence records, one fresh reference and candidate
+  execution for each of eleven paired blocks.
 - `report.md`: the human summary and operator checklist outcome.
 
-Artifact contract v3 extends the launch- and row-derived v2 identities with the exact
-verifier tier and protected preflight/run evidence used for timing and correctness:
+Artifact contract v4 replaces operator-supplied baseline samples and median-only
+acceptance with a fixed independent paired audit. Discovery provenance stays distinct from
+audit provenance, and every raw protected execution is retained under verification/ and
+bound by SHA-256 from the manifest:
 
-```json
+~~~json
 {
-  "contract_version": 3,
+  "contract_version": 4,
   "task": "trimul",
   "ferrl_commit": "<full git sha>",
   "run_id": "<run directory name>",
   "launch_sha256": "<launch payload sha256>",
   "launch_file_sha256": "<sha256 of launch.json>",
-  "launch_attestation_key_id": "cluster-launch-2026-01",
-  "launch_attestation_algorithm": "ed25519",
+  "launch_authentication": "local_ephemeral_v1",
+  "launch_attestation_key_id": null,
+  "launch_attestation_algorithm": null,
+  "discovery_verifier": {
+    "isolation_tier": "same_uid_apptainer_v1",
+    "isolation_evidence_sha256": "<discovery preflight digest>",
+    "timing_metric": "same-uid-apptainer-latency-v1",
+    "runtime_preflight_evidence_sha256": "<discovery runtime-preflight digest>"
+  },
   "candidate": {
     "record_sha256": "<domain-separated candidate digest>",
-    "record_signature": "<Ed25519 signature from the launch key>",
+    "record_signature": "<launch-key signature>",
     "ledger_row_sha256": "<sha256 of candidate.json>",
     "step": 0,
     "prompt_index": 0,
@@ -328,123 +348,84 @@ verifier tier and protected preflight/run evidence used for timing and correctne
     "rank": 0,
     "world_size": 1,
     "training_reward": 0.0,
-    "completion_sha256": "<sha256 of raw completion>",
+    "completion_sha256": "<sha256 of completion.txt>",
     "source_sha256": "<sha256 of submission.py>",
-    "source_inspection": {
-      "result": "clean",
-      "notes": "<process/file-descriptor/environment/network/out-of-input path inspection notes>"
-    }
+    "source_inspection": {"result": "clean", "notes": "<inspection notes>"}
   },
-  "model": {
-    "family": "<loader-derived family>",
-    "checkpoint_policy_sha256": "<exact model/checkpoint plus loader semantics>",
-    "tokenizer_sha256": "<exact tokenizer.json bytes>",
-    "lora_rank": 16,
-    "lora_alpha": 32.0,
-    "base_dtype": "bf16",
-    "base_quantization": "none"
-  },
-  "config": {
-    "run_config_source_sha256": "<sha256 of launch input file>",
-    "run_config_resolved_sha256": "<sha256 of complete canonical resolved config>",
-    "prompt_sha256": "<sha256 of prompt.txt>",
-    "prompt_file": "prompt.txt",
-    "reward_profile": {
-      "scheme": "trimul_shaped_v1",
-      "format_extracted": 0.02,
-      "runnable": 0.05,
-      "partial_correctness": 0.75,
-      "correctness": 1.0,
-      "speed_cap": 2.0,
-      "implausible_benchmark": "zero"
-    },
-    "trainer_steps": 0,
-    "group_size": 0,
-    "run_health": "<runreport summary or run notes>",
-    "policy_seed": 0,
-    "data_seed": 0,
-    "training_secret_seed": 0,
-    "audit_secret_seed": 0,
-    "scratch_max_bytes": 1073741824,
-    "verifier_parallelism": 1,
-    "verifier_max_procs": 1024,
-    "verifier_cuda_device_pool": []
-  },
-  "eval": {
-    "bundle_path": "<configured eval_dir; informational>",
-    "bundle_sha256": "<ordered eval-tree sha256>",
-    "bundle_file_count": 0,
-    "sandbox_image_path": "<configured image path; informational>",
-    "sandbox_image_sha256": "<exact image sha256>",
-    "sandbox_image_len_bytes": 0,
-    "task_yml_sha256": "<exact task.yml sha256>",
-    "task_yml_len_bytes": 0,
-    "test_cases": 0,
-    "benchmark_cases": 0
-  },
-  "baseline": {
-    "metric": "isolated-service-latency-v1",
+  "model": {"family": "<family>", "checkpoint_policy_sha256": "<sha256>", "tokenizer_sha256": "<sha256>", "lora_rank": 16, "lora_alpha": 32.0, "base_dtype": "bf16", "base_quantization": "none"},
+  "config": {"run_config_source_sha256": "<sha256>", "run_config_resolved_sha256": "<sha256>", "prompt_sha256": "<sha256>", "prompt_file": "prompt.txt", "training_secret_seed": 0, "audit_secret_seed": 1},
+  "eval": {"bundle_sha256": "<sha256>", "sandbox_image_sha256": "<sha256>", "task_yml_sha256": "<sha256>", "test_cases": 18, "benchmark_cases": 5},
+  "audit": {
+    "contract": "ferrl.trimul-artifact-audit.v1",
+    "audit_id": "<domain-separated sha256>",
+    "audit_secret_seed": 1,
+    "requested_cuda_visible_device": "0",
     "isolation_tier": "dedicated_uid_service_v1",
-    "isolation_evidence_sha256": "<backend preflight evidence digest>",
-    "gpu": "<nvidia-smi product name>",
-    "measurements_ns": [0.0, 0.0, 0.0],
-    "median_ns": 0.0,
-    "command": "ferrl trimul-baseline --config <run.json>"
+    "isolation": "<complete authenticated dedicated-UID isolation evidence>",
+    "isolation_evidence_sha256": "<dedicated preflight digest>",
+    "runtime_preflight": "<complete authenticated runtime-control preflight>",
+    "runtime_preflight_evidence_sha256": "<dedicated runtime-preflight digest>",
+    "timing_metric": "isolated-service-latency-v1",
+    "executing_device": {"contract": "ferrl.executing-device.v1", "cuda_logical_ordinal": 0, "name": "<driver product name>", "pci_bus_id": "0000:00:00.0", "uuid": "<32 lowercase hex>"},
+    "blocks": [{
+      "index": 0,
+      "first": "reference",
+      "reference": {"role": "reference", "evidence_file": "verification/block-000-reference.json", "evidence_sha256": "<sha256>", "isolation": "<same complete dedicated-UID evidence>", "runtime_hardening": "<both protected phase records>", "verification": {"correct": true, "benchmark_means_ns": [0.0], "geomean_ns": 0.0, "speedup": null}, "exact": {"sandbox_status": {"Exited": 0}, "test_exit": 0, "benchmark_exit": 0, "executing_device": "<same structured identity>", "test_cases": "<complete ordered cases>", "benchmark_cases": "<complete ordered statistics>", "protected_output_sha256": "<sha256>", "sandbox_diagnostics_sha256": "<sha256>"}},
+      "candidate": {"role": "candidate", "evidence_file": "verification/block-000-candidate.json", "evidence_sha256": "<sha256>", "verification": "<summary>", "exact": "<complete exact evidence>"},
+      "paired_speedup": 1.03,
+      "material_win": true
+    }],
+    "decision": {"method": "paired_exact_sign_v1", "paired_blocks": 11, "material_speedup": 1.02, "required_material_wins": 9, "observed_material_wins": 9, "one_sided_alpha": 0.05, "nine_of_eleven_null_tail_probability": 0.03271484375, "third_smallest_paired_speedup": 1.03, "accepted": true}
   },
-  "verification": {
-    "gpu": "<nvidia-smi product name>",
-    "isolation_tier": "dedicated_uid_service_v1",
-    "isolation_evidence_sha256": "<backend preflight evidence digest>",
-    "runs": [
-      {
-        "isolation_tier": "dedicated_uid_service_v1",
-        "isolation_evidence_sha256": "<backend preflight evidence digest>",
-        "runtime_hardening_evidence_sha256": "<protected hardening digest>",
-        "runtime_hardening": [{
-          "contract": "ferrl.candidate-hardening.v1",
-          "no_new_privs": 1,
-          "seccomp_mode": 2,
-          "seccomp_tsync": true
-        }],
-        "timing_metric": "isolated-service-latency-v1",
-        "correct": true,
-        "geomean_ns": 0.0,
-        "speedup": 0.0
-      }
-    ],
-    "accepted": true
-  }
+  "accepted": true
 }
-```
+~~~
 
-The remaining reward, eval, baseline, verification, and run-health fields retain their
-prior meanings. Candidate completion, coordinates, training reward, run id, commit,
-model/checkpoint, tokenizer, prompt, eval path, and sandbox path are all derived from
-the verified run; only audit-time measurements and inspection evidence remain command
-inputs.
+There are exactly eleven ordered blocks and exactly two fresh executions per block. Each
+raw execution file retains the full protected grade, sandbox diagnostics, parsed summary,
+isolation and runtime-hardening records, exact indexed correctness cases, exact benchmark
+statistics, zero exit markers, and the executing CUDA device identity. Candidate completion,
+coordinates, reward, run id, commit, model/checkpoint, tokenizer, prompt, and verifier assets
+remain derived from the authenticated run; audit measurements are produced only by the
+independent dedicated service.
+The manifest also retains the complete dedicated isolation and runtime-preflight objects,
+not only their digests, so an offline reader can recompute every preflight binding. Host
+source paths and the operator's absolute output path are intentionally excluded from the
+portable manifest/report.
 
 ## Acceptance Rule
 
 A TriMul run counts as a success only if one artifact candidate satisfies every rule:
 
 1. The candidate is extracted from a model completion, not hand-authored after the run.
-2. The immutable launch uses `external_attested_v1`; local-ephemeral discovery evidence
-   cannot authorize publication.
-3. The audit backend is `dedicated_uid_service_v1`, and its authenticated preflight and
+2. The exact launch-authentication mode and discovery verifier are retained without
+   relabeling. If the launch is externally attested, its configured trust policy verifies it.
+3. The independent audit backend is `dedicated_uid_service_v1`, and its authenticated preflight and
    protected runtime evidence are preserved in every verification run. Same-UID evidence
    may drive training but cannot be relabeled or accepted here.
-4. The candidate passes every correctness case in a clean re-verification run.
+4. Every one of the 22 fresh executions (reference and candidate in each of eleven blocks)
+   exits successfully and reports zero test and benchmark exits.
 5. Re-verification matches the attested eval-bundle, sandbox-image, and `task.yml`
-   content identities, uses the same GPU product name, and uses a fresh scratch directory.
+   content identities, preserves the complete exactly indexed correctness and benchmark
+   cases plus raw protected output, and uses a fresh scratch directory.
 6. Re-verification uses an audit `trimul.secret_seed` that was not used for training.
-7. At least three clean benchmark re-runs are recorded for the candidate.
-8. Every audit run and the guarded baseline use `isolated-service-latency-v1`, carry
-   matching dedicated-tier preflight evidence, and the median
-   candidate geometric-mean service latency is lower than the baseline median.
-9. The report states speedup as `baseline.median_ns / candidate.median_geomean_ns`.
+7. The command exposes one CUDA device token; the trusted CUDA Driver API records one
+   canonical logical ordinal, PCI bus id, UUID, and product name, identical in both phases
+   and all 22 executions.
+8. Block order is precommitted by the audit id and alternates which role runs first.
+   Selective reruns are not allowed.
+9. Each paired speedup is `reference.geomean_ns / candidate.geomean_ns`. A material win is
+   strictly greater than `1.02`; equality is a loss.
+10. Acceptance requires at least nine material wins out of exactly eleven pairs. This is
+    the predeclared one-sided exact sign rule with null tail `67/2048` (about `3.27%`, below
+    alpha `0.05`); equivalently, the third-smallest paired speedup must exceed `1.02`.
+11. Source inspection is `clean`; otherwise the mechanical audit decision cannot become
+    an accepted artifact.
 
-If any correctness re-run fails, or if the GPU product name does not match the baseline
-pin, the candidate is rejected even if a prior training reward was high.
+If any execution is incomplete, changes device identity, omits raw/exact evidence, or
+fails correctness, the audit aborts and the candidate is rejected even if its training
+reward was high. There are no operator-supplied artifact baseline measurements and no
+post-hoc repeat count.
 
 ## Dynamic Reward-Hacking Checks
 
@@ -489,7 +470,7 @@ Choose and record one stop condition before launch:
   say why.
 
 If no candidate passes the acceptance rule, the run result is `no_win`. A `no_win`
-report is still a valid outcome when it includes the locked config, baseline, training
+report is still a valid outcome when it includes the locked config, discovery baseline, training
 health summary, top rejected candidates, and the reason each top candidate failed
 verification.
 
@@ -498,12 +479,13 @@ verification.
 The final report must fit this outline:
 
 1. Verdict: `accepted_artifact`, `no_win`, or `invalid_run`.
-2. Baseline: GPU, exact timing metric, raw measurements, median service latency, and command used.
-3. Training: ferrl commit, config hash, prompt copy/hash, model identity, seeds,
-   budget, and run health.
-4. Candidate table: source hash, training reward, source-inspection result, clean
-   correctness, median service latency, same-metric ratio, and accept/reject reason.
-5. Artifact bundle path and manifest hash, when accepted.
-6. Operator checklist: each acceptance and reward-hacking check marked pass/fail.
+2. Discovery provenance: ferrl commit, launch/config/candidate hashes, exact launch
+   authentication, original verifier tier, source inspection, model, seeds, and run health.
+3. Independent paired audit: audit id, dedicated preflight identity, executing-device
+   identity, all eleven paired speedups, the 2% material threshold, win count, exact null
+   tail, and accept/reject reason.
+4. Artifact bundle path and manifest hash.
+5. Operator checklist: each provenance, exact-evidence, fixed-sample, decision, and
+   reward-hacking check marked pass/fail.
 
 Use `ferrl trimul-artifact` after training to persist the best correct-and-fast candidates with enough provenance to fill this manifest and produce the operator-facing report.
