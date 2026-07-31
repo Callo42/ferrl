@@ -4498,6 +4498,10 @@ mod tests {
             .find("if not _run_testing(")
             .expect("candidate test execution is explicit");
         assert!(grade_connect < device_identity && device_identity < candidate_start);
+        assert!(main.contains("if seed is not None and not 0 <= seed <= MAX_CASE_SEED:"));
+        assert!(main.contains("trusted case-generation seed is outside unsigned 32-bit range"));
+        assert!(main.contains("_SET_SEED(42 if seed is None else seed)"));
+        assert!(!main.contains("_SET_SEED(seed or 42)"));
         assert!(main.contains("reason = _bounded_message(f\"{type(error).__name__}: {error}\")"));
         assert_eq!(
             FERRL_EVAL_DRIVER

@@ -77,6 +77,9 @@ use ferrl::{
 /// A task's train/eval split: `(train, eval)` samples of the task's target type.
 type Splits<T> = (Vec<Sample<T>>, Vec<Sample<T>>);
 
+/// Largest case-generation seed accepted by the protected TriMul evaluator.
+const TRIMUL_CASE_SEED_MAX: u64 = u32::MAX as u64;
+
 /// The `ferrl` command-line interface.
 #[derive(Debug, Parser)]
 #[command(
@@ -1342,6 +1345,11 @@ impl RunConfig {
             )));
         }
         if self.task == "trimul" {
+            if self.trimul.secret_seed > TRIMUL_CASE_SEED_MAX {
+                return Err(CliError::msg(format!(
+                    "trimul.secret_seed must be between 0 and {TRIMUL_CASE_SEED_MAX}"
+                )));
+            }
             match self.trimul.verifier_isolation_tier {
                 ferrl::VerifierIsolationTier::SameUidApptainerV1 => {
                     if self.trimul.verifier_executor_socket.is_some() {
@@ -3221,6 +3229,11 @@ fn trimul_score(args: &TrimulScoreArgs) -> Result<(), CliError> {
             "trimul-score requires a config with task \"trimul\"",
         ));
     }
+    if args.score_secret_seed > TRIMUL_CASE_SEED_MAX {
+        return Err(CliError::msg(format!(
+            "trimul-score requires --score-secret-seed between 0 and {TRIMUL_CASE_SEED_MAX}"
+        )));
+    }
     if args.score_secret_seed == cfg.trimul.secret_seed {
         return Err(CliError::msg(
             "trimul-score requires --score-secret-seed to differ from trimul.secret_seed",
@@ -3576,7 +3589,7 @@ const ARTIFACT_AUDIT_BLOCKS: usize = 11;
 const ARTIFACT_MATERIAL_SPEEDUP: f64 = 1.02;
 const ARTIFACT_REQUIRED_MATERIAL_WINS: usize = 9;
 const ARTIFACT_ACCEPTANCE_METHOD: &str = "paired_material_wins_v1";
-const ARTIFACT_AUDIT_SEED_DERIVATION: &str = "sha256_contract_prefix_be_v1";
+const ARTIFACT_AUDIT_SEED_DERIVATION: &str = "sha256_contract_prefix_u32_be_v1";
 const ARTIFACT_ATTEMPT_SELECTION_ASSURANCE: &str = "operator_attested_v1";
 const ARTIFACT_OWNER_FILE: &str = ".ferrl-artifact-owner";
 const ARTIFACT_ATTEMPT_FILE: &str = "audit-attempt.json";
@@ -5148,8 +5161,10 @@ fn artifact_audit_secret_seed(audit_contract_sha256: &str, training_secret_seed:
         "ferrl.trimul-artifact-audit-seed.v1",
         &[audit_contract_sha256.as_bytes()],
     );
-    let mut seed = u64::from_str_radix(&digest[..16], 16)
-        .expect("domain SHA-256 prefix is lowercase hexadecimal");
+    let mut seed = u64::from(
+        u32::from_str_radix(&digest[..8], 16)
+            .expect("domain SHA-256 prefix is lowercase hexadecimal"),
+    );
     if seed == training_secret_seed {
         seed ^= 1;
     }
@@ -5865,6 +5880,7 @@ fn artifact_report(
             && validate_lower_sha256("artifact prompt", &manifest.config.prompt_sha256).is_ok()
             && manifest.config.reward_profile.validate().is_ok()
             && manifest.config.audit_secret_seed != manifest.config.training_secret_seed
+            && manifest.config.audit_secret_seed <= TRIMUL_CASE_SEED_MAX
             && manifest.config.scratch_max_bytes > 0
             && manifest.config.verifier_max_procs > 0,
         "prompt, reward, audit seed, and verifier budgets are valid",
@@ -10695,6 +10711,18 @@ mod tests {
     }
 
     #[test]
+    fn trimul_score_rejects_out_of_range_secret_seed_before_prompt_io() {
+        let tmp = TestDir::new("trimul-score-seed-range");
+        std::fs::write(tmp.path().join("run.json"), trimul_score_test_config(4242)).unwrap();
+        let mut args = trimul_score_args_for_test(tmp.path());
+        args.score_secret_seed = TRIMUL_CASE_SEED_MAX + 1;
+
+        let err = trimul_score(&args).unwrap_err().to_string();
+
+        assert!(err.contains("requires --score-secret-seed between 0 and 4294967295"));
+    }
+
+    #[test]
     fn trimul_score_verifies_prompt_copy_before_reading_inputs() {
         let tmp = TestDir::new("trimul-score-prompt");
         std::fs::write(tmp.path().join("run.json"), trimul_score_test_config(4242)).unwrap();
@@ -11576,6 +11604,21 @@ mod tests {
     }
 
     #[test]
+    fn trimul_config_rejects_out_of_range_case_seed() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&trimul_score_test_config(4242)).unwrap();
+        value["trimul"]["secret_seed"] = serde_json::json!(TRIMUL_CASE_SEED_MAX + 1);
+        let cfg: RunConfig = serde_json::from_value(value).unwrap();
+
+        let error = cfg
+            .validate_current_config_support()
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("trimul.secret_seed must be between 0 and 4294967295"));
+    }
+
+    #[test]
     fn trimul_verifier_config_rejects_mixed_tier_fields_without_fallback() {
         let base: serde_json::Value =
             serde_json::from_str(&trimul_score_test_config(4242)).unwrap();
@@ -12260,10 +12303,12 @@ benchmarks:
         let first_seed = artifact_audit_secret_seed(&contract, 17);
         let second_seed = artifact_audit_secret_seed(&contract, 17);
         assert_eq!(first_seed, second_seed);
+        assert!(first_seed <= TRIMUL_CASE_SEED_MAX);
         assert_ne!(first_seed, 17);
+        let collision_seed = artifact_audit_secret_seed(&contract, first_seed);
+        assert!(collision_seed <= TRIMUL_CASE_SEED_MAX);
         assert_ne!(
-            artifact_audit_secret_seed(&contract, first_seed),
-            first_seed,
+            collision_seed, first_seed,
             "the deterministic collision rule must keep audit and training seeds distinct"
         );
         assert_eq!(

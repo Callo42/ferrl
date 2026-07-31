@@ -37,6 +37,7 @@ ISOLATION_TIMING_METRICS = {
 }
 MAX_STATUS_BYTES = 1024
 MAX_STATUS_EVENTS = 32
+MAX_CASE_SEED = (1 << 32) - 1
 ENTRY_ACK = b"ENTRY-ACK-v3"
 # The pinned task's largest float32 input is 3 GiB before its small mask,
 # weights, config, and serialization envelope. Keep the transport bounded while
@@ -1237,11 +1238,7 @@ def main():
         return 114
     isolation_tier = os.environ.pop("FERRL_VERIFIER_ISOLATION_TIER", None)
     timing_metric = os.environ.pop("FERRL_TIMING_METRIC", None)
-    seed = os.environ.pop("POPCORN_SEED", None)
-    try:
-        seed = int(seed) if seed else None
-    except ValueError:
-        return 114
+    seed_raw = os.environ.pop("POPCORN_SEED", None)
 
     try:
         logger = GradeLogger(grade_socket)
@@ -1251,13 +1248,23 @@ def main():
     try:
         phase = "preparation"
         try:
+            try:
+                seed = int(seed_raw) if seed_raw is not None else None
+            except ValueError as error:
+                raise InfrastructureFailure(
+                    "trusted case-generation seed is not an integer"
+                ) from error
+            if seed is not None and not 0 <= seed <= MAX_CASE_SEED:
+                raise InfrastructureFailure(
+                    "trusted case-generation seed is outside unsigned 32-bit range"
+                )
             if (
                 isolation_tier not in ISOLATION_TIMING_METRICS
                 or ISOLATION_TIMING_METRICS[isolation_tier] != timing_metric
             ):
                 raise InfrastructureFailure("trusted verifier isolation/timing contract mismatch")
             _prctl(PR_SET_CHILD_SUBREAPER, 1)
-            _SET_SEED(seed or 42)
+            _SET_SEED(42 if seed is None else seed)
             torch.cuda.init()
             _SYNC()
             device_identity = _executing_device_identity()

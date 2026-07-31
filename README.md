@@ -332,7 +332,8 @@ audit evidence. Artifact acceptance runs a fresh serialized audit on one explici
 selected CUDA device. The default is the same no-administrator
 `same_uid_apptainer_v1` backend; pass `--audit-verifier-executor-socket <socket>` only
 to opt into the dedicated-UID backend. The command derives its case seed
-deterministically from the immutable candidate/audit contract, fixes eleven alternating
+deterministically as an unsigned 32-bit value from the immutable candidate/audit contract,
+fixes eleven alternating
 reference/candidate pairs, retains complete recomputable preflight and raw protected
 evidence, requires exact case coverage, and accepts only with at least nine strict
 speedups above `1.02x`. Before measurement it atomically claims the selected output;
@@ -352,8 +353,9 @@ For rollout-only diagnostics from an external inference runtime, use
 `ferrl trimul-score --config <run.json> --prompt-copy <prompt.txt>
 --completion <raw.txt> --out <scores.jsonl> --score-secret-seed <seed>` (or
 `--completions-jsonl`) to score raw completions once with the same shaped TriMul
-reward and persist external-score JSONL. The scoring seed must differ from the
-training `trimul.secret_seed`. `trimul-score` records opaque `source_id` values,
+reward and persist external-score JSONL. Both the scoring seed and training
+`trimul.secret_seed` must be in `0..=2^32-1`, and the scoring seed must differ
+from the training seed. `trimul-score` records opaque `source_id` values,
 not input file paths; use `--source-label <public-id>` or JSONL `source_id` values
 that are safe to copy into public reports. The default completion contract is strict:
 ferrl scores exactly the completion bytes supplied. For GGUF rollouts served through

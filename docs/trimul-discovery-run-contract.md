@@ -162,7 +162,8 @@ discovery boundary and fresh audit evidence without relabeling either.
 For rollout-only diagnostics from an external inference runtime, use `ferrl
 trimul-score --config <run.json> --prompt-copy <prompt.txt> --completion <raw.txt>
 --out <scores.jsonl> --score-secret-seed <seed>` or pass `--completions-jsonl
-<jsonl>`. The scoring seed must differ from the training `trimul.secret_seed`.
+<jsonl>`. Both seeds must be in `0..=2^32-1`, and the scoring seed must differ
+from the training `trimul.secret_seed`.
 The JSONL input rows must contain `completion` and may include `step`,
 `prompt_index`, `group_index`, `rank`, `world_size`, `completion_len_tokens`,
 `source_id`, `metadata`, and `reward_metadata`; `world_size` must be nonzero and
@@ -368,7 +369,7 @@ bound by SHA-256 from the manifest:
     "audit_contract_sha256": "<seed/output/device-independent candidate contract sha256>",
     "audit_id": "<domain-separated sha256>",
     "audit_secret_seed": 1,
-    "audit_seed_derivation": "sha256_contract_prefix_be_v1",
+    "audit_seed_derivation": "sha256_contract_prefix_u32_be_v1",
     "attempt_selection_assurance": "operator_attested_v1",
     "durable_once_only": false,
     "artifact_wide_false_positive_guarantee": false,
@@ -436,8 +437,8 @@ A TriMul run counts as a success only if one artifact candidate satisfies every 
    content identities, preserves the complete exactly indexed correctness and benchmark
    cases plus raw protected output, and uses a fresh scratch directory.
 6. The audit `trimul.secret_seed` is deterministically derived from the immutable
-   candidate/audit contract, is independent of output path, differs from the training
-   seed, and has no operator-selectable CLI input.
+   candidate/audit contract as an unsigned 32-bit value, is independent of output path,
+   differs from the training seed, and has no operator-selectable CLI input.
 7. The command exposes one CUDA device token; the trusted CUDA Driver API records one
    canonical logical ordinal, PCI bus id, UUID, and product name, identical in both phases
    and all 22 executions.
