@@ -298,9 +298,8 @@ pub use trainer::{
 pub use trimul::{Distribution, TrimulCase, TrimulError, TrimulReward};
 #[doc(inline)]
 pub use verifier_executor::{
-    serve_verifier_executor, ArtifactAuditClaim, SameUidApptainerSandbox, VerifierAssetTransport,
+    serve_verifier_executor, SameUidApptainerSandbox, VerifierAssetTransport,
     VerifierExecutorConfig, VerifierExecutorError, VerifierExecutorSandbox,
     VerifierIsolationEvidence, VerifierIsolationTier, VerifierUidBoundary,
-    ARTIFACT_AUDIT_CLAIM_VERSION, DEFAULT_VERIFIER_EXECUTOR_SOCKET,
-    VERIFIER_ISOLATION_EVIDENCE_VERSION,
+    DEFAULT_VERIFIER_EXECUTOR_SOCKET, VERIFIER_ISOLATION_EVIDENCE_VERSION,
 };

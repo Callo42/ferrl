@@ -62,9 +62,9 @@
 //! forged scratch files, printed passes, and zero-time kernels cannot reach the
 //! correctness floor. These controls constrain code inside the candidate process; the
 //! same-UID tier does **not** resist an arbitrary malicious peer process already running
-//! under the training account. Accepted artifact publication therefore requires the
-//! separately authenticated dedicated tier (or a future versioned stronger audit
-//! boundary), not same-UID discovery evidence.
+//! under the training account. Accepted same-UID artifact publication retains that
+//! explicit operator-trust boundary; the dedicated tier remains an optional
+//! higher-isolation backend and is not a no-administrator prerequisite.
 //!
 //! ## Testing split (as in [`crate::sandbox`])
 //!
@@ -90,8 +90,8 @@ use crate::sandbox::{
     Bind, ProtectedOutput, ResourceLimits, RunOutcome, RunSpec, RunStatus, Sandbox, SandboxError,
 };
 use crate::verifier_executor::{
-    ArtifactAuditClaim, SameUidApptainerSandbox, VerifierExecutorSandbox,
-    VerifierIsolationEvidence, VerifierIsolationTier,
+    SameUidApptainerSandbox, VerifierExecutorSandbox, VerifierIsolationEvidence,
+    VerifierIsolationTier,
 };
 #[cfg(test)]
 use crate::verifier_executor::{
@@ -1649,26 +1649,6 @@ impl TrimulReward {
         self.verifier_isolation_evidence = None;
         self.runtime_preflight_evidence = None;
         self
-    }
-
-    /// Select a dedicated verifier whose subsequent runs consume one durable,
-    /// service-owned artifact-audit sequence.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RewardError`] if the service-produced claim is structurally invalid.
-    pub fn with_artifact_audit_claim(
-        mut self,
-        socket: impl Into<PathBuf>,
-        claim: ArtifactAuditClaim,
-    ) -> Result<Self, RewardError> {
-        let sandbox = VerifierExecutorSandbox::new(socket)
-            .with_artifact_audit_claim(claim)
-            .map_err(RewardError::verifier)?;
-        self.sandbox = TrimulVerifierBackend::Dedicated(sandbox);
-        self.verifier_isolation_evidence = None;
-        self.runtime_preflight_evidence = None;
-        Ok(self)
     }
 
     /// Select the no-admin same-UID staged Apptainer backend explicitly.

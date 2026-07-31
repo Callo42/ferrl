@@ -327,18 +327,27 @@ ledger and, when present, the external attestation against the protected trust p
 selects that exact row, and derives completion, coordinates, reward, model,
 tokenizer, config, run id, prompt, and training commit from immutable run evidence.
 The artifact bundle retains the exact verified `launch.json` and selected row bytes,
-with hashes for both in `manifest.json`. Local-ephemeral launches and
-`same_uid_apptainer_v1` verifier evidence remain discovery provenance; they are never
-relabeled as publication evidence. Artifact acceptance instead requires a new serialized
-`dedicated_uid_service_v1` audit on one explicitly selected CUDA device: eleven
-alternating reference/candidate pairs, complete recomputable preflight and raw protected
-evidence, exact case coverage, and at least nine strict speedups above `1.02x`. Before
-measurement, the command atomically claims the output and the dedicated service durably
-claims the candidate/audit contract, generates the audit seed, and fixes one runtime
-preflight plus 22 audit executions. A second claim, seed selection, skipped/repeated
-execution, or alternate output cannot create another selectable audit on that service.
-Evidence is staged as it is produced and published through no-replace links with
+with hashes for both in `manifest.json`. Discovery provenance is never relabeled as
+audit evidence. Artifact acceptance runs a fresh serialized audit on one explicitly
+selected CUDA device. The default is the same no-administrator
+`same_uid_apptainer_v1` backend; pass `--audit-verifier-executor-socket <socket>` only
+to opt into the dedicated-UID backend. The command derives its case seed
+deterministically from the immutable candidate/audit contract, fixes eleven alternating
+reference/candidate pairs, retains complete recomputable preflight and raw protected
+evidence, requires exact case coverage, and accepts only with at least nine strict
+speedups above `1.02x`. Before measurement it atomically claims the selected output;
+evidence is staged as produced and published through no-replace links with
 `manifest.json` as the final commit marker.
+
+The default audit has an explicit operator-trust boundary: the operator and arbitrary
+peer processes under the same host UID can suppress a failed output or run the whole
+audit again under another output name. Consequently the bundle records
+`operator_attested_v1`, `durable_once_only = false`, and no artifact-wide
+false-positive guarantee. The 9-of-11 rule is an empirical material-win decision, not a
+selective-rerun-resistant `67/2048` claim. A dedicated service improves candidate
+execution isolation but does not change that attempt-selection statement by itself; a
+stronger experiment-wide claim needs a separately approved external or non-resettable
+attempt authority.
 For rollout-only diagnostics from an external inference runtime, use
 `ferrl trimul-score --config <run.json> --prompt-copy <prompt.txt>
 --completion <raw.txt> --out <scores.jsonl> --score-secret-seed <seed>` (or
@@ -429,10 +438,9 @@ already be owned by that UID and grant no group/world permissions. The service r
 the authenticated work root as an open directory descriptor and creates/stages requests
 descriptor-relatively. Executor socket I/O uses deadlines derived from the requested wall
 budget, so a stalled service cannot hold a training rank indefinitely.
-For artifact audits, the same protected work root is also the durable claim authority:
-`artifact-audits/` retains the once-only contract claim and all ordered run outcomes.
-Do not rotate, clean, copy, or replace that directory between audit attempts; deployment
-must preserve one authoritative work root for the artifact population it accepts.
+For artifact audits this service is optional. It strengthens the execution boundary but
+does not provide a whole-audit once-only ledger or override the bundle's
+`operator_attested_v1` attempt-selection assurance.
 
 ```jsonc
 "launch_authentication": "local_ephemeral_v1",

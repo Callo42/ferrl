@@ -40,9 +40,9 @@ prompt text. Select completion parsing separately with
 `thinking_after_think` and never changes prompt bytes. The extraction command is `ferrl
 trimul-artifact --run-dir <run-dir> --candidate-sha256 <record_sha256>
 --out <artifact-dir>
---audit-verifier-executor-socket <dedicated-service.sock>
 --audit-cuda-visible-device <one-device-token> --run-health <summary>
---source-inspection clean --source-inspection-notes <notes>`. Artifact extraction
+--source-inspection clean --source-inspection-notes <notes>
+[--audit-verifier-executor-socket <dedicated-service.sock>]`. Artifact extraction
 requires `launch.json` to have the exact production-canonical encoding, then validates
 its authentication contract and any required external attestation, every candidate row,
 the exact selected row, the frozen prompt, and the
@@ -50,7 +50,8 @@ live verifier assets before GPU detection or audit verification. It does not acc
 completion, coordinate, reward, run, commit, model, tokenizer, eval, or sandbox
 provenance fields. Both launch-authentication modes may hand a launch-bound native row
 to the artifact command. The discovery mode and verifier tier remain recorded without
-upgrade; acceptance requires a separate `dedicated_uid_service_v1` audit.
+upgrade. Artifact audit defaults to the no-administrator `same_uid_apptainer_v1` path;
+the dedicated socket is an explicit optional higher-isolation selection with no fallback.
 
 ## Launch Authentication
 
@@ -58,12 +59,15 @@ upgrade; acceptance requires a separate `dedicated_uid_service_v1` audit.
 or attestor socket and permits launch-bound, signed candidate ledgers. It protects the
 run against accidental drift, cross-run substitution, and later loss of the ephemeral
 candidate signing key. It does not authenticate the launch against a process already
-controlling the same host account, so it cannot authorize artifact publication.
+controlling the same host account. Publication is therefore operator-attested at that
+same-UID boundary rather than externally authenticated.
 
 The immutable local launch and its signed candidate row may nevertheless be inputs to
-`trimul-artifact`: the command does not treat them as publication evidence. It records
-their limited discovery boundary and establishes publication evidence independently
-through the dedicated audit service.
+`trimul-artifact`: the command records their limited discovery boundary without
+relabeling it, then produces fresh paired audit evidence under the explicitly selected
+audit tier. The default audit remains operator-trusted; the optional dedicated service
+strengthens execution isolation but does not by itself enforce whole-audit once-only
+selection.
 
 `external_attested_v1` is the optional higher-assurance discovery-launch mode. Candidate-producing
 training in this mode and artifact extraction have no
@@ -151,8 +155,9 @@ For `external_attested_v1`, `trimul-artifact` loads the protected trust policy
 independently. Replacing the entire run directory, recomputing every unkeyed hash, and
 signing rows under an operator-generated key therefore remains rejected: the replacement
 launch lacks a signature under a key trusted outside that directory. The local mode makes
-no such same-UID authenticity claim; its accepted artifact evidence comes from the
-separate dedicated audit, while the manifest preserves the discovery boundary accurately.
+no such same-UID authenticity claim. Its artifact publication is explicitly
+operator-attested unless an external authority is used, while the manifest preserves the
+discovery boundary and fresh audit evidence without relabeling either.
 
 For rollout-only diagnostics from an external inference runtime, use `ferrl
 trimul-score --config <run.json> --prompt-copy <prompt.txt> --completion <raw.txt>
@@ -280,7 +285,7 @@ with the final report:
 | reward profile | `trimul.reward`; defaults to `trimul_shaped_v1`, with custom ladder-preserving values allowed. |
 | run-health policy | `run_health`; post-run warn/fail policy, including the original top-level config passed to `ferrl runreport --config`. |
 | model | Loader-derived family, exact model/checkpoint policy SHA-256, exact tokenizer-file SHA-256, resolved EOS, LoRA rank/alpha, base dtype, and rollout seed, all sealed at launch. |
-| verifier assurance | Exact `trimul.verifier_isolation_tier`, backend preflight evidence and digest, tier-specific timing metric, and protected runtime-control evidence. `same_uid_apptainer_v1` is the default no-admin training tier: it uses a private user-owned mode-`0700` work root and a canonical root-owned Apptainer executable, but explicitly does not resist arbitrary hostile peers under the same host UID. `dedicated_uid_service_v1` uses a protected Unix socket and a distinct non-root service UID that authenticates `SO_PEERCRED`; it is the only audit tier accepted by the current artifact command. Neither tier falls back to the other. |
+| verifier assurance | Exact discovery and audit tiers, backend preflight evidence and digest, tier-specific timing metric, and protected runtime-control evidence. `same_uid_apptainer_v1` is the default no-admin training and artifact-audit tier: it uses a private user-owned mode-`0700` work root and a canonical root-owned Apptainer executable, but explicitly does not resist arbitrary hostile peers under the same host UID. `dedicated_uid_service_v1` is an optional audit tier using a protected Unix socket and a distinct non-root service UID that authenticates `SO_PEERCRED`. Neither tier falls back to the other, and dedicated execution isolation alone is not a whole-audit once-only authority. |
 | TriMul eval bundle | SHA-256 over every ordered relative regular-file name and byte under `eval_dir`, plus the exact file count. Every captured file is held in a Linux kernel-sealed anonymous descriptor; after all seals are installed, the ordered descriptor contents are rehashed and required to equal the launch identity. The selected backend copies and rehashes each asset into a unique private request directory and supplies only the resulting read-only paths to Apptainer. The dedicated backend receives descriptors over `SCM_RIGHTS`; the same-UID backend stages them in process. The configured source path is informational only. |
 | sandbox image | SHA-256 and byte length of the exact Apptainer image streamed into a kernel-sealed anonymous descriptor. After sealing, the descriptor is rehashed and required to equal the captured identity. The selected backend copies and rehashes it in private storage before launch. The configured source path is informational only. |
 | cases | Attested `task.yml` SHA-256 and byte length plus the loaded counts for `tests` and `benchmarks`. |
@@ -359,30 +364,31 @@ bound by SHA-256 from the manifest:
   "config": {"run_config_source_sha256": "<sha256>", "run_config_resolved_sha256": "<sha256>", "prompt_sha256": "<sha256>", "prompt_file": "prompt.txt", "training_secret_seed": 0, "audit_secret_seed": 1},
   "eval": {"bundle_sha256": "<sha256>", "sandbox_image_sha256": "<sha256>", "task_yml_sha256": "<sha256>", "test_cases": 18, "benchmark_cases": 5},
   "audit": {
-    "contract": "ferrl.trimul-artifact-audit.v1",
+    "contract": "ferrl.trimul-artifact-audit.v2",
     "audit_contract_sha256": "<seed/output/device-independent candidate contract sha256>",
     "audit_id": "<domain-separated sha256>",
-    "claim_file": "audit-claim.json",
-    "claim_file_sha256": "<sha256>",
-    "claim": {"contract_version": 1, "claim_id": "<sha256>", "contract_sha256": "<same audit contract sha256>", "audit_secret_seed": 1, "expected_executor_runs": 23, "requester_uid": 1000, "service_uid": 1001, "claimed_unix_millis": 1},
     "audit_secret_seed": 1,
+    "audit_seed_derivation": "sha256_contract_prefix_be_v1",
+    "attempt_selection_assurance": "operator_attested_v1",
+    "durable_once_only": false,
+    "artifact_wide_false_positive_guarantee": false,
     "requested_cuda_visible_device": "0",
-    "isolation_tier": "dedicated_uid_service_v1",
-    "isolation": "<complete authenticated dedicated-UID isolation evidence>",
-    "isolation_evidence_sha256": "<dedicated preflight digest>",
+    "isolation_tier": "same_uid_apptainer_v1",
+    "isolation": "<complete authenticated selected-tier isolation evidence>",
+    "isolation_evidence_sha256": "<selected-tier preflight digest>",
     "runtime_preflight": "<complete authenticated runtime-control preflight>",
-    "runtime_preflight_evidence_sha256": "<dedicated runtime-preflight digest>",
-    "timing_metric": "isolated-service-latency-v1",
+    "runtime_preflight_evidence_sha256": "<selected-tier runtime-preflight digest>",
+    "timing_metric": "same-uid-apptainer-latency-v1",
     "executing_device": {"contract": "ferrl.executing-device.v1", "cuda_logical_ordinal": 0, "name": "<driver product name>", "pci_bus_id": "0000:00:00.0", "uuid": "<32 lowercase hex>"},
     "blocks": [{
       "index": 0,
       "first": "reference",
-      "reference": {"role": "reference", "evidence_file": "verification/block-000-reference.json", "evidence_sha256": "<sha256>", "isolation": "<same complete dedicated-UID evidence>", "runtime_hardening": "<both protected phase records>", "verification": {"correct": true, "benchmark_means_ns": [0.0], "geomean_ns": 0.0, "speedup": null}, "exact": {"sandbox_status": {"Exited": 0}, "test_exit": 0, "benchmark_exit": 0, "executing_device": "<same structured identity>", "test_cases": "<complete ordered cases>", "benchmark_cases": "<complete ordered statistics>", "protected_output_sha256": "<sha256>", "sandbox_diagnostics_sha256": "<sha256>"}},
+      "reference": {"role": "reference", "evidence_file": "verification/block-000-reference.json", "evidence_sha256": "<sha256>", "isolation": "<same complete selected-tier evidence>", "runtime_hardening": "<both protected phase records>", "verification": {"correct": true, "benchmark_means_ns": [0.0], "geomean_ns": 0.0, "speedup": null}, "exact": {"sandbox_status": {"Exited": 0}, "test_exit": 0, "benchmark_exit": 0, "executing_device": "<same structured identity>", "test_cases": "<complete ordered cases>", "benchmark_cases": "<complete ordered statistics>", "protected_output_sha256": "<sha256>", "sandbox_diagnostics_sha256": "<sha256>"}},
       "candidate": {"role": "candidate", "evidence_file": "verification/block-000-candidate.json", "evidence_sha256": "<sha256>", "verification": "<summary>", "exact": "<complete exact evidence>"},
       "paired_speedup": 1.03,
       "material_win": true
     }],
-    "decision": {"method": "paired_exact_sign_v1", "paired_blocks": 11, "material_speedup": 1.02, "required_material_wins": 9, "observed_material_wins": 9, "one_sided_alpha": 0.05, "nine_of_eleven_null_tail_probability": 0.03271484375, "third_smallest_paired_speedup": 1.03, "accepted": true}
+    "decision": {"method": "paired_material_wins_v1", "paired_blocks": 11, "material_speedup": 1.02, "threshold_comparison": "strict_greater_than", "required_material_wins": 9, "observed_material_wins": 9, "accepted": true}
   },
   "accepted": true
 }
@@ -393,19 +399,22 @@ raw execution file retains the full protected grade, sandbox diagnostics, parsed
 isolation and runtime-hardening records, exact indexed correctness cases, exact benchmark
 statistics, zero exit markers, and the executing CUDA device identity. Candidate completion,
 coordinates, reward, run id, commit, model/checkpoint, tokenizer, prompt, and verifier assets
-remain derived from the authenticated run; audit measurements are produced only by the
-independent dedicated service.
+remain derived from the authenticated run. Audit measurements use the selected explicit tier;
+the no-administrator same-UID tier is the default and the dedicated service is optional.
 Before any runtime probe or measurement, the output directory is created exclusively
-with a durable owner/attempt record and a hidden sibling stage. The authenticated
-dedicated service then creates a no-replace claim beneath its descriptor-retained work
-root, generates the audit seed, and authorizes exactly 23 ordered executor runs: one
-runtime-control preflight followed by the 22 paired measurements. It durably records a
-start and completion (including failures) for every sequence slot, rejects gaps,
-duplicates, overflow, and a second candidate/contract claim, and retains an incomplete
-claim if the client exits. The client writes each raw execution to the retained stage as
-soon as it is validated. Publication uses ownership-checked no-replace hard links and
-makes `manifest.json` visible only after every other artifact file is durable.
-The manifest also retains the complete dedicated isolation and runtime-preflight objects,
+with a durable per-output owner/attempt record and a hidden sibling stage. The case seed
+and alternating order are derived deterministically from the immutable audit contract,
+independently of the output path; the CLI accepts no audit-seed override. The client
+writes each raw execution to the retained stage as soon as it is validated. Publication
+uses ownership-checked no-replace hard links and makes `manifest.json` visible only after
+every other artifact file is durable. A failed or partial destination remains claimed and
+cannot be mistaken for a published artifact because it has no manifest.
+
+This exclusive output transaction is not a global audit ledger. Under
+`operator_attested_v1`, the operator or another process controlling the same host UID can
+suppress that destination or run the whole audit into another output directory. The
+artifact therefore makes no durable once-only or artifact-wide false-positive guarantee.
+The manifest also retains the complete selected-tier isolation and runtime-preflight objects,
 not only their digests, so an offline reader can recompute every preflight binding. Host
 source paths and the operator's absolute output path are intentionally excluded from the
 portable manifest/report.
@@ -417,38 +426,45 @@ A TriMul run counts as a success only if one artifact candidate satisfies every 
 1. The candidate is extracted from a model completion, not hand-authored after the run.
 2. The exact launch-authentication mode and discovery verifier are retained without
    relabeling. If the launch is externally attested, its configured trust policy verifies it.
-3. The independent audit backend is `dedicated_uid_service_v1`, and its authenticated preflight and
-   protected runtime evidence are preserved in every verification run. Same-UID evidence
-   may drive training but cannot be relabeled or accepted here.
+3. The audit backend is `same_uid_apptainer_v1` by default, or
+   `dedicated_uid_service_v1` when the optional socket is supplied. Its authenticated
+   preflight and protected runtime evidence are preserved in every verification run;
+   discovery evidence is retained separately and never relabeled as audit evidence.
 4. Every one of the 22 fresh executions (reference and candidate in each of eleven blocks)
    exits successfully and reports zero test and benchmark exits.
 5. Re-verification matches the attested eval-bundle, sandbox-image, and `task.yml`
    content identities, preserves the complete exactly indexed correctness and benchmark
    cases plus raw protected output, and uses a fresh scratch directory.
-6. The dedicated service, not the operator, generates the audit `trimul.secret_seed`;
-   it differs from the training seed and is bound into the once-only claim.
+6. The audit `trimul.secret_seed` is deterministically derived from the immutable
+   candidate/audit contract, is independent of output path, differs from the training
+   seed, and has no operator-selectable CLI input.
 7. The command exposes one CUDA device token; the trusted CUDA Driver API records one
    canonical logical ordinal, PCI bus id, UUID, and product name, identical in both phases
    and all 22 executions.
 8. Block order is precommitted by the audit id and alternates which role runs first.
-   The service-owned sequence ledger permits exactly one runtime preflight and 22
-   measurements. Selective or whole-audit reruns, alternate seeds, skipped slots, and
-   extra executions are not allowed.
+   An accepted bundle contains exactly the 22 scheduled measurements; skipped,
+   reordered, repeated, or extra executions inside that bundle are invalid.
 9. Each paired speedup is `reference.geomean_ns / candidate.geomean_ns`. A material win is
    strictly greater than `1.02`; equality is a loss.
 10. Acceptance requires at least nine material wins out of exactly eleven pairs. This is
-    the predeclared one-sided exact sign rule with null tail `67/2048` (about `3.27%`, below
-    alpha `0.05`); equivalently, the third-smallest paired speedup must exceed `1.02`.
+    the predeclared empirical material-win rule. The `1.02` threshold is a materiality
+    margin, not a confidence bound on speedup magnitude.
 11. Source inspection is `clean`; otherwise the mechanical audit decision cannot become
     an accepted artifact.
 
 If any execution is incomplete, changes device identity, omits raw/exact evidence, or
 fails correctness, the audit aborts and the candidate is rejected even if its training
 reward was high. There are no operator-supplied artifact baseline measurements and no
-post-hoc repeat count.
-The output path is claimed before the service audit, partial evidence remains in its
-owned stage on failure, concurrent writers cannot share a destination, and only the
-manifest-last no-replace commit is a published bundle.
+post-hoc repeat count inside one invocation. The output path is claimed before the audit,
+partial evidence remains in its owned stage on failure, concurrent writers cannot share a
+destination, and only the manifest-last no-replace commit is a published bundle.
+
+The honest assurance boundary is explicit: same-UID publication trusts the operator not
+to select among whole-audit attempts. Even with the optional dedicated execution backend,
+this command does not enforce experiment-wide once-only selection and does not advertise
+the per-attempt binomial tail `67/2048` as an artifact-wide guarantee. A stronger claim
+requires a separately approved external runner or non-resettable attempt authority that
+retains every attempt and failure end to end.
 
 ## Dynamic Reward-Hacking Checks
 
@@ -467,11 +483,11 @@ grade socket. Launcher/init/shell stdout remains diagnostic only.
 The first discovery run still needs dynamic checks on top candidates because the
 training loop is optimizing against that reward.
 
-For every candidate considered before the once-only artifact claim:
+For every candidate considered before the artifact audit:
 
 - Re-run from `submission.py` only; do not reuse the training scratch tree.
-- Use discovery/diagnostic scoring for exploratory checks; do not rerun or choose the
-  seed of a claimed artifact audit.
+- Use discovery/diagnostic scoring for exploratory checks; the artifact command derives
+  its own seed and does not accept an operator-selected audit seed.
 - Record whether the source tries to inspect process state, file descriptors,
   environment variables, network sockets, or paths outside the kernel inputs.
 - Treat unexplained sub-launch-floor timings, inconsistent correctness, sandbox
@@ -480,9 +496,11 @@ For every candidate considered before the once-only artifact claim:
   accepted candidate was not simply the highest training reward.
 
 These checks are deliberately operator-facing. Same-UID discovery is not proof against
-an arbitrary malicious same-account peer; accepted publication requires the dedicated
-audit boundary above. The checks decide whether the run found a correct candidate with
-lower versioned ferrl latency or a reward artifact.
+an arbitrary malicious same-account peer; same-UID publication retains that exact
+operator-trusted boundary. Use the optional dedicated backend or an externally isolated
+runner when a stronger candidate-execution boundary is required. The checks decide
+whether the run found a correct candidate with lower versioned ferrl latency or a reward
+artifact.
 
 ## Stopping Rule
 
