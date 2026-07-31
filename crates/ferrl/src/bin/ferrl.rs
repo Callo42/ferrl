@@ -12009,9 +12009,10 @@ benchmarks:
     #[allow(clippy::cognitive_complexity)] // deployment oracle checks every retained evidence layer
     fn deployment_admin_free_artifact_v4_end_to_end() {
         let required_path = |key: &str| {
-            std::env::var_os(key)
-                .map(PathBuf::from)
-                .unwrap_or_else(|| panic!("set {key} to run the artifact deployment gate"))
+            std::env::var_os(key).map_or_else(
+                || panic!("set {key} to run the artifact deployment gate"),
+                PathBuf::from,
+            )
         };
         let image = required_path("FERRL_TRIMUL_IMAGE");
         let eval_dir = required_path("FERRL_TRIMUL_EVAL_DIR");
