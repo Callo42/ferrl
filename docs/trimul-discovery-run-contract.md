@@ -39,7 +39,7 @@ prompt text. Select completion parsing separately with
 `trimul.submission_extract_mode`, which must be either `final_fence` or
 `thinking_after_think` and never changes prompt bytes. The extraction command is `ferrl
 trimul-artifact --run-dir <run-dir> --candidate-sha256 <record_sha256>
---out <artifact-dir> --audit-secret-seed <seed>
+--out <artifact-dir>
 --audit-verifier-executor-socket <dedicated-service.sock>
 --audit-cuda-visible-device <one-device-token> --run-health <summary>
 --source-inspection clean --source-inspection-notes <notes>`. Artifact extraction
@@ -197,8 +197,11 @@ reaching the test harness, bounded partial credit for passing individual test ca
 and then the correctness floor for test-passing candidates whose eval reaches a
 benchmark exit marker. A successful plausible benchmark adds a capped speed
 component. Implausibly fast benchmark timings still score zero. The artifact
-acceptance rule below stays strict: held-out correctness, fixed same-device paired
-benchmarking, and nine of eleven strict speedups over the freshly measured reference.
+acceptance rule below stays strict: secret-seed re-verification of the launch-bound
+cases, fixed same-device paired benchmarking, and nine of eleven strict speedups over
+the freshly measured reference. This audit changes the case-generation seed but does
+not create the distinct TriMul case/reward boundary required for genuinely held-out
+evaluation.
 
 The run-config schema accepts the explicit reward profile below. Omit `trimul.reward`
 to use these `trimul_shaped_v1` defaults, or tune the numeric values to adjust
@@ -357,7 +360,11 @@ bound by SHA-256 from the manifest:
   "eval": {"bundle_sha256": "<sha256>", "sandbox_image_sha256": "<sha256>", "task_yml_sha256": "<sha256>", "test_cases": 18, "benchmark_cases": 5},
   "audit": {
     "contract": "ferrl.trimul-artifact-audit.v1",
+    "audit_contract_sha256": "<seed/output/device-independent candidate contract sha256>",
     "audit_id": "<domain-separated sha256>",
+    "claim_file": "audit-claim.json",
+    "claim_file_sha256": "<sha256>",
+    "claim": {"contract_version": 1, "claim_id": "<sha256>", "contract_sha256": "<same audit contract sha256>", "audit_secret_seed": 1, "expected_executor_runs": 23, "requester_uid": 1000, "service_uid": 1001, "claimed_unix_millis": 1},
     "audit_secret_seed": 1,
     "requested_cuda_visible_device": "0",
     "isolation_tier": "dedicated_uid_service_v1",
@@ -388,6 +395,16 @@ statistics, zero exit markers, and the executing CUDA device identity. Candidate
 coordinates, reward, run id, commit, model/checkpoint, tokenizer, prompt, and verifier assets
 remain derived from the authenticated run; audit measurements are produced only by the
 independent dedicated service.
+Before any runtime probe or measurement, the output directory is created exclusively
+with a durable owner/attempt record and a hidden sibling stage. The authenticated
+dedicated service then creates a no-replace claim beneath its descriptor-retained work
+root, generates the audit seed, and authorizes exactly 23 ordered executor runs: one
+runtime-control preflight followed by the 22 paired measurements. It durably records a
+start and completion (including failures) for every sequence slot, rejects gaps,
+duplicates, overflow, and a second candidate/contract claim, and retains an incomplete
+claim if the client exits. The client writes each raw execution to the retained stage as
+soon as it is validated. Publication uses ownership-checked no-replace hard links and
+makes `manifest.json` visible only after every other artifact file is durable.
 The manifest also retains the complete dedicated isolation and runtime-preflight objects,
 not only their digests, so an offline reader can recompute every preflight binding. Host
 source paths and the operator's absolute output path are intentionally excluded from the
@@ -408,12 +425,15 @@ A TriMul run counts as a success only if one artifact candidate satisfies every 
 5. Re-verification matches the attested eval-bundle, sandbox-image, and `task.yml`
    content identities, preserves the complete exactly indexed correctness and benchmark
    cases plus raw protected output, and uses a fresh scratch directory.
-6. Re-verification uses an audit `trimul.secret_seed` that was not used for training.
+6. The dedicated service, not the operator, generates the audit `trimul.secret_seed`;
+   it differs from the training seed and is bound into the once-only claim.
 7. The command exposes one CUDA device token; the trusted CUDA Driver API records one
    canonical logical ordinal, PCI bus id, UUID, and product name, identical in both phases
    and all 22 executions.
 8. Block order is precommitted by the audit id and alternates which role runs first.
-   Selective reruns are not allowed.
+   The service-owned sequence ledger permits exactly one runtime preflight and 22
+   measurements. Selective or whole-audit reruns, alternate seeds, skipped slots, and
+   extra executions are not allowed.
 9. Each paired speedup is `reference.geomean_ns / candidate.geomean_ns`. A material win is
    strictly greater than `1.02`; equality is a loss.
 10. Acceptance requires at least nine material wins out of exactly eleven pairs. This is
@@ -426,6 +446,9 @@ If any execution is incomplete, changes device identity, omits raw/exact evidenc
 fails correctness, the audit aborts and the candidate is rejected even if its training
 reward was high. There are no operator-supplied artifact baseline measurements and no
 post-hoc repeat count.
+The output path is claimed before the service audit, partial evidence remains in its
+owned stage on failure, concurrent writers cannot share a destination, and only the
+manifest-last no-replace commit is a published bundle.
 
 ## Dynamic Reward-Hacking Checks
 
@@ -444,10 +467,11 @@ grade socket. Launcher/init/shell stdout remains diagnostic only.
 The first discovery run still needs dynamic checks on top candidates because the
 training loop is optimizing against that reward.
 
-For every candidate included in the final report:
+For every candidate considered before the once-only artifact claim:
 
 - Re-run from `submission.py` only; do not reuse the training scratch tree.
-- Re-run with a fresh audit secret seed.
+- Use discovery/diagnostic scoring for exploratory checks; do not rerun or choose the
+  seed of a claimed artifact audit.
 - Record whether the source tries to inspect process state, file descriptors,
   environment variables, network sockets, or paths outside the kernel inputs.
 - Treat unexplained sub-launch-floor timings, inconsistent correctness, sandbox

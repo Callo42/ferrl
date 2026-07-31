@@ -321,7 +321,7 @@ runs so the best sampled completions are persisted in `candidates.jsonl`; every 
 carries the launch digest, a digest over all candidate fields, and a signature from the
 launch-bound per-run key.
 Promote exactly one row with `ferrl trimul-artifact --run-dir
-<run-dir> --candidate-sha256 <record_sha256> --audit-secret-seed <seed>
+<run-dir> --candidate-sha256 <record_sha256>
 --audit-cuda-visible-device <device> ...`. The extractor validates the whole
 ledger and, when present, the external attestation against the protected trust policy,
 selects that exact row, and derives completion, coordinates, reward, model,
@@ -332,7 +332,13 @@ with hashes for both in `manifest.json`. Local-ephemeral launches and
 relabeled as publication evidence. Artifact acceptance instead requires a new serialized
 `dedicated_uid_service_v1` audit on one explicitly selected CUDA device: eleven
 alternating reference/candidate pairs, complete recomputable preflight and raw protected
-evidence, exact case coverage, and at least nine strict speedups above `1.02x`.
+evidence, exact case coverage, and at least nine strict speedups above `1.02x`. Before
+measurement, the command atomically claims the output and the dedicated service durably
+claims the candidate/audit contract, generates the audit seed, and fixes one runtime
+preflight plus 22 audit executions. A second claim, seed selection, skipped/repeated
+execution, or alternate output cannot create another selectable audit on that service.
+Evidence is staged as it is produced and published through no-replace links with
+`manifest.json` as the final commit marker.
 For rollout-only diagnostics from an external inference runtime, use
 `ferrl trimul-score --config <run.json> --prompt-copy <prompt.txt>
 --completion <raw.txt> --out <scores.jsonl> --score-secret-seed <seed>` (or
@@ -352,8 +358,10 @@ low or zero rewards remain explainable without re-running the whole training ste
 reward-tail triage, set `candidate_log_top_k` at least as high as `group_size` so every
 sampled completion is retained. TriMul's training reward is shaped for search density;
 test-passing candidates whose eval reaches a benchmark marker get a correctness floor,
-and artifact acceptance still requires clean held-out correctness plus the fixed
-same-device paired decision through `ferrl trimul-artifact`. The run-config schema accepts the explicit
+and artifact acceptance still requires clean secret-seed re-verification of the
+launch-bound cases plus the fixed same-device paired decision through
+`ferrl trimul-artifact`. This is not the genuinely held-out TriMul case/reward boundary
+planned separately. The run-config schema accepts the explicit
 reward profile below. Omit `trimul.reward` to use these `trimul_shaped_v1` defaults,
 or tune the numeric values to adjust discovery density. Custom profiles must preserve
 the reward ladder: `format_extracted <= runnable` and
@@ -421,6 +429,10 @@ already be owned by that UID and grant no group/world permissions. The service r
 the authenticated work root as an open directory descriptor and creates/stages requests
 descriptor-relatively. Executor socket I/O uses deadlines derived from the requested wall
 budget, so a stalled service cannot hold a training rank indefinitely.
+For artifact audits, the same protected work root is also the durable claim authority:
+`artifact-audits/` retains the once-only contract claim and all ordered run outcomes.
+Do not rotate, clean, copy, or replace that directory between audit attempts; deployment
+must preserve one authoritative work root for the artifact population it accepts.
 
 ```jsonc
 "launch_authentication": "local_ephemeral_v1",

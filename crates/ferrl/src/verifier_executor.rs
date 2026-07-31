@@ -12,6 +12,8 @@
 //! an arbitrary malicious peer process already running under the caller's host UID.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -24,7 +26,72 @@ use crate::sandbox::{
 pub const DEFAULT_VERIFIER_EXECUTOR_SOCKET: &str = "/run/ferrl/verifier-executor.sock";
 /// Schema version for serialized verifier isolation preflight evidence.
 pub const VERIFIER_ISOLATION_EVIDENCE_VERSION: u32 = 1;
+/// Schema version for durable, once-only artifact-audit claims.
+pub const ARTIFACT_AUDIT_CLAIM_VERSION: u32 = 1;
 const SAME_UID_WORK_ROOT_PREFIX: &str = "ferrl-verifier";
+
+/// Service-owned authorization for exactly one artifact-audit execution sequence.
+///
+/// Claims are created durably beneath the dedicated verifier's authenticated work
+/// root. The service chooses the audit seed and rejects every later claim for the
+/// same candidate/audit-contract digest. Fields are intentionally private so a
+/// caller can only obtain a usable claim from the authenticated service.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactAuditClaim {
+    contract_version: u32,
+    claim_id: String,
+    contract_sha256: String,
+    audit_secret_seed: u64,
+    expected_executor_runs: u32,
+    requester_uid: u32,
+    service_uid: u32,
+    claimed_unix_millis: u64,
+}
+
+impl ArtifactAuditClaim {
+    /// Service-generated claim identifier bound to the contract and audit seed.
+    #[must_use]
+    pub fn claim_id(&self) -> &str {
+        &self.claim_id
+    }
+
+    /// Seed-independent candidate/audit-contract digest protected by this claim.
+    #[must_use]
+    pub fn contract_sha256(&self) -> &str {
+        &self.contract_sha256
+    }
+
+    /// Service-generated case seed for the claimed audit.
+    #[must_use]
+    pub const fn audit_secret_seed(&self) -> u64 {
+        self.audit_secret_seed
+    }
+
+    /// Exact number of executor runs authorized by this claim.
+    #[must_use]
+    pub const fn expected_executor_runs(&self) -> u32 {
+        self.expected_executor_runs
+    }
+
+    /// UID of the authenticated audit requester.
+    #[must_use]
+    pub const fn requester_uid(&self) -> u32 {
+        self.requester_uid
+    }
+
+    /// UID of the dedicated verifier service that owns the claim ledger.
+    #[must_use]
+    pub const fn service_uid(&self) -> u32 {
+        self.service_uid
+    }
+
+    /// Wall-clock issuance time recorded by the dedicated service.
+    #[must_use]
+    pub const fn claimed_unix_millis(&self) -> u64 {
+        self.claimed_unix_millis
+    }
+}
 
 /// Versioned host-identity boundary used for one verifier launch.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -206,6 +273,13 @@ impl Sandbox for SameUidApptainerSandbox {
 #[derive(Debug, Clone)]
 pub struct VerifierExecutorSandbox {
     socket_path: PathBuf,
+    artifact_audit: Option<ArtifactAuditClientContext>,
+}
+
+#[derive(Debug, Clone)]
+struct ArtifactAuditClientContext {
+    claim: ArtifactAuditClaim,
+    next_sequence: Arc<AtomicU32>,
 }
 
 impl Default for VerifierExecutorSandbox {
@@ -220,6 +294,7 @@ impl VerifierExecutorSandbox {
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
         Self {
             socket_path: socket_path.into(),
+            artifact_audit: None,
         }
     }
 
@@ -233,6 +308,62 @@ impl VerifierExecutorSandbox {
     #[must_use]
     pub const fn isolation_tier(&self) -> VerifierIsolationTier {
         VerifierIsolationTier::DedicatedUidServiceV1
+    }
+
+    /// Acquire the durable, once-only service claim for one candidate/audit contract.
+    ///
+    /// The contract digest must not contain an operator-selected output path, audit
+    /// seed, CUDA token, or other retry-selectable value. The service generates the
+    /// audit seed and permanently retains the claim even if the client later exits or
+    /// an execution fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns a fail-closed [`SandboxError`] if the service cannot authenticate or
+    /// durably create the claim, including when the contract was already claimed.
+    pub fn claim_artifact_audit(
+        &self,
+        contract_sha256: &str,
+        training_secret_seed: u64,
+        expected_executor_runs: u32,
+    ) -> Result<ArtifactAuditClaim, SandboxError> {
+        #[cfg(target_os = "linux")]
+        {
+            linux::claim_artifact_audit_client(
+                &self.socket_path,
+                contract_sha256,
+                training_secret_seed,
+                expected_executor_runs,
+            )
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (
+                contract_sha256,
+                training_secret_seed,
+                expected_executor_runs,
+            );
+            Err(SandboxError::InvalidSpec(
+                "protected verifier artifact claims require Linux".to_string(),
+            ))
+        }
+    }
+
+    /// Bind subsequent executor runs to the fixed sequence authorized by `claim`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxError::InvalidSpec`] if the claim is structurally invalid.
+    pub fn with_artifact_audit_claim(
+        mut self,
+        claim: ArtifactAuditClaim,
+    ) -> Result<Self, SandboxError> {
+        validate_artifact_audit_claim(&claim)?;
+        self.artifact_audit = Some(ArtifactAuditClientContext {
+            claim,
+            next_sequence: Arc::new(AtomicU32::new(0)),
+        });
+        Ok(self)
     }
 
     /// Request service-produced isolation evidence over the authenticated socket.
@@ -260,7 +391,7 @@ impl Sandbox for VerifierExecutorSandbox {
     fn run(&self, spec: &RunSpec) -> Result<RunOutcome, SandboxError> {
         #[cfg(target_os = "linux")]
         {
-            linux::run_client(&self.socket_path, spec)
+            linux::run_client(&self.socket_path, spec, self.artifact_audit.as_ref())
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -270,6 +401,30 @@ impl Sandbox for VerifierExecutorSandbox {
             ))
         }
     }
+}
+
+fn is_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn validate_artifact_audit_claim(claim: &ArtifactAuditClaim) -> Result<(), SandboxError> {
+    if claim.contract_version != ARTIFACT_AUDIT_CLAIM_VERSION
+        || !is_lower_sha256(&claim.claim_id)
+        || !is_lower_sha256(&claim.contract_sha256)
+        || claim.expected_executor_runs == 0
+        || claim.requester_uid == 0
+        || claim.service_uid == 0
+        || claim.requester_uid == claim.service_uid
+        || claim.claimed_unix_millis == 0
+    {
+        return Err(SandboxError::InvalidSpec(
+            "dedicated verifier returned an invalid artifact-audit claim".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Configuration for the long-running protected verifier executor.
@@ -385,13 +540,28 @@ struct ExecutorRequest {
     network: NetworkPolicy,
     limits: ResourceLimits,
     protected_output: Option<ExecutorProtectedOutput>,
+    artifact_audit: Option<ExecutorArtifactAuditRun>,
     asset_count: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 enum ExecutorWireRequest {
-    Preflight { version: u32 },
+    Preflight {
+        version: u32,
+    },
+    ClaimArtifactAudit {
+        version: u32,
+        contract_sha256: String,
+        training_secret_seed: u64,
+        expected_executor_runs: u32,
+    },
     Run(Box<ExecutorRequest>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ExecutorArtifactAuditRun {
+    claim: ArtifactAuditClaim,
+    sequence: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -422,6 +592,10 @@ enum ExecutorResponse {
         service_uid: u32,
         evidence: VerifierIsolationEvidence,
     },
+    ArtifactAuditClaim {
+        service_uid: u32,
+        claim: ArtifactAuditClaim,
+    },
     Outcome {
         service_uid: u32,
         outcome: RunOutcome,
@@ -448,11 +622,12 @@ mod linux {
         DirBuilderExt as _, FileTypeExt as _, MetadataExt as _, PermissionsExt as _,
     };
     use std::os::unix::net::{UnixListener, UnixStream};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
 
+    use ring::rand::{SecureRandom as _, SystemRandom};
     use rustix::net::{
         recvmsg, sendmsg, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags,
         SendAncillaryBuffer, SendAncillaryMessage, SendFlags,
@@ -465,7 +640,7 @@ mod linux {
         is_owned_descriptor_path, validate_protected_output_mapping, ApptainerSandbox, CAPTURE_CAP,
     };
 
-    const EXECUTOR_PROTOCOL_VERSION: u32 = 2;
+    const EXECUTOR_PROTOCOL_VERSION: u32 = 3;
     const MAX_ASSETS: usize = 32;
     const MAX_BINDS: usize = 32;
     const MAX_REQUEST_BYTES: usize = 1024 * 1024;
@@ -527,10 +702,23 @@ mod linux {
     pub(super) fn run_client(
         socket_path: &Path,
         spec: &RunSpec,
+        artifact_audit: Option<&ArtifactAuditClientContext>,
     ) -> Result<RunOutcome, SandboxError> {
-        let (request, assets) = request_from_spec(spec)?;
+        let (mut request, assets) = request_from_spec(spec)?;
         let wire_timeout = executor_wire_timeout(spec.limits.wall);
         let (mut stream, service_uid) = connect_authenticated(socket_path, wire_timeout)?;
+        if let Some(context) = artifact_audit {
+            if context.claim.service_uid != service_uid {
+                return Err(SandboxError::Executor(format!(
+                    "artifact-audit claim service UID {} does not match authenticated executor UID {service_uid}",
+                    context.claim.service_uid
+                )));
+            }
+            request.artifact_audit = Some(ExecutorArtifactAuditRun {
+                claim: context.claim.clone(),
+                sequence: context.next_sequence.fetch_add(1, Ordering::AcqRel),
+            });
+        }
         let wire_request = ExecutorWireRequest::Run(Box::new(request));
         send_request(&mut stream, &wire_request, &assets)
             .map_err(|error| SandboxError::Executor(error.to_string()))?;
@@ -548,8 +736,76 @@ mod linux {
             | ExecutorResponse::Preflight {
                 service_uid: response_uid,
                 ..
+            }
+            | ExecutorResponse::ArtifactAuditClaim {
+                service_uid: response_uid,
+                ..
             } => Err(SandboxError::Executor(format!(
                 "executor response UID {response_uid} or kind does not match authenticated run request for UID {service_uid}"
+            ))),
+            ExecutorResponse::Error(error) => Err(wire_error_to_sandbox(error)),
+        }
+    }
+
+    pub(super) fn claim_artifact_audit_client(
+        socket_path: &Path,
+        contract_sha256: &str,
+        training_secret_seed: u64,
+        expected_executor_runs: u32,
+    ) -> Result<ArtifactAuditClaim, SandboxError> {
+        if !is_lower_sha256(contract_sha256) || expected_executor_runs == 0 {
+            return Err(SandboxError::InvalidSpec(
+                "artifact-audit contract must be a lowercase SHA-256 and authorize at least one executor run"
+                    .to_string(),
+            ));
+        }
+        let (mut stream, service_uid) =
+            connect_authenticated(socket_path, EXECUTOR_HANDSHAKE_TIMEOUT)?;
+        send_request(
+            &mut stream,
+            &ExecutorWireRequest::ClaimArtifactAudit {
+                version: EXECUTOR_PROTOCOL_VERSION,
+                contract_sha256: contract_sha256.to_owned(),
+                training_secret_seed,
+                expected_executor_runs,
+            },
+            &[],
+        )
+        .map_err(|error| SandboxError::Executor(error.to_string()))?;
+        match read_response(&mut stream)
+            .map_err(|error| SandboxError::Executor(error.to_string()))?
+        {
+            ExecutorResponse::ArtifactAuditClaim {
+                service_uid: response_uid,
+                claim,
+            } if response_uid == service_uid => {
+                validate_artifact_audit_claim(&claim)?;
+                if claim.service_uid != service_uid
+                    || claim.requester_uid != rustix::process::geteuid().as_raw()
+                    || claim.contract_sha256 != contract_sha256
+                    || claim.expected_executor_runs != expected_executor_runs
+                    || claim.audit_secret_seed == training_secret_seed
+                {
+                    return Err(SandboxError::Executor(
+                        "executor returned an artifact-audit claim that does not match the request"
+                            .to_string(),
+                    ));
+                }
+                Ok(claim)
+            }
+            ExecutorResponse::ArtifactAuditClaim {
+                service_uid: response_uid,
+                ..
+            }
+            | ExecutorResponse::Preflight {
+                service_uid: response_uid,
+                ..
+            }
+            | ExecutorResponse::Outcome {
+                service_uid: response_uid,
+                ..
+            } => Err(SandboxError::Executor(format!(
+                "executor response UID {response_uid} or kind does not match authenticated artifact-audit claim request for UID {service_uid}"
             ))),
             ExecutorResponse::Error(error) => Err(wire_error_to_sandbox(error)),
         }
@@ -583,6 +839,10 @@ mod linux {
                 ..
             }
             | ExecutorResponse::Outcome {
+                service_uid: response_uid,
+                ..
+            }
+            | ExecutorResponse::ArtifactAuditClaim {
                 service_uid: response_uid,
                 ..
             } => Err(SandboxError::Executor(format!(
@@ -1219,6 +1479,312 @@ mod linux {
         Ok(())
     }
 
+    #[derive(Serialize)]
+    struct ArtifactAuditRunStart<'a> {
+        contract_version: u32,
+        claim_id: &'a str,
+        sequence: u32,
+        request_sha256: String,
+    }
+
+    #[derive(Serialize)]
+    struct ArtifactAuditRunCompletion<'a> {
+        contract_version: u32,
+        claim_id: &'a str,
+        sequence: u32,
+        succeeded: bool,
+        result_sha256: String,
+        outcome: Option<&'a RunOutcome>,
+        error: Option<String>,
+    }
+
+    fn claim_artifact_audit(
+        work_root: &ServiceWorkRoot,
+        requester_uid: u32,
+        service_uid: u32,
+        contract_sha256: &str,
+        training_secret_seed: u64,
+        expected_executor_runs: u32,
+    ) -> Result<ArtifactAuditClaim, SandboxError> {
+        validate_service_work_root(work_root, service_uid)?;
+        if !is_lower_sha256(contract_sha256) || expected_executor_runs == 0 {
+            return Err(SandboxError::InvalidSpec(
+                "artifact-audit contract must be a lowercase SHA-256 and authorize at least one executor run"
+                    .to_string(),
+            ));
+        }
+        let audits = open_or_create_private_service_directory(
+            &work_root.handle.directory,
+            rustix::cstr!("artifact-audits"),
+            service_uid,
+        )?;
+        let claim_name = CString::new(format!("contract-{contract_sha256}"))
+            .expect("lowercase SHA-256 claim directory contains no NUL");
+        match rustix::fs::mkdirat(
+            &audits,
+            &claim_name,
+            rustix::fs::Mode::from_bits_truncate(0o700),
+        ) {
+            Ok(()) => {}
+            Err(rustix::io::Errno::EXIST) => {
+                return Err(SandboxError::InvalidSpec(format!(
+                    "artifact-audit contract {contract_sha256} is already claimed; selective reruns are forbidden"
+                )))
+            }
+            Err(error) => {
+                return Err(SandboxError::Executor(format!(
+                    "could not create durable artifact-audit claim: {error}"
+                )))
+            }
+        }
+        rustix::fs::fsync(&audits).map_err(|error| SandboxError::Executor(error.to_string()))?;
+        let claim_directory = open_private_service_directory(&audits, &claim_name, service_uid)?;
+
+        let mut seed_bytes = [0_u8; 8];
+        SystemRandom::new().fill(&mut seed_bytes).map_err(|_| {
+            SandboxError::Executor(
+                "operating-system randomness failed after the artifact-audit claim was reserved"
+                    .to_string(),
+            )
+        })?;
+        let mut audit_secret_seed = u64::from_le_bytes(seed_bytes);
+        if audit_secret_seed == training_secret_seed {
+            audit_secret_seed ^= 1;
+        }
+        let claimed_unix_millis = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|error| SandboxError::Executor(error.to_string()))?
+                .as_millis(),
+        )
+        .map_err(|_| SandboxError::Executor("artifact-audit claim time overflowed".to_string()))?;
+        let mut digest = Sha256::new();
+        digest.update(b"ferrl.verifier-executor.artifact-audit-claim.v1\0");
+        digest.update(contract_sha256.as_bytes());
+        digest.update(audit_secret_seed.to_le_bytes());
+        digest.update(expected_executor_runs.to_le_bytes());
+        digest.update(requester_uid.to_le_bytes());
+        digest.update(service_uid.to_le_bytes());
+        digest.update(claimed_unix_millis.to_le_bytes());
+        digest.update(work_root.device.to_le_bytes());
+        digest.update(work_root.inode.to_le_bytes());
+        let claim = ArtifactAuditClaim {
+            contract_version: ARTIFACT_AUDIT_CLAIM_VERSION,
+            claim_id: format!("{:x}", digest.finalize()),
+            contract_sha256: contract_sha256.to_owned(),
+            audit_secret_seed,
+            expected_executor_runs,
+            requester_uid,
+            service_uid,
+            claimed_unix_millis,
+        };
+        let bytes = serde_json::to_vec_pretty(&claim)
+            .map_err(|error| SandboxError::Executor(error.to_string()))?;
+        write_new_synced_at(&claim_directory, rustix::cstr!("claim.json"), &bytes, 0o400)?;
+        rustix::fs::fsync(&claim_directory)
+            .and_then(|()| rustix::fs::fsync(&audits))
+            .and_then(|()| rustix::fs::fsync(&work_root.handle.directory))
+            .map_err(|error| SandboxError::Executor(error.to_string()))?;
+        validate_service_work_root(work_root, service_uid)?;
+        Ok(claim)
+    }
+
+    fn open_or_create_private_service_directory(
+        parent: &OwnedFd,
+        name: &CStr,
+        service_uid: u32,
+    ) -> Result<OwnedFd, SandboxError> {
+        match rustix::fs::mkdirat(parent, name, rustix::fs::Mode::from_bits_truncate(0o700)) {
+            Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+            Err(error) => return Err(SandboxError::Executor(error.to_string())),
+        }
+        let directory = open_private_service_directory(parent, name, service_uid)?;
+        rustix::fs::fsync(parent).map_err(|error| SandboxError::Executor(error.to_string()))?;
+        Ok(directory)
+    }
+
+    fn open_private_service_directory(
+        parent: &OwnedFd,
+        name: &CStr,
+        service_uid: u32,
+    ) -> Result<OwnedFd, SandboxError> {
+        let directory = rustix::fs::openat(
+            parent,
+            name,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(|error| SandboxError::Executor(error.to_string()))?;
+        let stat = rustix::fs::fstat(&directory)
+            .map_err(|error| SandboxError::Executor(error.to_string()))?;
+        if stat.st_uid != service_uid
+            || stat.st_mode & 0o777 != 0o700
+            || !rustix::fs::FileType::from_raw_mode(stat.st_mode).is_dir()
+        {
+            return Err(SandboxError::Executor(
+                "artifact-audit ledger directory is not service-owned mode 0700".to_string(),
+            ));
+        }
+        Ok(directory)
+    }
+
+    fn write_new_synced_at(
+        directory: &OwnedFd,
+        name: &CStr,
+        bytes: &[u8],
+        mode: u32,
+    ) -> Result<(), SandboxError> {
+        let descriptor = rustix::fs::openat(
+            directory,
+            name,
+            rustix::fs::OFlags::WRONLY
+                | rustix::fs::OFlags::CREATE
+                | rustix::fs::OFlags::EXCL
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::from_bits_truncate(0o600),
+        )
+        .map_err(|error| SandboxError::Executor(error.to_string()))?;
+        let mut file = File::from(descriptor);
+        file.write_all(bytes)
+            .and_then(|()| file.set_permissions(fs::Permissions::from_mode(mode)))
+            .and_then(|()| file.sync_all())
+            .map_err(|error| SandboxError::Executor(error.to_string()))
+    }
+
+    fn read_claim_at(claim_directory: &OwnedFd) -> Result<ArtifactAuditClaim, SandboxError> {
+        let descriptor = rustix::fs::openat(
+            claim_directory,
+            rustix::cstr!("claim.json"),
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(|error| SandboxError::Executor(error.to_string()))?;
+        let mut bytes = Vec::new();
+        File::from(descriptor)
+            .take(16 * 1024)
+            .read_to_end(&mut bytes)
+            .map_err(|error| SandboxError::Executor(error.to_string()))?;
+        let claim: ArtifactAuditClaim = serde_json::from_slice(&bytes)
+            .map_err(|error| SandboxError::Executor(error.to_string()))?;
+        validate_artifact_audit_claim(&claim)?;
+        Ok(claim)
+    }
+
+    fn artifact_audit_claim_directory(
+        work_root: &ServiceWorkRoot,
+        service_uid: u32,
+        audit: &ExecutorArtifactAuditRun,
+    ) -> Result<OwnedFd, SandboxError> {
+        validate_artifact_audit_claim(&audit.claim)?;
+        if audit.claim.service_uid != service_uid
+            || audit.sequence >= audit.claim.expected_executor_runs
+        {
+            return Err(SandboxError::InvalidSpec(
+                "artifact-audit execution is outside its service-owned fixed sequence".to_string(),
+            ));
+        }
+        let audits = open_private_service_directory(
+            &work_root.handle.directory,
+            rustix::cstr!("artifact-audits"),
+            service_uid,
+        )?;
+        let claim_name = CString::new(format!("contract-{}", audit.claim.contract_sha256))
+            .expect("validated lowercase SHA-256 contains no NUL");
+        let claim_directory = open_private_service_directory(&audits, &claim_name, service_uid)?;
+        if read_claim_at(&claim_directory)? != audit.claim {
+            return Err(SandboxError::InvalidSpec(
+                "artifact-audit execution does not match the durable service claim".to_string(),
+            ));
+        }
+        Ok(claim_directory)
+    }
+
+    fn start_artifact_audit_run(
+        work_root: &ServiceWorkRoot,
+        service_uid: u32,
+        audit: &ExecutorArtifactAuditRun,
+        request_sha256: String,
+    ) -> Result<(), SandboxError> {
+        let claim_directory = artifact_audit_claim_directory(work_root, service_uid, audit)?;
+        if audit.sequence > 0 {
+            let previous = CString::new(format!("run-{:06}-complete.json", audit.sequence - 1))
+                .expect("fixed journal name contains no NUL");
+            rustix::fs::statat(
+                &claim_directory,
+                &previous,
+                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+            )
+            .map_err(|_| {
+                SandboxError::InvalidSpec(format!(
+                    "artifact-audit run {} cannot start before run {} completed",
+                    audit.sequence,
+                    audit.sequence - 1
+                ))
+            })?;
+        }
+        let name = CString::new(format!("run-{:06}-start.json", audit.sequence))
+            .expect("fixed journal name contains no NUL");
+        let bytes = serde_json::to_vec_pretty(&ArtifactAuditRunStart {
+            contract_version: ARTIFACT_AUDIT_CLAIM_VERSION,
+            claim_id: &audit.claim.claim_id,
+            sequence: audit.sequence,
+            request_sha256,
+        })
+        .map_err(|error| SandboxError::Executor(error.to_string()))?;
+        write_new_synced_at(&claim_directory, &name, &bytes, 0o400)?;
+        rustix::fs::fsync(&claim_directory)
+            .map_err(|error| SandboxError::Executor(error.to_string()))
+    }
+
+    fn complete_artifact_audit_run(
+        work_root: &ServiceWorkRoot,
+        service_uid: u32,
+        audit: &ExecutorArtifactAuditRun,
+        result: &Result<RunOutcome, SandboxError>,
+    ) -> Result<(), SandboxError> {
+        let claim_directory = artifact_audit_claim_directory(work_root, service_uid, audit)?;
+        let (succeeded, result_sha256, outcome, error) = match result {
+            Ok(outcome) => {
+                let bytes = serde_json::to_vec(outcome)
+                    .map_err(|error| SandboxError::Executor(error.to_string()))?;
+                (
+                    true,
+                    format!("{:x}", Sha256::digest(bytes)),
+                    Some(outcome),
+                    None,
+                )
+            }
+            Err(error) => {
+                let text = error.to_string();
+                (
+                    false,
+                    format!("{:x}", Sha256::digest(text.as_bytes())),
+                    None,
+                    Some(text),
+                )
+            }
+        };
+        let name = CString::new(format!("run-{:06}-complete.json", audit.sequence))
+            .expect("fixed journal name contains no NUL");
+        let bytes = serde_json::to_vec_pretty(&ArtifactAuditRunCompletion {
+            contract_version: ARTIFACT_AUDIT_CLAIM_VERSION,
+            claim_id: &audit.claim.claim_id,
+            sequence: audit.sequence,
+            succeeded,
+            result_sha256,
+            outcome,
+            error,
+        })
+        .map_err(|error| SandboxError::Executor(error.to_string()))?;
+        write_new_synced_at(&claim_directory, &name, &bytes, 0o400)?;
+        rustix::fs::fsync(&claim_directory)
+            .map_err(|error| SandboxError::Executor(error.to_string()))
+    }
+
     fn validate_trusted_executor_binary(path: &Path) -> Result<(), VerifierExecutorError> {
         if !is_normal_absolute(path) {
             return Err(VerifierExecutorError::InvalidConfig(
@@ -1331,6 +1897,7 @@ mod linux {
                 network: spec.network,
                 limits: spec.limits.clone(),
                 protected_output,
+                artifact_audit: None,
                 asset_count: assets.len(),
             },
             assets,
@@ -1551,6 +2118,7 @@ mod linux {
         serde_json::from_slice(&payload).map_err(std::io::Error::other)
     }
 
+    #[allow(clippy::cognitive_complexity)] // one fail-closed arm per authenticated wire request
     fn handle_connection(
         mut stream: UnixStream,
         config: &VerifierExecutorConfig,
@@ -1568,9 +2136,11 @@ mod linux {
                 stream.set_write_timeout(Some(wire_timeout))?;
                 execute_request(*request, fds, config, service_uid, work_root)
             }
-            Ok((ExecutorWireRequest::Preflight { version }, _))
-                if version != EXECUTOR_PROTOCOL_VERSION =>
-            {
+            Ok((
+                ExecutorWireRequest::Preflight { version }
+                | ExecutorWireRequest::ClaimArtifactAudit { version, .. },
+                _,
+            )) if version != EXECUTOR_PROTOCOL_VERSION => {
                 ExecutorResponse::Error(ExecutorWireError::InvalidSpec(format!(
                     "unsupported verifier executor protocol version {version}"
                 )))
@@ -1591,6 +2161,30 @@ mod linux {
                     ))),
                 }
             }
+            Ok((ExecutorWireRequest::ClaimArtifactAudit { .. }, fds)) if !fds.is_empty() => {
+                ExecutorResponse::Error(ExecutorWireError::InvalidSpec(
+                    "artifact-audit claim must not include descriptors".to_string(),
+                ))
+            }
+            Ok((
+                ExecutorWireRequest::ClaimArtifactAudit {
+                    contract_sha256,
+                    training_secret_seed,
+                    expected_executor_runs,
+                    ..
+                },
+                _,
+            )) => match claim_artifact_audit(
+                work_root,
+                config.client_uid,
+                service_uid,
+                &contract_sha256,
+                training_secret_seed,
+                expected_executor_runs,
+            ) {
+                Ok(claim) => ExecutorResponse::ArtifactAuditClaim { service_uid, claim },
+                Err(error) => ExecutorResponse::Error(sandbox_error_to_wire(error)),
+            },
             Err(error) => ExecutorResponse::Error(ExecutorWireError::Executor(error.to_string())),
         };
         write_response(&mut stream, &response)
@@ -1617,9 +2211,34 @@ mod linux {
         service_uid: u32,
         work_root: &ServiceWorkRoot,
     ) -> ExecutorResponse {
-        let result = validate_service_work_root(work_root, service_uid).and_then(|()| {
-            execute_request_inner_at(request, fds, &work_root.handle, &config.apptainer_bin)
-        });
+        let audit = request.artifact_audit.clone();
+        let request_sha256 = serde_json::to_vec(&request)
+            .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+            .map_err(|error| SandboxError::Executor(error.to_string()));
+        let mut audit_started = false;
+        let result = validate_service_work_root(work_root, service_uid)
+            .and(request_sha256)
+            .and_then(|request_sha256| {
+                if let Some(audit) = &audit {
+                    start_artifact_audit_run(work_root, service_uid, audit, request_sha256)?;
+                    audit_started = true;
+                }
+                Ok(())
+            })
+            .and_then(|()| {
+                execute_request_inner_at(request, fds, &work_root.handle, &config.apptainer_bin)
+            });
+        let result = if audit_started {
+            let audit = audit
+                .as_ref()
+                .expect("audit_started is set only for an artifact-audit request");
+            match complete_artifact_audit_run(work_root, service_uid, audit, &result) {
+                Ok(()) => result,
+                Err(error) => Err(error),
+            }
+        } else {
+            result
+        };
         let result = match (result, validate_service_work_root(work_root, service_uid)) {
             (Ok(outcome), Ok(())) => Ok(outcome),
             (Err(error), Ok(())) | (_, Err(error)) => Err(error),
@@ -2898,6 +3517,120 @@ printf '%s\n' '{ENTRY_MARKER}' >&2
             );
             let error = validate_service_config(&config).unwrap_err().to_string();
             assert!(error.contains("distinct non-root UIDs"));
+        }
+
+        #[test]
+        #[allow(clippy::cognitive_complexity)] // exercises every durable claim field and refusal
+        fn artifact_audit_claim_is_durable_once_only_and_service_seeded() {
+            let root = test_root("artifact-audit-once-only");
+            let service_uid = rustix::process::geteuid().as_raw();
+            let requester_uid = service_uid.saturating_add(1);
+            let work_root = test_service_work_root(&root);
+            let contract = "42".repeat(32);
+            let training_seed = 17;
+
+            let first = claim_artifact_audit(
+                &work_root,
+                requester_uid,
+                service_uid,
+                &contract,
+                training_seed,
+                23,
+            )
+            .unwrap();
+            assert_eq!(first.contract_sha256(), contract);
+            assert_eq!(first.expected_executor_runs(), 23);
+            assert_eq!(first.requester_uid(), requester_uid);
+            assert_eq!(first.service_uid(), service_uid);
+            assert_ne!(first.audit_secret_seed(), training_seed);
+            assert!(is_lower_sha256(first.claim_id()));
+
+            let error =
+                claim_artifact_audit(&work_root, requester_uid, service_uid, &contract, 99, 23)
+                    .unwrap_err()
+                    .to_string();
+            assert!(error.contains("already claimed"), "{error}");
+            assert!(error.contains("selective reruns"), "{error}");
+
+            let stored = fs::read(
+                root.join("artifact-audits")
+                    .join(format!("contract-{contract}"))
+                    .join("claim.json"),
+            )
+            .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<ArtifactAuditClaim>(&stored).unwrap(),
+                first
+            );
+            remove_request_tree(&root).unwrap();
+        }
+
+        #[test]
+        #[allow(clippy::cognitive_complexity)] // one assertion per fixed journal transition
+        fn artifact_audit_journal_forbids_skips_reuse_and_extra_runs() {
+            let root = test_root("artifact-audit-fixed-journal");
+            let service_uid = rustix::process::geteuid().as_raw();
+            let requester_uid = service_uid.saturating_add(1);
+            let work_root = test_service_work_root(&root);
+            let claim = claim_artifact_audit(
+                &work_root,
+                requester_uid,
+                service_uid,
+                &"24".repeat(32),
+                3,
+                2,
+            )
+            .unwrap();
+            let run = |sequence| ExecutorArtifactAuditRun {
+                claim: claim.clone(),
+                sequence,
+            };
+
+            let error = start_artifact_audit_run(&work_root, service_uid, &run(1), "11".repeat(32))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("cannot start before run 0 completed"),
+                "{error}"
+            );
+
+            start_artifact_audit_run(&work_root, service_uid, &run(0), "12".repeat(32)).unwrap();
+            assert!(
+                start_artifact_audit_run(&work_root, service_uid, &run(0), "13".repeat(32),)
+                    .is_err()
+            );
+            let outcome = RunOutcome {
+                status: RunStatus::Exited(1),
+                stdout: String::new(),
+                stderr: "candidate failed".to_string(),
+                protected_output: String::new(),
+                wall: Duration::from_millis(1),
+            };
+            complete_artifact_audit_run(&work_root, service_uid, &run(0), &Ok(outcome)).unwrap();
+            start_artifact_audit_run(&work_root, service_uid, &run(1), "14".repeat(32)).unwrap();
+            complete_artifact_audit_run(
+                &work_root,
+                service_uid,
+                &run(1),
+                &Err(SandboxError::Executor("retained failure".to_string())),
+            )
+            .unwrap();
+            let error = start_artifact_audit_run(&work_root, service_uid, &run(2), "15".repeat(32))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("outside its service-owned fixed sequence"));
+
+            let ledger = root
+                .join("artifact-audits")
+                .join(format!("contract-{}", claim.contract_sha256()));
+            assert!(ledger.join("run-000000-start.json").is_file());
+            let retained_outcome =
+                fs::read_to_string(ledger.join("run-000000-complete.json")).unwrap();
+            assert!(retained_outcome.contains("candidate failed"));
+            assert!(ledger.join("run-000001-start.json").is_file());
+            let failure = fs::read_to_string(ledger.join("run-000001-complete.json")).unwrap();
+            assert!(failure.contains("retained failure"));
+            remove_request_tree(&root).unwrap();
         }
 
         #[test]

@@ -37,7 +37,9 @@
 //!    exit marker score the correctness floor plus any capped latency component.
 //!    Implausibly fast timings (below the configured floor — a glitch or forged
 //!    grade) still score `0`. The final artifact gate remains stricter than the
-//!    training reward: held-out correctness plus repeated same-metric latency audit.
+//!    training reward: secret-seed re-verification of the launch-bound cases plus a
+//!    repeated same-metric latency audit. A distinct genuinely held-out case/reward
+//!    boundary is outside this contract.
 //!
 //! ## What lives where
 //!
@@ -88,8 +90,8 @@ use crate::sandbox::{
     Bind, ProtectedOutput, ResourceLimits, RunOutcome, RunSpec, RunStatus, Sandbox, SandboxError,
 };
 use crate::verifier_executor::{
-    SameUidApptainerSandbox, VerifierExecutorSandbox, VerifierIsolationEvidence,
-    VerifierIsolationTier,
+    ArtifactAuditClaim, SameUidApptainerSandbox, VerifierExecutorSandbox,
+    VerifierIsolationEvidence, VerifierIsolationTier,
 };
 #[cfg(test)]
 use crate::verifier_executor::{
@@ -1410,8 +1412,8 @@ pub struct TrimulReward {
     test_cases: Vec<TrimulCase>,
     /// Timing cases.
     benchmark_cases: Vec<TrimulCase>,
-    /// The secret seed Cantor-combined with each case's public seed for held-out
-    /// inputs (passed as `POPCORN_SEED`).
+    /// The secret seed Cantor-combined with each launch-bound case's public seed
+    /// (passed as `POPCORN_SEED`).
     secret_seed: u64,
     /// Reference geometric-mean service latency (ns) on the target GPU; the
     /// same-metric ratio denominator for the shaped reward's latency component. `None`
@@ -1649,6 +1651,26 @@ impl TrimulReward {
         self
     }
 
+    /// Select a dedicated verifier whose subsequent runs consume one durable,
+    /// service-owned artifact-audit sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RewardError`] if the service-produced claim is structurally invalid.
+    pub fn with_artifact_audit_claim(
+        mut self,
+        socket: impl Into<PathBuf>,
+        claim: ArtifactAuditClaim,
+    ) -> Result<Self, RewardError> {
+        let sandbox = VerifierExecutorSandbox::new(socket)
+            .with_artifact_audit_claim(claim)
+            .map_err(RewardError::verifier)?;
+        self.sandbox = TrimulVerifierBackend::Dedicated(sandbox);
+        self.verifier_isolation_evidence = None;
+        self.runtime_preflight_evidence = None;
+        Ok(self)
+    }
+
     /// Select the no-admin same-UID staged Apptainer backend explicitly.
     #[must_use]
     pub fn with_same_uid_apptainer(
@@ -1737,7 +1759,7 @@ impl TrimulReward {
         })
     }
 
-    /// Set the secret held-out seed (`POPCORN_SEED`).
+    /// Set the secret case-generation seed (`POPCORN_SEED`).
     #[must_use]
     pub fn with_secret_seed(mut self, seed: u64) -> Self {
         self.secret_seed = seed;
