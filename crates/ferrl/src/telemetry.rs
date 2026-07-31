@@ -1,19 +1,23 @@
 //! Run telemetry: structured tracing plus a per-run on-disk layout.
 //!
-//! Every training run materializes a `runs/<run_id>/` directory containing
-//! `config.json` (the run configuration), `metrics.jsonl` (one [`Metrics`] JSON
-//! object per optimizer step), an optional `candidates.jsonl` stream (top sampled
-//! completions when enabled), a `checkpoints/` subdirectory, and `run.log` (a
-//! human-readable log). [`init_tracing`] wires up `tracing` once for the
-//! process; [`RunDir`] owns the directory; [`MetricsWriter`] appends step
-//! metrics as JSON Lines; [`CandidateWriter`] appends sampled-completion
-//! provenance as JSON Lines.
+//! Every production training run materializes a `runs/<run_id>/` directory whose
+//! immutable `launch.json` commits the resolved launch before telemetry begins.
+//! The directory also contains `config.json`, `metrics.jsonl` (one [`Metrics`]
+//! object per optimizer step), an optional launch-bound `candidates.jsonl`
+//! stream, a `checkpoints/` subdirectory, and `run.log`. TriMul launches also
+//! freeze `prompt.txt` plus its compatibility `prompt.sha256` sidecar.
+//! [`init_tracing`] wires up `tracing` once for the process; [`RunDir`] owns the
+//! directory; [`MetricsWriter`] appends step metrics as JSON Lines; and
+//! [`CandidateWriter`] appends sampled-completion provenance as JSON Lines.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use ring::rand::SystemRandom;
+use ring::signature::{self, Ed25519KeyPair, KeyPair as _};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tracing_subscriber::filter::EnvFilter;
 use tracing_subscriber::fmt;
 use tracing_subscriber::prelude::*;
@@ -120,6 +124,10 @@ pub enum TelemetryError {
         /// Rejected IEEE-754 value.
         value: f32,
     },
+    /// A launch-bound candidate row is incomplete, malformed, or was mutated
+    /// after its digest was computed.
+    #[error("invalid candidate provenance: {0}")]
+    CandidateProvenance(String),
     /// A filesystem operation (create dir / open / write) failed.
     #[error("telemetry io error at {path}: {source}")]
     Io {
@@ -141,11 +149,11 @@ pub enum TelemetryError {
         source: serde_json::Error,
     },
     /// [`RunDir::create`] was given a `run_id` whose directory already holds an
-    /// append-only telemetry stream — appending a fresh run to a prior run's
-    /// stream would silently interleave two runs. Use a new `run_id`, or
-    /// [`RunDir::open`] to deliberately continue the existing run (resume).
+    /// immutable launch or append-only telemetry stream. Reusing it would
+    /// silently mix two runs. Use a new `run_id`, or [`RunDir::open`] to
+    /// deliberately continue the existing run (resume).
     #[error(
-        "run directory already contains an append-only telemetry stream at {path} \
+        "run directory already contains immutable launch/telemetry state at {path} \
          (duplicate run_id? use RunDir::open to resume)"
     )]
     DuplicateRun {
@@ -242,6 +250,12 @@ impl RunDir {
     pub const METRICS_FILE: &'static str = "metrics.jsonl";
     /// Standard filename for the optional per-candidate ledger stream.
     pub const CANDIDATES_FILE: &'static str = "candidates.jsonl";
+    /// Immutable launch manifest committed before trainer publication begins.
+    pub const LAUNCH_FILE: &'static str = "launch.json";
+    /// Exact rendered prompt bytes committed by a TriMul launch.
+    pub const PROMPT_FILE: &'static str = "prompt.txt";
+    /// Compatibility sidecar for prompt consumers outside the launch reader.
+    pub const PROMPT_SHA256_FILE: &'static str = "prompt.sha256";
     /// Standard filename for the serialized run configuration.
     pub const CONFIG_FILE: &'static str = "config.json";
     /// Standard filename for the human-readable run log.
@@ -252,25 +266,25 @@ impl RunDir {
     /// Create `runs_root/<run_id>/` (and its `checkpoints/` subdir) for a
     /// **fresh** run.
     ///
-    /// Fails loud if the directory already holds an append-only telemetry
-    /// stream (`metrics.jsonl` or `candidates.jsonl`): those writers append, so
-    /// a duplicate `run_id` would silently interleave a new run's stream into a
-    /// prior run's file (the `RUNDIR-APPEND` hazard). To
+    /// Fails loud if the directory already holds the immutable `launch.json` or
+    /// an append-only telemetry stream (`metrics.jsonl` or `candidates.jsonl`):
+    /// reusing either would silently mix two run identities (the
+    /// `RUNDIR-APPEND` hazard). To
     /// deliberately continue an existing run — the checkpoint-resume path — use
     /// [`open`](Self::open) instead.
     ///
     /// # Errors
     ///
-    /// Returns [`TelemetryError::DuplicateRun`] if an append-only telemetry
-    /// stream already exists under `runs_root/<run_id>/`, or [`TelemetryError::Io`]
-    /// if any directory cannot be created.
+    /// Returns [`TelemetryError::DuplicateRun`] if an immutable launch or
+    /// append-only telemetry stream already exists under `runs_root/<run_id>/`,
+    /// or [`TelemetryError::Io`] if any directory cannot be created.
     pub fn create(
         runs_root: impl AsRef<Path>,
         run_id: impl Into<String>,
     ) -> Result<Self, TelemetryError> {
         let run_id = run_id.into();
         let root = runs_root.as_ref().join(&run_id);
-        for file in [Self::METRICS_FILE, Self::CANDIDATES_FILE] {
+        for file in [Self::METRICS_FILE, Self::CANDIDATES_FILE, Self::LAUNCH_FILE] {
             let path = root.join(file);
             if path.exists() {
                 return Err(TelemetryError::DuplicateRun { path });
@@ -334,6 +348,24 @@ impl RunDir {
         self.root.join(Self::CANDIDATES_FILE)
     }
 
+    /// Path to the immutable launch manifest.
+    #[must_use]
+    pub fn launch_path(&self) -> PathBuf {
+        self.root.join(Self::LAUNCH_FILE)
+    }
+
+    /// Path to the exact rendered prompt committed for this run, when present.
+    #[must_use]
+    pub fn prompt_path(&self) -> PathBuf {
+        self.root.join(Self::PROMPT_FILE)
+    }
+
+    /// Path to the exact rendered prompt's compatibility SHA-256 sidecar.
+    #[must_use]
+    pub fn prompt_sha256_path(&self) -> PathBuf {
+        self.root.join(Self::PROMPT_SHA256_FILE)
+    }
+
     /// Path to `config.json`.
     #[must_use]
     pub fn config_path(&self) -> PathBuf {
@@ -363,6 +395,39 @@ impl RunDir {
         fs::write(&path, json).map_err(|e| TelemetryError::io(&path, e))
     }
 
+    /// Commit an immutable launch manifest, with an optional exact rendered
+    /// prompt as a payload written before the manifest commit marker.
+    ///
+    /// Every payload file uses create-new semantics and is synchronized before
+    /// `launch.json` becomes the final commit marker; the run directory and its
+    /// parent are then fenced. A visible launch prevents [`create`](Self::create)
+    /// from reusing the run id, while a partial prompt payload makes any retry
+    /// fail closed before it can publish a different launch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TelemetryError::Io`] if a file already exists or any
+    /// write/synchronization fails.
+    pub fn write_immutable_launch(
+        &self,
+        launch_json: &[u8],
+        prompt: Option<&[u8]>,
+    ) -> Result<(), TelemetryError> {
+        if let Some(prompt) = prompt {
+            write_new_synced(&self.prompt_path(), prompt)?;
+            let digest = format!("{:x}\n", Sha256::digest(prompt));
+            write_new_synced(&self.prompt_sha256_path(), digest.as_bytes())?;
+        }
+        write_new_synced(&self.launch_path(), launch_json)?;
+        File::open(&self.root)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| TelemetryError::io(&self.root, error))?;
+        let parent = self.root.parent().unwrap_or_else(|| Path::new("."));
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| TelemetryError::io(parent, error))
+    }
+
     /// Open a [`MetricsWriter`] appending to this run's `metrics.jsonl`.
     ///
     /// # Errors
@@ -380,6 +445,18 @@ impl RunDir {
     pub fn candidate_writer(&self) -> Result<CandidateWriter, TelemetryError> {
         CandidateWriter::open(self.candidates_path())
     }
+}
+
+fn write_new_synced(path: &Path, bytes: &[u8]) -> Result<(), TelemetryError> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| TelemetryError::io(path, error))?;
+    file.write_all(bytes)
+        .map_err(|error| TelemetryError::io(path, error))?;
+    file.sync_all()
+        .map_err(|error| TelemetryError::io(path, error))
 }
 
 /// One optimizer-step's worth of training metrics, serialized as a single JSON
@@ -666,6 +743,17 @@ pub struct MetricsWriter {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct CandidateRecord {
+    /// SHA-256 of the immutable launch payload that owns this ledger.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_sha256: Option<String>,
+    /// Domain-separated SHA-256 over this launch digest and every candidate
+    /// payload field. Present on production CLI ledgers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_sha256: Option<String>,
+    /// Ed25519 signature made by the process-local key whose public half is
+    /// committed in `launch.json`. Present on production CLI ledgers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_signature: Option<String>,
     /// Global optimizer step (0-based).
     pub step: u64,
     /// Data-parallel rank that sampled and scored this completion.
@@ -698,6 +786,40 @@ pub struct CandidateRecord {
 }
 
 impl CandidateRecord {
+    /// Stable domain separator for launch-bound candidate row digests.
+    pub const DIGEST_DOMAIN: &'static str = "ferrl.candidate-record.v1";
+
+    /// Construct an unbound candidate payload. Production CLI writers attach
+    /// launch and row digests immediately before publication.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        step: u64,
+        rank: usize,
+        world_size: usize,
+        prompt_index: u64,
+        group_index: usize,
+        reward: f32,
+        completion_len_tokens: usize,
+        completion: String,
+    ) -> Self {
+        Self {
+            launch_sha256: None,
+            record_sha256: None,
+            record_signature: None,
+            step,
+            rank,
+            world_size,
+            prompt_index,
+            group_index,
+            reward,
+            completion_len_tokens,
+            reward_diagnostic: None,
+            reward_metadata: None,
+            completion,
+        }
+    }
+
     /// A copy with a finite reward for callers that explicitly need numerical
     /// saturation outside [`CandidateWriter`]. The writer itself rejects
     /// non-finite rewards instead of silently rewriting evidence.
@@ -715,6 +837,264 @@ impl CandidateRecord {
         };
         out
     }
+
+    /// Return a copy integrity-bound to `launch_sha256`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TelemetryError::CandidateProvenance`] for a malformed launch
+    /// digest or non-finite reward.
+    pub fn bind_to_launch(&self, launch_sha256: &str) -> Result<Self, TelemetryError> {
+        validate_sha256("launch_sha256", launch_sha256)?;
+        if !self.reward.is_finite() {
+            return Err(TelemetryError::NonFiniteCandidateReward { value: self.reward });
+        }
+        let mut bound = self.clone();
+        bound.launch_sha256 = Some(launch_sha256.to_owned());
+        bound.record_sha256 = None;
+        bound.record_signature = None;
+        bound.record_sha256 = Some(bound.expected_record_sha256()?);
+        Ok(bound)
+    }
+
+    /// Verify the row digest and its production-launch Ed25519 signature.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TelemetryError::CandidateProvenance`] when the public key or
+    /// signature is malformed, the row digest is invalid, or the signature was
+    /// not made by the launch key.
+    pub fn verify_signed_provenance(&self, signing_public_key: &str) -> Result<(), TelemetryError> {
+        self.verify_provenance()?;
+        let public_key = decode_lower_hex("candidate signing public key", signing_public_key, 32)?;
+        let signature = self.record_signature.as_deref().ok_or_else(|| {
+            TelemetryError::CandidateProvenance("missing record_signature".into())
+        })?;
+        let signature = decode_lower_hex("record_signature", signature, 64)?;
+        let record_sha256 = self
+            .record_sha256
+            .as_deref()
+            .ok_or_else(|| TelemetryError::CandidateProvenance("missing record_sha256".into()))?;
+        let launch_sha256 = self
+            .launch_sha256
+            .as_deref()
+            .ok_or_else(|| TelemetryError::CandidateProvenance("missing launch_sha256".into()))?;
+        let message = candidate_signature_message(launch_sha256, record_sha256);
+        signature::UnparsedPublicKey::new(&signature::ED25519, public_key)
+            .verify(message.as_bytes(), &signature)
+            .map_err(|_| {
+                TelemetryError::CandidateProvenance(
+                    "record_signature was not made by the launch signing key".into(),
+                )
+            })
+    }
+
+    /// Verify that this row has a complete, exact launch/record binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TelemetryError::CandidateProvenance`] when either digest is
+    /// absent/malformed or any payload field no longer matches `record_sha256`.
+    pub fn verify_provenance(&self) -> Result<(), TelemetryError> {
+        let launch = self
+            .launch_sha256
+            .as_deref()
+            .ok_or_else(|| TelemetryError::CandidateProvenance("missing launch_sha256".into()))?;
+        validate_sha256("launch_sha256", launch)?;
+        let recorded = self
+            .record_sha256
+            .as_deref()
+            .ok_or_else(|| TelemetryError::CandidateProvenance("missing record_sha256".into()))?;
+        validate_sha256("record_sha256", recorded)?;
+        let expected = self.expected_record_sha256()?;
+        if recorded != expected {
+            return Err(TelemetryError::CandidateProvenance(format!(
+                "record_sha256 mismatch: recorded {recorded}, computed {expected}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn expected_record_sha256(&self) -> Result<String, TelemetryError> {
+        let launch_sha256 = self
+            .launch_sha256
+            .as_deref()
+            .ok_or_else(|| TelemetryError::CandidateProvenance("missing launch_sha256".into()))?;
+        let payload = CandidateDigestPayload {
+            launch_sha256,
+            step: self.step,
+            rank: self.rank,
+            world_size: self.world_size,
+            prompt_index: self.prompt_index,
+            group_index: self.group_index,
+            reward_bits: self.reward.to_bits(),
+            completion_len_tokens: self.completion_len_tokens,
+            reward_diagnostic: self.reward_diagnostic.as_deref(),
+            reward_metadata: self.reward_metadata.as_ref(),
+            completion: &self.completion,
+        };
+        let bytes = serde_json::to_vec(&payload)?;
+        Ok(domain_sha256(Self::DIGEST_DOMAIN, &[&bytes]))
+    }
+}
+
+/// Process-local Ed25519 capability used to authenticate production candidate
+/// rows to an externally attested launch.
+///
+/// Only the public key is persisted inside the launch payload authenticated by
+/// an external root. The private key remains inside this value for the lifetime
+/// of one trainer and is dropped when the process exits, so a later process
+/// cannot mint a new row for that launch.
+pub struct CandidateSigner {
+    key_pair: Ed25519KeyPair,
+}
+
+impl std::fmt::Debug for CandidateSigner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CandidateSigner")
+            .field("public_key", &self.public_key_hex())
+            .finish_non_exhaustive()
+    }
+}
+
+impl CandidateSigner {
+    /// Generate a fresh process-local candidate signing capability.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TelemetryError::CandidateProvenance`] if the operating system
+    /// cannot provide secure randomness or ring rejects the generated key.
+    pub fn generate() -> Result<Self, TelemetryError> {
+        let rng = SystemRandom::new();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).map_err(|_| {
+            TelemetryError::CandidateProvenance(
+                "generate candidate signing key from system randomness".into(),
+            )
+        })?;
+        let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).map_err(|_| {
+            TelemetryError::CandidateProvenance("parse generated candidate signing key".into())
+        })?;
+        Ok(Self { key_pair })
+    }
+
+    /// Lowercase hexadecimal Ed25519 public key to commit in `launch.json`.
+    #[must_use]
+    pub fn public_key_hex(&self) -> String {
+        lower_hex(self.key_pair.public_key().as_ref())
+    }
+
+    /// Bind and sign one candidate row for `launch_sha256`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TelemetryError::CandidateProvenance`] for malformed launch
+    /// identity or [`TelemetryError::NonFiniteCandidateReward`] for a non-finite
+    /// reward.
+    pub fn sign_candidate(
+        &self,
+        record: &CandidateRecord,
+        launch_sha256: &str,
+    ) -> Result<CandidateRecord, TelemetryError> {
+        let mut bound = record.bind_to_launch(launch_sha256)?;
+        let record_sha256 = bound
+            .record_sha256
+            .as_deref()
+            .ok_or_else(|| TelemetryError::CandidateProvenance("missing record_sha256".into()))?;
+        let message = candidate_signature_message(launch_sha256, record_sha256);
+        bound.record_signature = Some(lower_hex(self.key_pair.sign(message.as_bytes()).as_ref()));
+        Ok(bound)
+    }
+}
+
+#[derive(Serialize)]
+struct CandidateDigestPayload<'a> {
+    launch_sha256: &'a str,
+    step: u64,
+    rank: usize,
+    world_size: usize,
+    prompt_index: u64,
+    group_index: usize,
+    reward_bits: u32,
+    completion_len_tokens: usize,
+    reward_diagnostic: Option<&'a str>,
+    reward_metadata: Option<&'a serde_json::Value>,
+    completion: &'a str,
+}
+
+fn validate_sha256(label: &str, digest: &str) -> Result<(), TelemetryError> {
+    if digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Ok(());
+    }
+    Err(TelemetryError::CandidateProvenance(format!(
+        "{label} must be 64 lowercase hexadecimal characters"
+    )))
+}
+
+fn decode_lower_hex(
+    label: &str,
+    value: &str,
+    expected_bytes: usize,
+) -> Result<Vec<u8>, TelemetryError> {
+    if value.len() != expected_bytes.saturating_mul(2)
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(TelemetryError::CandidateProvenance(format!(
+            "{label} must be {} lowercase hexadecimal characters",
+            expected_bytes.saturating_mul(2)
+        )));
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = hex_nibble(pair[0]);
+            let low = hex_nibble(pair[1]);
+            Ok((high << 4) | low)
+        })
+        .collect()
+}
+
+fn hex_nibble(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        _ => unreachable!("decode_lower_hex validates every byte"),
+    }
+}
+
+fn lower_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    encoded
+}
+
+fn candidate_signature_message(launch_sha256: &str, record_sha256: &str) -> String {
+    domain_sha256(
+        "ferrl.candidate-record-signature.v1",
+        &[launch_sha256.as_bytes(), record_sha256.as_bytes()],
+    )
+}
+
+fn domain_sha256(domain: &str, fields: &[&[u8]]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update((domain.len() as u64).to_le_bytes());
+    hasher.update(domain.as_bytes());
+    for field in fields {
+        hasher.update((field.len() as u64).to_le_bytes());
+        hasher.update(field);
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 /// Appends [`CandidateRecord`]s to a JSON Lines file, one object per line.
@@ -722,6 +1102,8 @@ impl CandidateRecord {
 pub struct CandidateWriter {
     path: PathBuf,
     file: File,
+    launch_sha256: Option<String>,
+    signer: Option<CandidateSigner>,
     #[cfg(test)]
     fail_next_batch_after_bytes: Option<usize>,
     #[cfg(test)]
@@ -746,6 +1128,8 @@ impl CandidateWriter {
         Ok(Self {
             path,
             file,
+            launch_sha256: None,
+            signer: None,
             #[cfg(test)]
             fail_next_batch_after_bytes: None,
             #[cfg(test)]
@@ -753,6 +1137,37 @@ impl CandidateWriter {
             #[cfg(test)]
             panic_next_rollback: false,
         })
+    }
+
+    /// Seal every subsequently written row to one immutable launch payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TelemetryError::CandidateProvenance`] when `digest` is not a
+    /// lowercase SHA-256 value or the ledger is already non-empty. A resumed
+    /// process cannot recover the prior process-local signing capability, so it
+    /// must fail before appending instead of mixing independently keyed rows.
+    pub(crate) fn bind_launch(
+        &mut self,
+        digest: &str,
+        signer: CandidateSigner,
+    ) -> Result<(), TelemetryError> {
+        validate_sha256("launch_sha256", digest)?;
+        let len = self
+            .file
+            .metadata()
+            .map_err(|error| TelemetryError::io(&self.path, error))?
+            .len();
+        if len != 0 {
+            return Err(TelemetryError::CandidateProvenance(format!(
+                "refuse to bind launch-authenticated candidate appends to non-empty ledger {}; \
+                 the original process-local signing capability is unavailable",
+                self.path.display()
+            )));
+        }
+        self.launch_sha256 = Some(digest.to_owned());
+        self.signer = Some(signer);
+        Ok(())
     }
 
     /// Append one candidate record as a JSON line and flush it.
@@ -781,7 +1196,20 @@ impl CandidateWriter {
                     value: record.reward,
                 });
             }
-            serde_json::to_writer(&mut bytes, record)?;
+            if let Some(launch_sha256) = self.launch_sha256.as_deref() {
+                let signer = self.signer.as_ref().ok_or_else(|| {
+                    TelemetryError::CandidateProvenance(
+                        "launch-bound candidate writer has no signing capability".into(),
+                    )
+                })?;
+                let bound = signer.sign_candidate(record, launch_sha256)?;
+                serde_json::to_writer(&mut bytes, &bound)?;
+            } else {
+                if record.launch_sha256.is_some() || record.record_sha256.is_some() {
+                    record.verify_provenance()?;
+                }
+                serde_json::to_writer(&mut bytes, record)?;
+            }
             bytes.push(b'\n');
         }
         #[cfg(test)]
@@ -2374,6 +2802,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cognitive_complexity)] // one compact inventory of the complete layout
     fn rundir_creates_layout_and_paths() {
         let tmp = TempDir::new("rundir");
         let rd = RunDir::create(tmp.path(), "run-001").unwrap();
@@ -2381,8 +2810,34 @@ mod tests {
         assert!(rd.root().is_dir());
         assert!(rd.checkpoints_dir().is_dir());
         assert!(rd.metrics_path().ends_with("metrics.jsonl"));
+        assert!(rd.launch_path().ends_with("launch.json"));
+        assert!(rd.prompt_path().ends_with("prompt.txt"));
+        assert!(rd.prompt_sha256_path().ends_with("prompt.sha256"));
         assert!(rd.config_path().ends_with("config.json"));
         assert!(rd.log_path().ends_with("run.log"));
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // one mutation-sensitive durability/reuse control
+    fn immutable_launch_is_fenced_and_prevents_run_id_reuse() {
+        let tmp = TempDir::new("immutable-launch");
+        let rd = RunDir::create(tmp.path(), "run-001").unwrap();
+        rd.write_immutable_launch(b"{\"launch\":true}", Some(b"prompt"))
+            .unwrap();
+        assert_eq!(
+            std::fs::read(rd.launch_path()).unwrap(),
+            b"{\"launch\":true}"
+        );
+        assert_eq!(std::fs::read(rd.prompt_path()).unwrap(), b"prompt");
+        assert_eq!(
+            std::fs::read_to_string(rd.prompt_sha256_path()).unwrap(),
+            format!("{:x}\n", Sha256::digest(b"prompt"))
+        );
+        assert!(rd
+            .write_immutable_launch(b"{\"launch\":false}", Some(b"changed"))
+            .is_err());
+        let error = RunDir::create(tmp.path(), "run-001").unwrap_err();
+        assert!(matches!(error, TelemetryError::DuplicateRun { path } if path == rd.launch_path()));
     }
 
     #[test]
@@ -2414,6 +2869,9 @@ mod tests {
         let rd = RunDir::create(tmp.path(), "run-001").unwrap();
         let mut w = rd.candidate_writer().unwrap();
         w.append(&CandidateRecord {
+            launch_sha256: None,
+            record_sha256: None,
+            record_signature: None,
             step: 0,
             rank: 0,
             world_size: 1,
@@ -2470,6 +2928,9 @@ mod tests {
         let rd = RunDir::create(tmp.path(), "run-candidates").unwrap();
         let mut w = rd.candidate_writer().unwrap();
         let rec = CandidateRecord {
+            launch_sha256: None,
+            record_sha256: None,
+            record_signature: None,
             step: 3,
             rank: 0,
             world_size: 1,
@@ -2503,6 +2964,74 @@ mod tests {
     }
 
     #[test]
+    fn candidate_writer_binds_every_payload_field_to_the_launch() {
+        let tmp = TempDir::new("candidate-binding");
+        let rd = RunDir::create(tmp.path(), "run-candidates").unwrap();
+        let mut writer = rd.candidate_writer().unwrap();
+        let signer = CandidateSigner::generate().unwrap();
+        let public_key = signer.public_key_hex();
+        writer.bind_launch(&"ab".repeat(32), signer).unwrap();
+        let mut record = CandidateRecord::new(3, 0, 1, 12, 1, 1.25, 42, "candidate".into());
+        record.reward_metadata = Some(serde_json::json!({ "task": "trimul" }));
+        writer.append(&record).unwrap();
+        drop(writer);
+
+        let raw = std::fs::read_to_string(rd.candidates_path()).unwrap();
+        let bound: CandidateRecord = serde_json::from_str(raw.trim()).unwrap();
+        assert_eq!(
+            bound.launch_sha256.as_deref(),
+            Some("ab".repeat(32).as_str())
+        );
+        bound.verify_signed_provenance(&public_key).unwrap();
+
+        let mut changed = bound.clone();
+        changed.reward = 9.0;
+        assert!(changed.verify_provenance().is_err());
+
+        let attacker = CandidateSigner::generate().unwrap();
+        let forged = attacker.sign_candidate(&record, &"ab".repeat(32)).unwrap();
+        assert!(forged.verify_signed_provenance(&public_key).is_err());
+    }
+
+    #[test]
+    fn launch_bound_candidate_writer_rejects_cross_process_append() {
+        let tmp = TempDir::new("candidate-resume-key");
+        let rd = RunDir::create(tmp.path(), "run-candidate-resume").unwrap();
+        let mut first = rd.candidate_writer().unwrap();
+        first
+            .append(&CandidateRecord::new(
+                0,
+                0,
+                1,
+                0,
+                0,
+                1.0,
+                1,
+                "existing".into(),
+            ))
+            .unwrap();
+        drop(first);
+
+        let mut resumed = rd.candidate_writer().unwrap();
+        let error = resumed
+            .bind_launch(&"ab".repeat(32), CandidateSigner::generate().unwrap())
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            TelemetryError::CandidateProvenance(message)
+                if message.contains("non-empty ledger")
+                    && message.contains("signing capability is unavailable")
+        ));
+        assert_eq!(
+            std::fs::read_to_string(rd.candidates_path())
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn candidate_writer_rejects_nonfinite_rewards_without_writing() {
         let tmp = TempDir::new("candidates-nonfinite");
         let rd = RunDir::create(tmp.path(), "run-candidates-nonfinite").unwrap();
@@ -2510,6 +3039,9 @@ mod tests {
         for reward in [f32::NAN, f32::NEG_INFINITY, f32::INFINITY] {
             let error = writer
                 .append(&CandidateRecord {
+                    launch_sha256: None,
+                    record_sha256: None,
+                    record_signature: None,
                     step: 0,
                     rank: 0,
                     world_size: 1,
@@ -2545,6 +3077,9 @@ mod tests {
         let rd = RunDir::create(tmp.path(), "run-candidates-compat").unwrap();
         let mut w = rd.candidate_writer().unwrap();
         let rec = CandidateRecord {
+            launch_sha256: None,
+            record_sha256: None,
+            record_signature: None,
             step: 3,
             rank: 0,
             world_size: 1,

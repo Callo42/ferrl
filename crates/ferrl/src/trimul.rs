@@ -4,31 +4,40 @@
 //! Multiplicative Update** (the GPUMODE `bioml/trimul` task — a core AlphaFold-family
 //! operator). Each completion is expected to contain a Python `custom_kernel`
 //! implementation; this reward **runs it** and scores it on **correctness** and
-//! **speed**.
+//! versioned ferrl **service latency**.
 //!
 //! ## Flow (per candidate)
 //!
 //! 1. Extract the `custom_kernel` source from the completion according to the
 //!    configured [`SubmissionExtractMode`] — the final fenced Python code block, or
 //!    for thinking prompts, the final fenced block after `</think>`.
-//! 2. Stage a node-local scratch dir: the candidate as `submission.py`, plus a
-//!    generated test-spec and benchmark-spec file ([`render_spec`]).
-//! 3. Run the eval in the sandbox ([`crate::sandbox::ApptainerSandbox`]): the pinned
-//!    GPUMODE eval files are bound **read-only**, the scratch **read-write**, the GPU
-//!    exposed (`--nv`), and the **network denied**. Inside, the GPUMODE `eval.py`
-//!    runs `test` (correctness) then `benchmark` (variance-aware CUDA-event timing).
-//!    Its grade is written to `POPCORN_FD`, which we route to the **captured stdout
-//!    pipe** while the candidate's own stdout goes to `/dev/null` — so the grade rides
-//!    a channel the untrusted candidate cannot reach (its worker neither inherits the
-//!    fd nor can target it by path), foreclosing a forged pass.
+//! 2. Capture the candidate plus generated test/benchmark specs ([`render_spec`])
+//!    in kernel-sealed descriptors. They stay read-only and identical across both
+//!    phases; scratch contains only writable cache/output state.
+//! 3. Send the eval through the explicitly selected verifier tier. The default
+//!    `same_uid_apptainer_v1` tier stages sealed assets in a private mode-`0700`
+//!    request root and launches Apptainer without administrator setup. The optional
+//!    `dedicated_uid_service_v1` tier sends sealed descriptors to a distinct-UID
+//!    [`crate::verifier_executor::VerifierExecutorSandbox`]. In both tiers, the pinned
+//!    GPUMODE eval files, Ferrl driver, candidate, and specs are bound **read-only**,
+//!    scratch is **read-write**, the GPU is exposed (`--nv`), and the **network is
+//!    denied**. The sealed driver runs `test` then `benchmark`. A separate
+//!    non-dumpable controller owns trusted protocol connections, while candidate Python
+//!    lives in its own spawned payload process with independent CUDA allocations; only
+//!    bounded CPU bytes cross process boundaries, so no parent allocator block is exported.
+//!    The protected parent owns hidden-seed input generation and measures the versioned
+//!    end-to-end candidate service latency from byte handoff through result receipt.
+//!    Its grade travels over a post-launch Unix socket
+//!    owned only by the non-dumpable parent. Launcher/init/shell stdout descriptors are
+//!    untrusted diagnostics and can never become a grade.
 //! 4. Map the captured grade to a shaped training reward: missing submissions score
 //!    `0`, extracted-but-broken submissions get only a tiny format reward, runnable
 //!    candidates get a small floor, partially correct candidates scale below the
 //!    correctness floor, and test-passing candidates whose eval reaches a benchmark
-//!    exit marker score the correctness floor plus any capped speed component.
-//!    Implausibly fast timings (below the kernel-launch floor — a glitch or forged
+//!    exit marker score the correctness floor plus any capped latency component.
+//!    Implausibly fast timings (below the configured floor — a glitch or forged
 //!    grade) still score `0`. The final artifact gate remains stricter than the
-//!    training reward: held-out correctness plus repeated speedup audit.
+//!    training reward: held-out correctness plus repeated same-metric latency audit.
 //!
 //! ## What lives where
 //!
@@ -42,31 +51,32 @@
 //!
 //! ## Reward integrity
 //!
-//! The grade rides a channel the candidate cannot reach by file or by print, and an
-//! implausibly fast time is rejected — so trivial fake-pass routes (forge a `/work`
-//! result file, print a fake pass, report a 0 ns kernel) cannot reach the correctness
-//! floor; the absurd-time path still scores zero. The negative-control suite gates
-//! those cases. **Known residual (PoC):** a candidate that scans `/proc` for the
-//! grader's grade fd *and* reports a physically plausible fake time could still forge
-//! a pass — its worker shares the grader's PID namespace and uid, so only per-candidate
-//! PID-namespace isolation closes it (earned when untrusted external submissions
-//! arrive, not this PoC, whose kernel-writing policy is extremely unlikely to emit such
-//! an exploit). The held-out `POPCORN_SEED` is likewise candidate-readable; both are
-//! moot against an attacker who can already forge the grade and close together with
-//! that isolation. The dynamic guard — watching the discovery run for implausible wins
-//! and re-verifying top candidates — is the spec's Phase-1 instrumentation, done in the
-//! run, not the reward.
+//! Verifier, candidate, and rendered-case bytes remain kernel-sealed and read-only
+//! through correctness and benchmark execution. Candidate code never shares memory
+//! with trusted checker/timer state. The grade and actual-import proof ride an
+//! exclusive post-launch socket owned by a non-dumpable trusted parent. The payload
+//! enters with no active capabilities, `NoNewPrivs`, a TSYNC seccomp deny policy, and
+//! AF_UNIX-only socket creation. An implausibly fast service latency is rejected, so
+//! forged scratch files, printed passes, and zero-time kernels cannot reach the
+//! correctness floor. These controls constrain code inside the candidate process; the
+//! same-UID tier does **not** resist an arbitrary malicious peer process already running
+//! under the training account. Accepted artifact publication therefore requires the
+//! separately authenticated dedicated tier (or a future versioned stronger audit
+//! boundary), not same-UID discovery evidence.
 //!
 //! ## Testing split (as in [`crate::sandbox`])
 //!
 //! The pure pieces — submission extraction, spec rendering, result parsing, the
 //! run-spec builder, and the reward math — are unit-tested in CI. The real GPU eval
 //! is a `gate`-feature integration test (`tests/trimul_gate.rs`), run on an `sm_80`
-//! node against the eval image; like the GPU tests it is never compiled in CI.
+//! node against the eval image. CI clippies that target and runs its non-ignored
+//! source-contract test; only the ignored Apptainer/GPU controls are deployment-only.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -74,7 +84,46 @@ use sha2::{Digest, Sha256};
 
 use crate::reward::{RewardError, RewardFn, RewardOutcome};
 use crate::sample::Sample;
-use crate::sandbox::{ApptainerSandbox, Bind, ResourceLimits, RunSpec, RunStatus, Sandbox};
+use crate::sandbox::{
+    Bind, ProtectedOutput, ResourceLimits, RunOutcome, RunSpec, RunStatus, Sandbox, SandboxError,
+};
+use crate::verifier_executor::{
+    SameUidApptainerSandbox, VerifierExecutorSandbox, VerifierIsolationEvidence,
+    VerifierIsolationTier,
+};
+#[cfg(test)]
+use crate::verifier_executor::{
+    VerifierAssetTransport, VerifierUidBoundary, VERIFIER_ISOLATION_EVIDENCE_VERSION,
+};
+
+#[derive(Debug, Clone)]
+enum TrimulVerifierBackend {
+    SameUid(SameUidApptainerSandbox),
+    Dedicated(VerifierExecutorSandbox),
+}
+
+impl TrimulVerifierBackend {
+    const fn tier(&self) -> VerifierIsolationTier {
+        match self {
+            Self::SameUid(_) => VerifierIsolationTier::SameUidApptainerV1,
+            Self::Dedicated(_) => VerifierIsolationTier::DedicatedUidServiceV1,
+        }
+    }
+
+    fn preflight(&self) -> Result<VerifierIsolationEvidence, SandboxError> {
+        match self {
+            Self::SameUid(sandbox) => sandbox.preflight(),
+            Self::Dedicated(sandbox) => sandbox.preflight(),
+        }
+    }
+
+    fn run(&self, spec: &RunSpec) -> Result<RunOutcome, SandboxError> {
+        match self {
+            Self::SameUid(sandbox) => sandbox.run(spec),
+            Self::Dedicated(sandbox) => sandbox.run(spec),
+        }
+    }
+}
 
 /// Versioned TriMul training-reward scheme identifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -354,8 +403,8 @@ pub fn test_passed(test_log: &str) -> bool {
     log_value(test_log, "check") == Some("pass")
 }
 
-/// The per-case mean runtimes (nanoseconds) from a `benchmark`-mode result log: every
-/// `benchmark.<i>.mean` value.
+/// The per-case mean service latencies (nanoseconds) from a `benchmark`-mode result
+/// log: every `benchmark.<i>.mean` value.
 fn benchmark_means_ns(bench_log: &str) -> Vec<f64> {
     bench_log
         .lines()
@@ -371,8 +420,18 @@ fn benchmark_means_ns(bench_log: &str) -> Vec<f64> {
         .collect()
 }
 
-/// The geometric mean of `xs`, or `None` if empty or any value is non-positive (the
-/// GPUMODE leaderboard ranks by the geometric mean of per-case runtimes).
+fn candidate_attempt_sentinels(log: &str) -> Vec<&str> {
+    log.lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once(": ")?;
+            key.trim()
+                .ends_with(".candidate-sentinel")
+                .then_some(value.trim())
+        })
+        .collect()
+}
+
+/// The geometric mean of `xs`, or `None` if empty or any value is non-positive.
 #[must_use]
 pub fn geomean(xs: &[f64]) -> Option<f64> {
     if xs.is_empty() || xs.iter().any(|&x| x <= 0.0 || x.is_nan()) {
@@ -483,6 +542,792 @@ pub fn parse_task_yml(text: &str) -> Result<(Vec<TrimulCase>, Vec<TrimulCase>), 
     Ok((tests, benches))
 }
 
+/// Content identity of the immutable verifier assets used by a TriMul launch.
+///
+/// The image digest binds the exact container bytes. The bundle digest binds every
+/// relative regular-file name and byte in the eval tree; `task.yml` is also named
+/// separately because it selects the concrete correctness and benchmark cases.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrimulVerifierIdentity {
+    /// SHA-256 of the exact sandbox image bytes.
+    pub image_sha256: String,
+    /// Length of the exact sandbox image.
+    pub image_len_bytes: u64,
+    /// SHA-256 of the complete ordered eval bundle.
+    pub eval_bundle_sha256: String,
+    /// Number of regular files bound by `eval_bundle_sha256`.
+    pub eval_file_count: usize,
+    /// SHA-256 of the exact `task.yml` bytes used to construct cases.
+    pub task_yml_sha256: String,
+    /// Length of the exact `task.yml` bytes.
+    pub task_yml_len_bytes: usize,
+}
+
+/// Failure while capturing or revalidating immutable TriMul verifier assets.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum TrimulAssetError {
+    /// A verifier asset could not be read or sealed.
+    #[error("TriMul verifier asset I/O failed at {path}: {source}")]
+    Io {
+        /// Asset path being accessed.
+        path: PathBuf,
+        /// Underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+    /// The asset tree or its live identity violated the immutable contract.
+    #[error("{0}")]
+    Invalid(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+    #[cfg(unix)]
+    ctime: i64,
+    #[cfg(unix)]
+    ctime_nsec: i64,
+}
+
+impl FileStamp {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt as _;
+
+        Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            dev: metadata.dev(),
+            #[cfg(unix)]
+            ino: metadata.ino(),
+            #[cfg(unix)]
+            ctime: metadata.ctime(),
+            #[cfg(unix)]
+            ctime_nsec: metadata.ctime_nsec(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct EvalBundleSnapshot {
+    files: BTreeMap<PathBuf, Vec<u8>>,
+    identity: String,
+}
+
+#[derive(Debug)]
+struct SealedEvalFile {
+    relative_path: PathBuf,
+    file: File,
+    len: u64,
+}
+
+impl SealedEvalFile {
+    fn verify(&self) -> Result<(), TrimulAssetError> {
+        verify_sealed_asset(&self.file, &self.relative_path, self.len)
+    }
+
+    fn descriptor_path(&self) -> PathBuf {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd as _;
+            PathBuf::from(format!(
+                "/proc/{}/fd/{}",
+                std::process::id(),
+                self.file.as_raw_fd()
+            ))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            PathBuf::new()
+        }
+    }
+}
+
+#[derive(Debug)]
+struct VerifierAssetSnapshot {
+    image_path: PathBuf,
+    image_file: File,
+    image_stamp: FileStamp,
+    eval_dir: PathBuf,
+    sealed_eval_files: Vec<SealedEvalFile>,
+    task_yml: String,
+    identity: TrimulVerifierIdentity,
+}
+
+const SANDBOX_EVAL_FILES: [(&str, &str); 4] = [
+    ("eval.py", "/opt/ferrl-verifier/eval.py"),
+    ("reference.py", "/opt/ferrl-verifier/reference.py"),
+    ("task.py", "/opt/ferrl-verifier/task.py"),
+    ("utils.py", "/opt/ferrl-verifier/utils.py"),
+];
+
+const FERRL_EVAL_DRIVER_PATH: &str = "/opt/ferrl-verifier/ferrl_eval.py";
+const SUBMISSION_PATH: &str = "/opt/ferrl-verifier/submission.py";
+const TEST_SPEC_PATH: &str = "/opt/ferrl-verifier/test_spec.txt";
+const BENCH_SPEC_PATH: &str = "/opt/ferrl-verifier/bench_spec.txt";
+
+/// Ferrl-owned immutable verifier driver. The protected parent owns trusted input
+/// generation, checking, timing, statistics, and the machine-grade socket. Candidate
+/// Python runs only in fresh spawned children and can influence the parent solely
+/// through checked CUDA buffers plus a bounded raw status protocol.
+const FERRL_EVAL_DRIVER: &str = include_str!("trimul_eval_driver.py");
+
+/// Stable verifier assets captured before launch attestation.
+///
+/// The image and every file in the eval tree are copied byte-for-byte into anonymous
+/// Linux memfds with write/grow/shrink/further-seal operations permanently disabled
+/// by the kernel. After sealing, the image descriptor and complete ordered eval
+/// descriptor set are hashed again and compared with the identities captured from
+/// their sources. Exact sealed descriptors, never writable snapshot pathnames, supply
+/// every verifier invocation. The sandbox copies only from those handles into its
+/// private tmpfs, remounts it read-only, and authenticates the final bytes before use.
+/// Later checks inspect source identities and kernel seals without repeatedly
+/// rehashing the potentially multi-gigabyte image.
+#[derive(Debug, Clone)]
+pub struct TrimulVerifierAssets {
+    snapshot: Arc<VerifierAssetSnapshot>,
+}
+
+impl TrimulVerifierAssets {
+    /// Capture exact image and eval-bundle content. The legacy scratch-root
+    /// argument is retained for API compatibility but no verifier asset is staged
+    /// there: eval files live only in anonymous kernel-sealed descriptors.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrimulAssetError`] if an asset is missing, non-regular, changes
+    /// during capture, contains a symlink/special entry, or cannot be kernel-sealed.
+    pub fn capture(
+        image_path: impl AsRef<Path>,
+        eval_dir: impl AsRef<Path>,
+        _scratch_root: impl AsRef<Path>,
+    ) -> Result<Self, TrimulAssetError> {
+        let image_path = image_path.as_ref().to_path_buf();
+        let eval_dir = eval_dir.as_ref().to_path_buf();
+        let (image_file, image_stamp, image_sha256) = capture_image(&image_path)?;
+        let eval = capture_eval_bundle(&eval_dir)?;
+        let task_yml_bytes = eval.files.get(Path::new("task.yml")).ok_or_else(|| {
+            TrimulAssetError::Invalid(format!(
+                "TriMul eval bundle {} has no regular task.yml",
+                eval_dir.display()
+            ))
+        })?;
+        let task_yml = std::str::from_utf8(task_yml_bytes)
+            .map_err(|error| {
+                TrimulAssetError::Invalid(format!("TriMul task.yml is not UTF-8: {error}"))
+            })?
+            .to_owned();
+        for (relative, _) in SANDBOX_EVAL_FILES {
+            if !eval.files.contains_key(Path::new(relative)) {
+                return Err(TrimulAssetError::Invalid(format!(
+                    "TriMul eval bundle {} has no regular {relative}",
+                    eval_dir.display()
+                )));
+            }
+        }
+        let sealed_eval_files = seal_eval_bundle(&eval.files, &eval.identity)?;
+        let identity = TrimulVerifierIdentity {
+            image_sha256,
+            image_len_bytes: image_stamp.len,
+            eval_bundle_sha256: eval.identity,
+            eval_file_count: eval.files.len(),
+            task_yml_sha256: sha256_hex(task_yml_bytes),
+            task_yml_len_bytes: task_yml_bytes.len(),
+        };
+        let assets = Self {
+            snapshot: Arc::new(VerifierAssetSnapshot {
+                image_path,
+                image_file,
+                image_stamp,
+                eval_dir,
+                sealed_eval_files,
+                task_yml,
+                identity,
+            }),
+        };
+        assets.verify_current()?;
+        Ok(assets)
+    }
+
+    /// Exact portable content identity bound into `launch.json`.
+    #[must_use]
+    pub fn identity(&self) -> &TrimulVerifierIdentity {
+        &self.snapshot.identity
+    }
+
+    /// Exact captured `task.yml` text used to construct the reward cases.
+    #[must_use]
+    pub fn task_yml(&self) -> &str {
+        &self.snapshot.task_yml
+    }
+
+    /// Revalidate configured sources and sealed assets without changing which bytes
+    /// subsequent verifier invocations consume.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrimulAssetError`] after any path substitution or in-place change.
+    pub fn verify_current(&self) -> Result<(), TrimulAssetError> {
+        let image_path_metadata = regular_metadata(&self.snapshot.image_path)?;
+        if FileStamp::from_metadata(&image_path_metadata) != self.snapshot.image_stamp {
+            return Err(TrimulAssetError::Invalid(
+                "TriMul sandbox image changed after verifier attestation".to_string(),
+            ));
+        }
+        verify_sealed_asset(
+            &self.snapshot.image_file,
+            &self.snapshot.image_path,
+            self.snapshot.identity.image_len_bytes,
+        )?;
+        let current_eval = capture_eval_bundle(&self.snapshot.eval_dir)?;
+        for file in &self.snapshot.sealed_eval_files {
+            file.verify()?;
+        }
+        if current_eval.identity != self.snapshot.identity.eval_bundle_sha256
+            || current_eval.files.len() != self.snapshot.identity.eval_file_count
+        {
+            return Err(TrimulAssetError::Invalid(
+                "TriMul eval bundle changed after verifier attestation".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn image_for_sandbox(&self) -> PathBuf {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd as _;
+            PathBuf::from(format!(
+                "/proc/{}/fd/{}",
+                std::process::id(),
+                self.snapshot.image_file.as_raw_fd()
+            ))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.snapshot.image_path.clone()
+        }
+    }
+
+    fn eval_binds(&self) -> Vec<Bind> {
+        SANDBOX_EVAL_FILES
+            .iter()
+            .map(|(relative, destination)| {
+                let sealed = self
+                    .snapshot
+                    .sealed_eval_files
+                    .iter()
+                    .find(|file| file.relative_path == Path::new(relative))
+                    .expect("capture validates every sandbox eval file");
+                Bind::ro(sealed.descriptor_path(), *destination)
+            })
+            .collect()
+    }
+}
+
+/// Per-candidate bytes consumed by the verifier. These descriptors live until
+/// [`Sandbox::run`] returns; every bind is read-only, so test and benchmark see
+/// the exact same candidate and rendered case sets.
+#[derive(Debug)]
+struct SealedInvocationAssets {
+    files: Vec<(SealedEvalFile, &'static str)>,
+}
+
+impl SealedInvocationAssets {
+    #[cfg(target_os = "linux")]
+    fn capture(
+        submission: &str,
+        test_spec: &str,
+        bench_spec: &str,
+    ) -> Result<Self, TrimulAssetError> {
+        let files = [
+            (
+                "ferrl_eval.py",
+                FERRL_EVAL_DRIVER.as_bytes(),
+                FERRL_EVAL_DRIVER_PATH,
+            ),
+            ("submission.py", submission.as_bytes(), SUBMISSION_PATH),
+            ("test_spec.txt", test_spec.as_bytes(), TEST_SPEC_PATH),
+            ("bench_spec.txt", bench_spec.as_bytes(), BENCH_SPEC_PATH),
+        ]
+        .into_iter()
+        .map(|(name, bytes, destination)| {
+            seal_invocation_asset(Path::new(name), bytes).map(|sealed| (sealed, destination))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { files })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn capture(
+        _submission: &str,
+        _test_spec: &str,
+        _bench_spec: &str,
+    ) -> Result<Self, TrimulAssetError> {
+        Err(TrimulAssetError::Invalid(
+            "TriMul invocation assets require Linux kernel-sealed memfd storage".to_string(),
+        ))
+    }
+
+    fn binds(&self) -> Vec<Bind> {
+        self.files
+            .iter()
+            .map(|(file, destination)| Bind::ro(file.descriptor_path(), *destination))
+            .collect()
+    }
+
+    fn verify(&self) -> Result<(), TrimulAssetError> {
+        self.files.iter().try_for_each(|(file, _)| file.verify())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn seal_invocation_asset(path: &Path, bytes: &[u8]) -> Result<SealedEvalFile, TrimulAssetError> {
+    use std::io::Write as _;
+
+    let descriptor = rustix::fs::memfd_create(
+        path,
+        rustix::fs::MemfdFlags::ALLOW_SEALING | rustix::fs::MemfdFlags::CLOEXEC,
+    )
+    .map_err(|source| TrimulAssetError::Io {
+        path: path.to_path_buf(),
+        source: source.into(),
+    })?;
+    let mut file = descriptor_file_above_stdio(File::from(descriptor), true).map_err(|source| {
+        TrimulAssetError::Io {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
+    file.write_all(bytes)
+        .map_err(|source| TrimulAssetError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    rustix::fs::fcntl_add_seals(&file, required_asset_seals()).map_err(|source| {
+        TrimulAssetError::Io {
+            path: path.to_path_buf(),
+            source: source.into(),
+        }
+    })?;
+    let sealed = SealedEvalFile {
+        relative_path: path.to_path_buf(),
+        file,
+        len: bytes.len() as u64,
+    };
+    authenticate_sealed_asset(
+        &sealed.file,
+        &sealed.relative_path,
+        sealed.len,
+        &sha256_hex(bytes),
+    )?;
+    Ok(sealed)
+}
+
+fn regular_metadata(path: &Path) -> Result<std::fs::Metadata, TrimulAssetError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|source| TrimulAssetError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(TrimulAssetError::Invalid(format!(
+            "TriMul verifier asset {} is not a regular file",
+            path.display()
+        )));
+    }
+    Ok(metadata)
+}
+
+#[cfg(target_os = "linux")]
+fn capture_image(path: &Path) -> Result<(File, FileStamp, String), TrimulAssetError> {
+    capture_image_with_hook(path, |_| {})
+}
+
+#[cfg(target_os = "linux")]
+fn capture_image_with_hook(
+    path: &Path,
+    before_seal: impl FnOnce(&File),
+) -> Result<(File, FileStamp, String), TrimulAssetError> {
+    use std::io::{Read as _, Write as _};
+
+    let path_metadata = regular_metadata(path)?;
+    let mut source_file = File::open(path).map_err(|source| TrimulAssetError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let before = FileStamp::from_metadata(&source_file.metadata().map_err(|source| {
+        TrimulAssetError::Io {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?);
+    if before != FileStamp::from_metadata(&path_metadata) {
+        return Err(TrimulAssetError::Invalid(format!(
+            "TriMul sandbox image {} changed while it was opened",
+            path.display()
+        )));
+    }
+    let descriptor = rustix::fs::memfd_create(
+        "ferrl-trimul-image",
+        rustix::fs::MemfdFlags::ALLOW_SEALING | rustix::fs::MemfdFlags::CLOEXEC,
+    )
+    .map_err(|source| TrimulAssetError::Io {
+        path: path.to_path_buf(),
+        source: source.into(),
+    })?;
+    let mut sealed_file =
+        descriptor_file_above_stdio(File::from(descriptor), true).map_err(|source| {
+            TrimulAssetError::Io {
+                path: path.to_path_buf(),
+                source,
+            }
+        })?;
+    let mut digest = Sha256::new();
+    let mut copied = 0_u64;
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = source_file
+            .read(&mut buffer)
+            .map_err(|source| TrimulAssetError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if read == 0 {
+            break;
+        }
+        sealed_file
+            .write_all(&buffer[..read])
+            .map_err(|source| TrimulAssetError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        copied += read as u64;
+        digest.update(&buffer[..read]);
+    }
+    let after = FileStamp::from_metadata(&source_file.metadata().map_err(|source| {
+        TrimulAssetError::Io {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?);
+    if before != after || copied != before.len {
+        return Err(TrimulAssetError::Invalid(format!(
+            "TriMul sandbox image {} changed while it was captured",
+            path.display()
+        )));
+    }
+    let source_sha256 = format!("{:x}", digest.finalize());
+    before_seal(&sealed_file);
+    rustix::fs::fcntl_add_seals(&sealed_file, required_asset_seals()).map_err(|source| {
+        TrimulAssetError::Io {
+            path: path.to_path_buf(),
+            source: source.into(),
+        }
+    })?;
+    authenticate_sealed_asset(&sealed_file, path, copied, &source_sha256)?;
+    Ok((sealed_file, before, source_sha256))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn capture_image(_path: &Path) -> Result<(File, FileStamp, String), TrimulAssetError> {
+    Err(TrimulAssetError::Invalid(
+        "TriMul verifier assets require Linux kernel-sealed memfd storage".to_string(),
+    ))
+}
+
+fn capture_eval_bundle(root: &Path) -> Result<EvalBundleSnapshot, TrimulAssetError> {
+    let metadata = std::fs::symlink_metadata(root).map_err(|source| TrimulAssetError::Io {
+        path: root.to_path_buf(),
+        source,
+    })?;
+    if !metadata.file_type().is_dir() {
+        return Err(TrimulAssetError::Invalid(format!(
+            "TriMul eval bundle {} is not a directory",
+            root.display()
+        )));
+    }
+    let mut pending = vec![PathBuf::new()];
+    let mut files = BTreeMap::new();
+    while let Some(relative_dir) = pending.pop() {
+        let directory = root.join(&relative_dir);
+        let entries = std::fs::read_dir(&directory).map_err(|source| TrimulAssetError::Io {
+            path: directory.clone(),
+            source,
+        })?;
+        let mut entries =
+            entries
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|source| TrimulAssetError::Io {
+                    path: directory.clone(),
+                    source,
+                })?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let relative = relative_dir.join(entry.file_name());
+            let path = entry.path();
+            let metadata =
+                std::fs::symlink_metadata(&path).map_err(|source| TrimulAssetError::Io {
+                    path: path.clone(),
+                    source,
+                })?;
+            if metadata.file_type().is_dir() {
+                pending.push(relative);
+            } else if metadata.file_type().is_file() {
+                let before = FileStamp::from_metadata(&metadata);
+                let bytes = std::fs::read(&path).map_err(|source| TrimulAssetError::Io {
+                    path: path.clone(),
+                    source,
+                })?;
+                let after = FileStamp::from_metadata(&regular_metadata(&path)?);
+                if before != after || bytes.len() as u64 != before.len {
+                    return Err(TrimulAssetError::Invalid(format!(
+                        "TriMul eval asset {} changed while it was read",
+                        path.display()
+                    )));
+                }
+                files.insert(relative, bytes);
+            } else {
+                return Err(TrimulAssetError::Invalid(format!(
+                    "TriMul eval bundle contains a symlink or special entry at {}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    if files.is_empty() {
+        return Err(TrimulAssetError::Invalid(format!(
+            "TriMul eval bundle {} contains no regular files",
+            root.display()
+        )));
+    }
+    let identity = eval_bundle_sha256(&files)?;
+    Ok(EvalBundleSnapshot { files, identity })
+}
+
+fn eval_bundle_sha256(files: &BTreeMap<PathBuf, Vec<u8>>) -> Result<String, TrimulAssetError> {
+    let mut digest = Sha256::new();
+    digest.update(b"ferrl.trimul.eval-bundle.v1\0");
+    for (path, bytes) in files {
+        let path = path.to_str().ok_or_else(|| {
+            TrimulAssetError::Invalid("TriMul eval bundle paths must be UTF-8".to_string())
+        })?;
+        digest.update((path.len() as u64).to_le_bytes());
+        digest.update(path.as_bytes());
+        digest.update((bytes.len() as u64).to_le_bytes());
+        digest.update(bytes);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+#[cfg(target_os = "linux")]
+fn required_asset_seals() -> rustix::fs::SealFlags {
+    rustix::fs::SealFlags::WRITE
+        | rustix::fs::SealFlags::GROW
+        | rustix::fs::SealFlags::SHRINK
+        | rustix::fs::SealFlags::SEAL
+}
+
+/// memfd creation follows the ordinary lowest-free-fd rule. A launcher with
+/// closed stdio can therefore receive fd 0, 1, or 2; duplicate such handles
+/// above the standard range while preserving whether they must cross exec.
+#[cfg(target_os = "linux")]
+fn descriptor_file_above_stdio(file: File, cloexec: bool) -> std::io::Result<File> {
+    use std::os::fd::AsRawFd as _;
+
+    if file.as_raw_fd() > 2 {
+        return Ok(file);
+    }
+    let duplicated = rustix::io::fcntl_dupfd_cloexec(&file, 3).map_err(std::io::Error::from)?;
+    if !cloexec {
+        rustix::io::fcntl_setfd(&duplicated, rustix::io::FdFlags::empty())
+            .map_err(std::io::Error::from)?;
+    }
+    Ok(File::from(duplicated))
+}
+
+fn verify_sealed_asset(file: &File, path: &Path, len: u64) -> Result<(), TrimulAssetError> {
+    let metadata = file.metadata().map_err(|source| TrimulAssetError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if metadata.len() != len {
+        return Err(TrimulAssetError::Invalid(format!(
+            "sealed TriMul verifier asset {} changed length",
+            path.display()
+        )));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let seals = rustix::fs::fcntl_get_seals(file).map_err(|source| TrimulAssetError::Io {
+            path: path.to_path_buf(),
+            source: source.into(),
+        })?;
+        if !seals.contains(required_asset_seals()) {
+            return Err(TrimulAssetError::Invalid(format!(
+                "TriMul verifier asset {} is not kernel-sealed",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn update_digest_from_sealed_asset(
+    digest: &mut Sha256,
+    file: &File,
+    path: &Path,
+    len: u64,
+) -> Result<(), TrimulAssetError> {
+    use std::os::unix::fs::FileExt as _;
+
+    verify_sealed_asset(file, path, len)?;
+    let mut offset = 0_u64;
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    while offset < len {
+        let remaining = len - offset;
+        let chunk_len = usize::try_from(remaining.min(buffer.len() as u64))
+            .expect("bounded descriptor-hash chunk fits usize");
+        let read = file
+            .read_at(&mut buffer[..chunk_len], offset)
+            .map_err(|source| TrimulAssetError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if read == 0 {
+            return Err(TrimulAssetError::Invalid(format!(
+                "sealed TriMul verifier asset {} ended before its authenticated length",
+                path.display()
+            )));
+        }
+        digest.update(&buffer[..read]);
+        offset += read as u64;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn sealed_asset_sha256(file: &File, path: &Path, len: u64) -> Result<String, TrimulAssetError> {
+    let mut digest = Sha256::new();
+    update_digest_from_sealed_asset(&mut digest, file, path, len)?;
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+#[cfg(target_os = "linux")]
+fn authenticate_sealed_asset(
+    file: &File,
+    path: &Path,
+    len: u64,
+    expected_sha256: &str,
+) -> Result<(), TrimulAssetError> {
+    if sealed_asset_sha256(file, path, len)? != expected_sha256 {
+        return Err(TrimulAssetError::Invalid(format!(
+            "sealed TriMul verifier asset {} does not match its captured identity",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn sealed_eval_bundle_sha256(files: &[SealedEvalFile]) -> Result<String, TrimulAssetError> {
+    let mut digest = Sha256::new();
+    digest.update(b"ferrl.trimul.eval-bundle.v1\0");
+    for file in files {
+        let path = file.relative_path.to_str().ok_or_else(|| {
+            TrimulAssetError::Invalid("TriMul eval bundle paths must be UTF-8".to_string())
+        })?;
+        digest.update((path.len() as u64).to_le_bytes());
+        digest.update(path.as_bytes());
+        digest.update(file.len.to_le_bytes());
+        update_digest_from_sealed_asset(&mut digest, &file.file, &file.relative_path, file.len)?;
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+#[cfg(target_os = "linux")]
+fn seal_eval_bundle(
+    files: &BTreeMap<PathBuf, Vec<u8>>,
+    expected_sha256: &str,
+) -> Result<Vec<SealedEvalFile>, TrimulAssetError> {
+    seal_eval_bundle_with_hook(files, expected_sha256, |_, _| {})
+}
+
+#[cfg(target_os = "linux")]
+fn seal_eval_bundle_with_hook(
+    files: &BTreeMap<PathBuf, Vec<u8>>,
+    expected_sha256: &str,
+    mut before_seal: impl FnMut(&Path, &File),
+) -> Result<Vec<SealedEvalFile>, TrimulAssetError> {
+    use std::io::Write as _;
+
+    let mut sealed = Vec::with_capacity(files.len());
+    for (index, (relative_path, bytes)) in files.iter().enumerate() {
+        // The protected handoff opens sandbox-consumed assets through the owner
+        // process's proc-fd path, authenticates their private read-only copies, and
+        // closes every source on exec. No verifier descriptor is inherited by
+        // launcher, init, shell, or candidate processes.
+        let descriptor = rustix::fs::memfd_create(
+            format!("ferrl-trimul-eval-{index}"),
+            rustix::fs::MemfdFlags::ALLOW_SEALING | rustix::fs::MemfdFlags::CLOEXEC,
+        )
+        .map_err(|source| TrimulAssetError::Io {
+            path: relative_path.clone(),
+            source: source.into(),
+        })?;
+        let mut file =
+            descriptor_file_above_stdio(File::from(descriptor), true).map_err(|source| {
+                TrimulAssetError::Io {
+                    path: relative_path.clone(),
+                    source,
+                }
+            })?;
+        file.write_all(bytes)
+            .map_err(|source| TrimulAssetError::Io {
+                path: relative_path.clone(),
+                source,
+            })?;
+        before_seal(relative_path, &file);
+        rustix::fs::fcntl_add_seals(&file, required_asset_seals()).map_err(|source| {
+            TrimulAssetError::Io {
+                path: relative_path.clone(),
+                source: source.into(),
+            }
+        })?;
+        let sealed_file = SealedEvalFile {
+            relative_path: relative_path.clone(),
+            file,
+            len: bytes.len() as u64,
+        };
+        sealed_file.verify()?;
+        sealed.push(sealed_file);
+    }
+    if sealed_eval_bundle_sha256(&sealed)? != expected_sha256 {
+        return Err(TrimulAssetError::Invalid(
+            "sealed TriMul eval bundle does not match its captured identity".to_string(),
+        ));
+    }
+    Ok(sealed)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn seal_eval_bundle(
+    _files: &BTreeMap<PathBuf, Vec<u8>>,
+    _expected_sha256: &str,
+) -> Result<Vec<SealedEvalFile>, TrimulAssetError> {
+    Err(TrimulAssetError::Invalid(
+        "TriMul verifier assets require Linux kernel-sealed memfd storage".to_string(),
+    ))
+}
+
 /// Parse one flow-mapping case line (the body between `{` and `}`) into a [`TrimulCase`].
 /// Values may be quoted; the mapping has no nested commas, so a flat split on `,` is safe.
 fn parse_case(mapping: &str) -> Result<TrimulCase, TrimulError> {
@@ -552,14 +1397,10 @@ fn parse_distribution(raw: Option<&String>) -> Result<Distribution, TrimulError>
 }
 
 /// The TriMul discovery reward: runs a candidate kernel in the sandboxed eval image
-/// and scores it on correctness + speed. Construct with [`TrimulReward::new`].
+/// and scores it on correctness plus versioned service latency. Construct with
+/// [`TrimulReward::new`].
 #[derive(Debug, Clone)]
 pub struct TrimulReward {
-    /// The eval image (the pinned PyTorch+Triton `.sif`).
-    image: PathBuf,
-    /// The pinned GPUMODE eval bundle (`eval.py`/`reference.py`/`task.py`/`utils.py`),
-    /// bound **read-only**.
-    eval_dir: PathBuf,
     /// Where per-candidate scratch dirs are created — node-local tmpfs is preferred
     /// (e.g. `/dev/shm/ferrl`) so overflow cannot fill persistent host storage.
     scratch_root: PathBuf,
@@ -572,9 +1413,9 @@ pub struct TrimulReward {
     /// The secret seed Cantor-combined with each case's public seed for held-out
     /// inputs (passed as `POPCORN_SEED`).
     secret_seed: u64,
-    /// Reference geometric-mean runtime (ns) on the target GPU; the speedup
-    /// denominator for the shaped reward's speed component. `None` falls back to an
-    /// inverse-time signal.
+    /// Reference geometric-mean service latency (ns) on the target GPU; the
+    /// same-metric ratio denominator for the shaped reward's latency component. `None`
+    /// falls back to an inverse-latency signal.
     baseline_ns: Option<f64>,
     /// Tunable training-reward profile.
     reward_profile: TrimulRewardProfile,
@@ -595,8 +1436,16 @@ pub struct TrimulReward {
     verifier_parallelism: usize,
     /// Process cap applied to the verifier sandbox (`ulimit -u`).
     verifier_max_procs: u64,
-    /// The sandbox backend.
-    sandbox: ApptainerSandbox,
+    /// Explicit verifier backend. Variants never fall back to one another.
+    sandbox: TrimulVerifierBackend,
+    /// Backend preflight evidence pinned before launch publication. CLI construction
+    /// always sets this; direct library callers are preflighted on first execution.
+    verifier_isolation_evidence: Option<VerifierIsolationEvidence>,
+    /// Protected in-container control probe pinned before launch publication.
+    runtime_preflight_evidence: Option<TrimulRuntimePreflightEvidence>,
+    /// Immutable verifier assets captured before launch attestation. Construction
+    /// cannot produce an execution-capable reward without this owner.
+    verifier_assets: TrimulVerifierAssets,
 }
 
 /// The parsed result of one sandboxed TriMul eval.
@@ -604,22 +1453,56 @@ pub struct TrimulReward {
 pub struct TrimulVerification {
     /// Whether the eval reported `check: pass`.
     pub correct: bool,
-    /// Per-benchmark mean runtimes in nanoseconds, after parsing the grade stream.
+    /// Per-benchmark mean service latencies in nanoseconds, after parsing the grade stream.
     pub benchmark_means_ns: Vec<f64>,
-    /// Plausibility-checked geometric-mean benchmark time (ns), if any.
+    /// Plausibility-checked geometric-mean service latency (ns), if any.
     pub geomean_ns: Option<f64>,
-    /// Speedup over the configured baseline, when both baseline and timing are present.
+    /// Same-metric baseline/candidate latency ratio, when both values are present.
     pub speedup: Option<f64>,
 }
 
+/// A parsed TriMul result together with backend and protected in-container evidence.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvidencedTrimulVerification {
+    /// Correctness and timing result.
+    pub verification: TrimulVerification,
+    /// Exact backend preflight evidence revalidated around the execution.
+    pub isolation: VerifierIsolationEvidence,
+    /// Domain-separated digest of `isolation`.
+    pub isolation_evidence_sha256: String,
+    /// Canonical protected hardening records, ordered test then benchmark.
+    pub runtime_hardening: Vec<serde_json::Value>,
+    /// Domain-separated digest of the ordered raw hardening records.
+    pub runtime_hardening_evidence_sha256: String,
+}
+
+/// Launch-time control probe produced through the exact staged verifier path.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrimulRuntimePreflightEvidence {
+    /// Evidence schema version.
+    pub contract_version: u32,
+    /// Selected verifier tier.
+    pub isolation_tier: VerifierIsolationTier,
+    /// Digest of the backend preflight evidence used by the probe.
+    pub isolation_evidence_sha256: String,
+    /// SHA-256 of Ferrl's fixed probe submission.
+    pub probe_submission_sha256: String,
+    /// Canonical protected hardening records produced before probe candidate entry.
+    pub runtime_hardening: Vec<serde_json::Value>,
+    /// Digest of the ordered protected records.
+    pub runtime_hardening_evidence_sha256: String,
+}
+
 /// A `custom_kernel` that delegates to the bundled reference implementation. Used to
-/// **measure the speedup baseline**: the reference is correct by definition, so it
-/// passes correctness and its benchmark time *is* the reference runtime. The
-/// `reference` module is copied next to the submission inside the image (see
-/// [`TrimulReward::in_container_command`]). This is the extracted code, not a fenced
-/// block — it is fed straight to the eval path, bypassing [`extract_submission`].
+/// **measure the service-latency baseline**: the reference is correct by definition, so
+/// it passes correctness and its benchmark record supplies the reference latency. The
+/// `reference` module is bound read-only next to the sealed submission. This is the
+/// extracted code, not a fenced block — it is fed straight to the eval path,
+/// bypassing [`extract_submission`].
 const REFERENCE_SUBMISSION: &str =
     "def custom_kernel(data):\n    from reference import ref_kernel\n    return ref_kernel(data)\n";
+const HARDENING_PREFLIGHT_SUBMISSION: &str =
+    "def custom_kernel(data):\n    return data[0].clone()\n";
 
 /// Default process cap for a TriMul verifier sandbox.
 ///
@@ -629,19 +1512,23 @@ const REFERENCE_SUBMISSION: &str =
 pub const DEFAULT_VERIFIER_MAX_PROCS: u64 = 1024;
 
 impl TrimulReward {
-    /// Construct with the eval `image`, the pinned `eval_dir` bundle, and a
-    /// node-local `scratch_root`. Cases default to empty — set them with
+    /// Construct from captured immutable verifier `assets` and a node-local
+    /// `scratch_root`. Cases default to empty — set them with
     /// [`with_cases`](Self::with_cases) (they are GPU Mode's, kept out of this repo).
+    ///
+    /// Requiring the descriptor owner here prevents an apparently valid reward or
+    /// run specification whose verifier handles were never captured or have already
+    /// been dropped.
     #[must_use]
-    pub fn new(
-        image: impl Into<PathBuf>,
-        eval_dir: impl Into<PathBuf>,
-        scratch_root: impl Into<PathBuf>,
-    ) -> Self {
+    pub fn new(assets: TrimulVerifierAssets, scratch_root: impl Into<PathBuf>) -> Self {
+        let scratch_root = scratch_root.into();
         Self {
-            image: image.into(),
-            eval_dir: eval_dir.into(),
-            scratch_root: scratch_root.into(),
+            sandbox: TrimulVerifierBackend::SameUid(SameUidApptainerSandbox::new(
+                scratch_root.join(".ferrl-verifier"),
+            )),
+            verifier_isolation_evidence: None,
+            runtime_preflight_evidence: None,
+            scratch_root,
             scratch_max_bytes: 1 << 30,
             test_cases: Vec::new(),
             benchmark_cases: Vec::new(),
@@ -655,7 +1542,7 @@ impl TrimulReward {
             verifier_cuda_device_pool: Vec::new(),
             verifier_parallelism: 1,
             verifier_max_procs: DEFAULT_VERIFIER_MAX_PROCS,
-            sandbox: ApptainerSandbox::default(),
+            verifier_assets: assets,
         }
     }
 
@@ -669,6 +1556,103 @@ impl TrimulReward {
         self.test_cases = test_cases;
         self.benchmark_cases = benchmark_cases;
         self
+    }
+
+    /// Override the protected verifier executor socket.
+    #[must_use]
+    pub fn with_verifier_executor_socket(mut self, socket: impl Into<PathBuf>) -> Self {
+        self.sandbox = TrimulVerifierBackend::Dedicated(VerifierExecutorSandbox::new(socket));
+        self.verifier_isolation_evidence = None;
+        self.runtime_preflight_evidence = None;
+        self
+    }
+
+    /// Select the no-admin same-UID staged Apptainer backend explicitly.
+    #[must_use]
+    pub fn with_same_uid_apptainer(
+        mut self,
+        work_root: impl Into<PathBuf>,
+        apptainer_bin: impl Into<PathBuf>,
+    ) -> Self {
+        self.sandbox = TrimulVerifierBackend::SameUid(
+            SameUidApptainerSandbox::new(work_root).with_apptainer_bin(apptainer_bin),
+        );
+        self.verifier_isolation_evidence = None;
+        self.runtime_preflight_evidence = None;
+        self
+    }
+
+    /// Preflight and pin the exact verifier backend identity used by this reward.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RewardError`] when the selected tier is unavailable or cannot prove
+    /// its declared runtime identity. No alternate tier is attempted.
+    pub fn with_verified_isolation(mut self) -> Result<Self, RewardError> {
+        self.verifier_isolation_evidence =
+            Some(self.sandbox.preflight().map_err(RewardError::verifier)?);
+        self.runtime_preflight_evidence = None;
+        Ok(self)
+    }
+
+    /// Run and pin the protected in-container control probe.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RewardError`] when required controls cannot be proved before launch.
+    pub fn with_verified_runtime(mut self) -> Result<Self, RewardError> {
+        let evidence = self.execute_runtime_preflight()?;
+        self.runtime_preflight_evidence = Some(evidence);
+        Ok(self)
+    }
+
+    /// Selected verifier isolation tier.
+    #[must_use]
+    pub const fn verifier_isolation_tier(&self) -> VerifierIsolationTier {
+        self.sandbox.tier()
+    }
+
+    /// Return and revalidate the launch-bound verifier preflight evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RewardError`] if the backend is unavailable or changed since its
+    /// evidence was pinned.
+    pub fn verifier_isolation_evidence(&self) -> Result<VerifierIsolationEvidence, RewardError> {
+        self.current_isolation_evidence()
+    }
+
+    /// Execute Ferrl's fixed wrong-output probe through the production image and
+    /// return the protected controls observed before its candidate entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RewardError`] if staging, runtime hardening, protected evidence, or
+    /// cleanup fails. Call this before publishing the immutable launch.
+    pub fn runtime_preflight_evidence(
+        &self,
+    ) -> Result<TrimulRuntimePreflightEvidence, RewardError> {
+        if let Some(evidence) = &self.runtime_preflight_evidence {
+            return Ok(evidence.clone());
+        }
+        self.execute_runtime_preflight()
+    }
+
+    fn execute_runtime_preflight(&self) -> Result<TrimulRuntimePreflightEvidence, RewardError> {
+        let evidenced = self.verify_submission_with_evidence(HARDENING_PREFLIGHT_SUBMISSION)?;
+        if evidenced.verification.correct {
+            return Err(RewardError::msg(
+                "TriMul hardening preflight unexpectedly passed correctness",
+            ));
+        }
+        Ok(TrimulRuntimePreflightEvidence {
+            contract_version: 1,
+            isolation_tier: evidenced.isolation.tier,
+            isolation_evidence_sha256: evidenced.isolation_evidence_sha256,
+            probe_submission_sha256: sha256_hex(HARDENING_PREFLIGHT_SUBMISSION.as_bytes()),
+            runtime_hardening: evidenced.runtime_hardening,
+            runtime_hardening_evidence_sha256: evidenced.runtime_hardening_evidence_sha256,
+        })
     }
 
     /// Set the secret held-out seed (`POPCORN_SEED`).
@@ -796,8 +1780,8 @@ impl TrimulReward {
 
     /// Map a parsed `(correct, geom-mean ns)` outcome to the speed component of the
     /// training reward: `0` unless the candidate is correct and produced a positive
-    /// runtime; otherwise the speedup over the baseline (or an inverse-time proxy when
-    /// no baseline is set).
+    /// service latency; otherwise the same-metric ratio over the baseline (or an
+    /// inverse-latency proxy when no baseline is set).
     #[must_use]
     pub fn reward_value(&self, correct: bool, geomean_ns: Option<f64>) -> f32 {
         if !correct {
@@ -822,7 +1806,23 @@ impl TrimulReward {
     /// Returns [`RewardError`] if the eval could not be carried out (scratch I/O or
     /// sandbox launch/supervision failure).
     pub fn verify_submission(&self, submission: &str) -> Result<TrimulVerification, RewardError> {
+        self.validate_case_sets()?;
         self.run_eval(submission)
+    }
+
+    /// Verify an extracted submission and retain the exact isolation/hardening evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RewardError`] if execution fails or the protected result omits or
+    /// contradicts the launch-pinned evidence.
+    pub fn verify_submission_with_evidence(
+        &self,
+        submission: &str,
+    ) -> Result<EvidencedTrimulVerification, RewardError> {
+        self.validate_case_sets()?;
+        let eval = self.run_eval_detailed(submission)?;
+        eval.evidenced_verification()
     }
 
     /// Extract a completion using this reward's configured prompt/extraction contract.
@@ -847,37 +1847,14 @@ impl TrimulReward {
         }
     }
 
-    /// The `bash -c` program run inside the image: copy the read-only eval files next
-    /// to the staged `submission.py`, run `test`, and — only if it exits cleanly —
-    /// `benchmark`, each writing its result via fd 3 (`POPCORN_FD`). A trailing `true` keeps the
-    /// shell's exit status clean; ferrl reads the result files, not the exit code.
-    fn in_container_command() -> String {
-        // Route the grade (POPCORN fd 3) to the *captured stdout pipe* (`3>&1`) and
-        // send the eval's — and the candidate's — own stdout to `/dev/null`
-        // (`1>/dev/null`). The grade therefore arrives on a channel the untrusted
-        // candidate cannot reach: its spawn-worker does not inherit fd 3 (eval.py marks
-        // it non-inheritable) and its stdout is discarded, so it cannot forge a pass by
-        // writing files or printing. A separator splits the two sections; benchmark runs
-        // only if `test` exits cleanly.
-        "cp /eval/eval.py /eval/reference.py /eval/task.py /eval/utils.py . && \
-         { POPCORN_FD=3 python eval.py test test_spec.txt 3>&1 1>/dev/null; \
-           test_rc=$?; \
-           echo \"test-exit: $test_rc\"; \
-           if [ \"$test_rc\" -eq 0 ]; then \
-             echo '===FERRL-BENCH==='; \
-             POPCORN_FD=3 python eval.py benchmark bench_spec.txt 3>&1 1>/dev/null; \
-             bench_rc=$?; \
-             echo \"benchmark-exit: $bench_rc\"; \
-           fi; }; \
-         true"
-            .to_string()
-    }
-
     /// Build the [`RunSpec`] for a candidate whose scratch dir is `scratch`: the eval
-    /// image with the GPU exposed, the eval bundle bound read-only, the scratch
-    /// read-write, the network denied (the default), and only the env the eval needs.
-    #[must_use]
-    pub fn build_run_spec(&self, scratch: &Path) -> RunSpec {
+    /// image with the GPU exposed, the captured eval bundle bound read-only, scratch
+    /// cache/output storage read-write, the network denied, and only the env needed
+    /// by the eval. Per-candidate sealed binds are added immediately before launch.
+    ///
+    /// This remains private so descriptor-backed paths cannot outlive the
+    /// [`TrimulVerifierAssets`] owner held by this reward.
+    fn build_run_spec(&self, scratch: &Path) -> RunSpec {
         self.build_run_spec_with_devices(scratch, self.verifier_cuda_visible_devices.as_deref())
     }
 
@@ -897,23 +1874,45 @@ impl TrimulReward {
             ("HOME".into(), "/work/cache".into()),
             ("TRITON_CACHE_DIR".into(), "/work/cache/triton".into()),
             ("POPCORN_SEED".into(), self.secret_seed.to_string()),
+            (
+                "FERRL_VERIFIER_ISOLATION_TIER".into(),
+                self.verifier_isolation_tier().as_str().to_string(),
+            ),
+            (
+                "FERRL_TIMING_METRIC".into(),
+                timing_metric_for_tier(self.verifier_isolation_tier()).to_string(),
+            ),
+            (
+                "FERRL_GRADE_SOCKET".into(),
+                "/work/.ferrl-grade-v1.sock".into(),
+            ),
         ];
         if let Some(devices) = devices {
             env.push(("CUDA_VISIBLE_DEVICES".into(), devices.to_string()));
         }
 
+        let image = self.verifier_assets.image_for_sandbox();
+        let mut binds = self.verifier_assets.eval_binds();
+        binds.push(Bind::rw(scratch, "/work").with_total_limit(self.scratch_max_bytes));
         RunSpec::new(
-            &self.image,
-            vec!["bash".into(), "-c".into(), Self::in_container_command()],
+            image,
+            vec![
+                "python".into(),
+                "-I".into(),
+                FERRL_EVAL_DRIVER_PATH.into(),
+                TEST_SPEC_PATH.into(),
+                BENCH_SPEC_PATH.into(),
+            ],
         )
         .with_gpu(true)
-        .with_binds(vec![
-            Bind::ro(&self.eval_dir, "/eval"),
-            Bind::rw(scratch, "/work").with_total_limit(self.scratch_max_bytes),
-        ])
+        .with_binds(binds)
         .with_workdir("/work")
         .with_env(env)
         .with_limits(self.limits())
+        .with_protected_output(ProtectedOutput::new(
+            scratch.join(".ferrl-grade-v1.sock"),
+            "/work/.ferrl-grade-v1.sock",
+        ))
     }
 
     /// Stage `submission`, run the eval in the sandbox, and score the result files.
@@ -924,20 +1923,27 @@ impl TrimulReward {
     /// I/O or the sandbox failing to launch) — a crashing or wrong candidate is a
     /// `0.0` reward, not an error.
     fn run_eval(&self, submission: &str) -> Result<TrimulVerification, RewardError> {
+        Ok(self.run_eval_detailed(submission)?.verification)
+    }
+
+    fn run_eval_detailed(&self, submission: &str) -> Result<TrimulEval, RewardError> {
+        self.validate_case_sets()?;
+        self.verify_verifier_assets()?;
         let scratch = self.make_scratch()?;
-        let result = self
-            .eval_in(&scratch, submission)
-            .map(|outcome| outcome.verification);
+        let result = self.eval_in(&scratch, submission);
         // Best-effort cleanup; the scratch is node-local and disposable.
         let _ = std::fs::remove_dir_all(&scratch);
+        self.verify_verifier_assets()?;
         result
     }
 
-    /// Measure the reference kernel's geometric-mean runtime (ns) on this node's GPU,
-    /// by running the bundled reference as the candidate over the configured
-    /// `benchmark_cases`. This is the value to pin as the speedup baseline
+    /// Measure the reference candidate's geometric-mean ferrl service latency (ns) on
+    /// this node's GPU by running the bundled reference over the configured
+    /// `benchmark_cases`. This is the value to pin as the same-metric baseline
     /// ([`with_baseline_ns`](Self::with_baseline_ns)) — a *guarded pin*: measure it once
-    /// on the target GPU, record it, and re-use it for runs on that same GPU.
+    /// on the target GPU through the same backend, record it with that tier's
+    /// [`timing_metric_for_tier`], and re-use it only with the exact same preflight
+    /// evidence. It is not a GPUMODE CUDA-event kernel runtime.
     ///
     /// Returns `None` if the reference somehow did not pass correctness or produced no
     /// plausible timing (it should always pass — it *is* the reference).
@@ -976,23 +1982,57 @@ impl TrimulReward {
         submission: &str,
         spec: &RunSpec,
     ) -> Result<TrimulEval, RewardError> {
+        let isolation = self.current_isolation_evidence()?;
         std::fs::create_dir_all(scratch.join("cache")).map_err(RewardError::verifier)?;
-        write(scratch, "submission.py", submission)?;
-        write(scratch, "test_spec.txt", &render_spec(&self.test_cases))?;
-        write(
-            scratch,
-            "bench_spec.txt",
-            &render_spec(&self.benchmark_cases),
-        )?;
+        let test_spec = render_spec(&self.test_cases);
+        let bench_spec = render_spec(&self.benchmark_cases);
+        let invocation = SealedInvocationAssets::capture(submission, &test_spec, &bench_spec)
+            .map_err(RewardError::verifier)?;
+        invocation.verify().map_err(RewardError::verifier)?;
+        let mut sealed_spec = spec.clone();
+        sealed_spec.binds.extend(invocation.binds());
 
-        // The grade arrives on the captured stdout (fd 3 → the pipe; see
-        // `in_container_command`), NOT on a candidate-writable file — so a forged
-        // `/work` file or a printed `check: pass` cannot influence the score. A
-        // crashing candidate yields no grade lines, scored a failure.
-        let outcome = self.sandbox.run(spec).map_err(RewardError::verifier)?;
+        // The machine grade arrives only through the verifier-owned Unix stream.
+        // Ordinary stdout/stderr remain untrusted diagnostics. The sealed invocation
+        // descriptors remain owned here until the sandbox returns.
+        let outcome = self
+            .sandbox
+            .run(&sealed_spec)
+            .map_err(RewardError::verifier)?;
+        let isolation_after = self.current_isolation_evidence()?;
+        if isolation_after != isolation {
+            return Err(RewardError::msg(
+                "verifier isolation evidence changed during candidate execution",
+            ));
+        }
+        invocation.verify().map_err(RewardError::verifier)?;
+        let outcome = require_trimul_verifier_entry_for_tier(outcome, isolation.tier)
+            .map_err(RewardError::verifier)?;
 
-        let has_benchmark_section = outcome.stdout.contains(RESULT_SPLIT);
-        let (test_log, bench_log) = split_result(&outcome.stdout);
+        let grade = outcome.protected_output;
+        let (runtime_hardening, runtime_hardening_raw) =
+            protected_runtime_evidence(&grade, isolation.tier).map_err(|error| {
+                RewardError::verifier(SandboxError::Infrastructure {
+                    status: outcome.status,
+                    stderr: format!("TriMul protected hardening evidence failed: {error}"),
+                })
+            })?;
+        if let Some(preflight) = &self.runtime_preflight_evidence {
+            let expected = preflight.runtime_hardening.first().ok_or_else(|| {
+                RewardError::msg("launch runtime preflight contains no hardening record")
+            })?;
+            if preflight.isolation_tier != isolation.tier
+                || preflight.isolation_evidence_sha256
+                    != verifier_isolation_evidence_sha256(&isolation)
+                || runtime_hardening.iter().any(|record| record != expected)
+            {
+                return Err(RewardError::msg(
+                    "candidate runtime hardening evidence differs from the launch preflight",
+                ));
+            }
+        }
+        let has_benchmark_section = grade.contains(RESULT_SPLIT);
+        let (test_log, bench_log) = split_result(&grade);
         let test_check = log_value(test_log, "check").map(str::to_string);
         let test_exit = log_i32_value(test_log, "test-exit");
         let benchmark_exit = log_i32_value(bench_log, "benchmark-exit");
@@ -1020,8 +2060,14 @@ impl TrimulReward {
             },
             status: outcome.status,
             output: TrimulEvalOutput {
-                stdout: outcome.stdout,
-                stderr: outcome.stderr,
+                stdout: grade,
+                stderr: format!(
+                    "sandbox stdout:\n{}\nsandbox stderr:\n{}",
+                    outcome.stdout, outcome.stderr
+                ),
+                isolation: Some(isolation),
+                runtime_hardening,
+                runtime_hardening_raw,
             },
             test_check,
             test_exit,
@@ -1039,7 +2085,16 @@ impl TrimulReward {
         completion: &str,
         worker_index: usize,
     ) -> Result<RewardOutcome, RewardError> {
+        self.validate_case_sets()?;
         let Some(code) = self.extract_submission(completion) else {
+            let isolation_evidence_sha256 = self
+                .verifier_isolation_evidence
+                .as_ref()
+                .map(verifier_isolation_evidence_sha256);
+            let runtime_preflight_evidence_sha256 = self
+                .runtime_preflight_evidence
+                .as_ref()
+                .map(runtime_preflight_evidence_sha256);
             return Ok(RewardOutcome {
                 reward: 0.0,
                 diagnostic: Some("trimul:no_submission".to_string()),
@@ -1048,6 +2103,11 @@ impl TrimulReward {
                     "reward_scheme": self.reward_profile.scheme.as_str(),
                     "reward_profile": self.reward_profile.metadata(),
                     "submission_extracted": false,
+                    "verification_executed": false,
+                    "verifier_isolation_tier": self.verifier_isolation_tier().as_str(),
+                    "verifier_isolation_evidence_sha256": isolation_evidence_sha256,
+                    "runtime_preflight_evidence_sha256": runtime_preflight_evidence_sha256,
+                    "timing_metric": timing_metric_for_tier(self.verifier_isolation_tier()),
                 })),
             });
         };
@@ -1058,7 +2118,7 @@ impl TrimulReward {
         let eval = result?;
         let reward = self.reward_from_extracted_eval(&eval);
         let diagnostic = self.reward_diagnostic(&eval);
-        let metadata = Some(self.reward_metadata(&code, &eval, reward));
+        let metadata = Some(self.reward_metadata(&code, &eval, reward)?);
         Ok(RewardOutcome {
             reward,
             diagnostic,
@@ -1071,8 +2131,13 @@ impl TrimulReward {
         submission: &str,
         eval: &TrimulEval,
         training_reward: f32,
-    ) -> serde_json::Value {
+    ) -> Result<serde_json::Value, RewardError> {
         let test_progress = eval.test_progress();
+        let evidenced = eval.evidenced_verification()?;
+        let runtime_preflight_evidence_sha256 = self
+            .runtime_preflight_evidence
+            .as_ref()
+            .map(runtime_preflight_evidence_sha256);
         let speed_component = if eval.verification.correct && eval.benchmark_exit == Some(0) {
             self.speed_reward_component(eval.verification.geomean_ns)
         } else {
@@ -1083,6 +2148,7 @@ impl TrimulReward {
             "reward_scheme": self.reward_profile.scheme.as_str(),
             "reward_profile": self.reward_profile.metadata(),
             "submission_extracted": true,
+            "verification_executed": true,
             "source_sha256": sha256_hex(submission.as_bytes()),
             "source_len_bytes": submission.len(),
             "training_reward": training_reward,
@@ -1099,6 +2165,18 @@ impl TrimulReward {
             "has_benchmark_section": eval.has_benchmark_section,
             "correct": eval.verification.correct,
             "benchmark_mean_count": eval.verification.benchmark_means_ns.len(),
+            "verifier_isolation_tier": self.verifier_isolation_tier().as_str(),
+            "verifier_isolation_evidence": &evidenced.isolation,
+            "verifier_isolation_evidence_sha256": &evidenced.isolation_evidence_sha256,
+            "runtime_hardening": &evidenced.runtime_hardening,
+            "runtime_hardening_evidence_sha256": &evidenced.runtime_hardening_evidence_sha256,
+            "runtime_preflight_evidence_sha256": runtime_preflight_evidence_sha256,
+            "timing_metric": timing_metric_for_tier(self.verifier_isolation_tier()),
+            "candidate_attempt_sentinels": candidate_attempt_sentinels(&eval.output.stdout),
+            "candidate_rejection_reason": log_value(
+                &eval.output.stdout,
+                "ferrl-candidate-rejection-reason",
+            ),
             "geomean_ns": eval.verification.geomean_ns,
             "speedup": eval.verification.speedup,
             "speed_reward_component": speed_component,
@@ -1128,7 +2206,7 @@ impl TrimulReward {
             }
         }
 
-        metadata
+        Ok(metadata)
     }
 
     fn reward_from_extracted_eval(&self, eval: &TrimulEval) -> f32 {
@@ -1227,15 +2305,323 @@ impl TrimulReward {
         std::fs::create_dir_all(&dir).map_err(RewardError::verifier)?;
         Ok(dir)
     }
+
+    fn verify_verifier_assets(&self) -> Result<(), RewardError> {
+        self.verifier_assets
+            .verify_current()
+            .map_err(RewardError::verifier)
+    }
+
+    fn current_isolation_evidence(&self) -> Result<VerifierIsolationEvidence, RewardError> {
+        let current = self.sandbox.preflight().map_err(RewardError::verifier)?;
+        if current.tier != self.sandbox.tier() {
+            return Err(RewardError::msg(
+                "verifier backend returned evidence for a different isolation tier",
+            ));
+        }
+        if self
+            .verifier_isolation_evidence
+            .as_ref()
+            .is_some_and(|expected| expected != &current)
+        {
+            return Err(RewardError::msg(
+                "verifier isolation evidence changed after launch preflight",
+            ));
+        }
+        Ok(current)
+    }
+
+    fn validate_case_sets(&self) -> Result<(), RewardError> {
+        if self.test_cases.is_empty() {
+            return Err(RewardError::msg(
+                "trimul verifier requires at least one correctness case",
+            ));
+        }
+        if self.benchmark_cases.is_empty() {
+            return Err(RewardError::msg(
+                "trimul verifier requires at least one benchmark case",
+            ));
+        }
+        Ok(())
+    }
+}
+
+const TEST_VERIFIER_ENTRY: &str = "test-v4";
+const BENCHMARK_VERIFIER_ENTRY: &str = "benchmark-v4";
+/// Versioned protected end-to-end candidate latency for the no-admin tier.
+pub const SAME_UID_TRIMUL_TIMING_METRIC: &str = "same-uid-apptainer-latency-v1";
+/// Versioned protected end-to-end candidate service latency for the dedicated tier.
+pub const DEDICATED_TRIMUL_TIMING_METRIC: &str = "isolated-service-latency-v1";
+/// Default public timing metric, matching [`VerifierIsolationTier::default`].
+pub const TRIMUL_TIMING_METRIC: &str = SAME_UID_TRIMUL_TIMING_METRIC;
+/// Protected candidate hardening evidence contract emitted before candidate entry.
+pub const TRIMUL_RUNTIME_HARDENING_CONTRACT: &str = "ferrl.candidate-hardening.v1";
+
+/// Exact timing metric for one verifier isolation tier.
+#[must_use]
+pub const fn timing_metric_for_tier(tier: VerifierIsolationTier) -> &'static str {
+    match tier {
+        VerifierIsolationTier::SameUidApptainerV1 => SAME_UID_TRIMUL_TIMING_METRIC,
+        VerifierIsolationTier::DedicatedUidServiceV1 => DEDICATED_TRIMUL_TIMING_METRIC,
+    }
+}
+
+/// Domain-separated digest of canonical backend preflight evidence.
+///
+/// # Panics
+///
+/// Panics only if `serde_json` cannot serialize the fixed evidence schema.
+#[must_use]
+pub fn verifier_isolation_evidence_sha256(evidence: &VerifierIsolationEvidence) -> String {
+    let bytes = serde_json::to_vec(evidence)
+        .expect("VerifierIsolationEvidence contains only infallible JSON values");
+    domain_sha256("ferrl.verifier-isolation-evidence.v1", &[&bytes])
+}
+
+/// Domain-separated digest of canonical launch-time runtime-control evidence.
+///
+/// # Panics
+///
+/// Panics only if `serde_json` cannot serialize the fixed evidence schema.
+#[must_use]
+pub fn runtime_preflight_evidence_sha256(evidence: &TrimulRuntimePreflightEvidence) -> String {
+    let bytes = serde_json::to_vec(evidence)
+        .expect("TrimulRuntimePreflightEvidence contains only infallible JSON values");
+    domain_sha256("ferrl.trimul-runtime-preflight-evidence.v1", &[&bytes])
+}
+const TRIMUL_INFRASTRUCTURE_MARKER: &str = "ferrl-infrastructure: v1";
+const TRIMUL_INFRASTRUCTURE_EXIT: i32 = 114;
+const HARDENING_LOG_KEY: &str = "ferrl-candidate-hardening";
+const ISOLATION_LOG_KEY: &str = "ferrl-verifier-isolation-tier";
+
+fn validate_runtime_hardening_record(raw: &str) -> Result<serde_json::Value, String> {
+    let value: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|error| format!("malformed candidate hardening JSON: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "candidate hardening evidence is not an object".to_string())?;
+    const KEYS: [&str; 19] = [
+        "arch",
+        "cap_amb",
+        "cap_bnd",
+        "cap_eff",
+        "cap_inh",
+        "cap_prm",
+        "cgroup",
+        "contract",
+        "denial_probes",
+        "dumpable",
+        "landlock",
+        "network_socket_policy",
+        "no_new_privs",
+        "physical_gpu_isolation",
+        "seccomp_filters",
+        "seccomp_mode",
+        "seccomp_policy",
+        "seccomp_tsync",
+        "unix_socket_probe",
+    ];
+    if object.len() != KEYS.len() || KEYS.iter().any(|key| !object.contains_key(*key)) {
+        return Err("candidate hardening evidence has an unsupported schema".to_string());
+    }
+    let exact_string = |key: &str, expected: &str| {
+        (object.get(key).and_then(serde_json::Value::as_str) == Some(expected))
+            .then_some(())
+            .ok_or_else(|| format!("candidate hardening field {key:?} is not {expected:?}"))
+    };
+    let exact_i64 = |key: &str, expected: i64| {
+        (object.get(key).and_then(serde_json::Value::as_i64) == Some(expected))
+            .then_some(())
+            .ok_or_else(|| format!("candidate hardening field {key:?} is not {expected}"))
+    };
+    let exact_bool = |key: &str, expected: bool| {
+        (object.get(key).and_then(serde_json::Value::as_bool) == Some(expected))
+            .then_some(())
+            .ok_or_else(|| format!("candidate hardening field {key:?} is not {expected}"))
+    };
+    exact_string("contract", TRIMUL_RUNTIME_HARDENING_CONTRACT)?;
+    exact_string("arch", "x86_64")?;
+    exact_string("seccomp_policy", "x86_64-tsync-af-unix-v1")?;
+    exact_string("network_socket_policy", "af_unix_only")?;
+    exact_i64("dumpable", 0)?;
+    exact_i64("no_new_privs", 1)?;
+    exact_i64("seccomp_mode", 2)?;
+    exact_bool("seccomp_tsync", true)?;
+    exact_bool("unix_socket_probe", true)?;
+    exact_bool("landlock", false)?;
+    exact_bool("cgroup", false)?;
+    exact_bool("physical_gpu_isolation", false)?;
+    let denial_probes = object
+        .get("denial_probes")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "candidate hardening denial probes are not an array".to_string())?;
+    let expected_probes = [
+        "bpf",
+        "io_uring",
+        "namespace",
+        "network",
+        "parent_proc",
+        "pidfd_getfd",
+        "process_vm",
+        "ptrace",
+    ];
+    if denial_probes.len() != expected_probes.len()
+        || denial_probes
+            .iter()
+            .zip(expected_probes)
+            .any(|(actual, expected)| actual.as_str() != Some(expected))
+    {
+        return Err("candidate hardening denial probes are incomplete".to_string());
+    }
+    for key in ["cap_amb", "cap_bnd", "cap_eff", "cap_inh", "cap_prm"] {
+        let capability = object
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("candidate hardening field {key:?} is not a string"))?;
+        if capability.len() != 16
+            || !capability
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(format!(
+                "candidate hardening field {key:?} is not canonical capability hex"
+            ));
+        }
+        if key != "cap_bnd" && capability != "0000000000000000" {
+            return Err(format!(
+                "candidate hardening field {key:?} retains capabilities"
+            ));
+        }
+    }
+    let bounding = object["cap_bnd"]
+        .as_str()
+        .ok_or_else(|| "candidate hardening bounding set is not a string".to_string())
+        .and_then(|value| {
+            u64::from_str_radix(value, 16)
+                .map_err(|error| format!("candidate hardening bounding set is invalid: {error}"))
+        })?;
+    const CAP_SYS_PTRACE: u64 = 1 << 19;
+    const CAP_SYS_ADMIN: u64 = 1 << 21;
+    if bounding & (CAP_SYS_PTRACE | CAP_SYS_ADMIN) != 0 {
+        return Err(
+            "candidate hardening bounding set retains ptrace or admin capability".to_string(),
+        );
+    }
+    if !object["seccomp_filters"].is_null()
+        && object["seccomp_filters"]
+            .as_u64()
+            .is_none_or(|count| count == 0)
+    {
+        return Err("candidate hardening seccomp filter count is invalid".to_string());
+    }
+    if serde_json::to_string(&value).map_err(|error| error.to_string())? != raw {
+        return Err("candidate hardening evidence is not canonical JSON".to_string());
+    }
+    Ok(value)
+}
+
+fn protected_runtime_evidence(
+    grade: &str,
+    tier: VerifierIsolationTier,
+) -> Result<(Vec<serde_json::Value>, Vec<String>), String> {
+    let expected_metric = timing_metric_for_tier(tier);
+    let (test_log, benchmark_log) = split_result(grade);
+    let mut phases = vec![test_log];
+    if grade.contains(RESULT_SPLIT) {
+        phases.push(benchmark_log);
+    }
+    let mut values = Vec::with_capacity(phases.len());
+    let mut raw_values = Vec::with_capacity(phases.len());
+    for phase in phases {
+        if log_value(phase, ISOLATION_LOG_KEY) != Some(tier.as_str()) {
+            return Err("protected verifier did not authenticate its isolation tier".to_string());
+        }
+        if log_value(phase, "ferrl-timing-metric") != Some(expected_metric) {
+            return Err("protected verifier did not authenticate its timing metric".to_string());
+        }
+        let raw = log_value(phase, HARDENING_LOG_KEY)
+            .ok_or_else(|| "protected verifier omitted candidate hardening evidence".to_string())?;
+        values.push(validate_runtime_hardening_record(raw)?);
+        raw_values.push(raw.to_string());
+    }
+    Ok((values, raw_values))
+}
+
+/// Require records written by the sealed parent on the verifier-only socket after
+/// exact trusted initialization and either actual candidate-frame entry or an
+/// authenticated candidate-source rejection. Benchmark proof is mandatory whenever
+/// the protected grade reached that phase, so a later platform failure cannot retain
+/// correctness credit.
+fn require_trimul_verifier_entry_for_tier(
+    outcome: RunOutcome,
+    tier: VerifierIsolationTier,
+) -> Result<RunOutcome, SandboxError> {
+    let infrastructure_record = outcome.protected_output.lines().find_map(|line| {
+        let line = line.trim();
+        (line == TRIMUL_INFRASTRUCTURE_MARKER || line.starts_with("ferrl-infrastructure: v1 "))
+            .then_some(line)
+    });
+    if outcome.status == RunStatus::Exited(TRIMUL_INFRASTRUCTURE_EXIT)
+        || infrastructure_record.is_some()
+    {
+        let record = infrastructure_record.unwrap_or("reserved exit 114");
+        return Err(SandboxError::Infrastructure {
+            status: outcome.status,
+            stderr: format!(
+                "TriMul protected parent reported authenticated infrastructure failure ({record}); sandbox stderr: {}",
+                outcome.stderr
+            ),
+        });
+    }
+    let (test_log, benchmark_log) = split_result(&outcome.protected_output);
+    if !phase_reached(test_log, TEST_VERIFIER_ENTRY, "test-import-v1") {
+        return Err(missing_verifier_entry(&outcome, "test"));
+    }
+    if outcome.protected_output.contains(RESULT_SPLIT)
+        && !phase_reached(
+            benchmark_log,
+            BENCHMARK_VERIFIER_ENTRY,
+            "benchmark-import-v1",
+        )
+    {
+        return Err(missing_verifier_entry(&outcome, "benchmark"));
+    }
+    if let Err(error) = protected_runtime_evidence(&outcome.protected_output, tier) {
+        return Err(SandboxError::Infrastructure {
+            status: outcome.status,
+            stderr: format!("TriMul verifier hardening evidence failed: {error}"),
+        });
+    }
+    Ok(outcome)
+}
+
+#[cfg(test)]
+fn require_trimul_verifier_entry(outcome: RunOutcome) -> Result<RunOutcome, SandboxError> {
+    require_trimul_verifier_entry_for_tier(outcome, VerifierIsolationTier::SameUidApptainerV1)
+}
+
+fn phase_reached(log: &str, entry: &str, rejected: &str) -> bool {
+    log_value(log, "ferrl-entry") == Some(entry)
+        || log_value(log, "ferrl-candidate-rejected") == Some(rejected)
+}
+
+fn missing_verifier_entry(outcome: &RunOutcome, phase: &str) -> SandboxError {
+    let stderr = if outcome.stderr.is_empty() {
+        format!("TriMul {phase} verifier did not reach trusted worker/GPU entry")
+    } else {
+        format!(
+            "TriMul {phase} verifier did not reach trusted worker/GPU entry: {}",
+            outcome.stderr
+        )
+    };
+    SandboxError::Infrastructure {
+        status: outcome.status,
+        stderr,
+    }
 }
 
 /// Process-wide counter for unique scratch-dir names.
 static SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// Write `contents` to `dir/name`.
-fn write(dir: &Path, name: &str, contents: &str) -> Result<(), RewardError> {
-    std::fs::write(dir.join(name), contents).map_err(RewardError::verifier)
-}
 
 #[derive(Debug, Clone)]
 struct TrimulEval {
@@ -1259,12 +2645,42 @@ impl TrimulEval {
         let (test_log, _) = split_result(&self.output.stdout);
         test_progress(test_log)
     }
+
+    fn evidenced_verification(&self) -> Result<EvidencedTrimulVerification, RewardError> {
+        let isolation = self.output.isolation.clone().ok_or_else(|| {
+            RewardError::msg("TriMul result is missing verifier isolation evidence")
+        })?;
+        if self.output.runtime_hardening.is_empty() {
+            return Err(RewardError::msg(
+                "TriMul result is missing protected runtime hardening evidence",
+            ));
+        }
+        let runtime_bytes = self
+            .output
+            .runtime_hardening_raw
+            .iter()
+            .map(String::as_bytes)
+            .collect::<Vec<_>>();
+        Ok(EvidencedTrimulVerification {
+            verification: self.verification.clone(),
+            isolation_evidence_sha256: verifier_isolation_evidence_sha256(&isolation),
+            isolation,
+            runtime_hardening: self.output.runtime_hardening.clone(),
+            runtime_hardening_evidence_sha256: domain_sha256(
+                "ferrl.trimul-runtime-hardening-evidence.v1",
+                &runtime_bytes,
+            ),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Default)]
 struct TrimulEvalOutput {
     stdout: String,
     stderr: String,
+    isolation: Option<VerifierIsolationEvidence>,
+    runtime_hardening: Vec<serde_json::Value>,
+    runtime_hardening_raw: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1304,12 +2720,6 @@ fn test_progress(test_log: &str) -> TestProgress {
         } else {
             statuses.insert(index, passed);
         }
-    }
-    if declared_count == Some(0) && test_passed(test_log) {
-        return TestProgress {
-            pass_count: 1,
-            case_count: 1,
-        };
     }
     let pass_count = statuses
         .iter()
@@ -1355,6 +2765,17 @@ fn run_status_label(status: RunStatus) -> String {
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     format!("{digest:x}")
+}
+
+fn domain_sha256(domain: &str, fields: &[&[u8]]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update((domain.len() as u64).to_le_bytes());
+    hasher.update(domain.as_bytes());
+    for field in fields {
+        hasher.update((field.len() as u64).to_le_bytes());
+        hasher.update(field);
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 /// The marker the in-container command echoes between the `test` and `benchmark`
@@ -1403,7 +2824,11 @@ impl RewardFn for TrimulReward {
     type Target = ();
 
     fn reward(&self, _sample: &Sample<()>, completion: &str) -> Result<f32, RewardError> {
-        Ok(self.reward_outcome(completion)?.reward)
+        self.validate_case_sets()?;
+        self.verify_verifier_assets()?;
+        let outcome = self.reward_outcome(completion);
+        self.verify_verifier_assets()?;
+        Ok(outcome?.reward)
     }
 
     fn reward_group_detailed(
@@ -1411,18 +2836,23 @@ impl RewardFn for TrimulReward {
         _sample: &Sample<()>,
         completions: &[String],
     ) -> Result<Vec<RewardOutcome>, RewardError> {
-        if self.verifier_parallelism <= 1 || completions.len() <= 1 {
-            return completions
+        self.validate_case_sets()?;
+        self.verify_verifier_assets()?;
+        let outcomes = if self.verifier_parallelism <= 1 || completions.len() <= 1 {
+            completions
                 .iter()
                 .enumerate()
                 .map(|(index, completion)| self.reward_outcome_for_worker(completion, index))
-                .collect();
-        }
-        map_bounded_reward_outcomes(
-            completions,
-            self.verifier_parallelism,
-            |index, completion| self.reward_outcome_for_worker(completion, index),
-        )
+                .collect()
+        } else {
+            map_bounded_reward_outcomes(
+                completions,
+                self.verifier_parallelism,
+                |index, completion| self.reward_outcome_for_worker(completion, index),
+            )
+        };
+        self.verify_verifier_assets()?;
+        outcomes
     }
     // No `reward_group` override: the detailed path preserves per-candidate diagnostics.
 }
@@ -1479,7 +2909,363 @@ mod tests {
     }
 
     fn reward() -> TrimulReward {
-        TrimulReward::new("/img.sif", "/eval", "/tmp")
+        static FIXTURE: std::sync::OnceLock<(PathBuf, PathBuf, PathBuf, PathBuf)> =
+            std::sync::OnceLock::new();
+        let (_, image, eval, scratch) = FIXTURE.get_or_init(|| verifier_fixture("shared-reward"));
+        let assets = TrimulVerifierAssets::capture(image, eval, scratch).unwrap();
+        TrimulReward::new(assets, scratch).with_cases(
+            vec![case(8, true, Distribution::Normal)],
+            vec![case(16, false, Distribution::Cauchy)],
+        )
+    }
+
+    fn test_isolation_evidence() -> VerifierIsolationEvidence {
+        VerifierIsolationEvidence {
+            contract_version: VERIFIER_ISOLATION_EVIDENCE_VERSION,
+            tier: VerifierIsolationTier::SameUidApptainerV1,
+            requester_uid: 1000,
+            launcher_uid: 1000,
+            uid_boundary: VerifierUidBoundary::SameHostUid,
+            asset_transport: VerifierAssetTransport::InProcessSealedCopy,
+            apptainer_path: PathBuf::from("/usr/bin/apptainer"),
+            apptainer_sha256: "11".repeat(32),
+            apptainer_len_bytes: 1,
+            apptainer_version: "apptainer version 1.4.0".to_string(),
+            work_root: PathBuf::from("/tmp/ferrl-verifier-test"),
+            work_root_uid: 1000,
+            work_root_device: 1,
+            work_root_inode: 2,
+            work_root_mode: 0o700,
+        }
+    }
+
+    fn test_runtime_hardening() -> serde_json::Value {
+        serde_json::json!({
+            "arch": "x86_64",
+            "cap_amb": "0000000000000000",
+            "cap_bnd": "00000000a80425fb",
+            "cap_eff": "0000000000000000",
+            "cap_inh": "0000000000000000",
+            "cap_prm": "0000000000000000",
+            "cgroup": false,
+            "contract": TRIMUL_RUNTIME_HARDENING_CONTRACT,
+            "denial_probes": ["bpf", "io_uring", "namespace", "network", "parent_proc", "pidfd_getfd", "process_vm", "ptrace"],
+            "dumpable": 0,
+            "landlock": false,
+            "network_socket_policy": "af_unix_only",
+            "no_new_privs": 1,
+            "physical_gpu_isolation": false,
+            "seccomp_filters": 1,
+            "seccomp_mode": 2,
+            "seccomp_policy": "x86_64-tsync-af-unix-v1",
+            "seccomp_tsync": true,
+            "unix_socket_probe": true,
+        })
+    }
+
+    fn test_runtime_hardening_raw() -> String {
+        serde_json::to_string(&test_runtime_hardening()).unwrap()
+    }
+
+    fn evidenced_output(stdout: &str, stderr: &str) -> TrimulEvalOutput {
+        TrimulEvalOutput {
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+            isolation: Some(test_isolation_evidence()),
+            runtime_hardening: vec![test_runtime_hardening()],
+            runtime_hardening_raw: vec![test_runtime_hardening_raw()],
+        }
+    }
+
+    fn protected_phase_prelude() -> String {
+        format!(
+            "ferrl-verifier-isolation-tier: {}\nferrl-timing-metric: {}\nferrl-candidate-hardening: {}\n",
+            VerifierIsolationTier::SameUidApptainerV1.as_str(),
+            TRIMUL_TIMING_METRIC,
+            test_runtime_hardening_raw(),
+        )
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn candidate_hardening_record_rejects_weakened_or_noncanonical_controls() {
+        let valid = test_runtime_hardening_raw();
+        assert!(validate_runtime_hardening_record(&valid).is_ok());
+
+        let reject_field = |key: &str, replacement: serde_json::Value| {
+            let mut record = test_runtime_hardening();
+            record
+                .as_object_mut()
+                .unwrap()
+                .insert(key.to_string(), replacement);
+            let raw = serde_json::to_string(&record).unwrap();
+            assert!(
+                validate_runtime_hardening_record(&raw).is_err(),
+                "weakened {key} unexpectedly passed: {raw}"
+            );
+        };
+        reject_field("cap_eff", serde_json::json!("0000000000000001"));
+        reject_field("cap_prm", serde_json::json!("0000000000000001"));
+        reject_field("cap_inh", serde_json::json!("0000000000000001"));
+        reject_field("cap_amb", serde_json::json!("0000000000000001"));
+        reject_field("cap_bnd", serde_json::json!("0000000000080000"));
+        reject_field("cap_bnd", serde_json::json!("0000000000200000"));
+        reject_field("no_new_privs", serde_json::json!(0));
+        reject_field("dumpable", serde_json::json!(1));
+        reject_field("seccomp_mode", serde_json::json!(1));
+        reject_field("seccomp_filters", serde_json::json!(0));
+        reject_field("seccomp_tsync", serde_json::json!(false));
+        reject_field("unix_socket_probe", serde_json::json!(false));
+        reject_field("network_socket_policy", serde_json::json!("unrestricted"));
+        reject_field("contract", serde_json::json!("operator-claimed-v1"));
+        reject_field(
+            "denial_probes",
+            serde_json::json!(["bpf", "io_uring", "namespace", "network", "ptrace"]),
+        );
+        let mut missing = test_runtime_hardening();
+        missing.as_object_mut().unwrap().remove("no_new_privs");
+        assert!(
+            validate_runtime_hardening_record(&serde_json::to_string(&missing).unwrap()).is_err()
+        );
+        assert!(validate_runtime_hardening_record(&format!(" {valid}")).is_err());
+
+        let protected = format!(
+            "{}ferrl-entry: {TEST_VERIFIER_ENTRY}\ntest-exit: 7\n",
+            protected_phase_prelude(),
+        );
+        assert!(protected_runtime_evidence(
+            &protected,
+            VerifierIsolationTier::DedicatedUidServiceV1,
+        )
+        .is_err());
+    }
+
+    fn verifier_fixture(tag: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "ferrl-trimul-assets-{tag}-{}-{nonce}",
+            std::process::id()
+        ));
+        let image = root.join("image.sif");
+        let eval = root.join("eval");
+        let scratch = root.join("scratch");
+        std::fs::create_dir_all(&eval).unwrap();
+        std::fs::write(&image, b"exact image").unwrap();
+        std::fs::write(eval.join("eval.py"), b"# exact eval\n").unwrap();
+        std::fs::write(eval.join("reference.py"), b"# exact reference\n").unwrap();
+        std::fs::write(eval.join("task.py"), b"# exact task\n").unwrap();
+        std::fs::write(eval.join("utils.py"), b"# exact utils\n").unwrap();
+        std::fs::write(
+            eval.join("task.yml"),
+            b"tests:\n  - {\"seqlen\": 8, \"bs\": 1, \"dim\": 4, \"hiddendim\": 4, \"seed\": 1, \"nomask\": true, \"distribution\": \"normal\"}\nbenchmarks:\n  - {\"seqlen\": 16, \"bs\": 1, \"dim\": 4, \"hiddendim\": 4, \"seed\": 2, \"nomask\": false, \"distribution\": \"cauchy\"}\n",
+        )
+        .unwrap();
+        (root, image, eval, scratch)
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn verifier_assets_consume_stable_image_and_sealed_eval_descriptors() {
+        let (root, image, eval, scratch) = verifier_fixture("stable-consumption");
+        let assets = TrimulVerifierAssets::capture(&image, &eval, &scratch).unwrap();
+        let reward = TrimulReward::new(assets.clone(), &scratch);
+        let run_scratch = scratch.join("candidate");
+        let spec = reward.build_run_spec(&run_scratch);
+
+        #[cfg(target_os = "linux")]
+        assert!(spec
+            .image
+            .starts_with(format!("/proc/{}/fd", std::process::id())));
+        let eval_bind = spec
+            .binds
+            .iter()
+            .find(|bind| bind.dst == Path::new("/opt/ferrl-verifier/eval.py"))
+            .unwrap();
+        assert_ne!(eval_bind.src, eval);
+        assert!(eval_bind
+            .src
+            .starts_with(format!("/proc/{}/fd", std::process::id())));
+        assert_eq!(std::fs::read(&eval_bind.src).unwrap(), b"# exact eval\n");
+        assert_eq!(
+            spec.binds
+                .iter()
+                .filter(|bind| {
+                    SANDBOX_EVAL_FILES
+                        .iter()
+                        .any(|(_, destination)| bind.dst == Path::new(destination))
+                })
+                .count(),
+            SANDBOX_EVAL_FILES.len()
+        );
+        assets.verify_current().unwrap();
+        drop(reward);
+        drop(assets);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn verifier_assets_are_never_inherited_by_launcher_or_candidate_processes() {
+        use std::os::fd::AsRawFd as _;
+
+        let (root, image, eval, scratch) = verifier_fixture("descriptor-inheritance");
+        let assets = TrimulVerifierAssets::capture(&image, &eval, &scratch).unwrap();
+        let image_flags = rustix::io::fcntl_getfd(&assets.snapshot.image_file).unwrap();
+        assert!(image_flags.contains(rustix::io::FdFlags::CLOEXEC));
+        assert!(assets.snapshot.image_file.as_raw_fd() > 2);
+        for file in &assets.snapshot.sealed_eval_files {
+            assert!(file.file.as_raw_fd() > 2);
+            let flags = rustix::io::fcntl_getfd(&file.file).unwrap();
+            assert!(
+                flags.contains(rustix::io::FdFlags::CLOEXEC),
+                "{} could cross a launcher exec",
+                file.relative_path.display()
+            );
+        }
+
+        drop(assets);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::cognitive_complexity)] // one assertion per sealed invocation asset/boundary
+    fn invocation_verifier_submission_and_specs_stay_sealed_between_phases() {
+        use std::io::Write as _;
+        use std::os::fd::AsRawFd as _;
+
+        let submission = "def custom_kernel(data):\n    return data\n";
+        let test_spec = "seqlen: 8; bs: 1";
+        let bench_spec = "seqlen: 16; bs: 1";
+        let assets = SealedInvocationAssets::capture(submission, test_spec, bench_spec).unwrap();
+        assets.verify().unwrap();
+        assert_eq!(assets.files.len(), 4);
+        assert_eq!(
+            std::fs::read(assets.files[1].0.descriptor_path()).unwrap(),
+            submission.as_bytes()
+        );
+        assert_eq!(
+            std::fs::read(assets.files[2].0.descriptor_path()).unwrap(),
+            test_spec.as_bytes()
+        );
+        assert_eq!(
+            std::fs::read(assets.files[3].0.descriptor_path()).unwrap(),
+            bench_spec.as_bytes()
+        );
+        for (file, destination) in &assets.files {
+            assert!(file.file.as_raw_fd() > 2);
+            assert!(
+                rustix::io::fcntl_getfd(&file.file)
+                    .unwrap()
+                    .contains(rustix::io::FdFlags::CLOEXEC),
+                "{} could cross a launcher exec",
+                file.relative_path.display()
+            );
+            assert!(destination.starts_with("/opt/ferrl-verifier/"));
+            let mut attacker = std::fs::OpenOptions::new()
+                .write(true)
+                .open(file.descriptor_path())
+                .unwrap();
+            let error = attacker
+                .write_all(b"between-phase substitution")
+                .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(1));
+        }
+        assert!(assets
+            .binds()
+            .iter()
+            .all(|bind| bind.mode == crate::sandbox::BindMode::ReadOnly));
+        assets.verify().unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn verifier_assets_reject_in_flight_mutation_between_sandbox_open_and_use() {
+        use std::io::Write as _;
+
+        let (root, image, eval, scratch) = verifier_fixture("in-flight-mutation");
+        let assets = TrimulVerifierAssets::capture(&image, &eval, &scratch).unwrap();
+        let reward = TrimulReward::new(assets.clone(), &scratch);
+        let spec = reward.build_run_spec(&scratch.join("candidate"));
+        assets.verify_current().unwrap();
+
+        let eval_bind = spec
+            .binds
+            .iter()
+            .find(|bind| bind.dst == Path::new("/opt/ferrl-verifier/eval.py"))
+            .unwrap();
+        for (target, expected) in [
+            (spec.image.as_path(), b"exact image".as_slice()),
+            (eval_bind.src.as_path(), b"# exact eval\n".as_slice()),
+        ] {
+            let mut attacker = std::fs::OpenOptions::new()
+                .write(true)
+                .open(target)
+                .unwrap();
+            let error = attacker.write_all(b"# forged verifier\n").unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(1));
+            assert_eq!(std::fs::read(target).unwrap(), expected);
+        }
+        assets.verify_current().unwrap();
+
+        drop(reward);
+        drop(assets);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn verifier_assets_capture_authenticates_contents_after_sealing() {
+        use std::os::unix::fs::FileExt as _;
+
+        let (root, image, eval_dir, _scratch) = verifier_fixture("pre-seal-mutation");
+        let image_error = capture_image_with_hook(&image, |file| {
+            assert_eq!(file.write_at(b"X", 0).unwrap(), 1);
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            image_error.contains("does not match its captured identity"),
+            "{image_error}"
+        );
+
+        let eval = capture_eval_bundle(&eval_dir).unwrap();
+        let eval_error =
+            seal_eval_bundle_with_hook(&eval.files, &eval.identity, |relative_path, file| {
+                if relative_path == Path::new("eval.py") {
+                    assert_eq!(file.write_at(b"X", 0).unwrap(), 1);
+                }
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            eval_error.contains("does not match its captured identity"),
+            "{eval_error}"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn verifier_assets_reject_image_eval_and_task_substitution() {
+        for target in ["image.sif", "eval/eval.py", "eval/task.yml"] {
+            let (root, image, eval, scratch) = verifier_fixture(target);
+            let assets = TrimulVerifierAssets::capture(&image, &eval, &scratch).unwrap();
+            let target = root.join(target);
+            std::fs::write(&target, b"replacement").unwrap();
+            let error = assets.verify_current().unwrap_err().to_string();
+            assert!(
+                error.contains("changed after verifier attestation"),
+                "{}: {error}",
+                target.display()
+            );
+            drop(assets);
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 
     #[test]
@@ -1584,6 +3370,7 @@ mod tests {
                 stdout: "test-count: 4\ntest.0.status: pass\ntest.1.status: pass\ntest-exit: 1\n"
                     .to_string(),
                 stderr: String::new(),
+                ..TrimulEvalOutput::default()
             },
             test_check: Some("fail".to_string()),
             test_exit: Some(1),
@@ -1601,7 +3388,7 @@ mod tests {
                 speedup: Some(4.0),
             },
             status: RunStatus::Exited(0),
-            output: TrimulEvalOutput::default(),
+            output: evidenced_output("", ""),
             test_check: Some("pass".to_string()),
             test_exit: Some(0),
             benchmark_exit: Some(0),
@@ -1635,11 +3422,13 @@ mod tests {
             .with_baseline_ns(1000.0);
         let fast = correct_fast_eval();
         let training_reward = r.reward_from_extracted_eval(&fast);
-        let metadata = r.reward_metadata(
-            "def custom_kernel(data): return data",
-            &fast,
-            training_reward,
-        );
+        let metadata = r
+            .reward_metadata(
+                "def custom_kernel(data): return data",
+                &fast,
+                training_reward,
+            )
+            .unwrap();
         let profile_metadata = &metadata["reward_profile"];
 
         assert_profile_number(profile_metadata, "format_extracted", 0.03);
@@ -1664,6 +3453,36 @@ mod tests {
             reward().with_verifier_parallelism(3).verifier_parallelism,
             3
         );
+    }
+
+    #[test]
+    fn public_verifier_apis_reject_empty_test_or_benchmark_sets_before_launch() {
+        let sample = Sample::new("write a faster TriMul kernel", ());
+        let completion = "```python\ndef custom_kernel(data):\n    return data[0]\n```".to_string();
+        for (configured, expected) in [
+            (
+                reward().with_cases(Vec::new(), vec![case(16, false, Distribution::Normal)]),
+                "at least one correctness case",
+            ),
+            (
+                reward().with_cases(vec![case(8, true, Distribution::Normal)], Vec::new()),
+                "at least one benchmark case",
+            ),
+        ] {
+            let group_error = configured
+                .reward_group_detailed(&sample, std::slice::from_ref(&completion))
+                .unwrap_err()
+                .to_string();
+            assert!(group_error.contains(expected), "{group_error}");
+            let verification_error = configured
+                .verify_submission("def custom_kernel(data):\n    return data[0]\n")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                verification_error.contains(expected),
+                "{verification_error}"
+            );
+        }
     }
 
     #[test]
@@ -1884,6 +3703,7 @@ mod tests {
                 stdout: "test-count: 4\ntest.0.status: pass\ntest.1.status: pass\ntest-exit: 1\n"
                     .to_string(),
                 stderr: String::new(),
+                ..TrimulEvalOutput::default()
             },
             test_check: Some("fail".to_string()),
             test_exit: Some(1),
@@ -2020,6 +3840,299 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn pre_verifier_infrastructure_failure_never_earns_the_format_floor() {
+        let (root, image, eval, scratch) = verifier_fixture("pre-entry-infrastructure");
+        let assets = TrimulVerifierAssets::capture(&image, &eval, &scratch).unwrap();
+        let r = TrimulReward::new(assets, &scratch)
+            .with_cases(
+                vec![case(8, true, Distribution::Normal)],
+                vec![case(16, false, Distribution::Cauchy)],
+            )
+            .with_verifier_executor_socket("/no/such/ferrl-verifier-executor.sock");
+        let sample = Sample::new("write a faster TriMul kernel", ());
+        let completion = "final:\n```python\ndef custom_kernel(data):\n    return data\n```\n";
+
+        let error = r
+            .reward_group_detailed(&sample, &[completion.to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("staged verifier execution failed"),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // phase matrix keeps infrastructure and candidate outcomes adjacent
+    fn verifier_entry_requires_trusted_worker_and_gpu_proof_for_each_phase() {
+        let spec = reward().build_run_spec(Path::new("/tmp/scratch"));
+        assert_eq!(
+            spec.command,
+            vec![
+                "python",
+                "-I",
+                FERRL_EVAL_DRIVER_PATH,
+                TEST_SPEC_PATH,
+                BENCH_SPEC_PATH,
+            ]
+        );
+        assert!(spec.protected_output.is_some());
+        assert!(spec.env.iter().any(
+            |(key, value)| key == "FERRL_GRADE_SOCKET" && value == "/work/.ferrl-grade-v1.sock"
+        ));
+
+        let protect = FERRL_EVAL_DRIVER
+            .find("_prctl(PR_SET_DUMPABLE, 0)")
+            .expect("the grade parent is protected before trusted imports");
+        let trusted_import = FERRL_EVAL_DRIVER
+            .find("import eval as upstream")
+            .expect("the sealed driver imports the attested verifier");
+        let payload = FERRL_EVAL_DRIVER
+            .split_once("def _candidate_payload")
+            .expect("candidate code has a separate payload-process target")
+            .1;
+        let payload = payload
+            .split_once("def _read_parent_pid")
+            .expect("the payload target has a bounded source region")
+            .0;
+        let ready = payload
+            .find("_send_payload(results, b\"READY\")")
+            .expect("the payload process proves CUDA initialization");
+        let ack = payload
+            .find("commands.recv_bytes(MAX_STATUS_BYTES) != b\"ACK-v2\"")
+            .expect("candidate import follows the controller acknowledgement");
+        let traced_entry = payload
+            .find("frame.f_code.co_filename == SUBMISSION_PATH")
+            .expect("entry is observed from the actual submission module frame");
+        let entry_event = payload
+            .find("_send_payload(results, b\"ENTRY\")")
+            .expect("payload announces candidate entry");
+        let entry_ack = payload
+            .find("commands.recv_bytes(MAX_STATUS_BYTES) != ENTRY_ACK")
+            .expect("candidate execution waits for protected-parent entry acknowledgement");
+        let trace_release = payload
+            .find("sys.settrace(None)\n            return None")
+            .expect("candidate tracing is released only after acknowledgement");
+        let candidate_import = payload
+            .find("importlib.import_module(\"submission\")")
+            .expect("candidate import is explicit and deferred");
+        assert!(protect < trusted_import);
+        assert!(ready < ack && ack < traced_entry && traced_entry < candidate_import);
+        assert!(traced_entry < entry_event && entry_event < entry_ack && entry_ack < trace_release);
+        assert!(FERRL_EVAL_DRIVER.contains("multiprocessing.get_context(\"spawn\")"));
+        assert!(FERRL_EVAL_DRIVER.contains("time.perf_counter_ns()"));
+        assert!(FERRL_EVAL_DRIVER.contains("_CHECK_IMPLEMENTATION(data, output)"));
+        assert!(FERRL_EVAL_DRIVER.contains("_CALCULATE_STATS(durations)"));
+        let controller = FERRL_EVAL_DRIVER
+            .split_once("def _candidate_worker")
+            .expect("trusted candidate protocol has a separate controller process")
+            .1
+            .split_once("class CandidateSession")
+            .expect("the controller target has a bounded source region")
+            .0;
+        assert!(!payload.contains("_send_status"));
+        assert!(!payload.contains("outputs.send_bytes"));
+        assert!(!controller.contains("importlib.import_module"));
+        assert!(!controller.contains("kernel(candidate_data)"));
+        assert!(controller.contains(
+            "_send_status(status, b\"IMPORT_ERROR\" if entered else b\"IMPORT_REJECTED\")"
+        ));
+        assert!(controller.contains("if event == b\"IMPORT_REJECTED\" and entered:"));
+        assert!(controller.contains("_send_status(status, b\"IMPORT_CHANNEL_CORRUPTED\")"));
+        assert!(controller.contains("if import_events > MAX_STATUS_EVENTS:"));
+        assert!(controller.contains("payload_commands.send_bytes(acknowledgement)"));
+        assert!(FERRL_EVAL_DRIVER.contains("self.commands.send_bytes(ENTRY_ACK)"));
+        assert!(FERRL_EVAL_DRIVER.contains("self.import_status_events += 1"));
+        assert!(FERRL_EVAL_DRIVER.contains("candidate worker sent duplicate entry"));
+        assert!(FERRL_EVAL_DRIVER.contains("payload-results-channel-v1"));
+        assert!(controller.contains("_send_status(status, b\"OUTPUT_READY\")"));
+        assert!(controller.contains("outputs.send_bytes(payload)"));
+        assert!(payload.contains("_send_payload(results, b\"OUTPUT\", raw_output)"));
+        assert!(payload.contains(
+            "_send_payload(results, b\"IMPORT_ERROR\" if entry_sent else b\"IMPORT_REJECTED\")"
+        ));
+        assert!(FERRL_EVAL_DRIVER.contains("_cpu_clone(value)"));
+        assert!(FERRL_EVAL_DRIVER.contains("torch.frombuffer("));
+        assert!(!FERRL_EVAL_DRIVER.contains("candidate_data, shared_output"));
+        assert!(!FERRL_EVAL_DRIVER.contains("torch.multiprocessing"));
+        assert!(FERRL_EVAL_DRIVER.contains("trusted correctness checker failed"));
+        assert!(!FERRL_EVAL_DRIVER.contains("upstream.run_testing"));
+        assert!(!FERRL_EVAL_DRIVER.contains("multiprocessing.Pool"));
+
+        let execute = FERRL_EVAL_DRIVER
+            .split_once("def execute(self, candidate_data, checked_output):")
+            .expect("the protected parent owns candidate handoff and output capture")
+            .1;
+        let timer = execute
+            .find("started = time.perf_counter_ns()")
+            .expect("protected timing starts explicitly");
+        let handoff = execute
+            .find("self.commands.send_bytes(b\"RUN-v2\\0\" + payload)")
+            .expect("the CPU-only input bytes are handed off explicitly");
+        let private_capture = execute
+            .find("_COPY_TENSOR(checked_output, cpu_output)")
+            .expect("the parent reconstructs a private result from CPU bytes");
+        let elapsed = execute
+            .find("elapsed = time.perf_counter_ns() - started")
+            .expect("timing ends after bounded result receipt");
+        assert!(timer < handoff && handoff < elapsed && elapsed < private_capture);
+        assert!(FERRL_EVAL_DRIVER.contains("_wrap_check(data, checked_output)"));
+        let session = FERRL_EVAL_DRIVER
+            .split_once("class CandidateSession")
+            .expect("the protected parent owns candidate-session classification")
+            .1
+            .split_once("def _wrap_check")
+            .expect("the candidate session has a bounded source region")
+            .0;
+        assert!(session.contains("except CandidateFailure as error:"));
+        assert!(session.contains("if not self.entered:"));
+        assert!(session
+            .contains("self.logger.log(\"ferrl-candidate-rejected\", f\"{self.mode}-import-v1\")"));
+
+        let main = FERRL_EVAL_DRIVER
+            .split_once("def main():")
+            .expect("the sealed driver has one protected main boundary")
+            .1;
+        let grade_connect = main
+            .find("logger = GradeLogger(grade_socket)")
+            .expect("the protected parent opens the only grade endpoint");
+        let candidate_start = main
+            .find("_run_testing(logger, test_cases, isolation_tier, timing_metric)")
+            .expect("candidate test execution is explicit");
+        assert!(grade_connect < candidate_start);
+        assert!(FERRL_EVAL_DRIVER.contains("self.socket.set_inheritable(False)"));
+
+        let missing_runtime = require_trimul_verifier_entry(RunOutcome {
+            status: RunStatus::Exited(0),
+            stdout: "ferrl-entry: test-v4\ncheck: pass\n".to_string(),
+            stderr: "python: not found".to_string(),
+            protected_output: String::new(),
+            wall: Duration::from_millis(1),
+        })
+        .unwrap_err();
+        assert!(matches!(
+            missing_runtime,
+            SandboxError::Infrastructure {
+                status: RunStatus::Exited(0),
+                ref stderr,
+            } if stderr.contains("test verifier did not reach trusted worker/GPU entry")
+                && stderr.contains("python: not found")
+        ));
+
+        let trusted_benchmark_import_failure = require_trimul_verifier_entry(RunOutcome {
+            status: RunStatus::Exited(0),
+            stdout: "candidate forged stdout\n".to_string(),
+            stderr: "ImportError: trusted benchmark dependency".to_string(),
+            protected_output: format!(
+                "ferrl-entry: {TEST_VERIFIER_ENTRY}\ncheck: pass\ntest-exit: 0\n\
+                 {RESULT_SPLIT}\nbenchmark-exit: 1\n"
+            ),
+            wall: Duration::from_millis(1),
+        })
+        .unwrap_err();
+        assert!(matches!(
+            trusted_benchmark_import_failure,
+            SandboxError::Infrastructure {
+                status: RunStatus::Exited(0),
+                ref stderr,
+            } if stderr.contains("benchmark verifier did not reach trusted worker/GPU entry")
+                && stderr.contains("trusted benchmark dependency")
+        ));
+
+        let candidate_failure = require_trimul_verifier_entry(RunOutcome {
+            status: RunStatus::Exited(7),
+            stdout: String::new(),
+            stderr: "candidate failed\n".to_string(),
+            protected_output: format!(
+                "{}\
+                 ferrl-entry: {TEST_VERIFIER_ENTRY}\ntest-exit: 7\n",
+                protected_phase_prelude(),
+            ),
+            wall: Duration::from_millis(1),
+        })
+        .unwrap();
+        assert_eq!(candidate_failure.status, RunStatus::Exited(7));
+
+        let benchmark_candidate_failure = require_trimul_verifier_entry(RunOutcome {
+            status: RunStatus::Exited(0),
+            stdout: String::new(),
+            stderr: "candidate benchmark failed\n".to_string(),
+            protected_output: format!(
+                "{}\
+                 ferrl-entry: {TEST_VERIFIER_ENTRY}\ncheck: pass\ntest-exit: 0\n\
+                 {RESULT_SPLIT}\n{}\
+                 ferrl-entry: {BENCHMARK_VERIFIER_ENTRY}\nbenchmark-exit: 7\n",
+                protected_phase_prelude(),
+                protected_phase_prelude(),
+            ),
+            wall: Duration::from_millis(1),
+        })
+        .unwrap();
+        assert_eq!(benchmark_candidate_failure.status, RunStatus::Exited(0));
+
+        let rejected_candidate = require_trimul_verifier_entry(RunOutcome {
+            status: RunStatus::Exited(0),
+            stdout: String::new(),
+            stderr: String::new(),
+            protected_output: format!(
+                "{}\
+                 ferrl-candidate-rejected: test-import-v1\ncheck: fail\ntest-exit: 112\n",
+                protected_phase_prelude(),
+            ),
+            wall: Duration::from_millis(1),
+        })
+        .unwrap();
+        assert_eq!(rejected_candidate.status, RunStatus::Exited(0));
+
+        for infrastructure in [
+            RunOutcome {
+                status: RunStatus::Exited(0),
+                stdout: String::new(),
+                stderr: "trusted checker failed".to_string(),
+                protected_output: format!(
+                    "ferrl-timing-metric: {TRIMUL_TIMING_METRIC}\n\
+                     ferrl-entry: {TEST_VERIFIER_ENTRY}\n\
+                     ferrl-infrastructure: v1 phase=test\n"
+                ),
+                wall: Duration::from_millis(1),
+            },
+            RunOutcome {
+                status: RunStatus::Exited(TRIMUL_INFRASTRUCTURE_EXIT),
+                stdout: String::new(),
+                stderr: "trusted parent exited".to_string(),
+                protected_output: String::new(),
+                wall: Duration::from_millis(1),
+            },
+            RunOutcome {
+                status: RunStatus::Exited(0),
+                stdout: String::new(),
+                stderr: "trusted statistics failed".to_string(),
+                protected_output: format!(
+                    "ferrl-timing-metric: {TRIMUL_TIMING_METRIC}\n\
+                     ferrl-entry: {TEST_VERIFIER_ENTRY}\ncheck: pass\ntest-exit: 0\n\
+                     {RESULT_SPLIT}\nferrl-timing-metric: {TRIMUL_TIMING_METRIC}\n\
+                     ferrl-entry: {BENCHMARK_VERIFIER_ENTRY}\n\
+                     ferrl-infrastructure: v1 phase=benchmark\n"
+                ),
+                wall: Duration::from_millis(1),
+            },
+        ] {
+            let expected = infrastructure
+                .protected_output
+                .lines()
+                .find(|line| line.trim_start().starts_with("ferrl-infrastructure: v1"))
+                .map_or("reserved exit 114", str::trim)
+                .to_string();
+            assert!(matches!(
+                require_trimul_verifier_entry(infrastructure),
+                Err(SandboxError::Infrastructure { stderr, .. }) if stderr.contains(&expected)
+            ));
+        }
+    }
+
     #[test]
     #[allow(clippy::cognitive_complexity)] // metadata regression intentionally checks each preserved marker
     fn reward_metadata_preserves_source_hash_and_eval_markers() {
@@ -2033,13 +4146,13 @@ mod tests {
                 speedup: Some(1.581_138_830_084_189_8),
             },
             status: RunStatus::Exited(0),
-            output: TrimulEvalOutput {
-                stdout: "check: pass\ntest-exit: 1\n".to_string(),
-                stderr: format!(
+            output: evidenced_output(
+                "check: pass\ntest-exit: 1\n",
+                &format!(
                     "Traceback: candidate crashed\n{}",
                     "x".repeat(EVAL_OUTPUT_TAIL_LIMIT_BYTES + 8)
                 ),
-            },
+            ),
             test_check: Some("pass".to_string()),
             test_exit: Some(1),
             benchmark_exit: None,
@@ -2047,7 +4160,7 @@ mod tests {
         };
 
         let training_reward = r.reward_from_extracted_eval(&eval);
-        let metadata = r.reward_metadata(source, &eval, training_reward);
+        let metadata = r.reward_metadata(source, &eval, training_reward).unwrap();
         assert_eq!(metadata["task"], serde_json::json!("trimul"));
         assert_eq!(
             metadata["reward_scheme"],
@@ -2114,7 +4227,7 @@ mod tests {
                 speedup: Some(2.0),
             },
             status: RunStatus::Exited(0),
-            output: TrimulEvalOutput::default(),
+            output: evidenced_output("", ""),
             test_check: Some("pass".to_string()),
             test_exit: Some(0),
             benchmark_exit: Some(0),
@@ -2122,11 +4235,13 @@ mod tests {
         };
 
         let training_reward = r.reward_from_extracted_eval(&eval);
-        let metadata = r.reward_metadata(
-            "def custom_kernel(data): return data",
-            &eval,
-            training_reward,
-        );
+        let metadata = r
+            .reward_metadata(
+                "def custom_kernel(data): return data",
+                &eval,
+                training_reward,
+            )
+            .unwrap();
         assert_eq!(metadata["sandbox_stdout_len_bytes"], serde_json::json!(0));
         assert_eq!(metadata["sandbox_stderr_len_bytes"], serde_json::json!(0));
         assert_eq!(metadata["training_reward"], serde_json::json!(3.0));
@@ -2146,10 +4261,7 @@ mod tests {
                 speedup: None,
             },
             status: RunStatus::Exited(0),
-            output: TrimulEvalOutput {
-                stdout: "test-exit: 1\n".to_string(),
-                stderr: "RuntimeError: candidate test failed\n".to_string(),
-            },
+            output: evidenced_output("test-exit: 1\n", "RuntimeError: candidate test failed\n"),
             test_check: None,
             test_exit: Some(1),
             benchmark_exit: None,
@@ -2161,11 +4273,13 @@ mod tests {
             Some("trimul:test_process_failed")
         );
         let training_reward = r.reward_from_extracted_eval(&eval);
-        let metadata = r.reward_metadata(
-            "def custom_kernel(data): return data",
-            &eval,
-            training_reward,
-        );
+        let metadata = r
+            .reward_metadata(
+                "def custom_kernel(data): return data",
+                &eval,
+                training_reward,
+            )
+            .unwrap();
         assert_eq!(
             metadata["training_reward"],
             serde_json::json!(RUNNABLE_REWARD)
@@ -2282,12 +4396,14 @@ mod tests {
     #[test]
     fn build_run_spec_binds_eval_readonly_and_scratch_readwrite() {
         let spec = reward().build_run_spec(Path::new("/tmp/scratch"));
-        let eval = spec
-            .binds
-            .iter()
-            .find(|b| b.dst == Path::new("/eval"))
-            .expect("eval bundle is bound");
-        assert_eq!(eval.mode, crate::sandbox::BindMode::ReadOnly);
+        for (_, destination) in SANDBOX_EVAL_FILES {
+            let eval = spec
+                .binds
+                .iter()
+                .find(|bind| bind.dst == Path::new(destination))
+                .expect("each verifier file is bound independently");
+            assert_eq!(eval.mode, crate::sandbox::BindMode::ReadOnly);
+        }
         let work = spec
             .binds
             .iter()
@@ -2298,24 +4414,34 @@ mod tests {
     }
 
     #[test]
-    fn in_container_command_routes_the_grade_to_stdout_and_gates_benchmark() {
-        let cmd = TrimulReward::in_container_command();
-        // Grade -> fd 3 -> the captured stdout pipe; the eval's/candidate's own stdout
-        // is discarded, so a forged file or print cannot influence the score.
-        assert!(cmd.contains("eval.py test test_spec.txt 3>&1 1>/dev/null"));
-        assert!(cmd.contains("eval.py benchmark bench_spec.txt 3>&1 1>/dev/null"));
-        assert!(cmd.contains("if [ \"$test_rc\" -eq 0 ]; then"));
+    fn run_spec_uses_one_protected_driver_and_no_grade_fd_alias() {
+        let spec = reward().build_run_spec(Path::new("/tmp/scratch"));
+        assert_eq!(spec.command[0..3], ["python", "-I", FERRL_EVAL_DRIVER_PATH]);
+        assert_eq!(spec.command[3], TEST_SPEC_PATH);
+        assert_eq!(spec.command[4], BENCH_SPEC_PATH);
+        assert!(spec.protected_output.is_some());
+        assert!(!spec.command.iter().any(|value| value.contains("3>&1")));
+        assert!(!spec.env.iter().any(|(key, _)| key == "POPCORN_FD"));
     }
 
     #[test]
-    fn in_container_command_reports_eval_exit_statuses() {
-        let cmd = TrimulReward::in_container_command();
-        // The shell reports eval process exits on the same controlled grade channel,
-        // so missing grade output can be distinguished from eval process failure.
-        assert!(cmd.contains("test_rc=$?"));
-        assert!(cmd.contains("echo \"test-exit: $test_rc\""));
-        assert!(cmd.contains("bench_rc=$?"));
-        assert!(cmd.contains("echo \"benchmark-exit: $bench_rc\""));
+    fn protected_driver_reports_phase_status_after_candidate_teardown() {
+        assert!(FERRL_EVAL_DRIVER.contains("logger.log(\"test-exit\""));
+        assert!(FERRL_EVAL_DRIVER.contains("logger.log(\"benchmark-exit\""));
+        let preparation = FERRL_EVAL_DRIVER
+            .find("phase = \"preparation\"")
+            .expect("trusted preparation has an infrastructure phase");
+        let trusted_preparation = FERRL_EVAL_DRIVER
+            .find("_prctl(PR_SET_CHILD_SUBREAPER, 1)")
+            .expect("trusted preparation is explicit");
+        assert!(preparation < trusted_preparation);
+        let final_kill = FERRL_EVAL_DRIVER
+            .rfind("_kill_candidate_tree()")
+            .expect("the driver has a final candidate-tree kill");
+        let grade_close = FERRL_EVAL_DRIVER
+            .rfind("logger.close()")
+            .expect("the verifier closes its exclusive grade endpoint");
+        assert!(final_kill < grade_close);
     }
 
     #[test]
@@ -2357,6 +4483,27 @@ mod tests {
                 .unwrap(),
             0.0
         );
+    }
+
+    #[test]
+    fn empty_test_or_benchmark_sets_fail_before_candidate_scoring() {
+        let sample = Sample::new("write a faster TriMul kernel", ());
+        let completion = "Sorry, no code.";
+        let mut no_tests = reward();
+        no_tests.test_cases.clear();
+        let error = no_tests
+            .reward(&sample, completion)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("at least one correctness case"));
+
+        let mut no_benchmarks = reward();
+        no_benchmarks.benchmark_cases.clear();
+        let error = no_benchmarks
+            .reward_group_detailed(&sample, &[completion.to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("at least one benchmark case"));
     }
 
     #[test]
@@ -2594,6 +4741,7 @@ mod tests {
             output: TrimulEvalOutput {
                 stdout: String::new(),
                 stderr: "RuntimeError: mat1 and mat2 shapes cannot be multiplied".to_string(),
+                ..TrimulEvalOutput::default()
             },
             ..base.clone()
         };
@@ -2608,6 +4756,7 @@ mod tests {
                 stdout: String::new(),
                 stderr: "RuntimeError: Expected weight to be of same shape as normalized_shape"
                     .to_string(),
+                ..TrimulEvalOutput::default()
             },
             ..base
         };

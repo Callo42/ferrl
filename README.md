@@ -176,10 +176,16 @@ on a finished run:
 
 ```sh
 cargo build --release            # builds the `ferrl` binary (target/release/ferrl)
-ferrl train --config run.json    # GRPO-train a built-in task; writes a run under runs/
+ferrl train --config run.json
+                                # GRPO-train; writes an identity-bound run under runs/
 ferrl runreport runs/<run-id> --config run.json
                                 # one-glance health summary + configured post-run policy
 ```
+
+`ferrl train` accepts only a binary built from a clean Git tree. The build
+embeds its full source commit and rejects repository-local Cargo or rustup
+configuration shadows from the workspace root through the ferrl member, so the
+launch cannot substitute an operator-supplied revision at runtime.
 
 A `run.json` selects a task, points at a supported model checkpoint, and carries the trainer
 config (only `task`, `model_dir`, and `trainer` are required; everything else has a
@@ -299,13 +305,29 @@ reward curve. Before spending GPU time on a TriMul run, use the
 [TriMul Discovery Run Contract](docs/trimul-discovery-run-contract.md). It defines the
 artifact bundle, provenance fields, same-GPU baseline pin, held-out verification,
 dynamic reward-hacking checks, and the no-win stopping report that the operator audits.
-Set `trainer.candidate_log_top_k` to a positive value for discovery runs so the best
-sampled completions are persisted in `candidates.jsonl`; pass that ledger row's raw
-completion plus its step/prompt/group/rank coordinates to `ferrl trimul-artifact`
-(see the contract for the full command) to extract `submission.py`, re-verify with
-an audit seed, and write the manifest/report. Include `--prompt-copy
-<run-dir>/prompt.txt` so the artifact uses the rendered model prompt frozen at
-training launch; extraction verifies the adjacent `<run-dir>/prompt.sha256`.
+`ferrl train` requires a binary with a clean, exact embedded source commit. The default
+top-level `launch_authentication = "local_ephemeral_v1"` needs no administrator service:
+ferrl integrity-binds the synchronized run identity, complete resolved config,
+model/checkpoint loader identity, exact tokenizer bytes, rendered prompt, selected
+verifier tier and preflight evidence, per-run candidate key, and candidate-ledger
+contract in `launch.json`. This mode detects accidental drift and cross-run row
+substitution, but it is not external authenticity against a process already controlling
+the training account. Set `launch_authentication = "external_attested_v1"` to require
+the protected `/run/ferrl/launch-attestor.sock` service and
+`/etc/ferrl/launch-trust.json` policy before rollout; there is no fallback to local
+authentication. Set `trainer.candidate_log_top_k` to a positive value for discovery
+runs so the best sampled completions are persisted in `candidates.jsonl`; every row
+carries the launch digest, a digest over all candidate fields, and a signature from the
+launch-bound per-run key.
+Promote exactly one row with `ferrl trimul-artifact --run-dir
+<run-dir> --candidate-sha256 <record_sha256> ...`. The extractor validates the whole
+ledger and the external attestation against the protected trust policy, selects that exact row, and derives completion, coordinates, reward, model,
+tokenizer, config, run id, prompt, and training commit from immutable run evidence.
+The artifact bundle retains the exact verified `launch.json` and selected row bytes,
+with hashes for both in `manifest.json`. Local-ephemeral launches and
+`same_uid_apptainer_v1` verifier evidence are valid for training and discovery, but
+`trimul-artifact` rejects them: accepted publication currently requires an externally
+attested launch whose audit runs use `dedicated_uid_service_v1`.
 For rollout-only diagnostics from an external inference runtime, use
 `ferrl trimul-score --config <run.json> --prompt-copy <prompt.txt>
 --completion <raw.txt> --out <scores.jsonl> --score-secret-seed <seed>` (or
@@ -315,11 +337,11 @@ training `trimul.secret_seed`. `trimul-score` records opaque `source_id` values,
 not input file paths; use `--source-label <public-id>` or JSONL `source_id` values
 that are safe to copy into public reports. The default completion contract is strict:
 ferrl scores exactly the completion bytes supplied. For GGUF rollouts served through
-llama.cpp, pass `--completion-normalization llama-cpp` to `trimul-score` and
-`trimul-artifact`; this strips only llama.cpp's trailing `[end of text]` stdout
-sentinel before extraction and records raw and normalized hashes in the score/artifact
-metadata. Then run `ferrl trimul-artifact` only on promising extracted candidates;
-`trimul-score` is diagnostic evidence, not the strict artifact gate.
+llama.cpp, pass `--completion-normalization llama-cpp` to `trimul-score`; this strips
+only llama.cpp's trailing `[end of text]` stdout sentinel before extraction and records
+raw and normalized hashes in score metadata. External scores remain diagnostic
+evidence and are not accepted by `trimul-artifact`, whose input must be one
+launch-bound native candidate row.
 Verifier-backed rewards may also attach `reward_diagnostic` to candidate rows so
 low or zero rewards remain explainable without re-running the whole training step; for
 reward-tail triage, set `candidate_log_top_k` at least as high as `group_size` so every
@@ -333,8 +355,73 @@ the reward ladder: `format_extracted <= runnable` and
 `runnable + partial_correctness <= correctness`; implausibly fast benchmark timings
 remain fail-closed at zero.
 
+The training process retains the SIF, evaluator, submission, and rendered specifications
+in Linux kernel-sealed descriptors. `trimul.verifier_isolation_tier` selects one of two
+non-interchangeable backends, with no fallback:
+
+- `same_uid_apptainer_v1` (default) is the no-admin discovery tier. Ferrl copies and
+  rehashes sealed assets into a fresh directory below a private mode-`0700` work root,
+  creates fresh scratch, and launches an absolute, root-owned, non-writable Apptainer
+  executable as the training UID.
+- `dedicated_uid_service_v1` sends a path-free request and the sealed descriptors over
+  `SCM_RIGHTS` to a protected non-root UID distinct from the training UID. The service
+  authenticates `SO_PEERCRED`, owns staging/scratch, and owns the Apptainer launch.
+
+Every payload launch uses `--userns`, `--containall`, `--no-home`, `--cleanenv`,
+`--no-eval`, `--disable-cache`, `--no-privs`, and `--drop-caps all`; disables
+ambient host/admin binds; and uses a network namespace with no network. The
+candidate payload then installs
+`NoNewPrivs` plus a TSYNC seccomp policy that denies ptrace/process-memory,
+mount/namespace, non-AF_UNIX socket, and other kernel attack surfaces. Launch-time
+preflight evidence and per-run protected hardening records are bound into the launch and
+candidate rows. The same-UID tier is nevertheless **not** a security boundary against an
+arbitrary malicious peer process already running under the same host UID; use a separate
+account/service or externally isolated runner when that threat is in scope.
+
+The verifier parent, protocol controller, and untrusted payload are separate
+non-dumpable processes. Trusted inputs/check storage stay in the verifier parent. Only
+bounded CPU byte strings cross into or out of the payload, so no parent CUDA allocation
+is exported through CUDA IPC. The controller alone owns the trusted status/output
+connections, while the parent owns the clock, exact-size output reconstruction,
+correctness checks, statistics, and the post-launch grade socket. The versioned metrics
+`same-uid-apptainer-latency-v1` and `isolated-service-latency-v1` measure protected
+request handoff through receipt of the candidate's device-to-host result bytes for the
+same-UID and dedicated tiers respectively. They are end-to-end ferrl latency metrics,
+not upstream GPUMODE CUDA-event kernel runtimes. A baseline binds its exact tier and
+preflight-evidence digest; metrics and evidence from different tiers are not comparable.
+
+No administrator setup is required for the default tier. Its work root defaults to
+`<trimul.scratch_root>/.ferrl-verifier`, is created mode `0700`, and must remain owned by
+the training UID. `trimul.verifier_apptainer_bin` may override `/usr/bin/apptainer` with
+another absolute, canonical, root-owned, non-group/world-writable executable.
+
+The optional dedicated tier requires an administrator to pre-create a service-owned,
+non-group-writable socket directory and a mode-`0700` work root beneath ancestors that
+are owned by root or the service UID and grant no group/world write access, then run the
+executor under the dedicated UID (normally through a service manager):
+
+```sh
+ferrl verifier-executor \
+  --socket /run/ferrl/verifier-executor.sock \
+  --work-root /var/lib/ferrl/verifier-executor \
+  --client-uid <training-uid> \
+  --apptainer /usr/bin/apptainer
+```
+
+Set `trimul.verifier_isolation_tier = "dedicated_uid_service_v1"` and optionally
+`trimul.verifier_executor_socket` when deployment uses a non-default socket. The
+socket parent and socket must be owned by the executor UID and grant no world write or
+socket access; the socket parent must not be group-writable, and the work root must
+already be owned by that UID and grant no group/world permissions. The service retains
+the authenticated work root as an open directory descriptor and creates/stages requests
+descriptor-relatively. Executor socket I/O uses deadlines derived from the requested wall
+budget, so a stalled service cannot hold a training rank indefinitely.
+
 ```jsonc
+"launch_authentication": "local_ephemeral_v1",
 "trimul": {
+  "verifier_isolation_tier": "same_uid_apptainer_v1",
+  "verifier_apptainer_bin": "/usr/bin/apptainer",
   "reward": {
     "scheme": "trimul_shaped_v1",
     "format_extracted": 0.02,
@@ -640,7 +727,11 @@ Each training run writes to `runs/<run_id>/`:
 
 ```
 runs/<run_id>/
+├── launch.json       # immutable full launch/run/model/tokenizer/ledger binding
+├── prompt.txt        # exact rendered prompt bytes (TriMul launches)
+├── prompt.sha256     # compatibility digest sidecar for prompt.txt
 ├── config.json       # the trainer config written by the generic Trainer
+├── candidates.jsonl  # optional launch-bound, per-row-digested candidate ledger
 ├── metrics.jsonl     # one JSON object per step:
 │                     #   step, reward_mean, reward_std, frac_reward_zero_std,
 │                     #   kl, clip_ratio, frac_truncated, completion_len,

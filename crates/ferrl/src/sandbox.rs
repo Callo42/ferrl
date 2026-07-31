@@ -16,45 +16,84 @@
 //! unprivileged container runtime on HPC clusters. A run is one
 //! `apptainer exec` of a pinned image with:
 //!
-//! - `--containall` + `--no-home` + `--cleanenv` — private PID/IPC/env
-//!   namespaces and a minimal, read-only rootfs with **no host `$HOME`**, so no
-//!   ambient credentials or SSH keys are reachable;
+//! - `--userns` + `--containall` + `--no-home` + `--cleanenv` — an explicitly
+//!   unprivileged user-namespace launch, private PID/IPC/env namespaces, and a
+//!   minimal, read-only rootfs with **no host `$HOME`**;
+//! - `--no-eval --disable-cache --no-mount home,cwd,hostfs,bind-paths` beneath a
+//!   launcher environment cleared to a fixed operational allow-list, so ambient
+//!   Apptainer variables, configured binds, credentials, and shell evaluation
+//!   cannot alter the requested launch;
 //! - `--net --network none` (the default [`NetworkPolicy`]) — no network, removing
 //!   the exfiltration channel;
 //! - `--nv` only when [`RunSpec::gpu`] is set — GPU passthrough is opt-in;
 //! - read-only / read-write [`Bind`]s for exactly the reference harness and a
 //!   scratch directory, nothing else;
+//! - `--no-privs --drop-caps all` unconditionally removes payload privilege and
+//!   Linux capabilities. Direct [`ApptainerSandbox`] runs accept ordinary host
+//!   paths only; kernel-sealed verifier descriptors must use a staged backend:
+//!   [`crate::verifier_executor::SameUidApptainerSandbox`] copies them into a private
+//!   caller-owned request root, while the dedicated-UID
+//!   [`crate::verifier_executor::VerifierExecutorSandbox`] transfers them with
+//!   `SCM_RIGHTS` and copies them into service-private paths;
 //! - in-image `ulimit`s (CPU, address space, processes, file size), beneath a
 //!   **host-side wall-clock supervisor** that is the final authority on the time
-//!   budget — it kills the run if it overruns, and cannot be evaded from inside
-//!   the container;
+//!   budget — it owns a fresh process group and kills the complete launch tree if
+//!   the run overruns, and cannot be evaded from inside the container;
 //! - optional host-supervised total byte caps for writable binds such as `/work`,
 //!   so many-small-file fills are bounded as well as single large writes;
+//! - an optional post-launch Unix socket accepted only from the spawned process
+//!   tree, so a protected verifier can own machine output without exposing a grade
+//!   descriptor through launcher, init, shell, or untrusted worker processes;
 //! - **bounded output capture** — at most `CAPTURE_CAP` bytes per stream are read
 //!   into host memory, so a payload spewing to stdout cannot exhaust the host;
 //!   past the cap the writer blocks on a full pipe and the supervisor reaps it.
 //!
+//! These controls constrain the launched payload. When staging and Apptainer run
+//! under the caller's UID, they do not isolate it from an arbitrary malicious peer
+//! process already running under that same host UID; the distinct-UID verifier
+//! service is the stronger boundary for that threat.
+//!
 //! ## Testing split (the same shape as [`crate::cuda_compat`])
 //!
-//! The *policy* is pure and fully unit-tested on any machine: [`ApptainerSandbox::build_argv`]
-//! and the in-image-script builder encode every isolation flag and resource cap, and
-//! their tests are **security-invariant regression guards** — they fail if a future
-//! edit drops `--cleanenv`, opens the network, or stops capping processes. The
-//! host-side wall-clock supervisor is tested against a plain subprocess (no
-//! container runtime needed). The proof that Apptainer *actually contains a hostile
-//! payload* — a malicious-probe battery — lives behind the off-by-default `gate`
-//! feature in `tests/sandbox_gate.rs`, run on a cluster node with an isolated
-//! allocation; it is never compiled in CI, just as the GPU tests are not.
+//! The *policy* is pure and fully unit-tested on any machine:
+//! [`ApptainerSandbox::build_argv`] and the
+//! in-image-script builder encode every isolation flag and resource cap. Their tests
+//! are **security-invariant regression guards** — they fail if a future edit drops
+//! `--cleanenv`, restores payload capabilities, accepts a sealed descriptor on the
+//! direct path, or stops capping processes. The host-side wall-clock supervisor is
+//! tested against a plain subprocess (no container runtime needed). The proof that
+//! Apptainer *actually contains a hostile payload* — a malicious-probe battery —
+//! lives behind the off-by-default `gate` feature in `tests/sandbox_gate.rs`, run on
+//! a cluster node with an isolated allocation; it is never compiled in CI, just as
+//! the GPU tests are not.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
-use std::sync::mpsc::{self, Receiver};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc::{self, Receiver},
+    Arc,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
+
+#[cfg(unix)]
+use std::os::unix::{
+    fs::PermissionsExt as _,
+    net::{UnixListener, UnixStream},
+};
+#[cfg(target_os = "linux")]
+use std::{
+    fs::File,
+    mem::MaybeUninit,
+    os::fd::{AsRawFd as _, OwnedFd},
+};
+
 /// How a host path is exposed inside the sandbox.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BindMode {
     /// Mounted read-only — the payload may read but not modify the source.
     ReadOnly,
@@ -73,7 +112,7 @@ impl BindMode {
 }
 
 /// A host directory or file bound into the sandbox at a fixed mount point.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Bind {
     /// Host path to expose.
     pub src: PathBuf,
@@ -130,7 +169,7 @@ impl Bind {
 }
 
 /// Whether the sandbox is given a network.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum NetworkPolicy {
     /// No network: a private network namespace with no interfaces
     /// (`--net --network none`). The default — generated code has no reason to
@@ -149,7 +188,7 @@ pub enum NetworkPolicy {
 /// notably `address_space`, which must usually be `None` for CUDA/GPU payloads,
 /// because the CUDA runtime reserves tens of gigabytes of *virtual* address space
 /// that an address-space cap would wrongly kill.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceLimits {
     /// Wall-clock budget; the host supervisor kills the run when it elapses.
     pub wall: Duration,
@@ -162,6 +201,37 @@ pub struct ResourceLimits {
     pub max_procs: Option<u64>,
     /// Max size a single write may create, in bytes (`ulimit -f`), or `None`.
     pub max_file: Option<u64>,
+}
+
+/// A one-launch machine-grade channel connected only after the protected verifier
+/// is running inside the sandbox.
+///
+/// The host listener is created before launch. The verifier connects through the
+/// sandbox-visible pathname; the supervisor accepts only a peer whose kernel PID is
+/// a descendant of the process it spawned. Launcher, init, and shell processes never
+/// inherit the accepted stream, and the verifier must keep it close-on-exec before
+/// starting untrusted workers. Both paths must be normalized absolute paths to the
+/// same non-empty relative file beneath exactly one read-write [`Bind`]; launch
+/// preflight rejects missing, ambiguous, or mismatched mappings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProtectedOutput {
+    /// Unix-socket pathname in the host scratch tree.
+    pub host_socket: PathBuf,
+    /// The same relative socket as addressed inside the sandbox's matching
+    /// read-write bind.
+    pub sandbox_socket: PathBuf,
+}
+
+impl ProtectedOutput {
+    /// Describe the host and sandbox views of one protected output socket. The
+    /// corresponding [`RunSpec`] is validated before the listener is created.
+    #[must_use]
+    pub fn new(host_socket: impl Into<PathBuf>, sandbox_socket: impl Into<PathBuf>) -> Self {
+        Self {
+            host_socket: host_socket.into(),
+            sandbox_socket: sandbox_socket.into(),
+        }
+    }
 }
 
 impl Default for ResourceLimits {
@@ -180,16 +250,18 @@ impl Default for ResourceLimits {
 
 /// A fully-specified sandboxed run: which image, which command, what is mounted,
 /// and the isolation / resource policy.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunSpec {
     /// The container image — an Apptainer `.sif`, or any reference `apptainer
-    /// exec` accepts.
+    /// exec` accepts. Descriptor-backed images are accepted only by a staged
+    /// verifier backend.
     pub image: PathBuf,
     /// The command + args to run *inside* the sandbox (e.g. `["python",
     /// "/work/eval.py"]`). This is **ferrl-controlled**; untrusted model code is
     /// delivered as a *file* under a [`Bind`], never spliced into this argv.
     pub command: Vec<String>,
-    /// Host directories / files exposed inside, with their modes.
+    /// Host directories / files exposed inside, with their modes. Descriptor-backed
+    /// read-only sources are accepted only by a staged verifier backend.
     pub binds: Vec<Bind>,
     /// Working directory inside the sandbox (`--pwd`).
     pub workdir: PathBuf,
@@ -203,6 +275,9 @@ pub struct RunSpec {
     pub network: NetworkPolicy,
     /// Resource ceilings.
     pub limits: ResourceLimits,
+    /// Optional verifier-only machine-grade channel. Ordinary stdout remains
+    /// untrusted diagnostics when this is present.
+    pub protected_output: Option<ProtectedOutput>,
 }
 
 impl RunSpec {
@@ -219,6 +294,7 @@ impl RunSpec {
             gpu: false,
             network: NetworkPolicy::None,
             limits: ResourceLimits::default(),
+            protected_output: None,
         }
     }
 
@@ -256,10 +332,17 @@ impl RunSpec {
         self.limits = limits;
         self
     }
+
+    /// Add a verifier-only machine-grade channel.
+    #[must_use]
+    pub fn with_protected_output(mut self, output: ProtectedOutput) -> Self {
+        self.protected_output = Some(output);
+        self
+    }
 }
 
 /// How a sandboxed run ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RunStatus {
     /// The command exited on its own with this status code.
     Exited(i32),
@@ -282,14 +365,18 @@ impl RunStatus {
 /// A host path whose total disk usage is capped during a sandboxed run.
 #[derive(Debug, Clone)]
 struct ScratchLimit {
-    /// Host path to monitor.
+    /// Host path retained for diagnostics and non-Linux fallback traversal.
+    #[cfg(not(target_os = "linux"))]
     path: PathBuf,
+    /// Directory identity captured before the untrusted process starts.
+    #[cfg(target_os = "linux")]
+    directory: Arc<OwnedFd>,
     /// Maximum total bytes allowed beneath `path`.
     bytes: u64,
 }
 
 /// The result of a sandboxed run: how it ended, plus its captured output.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunOutcome {
     /// How the run ended.
     pub status: RunStatus,
@@ -297,40 +384,59 @@ pub struct RunOutcome {
     pub stdout: String,
     /// Captured standard error (UTF-8 lossy).
     pub stderr: String,
+    /// Bytes received from the verifier-only protected channel. Untrusted stdout
+    /// is never promoted into this field.
+    pub protected_output: String,
     /// Wall-clock time the run took.
     pub wall: Duration,
 }
 
 /// Error from attempting a sandboxed run.
 ///
-/// A non-zero exit, a timeout, or an OOM is **not** an error — those are normal
-/// [`RunOutcome`]s a reward interprets. An error here means the run could not be
-/// carried out at all: the sandbox binary could not be spawned, or an OS I/O
-/// failure occurred while supervising it.
+/// After the trusted verifier-entry boundary, a non-zero exit, timeout, or OOM is
+/// a normal [`RunOutcome`] a reward interprets. The same termination before entry
+/// is an infrastructure error because no candidate result was produced.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum SandboxError {
+    /// Host paths or launch configuration violate sandbox preflight.
+    #[error("invalid sandbox run specification: {0}")]
+    InvalidSpec(String),
     /// The sandbox process could not be spawned (e.g. `apptainer` not on `PATH`).
     #[error("failed to spawn sandbox process: {0}")]
     Spawn(#[source] std::io::Error),
     /// An OS error occurred while supervising the run.
     #[error("sandbox supervision failed: {0}")]
     Supervise(#[source] std::io::Error),
+    /// The wrapper or container runtime failed before the trusted in-container
+    /// verifier command was entered. This is an infrastructure failure, never a
+    /// low-quality candidate result.
+    #[error("sandbox infrastructure failed before verifier entry ({status:?}): {stderr}")]
+    Infrastructure {
+        /// How the pre-entry wrapper terminated.
+        status: RunStatus,
+        /// Bounded wrapper/runtime diagnostics with the entry token removed.
+        stderr: String,
+    },
+    /// A staged verifier backend rejected or could not complete the request.
+    #[error("staged verifier execution failed: {0}")]
+    Executor(String),
 }
 
 /// A backend that runs a [`RunSpec`] under isolation and returns its [`RunOutcome`].
 ///
-/// The one production implementation is [`ApptainerSandbox`]. The trait is the seam
-/// a reward verifier depends on, so the reward path can be exercised in tests with
-/// a fake runner that needs no container runtime.
+/// Production verifier rewards use one of the staged backends in
+/// [`crate::verifier_executor`]; direct path-backed tools may use
+/// [`ApptainerSandbox`]. The trait keeps reward policy separate from either launch
+/// mechanism.
 pub trait Sandbox {
     /// Run `spec` to completion, or until its wall-clock budget elapses.
     ///
     /// # Errors
     ///
-    /// Returns [`SandboxError`] only if the run could not be carried out — never
-    /// for a non-zero exit, a timeout, or a resource kill, which are reported as
-    /// [`RunOutcome`]s.
+    /// Returns [`SandboxError`] if the run could not reach the trusted verifier
+    /// entry boundary. After entry, non-zero exits, timeouts, and resource kills
+    /// are reported as [`RunOutcome`]s.
     fn run(&self, spec: &RunSpec) -> Result<RunOutcome, SandboxError>;
 }
 
@@ -372,12 +478,26 @@ impl ApptainerSandbox {
     #[must_use]
     pub fn build_argv(&self, spec: &RunSpec) -> Vec<String> {
         let mut argv: Vec<String> = vec!["exec".into()];
+        // Force the unprivileged user-namespace path even when the installed
+        // Apptainer also has a setuid launcher. Unsupported kernels/runtimes fail
+        // before the verifier-entry marker instead of silently weakening the run.
+        argv.push("--userns".into());
         // Strong isolation: private PID/IPC/env namespaces + a minimal, read-only
         // rootfs, and crucially no host `$HOME` — so credentials and keys cannot
-        // be read. These three are unconditional.
+        // be read. These are unconditional.
         argv.push("--containall".into());
         argv.push("--no-home".into());
         argv.push("--cleanenv".into());
+        // Do not evaluate image/host environment values through Apptainer's
+        // embedded shell, consult its cache, or accept ambient CWD/hostfs/admin
+        // bind entries. Ferrl's explicit --bind arguments remain authoritative.
+        argv.push("--no-eval".into());
+        argv.push("--disable-cache".into());
+        argv.push("--no-mount".into());
+        argv.push("home,cwd,hostfs,bind-paths".into());
+        argv.push("--no-privs".into());
+        argv.push("--drop-caps".into());
+        argv.push("all".into());
         if spec.gpu {
             argv.push("--nv".into());
         }
@@ -405,57 +525,295 @@ impl ApptainerSandbox {
         argv.push(in_container_script(spec));
         argv
     }
+
+    /// Build the direct path-backed host command.
+    fn build_host_command(&self, spec: &RunSpec) -> Command {
+        let mut command = Command::new(&self.bin);
+        command.args(self.build_argv(spec));
+        // `--cleanenv` applies to the container payload, not to the Apptainer
+        // launcher itself. Clear APPTAINER_BIND*, APPTAINER_MOUNT,
+        // APPTAINERENV_*, SINGULARITY_*, LD_*, proxy, credential, and scheduler
+        // variables rather than letting ambient process state alter the launch.
+        // CUDA selection remains explicit in RunSpec::env via --env.
+        command.env_clear().envs([
+            (
+                "PATH",
+                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            ),
+            ("LANG", "C"),
+            ("LC_ALL", "C"),
+            ("HOME", "/nonexistent"),
+            ("TMPDIR", "/tmp"),
+        ]);
+        command
+    }
 }
 
 impl Sandbox for ApptainerSandbox {
     fn run(&self, spec: &RunSpec) -> Result<RunOutcome, SandboxError> {
-        let mut command = Command::new(&self.bin);
-        command.args(self.build_argv(spec));
-        let scratch_limits = scratch_limits(spec);
-        supervise(command, spec.limits.wall, &scratch_limits)
+        validate_direct_apptainer_spec(spec)?;
+        validate_protected_output_mapping(spec)?;
+        let protected = ProtectedOutputListener::bind(spec.protected_output.as_ref())?;
+        let command = self.build_host_command(spec);
+        let scratch_limits = scratch_limits(spec)?;
+        supervise_with_protected_output(
+            command,
+            spec.limits.wall,
+            &scratch_limits,
+            EntryProtocol::Required,
+            protected,
+        )
+    }
+}
+
+pub(crate) fn is_owned_descriptor_path(path: &Path) -> bool {
+    let Some(path) = path.to_str() else {
+        return false;
+    };
+    let prefix = format!("/proc/{}/fd/", std::process::id());
+    path.strip_prefix(&prefix)
+        .and_then(|value| value.parse::<u32>().ok())
+        .is_some_and(|fd| fd > 2)
+}
+
+fn validate_direct_apptainer_spec(spec: &RunSpec) -> Result<(), SandboxError> {
+    let descriptor = std::iter::once(("sandbox image", spec.image.as_path())).chain(
+        spec.binds
+            .iter()
+            .map(|bind| ("bind source", bind.src.as_path())),
+    );
+    if let Some((label, path)) = descriptor
+        .into_iter()
+        .find(|(_, path)| is_owned_descriptor_path(path))
+    {
+        return Err(SandboxError::InvalidSpec(format!(
+            "{label} {} is descriptor-backed; sealed verifier assets require SameUidApptainerSandbox or VerifierExecutorSandbox",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProtectedOutputMapping {
+    pub(crate) bind_index: usize,
+    pub(crate) relative_path: PathBuf,
+}
+
+pub(crate) fn validate_protected_output_mapping(
+    spec: &RunSpec,
+) -> Result<Option<ProtectedOutputMapping>, SandboxError> {
+    let Some(output) = &spec.protected_output else {
+        return Ok(None);
+    };
+    for (label, path) in [
+        ("protected output host socket", output.host_socket.as_path()),
+        (
+            "protected output sandbox socket",
+            output.sandbox_socket.as_path(),
+        ),
+    ] {
+        if !is_normal_absolute(path) {
+            return Err(SandboxError::InvalidSpec(format!(
+                "{label} must be an absolute path without '.' or '..': {}",
+                path.display()
+            )));
+        }
+    }
+
+    let mut matches = spec
+        .binds
+        .iter()
+        .enumerate()
+        .filter(|(_, bind)| bind.mode == BindMode::ReadWrite)
+        .filter_map(|(index, bind)| {
+            if !is_normal_absolute(&bind.src) || !is_normal_absolute(&bind.dst) {
+                return None;
+            }
+            let host_relative = output.host_socket.strip_prefix(&bind.src).ok()?;
+            let sandbox_relative = output.sandbox_socket.strip_prefix(&bind.dst).ok()?;
+            (host_relative == sandbox_relative).then(|| ProtectedOutputMapping {
+                bind_index: index,
+                relative_path: host_relative.to_path_buf(),
+            })
+        });
+    let mapping = matches.next().ok_or_else(|| {
+        SandboxError::InvalidSpec(
+            "protected output socket does not map through a read-write bind".to_string(),
+        )
+    })?;
+    if matches.next().is_some() {
+        return Err(SandboxError::InvalidSpec(
+            "protected output socket maps through more than one read-write bind".to_string(),
+        ));
+    }
+    if mapping.relative_path.as_os_str().is_empty() {
+        return Err(SandboxError::InvalidSpec(
+            "protected output socket must name a file beneath its read-write bind".to_string(),
+        ));
+    }
+    Ok(Some(mapping))
+}
+
+fn is_normal_absolute(path: &Path) -> bool {
+    path.is_absolute()
+        && path.components().all(|component| {
+            matches!(
+                component,
+                std::path::Component::RootDir | std::path::Component::Normal(_)
+            )
+        })
+}
+
+#[cfg(unix)]
+struct ProtectedOutputListener {
+    listener: UnixListener,
+    #[cfg(target_os = "linux")]
+    _parent: File,
+}
+
+#[cfg(unix)]
+impl ProtectedOutputListener {
+    fn bind(output: Option<&ProtectedOutput>) -> Result<Option<Self>, SandboxError> {
+        let Some(output) = output else {
+            return Ok(None);
+        };
+        if !output.host_socket.is_absolute() || !output.sandbox_socket.is_absolute() {
+            return Err(SandboxError::InvalidSpec(
+                "protected output socket paths must be absolute".to_string(),
+            ));
+        }
+        if output.host_socket.exists() {
+            return Err(SandboxError::InvalidSpec(format!(
+                "protected output socket already exists: {}",
+                output.host_socket.display()
+            )));
+        }
+        #[cfg(target_os = "linux")]
+        let (listener, parent) = bind_protected_listener(&output.host_socket)?;
+        #[cfg(all(unix, not(target_os = "linux")))]
+        let listener = UnixListener::bind(&output.host_socket).map_err(SandboxError::Supervise)?;
+        std::fs::set_permissions(&output.host_socket, std::fs::Permissions::from_mode(0o600))
+            .map_err(SandboxError::Supervise)?;
+        listener
+            .set_nonblocking(true)
+            .map_err(SandboxError::Supervise)?;
+        Ok(Some(Self {
+            listener,
+            #[cfg(target_os = "linux")]
+            _parent: parent,
+        }))
+    }
+}
+
+/// Bind through an open parent-directory descriptor so `sockaddr_un::sun_path`
+/// never receives an arbitrarily long configured scratch path. The socket is still
+/// created at `path`, while the retained directory keeps that descriptor path valid
+/// for the listener lifetime.
+#[cfg(target_os = "linux")]
+fn bind_protected_listener(path: &Path) -> Result<(UnixListener, File), SandboxError> {
+    let parent_path = path.parent().ok_or_else(|| {
+        SandboxError::InvalidSpec("protected output socket has no parent directory".to_string())
+    })?;
+    let name = path.file_name().ok_or_else(|| {
+        SandboxError::InvalidSpec("protected output socket has no file name".to_string())
+    })?;
+    let parent = File::open(parent_path).map_err(SandboxError::Supervise)?;
+    let descriptor_path = PathBuf::from("/proc/self/fd")
+        .join(parent.as_raw_fd().to_string())
+        .join(name);
+    let listener = UnixListener::bind(descriptor_path).map_err(SandboxError::Supervise)?;
+    Ok((listener, parent))
+}
+
+#[cfg(not(unix))]
+struct ProtectedOutputListener;
+
+#[cfg(not(unix))]
+impl ProtectedOutputListener {
+    fn bind(output: Option<&ProtectedOutput>) -> Result<Option<Self>, SandboxError> {
+        if output.is_some() {
+            return Err(SandboxError::InvalidSpec(
+                "protected output sockets require Unix".to_string(),
+            ));
+        }
+        Ok(None)
     }
 }
 
 /// Extract writable bind limits from the run spec.
-fn scratch_limits(spec: &RunSpec) -> Vec<ScratchLimit> {
+fn scratch_limits(spec: &RunSpec) -> Result<Vec<ScratchLimit>, SandboxError> {
     spec.binds
         .iter()
         .filter_map(|bind| {
             (bind.mode == BindMode::ReadWrite)
                 .then_some(bind.total_limit)
                 .flatten()
-                .map(|bytes| ScratchLimit {
-                    path: bind.src.clone(),
-                    bytes,
-                })
+                .map(|bytes| open_scratch_limit(&bind.src, bytes))
         })
         .collect()
 }
 
+fn open_scratch_limit(path: &Path, bytes: u64) -> Result<ScratchLimit, SandboxError> {
+    #[cfg(target_os = "linux")]
+    let directory = rustix::fs::openat(
+        rustix::fs::CWD,
+        path,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|error| {
+        SandboxError::InvalidSpec(format!(
+            "could not anchor writable bind {} for scratch accounting: {error}",
+            path.display()
+        ))
+    })?;
+    Ok(ScratchLimit {
+        #[cfg(not(target_os = "linux"))]
+        path: path.to_path_buf(),
+        #[cfg(target_os = "linux")]
+        directory: Arc::new(directory),
+        bytes,
+    })
+}
+
 /// The `bash -c` script run *inside* the image: apply the requested `ulimit`s, then
-/// `exec` the command. Each `ulimit` is `|| true` so a shell lacking one option does
-/// not abort an otherwise-benign run; the malicious-probe gate verifies the caps that
-/// matter are actually enforced. The wall-clock budget is **not** enforced here — the
-/// host-side supervisor owns it, so an in-container process cannot evade it.
+/// `exec` the command. A requested limit is mandatory: if the image shell cannot
+/// install it, the shell exits before the verifier-entry marker and the run is an
+/// infrastructure failure rather than silently running with a weaker policy. The
+/// wall-clock budget is **not** enforced here — the host-side supervisor owns it, so
+/// an in-container process cannot evade it.
 fn in_container_script(spec: &RunSpec) -> String {
     let limits = &spec.limits;
-    let mut script = String::new();
+    let mut script = String::from("umask 077; ");
     if let Some(cpu) = limits.cpu {
-        script.push_str(&format!("ulimit -t {} || true; ", cpu.as_secs().max(1)));
+        script.push_str(&format!("ulimit -t {} || exit 114; ", cpu.as_secs().max(1)));
     }
     if let Some(bytes) = limits.address_space {
-        script.push_str(&format!("ulimit -v {} || true; ", bytes / 1024));
+        script.push_str(&format!("ulimit -v {} || exit 114; ", bytes / 1024));
     }
     if let Some(procs) = limits.max_procs {
-        script.push_str(&format!("ulimit -u {procs} || true; "));
+        script.push_str(&format!("ulimit -u {procs} || exit 114; "));
     }
     if let Some(bytes) = limits.max_file {
-        script.push_str(&format!("ulimit -f {} || true; ", bytes / 1024));
+        script.push_str(&format!("ulimit -f {} || exit 114; ", bytes / 1024));
     }
     let quoted: Vec<String> = spec.command.iter().map(|word| shell_quote(word)).collect();
-    script.push_str(&format!("exec {}", quoted.join(" ")));
+    script.push_str(&format!(
+        "printf '%s\\n' '{}' >&2; exec {}",
+        SANDBOX_ENTRY_MARKER,
+        quoted.join(" ")
+    ));
     script
 }
+
+/// Written by the trusted in-image shell immediately before it execs the
+/// verifier command. Its absence proves that a launcher/runtime failure occurred
+/// before candidate evaluation began.
+const SANDBOX_ENTRY_MARKER: &str = "ferrl-sandbox-verifier-entry-v1";
 
 /// POSIX single-quote `word` so it is one literal shell word (a literal single
 /// quote becomes `'\''`). The command is ferrl-controlled, but quoting keeps paths
@@ -474,83 +832,647 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// pipe open, so the supervisor returns promptly instead of blocking on it.
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
-/// Largest captured stream kept per pipe (8 MiB). Untrusted output is otherwise
+/// Largest captured stream kept per pipe (1 MiB). Untrusted output is otherwise
 /// unbounded — a payload spewing to stdout could exhaust host memory well within the
 /// wall budget — so each drain stops reading here and drops the pipe, leaving the
 /// writer to block on a full pipe (then be reaped by the wall-clock supervisor). The
-/// eval's machine-read *result* travels via a bound output file, not this log stream.
-const CAPTURE_CAP: usize = 8 << 20;
+/// eval's machine-read *result* travels via the verifier-only protected channel,
+/// not this log stream.
+pub(crate) const CAPTURE_CAP: usize = 1 << 20;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryProtocol {
+    #[cfg(test)]
+    NotRequired,
+    Required,
+}
+
+#[cfg(unix)]
+struct ProtectedDrain {
+    receiver: Option<Receiver<Vec<u8>>>,
+    stop: Option<Arc<AtomicBool>>,
+}
+
+#[cfg(unix)]
+impl ProtectedDrain {
+    fn start(listener: Option<ProtectedOutputListener>, root_pid: u32, deadline: Duration) -> Self {
+        let (sender, receiver) = mpsc::channel();
+        let Some(listener) = listener else {
+            let _ = sender.send(Vec::new());
+            return Self {
+                receiver: Some(receiver),
+                stop: None,
+            };
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        thread::spawn(move || {
+            let bytes =
+                receive_protected_output(&listener.listener, root_pid, deadline, &thread_stop);
+            let _ = sender.send(bytes);
+        });
+        Self {
+            receiver: Some(receiver),
+            stop: Some(stop),
+        }
+    }
+
+    fn finish(mut self) -> String {
+        let output = self
+            .receiver
+            .take()
+            .map_or_else(String::new, |receiver| collect_output(&receiver));
+        if let Some(stop) = &self.stop {
+            stop.store(true, Ordering::Release);
+        }
+        output
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ProtectedDrain {
+    fn drop(&mut self) {
+        if let Some(stop) = &self.stop {
+            stop.store(true, Ordering::Release);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn receive_protected_output(
+    listener: &UnixListener,
+    root_pid: u32,
+    deadline: Duration,
+    stop: &AtomicBool,
+) -> Vec<u8> {
+    let started = Instant::now();
+    while !stop.load(Ordering::Acquire) && started.elapsed() < deadline {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                if protected_peer_pid(&stream)
+                    .is_some_and(|pid| process_descends_from(pid, root_pid))
+                {
+                    return read_protected_stream(stream, stop);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => return Vec::new(),
+        }
+    }
+    Vec::new()
+}
+
+#[cfg(target_os = "linux")]
+fn protected_peer_pid(stream: &UnixStream) -> Option<u32> {
+    let raw_pid = rustix::net::sockopt::socket_peercred(stream)
+        .ok()?
+        .pid
+        .as_raw_pid();
+    u32::try_from(raw_pid).ok()
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn protected_peer_pid(_stream: &UnixStream) -> Option<u32> {
+    None
+}
+
+#[cfg(unix)]
+fn read_protected_stream(mut stream: UnixStream, stop: &AtomicBool) -> Vec<u8> {
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+    let mut bytes = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    while bytes.len() < CAPTURE_CAP && !stop.load(Ordering::Acquire) {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => bytes.extend_from_slice(&chunk[..read.min(CAPTURE_CAP - bytes.len())]),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) => {}
+            Err(_) => break,
+        }
+    }
+    bytes
+}
+
+#[cfg(unix)]
+fn process_descends_from(mut pid: u32, root_pid: u32) -> bool {
+    for _ in 0..256 {
+        if pid == root_pid {
+            return true;
+        }
+        let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+            return false;
+        };
+        let Some(parent) = status
+            .lines()
+            .find_map(|line| line.strip_prefix("PPid:\t"))
+            .and_then(|value| value.trim().parse::<u32>().ok())
+        else {
+            return false;
+        };
+        if parent == 0 || parent == pid {
+            return false;
+        }
+        pid = parent;
+    }
+    false
+}
+
+#[cfg(not(unix))]
+struct ProtectedDrain;
+
+#[cfg(not(unix))]
+impl ProtectedDrain {
+    fn start(
+        _listener: Option<ProtectedOutputListener>,
+        _root_pid: u32,
+        _deadline: Duration,
+    ) -> Self {
+        Self
+    }
+
+    fn finish(self) -> String {
+        String::new()
+    }
+}
 
 /// Spawn `command`, drain its stdout/stderr concurrently, and enforce `deadline`
 /// (wall-clock) by killing the process if it overruns. The concurrent drain avoids
 /// the classic pipe-buffer deadlock; the kill is the final authority over a runaway.
+#[cfg(test)]
 fn supervise(
+    command: Command,
+    deadline: Duration,
+    scratch_limits: &[ScratchLimit],
+    entry_protocol: EntryProtocol,
+) -> Result<RunOutcome, SandboxError> {
+    supervise_with_post_spawn_hook_and_protected_output(
+        command,
+        deadline,
+        scratch_limits,
+        entry_protocol,
+        None,
+        |_| Ok(()),
+    )
+}
+
+fn supervise_with_protected_output(
+    command: Command,
+    deadline: Duration,
+    scratch_limits: &[ScratchLimit],
+    entry_protocol: EntryProtocol,
+    protected_output: Option<ProtectedOutputListener>,
+) -> Result<RunOutcome, SandboxError> {
+    supervise_with_post_spawn_hook_and_protected_output(
+        command,
+        deadline,
+        scratch_limits,
+        entry_protocol,
+        protected_output,
+        |_| Ok(()),
+    )
+}
+
+#[cfg(test)]
+fn supervise_with_post_spawn_hook(
+    command: Command,
+    deadline: Duration,
+    scratch_limits: &[ScratchLimit],
+    entry_protocol: EntryProtocol,
+    post_spawn: impl FnOnce(u32) -> std::io::Result<()>,
+) -> Result<RunOutcome, SandboxError> {
+    supervise_with_post_spawn_hook_and_protected_output(
+        command,
+        deadline,
+        scratch_limits,
+        entry_protocol,
+        None,
+        post_spawn,
+    )
+}
+
+fn supervise_with_post_spawn_hook_and_protected_output(
     mut command: Command,
     deadline: Duration,
     scratch_limits: &[ScratchLimit],
+    entry_protocol: EntryProtocol,
+    protected_output: Option<ProtectedOutputListener>,
+    post_spawn: impl FnOnce(u32) -> std::io::Result<()>,
 ) -> Result<RunOutcome, SandboxError> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    configure_process_tree(&mut command);
     let start = Instant::now();
-    let mut child = command.spawn().map_err(SandboxError::Spawn)?;
-    let out = drain(child.stdout.take());
-    let err = drain(child.stderr.take());
+    let child = command.spawn().map_err(SandboxError::Spawn)?;
+    let mut child = ProcessTreeGuard::new(child);
+    post_spawn(child.id()).map_err(SandboxError::Supervise)?;
+    let out = drain(child.child_mut().stdout.take());
+    let err = drain(child.child_mut().stderr.take());
+    let protected = ProtectedDrain::start(protected_output, child.id(), deadline);
+    let scratch_monitor = ScratchMonitor::start(scratch_limits);
 
     let mut timed_out = false;
     let mut scratch_exceeded = false;
     let status = loop {
-        if let Some(status) = child.try_wait().map_err(SandboxError::Supervise)? {
+        if let Some(status) = child
+            .child_mut()
+            .try_wait()
+            .map_err(SandboxError::Supervise)?
+        {
+            // A launcher may exit while a descendant still holds output pipes,
+            // descriptors, or its mount namespace. Reap the residual group on
+            // every terminal path, not only timeout/scratch enforcement.
+            child.terminate_residuals();
+            scratch_monitor.stop();
             scratch_exceeded = scratch_over_limit(scratch_limits);
+            child.disarm();
             break status;
         }
         if start.elapsed() >= deadline {
-            let _ = child.kill();
             timed_out = true;
-            break child.wait().map_err(SandboxError::Supervise)?;
+            break child
+                .terminate_and_wait()
+                .map_err(SandboxError::Supervise)?;
         }
-        if scratch_over_limit(scratch_limits) {
-            let _ = child.kill();
+        if scratch_monitor.over_limit() {
             scratch_exceeded = true;
-            break child.wait().map_err(SandboxError::Supervise)?;
+            break child
+                .terminate_and_wait()
+                .map_err(SandboxError::Supervise)?;
         }
         thread::sleep(POLL_INTERVAL);
     };
+    scratch_monitor.stop();
 
+    let status = classify_exit(status, timed_out, scratch_exceeded);
+    let stdout = collect_output(&out);
+    let mut stderr = collect_output(&err);
+    let protected_output = protected.finish();
+    if entry_protocol == EntryProtocol::Required && !consume_entry_marker(&mut stderr) {
+        return Err(SandboxError::Infrastructure { status, stderr });
+    }
     Ok(RunOutcome {
-        status: classify_exit(status, timed_out, scratch_exceeded),
-        stdout: collect_output(&out),
-        stderr: collect_output(&err),
+        status,
+        stdout,
+        stderr,
+        protected_output,
         wall: start.elapsed(),
     })
 }
 
-/// `true` if any monitored path's current tree size is over its cap. Missing
-/// paths count as empty, but other I/O errors fail closed: a payload should not
-/// be able to hide scratch usage by changing permissions or racing traversal.
-fn scratch_over_limit(limits: &[ScratchLimit]) -> bool {
-    limits
-        .iter()
-        .any(|limit| dir_size(&limit.path).map_or(true, |bytes| bytes > limit.bytes))
+/// Armed immediately after spawn. Any subsequent error or unwind kills the
+/// complete process group and waits for its leader before stack unwinding can
+/// release retained sealed descriptors or the protected verifier channel unsafely.
+struct ProcessTreeGuard {
+    child: Child,
+    armed: bool,
 }
 
-/// Total bytes used by `path`, summing regular files and directory entries without
-/// following symlinks.
-fn dir_size(path: &Path) -> std::io::Result<u64> {
-    let meta = match std::fs::symlink_metadata(path) {
-        Ok(meta) => meta,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(err) => return Err(err),
+impl ProcessTreeGuard {
+    fn new(child: Child) -> Self {
+        Self { child, armed: true }
+    }
+
+    fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+
+    fn terminate_residuals(&mut self) {
+        terminate_process_tree(&mut self.child);
+    }
+
+    fn terminate_and_wait(&mut self) -> std::io::Result<ExitStatus> {
+        self.terminate_residuals();
+        let status = self.child.wait()?;
+        self.armed = false;
+        Ok(status)
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ProcessTreeGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.terminate_residuals();
+            let _ = self.child.wait();
+            self.armed = false;
+        }
+    }
+}
+
+/// Give every launch a fresh process group before `exec`. The process group catches
+/// launcher/container descendants; Apptainer's unconditional `--containall` PID
+/// namespace closes the setsid/session escape path when its namespace init is killed.
+#[cfg(unix)]
+fn configure_process_tree(command: &mut Command) {
+    use std::os::unix::process::CommandExt as _;
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_process_tree(_command: &mut Command) {}
+
+#[cfg(unix)]
+fn terminate_process_tree(child: &mut std::process::Child) {
+    if let Ok(raw_pid) = i32::try_from(child.id()) {
+        if let Some(pid) = rustix::process::Pid::from_raw(raw_pid) {
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+        }
+    }
+    // The direct kill is a race-safe fallback if the child exited or changed
+    // process-group state between observation and the group signal.
+    let _ = child.kill();
+}
+
+#[cfg(not(unix))]
+fn terminate_process_tree(child: &mut std::process::Child) {
+    let _ = child.kill();
+}
+
+fn consume_entry_marker(stderr: &mut String) -> bool {
+    let token = format!("{SANDBOX_ENTRY_MARKER}\n");
+    let Some(offset) = stderr.find(&token) else {
+        return false;
     };
-    if !meta.is_dir() {
-        return Ok(meta.len());
+    stderr.replace_range(offset..offset + token.len(), "");
+    true
+}
+
+const SCRATCH_SCAN_ENTRY_BUDGET: usize = 16_384;
+const SCRATCH_SCAN_DEPTH_BUDGET: usize = 64;
+const SCRATCH_SCAN_TIME_BUDGET: Duration = Duration::from_millis(100);
+
+struct ScratchMonitor {
+    stop: Arc<AtomicBool>,
+    exceeded: Receiver<()>,
+    enabled: bool,
+}
+
+impl ScratchMonitor {
+    fn start(limits: &[ScratchLimit]) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (sender, exceeded) = mpsc::channel();
+        let enabled = !limits.is_empty();
+        if enabled {
+            let limits = limits.to_vec();
+            let monitor_stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                while !monitor_stop.load(Ordering::Acquire) {
+                    if scratch_over_limit_with_stop(&limits, &monitor_stop) {
+                        let _ = sender.send(());
+                        return;
+                    }
+                    thread::sleep(POLL_INTERVAL);
+                }
+            });
+        }
+        Self {
+            stop,
+            exceeded,
+            enabled,
+        }
     }
-    let mut total = meta.len();
-    for entry in std::fs::read_dir(path)? {
-        total = total.saturating_add(dir_size(&entry?.path())?);
+
+    fn over_limit(&self) -> bool {
+        match self.exceeded.try_recv() {
+            Ok(()) => true,
+            Err(mpsc::TryRecvError::Empty) => false,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.enabled && !self.stop.load(Ordering::Acquire)
+            }
+        }
     }
-    Ok(total)
+
+    fn stop(&self) {
+        self.stop.store(true, Ordering::Release);
+    }
+}
+
+impl Drop for ScratchMonitor {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// `true` if a monitored tree exceeds its byte cap or cannot be proven within
+/// strict traversal budgets. The scan runs off the wall-clock supervisor thread;
+/// blocking filesystem work can therefore never defer process-tree termination.
+fn scratch_over_limit(limits: &[ScratchLimit]) -> bool {
+    let limits = limits.to_vec();
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let exceeded = scratch_over_limit_with_stop(&limits, &AtomicBool::new(false));
+        let _ = sender.send(exceeded);
+    });
+    receiver
+        .recv_timeout(SCRATCH_SCAN_TIME_BUDGET + POLL_INTERVAL)
+        .unwrap_or(true)
+}
+
+fn scratch_over_limit_with_stop(limits: &[ScratchLimit], stop: &AtomicBool) -> bool {
+    let mut budget = ScratchScanBudget {
+        entries_left: SCRATCH_SCAN_ENTRY_BUDGET,
+        deadline: Instant::now() + SCRATCH_SCAN_TIME_BUDGET,
+        stop,
+    };
+    limits
+        .iter()
+        .any(|limit| match scratch_tree_size(limit, &mut budget, 0) {
+            ScratchScan::Complete(bytes) => bytes > limit.bytes,
+            ScratchScan::Stopped => false,
+            ScratchScan::Exceeded => true,
+        })
+}
+
+struct ScratchScanBudget<'a> {
+    entries_left: usize,
+    deadline: Instant,
+    stop: &'a AtomicBool,
+}
+
+enum ScratchScan {
+    Complete(u64),
+    Exceeded,
+    Stopped,
+}
+
+impl ScratchScanBudget<'_> {
+    fn checkpoint(&mut self) -> ScratchScan {
+        if self.stop.load(Ordering::Acquire) {
+            ScratchScan::Stopped
+        } else if self.entries_left == 0 || Instant::now() >= self.deadline {
+            ScratchScan::Exceeded
+        } else {
+            self.entries_left -= 1;
+            ScratchScan::Complete(0)
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn scratch_tree_size(
+    limit: &ScratchLimit,
+    budget: &mut ScratchScanBudget<'_>,
+    depth: usize,
+) -> ScratchScan {
+    scratch_directory_size(limit.directory.as_ref(), limit.bytes, budget, depth)
+}
+
+#[cfg(target_os = "linux")]
+fn scratch_directory_size(
+    directory: &OwnedFd,
+    cap: u64,
+    budget: &mut ScratchScanBudget<'_>,
+    depth: usize,
+) -> ScratchScan {
+    if depth > SCRATCH_SCAN_DEPTH_BUDGET {
+        return ScratchScan::Exceeded;
+    }
+    match budget.checkpoint() {
+        ScratchScan::Complete(_) => {}
+        outcome => return outcome,
+    }
+    let Ok(stat) = rustix::fs::fstat(directory) else {
+        return ScratchScan::Exceeded;
+    };
+    let mut total = u64::try_from(stat.st_size).unwrap_or(u64::MAX);
+    if total > cap {
+        return ScratchScan::Complete(total);
+    }
+    let Ok(scan) = rustix::fs::openat(
+        directory,
+        rustix::cstr!("."),
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    ) else {
+        return ScratchScan::Exceeded;
+    };
+    let mut buffer = [MaybeUninit::<u8>::uninit(); 8192];
+    let mut entries = rustix::fs::RawDir::new(scan, &mut buffer);
+    while let Some(entry) = entries.next() {
+        match budget.checkpoint() {
+            ScratchScan::Complete(_) => {}
+            outcome => return outcome,
+        }
+        let Ok(entry) = entry else {
+            return ScratchScan::Exceeded;
+        };
+        let name = entry.file_name();
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        let entry_size =
+            match scratch_entry_size(directory, name, cap.saturating_sub(total), budget, depth) {
+                ScratchScan::Complete(bytes) => bytes,
+                outcome => return outcome,
+            };
+        total = total.saturating_add(entry_size);
+        if total > cap {
+            return ScratchScan::Complete(total);
+        }
+    }
+    ScratchScan::Complete(total)
+}
+
+#[cfg(target_os = "linux")]
+fn scratch_entry_size(
+    directory: &OwnedFd,
+    name: &std::ffi::CStr,
+    cap: u64,
+    budget: &mut ScratchScanBudget<'_>,
+    depth: usize,
+) -> ScratchScan {
+    let Ok(stat) = rustix::fs::statat(directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+    else {
+        return ScratchScan::Exceeded;
+    };
+    if !rustix::fs::FileType::from_raw_mode(stat.st_mode).is_dir() {
+        return ScratchScan::Complete(u64::try_from(stat.st_size).unwrap_or(u64::MAX));
+    }
+    if depth == SCRATCH_SCAN_DEPTH_BUDGET {
+        return ScratchScan::Exceeded;
+    }
+    let Ok(child) = rustix::fs::openat(
+        directory,
+        name,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    ) else {
+        return ScratchScan::Exceeded;
+    };
+    scratch_directory_size(&child, cap, budget, depth + 1)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn scratch_tree_size(
+    limit: &ScratchLimit,
+    budget: &mut ScratchScanBudget<'_>,
+    depth: usize,
+) -> ScratchScan {
+    scratch_path_size(&limit.path, limit.bytes, budget, depth)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn scratch_path_size(
+    path: &Path,
+    cap: u64,
+    budget: &mut ScratchScanBudget<'_>,
+    depth: usize,
+) -> ScratchScan {
+    if depth > SCRATCH_SCAN_DEPTH_BUDGET {
+        return ScratchScan::Exceeded;
+    }
+    match budget.checkpoint() {
+        ScratchScan::Complete(_) => {}
+        outcome => return outcome,
+    }
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(_) => return ScratchScan::Exceeded,
+    };
+    let mut total = metadata.len();
+    if !metadata.is_dir() || total > cap {
+        return ScratchScan::Complete(total);
+    }
+    let entries = match std::fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(_) => return ScratchScan::Exceeded,
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => return ScratchScan::Exceeded,
+        };
+        match scratch_path_size(&entry.path(), cap.saturating_sub(total), budget, depth + 1) {
+            ScratchScan::Complete(bytes) => total = total.saturating_add(bytes),
+            outcome => return outcome,
+        }
+        if total > cap {
+            return ScratchScan::Complete(total);
+        }
+    }
+    ScratchScan::Complete(total)
 }
 
 /// Read a child pipe on a detached thread, capturing at most [`CAPTURE_CAP`] bytes
@@ -640,9 +1562,24 @@ mod tests {
     #[test]
     fn argv_always_isolates_env_home_and_namespaces() {
         let argv = ApptainerSandbox::default().build_argv(&spec());
-        for flag in ["exec", "--containall", "--no-home", "--cleanenv"] {
+        for flag in [
+            "exec",
+            "--userns",
+            "--containall",
+            "--no-home",
+            "--cleanenv",
+            "--no-eval",
+            "--disable-cache",
+            "--no-mount",
+            "--no-privs",
+            "--drop-caps",
+        ] {
             assert!(pos(&argv, flag).is_some(), "argv missing {flag}");
         }
+        let no_mount = pos(&argv, "--no-mount").unwrap();
+        assert_eq!(argv[no_mount + 1], "home,cwd,hostfs,bind-paths");
+        let drop_caps = pos(&argv, "--drop-caps").unwrap();
+        assert_eq!(argv[drop_caps + 1], "all");
     }
 
     #[test]
@@ -709,6 +1646,95 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_paths_execute_apptainer_directly() {
+        let command = ApptainerSandbox::default().build_host_command(&spec());
+        assert_eq!(command.get_program(), "apptainer");
+    }
+
+    #[test]
+    fn host_launcher_environment_is_an_exact_allowlist() {
+        use std::collections::BTreeMap;
+
+        let command = ApptainerSandbox::default().build_host_command(
+            &spec().with_env(vec![("CUDA_VISIBLE_DEVICES".into(), "2,3".into())]),
+        );
+        let environment = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            environment,
+            BTreeMap::from([
+                ("HOME".into(), Some("/nonexistent".into())),
+                ("LANG".into(), Some("C".into())),
+                ("LC_ALL".into(), Some("C".into())),
+                (
+                    "PATH".into(),
+                    Some("/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into())
+                ),
+                ("TMPDIR".into(), Some("/tmp".into())),
+            ])
+        );
+        let argv = command
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(argv
+            .windows(2)
+            .any(|words| words[0] == "--env" && words[1] == "CUDA_VISIBLE_DEVICES=2,3"));
+    }
+
+    #[test]
+    fn direct_backend_rejects_descriptor_backed_assets() {
+        let descriptor = PathBuf::from(format!("/proc/{}/fd/10", std::process::id()));
+        let error = validate_direct_apptainer_spec(&RunSpec::new(descriptor, vec!["true".into()]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("require SameUidApptainerSandbox or VerifierExecutorSandbox"));
+    }
+
+    #[test]
+    fn protected_output_requires_exact_read_write_bind_mapping() {
+        let valid = spec()
+            .with_binds(vec![Bind::rw("/host/scratch", "/work")])
+            .with_protected_output(ProtectedOutput::new(
+                "/host/scratch/grade.sock",
+                "/work/grade.sock",
+            ));
+        assert_eq!(
+            validate_protected_output_mapping(&valid).unwrap(),
+            Some(ProtectedOutputMapping {
+                bind_index: 0,
+                relative_path: PathBuf::from("grade.sock"),
+            })
+        );
+
+        let mismatched = RunSpec {
+            protected_output: Some(ProtectedOutput::new(
+                "/host/scratch/grade.sock",
+                "/work/other.sock",
+            )),
+            ..valid.clone()
+        };
+        assert!(validate_protected_output_mapping(&mismatched).is_err());
+
+        let traversal = RunSpec {
+            protected_output: Some(ProtectedOutput::new(
+                "/host/scratch/../grade.sock",
+                "/work/grade.sock",
+            )),
+            ..valid
+        };
+        assert!(validate_protected_output_mapping(&traversal).is_err());
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // one assertion per encoded resource/entry boundary
     fn in_container_script_encodes_the_ulimits_then_execs() {
         let script = in_container_script(&spec().with_limits(ResourceLimits {
             wall: Duration::from_secs(30),
@@ -721,8 +1747,11 @@ mod tests {
         assert!(script.contains("ulimit -v 2097152")); // 2 GiB / 1 KiB
         assert!(script.contains("ulimit -u 64"));
         assert!(script.contains("ulimit -f 8192")); // 8 MiB / 1 KiB
-                                                    // No in-image timeout: the host supervisor owns the wall-clock budget.
+        assert_eq!(script.matches("|| exit 114").count(), 4);
+        assert!(script.starts_with("umask 077; "));
+        // No in-image timeout: the host supervisor owns the wall-clock budget.
         assert!(!script.contains("timeout"));
+        assert!(script.contains(SANDBOX_ENTRY_MARKER));
         assert!(script.contains("exec 'python' '/work/eval.py'"));
     }
 
@@ -736,7 +1765,12 @@ mod tests {
             max_file: None,
         }));
         assert!(!script.contains("ulimit"));
-        assert_eq!(script, "exec 'python' '/work/eval.py'");
+        assert_eq!(
+            script,
+            format!(
+                "umask 077; printf '%s\\n' '{SANDBOX_ENTRY_MARKER}' >&2; exec 'python' '/work/eval.py'"
+            )
+        );
     }
 
     #[test]
@@ -775,7 +1809,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn supervise_captures_stdout_on_clean_exit() {
-        let outcome = supervise(sh("printf hello"), Duration::from_secs(5), &[]).unwrap();
+        let outcome = supervise(
+            sh("printf hello"),
+            Duration::from_secs(5),
+            &[],
+            EntryProtocol::NotRequired,
+        )
+        .unwrap();
         assert_eq!(outcome.status, RunStatus::Exited(0));
         assert_eq!(outcome.stdout, "hello");
     }
@@ -783,8 +1823,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn supervise_captures_stderr_and_nonzero_exit() {
-        let outcome =
-            supervise(sh("printf oops 1>&2; exit 3"), Duration::from_secs(5), &[]).unwrap();
+        let outcome = supervise(
+            sh("printf oops 1>&2; exit 3"),
+            Duration::from_secs(5),
+            &[],
+            EntryProtocol::NotRequired,
+        )
+        .unwrap();
         assert_eq!(outcome.status, RunStatus::Exited(3));
         assert_eq!(outcome.stderr, "oops");
     }
@@ -794,7 +1839,13 @@ mod tests {
     fn supervise_kills_on_wallclock_overrun() {
         // `sh -c 'sleep 30'` exec-replaces sh with sleep, so the kill closes the
         // pipe and the drain returns promptly.
-        let outcome = supervise(sh("sleep 30"), Duration::from_millis(300), &[]).unwrap();
+        let outcome = supervise(
+            sh("sleep 30"),
+            Duration::from_millis(300),
+            &[],
+            EntryProtocol::NotRequired,
+        )
+        .unwrap();
         assert_eq!(outcome.status, RunStatus::TimedOut);
         assert!(
             outcome.wall < Duration::from_secs(5),
@@ -810,6 +1861,7 @@ mod tests {
             Command::new("/no/such/ferrl-binary-xyz"),
             Duration::from_secs(1),
             &[],
+            EntryProtocol::NotRequired,
         )
         .unwrap_err();
         assert!(matches!(err, SandboxError::Spawn(_)));
@@ -820,7 +1872,13 @@ mod tests {
     fn supervise_reports_a_signal_death() {
         // The child kills itself with SIGKILL — it dies by signal (no exit code),
         // so the outcome is `Signaled`, exercising the signal-classification path.
-        let outcome = supervise(sh("kill -KILL $$"), Duration::from_secs(5), &[]).unwrap();
+        let outcome = supervise(
+            sh("kill -KILL $$"),
+            Duration::from_secs(5),
+            &[],
+            EntryProtocol::NotRequired,
+        )
+        .unwrap();
         assert!(
             matches!(outcome.status, RunStatus::Signaled(_)),
             "expected a signal death, got {:?}",
@@ -835,10 +1893,232 @@ mod tests {
         // builds the full argv and supervises the process, so the host-side path
         // (`Sandbox::run`) is covered without a container runtime. `/bin/true`
         // ignores the argv and exits 0.
-        let outcome = ApptainerSandbox::with_bin("/bin/true")
+        let error = ApptainerSandbox::with_bin("/bin/true")
             .run(&spec())
-            .unwrap();
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            SandboxError::Infrastructure {
+                status: RunStatus::Exited(0),
+                ..
+            }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verifier_entry_protocol_distinguishes_candidate_and_infrastructure_failures() {
+        let entered = format!("printf '%s\\n' '{SANDBOX_ENTRY_MARKER}' >&2; exit 7");
+        let outcome = supervise(
+            sh(&entered),
+            Duration::from_secs(5),
+            &[],
+            EntryProtocol::Required,
+        )
+        .unwrap();
+        assert_eq!(outcome.status, RunStatus::Exited(7));
+        assert_eq!(outcome.stderr, "");
+
+        let error = supervise(
+            sh("printf wrapper-failed >&2; exit 7"),
+            Duration::from_secs(5),
+            &[],
+            EntryProtocol::Required,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            SandboxError::Infrastructure {
+                status: RunStatus::Exited(7),
+                ref stderr,
+            } if stderr == "wrapper-failed"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supervise_kills_the_complete_process_group() {
+        let outcome = supervise(
+            sh("sleep 30 & printf '%s\\n' \"$!\"; wait"),
+            Duration::from_millis(300),
+            &[],
+            EntryProtocol::NotRequired,
+        )
+        .unwrap();
+        assert_eq!(outcome.status, RunStatus::TimedOut);
+        let descendant = outcome.stdout.trim().parse::<u32>().unwrap();
+        let proc_path = PathBuf::from(format!("/proc/{descendant}"));
+        let wait_started = Instant::now();
+        while proc_path.exists() && wait_started.elapsed() < Duration::from_secs(2) {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !proc_path.exists(),
+            "descendant {descendant} survived the process-tree kill"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supervise_reaps_descendants_after_the_launcher_exits() {
+        let outcome = supervise(
+            sh("sleep 30 & printf '%s\\n' \"$!\"; exit 0"),
+            Duration::from_secs(5),
+            &[],
+            EntryProtocol::NotRequired,
+        )
+        .unwrap();
         assert_eq!(outcome.status, RunStatus::Exited(0));
+        let descendant = outcome.stdout.trim().parse::<u32>().unwrap();
+        let proc_path = PathBuf::from(format!("/proc/{descendant}"));
+        let wait_started = Instant::now();
+        while proc_path.exists() && wait_started.elapsed() < Duration::from_secs(2) {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !proc_path.exists(),
+            "descendant {descendant} survived its launcher's exit"
+        );
+    }
+
+    #[cfg(unix)]
+    fn wait_for_descendant_pid(path: &Path) -> u32 {
+        let started = Instant::now();
+        loop {
+            if let Ok(value) = std::fs::read_to_string(path) {
+                if let Ok(pid) = value.trim().parse() {
+                    return pid;
+                }
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "child did not publish its descendant pid"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_process_gone(pid: u32) {
+        let proc_path = PathBuf::from(format!("/proc/{pid}"));
+        let started = Instant::now();
+        while proc_path.exists() && started.elapsed() < Duration::from_secs(2) {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !proc_path.exists(),
+            "descendant {pid} survived guard teardown"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_spawn_supervision_error_drops_through_armed_tree_guard() {
+        let root =
+            std::env::temp_dir().join(format!("ferrl-post-spawn-error-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let pid_file = root.join("descendant.pid");
+        let script = format!(
+            "sleep 30 & printf '%s\\n' \"$!\" > {}; wait",
+            shell_quote(&pid_file.display().to_string())
+        );
+        let error = supervise_with_post_spawn_hook(
+            sh(&script),
+            Duration::from_secs(5),
+            &[],
+            EntryProtocol::NotRequired,
+            |_| {
+                let _ = wait_for_descendant_pid(&pid_file);
+                Err(std::io::Error::other(
+                    "injected post-spawn supervision error",
+                ))
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, SandboxError::Supervise(_)));
+        let descendant = wait_for_descendant_pid(&pid_file);
+        assert_process_gone(descendant);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_spawn_unwind_drops_through_armed_tree_guard() {
+        let root =
+            std::env::temp_dir().join(format!("ferrl-post-spawn-unwind-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let pid_file = root.join("descendant.pid");
+        let script = format!(
+            "sleep 30 & printf '%s\\n' \"$!\" > {}; wait",
+            shell_quote(&pid_file.display().to_string())
+        );
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = supervise_with_post_spawn_hook(
+                sh(&script),
+                Duration::from_secs(5),
+                &[],
+                EntryProtocol::NotRequired,
+                |_| {
+                    let _ = wait_for_descendant_pid(&pid_file);
+                    panic!("injected post-spawn unwind")
+                },
+            );
+        }));
+        assert!(unwind.is_err());
+        let descendant = wait_for_descendant_pid(&pid_file);
+        assert_process_gone(descendant);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_output_accepts_only_the_spawned_tree_and_keeps_stdout_separate() {
+        use std::io::Write as _;
+
+        let root = std::env::temp_dir().join(format!(
+            "ferrl-protected-output-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let socket = root.join("grade.sock");
+        let listener =
+            ProtectedOutputListener::bind(Some(&ProtectedOutput::new(&socket, "/work/grade.sock")))
+                .unwrap();
+        let drain = ProtectedDrain::start(listener, std::process::id(), Duration::from_secs(5));
+        let writer = thread::spawn(move || {
+            let mut stream = UnixStream::connect(socket).unwrap();
+            stream.write_all(b"trusted-grade\n").unwrap();
+        });
+        writer.join().unwrap();
+        assert_eq!(drain.finish(), "trusted-grade\n");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_output_rejects_a_peer_outside_the_spawned_tree() {
+        use std::io::Write as _;
+
+        let root = std::env::temp_dir().join(format!(
+            "ferrl-protected-output-peer-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let socket = root.join("grade.sock");
+        let listener =
+            ProtectedOutputListener::bind(Some(&ProtectedOutput::new(&socket, "/work/grade.sock")))
+                .unwrap();
+        let drain = ProtectedDrain::start(listener, u32::MAX, Duration::from_millis(200));
+        let mut stream = UnixStream::connect(socket).unwrap();
+        stream.write_all(b"forged-grade\n").unwrap();
+        drop(stream);
+        thread::sleep(Duration::from_millis(250));
+        assert_eq!(drain.finish(), "");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]
@@ -852,13 +2132,12 @@ mod tests {
             "dd if=/dev/zero of={}/big bs=1024 count=2048 2>/dev/null; sleep 30",
             shell_quote(&dir.display().to_string())
         );
+        let limit = open_scratch_limit(&dir, 1 << 20).unwrap();
         let outcome = supervise(
             sh(&script),
             Duration::from_secs(10),
-            &[ScratchLimit {
-                path: dir.clone(),
-                bytes: 1 << 20,
-            }],
+            &[limit],
+            EntryProtocol::NotRequired,
         )
         .unwrap();
         let _ = std::fs::remove_dir_all(&dir);
@@ -883,17 +2162,117 @@ mod tests {
             "dd if=/dev/zero of={}/big bs=1024 count=2048 2>/dev/null; exit 0",
             shell_quote(&dir.display().to_string())
         );
+        let limit = open_scratch_limit(&dir, 1 << 20).unwrap();
         let outcome = supervise(
             sh(&script),
             Duration::from_secs(10),
-            &[ScratchLimit {
-                path: dir.clone(),
-                bytes: 1 << 20,
-            }],
+            &[limit],
+            EntryProtocol::NotRequired,
         )
         .unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(outcome.status, RunStatus::ScratchExceeded);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mutating_scratch_tree_cannot_delay_wallclock_enforcement() {
+        let root = std::env::temp_dir().join(format!(
+            "ferrl-scratch-mutation-deadline-test-{}",
+            std::process::id()
+        ));
+        let outside = std::env::temp_dir().join(format!(
+            "ferrl-scratch-mutation-outside-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("keep"), b"outside").unwrap();
+        let limit = open_scratch_limit(&root, u64::MAX).unwrap();
+        let root_arg = shell_quote(&root.display().to_string());
+        let outside_arg = shell_quote(&outside.display().to_string());
+        let script = format!(
+            r#"root={root_arg}
+outside={outside_arg}
+while :; do
+    mkdir "$root/race" 2>/dev/null || true
+    ln -s "$outside" "$root/link.new" 2>/dev/null || true
+    mv -f "$root/link.new" "$root/race/link" 2>/dev/null || true
+    rm -f "$root/race/link"
+    rmdir "$root/race" 2>/dev/null || true
+done"#
+        );
+        let outcome = supervise(
+            sh(&script),
+            Duration::from_millis(300),
+            &[limit],
+            EntryProtocol::NotRequired,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                outcome.status,
+                RunStatus::TimedOut | RunStatus::ScratchExceeded
+            ),
+            "mutating tree returned unexpected status {:?}",
+            outcome.status
+        );
+        assert!(
+            outcome.wall < Duration::from_secs(2),
+            "scratch traversal delayed wall-clock enforcement: {:?}",
+            outcome.wall
+        );
+        assert_eq!(std::fs::read(outside.join("keep")).unwrap(), b"outside");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scratch_scan_does_not_follow_a_symlink_outside_its_anchor() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "ferrl-scratch-nofollow-test-{}",
+            std::process::id()
+        ));
+        let outside = std::env::temp_dir().join(format!(
+            "ferrl-scratch-nofollow-outside-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("large"), vec![0_u8; 1 << 20]).unwrap();
+        symlink(&outside, root.join("outside-link")).unwrap();
+
+        let limit = open_scratch_limit(&root, 64 << 10).unwrap();
+        assert!(!scratch_over_limit(&[limit]));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scratch_scan_fails_closed_beyond_the_depth_budget() {
+        let root = std::env::temp_dir().join(format!(
+            "ferrl-scratch-depth-budget-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut deep = root.clone();
+        for _ in 0..=SCRATCH_SCAN_DEPTH_BUDGET {
+            deep.push("d");
+            std::fs::create_dir(&deep).unwrap();
+        }
+
+        let limit = open_scratch_limit(&root, u64::MAX).unwrap();
+        assert!(scratch_over_limit(&[limit]));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[cfg(unix)]
@@ -906,6 +2285,7 @@ mod tests {
             sh("head -c 50000000 /dev/zero"),
             Duration::from_secs(5),
             &[],
+            EntryProtocol::NotRequired,
         )
         .unwrap();
         assert!(

@@ -177,6 +177,7 @@ pub mod tensor_parallel;
 pub mod tokenizer;
 pub mod trainer;
 pub mod trimul;
+pub mod verifier_executor;
 
 #[doc(inline)]
 pub use checkpoint::{
@@ -226,9 +227,10 @@ pub use llama::{LlamaGradModel, LlamaMergedDecoder};
 pub use lm_policy::{Gemma4Policy, LlamaPolicy, LmPolicy, Qwen3_5Policy, QwenPolicy};
 #[doc(inline)]
 pub use loader::{
-    checkpoint_policy_sha256, load_auto_policy, load_auto_policy_bound, load_gemma4_policy,
-    load_gemma4_policy_bound, load_qwen35_policy_with_targets_bound, load_qwen_policy,
-    load_qwen_policy_bound, AutoPolicy, LoaderError, LoaderOpts,
+    checkpoint_policy_sha256, load_auto_policy, load_auto_policy_bound,
+    load_auto_policy_with_identity, load_gemma4_policy, load_gemma4_policy_bound,
+    load_qwen35_policy_with_targets_bound, load_qwen_policy, load_qwen_policy_bound, AutoPolicy,
+    LoaderError, LoaderOpts, PolicyLoadIdentity,
 };
 #[doc(inline)]
 pub use lora::{BaseQuantization, DenseLoraTargets};
@@ -269,8 +271,8 @@ pub use sample::Sample;
 pub use sampler::GrpoSampler;
 #[doc(inline)]
 pub use sandbox::{
-    ApptainerSandbox, Bind, BindMode, NetworkPolicy, ResourceLimits, RunOutcome, RunSpec,
-    RunStatus, Sandbox, SandboxError,
+    ApptainerSandbox, Bind, BindMode, NetworkPolicy, ProtectedOutput, ResourceLimits, RunOutcome,
+    RunSpec, RunStatus, Sandbox, SandboxError,
 };
 #[doc(inline)]
 pub use telemetry::{
@@ -294,3 +296,10 @@ pub use trainer::{
 };
 #[doc(inline)]
 pub use trimul::{Distribution, TrimulCase, TrimulError, TrimulReward};
+#[doc(inline)]
+pub use verifier_executor::{
+    serve_verifier_executor, SameUidApptainerSandbox, VerifierAssetTransport,
+    VerifierExecutorConfig, VerifierExecutorError, VerifierExecutorSandbox,
+    VerifierIsolationEvidence, VerifierIsolationTier, VerifierUidBoundary,
+    DEFAULT_VERIFIER_EXECUTOR_SOCKET, VERIFIER_ISOLATION_EVIDENCE_VERSION,
+};

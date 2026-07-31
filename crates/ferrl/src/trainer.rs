@@ -93,7 +93,7 @@ use crate::rollout_ledger::{
 };
 use crate::sample::Sample;
 use crate::telemetry::{
-    cuda_memory_snapshot, CandidateRecord, CandidateWriter, DecoderCacheSnapshot,
+    cuda_memory_snapshot, CandidateRecord, CandidateSigner, CandidateWriter, DecoderCacheSnapshot,
     GpuMemoryProbeEvent, GpuMemorySnapshot, Metrics, MetricsWriter, ModelTelemetryRecorder, RunDir,
     TelemetryError,
 };
@@ -2050,6 +2050,32 @@ impl Trainer {
     pub fn with_checkpoint_policy_sha256(mut self, digest: impl Into<String>) -> Self {
         self.checkpoint_policy_sha256 = Some(digest.into());
         self
+    }
+
+    /// Bind and authenticate every candidate row emitted by this trainer to one
+    /// externally attested immutable launch manifest payload.
+    ///
+    /// Has no effect when candidate logging is disabled. When enabled, the
+    /// writer computes the row digest and signs it with the launch's process-local
+    /// Ed25519 capability only after all reward/completion fields are final,
+    /// immediately before publication. Binding fails when the candidate ledger
+    /// is already non-empty: the process-local key is intentionally not
+    /// restorable, so checkpoint continuation must disable candidate logging or
+    /// start a new run identity instead of appending unverifiable evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrainerError::Telemetry`] if `digest` is not a lowercase
+    /// SHA-256 value or the candidate ledger already contains rows.
+    pub fn with_candidate_provenance(
+        mut self,
+        digest: &str,
+        signer: CandidateSigner,
+    ) -> Result<Self, TrainerError> {
+        if let Some(writer) = self.candidate_writer.as_mut() {
+            writer.bind_launch(digest, signer)?;
+        }
+        Ok(self)
     }
 
     /// Redirect checkpoint reads **and** writes to `dir` instead of this run's
@@ -7411,6 +7437,9 @@ impl Trainer {
             .into_iter()
             .take(k)
             .map(|group_index| CandidateRecord {
+                launch_sha256: None,
+                record_sha256: None,
+                record_signature: None,
                 step: ctx.step,
                 rank: ctx.rank,
                 world_size: ctx.world_size,
@@ -12000,6 +12029,56 @@ mod tests {
         }
     }
 
+    struct RankedInfrastructureReward {
+        fail: bool,
+        phase: &'static str,
+    }
+
+    impl RewardFn for RankedInfrastructureReward {
+        type Target = ();
+
+        fn reward(&self, _sample: &Sample<()>, _completion: &str) -> Result<f32, RewardError> {
+            unreachable!("the ranked infrastructure test uses the detailed group seam")
+        }
+
+        fn reward_group_detailed(
+            &self,
+            _sample: &Sample<()>,
+            completions: &[String],
+        ) -> Result<Vec<RewardOutcome>, RewardError> {
+            if self.fail {
+                return Err(RewardError::verifier(
+                    crate::sandbox::SandboxError::Infrastructure {
+                        status: crate::sandbox::RunStatus::Exited(114),
+                        stderr: format!("ferrl-infrastructure: v1 phase={}", self.phase),
+                    },
+                ));
+            }
+            Ok(completions
+                .iter()
+                .enumerate()
+                .map(|(index, _)| RewardOutcome::reward(index as f32))
+                .collect())
+        }
+    }
+
+    fn assert_trimul_infrastructure_error(error: &TrainerError, phase: &str) {
+        let TrainerError::Reward(RewardError::Verifier(source)) = error else {
+            panic!("expected a verifier infrastructure error, got {error:?}");
+        };
+        let infrastructure = source
+            .downcast_ref::<crate::sandbox::SandboxError>()
+            .unwrap_or_else(|| panic!("unexpected verifier source: {source:?}"));
+        assert!(matches!(
+            infrastructure,
+            crate::sandbox::SandboxError::Infrastructure {
+                status: crate::sandbox::RunStatus::Exited(114),
+                stderr,
+            } if stderr.contains("ferrl-infrastructure: v1")
+                && stderr.contains(&format!("phase={phase}"))
+        ));
+    }
+
     struct LateNonFiniteReward {
         calls: std::cell::Cell<usize>,
         invalid_call: Option<usize>,
@@ -13205,6 +13284,43 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, TrainerError::Reward(_)));
         assert_eq!(std::fs::read(run.candidates_path()).unwrap(), sentinel);
+    }
+
+    #[test]
+    fn direct_grouped_trimul_infrastructure_preserves_candidate_and_metric_prestates() {
+        for phase in ["test", "benchmark"] {
+            let tmp = WireTmp::new(&format!("direct-trimul-{phase}-infrastructure"));
+            let run = RunDir::create(&tmp.0, "run").unwrap();
+            let mut config = candidate_ledger_config();
+            config.candidate_log_top_k = 2;
+            config.beta = 0.0;
+            let mut trainer = Trainer::new(config, &run).unwrap();
+            let candidate_sentinel = b"preexisting-candidate-bytes\n";
+            let metric_sentinel = b"preexisting-metric-bytes\n";
+            std::fs::write(run.candidates_path(), candidate_sentinel).unwrap();
+            std::fs::write(run.metrics_path(), metric_sentinel).unwrap();
+            let mut policy = stateful_candidate_policy();
+
+            let error = trainer
+                .train(
+                    &mut policy,
+                    &RankedInfrastructureReward { fail: true, phase },
+                    &CandidateCodec,
+                    &[Sample::new("prompt", ())],
+                )
+                .unwrap_err();
+            assert_trimul_infrastructure_error(&error, phase);
+            assert_eq!(
+                std::fs::read(run.candidates_path()).unwrap(),
+                candidate_sentinel,
+                "candidate row escaped {phase} infrastructure failure"
+            );
+            assert_eq!(
+                std::fs::read(run.metrics_path()).unwrap(),
+                metric_sentinel,
+                "metric row escaped {phase} infrastructure failure"
+            );
+        }
     }
 
     #[test]
@@ -16366,7 +16482,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum CoordinatedTpRewardMode {
         Scores([f32; 2]),
-        Error,
+        Infrastructure(&'static str),
         CountMismatch,
         Panic,
     }
@@ -16403,9 +16519,12 @@ mod tests {
                         })),
                     })
                     .collect()),
-                CoordinatedTpRewardMode::Error => {
-                    Err(RewardError::msg("execution-primary reward failure"))
-                }
+                CoordinatedTpRewardMode::Infrastructure(phase) => Err(RewardError::verifier(
+                    crate::sandbox::SandboxError::Infrastructure {
+                        status: crate::sandbox::RunStatus::Exited(114),
+                        stderr: format!("ferrl-infrastructure: v1 phase={phase}"),
+                    },
+                )),
                 CoordinatedTpRewardMode::CountMismatch => Ok(vec![RewardOutcome::reward(1.0)]),
                 CoordinatedTpRewardMode::Panic => {
                     panic!("execution-primary reward panic")
@@ -16420,6 +16539,7 @@ mod tests {
         reward_calls: usize,
         policy_calls: TpProbeCalls,
         candidates: String,
+        metrics: String,
     }
 
     fn run_coordinated_tp_reward_case(
@@ -16467,12 +16587,15 @@ mod tests {
                         let policy_calls = policy_calls.lock().unwrap().clone();
                         let candidates =
                             std::fs::read_to_string(run.candidates_path()).unwrap_or_default();
+                        let metrics =
+                            std::fs::read_to_string(run.metrics_path()).unwrap_or_default();
                         results.lock().unwrap().push(CoordinatedTpRunResult {
                             rank,
                             result,
                             reward_calls: reward_calls.load(Ordering::Relaxed),
                             policy_calls,
                             candidates,
+                            metrics,
                         });
                     })
                 })
@@ -18475,20 +18598,22 @@ mod tests {
     #[allow(clippy::cognitive_complexity)] // two coordinated failure variants, same assertions
     fn train_tensor_parallel_coordinates_reward_error_and_count_mismatch() {
         for mode in [
-            CoordinatedTpRewardMode::Error,
+            CoordinatedTpRewardMode::Infrastructure("test"),
+            CoordinatedTpRewardMode::Infrastructure("benchmark"),
             CoordinatedTpRewardMode::CountMismatch,
         ] {
             let results = run_coordinated_tp_reward_case(
                 [mode, CoordinatedTpRewardMode::Scores([0.0, 2.0])],
-                0,
-                0.0,
+                2,
+                0.1,
             );
             assert_eq!(results[0].reward_calls, 1);
             assert_eq!(results[1].reward_calls, 0);
             match (mode, results[0].result.as_ref().unwrap_err()) {
-                (CoordinatedTpRewardMode::Error, TrainerError::Reward(err)) => {
-                    assert!(err.to_string().contains("execution-primary reward failure"));
-                }
+                (
+                    CoordinatedTpRewardMode::Infrastructure(phase),
+                    error @ TrainerError::Reward(_),
+                ) => assert_trimul_infrastructure_error(error, phase),
                 (CoordinatedTpRewardMode::CountMismatch, TrainerError::Contract(msg)) => {
                     assert!(msg.contains("returned 1 rewards for 2 completions"));
                 }
@@ -18502,6 +18627,15 @@ mod tests {
             for result in &results {
                 assert_eq!(result.policy_calls.live_logp, 0);
                 assert_eq!(result.policy_calls.detached_logp, 0);
+                assert_eq!(result.policy_calls.backward, 0);
+                assert!(
+                    result.candidates.is_empty(),
+                    "infrastructure/count failures must not publish a candidate row"
+                );
+                assert!(
+                    result.metrics.is_empty(),
+                    "infrastructure/count failures must not publish a metric row"
+                );
             }
         }
     }
@@ -19921,6 +20055,81 @@ mod tests {
             }
             assert!(candidates.is_empty());
             assert!(metrics.is_empty());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // explicit two-phase, two-rank abort matrix
+    fn data_parallel_trimul_infrastructure_aborts_before_candidate_or_metric_publication() {
+        for phase in ["test", "benchmark"] {
+            let tmp = WireTmp::new(&format!("dp-trimul-{phase}-infrastructure"));
+            let results = std::thread::scope(|scope| {
+                let handles: Vec<_> = crate::comm::LocalComm::world_with_timeout(
+                    2,
+                    std::time::Duration::from_secs(2),
+                )
+                .into_iter()
+                .map(|comm| {
+                    let rank = comm.rank();
+                    let root = tmp.0.clone();
+                    scope.spawn(move || {
+                        let run = RunDir::create(&root, format!("rank-{rank}")).unwrap();
+                        let cfg = TrainerConfig {
+                            steps: 1,
+                            group_size: 3,
+                            max_new_tokens: 2,
+                            beta: 0.0,
+                            lr: 0.0,
+                            candidate_log_top_k: 2,
+                            ..TrainerConfig::default()
+                        };
+                        let rows: [&[f32]; 3] = [&[-1.0, -1.0], &[-1.0, -1.0], &[-1.0, -1.0]];
+                        let logp = Var::from_tensor(&mat(&rows)).unwrap();
+                        let mut policy = CandidatePolicy { logp };
+                        let mut trainer = Trainer::with_comm(cfg, &run, comm).unwrap();
+                        let result = trainer.train(
+                            &mut policy,
+                            &RankedInfrastructureReward {
+                                fail: rank == 0,
+                                phase,
+                            },
+                            &CandidateCodec,
+                            &[Sample::new("prompt", ())],
+                        );
+                        let candidates =
+                            std::fs::read_to_string(run.candidates_path()).unwrap_or_default();
+                        let metrics =
+                            std::fs::read_to_string(run.metrics_path()).unwrap_or_default();
+                        (rank, result, candidates, metrics)
+                    })
+                })
+                .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+
+            for (rank, result, candidates, metrics) in results {
+                let error = result.unwrap_err();
+                if rank == 0 {
+                    assert_trimul_infrastructure_error(&error, phase);
+                } else {
+                    assert!(
+                        matches!(
+                            &error,
+                            TrainerError::Contract(message)
+                                if message.contains("rollout/reward evaluation failed on a peer rank")
+                        ),
+                        "unexpected rank-{rank} error: {error:?}"
+                    );
+                }
+                assert!(
+                    candidates.is_empty(),
+                    "candidate row escaped {phase} failure"
+                );
+                assert!(metrics.is_empty(), "metric row escaped {phase} failure");
+            }
         }
     }
 
