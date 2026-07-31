@@ -12086,7 +12086,9 @@ benchmarks:
         config["trimul"]["image"] = serde_json::json!(image);
         config["trimul"]["eval_dir"] = serde_json::json!(eval_dir);
         config["trimul"]["scratch_root"] = serde_json::json!(scratch_root);
-        config["trimul"]["wall_secs"] = serde_json::json!(300);
+        // Publication-grade reference/candidate runs exercise the complete 3 GiB
+        // pinned input through protected transport; use the documented default wall.
+        config["trimul"]["wall_secs"] = serde_json::json!(600);
         config["trimul"]["verifier_cuda_visible_devices"] = serde_json::json!("0");
         config["trimul"]["verifier_max_procs"] = serde_json::json!(1024);
         if let Some(apptainer) = std::env::var_os("FERRL_APPTAINER_BIN") {

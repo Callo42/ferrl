@@ -2764,7 +2764,18 @@ pub fn validate_artifact_verification_evidence(
         return Err("artifact verification requires non-empty test and benchmark sets".to_string());
     }
     if !evidenced.sandbox_status.is_success() {
-        return Err("artifact verifier sandbox did not exit successfully".to_string());
+        let infrastructure = evidenced
+            .protected_output
+            .lines()
+            .find(|line| line.starts_with("ferrl-infrastructure: "))
+            .unwrap_or("ferrl-infrastructure: not reported")
+            .chars()
+            .take(512)
+            .collect::<String>();
+        return Err(format!(
+            "artifact verifier sandbox did not exit successfully: {:?}; {infrastructure}",
+            evidenced.sandbox_status
+        ));
     }
     if sha256_hex(evidenced.protected_output.as_bytes()) != evidenced.protected_output_sha256
         || sha256_hex(evidenced.sandbox_diagnostics.as_bytes())
@@ -3475,6 +3486,18 @@ mod tests {
         let mut digest_mutation = artifact_evidenced_grade(valid);
         digest_mutation.protected_output_sha256 = "00".repeat(32);
         assert!(validate_artifact_verification_evidence(&digest_mutation, 1, 1).is_err());
+
+        let mut timeout = artifact_evidenced_grade(
+            "ferrl-infrastructure: v1 phase=test reason=\"candidate timed out\"\n".to_owned(),
+        );
+        timeout.sandbox_status = RunStatus::TimedOut;
+        assert_eq!(
+            validate_artifact_verification_evidence(&timeout, 1, 1).unwrap_err(),
+            concat!(
+                "artifact verifier sandbox did not exit successfully: TimedOut; ",
+                "ferrl-infrastructure: v1 phase=test reason=\"candidate timed out\""
+            )
+        );
     }
 
     #[test]
