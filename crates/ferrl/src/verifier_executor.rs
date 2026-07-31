@@ -2406,7 +2406,11 @@ printf '%s\n' '{ENTRY_MARKER}' >&2
                 assert_eq!(round_trip, evidence);
             } else {
                 let error = backend.preflight().unwrap_err().to_string();
-                assert!(error.contains("not trusted"), "{error}");
+                assert!(error.contains("same-UID verifier Apptainer"), "{error}");
+                assert!(
+                    !error.contains("socket"),
+                    "same-UID backend fell through: {error}"
+                );
                 let metadata = fs::symlink_metadata(&root).unwrap();
                 assert_eq!(metadata.uid(), rustix::process::geteuid().as_raw());
                 assert_eq!(metadata.mode() & 0o777, 0o700);
