@@ -37,7 +37,9 @@
 //!    exit marker score the correctness floor plus any capped latency component.
 //!    Implausibly fast timings (below the configured floor — a glitch or forged
 //!    grade) still score `0`. The final artifact gate remains stricter than the
-//!    training reward: held-out correctness plus repeated same-metric latency audit.
+//!    training reward: secret-seed re-verification of the launch-bound cases plus a
+//!    repeated same-metric latency audit. A distinct genuinely held-out case/reward
+//!    boundary is outside this contract.
 //!
 //! ## What lives where
 //!
@@ -60,9 +62,9 @@
 //! forged scratch files, printed passes, and zero-time kernels cannot reach the
 //! correctness floor. These controls constrain code inside the candidate process; the
 //! same-UID tier does **not** resist an arbitrary malicious peer process already running
-//! under the training account. Accepted artifact publication therefore requires the
-//! separately authenticated dedicated tier (or a future versioned stronger audit
-//! boundary), not same-UID discovery evidence.
+//! under the training account. Accepted same-UID artifact publication retains that
+//! explicit operator-trust boundary; the dedicated tier remains an optional
+//! higher-isolation backend and is not a no-administrator prerequisite.
 //!
 //! ## Testing split (as in [`crate::sandbox`])
 //!
@@ -1410,8 +1412,8 @@ pub struct TrimulReward {
     test_cases: Vec<TrimulCase>,
     /// Timing cases.
     benchmark_cases: Vec<TrimulCase>,
-    /// The secret seed Cantor-combined with each case's public seed for held-out
-    /// inputs (passed as `POPCORN_SEED`).
+    /// The secret seed Cantor-combined with each launch-bound case's public seed
+    /// (passed as `POPCORN_SEED`).
     secret_seed: u64,
     /// Reference geometric-mean service latency (ns) on the target GPU; the
     /// same-metric ratio denominator for the shaped reward's latency component. `None`
@@ -1474,6 +1476,88 @@ pub struct EvidencedTrimulVerification {
     pub runtime_hardening: Vec<serde_json::Value>,
     /// Domain-separated digest of the ordered raw hardening records.
     pub runtime_hardening_evidence_sha256: String,
+    /// Exact sandbox termination status for this verifier execution.
+    pub sandbox_status: RunStatus,
+    /// Exact protected machine-grade stream received from the trusted verifier.
+    pub protected_output: String,
+    /// SHA-256 of `protected_output`.
+    pub protected_output_sha256: String,
+    /// Untrusted sandbox stdout/stderr retained for diagnostics, never grading.
+    pub sandbox_diagnostics: String,
+    /// SHA-256 of `sandbox_diagnostics`.
+    pub sandbox_diagnostics_sha256: String,
+}
+
+/// Protected identity of the physical CUDA device used by one TriMul verifier run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrimulExecutingDevice {
+    /// Device-evidence schema identifier.
+    pub contract: String,
+    /// Logical CUDA ordinal seen inside the protected verifier.
+    pub cuda_logical_ordinal: u32,
+    /// CUDA driver product name.
+    pub name: String,
+    /// CUDA driver PCI bus identifier.
+    pub pci_bus_id: String,
+    /// Lowercase 16-byte CUDA UUID without presentation punctuation.
+    pub uuid: String,
+}
+
+/// One exactly indexed correctness-case result from the protected grade.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrimulTestCaseEvidence {
+    /// Zero-based case index.
+    pub index: usize,
+    /// Trusted case specification emitted by the verifier controller.
+    pub spec: String,
+    /// Whether the trusted checker accepted the candidate output.
+    pub passed: bool,
+}
+
+/// One exactly indexed benchmark-case result from the protected grade.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrimulBenchmarkCaseEvidence {
+    /// Zero-based case index.
+    pub index: usize,
+    /// Trusted case specification emitted by the verifier controller.
+    pub spec: String,
+    /// Number of timed candidate invocations summarized by this record.
+    pub runs: u64,
+    /// Mean protected service latency in nanoseconds.
+    pub mean_ns: f64,
+    /// Standard deviation in nanoseconds.
+    pub std_ns: f64,
+    /// Error estimate in nanoseconds.
+    pub err_ns: f64,
+    /// Best protected service latency in nanoseconds.
+    pub best_ns: f64,
+    /// Worst protected service latency in nanoseconds.
+    pub worst_ns: f64,
+}
+
+/// Strict, publication-grade interpretation of one protected TriMul execution.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrimulArtifactVerificationEvidence {
+    /// Exact successful sandbox termination status.
+    pub sandbox_status: RunStatus,
+    /// Trusted test-phase process exit marker.
+    pub test_exit: i32,
+    /// Trusted benchmark-phase process exit marker.
+    pub benchmark_exit: i32,
+    /// Physical CUDA device used by both phases.
+    pub executing_device: TrimulExecutingDevice,
+    /// Complete ordered correctness-case evidence.
+    pub test_cases: Vec<TrimulTestCaseEvidence>,
+    /// Complete ordered benchmark-case evidence.
+    pub benchmark_cases: Vec<TrimulBenchmarkCaseEvidence>,
+    /// SHA-256 of the exact protected grade retained in the artifact.
+    pub protected_output_sha256: String,
+    /// SHA-256 of retained untrusted sandbox diagnostics.
+    pub sandbox_diagnostics_sha256: String,
 }
 
 /// Launch-time control probe produced through the exact staged verifier path.
@@ -1655,7 +1739,7 @@ impl TrimulReward {
         })
     }
 
-    /// Set the secret held-out seed (`POPCORN_SEED`).
+    /// Set the secret case-generation seed (`POPCORN_SEED`).
     #[must_use]
     pub fn with_secret_seed(mut self, seed: u64) -> Self {
         self.secret_seed = seed;
@@ -1823,6 +1907,21 @@ impl TrimulReward {
         self.validate_case_sets()?;
         let eval = self.run_eval_detailed(submission)?;
         eval.evidenced_verification()
+    }
+
+    /// Verify Ferrl's bundled reference submission through the exact same protected path.
+    ///
+    /// Artifact audit uses this entry point so reference and candidate executions retain
+    /// identical raw evidence and can be paired without operator-supplied timing values.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RewardError`] if the verifier case set, assets, sandbox execution, or
+    /// protected evidence is invalid.
+    pub fn verify_reference_with_evidence(
+        &self,
+    ) -> Result<EvidencedTrimulVerification, RewardError> {
+        self.verify_submission_with_evidence(REFERENCE_SUBMISSION)
     }
 
     /// Extract a completion using this reward's configured prompt/extraction contract.
@@ -2393,6 +2492,8 @@ const TRIMUL_INFRASTRUCTURE_MARKER: &str = "ferrl-infrastructure: v1";
 const TRIMUL_INFRASTRUCTURE_EXIT: i32 = 114;
 const HARDENING_LOG_KEY: &str = "ferrl-candidate-hardening";
 const ISOLATION_LOG_KEY: &str = "ferrl-verifier-isolation-tier";
+const DEVICE_IDENTITY_LOG_KEY: &str = "ferrl-executing-device";
+const DEVICE_IDENTITY_CONTRACT: &str = "ferrl.executing-device.v1";
 
 fn validate_runtime_hardening_record(raw: &str) -> Result<serde_json::Value, String> {
     let value: serde_json::Value = serde_json::from_str(raw)
@@ -2547,6 +2648,312 @@ fn protected_runtime_evidence(
     Ok((values, raw_values))
 }
 
+fn exact_log_value<'a>(text: &'a str, key: &str) -> Result<&'a str, String> {
+    let mut values = text.lines().filter_map(|line| {
+        let (actual, value) = line.split_once(": ")?;
+        (actual.trim() == key).then_some(value.trim())
+    });
+    let value = values
+        .next()
+        .ok_or_else(|| format!("protected grade omitted {key:?}"))?;
+    if values.next().is_some() {
+        return Err(format!("protected grade repeated {key:?}"));
+    }
+    Ok(value)
+}
+
+fn exact_parsed_value<T>(text: &str, key: &str) -> Result<T, String>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    exact_log_value(text, key)?
+        .parse()
+        .map_err(|error| format!("protected grade field {key:?} is invalid: {error}"))
+}
+
+fn exact_index_set(
+    text: &str,
+    prefix: &str,
+    suffix: &str,
+    expected_count: usize,
+) -> Result<(), String> {
+    let mut counts = BTreeMap::<usize, usize>::new();
+    for line in text.lines() {
+        let Some((key, _)) = line.split_once(": ") else {
+            continue;
+        };
+        let key = key.trim();
+        let Some(index_text) = key
+            .strip_prefix(prefix)
+            .and_then(|value| value.strip_suffix(suffix))
+        else {
+            continue;
+        };
+        let index = index_text.parse::<usize>().map_err(|error| {
+            format!("protected grade has malformed indexed field {key:?}: {error}")
+        })?;
+        *counts.entry(index).or_default() += 1;
+    }
+    let expected = (0..expected_count)
+        .map(|index| (index, 1usize))
+        .collect::<BTreeMap<_, _>>();
+    if counts != expected {
+        return Err(format!(
+            "protected grade {prefix}<index>{suffix} coverage is not exactly 0..{expected_count}"
+        ));
+    }
+    Ok(())
+}
+
+fn parse_executing_device(raw: &str) -> Result<TrimulExecutingDevice, String> {
+    let device: TrimulExecutingDevice = serde_json::from_str(raw)
+        .map_err(|error| format!("malformed executing-device JSON: {error}"))?;
+    if device.contract != DEVICE_IDENTITY_CONTRACT {
+        return Err("executing-device evidence has an unsupported contract".to_string());
+    }
+    if device.name.trim().is_empty()
+        || device
+            .name
+            .bytes()
+            .any(|byte| byte == 0 || byte == b'\n' || byte == b'\r')
+    {
+        return Err("executing-device name is empty or non-canonical".to_string());
+    }
+    if device.uuid.len() != 32
+        || !device
+            .uuid
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("executing-device UUID is not 16-byte lowercase hexadecimal".to_string());
+    }
+    if device.pci_bus_id.is_empty()
+        || !device.pci_bus_id.is_ascii()
+        || !device.pci_bus_id.contains(':')
+        || !device.pci_bus_id.contains('.')
+        || !device.pci_bus_id.bytes().all(|byte| {
+            byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte) || byte == b':' || byte == b'.'
+        })
+    {
+        return Err("executing-device PCI bus id is not canonical".to_string());
+    }
+    if serde_json::to_string(&device).map_err(|error| error.to_string())? != raw {
+        return Err("executing-device evidence is not canonical JSON".to_string());
+    }
+    Ok(device)
+}
+
+/// Validate one protected verification result for publication-grade artifact use.
+///
+/// The grade must contain one successful sandbox/test/benchmark execution, complete
+/// exactly indexed case evidence, finite benchmark statistics, and the same canonical
+/// physical-device identity in both phases.
+///
+/// # Errors
+///
+/// Returns a descriptive error when raw evidence, hashes, isolation, runtime controls,
+/// exits, case coverage, benchmark statistics, or device identity are incomplete or
+/// inconsistent.
+pub fn validate_artifact_verification_evidence(
+    evidenced: &EvidencedTrimulVerification,
+    expected_test_cases: usize,
+    expected_benchmark_cases: usize,
+) -> Result<TrimulArtifactVerificationEvidence, String> {
+    if expected_test_cases == 0 || expected_benchmark_cases == 0 {
+        return Err("artifact verification requires non-empty test and benchmark sets".to_string());
+    }
+    if !evidenced.sandbox_status.is_success() {
+        let infrastructure = evidenced
+            .protected_output
+            .lines()
+            .find(|line| line.starts_with("ferrl-infrastructure: "))
+            .unwrap_or("ferrl-infrastructure: not reported")
+            .chars()
+            .take(512)
+            .collect::<String>();
+        return Err(format!(
+            "artifact verifier sandbox did not exit successfully: {:?}; {infrastructure}",
+            evidenced.sandbox_status
+        ));
+    }
+    if sha256_hex(evidenced.protected_output.as_bytes()) != evidenced.protected_output_sha256
+        || sha256_hex(evidenced.sandbox_diagnostics.as_bytes())
+            != evidenced.sandbox_diagnostics_sha256
+    {
+        return Err("artifact verifier raw-evidence digest mismatch".to_string());
+    }
+    if verifier_isolation_evidence_sha256(&evidenced.isolation)
+        != evidenced.isolation_evidence_sha256
+    {
+        return Err("artifact verifier isolation-evidence digest mismatch".to_string());
+    }
+    if evidenced.protected_output.matches(RESULT_SPLIT).count() != 1 {
+        return Err(
+            "artifact protected grade must contain exactly one phase separator".to_string(),
+        );
+    }
+    let (test_log, benchmark_log) = split_result(&evidenced.protected_output);
+    let mut hardening_values = Vec::with_capacity(2);
+    let mut hardening_raw = Vec::with_capacity(2);
+    for (phase, expected_entry) in [
+        (test_log, TEST_VERIFIER_ENTRY),
+        (benchmark_log, BENCHMARK_VERIFIER_ENTRY),
+    ] {
+        if exact_log_value(phase, "ferrl-entry")? != expected_entry {
+            return Err(
+                "artifact protected grade did not reach the trusted verifier entry".to_string(),
+            );
+        }
+        if exact_log_value(phase, ISOLATION_LOG_KEY)? != evidenced.isolation.tier.as_str()
+            || exact_log_value(phase, "ferrl-timing-metric")?
+                != timing_metric_for_tier(evidenced.isolation.tier)
+        {
+            return Err(
+                "artifact protected grade changed verifier tier or timing metric".to_string(),
+            );
+        }
+        let raw = exact_log_value(phase, HARDENING_LOG_KEY)?;
+        hardening_values.push(validate_runtime_hardening_record(raw)?);
+        hardening_raw.push(raw);
+    }
+    let hardening_fields = hardening_raw
+        .iter()
+        .map(|value| value.as_bytes())
+        .collect::<Vec<_>>();
+    if hardening_values != evidenced.runtime_hardening
+        || domain_sha256(
+            "ferrl.trimul-runtime-hardening-evidence.v1",
+            &hardening_fields,
+        ) != evidenced.runtime_hardening_evidence_sha256
+    {
+        return Err("artifact verifier runtime-hardening evidence mismatch".to_string());
+    }
+
+    let test_count: usize = exact_parsed_value(test_log, "test-count")?;
+    let benchmark_count: usize = exact_parsed_value(benchmark_log, "benchmark-count")?;
+    if test_count != expected_test_cases || benchmark_count != expected_benchmark_cases {
+        return Err("artifact protected grade case counts do not match task.yml".to_string());
+    }
+    if exact_log_value(test_log, "check")? != "pass"
+        || exact_log_value(benchmark_log, "check")? != "pass"
+        || !evidenced.verification.correct
+    {
+        return Err(
+            "artifact candidate did not pass every protected correctness check".to_string(),
+        );
+    }
+    let test_exit: i32 = exact_parsed_value(test_log, "test-exit")?;
+    let benchmark_exit: i32 = exact_parsed_value(benchmark_log, "benchmark-exit")?;
+    if test_exit != 0 || benchmark_exit != 0 {
+        return Err("artifact test or benchmark exit marker is not zero".to_string());
+    }
+
+    exact_index_set(test_log, "test.", ".spec", test_count)?;
+    exact_index_set(test_log, "test.", ".status", test_count)?;
+    let mut test_cases = Vec::with_capacity(test_count);
+    for index in 0..test_count {
+        let spec = exact_log_value(test_log, &format!("test.{index}.spec"))?.to_string();
+        if spec.is_empty() || exact_log_value(test_log, &format!("test.{index}.status"))? != "pass"
+        {
+            return Err(format!(
+                "artifact test case {index} is missing or did not pass"
+            ));
+        }
+        test_cases.push(TrimulTestCaseEvidence {
+            index,
+            spec,
+            passed: true,
+        });
+    }
+
+    for suffix in [".spec", ".runs", ".mean", ".std", ".err", ".best", ".worst"] {
+        exact_index_set(benchmark_log, "benchmark.", suffix, benchmark_count)?;
+    }
+    let mut benchmark_cases = Vec::with_capacity(benchmark_count);
+    for index in 0..benchmark_count {
+        let spec = exact_log_value(benchmark_log, &format!("benchmark.{index}.spec"))?.to_string();
+        let runs: u64 = exact_parsed_value(benchmark_log, &format!("benchmark.{index}.runs"))?;
+        let mean_ns: f64 = exact_parsed_value(benchmark_log, &format!("benchmark.{index}.mean"))?;
+        let std_ns: f64 = exact_parsed_value(benchmark_log, &format!("benchmark.{index}.std"))?;
+        let err_ns: f64 = exact_parsed_value(benchmark_log, &format!("benchmark.{index}.err"))?;
+        let best_ns: f64 = exact_parsed_value(benchmark_log, &format!("benchmark.{index}.best"))?;
+        let worst_ns: f64 = exact_parsed_value(benchmark_log, &format!("benchmark.{index}.worst"))?;
+        if spec.is_empty()
+            || runs < 3
+            || ![mean_ns, std_ns, err_ns, best_ns, worst_ns]
+                .iter()
+                .all(|value| value.is_finite())
+            || mean_ns <= 0.0
+            || best_ns <= 0.0
+            || worst_ns <= 0.0
+            || std_ns < 0.0
+            || err_ns < 0.0
+            || best_ns > mean_ns
+            || mean_ns > worst_ns
+        {
+            return Err(format!(
+                "artifact benchmark case {index} has invalid statistics"
+            ));
+        }
+        benchmark_cases.push(TrimulBenchmarkCaseEvidence {
+            index,
+            spec,
+            runs,
+            mean_ns,
+            std_ns,
+            err_ns,
+            best_ns,
+            worst_ns,
+        });
+    }
+    let parsed_means = benchmark_cases
+        .iter()
+        .map(|case| case.mean_ns)
+        .collect::<Vec<_>>();
+    if parsed_means.len() != evidenced.verification.benchmark_means_ns.len()
+        || parsed_means
+            .iter()
+            .zip(&evidenced.verification.benchmark_means_ns)
+            .any(|(parsed, summarized)| parsed.to_bits() != summarized.to_bits())
+    {
+        return Err("artifact benchmark means disagree with the protected summary".to_string());
+    }
+    let parsed_geomean = geomean(&parsed_means)
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| "artifact benchmark geomean is invalid".to_string())?;
+    if evidenced
+        .verification
+        .geomean_ns
+        .is_none_or(|summarized| summarized.to_bits() != parsed_geomean.to_bits())
+    {
+        return Err("artifact benchmark geomean disagrees with the protected means".to_string());
+    }
+
+    let test_device = parse_executing_device(exact_log_value(test_log, DEVICE_IDENTITY_LOG_KEY)?)?;
+    let benchmark_device =
+        parse_executing_device(exact_log_value(benchmark_log, DEVICE_IDENTITY_LOG_KEY)?)?;
+    if test_device != benchmark_device {
+        return Err("test and benchmark phases used different physical CUDA devices".to_string());
+    }
+    if test_device.cuda_logical_ordinal != 0 {
+        return Err(
+            "artifact verifier did not use the sole visible logical CUDA device".to_string(),
+        );
+    }
+
+    Ok(TrimulArtifactVerificationEvidence {
+        sandbox_status: evidenced.sandbox_status,
+        test_exit,
+        benchmark_exit,
+        executing_device: test_device,
+        test_cases,
+        benchmark_cases,
+        protected_output_sha256: evidenced.protected_output_sha256.clone(),
+        sandbox_diagnostics_sha256: evidenced.sandbox_diagnostics_sha256.clone(),
+    })
+}
+
 /// Require records written by the sealed parent on the verifier-only socket after
 /// exact trusted initialization and either actual candidate-frame entry or an
 /// authenticated candidate-source rejection. Benchmark proof is mandatory whenever
@@ -2670,6 +3077,11 @@ impl TrimulEval {
                 "ferrl.trimul-runtime-hardening-evidence.v1",
                 &runtime_bytes,
             ),
+            sandbox_status: self.status,
+            protected_output: self.output.stdout.clone(),
+            protected_output_sha256: sha256_hex(self.output.stdout.as_bytes()),
+            sandbox_diagnostics: self.output.stderr.clone(),
+            sandbox_diagnostics_sha256: sha256_hex(self.output.stderr.as_bytes()),
         })
     }
 }
@@ -2984,6 +3396,108 @@ mod tests {
             TRIMUL_TIMING_METRIC,
             test_runtime_hardening_raw(),
         )
+    }
+
+    fn test_device_identity(uuid: &str) -> String {
+        serde_json::to_string(&TrimulExecutingDevice {
+            contract: DEVICE_IDENTITY_CONTRACT.to_owned(),
+            cuda_logical_ordinal: 0,
+            name: "NVIDIA H100 80GB HBM3".to_owned(),
+            pci_bus_id: "0000:01:00.0".to_owned(),
+            uuid: uuid.to_owned(),
+        })
+        .unwrap()
+    }
+
+    fn artifact_grade(test_uuid: &str, benchmark_uuid: &str) -> String {
+        format!(
+            "{}ferrl-entry: {TEST_VERIFIER_ENTRY}\nferrl-executing-device: {}\ntest-count: 1\ntest.0.spec: seqlen: 8; bs: 1\ntest.0.status: pass\ncheck: pass\ntest-exit: 0\n{RESULT_SPLIT}\n{}ferrl-entry: {BENCHMARK_VERIFIER_ENTRY}\nferrl-executing-device: {}\nbenchmark-count: 1\nbenchmark.0.spec: seqlen: 16; bs: 1\nbenchmark.0.runs: 100\nbenchmark.0.mean: 10\nbenchmark.0.std: 0.5\nbenchmark.0.err: 0.05\nbenchmark.0.best: 9\nbenchmark.0.worst: 11\ncheck: pass\nbenchmark-exit: 0\n",
+            protected_phase_prelude(),
+            test_device_identity(test_uuid),
+            protected_phase_prelude(),
+            test_device_identity(benchmark_uuid),
+        )
+    }
+
+    fn artifact_evidenced_grade(grade: String) -> EvidencedTrimulVerification {
+        let isolation = test_isolation_evidence();
+        let hardening_raw = test_runtime_hardening_raw();
+        let hardening_fields = [hardening_raw.as_bytes(), hardening_raw.as_bytes()];
+        EvidencedTrimulVerification {
+            verification: TrimulVerification {
+                correct: true,
+                benchmark_means_ns: vec![10.0],
+                geomean_ns: geomean(&[10.0]),
+                speedup: None,
+            },
+            isolation_evidence_sha256: verifier_isolation_evidence_sha256(&isolation),
+            isolation,
+            runtime_hardening: vec![test_runtime_hardening(), test_runtime_hardening()],
+            runtime_hardening_evidence_sha256: domain_sha256(
+                "ferrl.trimul-runtime-hardening-evidence.v1",
+                &hardening_fields,
+            ),
+            sandbox_status: RunStatus::Exited(0),
+            protected_output_sha256: sha256_hex(grade.as_bytes()),
+            protected_output: grade,
+            sandbox_diagnostics_sha256: sha256_hex(b""),
+            sandbox_diagnostics: String::new(),
+        }
+    }
+
+    #[test]
+    fn artifact_evidence_requires_complete_exact_same_device_grade() {
+        let uuid = "ab".repeat(16);
+        let evidenced = artifact_evidenced_grade(artifact_grade(&uuid, &uuid));
+
+        let exact = validate_artifact_verification_evidence(&evidenced, 1, 1).unwrap();
+
+        assert_eq!(exact.sandbox_status, RunStatus::Exited(0));
+        assert_eq!(exact.executing_device.uuid, uuid);
+        assert_eq!(exact.test_cases.len(), 1);
+        assert_eq!(exact.benchmark_cases.len(), 1);
+        assert_eq!(exact.benchmark_cases[0].mean_ns, 10.0);
+    }
+
+    #[test]
+    fn artifact_evidence_rejects_case_device_exit_and_digest_mutations() {
+        let uuid = "ab".repeat(16);
+        let other_uuid = "cd".repeat(16);
+        let valid = artifact_grade(&uuid, &uuid);
+        let mutations = [
+            valid.replacen("test.0.status: pass\n", "", 1),
+            valid.replacen(
+                "test.0.status: pass\n",
+                "test.0.status: pass\ntest.0.status: pass\n",
+                1,
+            ),
+            valid.replacen("benchmark.0.worst: 11\n", "", 1),
+            valid.replacen("test-exit: 0\n", "test-exit: 7\n", 1),
+            artifact_grade(&uuid, &other_uuid),
+        ];
+        for mutation in mutations {
+            let evidenced = artifact_evidenced_grade(mutation);
+            assert!(
+                validate_artifact_verification_evidence(&evidenced, 1, 1).is_err(),
+                "mutated publication evidence unexpectedly passed"
+            );
+        }
+
+        let mut digest_mutation = artifact_evidenced_grade(valid);
+        digest_mutation.protected_output_sha256 = "00".repeat(32);
+        assert!(validate_artifact_verification_evidence(&digest_mutation, 1, 1).is_err());
+
+        let mut timeout = artifact_evidenced_grade(
+            "ferrl-infrastructure: v1 phase=test reason=\"candidate timed out\"\n".to_owned(),
+        );
+        timeout.sandbox_status = RunStatus::TimedOut;
+        assert_eq!(
+            validate_artifact_verification_evidence(&timeout, 1, 1).unwrap_err(),
+            concat!(
+                "artifact verifier sandbox did not exit successfully: TimedOut; ",
+                "ferrl-infrastructure: v1 phase=test reason=\"candidate timed out\""
+            )
+        );
     }
 
     #[test]
@@ -3956,6 +4470,7 @@ mod tests {
         ));
         assert!(FERRL_EVAL_DRIVER.contains("_cpu_clone(value)"));
         assert!(FERRL_EVAL_DRIVER.contains("torch.frombuffer("));
+        assert!(FERRL_EVAL_DRIVER.contains("MAX_INPUT_BYTES = 4 * 1024 * 1024 * 1024"));
         assert!(!FERRL_EVAL_DRIVER.contains("candidate_data, shared_output"));
         assert!(!FERRL_EVAL_DRIVER.contains("torch.multiprocessing"));
         assert!(FERRL_EVAL_DRIVER.contains("trusted correctness checker failed"));
@@ -3999,10 +4514,27 @@ mod tests {
         let grade_connect = main
             .find("logger = GradeLogger(grade_socket)")
             .expect("the protected parent opens the only grade endpoint");
+        let device_identity = main
+            .find("device_identity = _executing_device_identity()")
+            .expect("the trusted parent authenticates the executing CUDA device");
         let candidate_start = main
-            .find("_run_testing(logger, test_cases, isolation_tier, timing_metric)")
+            .find("if not _run_testing(")
             .expect("candidate test execution is explicit");
-        assert!(grade_connect < candidate_start);
+        assert!(grade_connect < device_identity && device_identity < candidate_start);
+        assert!(main.contains("if seed is not None and not 0 <= seed <= MAX_CASE_SEED:"));
+        assert!(main.contains("trusted case-generation seed is outside unsigned 32-bit range"));
+        assert!(main.contains("_SET_SEED(42 if seed is None else seed)"));
+        assert!(!main.contains("_SET_SEED(seed or 42)"));
+        assert!(main.contains("reason = _bounded_message(f\"{type(error).__name__}: {error}\")"));
+        assert_eq!(
+            FERRL_EVAL_DRIVER
+                .matches("logger.log(\"ferrl-executing-device\", device_identity)")
+                .count(),
+            2,
+            "both protected phases must report the same trusted identity"
+        );
+        assert!(FERRL_EVAL_DRIVER.contains("\"cuDeviceGetUuid_v2\""));
+        assert!(FERRL_EVAL_DRIVER.contains("driver.cuDeviceGetPCIBusId"));
         assert!(FERRL_EVAL_DRIVER.contains("self.socket.set_inheritable(False)"));
 
         let missing_runtime = require_trimul_verifier_entry(RunOutcome {

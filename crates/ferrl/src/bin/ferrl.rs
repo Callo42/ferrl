@@ -27,7 +27,7 @@
 //!
 //! `trimul-score` scores raw external completions with the same shaped TriMul reward
 //! used during training and writes external-score JSONL. It is for rollout diagnostics;
-//! `trimul-artifact` remains the strict repeated audit gate.
+//! `trimul-artifact` remains the strict fixed same-device paired audit gate.
 //!
 //! `runreport` folds in the standalone run-summary tool: it reads a run's
 //! `metrics.jsonl` and prints (or emits as JSON) a [`RunSummary`](ferrl::RunSummary).
@@ -46,12 +46,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs::OpenOptions;
 use std::io::{Read as IoRead, Write as IoWrite};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
 use candle_core::{DType, Device};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use ring::rand::{SecureRandom as _, SystemRandom};
 use ring::signature::{UnparsedPublicKey, ED25519};
 use serde::{
     de::Error as _,
@@ -73,6 +76,9 @@ use ferrl::{
 
 /// A task's train/eval split: `(train, eval)` samples of the task's target type.
 type Splits<T> = (Vec<Sample<T>>, Vec<Sample<T>>);
+
+/// Largest case-generation seed accepted by the protected TriMul evaluator.
+const TRIMUL_CASE_SEED_MAX: u64 = u32::MAX as u64;
 
 /// The `ferrl` command-line interface.
 #[derive(Debug, Parser)]
@@ -218,21 +224,16 @@ struct TrimulArtifactArgs {
     /// Exact `record_sha256` of one immutable row in `candidates.jsonl`.
     #[arg(long)]
     candidate_sha256: String,
-    /// Output artifact directory. Fails if `manifest.json` already exists.
+    /// New output directory claimed before the audit; existing paths are rejected.
     #[arg(long)]
     out: PathBuf,
-    /// Audit seed for clean held-out re-verification. Must differ from training seed.
+    /// Optional dedicated verifier-executor socket for a higher-isolation audit.
+    /// Omit it for the default no-administrator same-UID Apptainer path.
     #[arg(long)]
-    audit_secret_seed: u64,
-    /// Raw guarded-baseline measurements in ns; pass at least three values.
-    #[arg(long = "baseline-ns", required = true)]
-    baseline_measurements_ns: Vec<f64>,
-    /// Exact baseline command used. Defaults to `ferrl trimul-baseline --config <config>`.
+    audit_verifier_executor_socket: Option<PathBuf>,
+    /// One CUDA-visible device token for the serialized paired audit.
     #[arg(long)]
-    baseline_command: Option<String>,
-    /// Number of clean candidate verification re-runs.
-    #[arg(long, default_value_t = 3)]
-    repeats: usize,
+    audit_cuda_visible_device: String,
     /// Training run health summary copied from `runreport` or run notes.
     #[arg(long)]
     run_health: String,
@@ -662,7 +663,7 @@ struct BaselineCfg {
 }
 
 /// TriMul task knobs (read only when `task == "trimul"`): the sandboxed eval image and
-/// the pinned GPU Mode bundle, bounded scratch, the held-out secret seed, the
+/// the pinned GPU Mode bundle, bounded scratch, the secret case-generation seed, the
 /// per-candidate wall budget, and the optional baseline pin. The concrete case list is
 /// loaded at run time from `<eval_dir>/task.yml` (GPU Mode's, not vendored into this repo).
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -695,7 +696,7 @@ struct TrimulCfg {
     /// Host-supervised total byte cap for one candidate's writable scratch tree
     /// (`0` -> the reward default, 1 GiB).
     scratch_max_bytes: u64,
-    /// The held-out secret seed (`POPCORN_SEED`), combined with each case's public seed.
+    /// Secret case-generation seed (`POPCORN_SEED`), combined with each case's public seed.
     secret_seed: u64,
     /// Per-candidate wall-clock budget in seconds (`0` → the reward default, 600 s).
     wall_secs: u64,
@@ -718,10 +719,10 @@ struct TrimulCfg {
 #[serde(rename_all = "snake_case")]
 enum LaunchAuthenticationMode {
     /// Process-local discovery integrity. This mode requires no administrator service
-    /// and is deliberately ineligible for accepted artifact publication.
+    /// and retains an explicit operator-trust boundary when its candidate is audited.
     #[default]
     LocalEphemeralV1,
-    /// Root-trusted external launch attestation used by publication-grade audits.
+    /// Root-trusted external launch attestation for an optional stronger discovery boundary.
     ExternalAttestedV1,
 }
 
@@ -1344,6 +1345,11 @@ impl RunConfig {
             )));
         }
         if self.task == "trimul" {
+            if self.trimul.secret_seed > TRIMUL_CASE_SEED_MAX {
+                return Err(CliError::msg(format!(
+                    "trimul.secret_seed must be between 0 and {TRIMUL_CASE_SEED_MAX}"
+                )));
+            }
             match self.trimul.verifier_isolation_tier {
                 ferrl::VerifierIsolationTier::SameUidApptainerV1 => {
                     if self.trimul.verifier_executor_socket.is_some() {
@@ -1523,11 +1529,12 @@ impl RunConfig {
     ///
     /// Unlike countdown/math this does **not** use [`train_eval_split`]: that helper
     /// deduplicates whole samples, so a unit-target dataset of one repeated prompt would
-    /// collapse to a single row. TriMul is one task — the generalization held out is over
-    /// the *cases* (the secret seed inside the reward), not the prompt — and the trainer
-    /// cycles prompts mod the train length, so a one-prompt train set *is* the
-    /// single-task regime. `eval` (held-out) runs the same prompt through the reward, so a
-    /// non-zero `data.eval_n` gives an adapter-vs-base reward comparison.
+    /// collapse to a single row. TriMul is one launch-bound task whose secret seed
+    /// perturbs those configured cases; it does not yet provide a genuinely held-out
+    /// case/reward boundary. The trainer cycles prompts mod the train length, so a
+    /// one-prompt train set *is* the single-task regime. `eval` runs that same prompt
+    /// through the same reward, so a non-zero `data.eval_n` gives an adapter-vs-base
+    /// reward comparison rather than held-out TriMul evidence.
     #[cfg(test)]
     fn trimul_splits(&self) -> Result<Splits<()>, CliError> {
         let prompt_file_bytes = self.trimul_prompt_file_bytes()?;
@@ -3222,6 +3229,11 @@ fn trimul_score(args: &TrimulScoreArgs) -> Result<(), CliError> {
             "trimul-score requires a config with task \"trimul\"",
         ));
     }
+    if args.score_secret_seed > TRIMUL_CASE_SEED_MAX {
+        return Err(CliError::msg(format!(
+            "trimul-score requires --score-secret-seed between 0 and {TRIMUL_CASE_SEED_MAX}"
+        )));
+    }
     if args.score_secret_seed == cfg.trimul.secret_seed {
         return Err(CliError::msg(
             "trimul-score requires --score-secret-seed to differ from trimul.secret_seed",
@@ -3572,27 +3584,136 @@ fn trimul_score_record(
     }
 }
 
-/// One clean artifact-verification run written under `verification/`.
+const ARTIFACT_CONTRACT_VERSION: u32 = 4;
+const ARTIFACT_AUDIT_BLOCKS: usize = 11;
+const ARTIFACT_MATERIAL_SPEEDUP: f64 = 1.02;
+const ARTIFACT_REQUIRED_MATERIAL_WINS: usize = 9;
+const ARTIFACT_ACCEPTANCE_METHOD: &str = "paired_material_wins_v1";
+const ARTIFACT_AUDIT_SEED_DERIVATION: &str = "sha256_contract_prefix_u32_be_v1";
+const ARTIFACT_ATTEMPT_SELECTION_ASSURANCE: &str = "operator_attested_v1";
+const ARTIFACT_OWNER_FILE: &str = ".ferrl-artifact-owner";
+const ARTIFACT_ATTEMPT_FILE: &str = "audit-attempt.json";
+
+/// Which trusted submission occupies one half of a paired audit block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ArtifactAuditRole {
+    Reference,
+    Candidate,
+}
+
+impl ArtifactAuditRole {
+    const fn other(self) -> Self {
+        match self {
+            Self::Reference => Self::Candidate,
+            Self::Candidate => Self::Reference,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Reference => "reference",
+            Self::Candidate => "candidate",
+        }
+    }
+}
+
+/// Complete raw and structured evidence for one half of a paired audit block.
 #[derive(Debug, Clone, Serialize)]
-struct ArtifactVerificationRun {
-    /// Verifier isolation tier that produced this protected result.
+struct ArtifactAuditExecution {
+    role: ArtifactAuditRole,
     isolation_tier: ferrl::VerifierIsolationTier,
-    /// Digest of the exact backend preflight evidence checked for this run.
+    isolation: ferrl::VerifierIsolationEvidence,
     isolation_evidence_sha256: String,
-    /// Digest of the protected in-container hardening record.
     runtime_hardening_evidence_sha256: String,
-    /// Canonical protected hardening records retained for independent inspection.
     runtime_hardening: Vec<serde_json::Value>,
-    /// Versioned timing metric used for every benchmark mean.
     timing_metric: String,
-    /// Whether the candidate passed every correctness case.
-    correct: bool,
-    /// Per-benchmark means, in ns.
-    benchmark_means_ns: Vec<f64>,
-    /// Geometric mean service latency, in ns.
-    geomean_ns: Option<f64>,
-    /// Speedup over the baseline median.
-    speedup: Option<f64>,
+    verification: ferrl::trimul::TrimulVerification,
+    exact: ferrl::trimul::TrimulArtifactVerificationEvidence,
+    protected_output: String,
+    sandbox_diagnostics: String,
+}
+
+/// In-memory paired block before its raw evidence records are written.
+#[derive(Debug)]
+struct ArtifactAuditBlock {
+    index: usize,
+    first: ArtifactAuditRole,
+    reference: ArtifactAuditExecution,
+    candidate: ArtifactAuditExecution,
+    paired_speedup: f64,
+    material_win: bool,
+}
+
+/// Manifest binding for one raw execution-evidence file.
+#[derive(Debug, Clone, Serialize)]
+struct ArtifactAuditExecutionManifest {
+    role: ArtifactAuditRole,
+    evidence_file: String,
+    evidence_sha256: String,
+    isolation_tier: ferrl::VerifierIsolationTier,
+    isolation: ferrl::VerifierIsolationEvidence,
+    isolation_evidence_sha256: String,
+    runtime_hardening_evidence_sha256: String,
+    runtime_hardening: Vec<serde_json::Value>,
+    timing_metric: String,
+    verification: ferrl::trimul::TrimulVerification,
+    exact: ferrl::trimul::TrimulArtifactVerificationEvidence,
+}
+
+/// One reference/candidate pair in the artifact manifest.
+#[derive(Debug, Clone, Serialize)]
+struct ArtifactAuditBlockManifest {
+    index: usize,
+    first: ArtifactAuditRole,
+    reference: ArtifactAuditExecutionManifest,
+    candidate: ArtifactAuditExecutionManifest,
+    paired_speedup: f64,
+    material_win: bool,
+}
+
+/// Predeclared empirical material-margin decision.
+#[derive(Debug, Clone, Serialize)]
+struct ArtifactAcceptanceDecision {
+    method: &'static str,
+    paired_blocks: usize,
+    material_speedup: f64,
+    threshold_comparison: &'static str,
+    required_material_wins: usize,
+    observed_material_wins: usize,
+    accepted: bool,
+}
+
+/// Original discovery verifier provenance, never relabeled as audit evidence.
+#[derive(Debug, Serialize)]
+struct DiscoveryVerifierManifest {
+    isolation_tier: ferrl::VerifierIsolationTier,
+    isolation_evidence_sha256: String,
+    timing_metric: String,
+    runtime_preflight_evidence_sha256: String,
+}
+
+/// Launch-bound paired audit record.
+#[derive(Debug, Serialize)]
+struct ArtifactAuditManifest {
+    contract: &'static str,
+    audit_contract_sha256: String,
+    audit_id: String,
+    audit_secret_seed: u64,
+    audit_seed_derivation: &'static str,
+    attempt_selection_assurance: &'static str,
+    durable_once_only: bool,
+    artifact_wide_false_positive_guarantee: bool,
+    requested_cuda_visible_device: String,
+    isolation_tier: ferrl::VerifierIsolationTier,
+    isolation: ferrl::VerifierIsolationEvidence,
+    isolation_evidence_sha256: String,
+    runtime_preflight: ferrl::trimul::TrimulRuntimePreflightEvidence,
+    runtime_preflight_evidence_sha256: String,
+    timing_metric: String,
+    executing_device: ferrl::trimul::TrimulExecutingDevice,
+    blocks: Vec<ArtifactAuditBlockManifest>,
+    decision: ArtifactAcceptanceDecision,
 }
 
 /// Result of the operator-facing source inspection.
@@ -3631,10 +3752,14 @@ struct ArtifactManifest {
     launch_sha256: String,
     /// SHA-256 of the exact `launch.json` copied into the artifact bundle.
     launch_file_sha256: String,
-    /// Trusted external key that attested the launch before rollout.
-    launch_attestation_key_id: String,
-    /// Signature algorithm used by the trusted launch attestor.
-    launch_attestation_algorithm: String,
+    /// Discovery launch-authentication boundary; never upgraded by audit.
+    launch_authentication: LaunchAuthenticationMode,
+    /// Trusted external key when the discovery launch was externally attested.
+    launch_attestation_key_id: Option<String>,
+    /// Signature algorithm when the discovery launch was externally attested.
+    launch_attestation_algorithm: Option<String>,
+    /// Original discovery verifier provenance.
+    discovery_verifier: DiscoveryVerifierManifest,
     /// Candidate provenance.
     candidate: CandidateManifest,
     /// Model provenance.
@@ -3643,10 +3768,10 @@ struct ArtifactManifest {
     config: ArtifactConfigManifest,
     /// Eval harness provenance.
     eval: EvalManifest,
-    /// Same-GPU baseline record.
-    baseline: BaselineManifest,
-    /// Clean re-verification record.
-    verification: VerificationManifest,
+    /// Independent, same-device, interleaved reference/candidate audit.
+    audit: ArtifactAuditManifest,
+    /// Final mechanical artifact verdict, including clean source inspection.
+    accepted: bool,
 }
 
 /// Candidate provenance fields.
@@ -3654,7 +3779,7 @@ struct ArtifactManifest {
 struct CandidateManifest {
     /// Domain-separated digest stored on the selected candidate row.
     record_sha256: String,
-    /// Ed25519 authentication made by the externally attested per-run key.
+    /// Ed25519 authentication made by the launch-bound per-run key.
     record_signature: String,
     /// SHA-256 of the exact JSONL row bytes copied to `candidate.json`.
     ledger_row_sha256: String,
@@ -3737,14 +3862,10 @@ struct ArtifactConfigManifest {
 /// Eval harness provenance fields.
 #[derive(Debug, Serialize)]
 struct EvalManifest {
-    /// Configured eval bundle path (informational; the digest is authoritative).
-    bundle_path: String,
     /// SHA-256 of every ordered relative file name and byte in the eval bundle.
     bundle_sha256: String,
     /// Number of regular files bound by `bundle_sha256`.
     bundle_file_count: usize,
-    /// Configured sandbox image path (informational; the digest is authoritative).
-    sandbox_image_path: String,
     /// SHA-256 of the exact sandbox image bytes.
     sandbox_image_sha256: String,
     /// Exact sandbox image length.
@@ -3759,40 +3880,6 @@ struct EvalManifest {
     benchmark_cases: usize,
 }
 
-/// Same-GPU baseline fields.
-#[derive(Debug, Serialize)]
-struct BaselineManifest {
-    /// Versioned timing metric used for every measurement.
-    metric: String,
-    /// Verifier isolation tier used to measure the baseline.
-    isolation_tier: ferrl::VerifierIsolationTier,
-    /// Digest of the exact verifier preflight evidence used for the baseline.
-    isolation_evidence_sha256: String,
-    /// GPU product name seen during extraction.
-    gpu: String,
-    /// Raw baseline measurements, in ns.
-    measurements_ns: Vec<f64>,
-    /// Median baseline service latency, in ns.
-    median_ns: f64,
-    /// Exact baseline command used for these measurements.
-    command: String,
-}
-
-/// Verification summary fields.
-#[derive(Debug, Serialize)]
-struct VerificationManifest {
-    /// GPU product name seen during extraction.
-    gpu: String,
-    /// Higher-assurance tier used for artifact audit runs.
-    isolation_tier: ferrl::VerifierIsolationTier,
-    /// Digest of the audit verifier preflight evidence.
-    isolation_evidence_sha256: String,
-    /// Clean re-verification runs.
-    runs: Vec<ArtifactVerificationRun>,
-    /// Whether this bundle satisfies the mechanical artifact acceptance checks.
-    accepted: bool,
-}
-
 #[derive(Debug)]
 struct BoundRunCandidate {
     launch: LaunchManifest,
@@ -3803,18 +3890,40 @@ struct BoundRunCandidate {
     candidate_row_bytes: Vec<u8>,
 }
 
-#[allow(clippy::cognitive_complexity)] // linear fail-closed validation of every provenance layer
 fn load_bound_run_candidate_with_trust(
     run_dir: &Path,
     candidate_sha256: &str,
     trust_policy: &LaunchTrustPolicy,
+) -> Result<BoundRunCandidate, CliError> {
+    load_bound_run_candidate_impl(run_dir, candidate_sha256, Some(trust_policy))
+}
+
+fn load_bound_run_candidate(
+    run_dir: &Path,
+    candidate_sha256: &str,
+) -> Result<BoundRunCandidate, CliError> {
+    load_bound_run_candidate_impl(run_dir, candidate_sha256, None)
+}
+
+#[allow(clippy::cognitive_complexity)] // linear fail-closed validation of every provenance layer
+fn load_bound_run_candidate_impl(
+    run_dir: &Path,
+    candidate_sha256: &str,
+    trust_policy: Option<&LaunchTrustPolicy>,
 ) -> Result<BoundRunCandidate, CliError> {
     validate_lower_sha256("--candidate-sha256", candidate_sha256)?;
     let launch_path = run_dir.join(RunDir::LAUNCH_FILE);
     let launch_bytes = read_regular_bytes(&launch_path)?;
     let launch = parse_exact_launch_manifest(&launch_path, &launch_bytes)?;
     verify_launch_manifest_payload(&launch)?;
-    verify_launch_attestation(&launch, trust_policy)?;
+    if launch.payload.authentication == LaunchAuthenticationMode::ExternalAttestedV1 {
+        if let Some(trust_policy) = trust_policy {
+            verify_launch_attestation(&launch, trust_policy)?;
+        } else {
+            let trust_policy = load_system_launch_trust_policy()?;
+            verify_launch_attestation(&launch, &trust_policy)?;
+        }
+    }
     let run_name = run_dir
         .file_name()
         .and_then(|name| name.to_str())
@@ -4452,113 +4561,77 @@ fn validate_lower_hex(label: &str, value: &str, bytes: usize) -> Result<(), CliE
 }
 
 /// Dispatch `ferrl trimul-artifact`: extract `custom_kernel` from a model completion,
-/// re-verify it with an audit seed, and write the contract artifact bundle.
+/// re-verify it under the selected explicit audit tier, and publish the contract bundle.
 fn trimul_artifact(args: &TrimulArtifactArgs) -> Result<(), CliError> {
-    require_publication_eligible_launch(&args.run_dir)?;
-    let trust_policy = load_system_launch_trust_policy()?;
-    trimul_artifact_with_trust(args, &trust_policy)
+    trimul_artifact_impl(args, None)
 }
 
-fn require_publication_eligible_launch(run_dir: &Path) -> Result<(), CliError> {
-    let launch_path = run_dir.join(RunDir::LAUNCH_FILE);
-    let launch_bytes = read_regular_bytes(&launch_path)?;
-    let launch = parse_exact_launch_manifest(&launch_path, &launch_bytes)?;
-    verify_launch_manifest_payload(&launch)?;
-    require_publication_eligible_manifest(&launch)
-}
-
-fn require_publication_eligible_manifest(launch: &LaunchManifest) -> Result<(), CliError> {
-    if launch.payload.authentication != LaunchAuthenticationMode::ExternalAttestedV1 {
-        return Err(CliError::msg(
-            "this candidate was discovered under local_ephemeral_v1 launch authentication; accepted artifact publication requires an independent externally attested higher-assurance audit",
-        ));
-    }
-    let verifier = launch.payload.verifier.as_ref().ok_or_else(|| {
-        CliError::msg("TriMul launch manifest is missing verifier isolation evidence")
-    })?;
-    if verifier.isolation.tier != ferrl::VerifierIsolationTier::DedicatedUidServiceV1 {
-        return Err(CliError::msg(
-            "same_uid_apptainer_v1 evidence may drive discovery but cannot publish an accepted artifact; rerun the candidate under dedicated_uid_service_v1 or a separately versioned stronger audit boundary",
-        ));
-    }
-    Ok(())
-}
-
+#[cfg(test)]
 fn trimul_artifact_with_trust(
     args: &TrimulArtifactArgs,
     trust_policy: &LaunchTrustPolicy,
 ) -> Result<(), CliError> {
-    let _ = ferrl::init_tracing();
-    if args.repeats < 3 {
-        return Err(CliError::msg(
-            "trimul-artifact requires --repeats >= 3 for the first-run contract",
-        ));
-    }
-    let bound =
-        load_bound_run_candidate_with_trust(&args.run_dir, &args.candidate_sha256, trust_policy)?;
-    require_publication_eligible_manifest(&bound.launch)?;
-    let cfg = &bound.config;
-    if args.audit_secret_seed == cfg.trimul.secret_seed {
-        return Err(CliError::msg(
-            "audit secret seed must differ from trimul.secret_seed used during training",
-        ));
-    }
-    let baseline = cfg.trimul.baseline.as_ref().ok_or_else(|| {
-        CliError::msg("trimul-artifact requires trimul.baseline in the run config")
-    })?;
-    guard_baseline_metric(&baseline.metric, cfg.trimul.verifier_isolation_tier)?;
-    let verifier_assets = capture_attested_trimul_verifier_assets(cfg, &bound.launch)?;
-    let baseline_median = median_checked(&args.baseline_measurements_ns, "baseline-ns")?;
-    require_baseline_matches_config(baseline_median, baseline.ns)?;
-    let gpu = detect_gpu_name().ok_or_else(|| {
-        CliError::msg(
-            "cannot read this node's GPU (nvidia-smi unavailable); run on the target GPU node",
-        )
-    })?;
-    baseline_gpu_matches(&baseline.gpu, Some(&gpu)).map_err(CliError::Msg)?;
+    trimul_artifact_impl(args, Some(trust_policy))
+}
 
+fn trimul_artifact_impl(
+    args: &TrimulArtifactArgs,
+    trust_policy: Option<&LaunchTrustPolicy>,
+) -> Result<(), CliError> {
+    let _ = ferrl::init_tracing();
+    validate_audit_cuda_visible_device(&args.audit_cuda_visible_device)?;
+    validate_artifact_note("--run-health", &args.run_health)?;
+    validate_artifact_note("--source-inspection-notes", &args.source_inspection_notes)?;
+    let bound = if let Some(trust_policy) = trust_policy {
+        load_bound_run_candidate_with_trust(&args.run_dir, &args.candidate_sha256, trust_policy)?
+    } else {
+        load_bound_run_candidate(&args.run_dir, &args.candidate_sha256)?
+    };
+    let cfg = &bound.config;
+    let verifier_assets = capture_launch_bound_trimul_verifier_assets(cfg, &bound.launch)?;
     let raw_completion = &bound.candidate.completion;
     let extract_mode = cfg.trimul_submission_extract_mode()?;
-    let mut reward = cfg
-        .preflight_trimul_reward(
-            cfg.build_trimul_reward_base_with_assets(verifier_assets.clone())?,
-        )?
-        .with_submission_extract_mode(extract_mode);
-    let audit_verifier = launch_verifier_identity(&reward, &verifier_assets)?;
-    let launch_verifier = bound
-        .launch
-        .payload
-        .verifier
-        .as_ref()
-        .expect("publication eligibility requires verifier evidence");
-    if &audit_verifier != launch_verifier {
-        return Err(CliError::msg(
-            "dedicated verifier preflight evidence differs from the launch-bound training evidence; blocker-6 audit handoff is not yet available",
-        ));
-    }
-    if baseline.isolation_tier != audit_verifier.isolation.tier
-        || baseline.isolation_evidence_sha256 != audit_verifier.isolation_evidence_sha256
-    {
-        return Err(CliError::msg(
-            "trimul.baseline verifier isolation evidence differs from the dedicated audit backend",
-        ));
-    }
-    let submission = reward.extract_submission(raw_completion).ok_or_else(|| {
-        CliError::msg("completion does not contain a closed non-empty fenced code block")
-    })?;
-
-    reward = reward
-        .with_secret_seed(args.audit_secret_seed)
-        .with_baseline_ns(baseline_median);
+    let submission = ferrl::trimul::extract_submission_with_mode(raw_completion, extract_mode)
+        .ok_or_else(|| {
+            CliError::msg("completion does not contain a closed non-empty fenced code block")
+        })?;
     let (test_cases, benchmark_cases) = ferrl::trimul::parse_task_yml(verifier_assets.task_yml())?;
-    let runs = verify_submission_repeated(&reward, &submission, args.repeats)?;
-    let accepted = accepted_artifact(&runs, baseline_median)
-        && args.source_inspection == SourceInspectionResult::Clean;
+    let audit_contract_sha256 = artifact_audit_contract_sha256(
+        &bound.launch,
+        &bound.candidate,
+        &submission,
+        verifier_assets.identity(),
+    );
+    let audit_secret_seed =
+        artifact_audit_secret_seed(&audit_contract_sha256, cfg.trimul.secret_seed);
+    let audit_id = artifact_audit_id(&audit_contract_sha256, audit_secret_seed);
+    let mut publication = ArtifactPublication::claim(&args.out, &audit_contract_sha256)?;
+    publication.stage_text(Path::new("submission.py"), &submission)?;
+    publication.stage_text(Path::new("completion.txt"), raw_completion)?;
+    publication.stage_bytes(Path::new(RunDir::LAUNCH_FILE), &bound.launch_bytes)?;
+    publication.stage_bytes(Path::new("candidate.json"), &bound.candidate_row_bytes)?;
+    publication.stage_bytes(Path::new("prompt.txt"), &bound.prompt_bytes)?;
+
+    let reward =
+        build_artifact_audit_reward(cfg, verifier_assets.clone(), args, audit_secret_seed)?
+            .with_submission_extract_mode(extract_mode);
+    let audit_verifier = launch_verifier_identity(&reward, &verifier_assets)?;
+    let blocks = verify_submission_paired(
+        &reward,
+        &submission,
+        test_cases.len(),
+        benchmark_cases.len(),
+        &audit_verifier,
+        &audit_id,
+        &mut publication,
+    )?;
+    let decision = artifact_acceptance_decision(&blocks);
+    let accepted = decision.accepted && args.source_inspection == SourceInspectionResult::Clean;
     write_artifact_bundle(
         args,
         cfg,
+        &mut publication,
         &ArtifactInputs {
-            gpu,
             launch: &bound.launch,
             launch_bytes: &bound.launch_bytes,
             candidate: &bound.candidate,
@@ -4566,10 +4639,14 @@ fn trimul_artifact_with_trust(
             raw_completion,
             prompt_bytes: &bound.prompt_bytes,
             submission: &submission,
-            baseline_median,
             test_cases: test_cases.len(),
             benchmark_cases: benchmark_cases.len(),
-            runs,
+            audit_contract_sha256,
+            audit_id,
+            audit_secret_seed,
+            audit_verifier,
+            blocks,
+            decision,
             accepted,
         },
     )?;
@@ -4580,7 +4657,82 @@ fn trimul_artifact_with_trust(
     Ok(())
 }
 
-fn capture_attested_trimul_verifier_assets(
+fn validate_audit_cuda_visible_device(value: &str) -> Result<(), CliError> {
+    if value.is_empty()
+        || value.trim() != value
+        || value.contains(',')
+        || value.chars().any(char::is_whitespace)
+        || value.bytes().any(|byte| byte == 0)
+    {
+        return Err(CliError::msg(
+            "--audit-cuda-visible-device must be one non-empty CUDA device token",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_artifact_note(label: &str, value: &str) -> Result<(), CliError> {
+    if value.trim().is_empty() || value.trim() != value {
+        return Err(CliError::msg(format!(
+            "{label} must be non-empty without leading or trailing whitespace"
+        )));
+    }
+    if value.len() > 4096 || value.chars().any(char::is_control) {
+        return Err(CliError::msg(format!(
+            "{label} must be at most 4096 bytes and contain no control characters"
+        )));
+    }
+    Ok(())
+}
+
+fn build_artifact_audit_reward(
+    cfg: &RunConfig,
+    assets: ferrl::trimul::TrimulVerifierAssets,
+    args: &TrimulArtifactArgs,
+    audit_secret_seed: u64,
+) -> Result<TrimulReward, CliError> {
+    let (tests, benchmarks) = ferrl::trimul::parse_task_yml(assets.task_yml())?;
+    let wall = Duration::from_secs(if cfg.trimul.wall_secs == 0 {
+        600
+    } else {
+        cfg.trimul.wall_secs
+    });
+    let mut reward = TrimulReward::new(assets, &cfg.trimul.scratch_root)
+        .with_cases(tests, benchmarks)
+        .with_secret_seed(audit_secret_seed)
+        .with_wall(wall)
+        .with_verifier_cuda_visible_devices(args.audit_cuda_visible_device.clone())
+        .with_verifier_parallelism(1)
+        .with_reward_profile(cfg.trimul.reward)
+        .map_err(CliError::msg)?;
+    reward = if let Some(socket) = &args.audit_verifier_executor_socket {
+        reward.with_verifier_executor_socket(socket.clone())
+    } else {
+        reward.with_same_uid_apptainer(
+            cfg.trimul.scratch_root.join(".ferrl-verifier"),
+            cfg.trimul
+                .verifier_apptainer_bin
+                .as_deref()
+                .unwrap_or_else(|| Path::new("/usr/bin/apptainer")),
+        )
+    };
+    if cfg.trimul.verifier_max_procs != 0 {
+        reward = reward.with_verifier_max_procs(cfg.trimul.verifier_max_procs);
+    }
+    if cfg.trimul.scratch_max_bytes != 0 {
+        reward = reward.with_scratch_max_bytes(cfg.trimul.scratch_max_bytes);
+    }
+    let reward = reward.with_verified_isolation().map_err(|error| {
+        CliError::msg(format!(
+            "artifact audit isolation preflight failed: {error}"
+        ))
+    })?;
+    reward
+        .with_verified_runtime()
+        .map_err(|error| CliError::msg(format!("artifact audit runtime preflight failed: {error}")))
+}
+
+fn capture_launch_bound_trimul_verifier_assets(
     cfg: &RunConfig,
     launch: &LaunchManifest,
 ) -> Result<ferrl::trimul::TrimulVerifierAssets, CliError> {
@@ -4590,7 +4742,7 @@ fn capture_attested_trimul_verifier_assets(
     let assets = cfg.capture_trimul_verifier_assets()?;
     if assets.identity() != &expected.assets {
         return Err(CliError::msg(
-            "live TriMul verifier assets do not match the attested launch identity",
+            "live TriMul verifier assets do not match the launch-bound discovery identity",
         ));
     }
     assets
@@ -4599,10 +4751,279 @@ fn capture_attested_trimul_verifier_assets(
     Ok(assets)
 }
 
+#[derive(Debug, Serialize)]
+struct ArtifactAttemptRecord<'a> {
+    contract_version: u32,
+    audit_contract_sha256: &'a str,
+    attempt_selection_assurance: &'static str,
+    durable_once_only: bool,
+    state: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ArtifactDirectoryIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl ArtifactDirectoryIdentity {
+    fn capture(path: &Path) -> Result<Self, CliError> {
+        let metadata = std::fs::symlink_metadata(path).map_err(|source| CliError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(CliError::msg(format!(
+                "artifact publication path {} is not a non-symlink directory",
+                path.display()
+            )));
+        }
+        Ok(Self {
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct ArtifactPublication {
+    final_dir: PathBuf,
+    stage_dir: PathBuf,
+    parent_dir: PathBuf,
+    owner: String,
+    final_identity: ArtifactDirectoryIdentity,
+    stage_identity: ArtifactDirectoryIdentity,
+    staged_files: BTreeSet<PathBuf>,
+}
+
+impl ArtifactPublication {
+    fn claim(final_dir: &Path, audit_contract_sha256: &str) -> Result<Self, CliError> {
+        let file_name = final_dir.file_name().ok_or_else(|| {
+            CliError::msg("artifact output must name a new directory beneath an existing parent")
+        })?;
+        if file_name.is_empty() {
+            return Err(CliError::msg(
+                "artifact output directory name must not be empty",
+            ));
+        }
+        let parent_dir = final_dir
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        std::fs::create_dir_all(&parent_dir).map_err(|source| CliError::Io {
+            path: parent_dir.clone(),
+            source,
+        })?;
+        sync_artifact_directory(&parent_dir)?;
+
+        std::fs::create_dir(final_dir).map_err(|source| {
+            if source.kind() == std::io::ErrorKind::AlreadyExists {
+                CliError::msg(format!(
+                    "{} already exists; artifact output claims are exclusive",
+                    final_dir.display()
+                ))
+            } else {
+                CliError::Io {
+                    path: final_dir.to_path_buf(),
+                    source,
+                }
+            }
+        })?;
+        let final_identity = ArtifactDirectoryIdentity::capture(final_dir)?;
+
+        let mut owner_bytes = [0_u8; 32];
+        SystemRandom::new().fill(&mut owner_bytes).map_err(|_| {
+            CliError::msg("operating-system randomness failed after artifact output was claimed")
+        })?;
+        let mut owner = String::with_capacity(64);
+        for byte in owner_bytes {
+            write!(&mut owner, "{byte:02x}").expect("writing hexadecimal to String cannot fail");
+        }
+        write_new_synced(&final_dir.join(ARTIFACT_OWNER_FILE), owner.as_bytes())?;
+
+        let stage_dir = parent_dir.join(format!(".ferrl-artifact-{owner}.stage"));
+        std::fs::create_dir(&stage_dir).map_err(|source| CliError::Io {
+            path: stage_dir.clone(),
+            source,
+        })?;
+        let stage_identity = ArtifactDirectoryIdentity::capture(&stage_dir)?;
+        write_new_synced(&stage_dir.join(ARTIFACT_OWNER_FILE), owner.as_bytes())?;
+        let verification = stage_dir.join("verification");
+        std::fs::create_dir(&verification).map_err(|source| CliError::Io {
+            path: verification.clone(),
+            source,
+        })?;
+        let attempt_json = json_pretty(
+            &final_dir.join(ARTIFACT_ATTEMPT_FILE),
+            &ArtifactAttemptRecord {
+                contract_version: ARTIFACT_CONTRACT_VERSION,
+                audit_contract_sha256,
+                attempt_selection_assurance: ARTIFACT_ATTEMPT_SELECTION_ASSURANCE,
+                durable_once_only: false,
+                state: "output_claimed_before_measurement",
+            },
+        )?;
+        write_new_synced(
+            &final_dir.join(ARTIFACT_ATTEMPT_FILE),
+            attempt_json.as_bytes(),
+        )?;
+        write_new_synced(
+            &stage_dir.join(ARTIFACT_ATTEMPT_FILE),
+            attempt_json.as_bytes(),
+        )?;
+        sync_artifact_directory(&verification)?;
+        sync_artifact_directory(&stage_dir)?;
+        sync_artifact_directory(final_dir)?;
+        sync_artifact_directory(&parent_dir)?;
+
+        Ok(Self {
+            final_dir: final_dir.to_path_buf(),
+            stage_dir,
+            parent_dir,
+            owner,
+            final_identity,
+            stage_identity,
+            staged_files: BTreeSet::new(),
+        })
+    }
+
+    fn require_owner(&self) -> Result<(), CliError> {
+        if ArtifactDirectoryIdentity::capture(&self.final_dir)? != self.final_identity
+            || ArtifactDirectoryIdentity::capture(&self.stage_dir)? != self.stage_identity
+            || read_bytes(&self.final_dir.join(ARTIFACT_OWNER_FILE))? != self.owner.as_bytes()
+            || read_bytes(&self.stage_dir.join(ARTIFACT_OWNER_FILE))? != self.owner.as_bytes()
+        {
+            return Err(CliError::msg(
+                "artifact publication ownership changed after its exclusive claim",
+            ));
+        }
+        Ok(())
+    }
+
+    fn stage_bytes(&mut self, relative: &Path, bytes: &[u8]) -> Result<(), CliError> {
+        self.require_owner()?;
+        if relative.as_os_str().is_empty()
+            || relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+            || relative.parent().is_some_and(|parent| {
+                !parent.as_os_str().is_empty() && parent != Path::new("verification")
+            })
+        {
+            return Err(CliError::msg(format!(
+                "invalid artifact staging path {}",
+                relative.display()
+            )));
+        }
+        if !self.staged_files.insert(relative.to_path_buf()) {
+            return Err(CliError::msg(format!(
+                "artifact staging attempted to replace {}",
+                relative.display()
+            )));
+        }
+        write_new_synced(&self.stage_dir.join(relative), bytes)
+    }
+
+    fn stage_text(&mut self, relative: &Path, text: &str) -> Result<(), CliError> {
+        self.stage_bytes(relative, text.as_bytes())
+    }
+
+    fn publish_manifest_last(&self) -> Result<(), CliError> {
+        self.require_owner()?;
+        let manifest = Path::new("manifest.json");
+        if !self.staged_files.contains(manifest) {
+            return Err(CliError::msg(
+                "artifact publication has no staged manifest commit marker",
+            ));
+        }
+        sync_artifact_directory(&self.stage_dir.join("verification"))?;
+        sync_artifact_directory(&self.stage_dir)?;
+
+        let verification = self.final_dir.join("verification");
+        std::fs::create_dir(&verification).map_err(|source| CliError::Io {
+            path: verification.clone(),
+            source,
+        })?;
+        #[cfg(test)]
+        let mut linked = 0_usize;
+        for relative in &self.staged_files {
+            if relative == manifest {
+                continue;
+            }
+            self.require_owner()?;
+            let destination = self.final_dir.join(relative);
+            std::fs::hard_link(self.stage_dir.join(relative), &destination).map_err(|source| {
+                CliError::Io {
+                    path: destination,
+                    source,
+                }
+            })?;
+            #[cfg(test)]
+            {
+                linked += 1;
+                if ARTIFACT_PUBLICATION_FAIL_AFTER_LINK.with(|fault| fault.get() == Some(linked)) {
+                    return Err(CliError::msg("injected artifact mid-publication failure"));
+                }
+            }
+        }
+        sync_artifact_directory(&verification)?;
+        sync_artifact_directory(&self.final_dir)?;
+        self.require_owner()?;
+        let destination_manifest = self.final_dir.join(manifest);
+        std::fs::hard_link(self.stage_dir.join(manifest), &destination_manifest).map_err(
+            |source| CliError::Io {
+                path: destination_manifest,
+                source,
+            },
+        )?;
+        sync_artifact_directory(&self.final_dir)?;
+        sync_artifact_directory(&self.parent_dir)
+    }
+}
+
+fn write_new_synced(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|source| CliError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    file.write_all(bytes).map_err(|source| CliError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    file.sync_all().map_err(|source| CliError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn sync_artifact_directory(path: &Path) -> Result<(), CliError> {
+    let directory = std::fs::File::open(path).map_err(|source| CliError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    directory.sync_all().map_err(|source| CliError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static ARTIFACT_PUBLICATION_FAIL_AFTER_LINK: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
 /// Values needed to write the artifact bundle.
 struct ArtifactInputs<'a> {
-    /// GPU product name.
-    gpu: String,
     /// Verified immutable launch manifest.
     launch: &'a LaunchManifest,
     /// Exact `launch.json` bytes captured from the run directory.
@@ -4617,14 +5038,22 @@ struct ArtifactInputs<'a> {
     prompt_bytes: &'a [u8],
     /// Extracted source.
     submission: &'a str,
-    /// Median baseline service latency, in ns.
-    baseline_median: f64,
     /// Loaded correctness case count.
     test_cases: usize,
     /// Loaded benchmark case count.
     benchmark_cases: usize,
-    /// Verification runs.
-    runs: Vec<ArtifactVerificationRun>,
+    /// Immutable candidate/audit contract digest.
+    audit_contract_sha256: String,
+    /// Domain-separated audit request identity.
+    audit_id: String,
+    /// Deterministically derived case-generation seed.
+    audit_secret_seed: u64,
+    /// Selected verifier identity established at audit preflight.
+    audit_verifier: LaunchVerifierIdentity,
+    /// Fixed paired audit blocks.
+    blocks: Vec<ArtifactAuditBlock>,
+    /// Predeclared empirical material-margin decision.
+    decision: ArtifactAcceptanceDecision,
     /// Mechanical acceptance decision.
     accepted: bool,
 }
@@ -4676,83 +5105,332 @@ fn parse_run_config(path: &Path, bytes: &[u8]) -> Result<RunConfig, CliError> {
     Ok(cfg)
 }
 
-/// Run clean verification `repeats` times.
-fn verify_submission_repeated(
+fn artifact_audit_contract_sha256(
+    launch: &LaunchManifest,
+    candidate: &CandidateRecord,
+    submission: &str,
+    verifier_assets: &ferrl::trimul::TrimulVerifierIdentity,
+) -> String {
+    let submission_sha256 = sha256_hex(submission.as_bytes());
+    artifact_audit_contract_from_identity(
+        &launch.payload_sha256,
+        candidate
+            .record_sha256
+            .as_deref()
+            .expect("verified candidate must carry record_sha256"),
+        &submission_sha256,
+        &verifier_assets.eval_bundle_sha256,
+        &verifier_assets.image_sha256,
+        &verifier_assets.task_yml_sha256,
+    )
+}
+
+fn artifact_audit_contract_from_identity(
+    launch_sha256: &str,
+    candidate_sha256: &str,
+    submission_sha256: &str,
+    eval_bundle_sha256: &str,
+    image_sha256: &str,
+    task_yml_sha256: &str,
+) -> String {
+    let paired_blocks = (ARTIFACT_AUDIT_BLOCKS as u64).to_le_bytes();
+    let required_wins = (ARTIFACT_REQUIRED_MATERIAL_WINS as u64).to_le_bytes();
+    let material_speedup = ARTIFACT_MATERIAL_SPEEDUP.to_bits().to_le_bytes();
+    domain_sha256(
+        "ferrl.trimul-artifact-audit.v2",
+        &[
+            launch_sha256.as_bytes(),
+            candidate_sha256.as_bytes(),
+            submission_sha256.as_bytes(),
+            eval_bundle_sha256.as_bytes(),
+            image_sha256.as_bytes(),
+            task_yml_sha256.as_bytes(),
+            ARTIFACT_ACCEPTANCE_METHOD.as_bytes(),
+            ARTIFACT_AUDIT_SEED_DERIVATION.as_bytes(),
+            ARTIFACT_ATTEMPT_SELECTION_ASSURANCE.as_bytes(),
+            b"strict_greater_than",
+            &paired_blocks,
+            &required_wins,
+            &material_speedup,
+        ],
+    )
+}
+
+fn artifact_audit_secret_seed(audit_contract_sha256: &str, training_secret_seed: u64) -> u64 {
+    let digest = domain_sha256(
+        "ferrl.trimul-artifact-audit-seed.v1",
+        &[audit_contract_sha256.as_bytes()],
+    );
+    let mut seed = u64::from(
+        u32::from_str_radix(&digest[..8], 16)
+            .expect("domain SHA-256 prefix is lowercase hexadecimal"),
+    );
+    if seed == training_secret_seed {
+        seed ^= 1;
+    }
+    seed
+}
+
+fn artifact_audit_id(audit_contract_sha256: &str, audit_secret_seed: u64) -> String {
+    domain_sha256(
+        "ferrl.trimul-artifact-audit-attempt.v2",
+        &[
+            audit_contract_sha256.as_bytes(),
+            &audit_secret_seed.to_le_bytes(),
+        ],
+    )
+}
+
+fn artifact_execution(
+    role: ArtifactAuditRole,
+    result: ferrl::trimul::EvidencedTrimulVerification,
+    expected_test_cases: usize,
+    expected_benchmark_cases: usize,
+    audit_verifier: &LaunchVerifierIdentity,
+) -> Result<ArtifactAuditExecution, CliError> {
+    if result.isolation != audit_verifier.isolation
+        || result.isolation_evidence_sha256 != audit_verifier.isolation_evidence_sha256
+        || audit_verifier.runtime_preflight.runtime_hardening.len() != 1
+        || result.runtime_hardening.len() != 2
+        || result.runtime_hardening.iter().any(|record| {
+            audit_verifier.runtime_preflight.runtime_hardening.first() != Some(record)
+        })
+    {
+        return Err(CliError::msg(format!(
+            "artifact {} execution evidence differs from the selected audit preflight",
+            role.label()
+        )));
+    }
+    let exact = ferrl::trimul::validate_artifact_verification_evidence(
+        &result,
+        expected_test_cases,
+        expected_benchmark_cases,
+    )
+    .map_err(|error| {
+        CliError::msg(format!(
+            "artifact {} evidence is not publication-grade: {error}",
+            role.label()
+        ))
+    })?;
+    let isolation_tier = result.isolation.tier;
+    Ok(ArtifactAuditExecution {
+        role,
+        isolation_tier,
+        isolation: result.isolation,
+        isolation_evidence_sha256: result.isolation_evidence_sha256,
+        runtime_hardening_evidence_sha256: result.runtime_hardening_evidence_sha256,
+        runtime_hardening: result.runtime_hardening,
+        timing_metric: ferrl::trimul::timing_metric_for_tier(isolation_tier).to_owned(),
+        verification: result.verification,
+        exact,
+        protected_output: result.protected_output,
+        sandbox_diagnostics: result.sandbox_diagnostics,
+    })
+}
+
+fn verify_artifact_role(
     reward: &TrimulReward,
     submission: &str,
-    repeats: usize,
-) -> Result<Vec<ArtifactVerificationRun>, CliError> {
-    (0..repeats)
-        .map(|_| {
-            let v = reward
-                .verify_submission_with_evidence(submission)
-                .map_err(|e| CliError::msg(format!("artifact verification failed: {e}")))?;
-            Ok(ArtifactVerificationRun {
-                isolation_tier: v.isolation.tier,
-                isolation_evidence_sha256: v.isolation_evidence_sha256,
-                runtime_hardening_evidence_sha256: v.runtime_hardening_evidence_sha256,
-                runtime_hardening: v.runtime_hardening,
-                timing_metric: ferrl::trimul::timing_metric_for_tier(v.isolation.tier).to_string(),
-                correct: v.verification.correct,
-                benchmark_means_ns: v.verification.benchmark_means_ns,
-                geomean_ns: v.verification.geomean_ns,
-                speedup: v.verification.speedup,
-            })
+    role: ArtifactAuditRole,
+) -> Result<ferrl::trimul::EvidencedTrimulVerification, CliError> {
+    let result = match role {
+        ArtifactAuditRole::Reference => reward.verify_reference_with_evidence(),
+        ArtifactAuditRole::Candidate => reward.verify_submission_with_evidence(submission),
+    };
+    result.map_err(|error| {
+        CliError::msg(format!(
+            "artifact {} verification failed: {error}",
+            role.label()
+        ))
+    })
+}
+
+fn verify_submission_paired(
+    reward: &TrimulReward,
+    submission: &str,
+    expected_test_cases: usize,
+    expected_benchmark_cases: usize,
+    audit_verifier: &LaunchVerifierIdentity,
+    audit_id: &str,
+    publication: &mut ArtifactPublication,
+) -> Result<Vec<ArtifactAuditBlock>, CliError> {
+    let schedule = artifact_audit_schedule(audit_id);
+    let mut executing_device = None;
+    let mut blocks = Vec::with_capacity(schedule.len());
+    for (index, first) in schedule.into_iter().enumerate() {
+        let second = first.other();
+        let first_execution = artifact_execution(
+            first,
+            verify_artifact_role(reward, submission, first)?,
+            expected_test_cases,
+            expected_benchmark_cases,
+            audit_verifier,
+        )?;
+        stage_artifact_execution(publication, index, &first_execution)?;
+        let second_execution = artifact_execution(
+            second,
+            verify_artifact_role(reward, submission, second)?,
+            expected_test_cases,
+            expected_benchmark_cases,
+            audit_verifier,
+        )?;
+        stage_artifact_execution(publication, index, &second_execution)?;
+        for execution in [&first_execution, &second_execution] {
+            if executing_device
+                .as_ref()
+                .is_some_and(|expected| expected != &execution.exact.executing_device)
+            {
+                return Err(CliError::msg(
+                    "paired artifact audit changed physical CUDA devices",
+                ));
+            }
+            executing_device.get_or_insert_with(|| execution.exact.executing_device.clone());
+        }
+        let (reference, candidate) = if first == ArtifactAuditRole::Reference {
+            (first_execution, second_execution)
+        } else {
+            (second_execution, first_execution)
+        };
+        let reference_geomean = reference
+            .verification
+            .geomean_ns
+            .expect("strict reference evidence requires a finite geomean");
+        let candidate_geomean = candidate
+            .verification
+            .geomean_ns
+            .expect("strict candidate evidence requires a finite geomean");
+        let paired_speedup = reference_geomean / candidate_geomean;
+        if !paired_speedup.is_finite() || paired_speedup <= 0.0 {
+            return Err(CliError::msg(
+                "paired artifact audit produced an invalid speedup ratio",
+            ));
+        }
+        blocks.push(ArtifactAuditBlock {
+            index,
+            first,
+            reference,
+            candidate,
+            paired_speedup,
+            material_win: paired_speedup > ARTIFACT_MATERIAL_SPEEDUP,
+        });
+    }
+    Ok(blocks)
+}
+
+fn artifact_audit_schedule(audit_id: &str) -> Vec<ArtifactAuditRole> {
+    let starting_byte =
+        u8::from_str_radix(&audit_id[..2], 16).expect("domain SHA-256 is lowercase hexadecimal");
+    let starts_with_reference = starting_byte & 1 == 0;
+    (0..ARTIFACT_AUDIT_BLOCKS)
+        .map(|index| {
+            if (index % 2 == 0) == starts_with_reference {
+                ArtifactAuditRole::Reference
+            } else {
+                ArtifactAuditRole::Candidate
+            }
         })
         .collect()
 }
 
-/// Mechanical artifact acceptance: every re-run correct and measured under the exact
-/// versioned metric, and the median candidate service latency beats the baseline.
-fn accepted_artifact(runs: &[ArtifactVerificationRun], baseline_median: f64) -> bool {
-    let geos: Vec<f64> = runs.iter().filter_map(|r| r.geomean_ns).collect();
-    geos.len() == runs.len()
-        && runs.iter().all(|run| {
-            run.isolation_tier == ferrl::VerifierIsolationTier::DedicatedUidServiceV1
-                && run.timing_metric == ferrl::trimul::timing_metric_for_tier(run.isolation_tier)
-                && !run.isolation_evidence_sha256.is_empty()
-                && !run.runtime_hardening_evidence_sha256.is_empty()
-                && !run.runtime_hardening.is_empty()
-        })
-        && runs.iter().all(|r| r.correct)
-        && median_checked(&geos, "candidate geomean")
-            .is_ok_and(|candidate| candidate < baseline_median)
+fn artifact_acceptance_from_speedups(speedups: &[f64]) -> ArtifactAcceptanceDecision {
+    let valid_speedups = speedups
+        .iter()
+        .filter(|speedup| speedup.is_finite() && **speedup > 0.0)
+        .count();
+    let material_wins = speedups
+        .iter()
+        .filter(|speedup| speedup.is_finite() && **speedup > ARTIFACT_MATERIAL_SPEEDUP)
+        .count();
+    ArtifactAcceptanceDecision {
+        method: ARTIFACT_ACCEPTANCE_METHOD,
+        paired_blocks: speedups.len(),
+        material_speedup: ARTIFACT_MATERIAL_SPEEDUP,
+        threshold_comparison: "strict_greater_than",
+        required_material_wins: ARTIFACT_REQUIRED_MATERIAL_WINS,
+        observed_material_wins: material_wins,
+        accepted: speedups.len() == ARTIFACT_AUDIT_BLOCKS
+            && valid_speedups == ARTIFACT_AUDIT_BLOCKS
+            && material_wins >= ARTIFACT_REQUIRED_MATERIAL_WINS,
+    }
+}
+
+fn artifact_acceptance_decision(blocks: &[ArtifactAuditBlock]) -> ArtifactAcceptanceDecision {
+    artifact_acceptance_from_speedups(
+        &blocks
+            .iter()
+            .map(|block| block.paired_speedup)
+            .collect::<Vec<_>>(),
+    )
 }
 
 /// Write the full contract artifact bundle.
 fn write_artifact_bundle(
     args: &TrimulArtifactArgs,
     cfg: &RunConfig,
+    publication: &mut ArtifactPublication,
     inputs: &ArtifactInputs<'_>,
 ) -> Result<(), CliError> {
     let manifest_path = args.out.join("manifest.json");
-    if manifest_path.exists() {
-        return Err(CliError::msg(format!(
-            "{} already exists; refusing to overwrite an artifact",
-            manifest_path.display()
-        )));
+    let mut block_manifests = Vec::with_capacity(inputs.blocks.len());
+    for block in &inputs.blocks {
+        let reference = artifact_execution_manifest(block.index, &block.reference)?;
+        let candidate = artifact_execution_manifest(block.index, &block.candidate)?;
+        block_manifests.push(ArtifactAuditBlockManifest {
+            index: block.index,
+            first: block.first,
+            reference,
+            candidate,
+            paired_speedup: block.paired_speedup,
+            material_win: block.material_win,
+        });
     }
-    std::fs::create_dir_all(args.out.join("verification")).map_err(|source| CliError::Io {
-        path: args.out.clone(),
-        source,
-    })?;
-    write_text(&args.out.join("submission.py"), inputs.submission)?;
-    write_text(&args.out.join("completion.txt"), inputs.raw_completion)?;
-    write_bytes(&args.out.join(RunDir::LAUNCH_FILE), inputs.launch_bytes)?;
-    write_bytes(&args.out.join("candidate.json"), inputs.candidate_row_bytes)?;
-    write_bytes(&args.out.join("prompt.txt"), inputs.prompt_bytes)?;
-    for (i, run) in inputs.runs.iter().enumerate() {
-        write_json(&args.out.join(format!("verification/run-{i:03}.json")), run)?;
-    }
-    let manifest = build_manifest(args, cfg, inputs);
+    let manifest = build_manifest(args, cfg, inputs, block_manifests);
     let manifest_json = json_pretty(&manifest_path, &manifest)?;
-    write_text(&manifest_path, &manifest_json)?;
     let manifest_sha256 = sha256_hex(manifest_json.as_bytes());
-    write_text(
-        &args.out.join("report.md"),
+    publication.stage_text(
+        Path::new("report.md"),
         &artifact_report(&manifest, &args.out, &manifest_sha256),
     )?;
-    Ok(())
+    publication.stage_text(Path::new("manifest.json"), &manifest_json)?;
+    publication.publish_manifest_last()
+}
+
+fn stage_artifact_execution(
+    publication: &mut ArtifactPublication,
+    block_index: usize,
+    execution: &ArtifactAuditExecution,
+) -> Result<(), CliError> {
+    let evidence_file = format!(
+        "verification/block-{block_index:03}-{}.json",
+        execution.role.label()
+    );
+    let evidence_path = publication.stage_dir.join(&evidence_file);
+    let evidence_json = json_pretty(&evidence_path, execution)?;
+    publication.stage_text(Path::new(&evidence_file), &evidence_json)
+}
+
+fn artifact_execution_manifest(
+    block_index: usize,
+    execution: &ArtifactAuditExecution,
+) -> Result<ArtifactAuditExecutionManifest, CliError> {
+    let evidence_file = format!(
+        "verification/block-{block_index:03}-{}.json",
+        execution.role.label()
+    );
+    let evidence_json = json_pretty(Path::new(&evidence_file), execution)?;
+    Ok(ArtifactAuditExecutionManifest {
+        role: execution.role,
+        evidence_file,
+        evidence_sha256: sha256_hex(evidence_json.as_bytes()),
+        isolation_tier: execution.isolation_tier,
+        isolation: execution.isolation.clone(),
+        isolation_evidence_sha256: execution.isolation_evidence_sha256.clone(),
+        runtime_hardening_evidence_sha256: execution.runtime_hardening_evidence_sha256.clone(),
+        runtime_hardening: execution.runtime_hardening.clone(),
+        timing_metric: execution.timing_metric.clone(),
+        verification: execution.verification.clone(),
+        exact: execution.exact.clone(),
+    })
 }
 
 /// Build the artifact manifest.
@@ -4760,28 +5438,48 @@ fn build_manifest(
     args: &TrimulArtifactArgs,
     cfg: &RunConfig,
     inputs: &ArtifactInputs<'_>,
+    blocks: Vec<ArtifactAuditBlockManifest>,
 ) -> ArtifactManifest {
     let launch = &inputs.launch.payload;
-    let verifier = launch
+    let discovery_verifier = launch
         .verifier
         .as_ref()
         .expect("verified TriMul launch must bind verifier assets");
+    let audit_verifier = &inputs.audit_verifier;
     let candidate = inputs.candidate;
+    let executing_device = blocks
+        .first()
+        .expect("fixed artifact audit contains blocks")
+        .reference
+        .exact
+        .executing_device
+        .clone();
     ArtifactManifest {
-        contract_version: 3,
+        contract_version: ARTIFACT_CONTRACT_VERSION,
         task: "trimul",
         ferrl_commit: launch.ferrl_commit.clone(),
         run_id: launch.run.run_id.clone(),
         launch_sha256: inputs.launch.payload_sha256.clone(),
         launch_file_sha256: sha256_hex(inputs.launch_bytes),
+        launch_authentication: launch.authentication,
         launch_attestation_key_id: inputs
             .launch
             .attestation
             .as_ref()
-            .expect("verified candidate launch must have an attestation")
-            .key_id
-            .clone(),
-        launch_attestation_algorithm: LAUNCH_ATTESTATION_ALGORITHM.to_owned(),
+            .map(|attestation| attestation.key_id.clone()),
+        launch_attestation_algorithm: inputs
+            .launch
+            .attestation
+            .as_ref()
+            .map(|_| LAUNCH_ATTESTATION_ALGORITHM.to_owned()),
+        discovery_verifier: DiscoveryVerifierManifest {
+            isolation_tier: discovery_verifier.isolation.tier,
+            isolation_evidence_sha256: discovery_verifier.isolation_evidence_sha256.clone(),
+            timing_metric: discovery_verifier.timing_metric.clone(),
+            runtime_preflight_evidence_sha256: discovery_verifier
+                .runtime_preflight_evidence_sha256
+                .clone(),
+        },
         candidate: CandidateManifest {
             record_sha256: candidate
                 .record_sha256
@@ -4826,43 +5524,45 @@ fn build_manifest(
             policy_seed: cfg.policy.seed,
             data_seed: cfg.data.seed,
             training_secret_seed: cfg.trimul.secret_seed,
-            audit_secret_seed: args.audit_secret_seed,
+            audit_secret_seed: inputs.audit_secret_seed,
             scratch_max_bytes: trimul_scratch_cap(cfg),
             verifier_parallelism: cfg.trimul.verifier_parallelism.max(1),
             verifier_max_procs: trimul_verifier_max_procs(cfg),
             verifier_cuda_device_pool: cfg.trimul.verifier_cuda_device_pool.clone(),
         },
         eval: EvalManifest {
-            bundle_path: cfg.trimul.eval_dir.display().to_string(),
-            bundle_sha256: verifier.assets.eval_bundle_sha256.clone(),
-            bundle_file_count: verifier.assets.eval_file_count,
-            sandbox_image_path: cfg.trimul.image.display().to_string(),
-            sandbox_image_sha256: verifier.assets.image_sha256.clone(),
-            sandbox_image_len_bytes: verifier.assets.image_len_bytes,
-            task_yml_sha256: verifier.assets.task_yml_sha256.clone(),
-            task_yml_len_bytes: verifier.assets.task_yml_len_bytes,
+            bundle_sha256: audit_verifier.assets.eval_bundle_sha256.clone(),
+            bundle_file_count: audit_verifier.assets.eval_file_count,
+            sandbox_image_sha256: audit_verifier.assets.image_sha256.clone(),
+            sandbox_image_len_bytes: audit_verifier.assets.image_len_bytes,
+            task_yml_sha256: audit_verifier.assets.task_yml_sha256.clone(),
+            task_yml_len_bytes: audit_verifier.assets.task_yml_len_bytes,
             test_cases: inputs.test_cases,
             benchmark_cases: inputs.benchmark_cases,
         },
-        baseline: BaselineManifest {
-            metric: ferrl::trimul::timing_metric_for_tier(verifier.isolation.tier).to_string(),
-            isolation_tier: verifier.isolation.tier,
-            isolation_evidence_sha256: verifier.isolation_evidence_sha256.clone(),
-            gpu: inputs.gpu.clone(),
-            measurements_ns: args.baseline_measurements_ns.clone(),
-            median_ns: inputs.baseline_median,
-            command: args
-                .baseline_command
-                .clone()
-                .unwrap_or_else(|| "ferrl trimul-baseline --config <launch-config>".to_owned()),
+        audit: ArtifactAuditManifest {
+            contract: "ferrl.trimul-artifact-audit.v2",
+            audit_contract_sha256: inputs.audit_contract_sha256.clone(),
+            audit_id: inputs.audit_id.clone(),
+            audit_secret_seed: inputs.audit_secret_seed,
+            audit_seed_derivation: ARTIFACT_AUDIT_SEED_DERIVATION,
+            attempt_selection_assurance: ARTIFACT_ATTEMPT_SELECTION_ASSURANCE,
+            durable_once_only: false,
+            artifact_wide_false_positive_guarantee: false,
+            requested_cuda_visible_device: args.audit_cuda_visible_device.clone(),
+            isolation_tier: audit_verifier.isolation.tier,
+            isolation: audit_verifier.isolation.clone(),
+            isolation_evidence_sha256: audit_verifier.isolation_evidence_sha256.clone(),
+            runtime_preflight: audit_verifier.runtime_preflight.clone(),
+            runtime_preflight_evidence_sha256: audit_verifier
+                .runtime_preflight_evidence_sha256
+                .clone(),
+            timing_metric: audit_verifier.timing_metric.clone(),
+            executing_device,
+            blocks,
+            decision: inputs.decision.clone(),
         },
-        verification: VerificationManifest {
-            gpu: inputs.gpu.clone(),
-            isolation_tier: verifier.isolation.tier,
-            isolation_evidence_sha256: verifier.isolation_evidence_sha256.clone(),
-            runs: inputs.runs.clone(),
-            accepted: inputs.accepted,
-        },
+        accepted: inputs.accepted,
     }
 }
 
@@ -4883,101 +5583,51 @@ fn trimul_verifier_max_procs(cfg: &RunConfig) -> u64 {
     }
 }
 
-/// Write UTF-8 text to `path`.
-fn write_text(path: &Path, text: &str) -> Result<(), CliError> {
-    std::fs::write(path, text).map_err(|source| CliError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
-}
-
-/// Write bytes to `path`.
-fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
-    std::fs::write(path, bytes).map_err(|source| CliError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
-}
-
-/// Pretty-write JSON to `path`.
-fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), CliError> {
-    let json = json_pretty(path, value)?;
-    write_text(path, &json)
-}
-
 /// Render pretty JSON for `path` so callers can hash the exact bytes they write.
 fn json_pretty<T: Serialize>(path: &Path, value: &T) -> Result<String, CliError> {
     serde_json::to_string_pretty(value)
         .map_err(|e| CliError::msg(format!("serialize {}: {e}", path.display())))
 }
 
-/// A contract-shaped human report next to the machine manifest.
+#[allow(clippy::cognitive_complexity)] // renders and independently checks every v4 contract layer
 fn artifact_report(
     manifest: &ArtifactManifest,
-    artifact_dir: &Path,
+    _artifact_dir: &Path,
     manifest_sha256: &str,
 ) -> String {
-    let median_candidate = median_checked(
-        &manifest
-            .verification
-            .runs
-            .iter()
-            .filter_map(|r| r.geomean_ns)
-            .collect::<Vec<_>>(),
-        "candidate geomean",
-    )
-    .ok();
-    let speedup = median_candidate.map(|c| manifest.baseline.median_ns / c);
-    let verdict = if manifest.verification.accepted {
+    let verdict = if manifest.accepted {
         "accepted_artifact"
     } else {
-        "invalid_run"
+        "rejected_candidate"
     };
-    let clean_correct = manifest
-        .verification
-        .runs
+    let attestation = manifest.launch_attestation_key_id.as_ref().map_or_else(
+        || "none (local discovery authentication)".to_owned(),
+        |key_id| {
+            format!(
+                "{} ({})",
+                key_id,
+                manifest
+                    .launch_attestation_algorithm
+                    .as_deref()
+                    .unwrap_or("missing")
+            )
+        },
+    );
+    let source_inspection = source_inspection_label(manifest.candidate.source_inspection.result);
+    let ratios = manifest
+        .audit
+        .blocks
         .iter()
-        .filter(|r| r.correct)
-        .count();
-    let clean_total = manifest.verification.runs.len();
-    let decision = artifact_accept_reason(manifest, median_candidate);
-    let baseline_measurements = manifest
-        .baseline
-        .measurements_ns
-        .iter()
-        .map(|v| format!("{v:.6}"))
+        .map(|block| format!("{:.6}", block.paired_speedup))
         .collect::<Vec<_>>()
         .join(", ");
-    let candidate_median =
-        median_candidate.map_or_else(|| "none".to_string(), |v| format!("{v:.6}"));
-    let speedup = speedup.map_or_else(|| "none".to_string(), |v| format!("{v:.6}"));
-    let source_inspection = source_inspection_label(manifest.candidate.source_inspection.result);
 
     let mut out = String::new();
     writeln!(&mut out, "# TriMul Artifact Report\n").expect("writing to String cannot fail");
     writeln!(&mut out, "## 1. Verdict\n").expect("writing to String cannot fail");
     writeln!(&mut out, "{verdict}\n").expect("writing to String cannot fail");
 
-    writeln!(&mut out, "## 2. Baseline\n").expect("writing to String cannot fail");
-    writeln!(&mut out, "- GPU: {}", manifest.baseline.gpu).expect("writing to String cannot fail");
-    writeln!(&mut out, "- Timing metric: {}", manifest.baseline.metric)
-        .expect("writing to String cannot fail");
-    writeln!(&mut out, "- Raw measurements ns: {baseline_measurements}")
-        .expect("writing to String cannot fail");
-    writeln!(
-        &mut out,
-        "- Median service latency ns: {:.6}",
-        manifest.baseline.median_ns
-    )
-    .expect("writing to String cannot fail");
-    writeln!(
-        &mut out,
-        "- Command used: `{}`\n",
-        manifest.baseline.command
-    )
-    .expect("writing to String cannot fail");
-
-    writeln!(&mut out, "## 3. Training\n").expect("writing to String cannot fail");
+    writeln!(&mut out, "## 2. Discovery Provenance\n").expect("writing to String cannot fail");
     writeln!(&mut out, "- ferrl commit: {}", manifest.ferrl_commit)
         .expect("writing to String cannot fail");
     writeln!(
@@ -4991,21 +5641,32 @@ fn artifact_report(
     .expect("writing to String cannot fail");
     writeln!(
         &mut out,
-        "- Launch attestation: {} ({})",
-        manifest.launch_attestation_key_id, manifest.launch_attestation_algorithm
+        "- Launch authentication: {:?}",
+        manifest.launch_authentication
+    )
+    .expect("writing to String cannot fail");
+    writeln!(&mut out, "- Launch attestation: {attestation}")
+        .expect("writing to String cannot fail");
+    writeln!(
+        &mut out,
+        "- Discovery verifier: tier={:?}, evidence={}, metric={}",
+        manifest.discovery_verifier.isolation_tier,
+        manifest.discovery_verifier.isolation_evidence_sha256,
+        manifest.discovery_verifier.timing_metric
+    )
+    .expect("writing to String cannot fail");
+    writeln!(
+        &mut out,
+        "- Candidate: record={}, source={}, training_reward={:.6}",
+        manifest.candidate.record_sha256,
+        manifest.candidate.source_sha256,
+        manifest.candidate.training_reward
     )
     .expect("writing to String cannot fail");
     writeln!(
         &mut out,
         "- Prompt copy: {} ({})",
         manifest.config.prompt_file, manifest.config.prompt_sha256
-    )
-    .expect("writing to String cannot fail");
-    writeln!(
-        &mut out,
-        "- Reward profile: `{}`",
-        serde_json::to_string(&manifest.config.reward_profile)
-            .expect("reward profile serializes to JSON")
     )
     .expect("writing to String cannot fail");
     writeln!(
@@ -5017,7 +5678,14 @@ fn artifact_report(
         manifest.model.lora_rank,
         manifest.model.lora_alpha,
         manifest.model.base_dtype,
-        manifest.model.base_quantization
+        manifest.model.base_quantization,
+    )
+    .expect("writing to String cannot fail");
+    writeln!(
+        &mut out,
+        "- Reward profile: `{}`",
+        serde_json::to_string(&manifest.config.reward_profile)
+            .expect("reward profile serializes to JSON")
     )
     .expect("writing to String cannot fail");
     writeln!(
@@ -5026,7 +5694,7 @@ fn artifact_report(
         manifest.config.data_seed,
         manifest.config.policy_seed,
         manifest.config.training_secret_seed,
-        manifest.config.audit_secret_seed
+        manifest.config.audit_secret_seed,
     )
     .expect("writing to String cannot fail");
     writeln!(
@@ -5035,131 +5703,448 @@ fn artifact_report(
         manifest.config.trainer_steps,
         manifest.config.group_size,
         manifest.config.scratch_max_bytes,
-        manifest.config.verifier_max_procs
+        manifest.config.verifier_max_procs,
     )
     .expect("writing to String cannot fail");
-    writeln!(&mut out, "- Run health: {}\n", manifest.config.run_health)
+    writeln!(
+        &mut out,
+        "- Eval: bundle={}, image={}, task_yml={}, tests={}, benchmarks={}",
+        manifest.eval.bundle_sha256,
+        manifest.eval.sandbox_image_sha256,
+        manifest.eval.task_yml_sha256,
+        manifest.eval.test_cases,
+        manifest.eval.benchmark_cases,
+    )
+    .expect("writing to String cannot fail");
+    writeln!(&mut out, "- Run health: {}", manifest.config.run_health)
         .expect("writing to String cannot fail");
-
-    writeln!(&mut out, "## 4. Candidate Table\n").expect("writing to String cannot fail");
+    writeln!(&mut out, "- Source inspection: {source_inspection}")
+        .expect("writing to String cannot fail");
     writeln!(
         &mut out,
-        "| source hash | training reward | source inspection | clean correctness | median service latency ns | same-metric ratio | accept/reject reason |"
-    )
-    .expect("writing to String cannot fail");
-    writeln!(&mut out, "|---|---:|---|---:|---:|---:|---|").expect("writing to String cannot fail");
-    writeln!(
-        &mut out,
-        "| {} | {:.6} | {} | {}/{} | {} | {} | {} |\n",
-        manifest.candidate.source_sha256,
-        manifest.candidate.training_reward,
-        source_inspection,
-        clean_correct,
-        clean_total,
-        candidate_median,
-        speedup,
-        decision
-    )
-    .expect("writing to String cannot fail");
-    writeln!(
-        &mut out,
-        "Source inspection notes: {}\n",
+        "- Source inspection notes: {}\n",
         manifest.candidate.source_inspection.notes
     )
     .expect("writing to String cannot fail");
 
-    writeln!(&mut out, "## 5. Artifact Bundle\n").expect("writing to String cannot fail");
-    writeln!(&mut out, "- Path: {}", artifact_dir.display())
+    writeln!(&mut out, "## 3. Launch-Bound Paired Audit\n").expect("writing to String cannot fail");
+    writeln!(&mut out, "- Audit id: {}", manifest.audit.audit_id)
         .expect("writing to String cannot fail");
     writeln!(
         &mut out,
-        "- Manifest path: {}/manifest.json",
-        artifact_dir.display()
+        "- Audit contract: {}",
+        manifest.audit.audit_contract_sha256,
     )
     .expect("writing to String cannot fail");
+    writeln!(
+        &mut out,
+        "- Deterministic audit seed: {} ({})",
+        manifest.audit.audit_secret_seed, manifest.audit.audit_seed_derivation,
+    )
+    .expect("writing to String cannot fail");
+    writeln!(
+        &mut out,
+        "- Attempt selection: {}; durable_once_only={}; artifact_wide_false_positive_guarantee={}",
+        manifest.audit.attempt_selection_assurance,
+        manifest.audit.durable_once_only,
+        manifest.audit.artifact_wide_false_positive_guarantee,
+    )
+    .expect("writing to String cannot fail");
+    writeln!(
+        &mut out,
+        "- Audit verifier: tier={:?}, evidence={}, metric={}",
+        manifest.audit.isolation_tier,
+        manifest.audit.isolation_evidence_sha256,
+        manifest.audit.timing_metric
+    )
+    .expect("writing to String cannot fail");
+    writeln!(
+        &mut out,
+        "- Executing device: {} uuid={} pci={} logical_ordinal={}",
+        manifest.audit.executing_device.name,
+        manifest.audit.executing_device.uuid,
+        manifest.audit.executing_device.pci_bus_id,
+        manifest.audit.executing_device.cuda_logical_ordinal
+    )
+    .expect("writing to String cannot fail");
+    writeln!(&mut out, "- Paired speedups: {ratios}").expect("writing to String cannot fail");
+    writeln!(
+        &mut out,
+        "- Decision: method={}, threshold={} {:.6}x, material_wins={}/{}",
+        manifest.audit.decision.method,
+        manifest.audit.decision.threshold_comparison,
+        manifest.audit.decision.material_speedup,
+        manifest.audit.decision.observed_material_wins,
+        manifest.audit.decision.paired_blocks,
+    )
+    .expect("writing to String cannot fail");
+    writeln!(
+        &mut out,
+        "- Acceptance reason: {}\n",
+        artifact_accept_reason(manifest)
+    )
+    .expect("writing to String cannot fail");
+
+    writeln!(&mut out, "## 4. Artifact Bundle\n").expect("writing to String cannot fail");
+    writeln!(&mut out, "- Bundle root: .").expect("writing to String cannot fail");
     writeln!(&mut out, "- Manifest SHA-256: {manifest_sha256}\n")
         .expect("writing to String cannot fail");
 
-    writeln!(&mut out, "## 6. Operator Checklist\n").expect("writing to String cannot fail");
+    writeln!(&mut out, "## 5. Operator Checklist\n").expect("writing to String cannot fail");
+    push_check(
+        &mut out,
+        manifest.contract_version == 4,
+        "artifact contract is v4",
+    );
     push_check(&mut out, manifest.task == "trimul", "task is trimul");
     push_check(
         &mut out,
-        !manifest.ferrl_commit.trim().is_empty(),
-        "ferrl commit recorded",
+        validate_full_git_commit(&manifest.ferrl_commit).is_ok()
+            && validate_lower_sha256("artifact launch payload", &manifest.launch_sha256).is_ok()
+            && validate_lower_sha256("artifact launch file", &manifest.launch_file_sha256).is_ok()
+            && validate_lower_sha256(
+                "artifact source config",
+                &manifest.config.run_config_source_sha256,
+            )
+            .is_ok()
+            && validate_lower_sha256(
+                "artifact resolved config",
+                &manifest.config.run_config_resolved_sha256,
+            )
+            .is_ok(),
+        "launch commit and config hashes are canonical",
     );
     push_check(
         &mut out,
-        !manifest.launch_sha256.is_empty()
-            && !manifest.launch_file_sha256.is_empty()
-            && !manifest.launch_attestation_key_id.is_empty()
-            && manifest.launch_attestation_algorithm == LAUNCH_ATTESTATION_ALGORITHM
-            && !manifest.config.run_config_source_sha256.is_empty()
-            && !manifest.config.run_config_resolved_sha256.is_empty(),
-        "launch attestation and config hashes recorded",
+        match manifest.launch_authentication {
+            LaunchAuthenticationMode::LocalEphemeralV1 => {
+                manifest.launch_attestation_key_id.is_none()
+                    && manifest.launch_attestation_algorithm.is_none()
+            }
+            LaunchAuthenticationMode::ExternalAttestedV1 => {
+                manifest
+                    .launch_attestation_key_id
+                    .as_ref()
+                    .is_some_and(|value| !value.is_empty())
+                    && manifest.launch_attestation_algorithm.as_deref()
+                        == Some(LAUNCH_ATTESTATION_ALGORITHM)
+            }
+        },
+        "discovery authentication is recorded without relabeling",
     );
     push_check(
         &mut out,
-        !manifest.config.prompt_sha256.is_empty() && manifest.config.prompt_file == "prompt.txt",
-        "prompt copy and hash recorded",
+        validate_lower_sha256(
+            "discovery isolation evidence",
+            &manifest.discovery_verifier.isolation_evidence_sha256,
+        )
+        .is_ok()
+            && validate_lower_sha256(
+                "discovery runtime preflight",
+                &manifest
+                    .discovery_verifier
+                    .runtime_preflight_evidence_sha256,
+            )
+            .is_ok()
+            && manifest.discovery_verifier.timing_metric
+                == ferrl::trimul::timing_metric_for_tier(
+                    manifest.discovery_verifier.isolation_tier,
+                ),
+        "discovery verifier provenance is complete and tier-correct",
     );
     push_check(
         &mut out,
-        manifest.config.reward_profile.validate().is_ok(),
-        "reward profile recorded and valid",
+        validate_lower_sha256("candidate record", &manifest.candidate.record_sha256).is_ok()
+            && validate_lower_hex(
+                "candidate record signature",
+                &manifest.candidate.record_signature,
+                64,
+            )
+            .is_ok()
+            && validate_lower_sha256(
+                "candidate ledger row",
+                &manifest.candidate.ledger_row_sha256,
+            )
+            .is_ok()
+            && validate_lower_sha256(
+                "candidate completion",
+                &manifest.candidate.completion_sha256,
+            )
+            .is_ok()
+            && validate_lower_sha256("candidate source", &manifest.candidate.source_sha256).is_ok(),
+        "candidate row, signature, completion, and source hashes are canonical",
     );
     push_check(
         &mut out,
-        manifest.baseline.measurements_ns.len() >= 3,
-        "raw baseline has at least three measurements",
+        manifest.config.prompt_file == "prompt.txt"
+            && validate_lower_sha256("artifact prompt", &manifest.config.prompt_sha256).is_ok()
+            && manifest.config.reward_profile.validate().is_ok()
+            && manifest.config.audit_secret_seed != manifest.config.training_secret_seed
+            && manifest.config.audit_secret_seed <= TRIMUL_CASE_SEED_MAX
+            && manifest.config.scratch_max_bytes > 0
+            && manifest.config.verifier_max_procs > 0,
+        "prompt, reward, audit seed, and verifier budgets are valid",
     );
     push_check(
         &mut out,
-        manifest.baseline.gpu == manifest.verification.gpu,
-        "baseline and verification GPU match",
+        validate_lower_sha256("artifact eval bundle", &manifest.eval.bundle_sha256).is_ok()
+            && manifest.eval.bundle_file_count > 0
+            && validate_lower_sha256(
+                "artifact sandbox image",
+                &manifest.eval.sandbox_image_sha256,
+            )
+            .is_ok()
+            && manifest.eval.sandbox_image_len_bytes > 0
+            && validate_lower_sha256("artifact task.yml", &manifest.eval.task_yml_sha256).is_ok()
+            && manifest.eval.task_yml_len_bytes > 0
+            && manifest.eval.test_cases > 0
+            && manifest.eval.benchmark_cases > 0,
+        "eval bundle, image, task, and non-empty case counts are bound",
     );
     push_check(
         &mut out,
-        manifest.baseline.isolation_tier == ferrl::VerifierIsolationTier::DedicatedUidServiceV1
-            && manifest.verification.isolation_tier == manifest.baseline.isolation_tier
-            && manifest.verification.isolation_evidence_sha256
-                == manifest.baseline.isolation_evidence_sha256
-            && manifest.baseline.metric
-                == ferrl::trimul::timing_metric_for_tier(manifest.baseline.isolation_tier)
+        manifest.audit.contract == "ferrl.trimul-artifact-audit.v2"
+            && validate_lower_sha256(
+                "artifact audit contract",
+                &manifest.audit.audit_contract_sha256,
+            )
+            .is_ok()
+            && manifest.audit.audit_contract_sha256
+                == artifact_audit_contract_from_identity(
+                    &manifest.launch_sha256,
+                    &manifest.candidate.record_sha256,
+                    &manifest.candidate.source_sha256,
+                    &manifest.eval.bundle_sha256,
+                    &manifest.eval.sandbox_image_sha256,
+                    &manifest.eval.task_yml_sha256,
+                )
+            && manifest.audit.audit_secret_seed
+                == artifact_audit_secret_seed(
+                    &manifest.audit.audit_contract_sha256,
+                    manifest.config.training_secret_seed,
+                )
+            && manifest.audit.audit_secret_seed != manifest.config.training_secret_seed
+            && manifest.audit.audit_seed_derivation == ARTIFACT_AUDIT_SEED_DERIVATION
+            && manifest.audit.attempt_selection_assurance == ARTIFACT_ATTEMPT_SELECTION_ASSURANCE
+            && !manifest.audit.durable_once_only
+            && !manifest.audit.artifact_wide_false_positive_guarantee
+            && manifest.audit.audit_id
+                == artifact_audit_id(
+                    &manifest.audit.audit_contract_sha256,
+                    manifest.audit.audit_secret_seed,
+                )
+            && manifest.audit.isolation.tier == manifest.audit.isolation_tier
+            && manifest.audit.isolation.contract_version
+                == ferrl::VERIFIER_ISOLATION_EVIDENCE_VERSION
+            && matches!(
+                (
+                    manifest.audit.isolation_tier,
+                    manifest.audit.isolation.uid_boundary,
+                    manifest.audit.isolation.asset_transport,
+                ),
+                (
+                    ferrl::VerifierIsolationTier::SameUidApptainerV1,
+                    ferrl::VerifierUidBoundary::SameHostUid,
+                    ferrl::VerifierAssetTransport::InProcessSealedCopy,
+                ) | (
+                    ferrl::VerifierIsolationTier::DedicatedUidServiceV1,
+                    ferrl::VerifierUidBoundary::DistinctHostUid,
+                    ferrl::VerifierAssetTransport::ScmRightsSealedCopy,
+                )
+            )
+            && manifest.audit.isolation.requester_uid != 0
+            && manifest.audit.isolation.launcher_uid != 0
+            && match manifest.audit.isolation_tier {
+                ferrl::VerifierIsolationTier::SameUidApptainerV1 => {
+                    manifest.audit.isolation.requester_uid == manifest.audit.isolation.launcher_uid
+                }
+                ferrl::VerifierIsolationTier::DedicatedUidServiceV1 => {
+                    manifest.audit.isolation.requester_uid != manifest.audit.isolation.launcher_uid
+                }
+            }
+            && manifest.audit.timing_metric
+                == ferrl::trimul::timing_metric_for_tier(manifest.audit.isolation_tier)
+            && validate_lower_sha256("artifact audit id", &manifest.audit.audit_id).is_ok()
+            && validate_audit_cuda_visible_device(&manifest.audit.requested_cuda_visible_device)
+                .is_ok()
+            && validate_lower_sha256(
+                "audit isolation evidence",
+                &manifest.audit.isolation_evidence_sha256,
+            )
+            .is_ok()
+            && manifest.audit.isolation_evidence_sha256
+                == verifier_isolation_evidence_sha256(&manifest.audit.isolation)
+            && manifest.audit.runtime_preflight.contract_version == 1
+            && manifest.audit.runtime_preflight.isolation_tier == manifest.audit.isolation_tier
+            && manifest.audit.runtime_preflight.isolation_evidence_sha256
+                == manifest.audit.isolation_evidence_sha256
+            && validate_lower_sha256(
+                "audit preflight probe submission",
+                &manifest.audit.runtime_preflight.probe_submission_sha256,
+            )
+            .is_ok()
+            && manifest.audit.runtime_preflight.runtime_hardening.len() == 1
             && manifest
-                .verification
-                .runs
+                .audit
+                .runtime_preflight
+                .runtime_hardening
                 .iter()
-                .all(|run| run.timing_metric == manifest.baseline.metric),
-        "baseline and verification use the protected timing metric",
+                .all(|record| {
+                    record.get("contract").and_then(serde_json::Value::as_str)
+                        == Some(ferrl::trimul::TRIMUL_RUNTIME_HARDENING_CONTRACT)
+                })
+            && runtime_hardening_evidence_sha256(
+                &manifest.audit.runtime_preflight.runtime_hardening,
+            )
+            .is_ok_and(|digest| {
+                digest
+                    == manifest
+                        .audit
+                        .runtime_preflight
+                        .runtime_hardening_evidence_sha256
+            })
+            && validate_lower_sha256(
+                "audit runtime preflight",
+                &manifest.audit.runtime_preflight_evidence_sha256,
+            )
+            .is_ok()
+            && manifest.audit.runtime_preflight_evidence_sha256
+                == ferrl::trimul::runtime_preflight_evidence_sha256(
+                    &manifest.audit.runtime_preflight,
+                ),
+        "audit uses the selected tier and records operator-trusted attempt selection",
     );
     push_check(
         &mut out,
-        manifest.config.audit_secret_seed != manifest.config.training_secret_seed,
-        "audit seed differs from training seed",
+        manifest.audit.blocks.len() == ARTIFACT_AUDIT_BLOCKS
+            && manifest
+                .audit
+                .blocks
+                .iter()
+                .zip(artifact_audit_schedule(&manifest.audit.audit_id))
+                .enumerate()
+                .all(|(index, (block, expected_first))| {
+                    block.index == index && block.first == expected_first
+                }),
+        "audit contains the fixed eleven ordered pairs",
+    );
+    let exact_device = &manifest.audit.executing_device;
+    push_check(
+        &mut out,
+        exact_device.contract == "ferrl.executing-device.v1"
+            && exact_device.cuda_logical_ordinal == 0
+            && !exact_device.name.trim().is_empty()
+            && validate_lower_hex("audit CUDA UUID", &exact_device.uuid, 16).is_ok()
+            && exact_device.pci_bus_id.contains(':')
+            && exact_device.pci_bus_id.contains('.'),
+        "audit records one canonical executing CUDA device",
     );
     push_check(
         &mut out,
-        clean_total >= 3,
-        "at least three clean verification runs",
+        manifest.audit.blocks.iter().all(|block| {
+            let role_binding = block.reference.role == ArtifactAuditRole::Reference
+                && block.candidate.role == ArtifactAuditRole::Candidate;
+            let execution_evidence = [&block.reference, &block.candidate]
+                .iter()
+                .all(|execution| {
+                    let expected_file = format!(
+                        "verification/block-{:03}-{}.json",
+                        block.index,
+                        execution.role.label()
+                    );
+                    execution.evidence_file == expected_file
+                        && execution.isolation_tier == manifest.audit.isolation_tier
+                        && execution.isolation == manifest.audit.isolation
+                        && execution.isolation_evidence_sha256
+                            == manifest.audit.isolation_evidence_sha256
+                        && execution.isolation_evidence_sha256
+                            == verifier_isolation_evidence_sha256(&execution.isolation)
+                        && execution.runtime_hardening.len() == 2
+                        && execution.runtime_hardening.iter().all(|record| {
+                            manifest.audit.runtime_preflight.runtime_hardening.first()
+                                == Some(record)
+                        })
+                        && runtime_hardening_evidence_sha256(&execution.runtime_hardening)
+                            .is_ok_and(|digest| {
+                                digest == execution.runtime_hardening_evidence_sha256
+                            })
+                        && execution.timing_metric == manifest.audit.timing_metric
+                        && &execution.exact.executing_device == exact_device
+                        && execution.verification.correct
+                        && execution.verification.geomean_ns.is_some()
+                        && execution.exact.sandbox_status == ferrl::RunStatus::Exited(0)
+                        && execution.exact.test_exit == 0
+                        && execution.exact.benchmark_exit == 0
+                        && execution.exact.test_cases.len() == manifest.eval.test_cases
+                        && execution.exact.benchmark_cases.len() == manifest.eval.benchmark_cases
+                        && execution
+                            .exact
+                            .test_cases
+                            .iter()
+                            .enumerate()
+                            .all(|(index, case)| case.index == index && case.passed)
+                        && execution.exact.benchmark_cases.iter().enumerate().all(
+                            |(index, case)| {
+                                case.index == index
+                                    && case.runs >= 3
+                                    && case.mean_ns.is_finite()
+                                    && case.mean_ns > 0.0
+                            },
+                        )
+                        && validate_lower_sha256(
+                            "artifact raw execution evidence",
+                            &execution.evidence_sha256,
+                        )
+                        .is_ok()
+                        && validate_lower_sha256(
+                            "artifact runtime hardening evidence",
+                            &execution.runtime_hardening_evidence_sha256,
+                        )
+                        .is_ok()
+                        && validate_lower_sha256(
+                            "artifact protected output",
+                            &execution.exact.protected_output_sha256,
+                        )
+                        .is_ok()
+                        && validate_lower_sha256(
+                            "artifact sandbox diagnostics",
+                            &execution.exact.sandbox_diagnostics_sha256,
+                        )
+                        .is_ok()
+                });
+            let reference = block.reference.verification.geomean_ns;
+            let candidate = block.candidate.verification.geomean_ns;
+            let ratio_matches = reference
+                .zip(candidate)
+                .is_some_and(|(reference, candidate)| {
+                    let ratio = reference / candidate;
+                    ratio.is_finite()
+                        && ratio > 0.0
+                        && ratio.to_bits() == block.paired_speedup.to_bits()
+                        && block.material_win == (ratio > ARTIFACT_MATERIAL_SPEEDUP)
+                });
+            role_binding && execution_evidence && ratio_matches
+        }),
+        "all raw executions bind exact cases, verifier evidence, and one physical GPU",
     );
+    let speedups = manifest
+        .audit
+        .blocks
+        .iter()
+        .map(|block| block.paired_speedup)
+        .collect::<Vec<_>>();
+    let recomputed_decision = artifact_acceptance_from_speedups(&speedups);
     push_check(
         &mut out,
-        clean_correct == clean_total,
-        "every verification run is correct",
-    );
-    push_check(
-        &mut out,
-        manifest
-            .verification
-            .runs
-            .iter()
-            .all(|r| r.geomean_ns.is_some()),
-        "every verification run is timed",
-    );
-    push_check(
-        &mut out,
-        median_candidate.is_some_and(|v| v < manifest.baseline.median_ns),
-        "candidate median beats baseline median",
+        manifest.audit.decision.method == ARTIFACT_ACCEPTANCE_METHOD
+            && manifest.audit.decision.paired_blocks == ARTIFACT_AUDIT_BLOCKS
+            && manifest.audit.decision.material_speedup == ARTIFACT_MATERIAL_SPEEDUP
+            && manifest.audit.decision.threshold_comparison == "strict_greater_than"
+            && manifest.audit.decision.required_material_wins == ARTIFACT_REQUIRED_MATERIAL_WINS
+            && manifest.audit.decision.observed_material_wins
+                == recomputed_decision.observed_material_wins
+            && manifest.audit.decision.accepted == recomputed_decision.accepted,
+        "predeclared empirical 9-of-11 material-win rule is recorded",
     );
     push_check(
         &mut out,
@@ -5168,69 +6153,34 @@ fn artifact_report(
     );
     push_check(
         &mut out,
-        !manifest.candidate.source_inspection.notes.trim().is_empty(),
-        "source inspection notes recorded",
+        !manifest.candidate.source_inspection.notes.trim().is_empty()
+            && !manifest.config.run_health.trim().is_empty(),
+        "source-inspection notes and run health are recorded",
     );
     push_check(
         &mut out,
-        !manifest.eval.bundle_path.trim().is_empty()
-            && validate_lower_sha256("artifact eval bundle", &manifest.eval.bundle_sha256).is_ok()
-            && manifest.eval.bundle_file_count > 0,
-        "eval bundle identity recorded",
+        manifest.accepted
+            == (manifest.audit.decision.accepted
+                && manifest.candidate.source_inspection.result == SourceInspectionResult::Clean),
+        "final verdict follows the audit and source-inspection gates",
     );
     push_check(
         &mut out,
-        !manifest.eval.sandbox_image_path.trim().is_empty()
-            && validate_lower_sha256(
-                "artifact sandbox image",
-                &manifest.eval.sandbox_image_sha256,
-            )
-            .is_ok()
-            && manifest.eval.sandbox_image_len_bytes > 0
-            && validate_lower_sha256("artifact task.yml", &manifest.eval.task_yml_sha256).is_ok()
-            && manifest.eval.task_yml_len_bytes > 0,
-        "sandbox image identity recorded",
-    );
-    push_check(
-        &mut out,
-        manifest.config.scratch_max_bytes > 0,
-        "scratch cap recorded",
-    );
-    push_check(
-        &mut out,
-        manifest.config.verifier_max_procs > 0,
-        "verifier process cap recorded",
-    );
-    push_check(
-        &mut out,
-        !manifest_sha256.trim().is_empty(),
+        validate_lower_sha256("artifact manifest", manifest_sha256).is_ok(),
         "manifest hash recorded",
     );
     out
 }
 
-/// Human-readable accept/reject reason for the candidate table.
-fn artifact_accept_reason(
-    manifest: &ArtifactManifest,
-    median_candidate: Option<f64>,
-) -> &'static str {
-    if manifest.verification.accepted {
-        "accepted: all clean runs correct and median service latency beats baseline"
+fn artifact_accept_reason(manifest: &ArtifactManifest) -> &'static str {
+    if manifest.accepted {
+        "accepted: at least nine of eleven same-device pairs exceed the 2% material margin"
     } else if manifest.candidate.source_inspection.result == SourceInspectionResult::Suspicious {
         "rejected: source inspection found process/file/env/network/path probing"
-    } else if manifest.verification.runs.iter().any(|r| !r.correct) {
-        "rejected: at least one clean verification run failed correctness"
-    } else if manifest
-        .verification
-        .runs
-        .iter()
-        .any(|r| r.geomean_ns.is_none())
-    {
-        "rejected: at least one clean verification run did not produce timing"
-    } else if median_candidate.is_some_and(|v| v >= manifest.baseline.median_ns) {
-        "rejected: candidate median service latency does not beat baseline"
+    } else if !manifest.audit.decision.accepted {
+        "rejected: paired audit did not establish nine material wins out of eleven"
     } else {
-        "rejected: insufficient clean verification evidence"
+        "rejected: incomplete artifact evidence"
     }
 }
 
@@ -5267,36 +6217,6 @@ fn domain_sha256(domain: &str, fields: &[&[u8]]) -> String {
         hasher.update(field);
     }
     format!("{:x}", hasher.finalize())
-}
-
-/// Median of positive finite values. Requires at least three values for first-run
-/// timing discipline.
-fn median_checked(values: &[f64], label: &str) -> Result<f64, CliError> {
-    if values.len() < 3 {
-        return Err(CliError::msg(format!(
-            "{label} requires at least three measurements"
-        )));
-    }
-    if values.iter().any(|v| !v.is_finite() || *v <= 0.0) {
-        return Err(CliError::msg(format!(
-            "{label} measurements must be positive finite values"
-        )));
-    }
-    let mut sorted = values.to_vec();
-    sorted.sort_by(f64::total_cmp);
-    Ok(sorted[sorted.len() / 2])
-}
-
-/// Require the raw baseline median to match the config's guarded baseline pin.
-fn require_baseline_matches_config(median: f64, pinned: f64) -> Result<(), CliError> {
-    let tol = (pinned.abs().max(median.abs()) * 1e-9).max(1e-6);
-    if (median - pinned).abs() <= tol {
-        Ok(())
-    } else {
-        Err(CliError::msg(format!(
-            "median --baseline-ns ({median}) does not match trimul.baseline.ns ({pinned})"
-        )))
-    }
 }
 
 /// Dispatch `ferrl runreport`: read the run's metrics, summarize, and emit.
@@ -6592,14 +7512,174 @@ mod tests {
             run_dir: dir.join("test-run"),
             candidate_sha256: "11".repeat(32),
             out: dir.join("artifact"),
-            audit_secret_seed: 999,
-            baseline_measurements_ns: vec![1.0, 1.0, 1.0],
-            baseline_command: None,
-            repeats: 3,
+            audit_verifier_executor_socket: None,
+            audit_cuda_visible_device: "0".to_owned(),
             run_health: "test".to_string(),
             source_inspection: SourceInspectionResult::Clean,
             source_inspection_notes: "clean".to_string(),
         }
+    }
+
+    fn artifact_device_for_test() -> ferrl::trimul::TrimulExecutingDevice {
+        ferrl::trimul::TrimulExecutingDevice {
+            contract: "ferrl.executing-device.v1".to_owned(),
+            cuda_logical_ordinal: 0,
+            name: "NVIDIA H100 80GB HBM3".to_owned(),
+            pci_bus_id: "0000:01:00.0".to_owned(),
+            uuid: "ab".repeat(16),
+        }
+    }
+
+    fn artifact_execution_for_test(
+        role: ArtifactAuditRole,
+        verifier: &LaunchVerifierIdentity,
+        geomean_ns: f64,
+    ) -> ArtifactAuditExecution {
+        let runtime_hardening = vec![
+            test_runtime_hardening_record(),
+            test_runtime_hardening_record(),
+        ];
+        ArtifactAuditExecution {
+            role,
+            isolation_tier: verifier.isolation.tier,
+            isolation: verifier.isolation.clone(),
+            isolation_evidence_sha256: verifier.isolation_evidence_sha256.clone(),
+            runtime_hardening_evidence_sha256: runtime_hardening_evidence_sha256(
+                &runtime_hardening,
+            )
+            .unwrap(),
+            runtime_hardening,
+            timing_metric: verifier.timing_metric.clone(),
+            verification: ferrl::trimul::TrimulVerification {
+                correct: true,
+                benchmark_means_ns: vec![geomean_ns],
+                geomean_ns: Some(geomean_ns),
+                speedup: None,
+            },
+            exact: ferrl::trimul::TrimulArtifactVerificationEvidence {
+                sandbox_status: ferrl::RunStatus::Exited(0),
+                test_exit: 0,
+                benchmark_exit: 0,
+                executing_device: artifact_device_for_test(),
+                test_cases: vec![ferrl::trimul::TrimulTestCaseEvidence {
+                    index: 0,
+                    spec: "seqlen: 8".to_owned(),
+                    passed: true,
+                }],
+                benchmark_cases: vec![ferrl::trimul::TrimulBenchmarkCaseEvidence {
+                    index: 0,
+                    spec: "seqlen: 16".to_owned(),
+                    runs: 100,
+                    mean_ns: geomean_ns,
+                    std_ns: 0.1,
+                    err_ns: 0.01,
+                    best_ns: geomean_ns - 0.1,
+                    worst_ns: geomean_ns + 0.1,
+                }],
+                protected_output_sha256: "de".repeat(32),
+                sandbox_diagnostics_sha256: "ef".repeat(32),
+            },
+            protected_output: "protected grade".to_owned(),
+            sandbox_diagnostics: String::new(),
+        }
+    }
+
+    fn artifact_blocks_for_test(
+        verifier: &LaunchVerifierIdentity,
+        audit_id: &str,
+    ) -> Vec<ArtifactAuditBlock> {
+        artifact_audit_schedule(audit_id)
+            .into_iter()
+            .enumerate()
+            .map(|(index, first)| ArtifactAuditBlock {
+                index,
+                first,
+                reference: artifact_execution_for_test(
+                    ArtifactAuditRole::Reference,
+                    verifier,
+                    10.3,
+                ),
+                candidate: artifact_execution_for_test(
+                    ArtifactAuditRole::Candidate,
+                    verifier,
+                    10.0,
+                ),
+                paired_speedup: 10.3 / 10.0,
+                material_win: 10.3 / 10.0 > ARTIFACT_MATERIAL_SPEEDUP,
+            })
+            .collect()
+    }
+
+    fn artifact_block_manifest_for_test(block: &ArtifactAuditBlock) -> ArtifactAuditBlockManifest {
+        let execution = |value: &ArtifactAuditExecution| ArtifactAuditExecutionManifest {
+            role: value.role,
+            evidence_file: format!(
+                "verification/block-{:03}-{}.json",
+                block.index,
+                value.role.label()
+            ),
+            evidence_sha256: sha256_hex(
+                format!("{}:{}", block.index, value.role.label()).as_bytes(),
+            ),
+            isolation_tier: value.isolation_tier,
+            isolation: value.isolation.clone(),
+            isolation_evidence_sha256: value.isolation_evidence_sha256.clone(),
+            runtime_hardening_evidence_sha256: value.runtime_hardening_evidence_sha256.clone(),
+            runtime_hardening: value.runtime_hardening.clone(),
+            timing_metric: value.timing_metric.clone(),
+            verification: value.verification.clone(),
+            exact: value.exact.clone(),
+        };
+        ArtifactAuditBlockManifest {
+            index: block.index,
+            first: block.first,
+            reference: execution(&block.reference),
+            candidate: execution(&block.candidate),
+            paired_speedup: block.paired_speedup,
+            material_win: block.material_win,
+        }
+    }
+
+    fn artifact_manifest_for_test(cfg: &RunConfig) -> ArtifactManifest {
+        let args = trimul_artifact_args_for_test(Path::new("artifact-provenance"));
+        let (launch, signer) = launch_manifest_for_test(cfg, "test-run", b"prompt");
+        let candidate = candidate_for_test(&launch, &signer, "```python\npass\n```\n");
+        let candidate_row = serde_json::to_vec(&candidate).unwrap();
+        let launch_bytes = launch.to_pretty_bytes().unwrap();
+        let audit_verifier = test_launch_verifier_identity(
+            test_trimul_verifier_identity(),
+            ferrl::VerifierIsolationTier::SameUidApptainerV1,
+        );
+        let audit_contract_sha256 =
+            artifact_audit_contract_sha256(&launch, &candidate, "pass\n", &audit_verifier.assets);
+        let audit_secret_seed =
+            artifact_audit_secret_seed(&audit_contract_sha256, cfg.trimul.secret_seed);
+        let audit_id = artifact_audit_id(&audit_contract_sha256, audit_secret_seed);
+        let blocks = artifact_blocks_for_test(&audit_verifier, &audit_id);
+        let block_manifests = blocks
+            .iter()
+            .map(artifact_block_manifest_for_test)
+            .collect();
+        let decision = artifact_acceptance_decision(&blocks);
+        let inputs = ArtifactInputs {
+            launch: &launch,
+            launch_bytes: &launch_bytes,
+            candidate: &candidate,
+            candidate_row_bytes: &candidate_row,
+            raw_completion: &candidate.completion,
+            prompt_bytes: b"prompt",
+            submission: "pass\n",
+            test_cases: 1,
+            benchmark_cases: 1,
+            audit_contract_sha256,
+            audit_id,
+            audit_secret_seed,
+            audit_verifier,
+            blocks: Vec::new(),
+            accepted: decision.accepted,
+            decision,
+        };
+        build_manifest(&args, cfg, &inputs, block_manifests)
     }
 
     fn launch_manifest_for_test(
@@ -9631,6 +10711,18 @@ mod tests {
     }
 
     #[test]
+    fn trimul_score_rejects_out_of_range_secret_seed_before_prompt_io() {
+        let tmp = TestDir::new("trimul-score-seed-range");
+        std::fs::write(tmp.path().join("run.json"), trimul_score_test_config(4242)).unwrap();
+        let mut args = trimul_score_args_for_test(tmp.path());
+        args.score_secret_seed = TRIMUL_CASE_SEED_MAX + 1;
+
+        let err = trimul_score(&args).unwrap_err().to_string();
+
+        assert!(err.contains("requires --score-secret-seed between 0 and 4294967295"));
+    }
+
+    #[test]
     fn trimul_score_verifies_prompt_copy_before_reading_inputs() {
         let tmp = TestDir::new("trimul-score-prompt");
         std::fs::write(tmp.path().join("run.json"), trimul_score_test_config(4242)).unwrap();
@@ -10359,23 +11451,72 @@ mod tests {
             "clean",
             "--source-inspection-notes",
             "no process, file descriptor, environment, network, or out-of-input path probes",
-            "--audit-secret-seed",
-            "99",
-            "--baseline-ns",
-            "10",
-            "--baseline-ns",
-            "11",
-            "--baseline-ns",
-            "12",
+            "--audit-cuda-visible-device",
+            "0",
         ])
         .unwrap();
         match a.cmd {
             Command::TrimulArtifact(a) => {
                 assert_eq!(a.run_dir, PathBuf::from("runs/trimul-1"));
                 assert_eq!(a.candidate_sha256, "11".repeat(32));
+                assert!(a.audit_verifier_executor_socket.is_none());
             }
             _ => panic!("expected trimul-artifact"),
         }
+    }
+
+    #[test]
+    fn clap_accepts_an_optional_dedicated_artifact_verifier() {
+        let parsed = Cli::try_parse_from([
+            "ferrl",
+            "trimul-artifact",
+            "--run-dir",
+            "runs/trimul-1",
+            "--candidate-sha256",
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            "--out",
+            "artifact",
+            "--audit-verifier-executor-socket",
+            "/run/ferrl/verifier-executor.sock",
+            "--audit-cuda-visible-device",
+            "0",
+            "--run-health",
+            "healthy",
+            "--source-inspection",
+            "clean",
+            "--source-inspection-notes",
+            "clean",
+        ])
+        .unwrap();
+        let Command::TrimulArtifact(args) = parsed.cmd else {
+            panic!("expected trimul-artifact");
+        };
+        assert_eq!(
+            args.audit_verifier_executor_socket,
+            Some(PathBuf::from("/run/ferrl/verifier-executor.sock"))
+        );
+    }
+
+    #[test]
+    fn clap_rejects_an_operator_selected_artifact_audit_seed() {
+        let error = Cli::try_parse_from([
+            "ferrl",
+            "trimul-artifact",
+            "--run-dir",
+            "runs/trimul-1",
+            "--candidate-sha256",
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            "--out",
+            "artifact",
+            "--audit-secret-seed",
+            "99",
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("unexpected argument '--audit-secret-seed'"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -10460,6 +11601,21 @@ mod tests {
         assert_eq!((train.len(), eval.len()), (8, 2));
         assert_eq!(train[0].prompt, "Parse-test custom_kernel(data) prompt.\n");
         std::fs::remove_file(prompt_path).unwrap();
+    }
+
+    #[test]
+    fn trimul_config_rejects_out_of_range_case_seed() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&trimul_score_test_config(4242)).unwrap();
+        value["trimul"]["secret_seed"] = serde_json::json!(TRIMUL_CASE_SEED_MAX + 1);
+        let cfg: RunConfig = serde_json::from_value(value).unwrap();
+
+        let error = cfg
+            .validate_current_config_support()
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("trimul.secret_seed must be between 0 and 4294967295"));
     }
 
     #[test]
@@ -10815,49 +11971,410 @@ benchmarks:
     }
 
     #[test]
-    fn median_checked_requires_three_positive_values() {
-        assert_eq!(median_checked(&[3.0, 1.0, 2.0], "x").unwrap(), 2.0);
-        assert!(median_checked(&[1.0, 2.0], "x").is_err());
-        assert!(median_checked(&[1.0, f64::NAN, 3.0], "x").is_err());
-        assert!(median_checked(&[1.0, 0.0, 3.0], "x").is_err());
+    fn artifact_acceptance_requires_the_fixed_eleven_pair_sample() {
+        let decision = artifact_acceptance_from_speedups(&[1.10, 1.10, 1.10]);
+        assert!(!decision.accepted);
+        assert_eq!(decision.paired_blocks, 3);
     }
 
     #[test]
-    fn baseline_median_must_match_config_pin() {
-        assert!(require_baseline_matches_config(10.0, 10.0).is_ok());
-        assert!(require_baseline_matches_config(10.0, 11.0).is_err());
+    fn artifact_output_claim_is_exclusive_for_concurrent_writers() {
+        let tmp = TestDir::new("artifact-concurrent-output-claim");
+        let output = std::sync::Arc::new(tmp.path().join("artifact"));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut writers = Vec::new();
+        for _ in 0..2 {
+            let output = std::sync::Arc::clone(&output);
+            let barrier = std::sync::Arc::clone(&barrier);
+            writers.push(std::thread::spawn(move || {
+                barrier.wait();
+                ArtifactPublication::claim(&output, &"67".repeat(32))
+                    .map_or_else(|error| Some(error.to_string()), |_| None)
+            }));
+        }
+        let outcomes = writers
+            .into_iter()
+            .map(|writer| writer.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outcomes.iter().filter(|outcome| outcome.is_none()).count(),
+            1
+        );
+        let failure = outcomes.into_iter().flatten().next().unwrap();
+        assert!(failure.contains("output claims are exclusive"), "{failure}");
+        assert!(output.join(ARTIFACT_OWNER_FILE).is_file());
+        assert!(output.join(ARTIFACT_ATTEMPT_FILE).is_file());
+        assert!(!output.join("manifest.json").exists());
     }
 
     #[test]
-    fn artifact_publication_rejects_local_or_same_uid_discovery_evidence() {
-        let local_cfg: RunConfig = serde_json::from_str(&trimul_score_test_config(4242)).unwrap();
-        let (local_launch, _) = launch_manifest_for_test(&local_cfg, "test-run", b"prompt");
-        let error = require_publication_eligible_manifest(&local_launch)
+    fn artifact_mid_publication_failure_never_exposes_a_manifest_or_retry() {
+        let tmp = TestDir::new("artifact-mid-publication-failure");
+        let output = tmp.path().join("artifact");
+        let mut publication = ArtifactPublication::claim(&output, &"68".repeat(32)).unwrap();
+        publication
+            .stage_text(Path::new("submission.py"), "candidate")
+            .unwrap();
+        publication
+            .stage_text(Path::new("report.md"), "report")
+            .unwrap();
+        publication
+            .stage_text(Path::new("manifest.json"), "manifest")
+            .unwrap();
+        ARTIFACT_PUBLICATION_FAIL_AFTER_LINK.with(|fault| fault.set(Some(1)));
+        let error = publication.publish_manifest_last().unwrap_err().to_string();
+        ARTIFACT_PUBLICATION_FAIL_AFTER_LINK.with(|fault| fault.set(None));
+        assert!(error.contains("mid-publication failure"), "{error}");
+        assert!(!output.join("manifest.json").exists());
+        assert!(output.join(ARTIFACT_OWNER_FILE).is_file());
+        assert!(output.join(ARTIFACT_ATTEMPT_FILE).is_file());
+        let retry = ArtifactPublication::claim(&output, &"68".repeat(32))
             .unwrap_err()
             .to_string();
-        assert!(error.contains("local_ephemeral_v1"));
+        assert!(retry.contains("output claims are exclusive"), "{retry}");
+    }
 
-        let mut same_uid_external_value: serde_json::Value =
-            serde_json::from_str(&trimul_score_test_config(4242)).unwrap();
-        same_uid_external_value["launch_authentication"] =
-            serde_json::json!("external_attested_v1");
-        let same_uid_external_cfg: RunConfig =
-            serde_json::from_value(same_uid_external_value).unwrap();
-        let (same_uid_external_launch, _) =
-            launch_manifest_for_test(&same_uid_external_cfg, "test-run", b"prompt");
-        let error = require_publication_eligible_manifest(&same_uid_external_launch)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("same_uid_apptainer_v1"));
+    #[test]
+    fn artifact_audit_cli_fields_reject_ambiguous_device_and_report_text() {
+        for device in ["", "0,1", " 0", "0 ", "GPU 0"] {
+            assert!(validate_audit_cuda_visible_device(device).is_err());
+        }
+        for note in ["", " ", " leading", "trailing ", "line\nbreak"] {
+            assert!(validate_artifact_note("note", note).is_err());
+        }
+        assert!(validate_audit_cuda_visible_device("GPU-abcd").is_ok());
+        assert!(validate_artifact_note("note", "clean source inspection").is_ok());
+    }
 
-        let mut dedicated_value: serde_json::Value =
-            serde_json::from_str(&trimul_score_test_config(4242)).unwrap();
-        dedicated_value["launch_authentication"] = serde_json::json!("external_attested_v1");
-        dedicated_value["trimul"]["verifier_isolation_tier"] =
-            serde_json::json!("dedicated_uid_service_v1");
-        let dedicated_cfg: RunConfig = serde_json::from_value(dedicated_value).unwrap();
-        let (dedicated_launch, _) = launch_manifest_for_test(&dedicated_cfg, "test-run", b"prompt");
-        require_publication_eligible_manifest(&dedicated_launch).unwrap();
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires the controlled synthetic TriMul eval bundle, Apptainer, and one CUDA GPU"]
+    #[allow(clippy::cognitive_complexity)] // deployment oracle checks every retained evidence layer
+    fn deployment_admin_free_artifact_v4_synthetic_control_end_to_end() {
+        const CONTROL_KIND: &str = "synthetic_slow_reference_v1";
+        let required_path = |key: &str| {
+            std::env::var_os(key).map_or_else(
+                || panic!("set {key} to run the artifact deployment gate"),
+                PathBuf::from,
+            )
+        };
+        let image = required_path("FERRL_TRIMUL_IMAGE");
+        let eval_dir = required_path("FERRL_TRIMUL_EVAL_DIR");
+        let scratch_root = required_path("FERRL_TRIMUL_SCRATCH");
+        let submission_path = required_path("FERRL_TRIMUL_ARTIFACT_SUBMISSION");
+        let output_root = required_path("FERRL_TRIMUL_ARTIFACT_OUTPUT_ROOT");
+        assert_eq!(
+            std::env::var("FERRL_TRIMUL_ARTIFACT_CONTROL_KIND").as_deref(),
+            Ok(CONTROL_KIND),
+            "the deployment oracle is a synthetic branch-control, not discovery evidence"
+        );
+        assert!(
+            !output_root.exists(),
+            "deployment output must be a fresh retained path: {}",
+            output_root.display()
+        );
+        std::fs::create_dir_all(&output_root).unwrap();
+
+        let prompt = output_root.join("prompt.txt");
+        let model_dir = output_root.join("model");
+        let runs_dir = output_root.join("runs");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        std::fs::write(
+            &prompt,
+            b"exercise the synthetic launch-bound TriMul artifact control",
+        )
+        .unwrap();
+
+        let mut config: serde_json::Value =
+            serde_json::from_str(&trimul_score_test_config(424318)).unwrap();
+        config["launch_authentication"] = serde_json::json!("local_ephemeral_v1");
+        config["device"] = serde_json::json!("cuda");
+        config["model_dir"] = serde_json::json!(model_dir);
+        config["out_dir"] = serde_json::json!(runs_dir);
+        config["trimul"]["prompt_path"] = serde_json::json!(prompt);
+        config["trimul"]["image"] = serde_json::json!(image);
+        config["trimul"]["eval_dir"] = serde_json::json!(eval_dir);
+        config["trimul"]["scratch_root"] = serde_json::json!(scratch_root);
+        // Complete synthetic-control reference/candidate runs exercise the 3 GiB
+        // transport boundary; use the documented production wall without claiming
+        // that this engineered control is a discovered artifact.
+        config["trimul"]["wall_secs"] = serde_json::json!(600);
+        config["trimul"]["verifier_cuda_visible_devices"] = serde_json::json!("0");
+        config["trimul"]["verifier_max_procs"] = serde_json::json!(1024);
+        if let Some(apptainer) = std::env::var_os("FERRL_APPTAINER_BIN") {
+            config["trimul"]["verifier_apptainer_bin"] =
+                serde_json::json!(PathBuf::from(apptainer));
+        }
+        config["trainer"]["max_new_tokens"] = serde_json::json!(4096);
+        config["trainer"]["candidate_log_top_k"] = serde_json::json!(1);
+        let cfg: RunConfig = serde_json::from_value(config).unwrap();
+        cfg.validate_current_config_support().unwrap();
+
+        let assets = cfg.capture_trimul_verifier_assets().unwrap();
+        let discovery_reward = cfg
+            .preflight_trimul_reward(
+                cfg.build_trimul_reward_base_with_assets(assets.clone())
+                    .unwrap(),
+            )
+            .unwrap();
+        let discovery_verifier = launch_verifier_identity(&discovery_reward, &assets).unwrap();
+
+        let (launch, signer) = launch_manifest_for_test(
+            &cfg,
+            "trimul-1",
+            b"exercise the synthetic launch-bound TriMul artifact control",
+        );
+        let mut payload = launch.payload;
+        payload.ferrl_commit = env!("FERRL_BUILD_GIT_COMMIT").to_owned();
+        payload.run.group_id = "trimul-1".to_owned();
+        payload.verifier = Some(discovery_verifier);
+        let launch = LaunchManifest::new(payload).unwrap();
+        verify_launch_manifest_payload(&launch).unwrap();
+
+        let submission = std::fs::read_to_string(&submission_path).unwrap();
+        let completion = format!("```python\n{}\n```\n", submission.trim_end());
+        let candidate = candidate_for_test(&launch, &signer, &completion);
+        let candidate_sha256 = candidate.record_sha256.clone().unwrap();
+        let run = RunDir::create(&runs_dir, "trimul-1").unwrap();
+        run.write_immutable_launch(
+            &launch.to_pretty_bytes().unwrap(),
+            Some(b"exercise the synthetic launch-bound TriMul artifact control"),
+        )
+        .unwrap();
+        let mut candidate_row = serde_json::to_vec(&candidate).unwrap();
+        candidate_row.push(b'\n');
+        std::fs::write(run.candidates_path(), candidate_row).unwrap();
+
+        let accepted_out = output_root.join("accepted");
+        let accepted_args = TrimulArtifactArgs {
+            run_dir: run.root().to_path_buf(),
+            candidate_sha256: candidate_sha256.clone(),
+            out: accepted_out.clone(),
+            audit_verifier_executor_socket: None,
+            audit_cuda_visible_device: "0".to_owned(),
+            run_health:
+                "synthetic deployment control accepted branch; not discovery evidence".to_owned(),
+            source_inspection: SourceInspectionResult::Clean,
+            source_inspection_notes:
+                "synthetic control inspected process, file descriptor, environment, network, and path access; not discovery evidence"
+                    .to_owned(),
+        };
+        trimul_artifact(&accepted_args).unwrap();
+
+        let rejected_out = output_root.join("rejected");
+        let rejected_args = TrimulArtifactArgs {
+            run_dir: run.root().to_path_buf(),
+            candidate_sha256,
+            out: rejected_out.clone(),
+            audit_verifier_executor_socket: None,
+            audit_cuda_visible_device: "0".to_owned(),
+            run_health: "synthetic deployment control rejected branch; not discovery evidence"
+                .to_owned(),
+            source_inspection: SourceInspectionResult::Suspicious,
+            source_inspection_notes:
+                "synthetic injected suspicious-source rejection control; not discovery evidence"
+                    .to_owned(),
+        };
+        trimul_artifact(&rejected_args).unwrap();
+
+        let inspect_bundle = |bundle: &Path, expected_accepted: bool| {
+            let manifest_bytes = std::fs::read(bundle.join("manifest.json")).unwrap();
+            let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes).unwrap();
+            assert_eq!(manifest["contract_version"], serde_json::json!(4));
+            assert_eq!(
+                manifest["launch_authentication"],
+                serde_json::json!("local_ephemeral_v1")
+            );
+            assert_eq!(
+                manifest["audit"]["isolation_tier"],
+                serde_json::json!("same_uid_apptainer_v1")
+            );
+            assert_eq!(
+                manifest["audit"]["attempt_selection_assurance"],
+                serde_json::json!("operator_attested_v1")
+            );
+            assert_eq!(
+                manifest["audit"]["durable_once_only"],
+                serde_json::json!(false)
+            );
+            assert_eq!(
+                manifest["audit"]["artifact_wide_false_positive_guarantee"],
+                serde_json::json!(false)
+            );
+            assert!(manifest["config"]["run_health"]
+                .as_str()
+                .is_some_and(|value| value.contains("synthetic deployment control")
+                    && value.contains("not discovery evidence")));
+            assert!(manifest["candidate"]["source_inspection"]["notes"]
+                .as_str()
+                .is_some_and(
+                    |value| value.contains("synthetic") && value.contains("not discovery evidence")
+                ));
+            assert_eq!(manifest["accepted"], serde_json::json!(expected_accepted));
+            assert_eq!(
+                manifest["audit"]["decision"]["accepted"],
+                serde_json::json!(true),
+                "the rejection control must reject only at source inspection"
+            );
+
+            let blocks = manifest["audit"]["blocks"].as_array().unwrap();
+            assert_eq!(blocks.len(), ARTIFACT_AUDIT_BLOCKS);
+            let mut retained = std::collections::BTreeSet::new();
+            for block in blocks {
+                for role in ["reference", "candidate"] {
+                    let execution = &block[role];
+                    let relative = execution["evidence_file"].as_str().unwrap();
+                    assert!(retained.insert(relative.to_owned()));
+                    let evidence_bytes = std::fs::read(bundle.join(relative)).unwrap();
+                    assert_eq!(
+                        sha256_hex(&evidence_bytes),
+                        execution["evidence_sha256"].as_str().unwrap()
+                    );
+                    let evidence: serde_json::Value =
+                        serde_json::from_slice(&evidence_bytes).unwrap();
+                    assert_eq!(evidence["role"], serde_json::json!(role));
+                    assert_eq!(evidence["verification"]["correct"], serde_json::json!(true));
+                    assert_eq!(evidence["exact"]["test_exit"], serde_json::json!(0));
+                    assert_eq!(evidence["exact"]["benchmark_exit"], serde_json::json!(0));
+                    assert_eq!(evidence["runtime_hardening"].as_array().unwrap().len(), 2);
+                }
+            }
+            assert_eq!(retained.len(), 2 * ARTIFACT_AUDIT_BLOCKS);
+            assert_eq!(
+                std::fs::read_dir(bundle.join("verification"))
+                    .unwrap()
+                    .count(),
+                2 * ARTIFACT_AUDIT_BLOCKS
+            );
+
+            let attempt: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(bundle.join(ARTIFACT_ATTEMPT_FILE)).unwrap())
+                    .unwrap();
+            assert_eq!(
+                attempt["state"],
+                serde_json::json!("output_claimed_before_measurement")
+            );
+            assert_eq!(attempt["durable_once_only"], serde_json::json!(false));
+            let report = std::fs::read_to_string(bundle.join("report.md")).unwrap();
+            if expected_accepted {
+                assert!(report.contains("accepted_artifact"), "{report}");
+                assert!(!report.contains("[fail]"), "{report}");
+            } else {
+                assert!(report.contains("rejected_candidate"), "{report}");
+                assert!(report.contains(
+                    "[fail] source inspection found no process/file/env/network/path probing"
+                ));
+            }
+            manifest
+        };
+
+        let accepted = inspect_bundle(&accepted_out, true);
+        let rejected = inspect_bundle(&rejected_out, false);
+        assert_eq!(
+            accepted["audit"]["audit_contract_sha256"],
+            rejected["audit"]["audit_contract_sha256"]
+        );
+        assert_eq!(accepted["audit"]["audit_id"], rejected["audit"]["audit_id"]);
+        assert_eq!(
+            accepted["audit"]["audit_secret_seed"],
+            rejected["audit"]["audit_secret_seed"]
+        );
+    }
+
+    #[test]
+    fn artifact_acceptance_rejects_a_median_win_without_nine_material_wins() {
+        let mut speedups = vec![1.03; 8];
+        speedups.extend([1.01; 3]);
+        let decision = artifact_acceptance_from_speedups(&speedups);
+        assert!(!decision.accepted);
+        assert_eq!(decision.observed_material_wins, 8);
+    }
+
+    #[test]
+    fn artifact_acceptance_requires_nine_strict_material_wins() {
+        let mut speedups = vec![1.03; 9];
+        speedups.extend([1.02; 2]);
+        let accepted = artifact_acceptance_from_speedups(&speedups);
+        assert!(accepted.accepted);
+        assert_eq!(accepted.observed_material_wins, 9);
+        assert_eq!(accepted.threshold_comparison, "strict_greater_than");
+
+        speedups[0] = 1.02;
+        let tied = artifact_acceptance_from_speedups(&speedups);
+        assert!(!tied.accepted, "a threshold tie must count as a loss");
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // one assertion per fixed schedule/seed invariant
+    fn artifact_audit_schedule_is_fixed_deterministic_and_alternating() {
+        let reference_first = artifact_audit_schedule(&format!("00{}", "11".repeat(31)));
+        let candidate_first = artifact_audit_schedule(&format!("01{}", "11".repeat(31)));
+
+        assert_eq!(reference_first.len(), ARTIFACT_AUDIT_BLOCKS);
+        assert_eq!(candidate_first.len(), ARTIFACT_AUDIT_BLOCKS);
+        assert_eq!(reference_first[0], ArtifactAuditRole::Reference);
+        assert_eq!(candidate_first[0], ArtifactAuditRole::Candidate);
+        assert!(reference_first.windows(2).all(|pair| pair[0] != pair[1]));
+        assert_eq!(
+            reference_first,
+            artifact_audit_schedule(&format!("00{}", "11".repeat(31)))
+        );
+        let contract = "42".repeat(32);
+        let tmp = TestDir::new("artifact-output-independent-identity");
+        let first_args = trimul_artifact_args_for_test(tmp.path());
+        let mut second_args = trimul_artifact_args_for_test(tmp.path());
+        second_args.out = tmp.path().join("other-artifact");
+        assert_ne!(first_args.out, second_args.out);
+        let first_seed = artifact_audit_secret_seed(&contract, 17);
+        let second_seed = artifact_audit_secret_seed(&contract, 17);
+        assert_eq!(first_seed, second_seed);
+        assert!(first_seed <= TRIMUL_CASE_SEED_MAX);
+        assert_ne!(first_seed, 17);
+        let collision_seed = artifact_audit_secret_seed(&contract, first_seed);
+        assert!(collision_seed <= TRIMUL_CASE_SEED_MAX);
+        assert_ne!(
+            collision_seed, first_seed,
+            "the deterministic collision rule must keep audit and training seeds distinct"
+        );
+        assert_eq!(
+            artifact_audit_id(&contract, first_seed),
+            artifact_audit_id(&contract, second_seed)
+        );
+        let decision = artifact_acceptance_from_speedups(&[1.03; ARTIFACT_AUDIT_BLOCKS]);
+        assert_eq!(decision.method, ARTIFACT_ACCEPTANCE_METHOD);
+        assert!(decision.accepted);
+    }
+
+    #[test]
+    fn artifact_ingest_accepts_local_same_uid_discovery_without_relabeling_it() {
+        let tmp = TestDir::new("artifact-local-discovery-handoff");
+        let cfg: RunConfig = serde_json::from_str(&trimul_score_test_config(4242)).unwrap();
+        let (launch, signer) = launch_manifest_for_test(&cfg, "trimul-1", b"prompt");
+        let mut payload = launch.payload;
+        payload.run.group_id = "trimul-1".to_owned();
+        let launch = LaunchManifest::new(payload).unwrap();
+        let candidate = candidate_for_test(&launch, &signer, "```python\npass\n```\n");
+        let candidate_sha256 = candidate.record_sha256.clone().unwrap();
+        let run_dir = tmp.path().join("trimul-1");
+        let run = RunDir::create(tmp.path(), "trimul-1").unwrap();
+        run.write_immutable_launch(&launch.to_pretty_bytes().unwrap(), Some(b"prompt"))
+            .unwrap();
+        let mut writer =
+            ferrl::telemetry::CandidateWriter::open(run_dir.join(RunDir::CANDIDATES_FILE)).unwrap();
+        writer.append(&candidate).unwrap();
+        drop(writer);
+
+        let bound = load_bound_run_candidate(&run_dir, &candidate_sha256).unwrap();
+        assert_eq!(
+            bound.launch.payload.authentication,
+            LaunchAuthenticationMode::LocalEphemeralV1
+        );
+        assert_eq!(
+            bound.launch.payload.verifier.unwrap().isolation.tier,
+            ferrl::VerifierIsolationTier::SameUidApptainerV1
+        );
+        assert!(bound.launch.attestation.is_none());
     }
 
     #[test]
@@ -11030,11 +12547,11 @@ benchmarks:
             let launch = attest_launch_for_test(LaunchManifest::new(payload).unwrap());
             std::fs::write(tmp.path().join(target), b"post-attestation replacement").unwrap();
 
-            let error = capture_attested_trimul_verifier_assets(&cfg, &launch)
+            let error = capture_launch_bound_trimul_verifier_assets(&cfg, &launch)
                 .unwrap_err()
                 .to_string();
             assert!(
-                error.contains("do not match the attested launch identity"),
+                error.contains("do not match the launch-bound discovery identity"),
                 "{target}: {error}"
             );
         }
@@ -11257,224 +12774,121 @@ benchmarks:
     }
 
     #[test]
-    fn artifact_manifest_records_base_quantization() {
-        let cfg: RunConfig = serde_json::from_str(
-            r#"{
-                "task": "trimul",
-                "model_dir": "/m",
-                "launch_authentication": "external_attested_v1",
-                "policy": {
-                    "base_dtype": "bf16",
-                    "base_quantization": "q8_0"
-                },
-                "trimul": {
-                  "prompt_path": "/prompt.txt",
-                  "submission_extract_mode": "final_fence",
-                  "image": "/image.sif",
-                  "eval_dir": "/eval",
-                  "scratch_root": "/scratch",
-                  "secret_seed": 4242
-                },
-                "trainer": { "steps": 1, "group_size": 2, "max_new_tokens": 8,
-                  "temperature": 1.0, "mu": 1, "beta": 0.0, "clip_eps": 0.2,
-                  "lr": 1e-5, "weight_decay": 0.0,
-                  "loss_type": "grpo", "scale_rewards": "group" }
-            }"#,
-        )
-        .unwrap();
-        let args = trimul_artifact_args_for_test(Path::new("artifact-provenance"));
-        let (launch, signer) = launch_manifest_for_test(&cfg, "test-run", b"prompt");
-        let candidate = candidate_for_test(&launch, &signer, "```python\npass\n```\n");
-        let candidate_row = serde_json::to_vec(&candidate).unwrap();
-        let launch_bytes = launch.to_pretty_bytes().unwrap();
-        let inputs = ArtifactInputs {
-            gpu: "H100".to_string(),
-            launch: &launch,
-            launch_bytes: &launch_bytes,
-            candidate: &candidate,
-            candidate_row_bytes: &candidate_row,
-            raw_completion: &candidate.completion,
-            prompt_bytes: b"prompt",
-            submission: "pass\n",
-            baseline_median: 1.0,
-            test_cases: 1,
-            benchmark_cases: 1,
-            runs: Vec::new(),
-            accepted: false,
-        };
+    #[allow(clippy::cognitive_complexity)] // one assertion per artifact-v4 manifest invariant
+    fn artifact_v4_manifest_records_quantization_and_paired_audit() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&trimul_score_test_config(4242)).unwrap();
+        value["policy"] = serde_json::json!({
+            "base_dtype": "bf16",
+            "base_quantization": "q8_0"
+        });
+        let cfg: RunConfig = serde_json::from_value(value).unwrap();
 
-        let manifest = build_manifest(&args, &cfg, &inputs);
+        let manifest = artifact_manifest_for_test(&cfg);
         let json = serde_json::to_string(&manifest).unwrap();
 
+        assert_eq!(manifest.contract_version, ARTIFACT_CONTRACT_VERSION);
         assert_eq!(manifest.model.base_dtype, "bf16");
         assert_eq!(manifest.model.base_quantization, "q8_0");
-        assert_eq!(manifest.launch_file_sha256, sha256_hex(&launch_bytes));
+        assert_eq!(manifest.audit.blocks.len(), ARTIFACT_AUDIT_BLOCKS);
+        assert_eq!(
+            manifest.audit.isolation_tier,
+            ferrl::VerifierIsolationTier::SameUidApptainerV1
+        );
+        assert_eq!(
+            manifest.audit.audit_seed_derivation,
+            ARTIFACT_AUDIT_SEED_DERIVATION
+        );
+        assert_eq!(
+            manifest.audit.attempt_selection_assurance,
+            ARTIFACT_ATTEMPT_SELECTION_ASSURANCE
+        );
+        assert!(!manifest.audit.durable_once_only);
+        assert!(!manifest.audit.artifact_wide_false_positive_guarantee);
+        assert_eq!(
+            manifest.audit.audit_secret_seed,
+            artifact_audit_secret_seed(
+                &manifest.audit.audit_contract_sha256,
+                manifest.config.training_secret_seed,
+            )
+        );
+        assert_eq!(manifest.audit.decision.observed_material_wins, 11);
+        assert_eq!(
+            manifest.audit.isolation,
+            manifest.audit.blocks[0].reference.isolation
+        );
+        assert_eq!(
+            manifest.audit.runtime_preflight_evidence_sha256,
+            ferrl::trimul::runtime_preflight_evidence_sha256(&manifest.audit.runtime_preflight)
+        );
+        assert!(manifest.accepted);
         assert!(json.contains(r#""base_quantization":"q8_0""#));
+        assert!(!json.contains("baseline_measurements_ns"));
+        assert!(!json.contains("audit-claim.json"));
+        assert!(!json.contains("nine_of_eleven_null_tail_probability"));
+        assert!(!json.contains("one_sided_alpha"));
+        assert!(!json.contains("bundle_path"));
+        assert!(!json.contains("sandbox_image_path"));
     }
 
     #[test]
-    fn artifact_report_matches_the_contract_outline() {
-        let verifier = test_launch_verifier_identity(
-            test_trimul_verifier_identity(),
-            ferrl::VerifierIsolationTier::DedicatedUidServiceV1,
+    fn artifact_v4_report_surfaces_the_predeclared_decision_and_raw_audit() {
+        let cfg: RunConfig = serde_json::from_str(&trimul_score_test_config(4242)).unwrap();
+        let manifest = artifact_manifest_for_test(&cfg);
+
+        let report = artifact_report(
+            &manifest,
+            Path::new("/private/operator/artifact"),
+            &"34".repeat(32),
         );
-        let manifest = ArtifactManifest {
-            contract_version: 3,
-            task: "trimul",
-            ferrl_commit: "01".repeat(20),
-            run_id: "trimul-1".to_string(),
-            launch_sha256: "02".repeat(32),
-            launch_file_sha256: "03".repeat(32),
-            launch_attestation_key_id: "test-root-1".to_owned(),
-            launch_attestation_algorithm: LAUNCH_ATTESTATION_ALGORITHM.to_owned(),
-            candidate: CandidateManifest {
-                record_sha256: "04".repeat(32),
-                record_signature: "06".repeat(64),
-                ledger_row_sha256: "05".repeat(32),
-                step: 7,
-                prompt_index: 12,
-                group_index: 2,
-                rank: 0,
-                world_size: 1,
-                training_reward: 1.5,
-                completion_sha256: "completion-hash".to_string(),
-                source_sha256: "source-hash".to_string(),
-                source_inspection: SourceInspectionManifest {
-                    result: SourceInspectionResult::Clean,
-                    notes: "no process, file descriptor, environment, network, or out-of-input path probes"
-                        .to_string(),
-                },
-            },
-            model: ModelManifest {
-                family: "qwen3.x".to_string(),
-                checkpoint_policy_sha256: "06".repeat(32),
-                tokenizer_sha256: "07".repeat(32),
-                lora_rank: 8,
-                lora_alpha: 16.0,
-                base_dtype: "bf16",
-                base_quantization: "q8_0",
-            },
-            config: ArtifactConfigManifest {
-                run_config_source_sha256: "07".repeat(32),
-                run_config_resolved_sha256: "08".repeat(32),
-                prompt_sha256: "prompt-hash".to_string(),
-                prompt_file: "prompt.txt",
-                reward_profile: ferrl::trimul::TrimulRewardProfile::default(),
-                trainer_steps: 100,
-                group_size: 4,
-                run_health: "healthy".to_string(),
-                policy_seed: 11,
-                data_seed: 22,
-                training_secret_seed: 33,
-                audit_secret_seed: 44,
-                scratch_max_bytes: 1024,
-                verifier_parallelism: 1,
-                verifier_max_procs: ferrl::trimul::DEFAULT_VERIFIER_MAX_PROCS,
-                verifier_cuda_device_pool: Vec::new(),
-            },
-            eval: EvalManifest {
-                bundle_path: "eval-bundle".to_string(),
-                bundle_sha256: "09".repeat(32),
-                bundle_file_count: 5,
-                sandbox_image_path: "sandbox-image".to_string(),
-                sandbox_image_sha256: "0a".repeat(32),
-                sandbox_image_len_bytes: 1024,
-                task_yml_sha256: "0b".repeat(32),
-                task_yml_len_bytes: 512,
-                test_cases: 3,
-                benchmark_cases: 2,
-            },
-            baseline: BaselineManifest {
-                metric: verifier.timing_metric.clone(),
-                isolation_tier: verifier.isolation.tier,
-                isolation_evidence_sha256: verifier.isolation_evidence_sha256.clone(),
-                gpu: "H100".to_string(),
-                measurements_ns: vec![10.0, 11.0, 12.0],
-                median_ns: 11.0,
-                command: "ferrl trimul-baseline --config run.json".to_string(),
-            },
-            verification: VerificationManifest {
-                gpu: "H100".to_string(),
-                isolation_tier: verifier.isolation.tier,
-                isolation_evidence_sha256: verifier.isolation_evidence_sha256.clone(),
-                runs: vec![
-                    ArtifactVerificationRun {
-                        isolation_tier: verifier.isolation.tier,
-                        isolation_evidence_sha256: verifier.isolation_evidence_sha256.clone(),
-                        runtime_hardening_evidence_sha256: verifier
-                            .runtime_preflight
-                            .runtime_hardening_evidence_sha256
-                            .clone(),
-                        runtime_hardening: verifier.runtime_preflight.runtime_hardening.clone(),
-                        timing_metric: verifier.timing_metric.clone(),
-                        correct: true,
-                        benchmark_means_ns: vec![8.0],
-                        geomean_ns: Some(8.0),
-                        speedup: Some(1.375),
-                    },
-                    ArtifactVerificationRun {
-                        isolation_tier: verifier.isolation.tier,
-                        isolation_evidence_sha256: verifier.isolation_evidence_sha256.clone(),
-                        runtime_hardening_evidence_sha256: verifier
-                            .runtime_preflight
-                            .runtime_hardening_evidence_sha256
-                            .clone(),
-                        runtime_hardening: verifier.runtime_preflight.runtime_hardening.clone(),
-                        timing_metric: verifier.timing_metric.clone(),
-                        correct: true,
-                        benchmark_means_ns: vec![9.0],
-                        geomean_ns: Some(9.0),
-                        speedup: Some(1.222),
-                    },
-                    ArtifactVerificationRun {
-                        isolation_tier: verifier.isolation.tier,
-                        isolation_evidence_sha256: verifier.isolation_evidence_sha256.clone(),
-                        runtime_hardening_evidence_sha256: verifier
-                            .runtime_preflight
-                            .runtime_hardening_evidence_sha256
-                            .clone(),
-                        runtime_hardening: verifier.runtime_preflight.runtime_hardening.clone(),
-                        timing_metric: verifier.timing_metric.clone(),
-                        correct: true,
-                        benchmark_means_ns: vec![10.0],
-                        geomean_ns: Some(10.0),
-                        speedup: Some(1.1),
-                    },
-                ],
-                accepted: true,
-            },
-        };
-        let report = artifact_report(&manifest, Path::new("artifact"), "manifest-hash");
-        assert!(report.contains(&format!("ferrl commit: {}", "01".repeat(20))));
-        assert!(report.contains(&format!(
-            "Launch/config hashes: payload={}, file={}, source={}, resolved={}",
-            "02".repeat(32),
-            "03".repeat(32),
-            "07".repeat(32),
-            "08".repeat(32)
-        )));
+
         for required in [
             "## 1. Verdict",
-            "Raw measurements ns: 10.000000, 11.000000, 12.000000",
-            "Command used: `ferrl trimul-baseline --config run.json`",
-            "Launch attestation: test-root-1 (ed25519)",
-            "Prompt copy: prompt.txt (prompt-hash)",
-            "Reward profile: `{\"scheme\":\"trimul_shaped_v1\"",
-            "base_quantization=q8_0",
-            "Budget: trainer_steps=100, group_size=4, scratch_max_bytes=1024, verifier_max_procs=1024",
-            "Run health: healthy",
-            "| source hash | training reward | source inspection | clean correctness | median service latency ns | same-metric ratio | accept/reject reason |",
-            "| source-hash | 1.500000 | clean | 3/3 | 9.000000 | 1.222222 | accepted: all clean runs correct and median service latency beats baseline |",
-            "Source inspection notes: no process, file descriptor, environment, network, or out-of-input path probes",
-            "Path: artifact",
-            "Manifest SHA-256: manifest-hash",
-            "## 6. Operator Checklist",
-            "[pass] audit seed differs from training seed",
-            "[pass] reward profile recorded and valid",
-            "[pass] verifier process cap recorded",
-            "[pass] source inspection found no process/file/env/network/path probing",
+            "accepted_artifact",
+            "## 2. Discovery Provenance",
+            "Launch authentication: LocalEphemeralV1",
+            "Prompt copy: prompt.txt",
+            "Model: family=gemma4",
+            "Reward profile: `",
+            "Seeds: data=",
+            "Budget: trainer_steps=1, group_size=2",
+            "Eval: bundle=",
+            "Run health: test",
+            "## 3. Launch-Bound Paired Audit",
+            "Audit contract:",
+            "Deterministic audit seed:",
+            "Attempt selection: operator_attested_v1; durable_once_only=false; artifact_wide_false_positive_guarantee=false",
+            "Audit verifier: tier=SameUidApptainerV1",
+            "NVIDIA H100 80GB HBM3 uuid=abababababababababababababababab",
+            "threshold=strict_greater_than 1.020000x, material_wins=11/11",
+            "accepted: at least nine of eleven same-device pairs exceed the 2% material margin",
+            "[pass] audit contains the fixed eleven ordered pairs",
+            "[pass] audit uses the selected tier and records operator-trusted attempt selection",
+            "[pass] launch commit and config hashes are canonical",
+            "[pass] candidate row, signature, completion, and source hashes are canonical",
+            "[pass] all raw executions bind exact cases, verifier evidence, and one physical GPU",
+            "[pass] predeclared empirical 9-of-11 material-win rule is recorded",
+            "Bundle root: .",
         ] {
-            assert!(report.contains(required), "missing report field: {required}");
+            assert!(
+                report.contains(required),
+                "missing report field: {required}"
+            );
         }
+        assert!(!report.contains("[fail]"), "{report}");
+        assert!(!report.contains("/private/operator"));
+    }
+
+    #[test]
+    fn artifact_v4_report_rejects_a_mutated_preflight_preimage() {
+        let cfg: RunConfig = serde_json::from_str(&trimul_score_test_config(4242)).unwrap();
+        let mut manifest = artifact_manifest_for_test(&cfg);
+        manifest.audit.runtime_preflight.probe_submission_sha256 = "00".repeat(32);
+
+        let report = artifact_report(&manifest, Path::new("artifact"), &"34".repeat(32));
+
+        assert!(report.contains(
+            "[fail] audit uses the selected tier and records operator-trusted attempt selection"
+        ));
     }
 }

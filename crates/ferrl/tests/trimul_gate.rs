@@ -30,7 +30,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use ferrl::trimul::TrimulVerifierAssets;
+use ferrl::trimul::{validate_artifact_verification_evidence, TrimulVerifierAssets};
 use ferrl::{
     Distribution, RewardFn, RewardOutcome, Sample, TrimulCase, TrimulReward, VerifierIsolationTier,
 };
@@ -715,6 +715,26 @@ fn gate_raw_cuda_allocation_boundary_contains_no_parent_private_memory() {
         "raw-device-boundary-absent-wrong-output-v1",
         "raw CUDA allocation discovery must not expose protected-parent memory",
     );
+}
+
+#[test]
+#[ignore = "needs an sm_80 GPU + the eval image/bundle; run with --ignored"]
+fn gate_reference_publication_evidence_is_complete_and_device_bound() {
+    let evidenced = reward()
+        .verify_reference_with_evidence()
+        .expect("verify the bundled reference with raw protected evidence");
+    let exact = validate_artifact_verification_evidence(&evidenced, 2, 2)
+        .expect("accept complete publication-grade reference evidence");
+
+    assert_eq!(exact.test_cases.len(), 2);
+    assert_eq!(exact.benchmark_cases.len(), 2);
+    assert_eq!(exact.executing_device.cuda_logical_ordinal, 0);
+    assert!(!exact.executing_device.name.is_empty());
+    assert_eq!(exact.executing_device.uuid.len(), 32);
+    assert!(exact
+        .benchmark_cases
+        .iter()
+        .all(|case| case.runs >= 3 && case.mean_ns > 0.0));
 }
 
 #[test]
