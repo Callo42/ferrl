@@ -12169,8 +12169,8 @@ benchmarks:
             out: rejected_out.clone(),
             audit_verifier_executor_socket: None,
             audit_cuda_visible_device: "0".to_owned(),
-            run_health:
-                "synthetic deployment control rejected branch; not discovery evidence".to_owned(),
+            run_health: "synthetic deployment control rejected branch; not discovery evidence"
+                .to_owned(),
             source_inspection: SourceInspectionResult::Suspicious,
             source_inspection_notes:
                 "synthetic injected suspicious-source rejection control; not discovery evidence"
@@ -12202,18 +12202,15 @@ benchmarks:
                 manifest["audit"]["artifact_wide_false_positive_guarantee"],
                 serde_json::json!(false)
             );
-            assert!(
-                manifest["config"]["run_health"]
-                    .as_str()
-                    .is_some_and(|value| value.contains("synthetic deployment control")
-                        && value.contains("not discovery evidence"))
-            );
-            assert!(
-                manifest["candidate"]["source_inspection"]["notes"]
-                    .as_str()
-                    .is_some_and(|value| value.contains("synthetic")
-                        && value.contains("not discovery evidence"))
-            );
+            assert!(manifest["config"]["run_health"]
+                .as_str()
+                .is_some_and(|value| value.contains("synthetic deployment control")
+                    && value.contains("not discovery evidence")));
+            assert!(manifest["candidate"]["source_inspection"]["notes"]
+                .as_str()
+                .is_some_and(
+                    |value| value.contains("synthetic") && value.contains("not discovery evidence")
+                ));
             assert_eq!(manifest["accepted"], serde_json::json!(expected_accepted));
             assert_eq!(
                 manifest["audit"]["decision"]["accepted"],
