@@ -260,6 +260,8 @@ impl RunDir {
     pub const CONFIG_FILE: &'static str = "config.json";
     /// Standard filename for the human-readable run log.
     pub const LOG_FILE: &'static str = "run.log";
+    /// Durable held-out evaluation report, published once after evaluation.
+    pub const EVAL_REPORT_FILE: &'static str = "eval-report.json";
     /// Standard subdirectory for model checkpoints.
     pub const CHECKPOINTS_DIR: &'static str = "checkpoints";
 
@@ -376,6 +378,30 @@ impl RunDir {
     #[must_use]
     pub fn log_path(&self) -> PathBuf {
         self.root.join(Self::LOG_FILE)
+    }
+
+    /// Path to the immutable held-out evaluation report.
+    #[must_use]
+    pub fn eval_report_path(&self) -> PathBuf {
+        self.root.join(Self::EVAL_REPORT_FILE)
+    }
+
+    /// Publish one immutable, synchronized held-out evaluation report.
+    ///
+    /// Create-new semantics prevent a resumed or repeated evaluation from
+    /// silently replacing prior evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TelemetryError`] if serialization, create-new publication, or
+    /// directory synchronization fails.
+    pub fn write_eval_report<R: Serialize>(&self, report: &R) -> Result<(), TelemetryError> {
+        let mut bytes = serde_json::to_vec_pretty(report)?;
+        bytes.push(b'\n');
+        write_new_synced(&self.eval_report_path(), &bytes)?;
+        File::open(&self.root)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| TelemetryError::io(&self.root, error))
     }
 
     /// Path to the `checkpoints/` subdirectory.
@@ -3862,5 +3888,19 @@ mod tests {
         let s = format!("{err}");
         assert!(s.contains("/nope"));
         assert!(s.contains("boom"));
+    }
+
+    #[test]
+    fn eval_report_publication_is_immutable() {
+        let tmp = TempDir::new("eval-report");
+        let run = RunDir::create(tmp.path(), "run").unwrap();
+        let report = serde_json::json!({"contract": "ferrl.eval-report.v1", "value": 1});
+        run.write_eval_report(&report).unwrap();
+        let bytes = std::fs::read(run.eval_report_path()).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+            report
+        );
+        assert!(run.write_eval_report(&report).is_err());
     }
 }

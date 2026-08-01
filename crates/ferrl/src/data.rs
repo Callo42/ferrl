@@ -13,7 +13,7 @@
 //! Blank lines are skipped; any other parse failure is reported with its 1-based
 //! line number.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::hash::Hash;
 use std::path::{Path, PathBuf};
@@ -174,6 +174,59 @@ where
     (unique, eval)
 }
 
+/// Partition samples by a task-semantic key, never placing equivalent items in
+/// both train and evaluation.
+///
+/// Every row with the same key is assigned as one indivisible group. Groups are
+/// deterministically shuffled under `seed`; complete groups are moved to eval
+/// until at least `eval_n` rows are held out. Consequently eval may contain more
+/// than `eval_n` rows, but semantic equivalence can never cross the boundary.
+#[must_use]
+pub fn train_eval_split_by_key<T, K, F>(
+    samples: Vec<Sample<T>>,
+    eval_n: usize,
+    seed: u64,
+    mut key: F,
+) -> (Vec<Sample<T>>, Vec<Sample<T>>)
+where
+    K: Eq + Hash,
+    F: FnMut(&Sample<T>) -> K,
+{
+    let mut groups: Vec<Vec<Sample<T>>> = Vec::new();
+    let mut positions: HashMap<K, usize> = HashMap::new();
+    for sample in samples {
+        let sample_key = key(&sample);
+        if let Some(&index) = positions.get(&sample_key) {
+            groups[index].push(sample);
+        } else {
+            let index = groups.len();
+            positions.insert(sample_key, index);
+            groups.push(vec![sample]);
+        }
+    }
+
+    let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
+    for i in (1..groups.len()).rev() {
+        let j = (rng.random::<u64>() % (i as u64 + 1)) as usize;
+        groups.swap(i, j);
+    }
+
+    let target = eval_n.min(groups.iter().map(Vec::len).sum());
+    let mut eval_groups = 0;
+    let mut held_out = 0;
+    for rows in groups.iter().rev() {
+        if held_out >= target {
+            break;
+        }
+        held_out += rows.len();
+        eval_groups += 1;
+    }
+    let split = groups.len() - eval_groups;
+    let eval = groups.split_off(split).into_iter().flatten().collect();
+    let train = groups.into_iter().flatten().collect();
+    (train, eval)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,6 +236,21 @@ mod tests {
     struct Problem {
         numbers: Vec<u32>,
         answer: i64,
+    }
+
+    #[test]
+    fn semantic_groups_never_cross_the_split() {
+        let samples = vec![
+            Sample::new("first", 1u32),
+            Sample::new("equivalent spelling", 11u32),
+            Sample::new("second", 2u32),
+            Sample::new("third", 3u32),
+        ];
+        let (train, eval) = train_eval_split_by_key(samples, 1, 7, |sample| sample.target % 10);
+        let train_keys: HashSet<u32> = train.iter().map(|sample| sample.target % 10).collect();
+        let eval_keys: HashSet<u32> = eval.iter().map(|sample| sample.target % 10).collect();
+        assert!(train_keys.is_disjoint(&eval_keys));
+        assert!(!eval.is_empty());
     }
 
     #[test]

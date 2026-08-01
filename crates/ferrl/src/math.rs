@@ -39,6 +39,26 @@ impl MathProblem {
             answer: answer.into(),
         }
     }
+
+    /// Reward-semantic answer identity used by held-out split keys.
+    #[must_use]
+    pub fn normalized_answer(&self) -> String {
+        normalize(&self.answer)
+    }
+}
+
+/// Canonicalize prompt formatting for a Math held-out split key.
+///
+/// ASCII whitespace runs and thousands separators are ignored, matching the
+/// task's answer normalization while retaining the actual question semantics.
+#[must_use]
+pub fn math_split_key(sample: &Sample<MathProblem>) -> (String, String) {
+    let prompt = sample
+        .prompt
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace() && *c != ',')
+        .collect();
+    (prompt, sample.target.normalized_answer())
 }
 
 /// Wrap a `question` into a prompt that instructs the model to put its final answer
@@ -201,5 +221,12 @@ mod tests {
         let s = &samples[0];
         let completion = format!("<answer>{}</answer>", s.target.answer);
         assert_eq!(r.reward(s, &completion).unwrap(), 1.0);
+    }
+
+    #[test]
+    fn split_key_rejects_normalized_equivalent_leakage() {
+        let a = Sample::new("What is 1, 000 + 234?", MathProblem::new("1,234"));
+        let b = Sample::new("What is 1000 + 234?", MathProblem::new(" 1234 "));
+        assert_eq!(math_split_key(&a), math_split_key(&b));
     }
 }

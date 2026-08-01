@@ -73,6 +73,15 @@ pub struct CountdownProblem {
 }
 
 impl CountdownProblem {
+    /// Canonical task identity used to keep permuted-equivalent problems on one
+    /// side of a train/eval split.
+    #[must_use]
+    pub fn split_key(&self) -> (Vec<u32>, i64) {
+        let mut numbers = self.numbers.clone();
+        numbers.sort_unstable();
+        (numbers, self.target)
+    }
+
     /// Whether `expression` is a valid Countdown solution: it parses, uses each of
     /// [`numbers`](Self::numbers) exactly once (and nothing else), and evaluates
     /// exactly to [`target`](Self::target).
@@ -930,5 +939,18 @@ mod tests {
             assert_eq!(p.numbers, vec![5]);
             assert_eq!(p.target, 5);
         }
+    }
+
+    #[test]
+    fn split_key_rejects_permutation_leakage() {
+        let a = CountdownProblem {
+            numbers: vec![2, 3, 4],
+            target: 14,
+        };
+        let b = CountdownProblem {
+            numbers: vec![4, 2, 3],
+            target: 14,
+        };
+        assert_eq!(a.split_key(), b.split_key());
     }
 }

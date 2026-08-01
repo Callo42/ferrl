@@ -196,7 +196,7 @@ pub use countdown::{
 #[doc(inline)]
 pub use cuda_compat::{check_driver_compat, guard_first_kernel, translate_ptx_error, CompatReport};
 #[doc(inline)]
-pub use data::{parse_jsonl, read_jsonl, train_eval_split, DataError};
+pub use data::{parse_jsonl, read_jsonl, train_eval_split, train_eval_split_by_key, DataError};
 #[doc(inline)]
 pub use eval::{evaluate, EvalError, EvalReport, PromptEval};
 
@@ -235,7 +235,7 @@ pub use loader::{
 #[doc(inline)]
 pub use lora::{BaseQuantization, DenseLoraTargets};
 #[doc(inline)]
-pub use math::{math_prompt, MathProblem, MathReward};
+pub use math::{math_prompt, math_split_key, MathProblem, MathReward};
 #[doc(inline)]
 pub use model::{CachedDecoder, GradModel};
 #[doc(inline)]
