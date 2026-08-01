@@ -525,8 +525,8 @@ The final report must fit this outline:
 2. Discovery provenance: ferrl commit, launch/config/candidate hashes, exact launch
    authentication, original verifier tier, source inspection, model, seeds, and run health.
 3. Independent paired audit: audit id, dedicated preflight identity, executing-device
-   identity, all eleven paired speedups, the 2% material threshold, win count, exact null
-   tail, and accept/reject reason.
+   identity, all eleven paired speedups, the 2% material threshold, win count,
+   operator-trusted attempt boundary, and accept/reject reason.
 4. Artifact bundle path and manifest hash.
 5. Operator checklist: each provenance, exact-evidence, fixed-sample, decision, and
    reward-hacking check marked pass/fail.
