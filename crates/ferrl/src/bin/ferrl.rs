@@ -12048,9 +12048,10 @@ benchmarks:
 
     #[cfg(unix)]
     #[test]
-    #[ignore = "requires the pinned TriMul image/eval bundle, Apptainer, and one CUDA GPU"]
+    #[ignore = "requires the controlled synthetic TriMul eval bundle, Apptainer, and one CUDA GPU"]
     #[allow(clippy::cognitive_complexity)] // deployment oracle checks every retained evidence layer
-    fn deployment_admin_free_artifact_v4_end_to_end() {
+    fn deployment_admin_free_artifact_v4_synthetic_control_end_to_end() {
+        const CONTROL_KIND: &str = "synthetic_slow_reference_v1";
         let required_path = |key: &str| {
             std::env::var_os(key).map_or_else(
                 || panic!("set {key} to run the artifact deployment gate"),
@@ -12062,6 +12063,11 @@ benchmarks:
         let scratch_root = required_path("FERRL_TRIMUL_SCRATCH");
         let submission_path = required_path("FERRL_TRIMUL_ARTIFACT_SUBMISSION");
         let output_root = required_path("FERRL_TRIMUL_ARTIFACT_OUTPUT_ROOT");
+        assert_eq!(
+            std::env::var("FERRL_TRIMUL_ARTIFACT_CONTROL_KIND").as_deref(),
+            Ok(CONTROL_KIND),
+            "the deployment oracle is a synthetic branch-control, not discovery evidence"
+        );
         assert!(
             !output_root.exists(),
             "deployment output must be a fresh retained path: {}",
@@ -12074,7 +12080,11 @@ benchmarks:
         let runs_dir = output_root.join("runs");
         std::fs::create_dir_all(&model_dir).unwrap();
         std::fs::create_dir_all(&runs_dir).unwrap();
-        std::fs::write(&prompt, b"write a faster launch-bound TriMul kernel").unwrap();
+        std::fs::write(
+            &prompt,
+            b"exercise the synthetic launch-bound TriMul artifact control",
+        )
+        .unwrap();
 
         let mut config: serde_json::Value =
             serde_json::from_str(&trimul_score_test_config(424318)).unwrap();
@@ -12086,8 +12096,9 @@ benchmarks:
         config["trimul"]["image"] = serde_json::json!(image);
         config["trimul"]["eval_dir"] = serde_json::json!(eval_dir);
         config["trimul"]["scratch_root"] = serde_json::json!(scratch_root);
-        // Publication-grade reference/candidate runs exercise the complete 3 GiB
-        // pinned input through protected transport; use the documented default wall.
+        // Complete synthetic-control reference/candidate runs exercise the 3 GiB
+        // transport boundary; use the documented production wall without claiming
+        // that this engineered control is a discovered artifact.
         config["trimul"]["wall_secs"] = serde_json::json!(600);
         config["trimul"]["verifier_cuda_visible_devices"] = serde_json::json!("0");
         config["trimul"]["verifier_max_procs"] = serde_json::json!(1024);
@@ -12112,7 +12123,7 @@ benchmarks:
         let (launch, signer) = launch_manifest_for_test(
             &cfg,
             "trimul-1",
-            b"write a faster launch-bound TriMul kernel",
+            b"exercise the synthetic launch-bound TriMul artifact control",
         );
         let mut payload = launch.payload;
         payload.ferrl_commit = env!("FERRL_BUILD_GIT_COMMIT").to_owned();
@@ -12128,7 +12139,7 @@ benchmarks:
         let run = RunDir::create(&runs_dir, "trimul-1").unwrap();
         run.write_immutable_launch(
             &launch.to_pretty_bytes().unwrap(),
-            Some(b"write a faster launch-bound TriMul kernel"),
+            Some(b"exercise the synthetic launch-bound TriMul artifact control"),
         )
         .unwrap();
         let mut candidate_row = serde_json::to_vec(&candidate).unwrap();
@@ -12142,10 +12153,11 @@ benchmarks:
             out: accepted_out.clone(),
             audit_verifier_executor_socket: None,
             audit_cuda_visible_device: "0".to_owned(),
-            run_health: "deployment gate candidate is launch-bound".to_owned(),
+            run_health:
+                "synthetic deployment control accepted branch; not discovery evidence".to_owned(),
             source_inspection: SourceInspectionResult::Clean,
             source_inspection_notes:
-                "inspected process, file descriptor, environment, network, and path access"
+                "synthetic control inspected process, file descriptor, environment, network, and path access; not discovery evidence"
                     .to_owned(),
         };
         trimul_artifact(&accepted_args).unwrap();
@@ -12157,9 +12169,12 @@ benchmarks:
             out: rejected_out.clone(),
             audit_verifier_executor_socket: None,
             audit_cuda_visible_device: "0".to_owned(),
-            run_health: "deployment gate rejection control".to_owned(),
+            run_health:
+                "synthetic deployment control rejected branch; not discovery evidence".to_owned(),
             source_inspection: SourceInspectionResult::Suspicious,
-            source_inspection_notes: "injected suspicious-source rejection control".to_owned(),
+            source_inspection_notes:
+                "synthetic injected suspicious-source rejection control; not discovery evidence"
+                    .to_owned(),
         };
         trimul_artifact(&rejected_args).unwrap();
 
@@ -12186,6 +12201,18 @@ benchmarks:
             assert_eq!(
                 manifest["audit"]["artifact_wide_false_positive_guarantee"],
                 serde_json::json!(false)
+            );
+            assert!(
+                manifest["config"]["run_health"]
+                    .as_str()
+                    .is_some_and(|value| value.contains("synthetic deployment control")
+                        && value.contains("not discovery evidence"))
+            );
+            assert!(
+                manifest["candidate"]["source_inspection"]["notes"]
+                    .as_str()
+                    .is_some_and(|value| value.contains("synthetic")
+                        && value.contains("not discovery evidence"))
             );
             assert_eq!(manifest["accepted"], serde_json::json!(expected_accepted));
             assert_eq!(
