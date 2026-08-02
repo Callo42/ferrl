@@ -2762,11 +2762,13 @@ where
     })?;
 
     if !eval.is_empty() {
-        let report = evaluate(&mut policy, eval_reward, &tok, eval, &gen)?;
-        publish_eval_report(
-            cfg,
+        let report = evaluate_and_publish_report(
+            &mut policy,
+            eval_reward,
+            &tok,
             eval,
-            &report,
+            &gen,
+            cfg,
             &run,
             &launch_sha256,
             verifier_assets_identity.as_ref(),
@@ -2788,6 +2790,38 @@ where
         );
         Ok(())
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_and_publish_report<P, R>(
+    policy: &mut P,
+    reward: &R,
+    tokenizer: &dyn TokenizerLike,
+    eval: &[Sample<R::Target>],
+    gen: &GenConfig,
+    cfg: &RunConfig,
+    run: &RunDir,
+    launch_sha256: &str,
+    verifier_assets: Option<&ferrl::trimul::TrimulVerifierIdentity>,
+    launch_comm: Option<&dyn ferrl::Comm>,
+) -> Result<ferrl::EvalReport, CliError>
+where
+    P: Policy,
+    R: RewardFn,
+    R::Target: Serialize,
+{
+    let local = evaluate(policy, reward, tokenizer, eval, gen).map_err(CliError::from);
+    let report = coordinate_distributed_result(launch_comm, "held-out evaluation", local)?;
+    publish_eval_report(
+        cfg,
+        eval,
+        &report,
+        run,
+        launch_sha256,
+        verifier_assets,
+        launch_comm,
+    )?;
+    Ok(report)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9757,6 +9791,101 @@ mod tests {
             _completion: &str,
         ) -> Result<f32, ferrl::RewardError> {
             Ok(0.0)
+        }
+    }
+
+    struct RankSelectiveEvalReward {
+        fail: bool,
+    }
+
+    impl RewardFn for RankSelectiveEvalReward {
+        type Target = ();
+
+        fn reward(
+            &self,
+            _sample: &Sample<()>,
+            _completion: &str,
+        ) -> Result<f32, ferrl::RewardError> {
+            if self.fail {
+                Err(ferrl::RewardError::msg("injected rank-local eval failure"))
+            } else {
+                Ok(0.5)
+            }
+        }
+    }
+
+    #[test]
+    fn distributed_evaluation_failure_aborts_before_report_collectives() {
+        let tmp = TestDir::new("distributed-evaluation-failure");
+        let model_dir = tmp.path().join("model");
+        write_generation_metadata_fixture(
+            &model_dir,
+            Some(serde_json::json!(3)),
+            &serde_json::json!(4),
+        );
+        let tokenizer = ferrl::HfTokenizer::from_file(model_dir.join("tokenizer.json")).unwrap();
+        let results = std::thread::scope(|scope| {
+            ferrl::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(5))
+                .into_iter()
+                .map(|comm| {
+                    let rank = comm.rank();
+                    let tokenizer = &tokenizer;
+                    let root = tmp.path().join(format!("rank-{rank}"));
+                    scope.spawn(move || {
+                        let cfg: RunConfig =
+                            serde_json::from_str(&countdown_train_config("")).unwrap();
+                        let run = RunDir::create(&root, format!("eval-rank{rank}")).unwrap();
+                        let mut policy = EosRecordingPolicy::new(Arc::new(Mutex::new(Vec::new())));
+                        let reward = RankSelectiveEvalReward { fail: rank == 1 };
+                        let gen = GenConfig {
+                            group_size: 1,
+                            max_new_tokens: 2,
+                            eos_token_id: Some(3),
+                            ..GenConfig::default()
+                        };
+                        let result = evaluate_and_publish_report(
+                            &mut policy,
+                            &reward,
+                            tokenizer,
+                            &[Sample::new("hello", ())],
+                            &gen,
+                            &cfg,
+                            &run,
+                            &if rank == 0 {
+                                "00".repeat(32)
+                            } else {
+                                "11".repeat(32)
+                            },
+                            None,
+                            Some(&comm),
+                        )
+                        .map_err(|error| error.to_string());
+                        (rank, result, run.eval_report_path())
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        for (rank, result, report_path) in results {
+            let error = result.unwrap_err();
+            if rank == 1 {
+                assert!(
+                    error.contains("injected rank-local eval failure"),
+                    "{error}"
+                );
+            } else {
+                assert!(
+                    error.contains("held-out evaluation failed on a peer distributed rank"),
+                    "{error}"
+                );
+            }
+            assert!(
+                !report_path.exists(),
+                "rank {rank} published an eval report"
+            );
         }
     }
 
