@@ -68,14 +68,27 @@ use ferrl::countdown::{build_prompt, generate_dataset, CountdownConfig, Countdow
 use ferrl::policy::{GenConfig, Policy, TensorParallelPolicy};
 use ferrl::telemetry::{CandidateRecord, CandidateSigner, RegressionFailure};
 use ferrl::{
-    compare_distributed_metrics, compare_metrics, evaluate, read_jsonl, summarize,
-    train_eval_split, BaseQuantization, CountdownReward, LoaderOpts, MathProblem, MathReward,
-    RegressionBudget, RegressionReport, RewardFn, RunDir, RunStop, Sample, TensorParallelPlan,
-    TokenizerLike, Trainer, TrainerConfig, TrimulReward, VerifierExecutorConfig,
+    compare_distributed_metrics, compare_metrics, evaluate, math_split_key, read_jsonl, summarize,
+    train_eval_split_by_key, BaseQuantization, CountdownReward, LoaderOpts, MathProblem,
+    MathReward, RegressionBudget, RegressionReport, RewardFn, RunDir, RunStop, Sample,
+    TensorParallelPlan, TokenizerLike, Trainer, TrainerConfig, TrimulReward,
+    VerifierExecutorConfig,
 };
 
 /// A task's train/eval split: `(train, eval)` samples of the task's target type.
 type Splits<T> = (Vec<Sample<T>>, Vec<Sample<T>>);
+
+#[derive(Debug, Serialize)]
+struct DurableEvalReport<'a> {
+    contract: &'static str,
+    publishing_launch_sha256: String,
+    launch_group_sha256: String,
+    task: &'a str,
+    split_key_contract: &'static str,
+    eval_samples_sha256: String,
+    evaluation_boundary_sha256: String,
+    report: &'a ferrl::EvalReport,
+}
 
 /// Largest case-generation seed accepted by the protected TriMul evaluator.
 const TRIMUL_CASE_SEED_MAX: u64 = u32::MAX as u64;
@@ -698,6 +711,9 @@ struct TrimulCfg {
     scratch_max_bytes: u64,
     /// Secret case-generation seed (`POPCORN_SEED`), combined with each case's public seed.
     secret_seed: u64,
+    /// Distinct case-generation seed used only for held-out evaluation.
+    /// Required when `data.eval_n > 0` and must differ from `secret_seed`.
+    held_out_secret_seed: Option<u64>,
     /// Per-candidate wall-clock budget in seconds (`0` → the reward default, 600 s).
     wall_secs: u64,
     /// Optional CUDA-visible device list for every sandboxed verifier process.
@@ -1275,6 +1291,26 @@ fn default_out_dir() -> PathBuf {
 }
 
 impl RunConfig {
+    fn validate_trimul_held_out_boundary(&self) -> Result<(), CliError> {
+        if self.data.eval_n == 0 {
+            if self.trimul.held_out_secret_seed.is_some() {
+                return Err(CliError::msg(
+                    "trimul.held_out_secret_seed requires data.eval_n >= 1",
+                ));
+            }
+            return Ok(());
+        }
+        let held_out = self.trimul.held_out_secret_seed.ok_or_else(|| {
+            CliError::msg("TriMul held-out eval requires trimul.held_out_secret_seed")
+        })?;
+        if held_out > TRIMUL_CASE_SEED_MAX || held_out == self.trimul.secret_seed {
+            return Err(CliError::msg(
+                "trimul.held_out_secret_seed must be in the u32 range and differ from trimul.secret_seed",
+            ));
+        }
+        Ok(())
+    }
+
     fn open_device(&self) -> Result<Device, CliError> {
         self.device.open()
     }
@@ -1350,6 +1386,7 @@ impl RunConfig {
                     "trimul.secret_seed must be between 0 and {TRIMUL_CASE_SEED_MAX}"
                 )));
             }
+            self.validate_trimul_held_out_boundary()?;
             match self.trimul.verifier_isolation_tier {
                 ferrl::VerifierIsolationTier::SameUidApptainerV1 => {
                     if self.trimul.verifier_executor_socket.is_some() {
@@ -1513,7 +1550,9 @@ impl RunConfig {
             .into_iter()
             .map(|p| Sample::new(build_prompt(&p), p))
             .collect();
-        train_eval_split(samples, self.data.eval_n, self.data.seed)
+        train_eval_split_by_key(samples, self.data.eval_n, self.data.seed, |sample| {
+            sample.target.split_key()
+        })
     }
 
     /// Build the math train/eval splits from the configured JSONL `data.path`.
@@ -1522,7 +1561,12 @@ impl RunConfig {
             CliError::msg("task \"math\" requires data.path (a JSONL dataset of {prompt, target})")
         })?;
         let samples = read_jsonl::<MathProblem, _>(path)?;
-        Ok(train_eval_split(samples, self.data.eval_n, self.data.seed))
+        Ok(train_eval_split_by_key(
+            samples,
+            self.data.eval_n,
+            self.data.seed,
+            math_split_key,
+        ))
     }
 
     /// Build the TriMul train/eval splits: the single discovery prompt, repeated.
@@ -1625,12 +1669,20 @@ impl RunConfig {
         &self,
         assets: ferrl::trimul::TrimulVerifierAssets,
     ) -> Result<TrimulReward, CliError> {
+        self.build_trimul_reward_base_with_assets_and_seed(assets, self.trimul.secret_seed)
+    }
+
+    fn build_trimul_reward_base_with_assets_and_seed(
+        &self,
+        assets: ferrl::trimul::TrimulVerifierAssets,
+        secret_seed: u64,
+    ) -> Result<TrimulReward, CliError> {
         let t = &self.trimul;
         let (tests, benches) = ferrl::trimul::parse_task_yml(assets.task_yml())?;
         let wall = Duration::from_secs(if t.wall_secs == 0 { 600 } else { t.wall_secs });
         let reward = TrimulReward::new(assets, &t.scratch_root)
             .with_cases(tests, benches)
-            .with_secret_seed(t.secret_seed)
+            .with_secret_seed(secret_seed)
             .with_wall(wall);
         let mut reward = self
             .configure_verifier_isolation(reward)
@@ -1687,6 +1739,18 @@ impl RunConfig {
             reward = reward.with_baseline_ns(b.ns);
         }
         Ok(reward)
+    }
+
+    fn build_trimul_held_out_reward_with_assets(
+        &self,
+        assets: ferrl::trimul::TrimulVerifierAssets,
+    ) -> Result<TrimulReward, CliError> {
+        let seed = self.trimul.held_out_secret_seed.ok_or_else(|| {
+            CliError::msg("TriMul held-out eval requires trimul.held_out_secret_seed")
+        })?;
+        let mode = self.trimul_submission_extract_mode()?;
+        self.build_trimul_reward_base_with_assets_and_seed(assets, seed)
+            .map(|reward| reward.with_submission_extract_mode(mode))
     }
 
     fn preflight_trimul_reward(&self, reward: TrimulReward) -> Result<TrimulReward, CliError> {
@@ -2343,6 +2407,7 @@ fn train_with_launch_runtime_and_source_result(
                 &cfg,
                 &device,
                 &CountdownReward::default(),
+                &CountdownReward::default(),
                 &train,
                 &eval,
                 None,
@@ -2362,6 +2427,7 @@ fn train_with_launch_runtime_and_source_result(
                 &cfg,
                 &device,
                 &MathReward::default(),
+                &MathReward::default(),
                 &train,
                 &eval,
                 None,
@@ -2372,34 +2438,49 @@ fn train_with_launch_runtime_and_source_result(
             )
         }
         "trimul" => {
-            let (prompt_file_bytes, train, eval, reward, verifier_assets, verifier_identity) =
-                coordinate_distributed_result(
-                    launch_comm,
-                    "TriMul reward and dataset setup",
-                    (|| {
-                        let prompt_file_bytes = cfg.trimul_prompt_file_bytes()?;
-                        let prompt = cfg.trimul_prompt_text(&prompt_file_bytes)?;
-                        let (train, eval) = cfg.trimul_splits_from_prompt(&prompt);
-                        let verifier_assets = cfg.capture_trimul_verifier_assets()?;
-                        let reward = cfg.preflight_trimul_reward(
-                            cfg.build_trimul_reward_with_assets(verifier_assets.clone())?,
-                        )?;
-                        let verifier_identity =
-                            launch_verifier_identity(&reward, &verifier_assets)?;
-                        Ok((
-                            prompt_file_bytes,
-                            train,
-                            eval,
-                            reward,
-                            verifier_assets,
-                            verifier_identity,
-                        ))
-                    })(),
-                )?;
+            let (
+                prompt_file_bytes,
+                train,
+                eval,
+                reward,
+                eval_reward,
+                verifier_assets,
+                verifier_identity,
+            ) = coordinate_distributed_result(
+                launch_comm,
+                "TriMul reward and dataset setup",
+                (|| {
+                    let prompt_file_bytes = cfg.trimul_prompt_file_bytes()?;
+                    let prompt = cfg.trimul_prompt_text(&prompt_file_bytes)?;
+                    let (train, eval) = cfg.trimul_splits_from_prompt(&prompt);
+                    let verifier_assets = cfg.capture_trimul_verifier_assets()?;
+                    let reward = cfg.preflight_trimul_reward(
+                        cfg.build_trimul_reward_with_assets(verifier_assets.clone())?,
+                    )?;
+                    let eval_reward = if eval.is_empty() {
+                        None
+                    } else {
+                        Some(cfg.preflight_trimul_reward(
+                            cfg.build_trimul_held_out_reward_with_assets(verifier_assets.clone())?,
+                        )?)
+                    };
+                    let verifier_identity = launch_verifier_identity(&reward, &verifier_assets)?;
+                    Ok((
+                        prompt_file_bytes,
+                        train,
+                        eval,
+                        reward,
+                        eval_reward,
+                        verifier_assets,
+                        verifier_identity,
+                    ))
+                })(),
+            )?;
             run_training(
                 &cfg,
                 &device,
                 &reward,
+                eval_reward.as_ref().unwrap_or(&reward),
                 &train,
                 &eval,
                 Some(&prompt_file_bytes),
@@ -2424,6 +2505,7 @@ fn run_training<R: RewardFn>(
     cfg: &RunConfig,
     device: &Device,
     reward: &R,
+    eval_reward: &R,
     train: &[Sample<R::Target>],
     eval: &[Sample<R::Target>],
     rendered_prompt_bytes: Option<&[u8]>,
@@ -2431,7 +2513,10 @@ fn run_training<R: RewardFn>(
     verifier_identity: Option<&LaunchVerifierIdentity>,
     launch: &LaunchContext,
     launch_runtime: Option<LaunchRuntime>,
-) -> Result<(), CliError> {
+) -> Result<(), CliError>
+where
+    R::Target: Serialize,
+{
     let launch_attestor = SystemLaunchAttestor;
     let launch_attestor: Option<&dyn LaunchAttestor> = match cfg.launch_authentication {
         LaunchAuthenticationMode::LocalEphemeralV1 => None,
@@ -2441,6 +2526,7 @@ fn run_training<R: RewardFn>(
         cfg,
         device,
         reward,
+        eval_reward,
         train,
         eval,
         rendered_prompt_bytes,
@@ -2474,6 +2560,7 @@ fn run_training_with_loader<P, R>(
     cfg: &RunConfig,
     device: &Device,
     reward: &R,
+    eval_reward: &R,
     train: &[Sample<R::Target>],
     eval: &[Sample<R::Target>],
     rendered_prompt_bytes: Option<&[u8]>,
@@ -2492,6 +2579,7 @@ fn run_training_with_loader<P, R>(
 where
     P: CliTrainingPolicy,
     R: RewardFn,
+    R::Target: Serialize,
 {
     let tensor_parallel_plan = cfg.tensor_parallel_plan();
     let (tensor_parallel_runtime, distributed_launch_comm, distributed_comm) =
@@ -2650,9 +2738,9 @@ where
             &launch_sha256,
             candidate_signer,
         )?;
-        Ok((run, trainer))
+        Ok((run, trainer, launch_sha256))
     })();
-    let (run, mut trainer) = coordinate_distributed_result(
+    let (run, mut trainer, launch_sha256) = coordinate_distributed_result(
         launch_comm,
         "run directory and trainer setup",
         publication_setup,
@@ -2674,7 +2762,18 @@ where
     })?;
 
     if !eval.is_empty() {
-        let report = evaluate(&mut policy, reward, &tok, eval, &gen)?;
+        let report = evaluate_and_publish_report(
+            &mut policy,
+            eval_reward,
+            &tok,
+            eval,
+            &gen,
+            cfg,
+            &run,
+            &launch_sha256,
+            verifier_assets_identity.as_ref(),
+            launch_comm,
+        )?;
         info!(
             base = report.base_reward_mean,
             adapter = report.adapter_reward_mean,
@@ -2691,6 +2790,130 @@ where
         );
         Ok(())
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_and_publish_report<P, R>(
+    policy: &mut P,
+    reward: &R,
+    tokenizer: &dyn TokenizerLike,
+    eval: &[Sample<R::Target>],
+    gen: &GenConfig,
+    cfg: &RunConfig,
+    run: &RunDir,
+    launch_sha256: &str,
+    verifier_assets: Option<&ferrl::trimul::TrimulVerifierIdentity>,
+    launch_comm: Option<&dyn ferrl::Comm>,
+) -> Result<ferrl::EvalReport, CliError>
+where
+    P: Policy,
+    R: RewardFn,
+    R::Target: Serialize,
+{
+    let local = evaluate(policy, reward, tokenizer, eval, gen).map_err(CliError::from);
+    let report = coordinate_distributed_result(launch_comm, "held-out evaluation", local)?;
+    publish_eval_report(
+        cfg,
+        eval,
+        &report,
+        run,
+        launch_sha256,
+        verifier_assets,
+        launch_comm,
+    )?;
+    Ok(report)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_eval_report<T: Serialize>(
+    cfg: &RunConfig,
+    eval: &[Sample<T>],
+    report: &ferrl::EvalReport,
+    run: &RunDir,
+    launch_sha256: &str,
+    verifier_assets: Option<&ferrl::trimul::TrimulVerifierIdentity>,
+    launch_comm: Option<&dyn ferrl::Comm>,
+) -> Result<(), CliError> {
+    let (publishing_launch_sha256, launch_group_sha256) =
+        distributed_launch_binding(launch_sha256, launch_comm)?;
+    let eval_samples = serde_json::to_vec(eval)
+        .map_err(|error| CliError::msg(format!("serialize held-out samples: {error}")))?;
+    let split_key_contract = match cfg.task.as_str() {
+        "countdown" => "ferrl.countdown-split-key.sorted-multiset-target.v1",
+        "math" => "ferrl.math-split-key.normalized-prompt-answer.v1",
+        "trimul" => "ferrl.trimul-held-out-boundary.v1",
+        _ => "ferrl.unknown-split-key.v1",
+    };
+    let boundary = serde_json::to_vec(&(
+        "ferrl.eval-boundary.v1",
+        &cfg.task,
+        cfg.data.seed,
+        cfg.trimul.held_out_secret_seed,
+        &eval_samples,
+        verifier_assets,
+    ))
+    .map_err(|error| CliError::msg(format!("serialize held-out boundary: {error}")))?;
+    let durable = DurableEvalReport {
+        contract: "ferrl.eval-report.v2",
+        publishing_launch_sha256,
+        launch_group_sha256,
+        task: &cfg.task,
+        split_key_contract,
+        eval_samples_sha256: sha256_hex(&eval_samples),
+        evaluation_boundary_sha256: sha256_hex(&boundary),
+        report,
+    };
+    let consensus = serde_json::to_vec(&durable)
+        .map_err(|error| CliError::msg(format!("serialize held-out report: {error}")))?;
+    validate_launch_value_consensus("held-out evaluation report", &consensus, launch_comm)?;
+    let publication = if launch_comm.is_none_or(|comm| comm.rank() == 0) {
+        run.write_eval_report(&durable).map_err(CliError::from)
+    } else {
+        Ok(())
+    };
+    coordinate_distributed_result(
+        launch_comm,
+        "held-out evaluation report publication",
+        publication,
+    )
+}
+
+fn distributed_launch_binding(
+    local_launch_sha256: &str,
+    comm: Option<&dyn ferrl::Comm>,
+) -> Result<(String, String), CliError> {
+    let local = decode_lower_hex("launch payload SHA-256", local_launch_sha256, 32)?;
+    let Some(comm) = comm.filter(|comm| comm.world_size() > 1) else {
+        let group = serde_json::to_vec(&("ferrl.launch-group.v1", [local_launch_sha256]))
+            .map_err(|error| CliError::msg(format!("serialize launch group: {error}")))?;
+        return Ok((local_launch_sha256.to_owned(), sha256_hex(&group)));
+    };
+    let mut launches = Vec::with_capacity(comm.world_size());
+    for source_rank in 0..comm.world_size() {
+        let mut bytes = Vec::with_capacity(local.len());
+        for byte in &local {
+            let contribution = if comm.rank() == source_rank {
+                f64::from(*byte)
+            } else {
+                0.0
+            };
+            let value = comm.all_reduce_scalar_sum(contribution)?;
+            if !value.is_finite() || value.fract() != 0.0 || !(0.0..=255.0).contains(&value) {
+                return Err(CliError::msg("distributed launch digest byte is invalid"));
+            }
+            bytes.push(value as u8);
+        }
+        launches.push(
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+        );
+    }
+    let publishing = launches[0].clone();
+    let group = serde_json::to_vec(&("ferrl.launch-group.v1", &launches))
+        .map_err(|error| CliError::msg(format!("serialize launch group: {error}")))?;
+    Ok((publishing, sha256_hex(&group)))
 }
 
 fn train_with_optional_tensor_parallel<P, R>(
@@ -8801,6 +9024,172 @@ mod tests {
         assert_eq!(identities[1].data_parallel_rank, 1);
     }
 
+    fn eval_report_fixture(adapter_reward_mean: f32) -> ferrl::EvalReport {
+        ferrl::EvalReport {
+            n_prompts: 1,
+            group_size: 1,
+            base_reward_mean: 0.25,
+            adapter_reward_mean,
+            per_prompt: vec![ferrl::PromptEval {
+                base_mean: 0.25,
+                adapter_mean: adapter_reward_mean,
+            }],
+        }
+    }
+
+    #[test]
+    fn distributed_eval_report_binds_launch_group_and_publishes_immutably() {
+        let tmp = TestDir::new("distributed-eval-report-publication");
+        let roots = [tmp.path().join("rank0"), tmp.path().join("rank1")];
+        let cfg: RunConfig = serde_json::from_str(&countdown_train_config("")).unwrap();
+        let results = std::thread::scope(|scope| {
+            ferrl::LocalComm::world(2)
+                .into_iter()
+                .zip(roots.iter())
+                .map(|(comm, root)| {
+                    let cfg = &cfg;
+                    scope.spawn(move || {
+                        let run = RunDir::create(root, format!("run-rank{}", comm.rank())).unwrap();
+                        let samples = [Sample::new(
+                            "held out",
+                            CountdownProblem {
+                                numbers: vec![1, 2],
+                                target: 3,
+                            },
+                        )];
+                        let launch = if comm.rank() == 0 {
+                            "00".repeat(32)
+                        } else {
+                            "11".repeat(32)
+                        };
+                        publish_eval_report(
+                            cfg,
+                            &samples,
+                            &eval_report_fixture(0.75),
+                            &run,
+                            &launch,
+                            None,
+                            Some(&comm),
+                        )
+                        .map(|()| run)
+                        .map_err(|error| error.to_string())
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(results.iter().all(Result::is_ok), "{results:?}");
+        let rank_zero = results[0].as_ref().unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(rank_zero.eval_report_path()).unwrap()).unwrap();
+        assert_eq!(value["publishing_launch_sha256"], "00".repeat(32));
+        assert!(value["launch_group_sha256"].as_str().is_some());
+        assert!(!results[1].as_ref().unwrap().eval_report_path().exists());
+        assert!(rank_zero.write_eval_report(&value).is_err());
+    }
+
+    #[test]
+    fn distributed_eval_report_result_divergence_fails_in_lockstep() {
+        let tmp = TestDir::new("distributed-eval-report-divergence");
+        let cfg: RunConfig = serde_json::from_str(&countdown_train_config("")).unwrap();
+        let results = std::thread::scope(|scope| {
+            ferrl::LocalComm::world(2)
+                .into_iter()
+                .map(|comm| {
+                    let cfg = &cfg;
+                    let root = tmp.path().join(format!("rank{}", comm.rank()));
+                    scope.spawn(move || {
+                        let run =
+                            RunDir::create(&root, format!("run-rank{}", comm.rank())).unwrap();
+                        publish_eval_report(
+                            cfg,
+                            &[Sample::new(
+                                "held out",
+                                CountdownProblem {
+                                    numbers: vec![1, 2],
+                                    target: 3,
+                                },
+                            )],
+                            &eval_report_fixture(if comm.rank() == 0 { 0.75 } else { 0.5 }),
+                            &run,
+                            &if comm.rank() == 0 {
+                                "00".repeat(32)
+                            } else {
+                                "11".repeat(32)
+                            },
+                            None,
+                            Some(&comm),
+                        )
+                        .map_err(|error| error.to_string())
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            results.iter().all(|result| result
+                .as_ref()
+                .unwrap_err()
+                .contains("launch ranks disagree on held-out evaluation report")),
+            "{results:?}"
+        );
+    }
+
+    #[test]
+    fn distributed_eval_report_publication_failure_is_lockstep() {
+        let tmp = TestDir::new("distributed-eval-report-publication-failure");
+        let cfg: RunConfig = serde_json::from_str(&countdown_train_config("")).unwrap();
+        let results = std::thread::scope(|scope| {
+            ferrl::LocalComm::world(2)
+                .into_iter()
+                .map(|comm| {
+                    let cfg = &cfg;
+                    let root = tmp.path().join(format!("rank{}", comm.rank()));
+                    scope.spawn(move || {
+                        let run =
+                            RunDir::create(&root, format!("run-rank{}", comm.rank())).unwrap();
+                        if comm.rank() == 0 {
+                            run.write_eval_report(&serde_json::json!({ "occupied": true }))
+                                .unwrap();
+                        }
+                        publish_eval_report(
+                            cfg,
+                            &[Sample::new(
+                                "held out",
+                                CountdownProblem {
+                                    numbers: vec![1, 2],
+                                    target: 3,
+                                },
+                            )],
+                            &eval_report_fixture(0.75),
+                            &run,
+                            &if comm.rank() == 0 {
+                                "00".repeat(32)
+                            } else {
+                                "11".repeat(32)
+                            },
+                            None,
+                            Some(&comm),
+                        )
+                        .map_err(|error| error.to_string())
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(results[0].is_err(), "{results:?}");
+        assert!(results[1]
+            .as_ref()
+            .unwrap_err()
+            .contains("publication failed on a peer distributed rank"));
+    }
+
     #[test]
     fn distributed_launch_rejects_tokenizer_identity_drift() {
         let results = std::thread::scope(|scope| {
@@ -9405,6 +9794,101 @@ mod tests {
         }
     }
 
+    struct RankSelectiveEvalReward {
+        fail: bool,
+    }
+
+    impl RewardFn for RankSelectiveEvalReward {
+        type Target = ();
+
+        fn reward(
+            &self,
+            _sample: &Sample<()>,
+            _completion: &str,
+        ) -> Result<f32, ferrl::RewardError> {
+            if self.fail {
+                Err(ferrl::RewardError::msg("injected rank-local eval failure"))
+            } else {
+                Ok(0.5)
+            }
+        }
+    }
+
+    #[test]
+    fn distributed_evaluation_failure_aborts_before_report_collectives() {
+        let tmp = TestDir::new("distributed-evaluation-failure");
+        let model_dir = tmp.path().join("model");
+        write_generation_metadata_fixture(
+            &model_dir,
+            Some(serde_json::json!(3)),
+            &serde_json::json!(4),
+        );
+        let tokenizer = ferrl::HfTokenizer::from_file(model_dir.join("tokenizer.json")).unwrap();
+        let results = std::thread::scope(|scope| {
+            ferrl::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(5))
+                .into_iter()
+                .map(|comm| {
+                    let rank = comm.rank();
+                    let tokenizer = &tokenizer;
+                    let root = tmp.path().join(format!("rank-{rank}"));
+                    scope.spawn(move || {
+                        let cfg: RunConfig =
+                            serde_json::from_str(&countdown_train_config("")).unwrap();
+                        let run = RunDir::create(&root, format!("eval-rank{rank}")).unwrap();
+                        let mut policy = EosRecordingPolicy::new(Arc::new(Mutex::new(Vec::new())));
+                        let reward = RankSelectiveEvalReward { fail: rank == 1 };
+                        let gen = GenConfig {
+                            group_size: 1,
+                            max_new_tokens: 2,
+                            eos_token_id: Some(3),
+                            ..GenConfig::default()
+                        };
+                        let result = evaluate_and_publish_report(
+                            &mut policy,
+                            &reward,
+                            tokenizer,
+                            &[Sample::new("hello", ())],
+                            &gen,
+                            &cfg,
+                            &run,
+                            &if rank == 0 {
+                                "00".repeat(32)
+                            } else {
+                                "11".repeat(32)
+                            },
+                            None,
+                            Some(&comm),
+                        )
+                        .map_err(|error| error.to_string());
+                        (rank, result, run.eval_report_path())
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        for (rank, result, report_path) in results {
+            let error = result.unwrap_err();
+            if rank == 1 {
+                assert!(
+                    error.contains("injected rank-local eval failure"),
+                    "{error}"
+                );
+            } else {
+                assert!(
+                    error.contains("held-out evaluation failed on a peer distributed rank"),
+                    "{error}"
+                );
+            }
+            assert!(
+                !report_path.exists(),
+                "rank {rank} published an eval report"
+            );
+        }
+    }
+
     #[test]
     #[allow(clippy::cognitive_complexity)] // one production seam with exact persisted assertions
     fn local_ephemeral_production_training_needs_no_attestor_and_persists_signed_rows() {
@@ -9430,6 +9914,7 @@ mod tests {
         run_training_with_loader(
             &cfg,
             &Device::Cpu,
+            &EosSetupReward,
             &EosSetupReward,
             &[Sample::new("hello", ())],
             &[Sample::new("hello", ())],
@@ -9482,6 +9967,21 @@ mod tests {
         assert_eq!(launch.payload.model.resolved_eos_token_id, Some(3));
         assert_eq!(launch.payload.model.tokenizer_sha256, "11".repeat(32));
         assert_eq!(launch.payload.config.resolved["task"], "countdown");
+        let eval_report: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(run_root.join(RunDir::EVAL_REPORT_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(eval_report["contract"], "ferrl.eval-report.v2");
+        assert_eq!(
+            eval_report["publishing_launch_sha256"],
+            launch.payload_sha256
+        );
+        assert!(eval_report["launch_group_sha256"].as_str().is_some());
+        assert_eq!(
+            eval_report["split_key_contract"],
+            "ferrl.countdown-split-key.sorted-multiset-target.v1"
+        );
+        assert_eq!(eval_report["report"]["n_prompts"], 1);
         let candidate: CandidateRecord = serde_json::from_str(
             std::fs::read_to_string(run_root.join(RunDir::CANDIDATES_FILE))
                 .unwrap()
@@ -9524,6 +10024,7 @@ mod tests {
         let error = run_training_with_loader(
             &cfg,
             &Device::Cpu,
+            &EosSetupReward,
             &EosSetupReward,
             &[Sample::new("hello", ())],
             &[],
@@ -9585,6 +10086,7 @@ mod tests {
         let error = run_training_with_loader(
             &cfg,
             &Device::Cpu,
+            &EosSetupReward,
             &EosSetupReward,
             &[Sample::new("hello", ())],
             &[],
@@ -9649,6 +10151,7 @@ mod tests {
                         let result = run_training_with_loader(
                             &cfg,
                             &Device::Cpu,
+                            &EosSetupReward,
                             &EosSetupReward,
                             &[Sample::new("hello", ())],
                             &[],
@@ -9735,6 +10238,7 @@ mod tests {
                 &cfg,
                 &Device::Cpu,
                 &EosSetupReward,
+                &EosSetupReward,
                 &[Sample::new("hello", ())],
                 &[],
                 Some(b"exact prompt"),
@@ -9808,6 +10312,7 @@ mod tests {
                         let result = run_training_with_loader(
                             &cfg,
                             &Device::Cpu,
+                            &EosSetupReward,
                             &EosSetupReward,
                             &[Sample::new("hello", ())],
                             &[],
@@ -9892,6 +10397,7 @@ mod tests {
             &cfg,
             &Device::Cpu,
             &EosSetupReward,
+            &EosSetupReward,
             &[Sample::new("hello", ())],
             &[],
             None,
@@ -9961,6 +10467,7 @@ mod tests {
                         let result = run_training_with_loader(
                             &cfg,
                             &Device::Cpu,
+                            &EosSetupReward,
                             &EosSetupReward,
                             &[Sample::new("hello", ())],
                             &[],
@@ -10050,6 +10557,7 @@ mod tests {
                         let result = run_training_with_loader(
                             &cfg,
                             &Device::Cpu,
+                            &EosSetupReward,
                             &EosSetupReward,
                             &[Sample::new("hello", ())],
                             &[],
@@ -11556,7 +12064,8 @@ mod tests {
                           "prompt_path": "__PROMPT_PATH__",
                           "submission_extract_mode": "thinking_after_think",
                           "scratch_root": "/tmp", "scratch_max_bytes": 1048576,
-                          "secret_seed": 123, "wall_secs": 300,
+                          "secret_seed": 123, "held_out_secret_seed": 456,
+                          "wall_secs": 300,
                           "verifier_cuda_visible_devices": "1",
                           "verifier_cuda_device_pool": ["1", "2"],
                           "verifier_parallelism": 2,
@@ -11572,6 +12081,7 @@ mod tests {
             .replace("__PROMPT_PATH__", &prompt_path.display().to_string());
         let cfg: RunConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(cfg.task, "trimul");
+        assert_eq!(cfg.trimul.held_out_secret_seed, Some(456));
         assert_eq!((cfg.trimul.secret_seed, cfg.trimul.wall_secs), (123, 300));
         assert_eq!(cfg.trimul.scratch_max_bytes, 1_048_576);
         assert_eq!(
@@ -11616,6 +12126,99 @@ mod tests {
             .to_string();
 
         assert!(error.contains("trimul.secret_seed must be between 0 and 4294967295"));
+    }
+
+    #[test]
+    fn trimul_held_out_eval_requires_a_distinct_case_seed() {
+        let base: serde_json::Value =
+            serde_json::from_str(&trimul_score_test_config(4242)).unwrap();
+
+        let mut missing = base.clone();
+        missing["data"]["eval_n"] = serde_json::json!(1);
+        let cfg: RunConfig = serde_json::from_value(missing).unwrap();
+        let error = cfg
+            .validate_current_config_support()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("requires trimul.held_out_secret_seed"));
+
+        let mut reused = base;
+        reused["data"]["eval_n"] = serde_json::json!(1);
+        reused["trimul"]["held_out_secret_seed"] = serde_json::json!(4242);
+        let cfg: RunConfig = serde_json::from_value(reused).unwrap();
+        let error = cfg
+            .validate_current_config_support()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("differ from trimul.secret_seed"));
+
+        let mut ineffective: serde_json::Value =
+            serde_json::from_str(&trimul_score_test_config(4242)).unwrap();
+        ineffective["trimul"]["held_out_secret_seed"] = serde_json::json!(4243);
+        let cfg: RunConfig = serde_json::from_value(ineffective).unwrap();
+        let error = cfg
+            .validate_current_config_support()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("requires data.eval_n >= 1"));
+    }
+
+    #[test]
+    #[ignore = "needs the deployed sm_80 TriMul verifier assets; run in the GPU gate"]
+    fn trimul_held_out_builder_changes_protected_case_evidence() {
+        const CORRECT: &str = "```python\ndef custom_kernel(data):\n    from reference import ref_kernel\n    return ref_kernel(data)\n```";
+        let image = std::env::var("FERRL_TRIMUL_IMAGE").expect("set FERRL_TRIMUL_IMAGE");
+        let eval_dir = std::env::var("FERRL_TRIMUL_EVAL_DIR").expect("set FERRL_TRIMUL_EVAL_DIR");
+        let scratch = std::env::var("FERRL_TRIMUL_SCRATCH").expect("set FERRL_TRIMUL_SCRATCH");
+        let mut value: serde_json::Value =
+            serde_json::from_str(&trimul_score_test_config(123)).unwrap();
+        value["data"] = serde_json::json!({ "train_n": 1, "eval_n": 1, "seed": 7 });
+        value["trimul"]["held_out_secret_seed"] = serde_json::json!(456);
+        value["trimul"]["image"] = serde_json::json!(image);
+        value["trimul"]["eval_dir"] = serde_json::json!(eval_dir);
+        value["trimul"]["scratch_root"] = serde_json::json!(scratch);
+        let mut cfg: RunConfig = serde_json::from_value(value).unwrap();
+        cfg.validate_current_config_support().unwrap();
+        let assets = cfg.capture_trimul_verifier_assets().unwrap();
+        let training_reward = cfg
+            .build_trimul_reward_base_with_assets(assets.clone())
+            .unwrap();
+        let held_out_reward = cfg
+            .build_trimul_held_out_reward_with_assets(assets.clone())
+            .unwrap();
+        cfg.trimul.held_out_secret_seed = Some(cfg.trimul.secret_seed);
+        let collapsed_reward = cfg
+            .build_trimul_held_out_reward_with_assets(assets)
+            .unwrap();
+
+        let evaluate_specs = |reward: TrimulReward| {
+            let reward = cfg.preflight_trimul_reward(reward).unwrap();
+            let outcome = reward
+                .reward_group_detailed(&Sample::new("held out", ()), &[CORRECT.to_owned()])
+                .unwrap()
+                .remove(0);
+            outcome.metadata.unwrap()["verification_evidence"]["test_cases"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|case| case["spec"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+
+        let training_specs = evaluate_specs(training_reward);
+        let held_out_specs = evaluate_specs(held_out_reward);
+        let collapsed_specs = evaluate_specs(collapsed_reward);
+        let boundary_control = |candidate: &[String]| {
+            (candidate != training_specs)
+                .then_some(())
+                .ok_or("case schedule collapsed")
+        };
+        boundary_control(&held_out_specs).unwrap();
+        assert_eq!(training_specs, collapsed_specs);
+        assert_eq!(
+            boundary_control(&collapsed_specs),
+            Err("case schedule collapsed")
+        );
     }
 
     #[test]

@@ -52,9 +52,10 @@ use crate::policy::{validate_generated_rollout_semantics, GenConfig, Policy, Rol
 use crate::reward::{validate_reward_values, RewardError, RewardFn};
 use crate::sample::Sample;
 use crate::trainer::TokenizerLike;
+use serde::{Deserialize, Serialize};
 
 /// Per-prompt mean reward under the base model and under the adapter.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct PromptEval {
     /// Mean reward of `group_size` samples with the adapter disabled (base model).
     pub base_mean: f32,
@@ -63,7 +64,7 @@ pub struct PromptEval {
 }
 
 /// Aggregate result of an [`evaluate`] run.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EvalReport {
     /// Number of held-out prompts evaluated.
     pub n_prompts: usize,

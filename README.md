@@ -371,8 +371,13 @@ sampled completion is retained. TriMul's training reward is shaped for search de
 test-passing candidates whose eval reaches a benchmark marker get a correctness floor,
 and artifact acceptance still requires clean secret-seed re-verification of the
 launch-bound cases plus the fixed same-device paired decision through
-`ferrl trimul-artifact`. This is not the genuinely held-out TriMul case/reward boundary
-planned separately. The run-config schema accepts the explicit
+`ferrl trimul-artifact`. For training-time evaluation (`data.eval_n > 0`), configure
+a distinct in-range `trimul.held_out_secret_seed`; Ferrl evaluates through a separate
+verifier-backed reward and durably publishes the launch-bound result in
+`eval-report.json`. In data-parallel runs the report binds the ordered launch group
+and the exact rank-zero publishing launch; result consensus and immutable publication
+failure are coordinated across every rank. The artifact audit remains a separate acceptance boundary. The
+run-config schema accepts the explicit
 reward profile below. Omit `trimul.reward` to use these `trimul_shaped_v1` defaults,
 or tune the numeric values to adjust discovery density. Custom profiles must preserve
 the reward ladder: `format_extracted <= runnable` and

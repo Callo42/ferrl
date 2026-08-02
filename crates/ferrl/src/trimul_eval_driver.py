@@ -1134,6 +1134,11 @@ def _execute_checked(session, args):
     return bool(good), _bounded_message(message or ""), elapsed
 
 
+def _effective_case_spec(test):
+    """Canonical post-secret-derivation arguments actually sent to generate_input."""
+    return "; ".join(f"{key}: {test.args[key]}" for key in sorted(test.args))
+
+
 def _run_testing(logger, tests, isolation_tier, timing_metric, device_identity):
     if not tests:
         raise InfrastructureFailure("trusted test case set is empty")
@@ -1148,7 +1153,7 @@ def _run_testing(logger, tests, isolation_tier, timing_metric, device_identity):
             return False
         passed = True
         for index, test in enumerate(tests):
-            logger.log(f"test.{index}.spec", test.spec)
+            logger.log(f"test.{index}.spec", _effective_case_spec(test))
             try:
                 good, message, _ = _execute_checked(session, dict(test.args))
             except CandidateFailure:
@@ -1210,7 +1215,7 @@ def _run_benchmarking(logger, tests, isolation_tier, timing_metric, device_ident
             return False
         passed = True
         for index, test in enumerate(tests):
-            logger.log(f"benchmark.{index}.spec", test.spec)
+            logger.log(f"benchmark.{index}.spec", _effective_case_spec(test))
             try:
                 result = _run_benchmark_case(session, test)
             except CandidateFailure:

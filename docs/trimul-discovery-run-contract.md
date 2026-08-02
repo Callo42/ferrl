@@ -205,9 +205,14 @@ benchmark exit marker. A successful plausible benchmark adds a capped speed
 component. Implausibly fast benchmark timings still score zero. The artifact
 acceptance rule below stays strict: secret-seed re-verification of the launch-bound
 cases, fixed same-device paired benchmarking, and nine of eleven strict speedups over
-the freshly measured reference. This audit changes the case-generation seed but does
-not create the distinct TriMul case/reward boundary required for genuinely held-out
-evaluation.
+the freshly measured reference. This artifact audit remains separate from
+training-time held-out evaluation. When `data.eval_n > 0`, `ferrl train` requires
+`trimul.held_out_secret_seed` to be a different in-range case-generation seed,
+constructs a separate verifier-backed reward for those cases, and publishes the
+launch-bound result as `eval-report.json`. Data-parallel reports bind the ordered
+launch group plus the exact rank-zero publishing launch, and coordinate result
+consensus and immutable publication failure in lockstep. The artifact audit still derives its own
+seed and must not be relabeled as that held-out run.
 
 The run-config schema accepts the explicit reward profile below. Omit `trimul.reward`
 to use these `trimul_shaped_v1` defaults, or tune the numeric values to adjust
