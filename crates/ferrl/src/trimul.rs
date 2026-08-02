@@ -2243,14 +2243,12 @@ impl TrimulReward {
             0.0
         };
         let verification_evidence = if eval.verification.correct && eval.benchmark_exit == Some(0) {
-            Some(
-                validate_artifact_verification_evidence(
-                    &evidenced,
-                    self.test_cases.len(),
-                    self.benchmark_cases.len(),
-                )
-                .map_err(RewardError::msg)?,
+            validate_artifact_verification_evidence(
+                &evidenced,
+                self.test_cases.len(),
+                self.benchmark_cases.len(),
             )
+            .ok()
         } else {
             None
         };
