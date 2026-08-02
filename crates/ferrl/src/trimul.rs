@@ -2242,6 +2242,18 @@ impl TrimulReward {
         } else {
             0.0
         };
+        let verification_evidence = if eval.verification.correct && eval.benchmark_exit == Some(0) {
+            Some(
+                validate_artifact_verification_evidence(
+                    &evidenced,
+                    self.test_cases.len(),
+                    self.benchmark_cases.len(),
+                )
+                .map_err(RewardError::msg)?,
+            )
+        } else {
+            None
+        };
         let mut metadata = serde_json::json!({
             "task": "trimul",
             "reward_scheme": self.reward_profile.scheme.as_str(),
@@ -2270,7 +2282,7 @@ impl TrimulReward {
             "runtime_hardening": &evidenced.runtime_hardening,
             "runtime_hardening_evidence_sha256": &evidenced.runtime_hardening_evidence_sha256,
             "runtime_preflight_evidence_sha256": runtime_preflight_evidence_sha256,
-            "verification_evidence": &evidenced.verification,
+            "verification_evidence": verification_evidence,
             "timing_metric": timing_metric_for_tier(self.verifier_isolation_tier()),
             "candidate_attempt_sentinels": candidate_attempt_sentinels(&eval.output.stdout),
             "candidate_rejection_reason": log_value(
