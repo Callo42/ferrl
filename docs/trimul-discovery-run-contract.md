@@ -209,7 +209,9 @@ the freshly measured reference. This artifact audit remains separate from
 training-time held-out evaluation. When `data.eval_n > 0`, `ferrl train` requires
 `trimul.held_out_secret_seed` to be a different in-range case-generation seed,
 constructs a separate verifier-backed reward for those cases, and publishes the
-launch-bound result as `eval-report.json`. The artifact audit still derives its own
+launch-bound result as `eval-report.json`. Data-parallel reports bind the ordered
+launch group plus the exact rank-zero publishing launch, and coordinate result
+consensus and immutable publication failure in lockstep. The artifact audit still derives its own
 seed and must not be relabeled as that held-out run.
 
 The run-config schema accepts the explicit reward profile below. Omit `trimul.reward`

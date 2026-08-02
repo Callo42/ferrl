@@ -2270,6 +2270,7 @@ impl TrimulReward {
             "runtime_hardening": &evidenced.runtime_hardening,
             "runtime_hardening_evidence_sha256": &evidenced.runtime_hardening_evidence_sha256,
             "runtime_preflight_evidence_sha256": runtime_preflight_evidence_sha256,
+            "verification_evidence": &evidenced.verification,
             "timing_metric": timing_metric_for_tier(self.verifier_isolation_tier()),
             "candidate_attempt_sentinels": candidate_attempt_sentinels(&eval.output.stdout),
             "candidate_rejection_reason": log_value(

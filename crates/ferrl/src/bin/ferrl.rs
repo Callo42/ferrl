@@ -81,7 +81,8 @@ type Splits<T> = (Vec<Sample<T>>, Vec<Sample<T>>);
 #[derive(Debug, Serialize)]
 struct DurableEvalReport<'a> {
     contract: &'static str,
-    launch_sha256: &'a str,
+    publishing_launch_sha256: String,
+    launch_group_sha256: String,
     task: &'a str,
     split_key_contract: &'static str,
     eval_samples_sha256: String,
@@ -2799,6 +2800,8 @@ fn publish_eval_report<T: Serialize>(
     verifier_assets: Option<&ferrl::trimul::TrimulVerifierIdentity>,
     launch_comm: Option<&dyn ferrl::Comm>,
 ) -> Result<(), CliError> {
+    let (publishing_launch_sha256, launch_group_sha256) =
+        distributed_launch_binding(launch_sha256, launch_comm)?;
     let eval_samples = serde_json::to_vec(eval)
         .map_err(|error| CliError::msg(format!("serialize held-out samples: {error}")))?;
     let split_key_contract = match cfg.task.as_str() {
@@ -2817,8 +2820,9 @@ fn publish_eval_report<T: Serialize>(
     ))
     .map_err(|error| CliError::msg(format!("serialize held-out boundary: {error}")))?;
     let durable = DurableEvalReport {
-        contract: "ferrl.eval-report.v1",
-        launch_sha256,
+        contract: "ferrl.eval-report.v2",
+        publishing_launch_sha256,
+        launch_group_sha256,
         task: &cfg.task,
         split_key_contract,
         eval_samples_sha256: sha256_hex(&eval_samples),
@@ -2828,10 +2832,54 @@ fn publish_eval_report<T: Serialize>(
     let consensus = serde_json::to_vec(&durable)
         .map_err(|error| CliError::msg(format!("serialize held-out report: {error}")))?;
     validate_launch_value_consensus("held-out evaluation report", &consensus, launch_comm)?;
-    if launch_comm.is_none_or(|comm| comm.rank() == 0) {
-        run.write_eval_report(&durable)?;
+    let publication = if launch_comm.is_none_or(|comm| comm.rank() == 0) {
+        run.write_eval_report(&durable).map_err(CliError::from)
+    } else {
+        Ok(())
+    };
+    coordinate_distributed_result(
+        launch_comm,
+        "held-out evaluation report publication",
+        publication,
+    )
+}
+
+fn distributed_launch_binding(
+    local_launch_sha256: &str,
+    comm: Option<&dyn ferrl::Comm>,
+) -> Result<(String, String), CliError> {
+    let local = decode_lower_hex("launch payload SHA-256", local_launch_sha256, 32)?;
+    let Some(comm) = comm.filter(|comm| comm.world_size() > 1) else {
+        let group = serde_json::to_vec(&("ferrl.launch-group.v1", [local_launch_sha256]))
+            .map_err(|error| CliError::msg(format!("serialize launch group: {error}")))?;
+        return Ok((local_launch_sha256.to_owned(), sha256_hex(&group)));
+    };
+    let mut launches = Vec::with_capacity(comm.world_size());
+    for source_rank in 0..comm.world_size() {
+        let mut bytes = Vec::with_capacity(local.len());
+        for byte in &local {
+            let contribution = if comm.rank() == source_rank {
+                f64::from(*byte)
+            } else {
+                0.0
+            };
+            let value = comm.all_reduce_scalar_sum(contribution)?;
+            if !value.is_finite() || value.fract() != 0.0 || !(0.0..=255.0).contains(&value) {
+                return Err(CliError::msg("distributed launch digest byte is invalid"));
+            }
+            bytes.push(value as u8);
+        }
+        launches.push(
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+        );
     }
-    Ok(())
+    let publishing = launches[0].clone();
+    let group = serde_json::to_vec(&("ferrl.launch-group.v1", &launches))
+        .map_err(|error| CliError::msg(format!("serialize launch group: {error}")))?;
+    Ok((publishing, sha256_hex(&group)))
 }
 
 fn train_with_optional_tensor_parallel<P, R>(
@@ -8942,6 +8990,172 @@ mod tests {
         assert_eq!(identities[1].data_parallel_rank, 1);
     }
 
+    fn eval_report_fixture(adapter_reward_mean: f32) -> ferrl::EvalReport {
+        ferrl::EvalReport {
+            n_prompts: 1,
+            group_size: 1,
+            base_reward_mean: 0.25,
+            adapter_reward_mean,
+            per_prompt: vec![ferrl::PromptEval {
+                base_mean: 0.25,
+                adapter_mean: adapter_reward_mean,
+            }],
+        }
+    }
+
+    #[test]
+    fn distributed_eval_report_binds_launch_group_and_publishes_immutably() {
+        let tmp = TestDir::new("distributed-eval-report-publication");
+        let roots = [tmp.path().join("rank0"), tmp.path().join("rank1")];
+        let cfg: RunConfig = serde_json::from_str(&countdown_train_config("")).unwrap();
+        let results = std::thread::scope(|scope| {
+            ferrl::LocalComm::world(2)
+                .into_iter()
+                .zip(roots.iter())
+                .map(|(comm, root)| {
+                    let cfg = &cfg;
+                    scope.spawn(move || {
+                        let run = RunDir::create(root, format!("run-rank{}", comm.rank())).unwrap();
+                        let samples = [Sample::new(
+                            "held out",
+                            CountdownProblem {
+                                numbers: vec![1, 2],
+                                target: 3,
+                            },
+                        )];
+                        let launch = if comm.rank() == 0 {
+                            "00".repeat(32)
+                        } else {
+                            "11".repeat(32)
+                        };
+                        publish_eval_report(
+                            cfg,
+                            &samples,
+                            &eval_report_fixture(0.75),
+                            &run,
+                            &launch,
+                            None,
+                            Some(&comm),
+                        )
+                        .map(|()| run)
+                        .map_err(|error| error.to_string())
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(results.iter().all(Result::is_ok), "{results:?}");
+        let rank_zero = results[0].as_ref().unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(rank_zero.eval_report_path()).unwrap()).unwrap();
+        assert_eq!(value["publishing_launch_sha256"], "00".repeat(32));
+        assert!(value["launch_group_sha256"].as_str().is_some());
+        assert!(!results[1].as_ref().unwrap().eval_report_path().exists());
+        assert!(rank_zero.write_eval_report(&value).is_err());
+    }
+
+    #[test]
+    fn distributed_eval_report_result_divergence_fails_in_lockstep() {
+        let tmp = TestDir::new("distributed-eval-report-divergence");
+        let cfg: RunConfig = serde_json::from_str(&countdown_train_config("")).unwrap();
+        let results = std::thread::scope(|scope| {
+            ferrl::LocalComm::world(2)
+                .into_iter()
+                .map(|comm| {
+                    let cfg = &cfg;
+                    let root = tmp.path().join(format!("rank{}", comm.rank()));
+                    scope.spawn(move || {
+                        let run =
+                            RunDir::create(&root, format!("run-rank{}", comm.rank())).unwrap();
+                        publish_eval_report(
+                            cfg,
+                            &[Sample::new(
+                                "held out",
+                                CountdownProblem {
+                                    numbers: vec![1, 2],
+                                    target: 3,
+                                },
+                            )],
+                            &eval_report_fixture(if comm.rank() == 0 { 0.75 } else { 0.5 }),
+                            &run,
+                            &if comm.rank() == 0 {
+                                "00".repeat(32)
+                            } else {
+                                "11".repeat(32)
+                            },
+                            None,
+                            Some(&comm),
+                        )
+                        .map_err(|error| error.to_string())
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            results.iter().all(|result| result
+                .as_ref()
+                .unwrap_err()
+                .contains("launch ranks disagree on held-out evaluation report")),
+            "{results:?}"
+        );
+    }
+
+    #[test]
+    fn distributed_eval_report_publication_failure_is_lockstep() {
+        let tmp = TestDir::new("distributed-eval-report-publication-failure");
+        let cfg: RunConfig = serde_json::from_str(&countdown_train_config("")).unwrap();
+        let results = std::thread::scope(|scope| {
+            ferrl::LocalComm::world(2)
+                .into_iter()
+                .map(|comm| {
+                    let cfg = &cfg;
+                    let root = tmp.path().join(format!("rank{}", comm.rank()));
+                    scope.spawn(move || {
+                        let run =
+                            RunDir::create(&root, format!("run-rank{}", comm.rank())).unwrap();
+                        if comm.rank() == 0 {
+                            run.write_eval_report(&serde_json::json!({ "occupied": true }))
+                                .unwrap();
+                        }
+                        publish_eval_report(
+                            cfg,
+                            &[Sample::new(
+                                "held out",
+                                CountdownProblem {
+                                    numbers: vec![1, 2],
+                                    target: 3,
+                                },
+                            )],
+                            &eval_report_fixture(0.75),
+                            &run,
+                            &if comm.rank() == 0 {
+                                "00".repeat(32)
+                            } else {
+                                "11".repeat(32)
+                            },
+                            None,
+                            Some(&comm),
+                        )
+                        .map_err(|error| error.to_string())
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(results[0].is_err(), "{results:?}");
+        assert!(results[1]
+            .as_ref()
+            .unwrap_err()
+            .contains("publication failed on a peer distributed rank"));
+    }
+
     #[test]
     fn distributed_launch_rejects_tokenizer_identity_drift() {
         let results = std::thread::scope(|scope| {
@@ -9628,8 +9842,12 @@ mod tests {
             &std::fs::read(run_root.join(RunDir::EVAL_REPORT_FILE)).unwrap(),
         )
         .unwrap();
-        assert_eq!(eval_report["contract"], "ferrl.eval-report.v1");
-        assert_eq!(eval_report["launch_sha256"], launch.payload_sha256);
+        assert_eq!(eval_report["contract"], "ferrl.eval-report.v2");
+        assert_eq!(
+            eval_report["publishing_launch_sha256"],
+            launch.payload_sha256
+        );
+        assert!(eval_report["launch_group_sha256"].as_str().is_some());
         assert_eq!(
             eval_report["split_key_contract"],
             "ferrl.countdown-split-key.sorted-multiset-target.v1"
@@ -11814,6 +12032,64 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("requires data.eval_n >= 1"));
+    }
+
+    #[test]
+    #[ignore = "needs the deployed sm_80 TriMul verifier assets; run in the GPU gate"]
+    fn trimul_held_out_builder_changes_protected_case_evidence() {
+        const CORRECT: &str = "```python\ndef custom_kernel(data):\n    from reference import ref_kernel\n    return ref_kernel(data)\n```";
+        let image = std::env::var("FERRL_TRIMUL_IMAGE").expect("set FERRL_TRIMUL_IMAGE");
+        let eval_dir = std::env::var("FERRL_TRIMUL_EVAL_DIR").expect("set FERRL_TRIMUL_EVAL_DIR");
+        let scratch = std::env::var("FERRL_TRIMUL_SCRATCH").expect("set FERRL_TRIMUL_SCRATCH");
+        let mut value: serde_json::Value =
+            serde_json::from_str(&trimul_score_test_config(123)).unwrap();
+        value["data"] = serde_json::json!({ "train_n": 1, "eval_n": 1, "seed": 7 });
+        value["trimul"]["held_out_secret_seed"] = serde_json::json!(456);
+        value["trimul"]["image"] = serde_json::json!(image);
+        value["trimul"]["eval_dir"] = serde_json::json!(eval_dir);
+        value["trimul"]["scratch_root"] = serde_json::json!(scratch);
+        let mut cfg: RunConfig = serde_json::from_value(value).unwrap();
+        cfg.validate_current_config_support().unwrap();
+        let assets = cfg.capture_trimul_verifier_assets().unwrap();
+        let training_reward = cfg
+            .build_trimul_reward_base_with_assets(assets.clone())
+            .unwrap();
+        let held_out_reward = cfg
+            .build_trimul_held_out_reward_with_assets(assets.clone())
+            .unwrap();
+        cfg.trimul.held_out_secret_seed = Some(cfg.trimul.secret_seed);
+        let collapsed_reward = cfg
+            .build_trimul_held_out_reward_with_assets(assets)
+            .unwrap();
+
+        let evaluate_specs = |reward: TrimulReward| {
+            let reward = cfg.preflight_trimul_reward(reward).unwrap();
+            let outcome = reward
+                .reward_group_detailed(&Sample::new("held out", ()), &[CORRECT.to_owned()])
+                .unwrap()
+                .remove(0);
+            outcome.metadata.unwrap()["verification_evidence"]["test_cases"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|case| case["spec"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+
+        let training_specs = evaluate_specs(training_reward);
+        let held_out_specs = evaluate_specs(held_out_reward);
+        let collapsed_specs = evaluate_specs(collapsed_reward);
+        let boundary_control = |candidate: &[String]| {
+            (candidate != training_specs)
+                .then_some(())
+                .ok_or("case schedule collapsed")
+        };
+        boundary_control(&held_out_specs).unwrap();
+        assert_eq!(training_specs, collapsed_specs);
+        assert_eq!(
+            boundary_control(&collapsed_specs),
+            Err("case schedule collapsed")
+        );
     }
 
     #[test]
