@@ -2641,6 +2641,13 @@ where
     let (mut policy, tok, tcfg, policy_identity, checkpoint_policy_sha256) =
         coordinate_distributed_result(launch_comm, "model and EOS setup", model_setup)?;
     validate_resolved_eos_consensus(tcfg.eos_token_id, launch_comm)?;
+    validate_data_parallel_policy_preflight(
+        &policy,
+        &policy_identity,
+        distributed_launch_comm
+            .as_ref()
+            .map(|comm| comm as &dyn ferrl::Comm),
+    )?;
     let prompt_sha256 = rendered_prompt_bytes.map(sha256_hex);
     let verifier_assets_identity = verifier_assets.map(|assets| assets.identity().clone());
     if (verifier_assets.is_some() || verifier_identity.is_some()) != (cfg.task == "trimul")
@@ -3024,6 +3031,25 @@ impl ferrl::Comm for SharedComm {
         self.world_size
     }
 
+    fn validate_all_reduce_sum(
+        &self,
+        tensors: &[candle_core::Tensor],
+    ) -> Result<(), ferrl::CommError> {
+        // Keep the guard outside the unwind boundary: peer-error coordination still needs this
+        // wrapper after a rank-local backend validator panics.
+        let comm = self.inner.lock().map_err(|_| {
+            ferrl::CommError::Poisoned("shared launch communicator mutex was poisoned".into())
+        })?;
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            comm.validate_all_reduce_sum(tensors)
+        }))
+        .unwrap_or_else(|_| {
+            Err(ferrl::CommError::Mismatch(
+                "backend tensor capability validator panicked".into(),
+            ))
+        })
+    }
+
     fn all_reduce_sum(
         &self,
         tensors: &mut Vec<candle_core::Tensor>,
@@ -3190,6 +3216,60 @@ fn validate_launch_value_consensus(
         Ok(())
     };
     coordinate_distributed_result(Some(comm), "launch provenance consensus", local)
+}
+
+fn validate_data_parallel_policy_preflight<P: Policy>(
+    policy: &P,
+    identity: &ferrl::PolicyLoadIdentity,
+    comm: Option<&dyn ferrl::Comm>,
+) -> Result<(), CliError> {
+    let Some(comm) = comm.filter(|comm| comm.world_size() > 1) else {
+        return Ok(());
+    };
+    let local = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let vars = policy.trainable_vars();
+        let schema = vars
+            .iter()
+            .map(|var| {
+                let tensor = var.as_tensor();
+                (tensor.dims().to_vec(), tensor.dtype().as_str().to_owned())
+            })
+            .collect::<Vec<_>>();
+        let contract = serde_json::to_vec(&(
+            "ferrl.dp-policy-preflight.v1",
+            identity.policy_sha256.as_str(),
+            identity.model_family,
+            &schema,
+        ))
+        .map_err(|error| CliError::msg(format!("serialize DP policy preflight: {error}")))?;
+        let tensors = vars
+            .iter()
+            .map(|var| var.as_tensor().clone())
+            .collect::<Vec<_>>();
+        Ok((contract, tensors))
+    }))
+    .unwrap_or_else(|_| {
+        Err(CliError::msg(
+            "policy panicked while exposing the DP trainable tensor schema",
+        ))
+    });
+    let (contract, tensors) =
+        coordinate_distributed_result(Some(comm), "DP policy schema observation", local)?;
+    validate_launch_value_consensus(
+        "DP frozen model and trainable tensor schema",
+        &contract,
+        Some(comm),
+    )?;
+    let local = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        comm.validate_all_reduce_sum(&tensors)
+            .map_err(CliError::from)
+    }))
+    .unwrap_or_else(|_| {
+        Err(CliError::msg(
+            "DP backend tensor capability validator panicked",
+        ))
+    });
+    coordinate_distributed_result(Some(comm), "DP backend tensor capability preflight", local)
 }
 
 fn validate_launch_config_consensus(
@@ -9677,18 +9757,36 @@ mod tests {
 
     struct EosRecordingPolicy {
         logp: Var,
+        preflight_vars: Vec<Var>,
         enabled: bool,
         seen: Arc<Mutex<Vec<Option<u32>>>>,
+        panic_on_trainable_vars: bool,
     }
 
     impl EosRecordingPolicy {
         fn new(seen: Arc<Mutex<Vec<Option<u32>>>>) -> Self {
-            let logp = Var::from_tensor(&Tensor::zeros((2, 2), DType::F32, &Device::Cpu).unwrap())
-                .unwrap();
+            Self::new_with_shape(seen, (2, 2))
+        }
+
+        fn new_with_shape(seen: Arc<Mutex<Vec<Option<u32>>>>, shape: (usize, usize)) -> Self {
+            Self::new_with_trainable_schema(seen, vec![(vec![shape.0, shape.1], DType::F32)])
+        }
+
+        fn new_with_trainable_schema(
+            seen: Arc<Mutex<Vec<Option<u32>>>>,
+            schema: Vec<(Vec<usize>, DType)>,
+        ) -> Self {
+            let mut vars = schema
+                .into_iter()
+                .map(|(shape, dtype)| Var::zeros(shape, dtype, &Device::Cpu).unwrap())
+                .collect::<Vec<_>>();
+            let logp = vars.remove(0);
             Self {
                 logp,
+                preflight_vars: vars,
                 enabled: true,
                 seen,
+                panic_on_trainable_vars: false,
             }
         }
     }
@@ -9733,7 +9831,13 @@ mod tests {
         }
 
         fn trainable_vars(&self) -> Vec<Var> {
-            vec![self.logp.clone()]
+            assert!(
+                !self.panic_on_trainable_vars,
+                "injected trainable schema panic"
+            );
+            std::iter::once(self.logp.clone())
+                .chain(self.preflight_vars.iter().cloned())
+                .collect()
         }
 
         fn sampler_state(&self) -> CandleResult<Vec<u8>> {
@@ -9774,6 +9878,67 @@ mod tests {
         }
     }
 
+    type TensorMetadata = (Vec<usize>, String);
+    type ObservedPreflightPayloads = Arc<Mutex<Vec<(usize, Vec<TensorMetadata>)>>>;
+
+    #[derive(Debug)]
+    struct RejectingPolicyPreflightComm<C> {
+        inner: C,
+        reject: bool,
+        panic: bool,
+        validator_calls: Arc<std::sync::atomic::AtomicUsize>,
+        payload_calls: Arc<std::sync::atomic::AtomicUsize>,
+        expected_preflight_payload: Vec<TensorMetadata>,
+        observed_preflight_payloads: ObservedPreflightPayloads,
+    }
+
+    impl<C: ferrl::Comm> ferrl::Comm for RejectingPolicyPreflightComm<C> {
+        fn rank(&self) -> usize {
+            self.inner.rank()
+        }
+
+        fn world_size(&self) -> usize {
+            self.inner.world_size()
+        }
+
+        fn validate_all_reduce_sum(&self, tensors: &[Tensor]) -> Result<(), ferrl::CommError> {
+            let observed = tensors
+                .iter()
+                .map(|tensor| (tensor.dims().to_vec(), tensor.dtype().as_str().to_owned()))
+                .collect::<Vec<_>>();
+            self.observed_preflight_payloads
+                .lock()
+                .unwrap()
+                .push((self.rank(), observed.clone()));
+            if observed != self.expected_preflight_payload {
+                return Err(ferrl::CommError::Mismatch(format!(
+                    "test observed DP preflight payload mismatch: expected {:?}, got {:?}",
+                    self.expected_preflight_payload, observed
+                )));
+            }
+            self.validator_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert!(!self.panic, "injected DP backend validator panic");
+            if self.reject {
+                Err(ferrl::CommError::Mismatch(
+                    "injected DP backend tensor rejection".into(),
+                ))
+            } else {
+                self.inner.validate_all_reduce_sum(tensors)
+            }
+        }
+
+        fn all_reduce_sum(&self, tensors: &mut Vec<Tensor>) -> Result<(), ferrl::CommError> {
+            self.payload_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.all_reduce_sum(tensors)
+        }
+
+        fn all_reduce_scalar_sum(&self, value: f64) -> Result<f64, ferrl::CommError> {
+            self.inner.all_reduce_scalar_sum(value)
+        }
+    }
+
     impl CliTrainingPolicy for EosRecordingPolicy {
         fn supports_cli_tensor_parallel(&self) -> bool {
             false
@@ -9810,6 +9975,203 @@ mod tests {
                 Err(ferrl::RewardError::msg("injected rank-local eval failure"))
             } else {
                 Ok(0.5)
+            }
+        }
+    }
+
+    fn dp_preflight_schema(failure: &str, rank: usize) -> Vec<(Vec<usize>, DType)> {
+        let first = (vec![2, 2], DType::F32);
+        let second = (vec![3], DType::F64);
+        let third = (vec![1, 4], DType::BF16);
+        match (failure, rank) {
+            ("schema-count", 1) => vec![first, second],
+            ("schema-order", 1) => vec![first, third, second],
+            ("schema-shape", 1) => vec![first, (vec![4], DType::F64), third],
+            ("schema-dtype", 1) => vec![first, (vec![3], DType::F16), third],
+            _ => vec![first, second, third],
+        }
+    }
+
+    fn dp_preflight_tensor_metadata(schema: &[(Vec<usize>, DType)]) -> Vec<TensorMetadata> {
+        schema
+            .iter()
+            .map(|(shape, dtype)| (shape.clone(), dtype.as_str().to_owned()))
+            .collect()
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // one production-path table spans every preflight failure boundary
+    fn production_dp_policy_preflight_stops_before_payload_rollout_or_publication() {
+        for failure in [
+            "model",
+            "schema-count",
+            "schema-order",
+            "schema-shape",
+            "schema-dtype",
+            "policy-panic",
+            "backend-reject",
+            "backend-panic",
+        ] {
+            let tmp = TestDir::new(&format!("production-dp-policy-preflight-{failure}"));
+            let model_dir = tmp.path().join("model");
+            write_generation_metadata_fixture(
+                &model_dir,
+                Some(serde_json::json!(3)),
+                &serde_json::json!(4),
+            );
+            let validator_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let payload_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let expected_preflight_payload =
+                dp_preflight_tensor_metadata(&dp_preflight_schema("baseline", 0));
+            let observed_preflight_payloads = Arc::new(Mutex::new(Vec::new()));
+            let results = std::thread::scope(|scope| {
+                ferrl::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(5))
+                    .into_iter()
+                    .map(|comm| {
+                        let rank = comm.rank();
+                        let model_dir = model_dir.clone();
+                        let out_dir = tmp.path().join(format!("rank-{rank}-runs"));
+                        let validator_calls = Arc::clone(&validator_calls);
+                        let payload_calls = Arc::clone(&payload_calls);
+                        let expected_preflight_payload = expected_preflight_payload.clone();
+                        let observed_preflight_payloads = Arc::clone(&observed_preflight_payloads);
+                        scope.spawn(move || {
+                            let mut value: serde_json::Value =
+                                serde_json::from_str(&countdown_train_config("")).unwrap();
+                            value["model_dir"] = serde_json::json!(model_dir);
+                            value["out_dir"] = serde_json::json!(&out_dir);
+                            value["distributed"] = serde_json::json!({ "enabled": true });
+                            value["trainer"]["max_new_tokens"] = serde_json::json!(2);
+                            let cfg: RunConfig = serde_json::from_value(value).unwrap();
+                            let launch =
+                                launch_context_for_test(&cfg, format!("test-rank{rank}"), rank, 2);
+                            let seen = Arc::new(Mutex::new(Vec::new()));
+                            let loader_seen = Arc::clone(&seen);
+                            let result = run_training_with_loader(
+                                &cfg,
+                                &Device::Cpu,
+                                &EosSetupReward,
+                                &EosSetupReward,
+                                &[Sample::new("hello", ())],
+                                &[],
+                                None,
+                                None,
+                                None,
+                                &launch,
+                                Some(LaunchRuntime {
+                                    device: Device::Cpu,
+                                    comm: Box::new(RejectingPolicyPreflightComm {
+                                        inner: comm,
+                                        reject: failure == "backend-reject" && rank == 1,
+                                        panic: failure == "backend-panic" && rank == 1,
+                                        validator_calls,
+                                        payload_calls,
+                                        expected_preflight_payload,
+                                        observed_preflight_payloads,
+                                    }),
+                                }),
+                                None,
+                                move |model_dir, _device, _opts| {
+                                    let tokenizer = ferrl::HfTokenizer::from_file(
+                                        model_dir.join("tokenizer.json"),
+                                    )
+                                    .map_err(|error| CliError::msg(error.to_string()))?;
+                                    let mut policy = EosRecordingPolicy::new_with_trainable_schema(
+                                        loader_seen,
+                                        dp_preflight_schema(failure, rank),
+                                    );
+                                    policy.panic_on_trainable_vars =
+                                        failure == "policy-panic" && rank == 1;
+                                    let mut identity = test_policy_identity();
+                                    if failure == "model" && rank == 1 {
+                                        identity.policy_sha256 = "22".repeat(32);
+                                    }
+                                    Ok((policy, tokenizer, identity))
+                                },
+                            );
+                            let rollout_calls = seen.lock().unwrap().len();
+                            (
+                                rank,
+                                result.map_err(|error| error.to_string()),
+                                rollout_calls,
+                                out_dir,
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|handle| handle.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+
+            for (rank, result, rollout_calls, out_dir) in results {
+                let error = result.unwrap_err();
+                match failure {
+                    "model"
+                    | "schema-count"
+                    | "schema-order"
+                    | "schema-shape"
+                    | "schema-dtype" => assert!(
+                        error.contains("DP frozen model and trainable tensor schema"),
+                        "{failure} rank {rank}: {error}"
+                    ),
+                    "policy-panic" if rank == 1 => assert!(
+                        error.contains("policy panicked while exposing"),
+                        "{failure} rank {rank}: {error}"
+                    ),
+                    "policy-panic" => assert!(
+                        error.contains("DP policy schema observation failed on a peer"),
+                        "{failure} rank {rank}: {error}"
+                    ),
+                    "backend-reject" if rank == 1 => assert!(
+                        error.contains("injected DP backend tensor rejection"),
+                        "{failure} rank {rank}: {error}"
+                    ),
+                    "backend-panic" if rank == 1 => assert!(
+                        error.contains("backend tensor capability validator panicked"),
+                        "{failure} rank {rank}: {error}"
+                    ),
+                    "backend-reject" | "backend-panic" => assert!(
+                        error.contains(
+                            "DP backend tensor capability preflight failed on a peer distributed rank"
+                        ),
+                        "{failure} rank {rank}: {error}"
+                    ),
+                    _ => unreachable!(),
+                }
+                assert_eq!(rollout_calls, 0, "{failure} rank {rank} reached rollout");
+                assert!(
+                    !out_dir.exists(),
+                    "{failure} rank {rank} published a run directory"
+                );
+            }
+            let expected_validator_calls = usize::from(failure.starts_with("backend-")) * 2;
+            assert_eq!(
+                validator_calls.load(std::sync::atomic::Ordering::SeqCst),
+                expected_validator_calls,
+                "{failure} validator call count"
+            );
+            assert_eq!(
+                payload_calls.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "{failure} entered a tensor payload collective"
+            );
+            let mut observed = observed_preflight_payloads.lock().unwrap().clone();
+            observed.sort_by_key(|(rank, _)| *rank);
+            if failure.starts_with("backend-") {
+                assert_eq!(
+                    observed,
+                    vec![
+                        (0, expected_preflight_payload.clone()),
+                        (1, expected_preflight_payload.clone()),
+                    ],
+                    "{failure} backend validator received the complete ordered tensor payload before its injected failure"
+                );
+            } else {
+                assert!(
+                    observed.is_empty(),
+                    "{failure} reached backend validation after a failed consensus: {observed:?}"
+                );
             }
         }
     }
