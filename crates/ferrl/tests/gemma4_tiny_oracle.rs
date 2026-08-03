@@ -23,6 +23,13 @@ use std::path::PathBuf;
 /// tight enough that a mask, `RoPE`, norm, or residual-order bug should fail.
 const ORACLE_TOL: f32 = 3e-4;
 
+/// Permanent non-vacuity floors for two independent, load-compatible semantic
+/// mutations over the exact official fixture weights.  These require remote
+/// calibration before merge but remain more than an order of magnitude above
+/// the honest forward envelope.
+const SLIDING_PERTURBATION_FLOOR: f32 = 5e-3;
+const NORM_PERTURBATION_FLOOR: f32 = 1e-2;
+
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny_gemma4")
 }
@@ -77,9 +84,8 @@ fn input_ids(case: &serde_json::Value, key: &str) -> Tensor {
     Tensor::from_vec(flat, (b, l), &Device::Cpu).unwrap()
 }
 
-fn load_model() -> (Gemma4Config, Gemma4GradModel) {
+fn load_model_from_config(cfg: Gemma4Config) -> (Gemma4Config, Gemma4GradModel) {
     let dir = fixture_dir();
-    let cfg = Gemma4Config::from_json_file(dir.join("config.json")).unwrap();
     let vb = varbuilder_from_pretrained(&dir, DType::F32, &Device::Cpu).unwrap();
     let mut model = Gemma4GradModel::load_with_targets(
         &cfg,
@@ -92,6 +98,18 @@ fn load_model() -> (Gemma4Config, Gemma4GradModel) {
     .unwrap();
     model.set_adapter_enabled(false);
     (cfg, model)
+}
+
+fn load_model() -> (Gemma4Config, Gemma4GradModel) {
+    let cfg = Gemma4Config::from_json_file(fixture_dir().join("config.json")).unwrap();
+    load_model_from_config(cfg)
+}
+
+fn perturbed_config(mutator: impl FnOnce(&mut serde_json::Value)) -> Gemma4Config {
+    let raw = std::fs::read_to_string(fixture_dir().join("config.json")).unwrap();
+    let mut value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    mutator(&mut value);
+    Gemma4Config::from_json_str(&value.to_string()).unwrap()
 }
 
 fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
@@ -162,4 +180,59 @@ fn uncached_forward_matches_transformers_reference_logits() {
             "{case_name}: degenerate oracle logits ({scale})"
         );
     }
+}
+
+#[test]
+fn wrong_sliding_window_is_invisible_early_and_caught_at_later_positions() {
+    // Widen only the first layer's window while keeping the exact official
+    // weights, RoPE, full-attention layer, and golden fixed.  The first three
+    // positions have no token old enough to evict and therefore must retain
+    // honest parity; position 3 onward crosses the committed window of three
+    // and must expose a decisive mask-semantic difference.
+    let g = golden();
+    let cfg = perturbed_config(|value| {
+        value["text_config"]["sliding_window"] = serde_json::json!(32);
+    });
+    let (_cfg, model) = load_model_from_config(cfg);
+    let case = &g["cases"]["full_b2"];
+    let ids = input_ids(case, "input_ids");
+    let want = tensor_from(case, "logits", (2, 7, 16));
+    let got = model.forward(&ids).unwrap();
+
+    let early_got = got.narrow(1, 0, 3).unwrap();
+    let early_want = want.narrow(1, 0, 3).unwrap();
+    let early_diff = max_abs_diff(&early_got, &early_want);
+    assert!(
+        early_diff <= ORACLE_TOL,
+        "pre-window prefix changed under sliding-window perturbation: {early_diff}"
+    );
+
+    let later_got = got.narrow(1, 3, 4).unwrap();
+    let later_want = want.narrow(1, 3, 4).unwrap();
+    let later_diff = max_abs_diff(&later_got, &later_want);
+    assert!(
+        later_diff >= SLIDING_PERTURBATION_FLOOR,
+        "wrong sliding window changed later logits only {later_diff}; oracle is vacuous"
+    );
+}
+
+#[test]
+fn wrong_norm_epsilon_is_well_outside_honest_tolerance() {
+    // Independent from the sliding-mask axis: a deliberately large, still
+    // load-compatible RMSNorm epsilon changes both decoder layers and the final
+    // norm.  Compare that misconfigured same-weight model directly with the
+    // official Transformers golden, never with another Ferrl forward.
+    let g = golden();
+    let cfg = perturbed_config(|value| {
+        value["text_config"]["rms_norm_eps"] = serde_json::json!(0.25);
+    });
+    let (_cfg, model) = load_model_from_config(cfg);
+    let case = &g["cases"]["full_b1"];
+    let ids = input_ids(case, "input_ids");
+    let want = tensor_from(case, "logits", (1, 6, 16));
+    let difference = max_abs_diff(&model.forward(&ids).unwrap(), &want);
+    assert!(
+        difference >= NORM_PERTURBATION_FLOOR,
+        "wrong Gemma RMSNorm epsilon diverged only {difference}; oracle is vacuous"
+    );
 }
