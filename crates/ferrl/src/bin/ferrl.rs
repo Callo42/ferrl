@@ -9887,6 +9887,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cognitive_complexity)] // one table-driven two-rank contract with three failure modes
     fn dp_policy_preflight_rejects_rank_local_model_or_schema_drift_in_lockstep() {
         for drift in ["model", "schema", "panic"] {
             let results = std::thread::scope(|scope| {
