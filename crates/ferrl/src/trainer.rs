@@ -13119,6 +13119,109 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    struct RewardBindingCase {
+        label: &'static str,
+        rewards: [f32; 3],
+        group_advantages: [f32; 3],
+        none_advantages: [f32; 3],
+    }
+
+    fn reward_binding_cases() -> [RewardBindingCase; 3] {
+        // Hand-derived independently of the production reward helpers. The two
+        // symmetric cases have mean 1 and sample std 2. For [0, 1, 4], mean is
+        // 5/3 and sample variance is 13/3 (equivalently, scaled variance 13/48
+        // times scale 4), so all three centered magnitudes are distinct.
+        let symmetric = 0.999_950_002_499_875_f64 as f32;
+        let asymmetric_mean = 5.0_f64 / 3.0;
+        let asymmetric_sample_std = (13.0_f64 / 48.0).sqrt() * 4.0;
+        let asymmetric_denominator = asymmetric_sample_std + 1e-4;
+        [
+            RewardBindingCase {
+                label: "later-zero",
+                rewards: [3.0, -1.0, 1.0],
+                group_advantages: [symmetric, -symmetric, 0.0],
+                none_advantages: [2.0, -2.0, 0.0],
+            },
+            RewardBindingCase {
+                label: "later-positive",
+                rewards: [-1.0, 1.0, 3.0],
+                group_advantages: [-symmetric, 0.0, symmetric],
+                none_advantages: [-2.0, 0.0, 2.0],
+            },
+            RewardBindingCase {
+                label: "asymmetric",
+                rewards: [0.0, 1.0, 4.0],
+                group_advantages: [
+                    (-asymmetric_mean / asymmetric_denominator) as f32,
+                    ((1.0 - asymmetric_mean) / asymmetric_denominator) as f32,
+                    ((4.0 - asymmetric_mean) / asymmetric_denominator) as f32,
+                ],
+                none_advantages: [
+                    -asymmetric_mean as f32,
+                    (1.0 - asymmetric_mean) as f32,
+                    (4.0 - asymmetric_mean) as f32,
+                ],
+            },
+        ]
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // assertion-heavy reward/advantage matrix
+    fn collector_binds_detailed_reward_order_and_scale_to_published_advantage_bits() {
+        for (scale_label, scale) in [("group", ScaleRewards::Group), ("none", ScaleRewards::None)] {
+            for case in reward_binding_cases() {
+                let tmp = WireTmp::new(&format!(
+                    "reward-advantage-binding-{scale_label}-{}",
+                    case.label
+                ));
+                let run = RunDir::create(&tmp.0, "run").unwrap();
+                let mut config = candidate_ledger_config();
+                config.scale_rewards = scale;
+                let mut trainer = Trainer::new(config, &run).unwrap();
+                let mut policy = stateful_candidate_policy();
+
+                let published = trainer
+                    .collect_rollout_ledger_step(
+                        0,
+                        &mut policy,
+                        &FixedDetailedReward(case.rewards),
+                        &CandidateCodec,
+                        &[Sample::new("binding prompt", ())],
+                        tmp.0.join("ledger"),
+                        &"b".repeat(64),
+                        None,
+                    )
+                    .unwrap();
+
+                // Inspect the exact durable production artifact handed to the
+                // separated learner, including its ordered bit-level constants.
+                let payload: RolloutLedgerStep =
+                    serde_json::from_slice(&std::fs::read(published.join("window.json")).unwrap())
+                        .unwrap();
+                assert_eq!(payload.scale_rewards, scale);
+                assert_eq!(payload.groups.len(), 1);
+                let group = &payload.groups[0];
+                assert_eq!(
+                    group.reward_bits,
+                    case.rewards.map(f32::to_bits).to_vec(),
+                    "{scale_label}/{}: RewardOutcome order was not preserved",
+                    case.label
+                );
+                let expected = match scale {
+                    ScaleRewards::Group => case.group_advantages,
+                    ScaleRewards::None => case.none_advantages,
+                };
+                assert_eq!(
+                    group.advantage_bits,
+                    expected.map(f32::to_bits).to_vec(),
+                    "{scale_label}/{}: published advantage binding drifted",
+                    case.label
+                );
+            }
+        }
+    }
+
     #[test]
     fn collector_rejects_nonfinite_reward_before_candidate_or_ledger_publication() {
         let tmp = WireTmp::new("ledger-nonfinite-reward");
@@ -16533,6 +16636,341 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, Copy)]
+    enum TpRewardBindingRollout {
+        Ordinary,
+        EosAware,
+    }
+
+    struct TpRewardBindingPolicy {
+        inner: StatefulCandidatePolicy,
+        rollout: TpRewardBindingRollout,
+    }
+
+    impl TpRewardBindingPolicy {
+        fn new(rollout: TpRewardBindingRollout) -> Self {
+            let width = match rollout {
+                TpRewardBindingRollout::Ordinary => 2,
+                TpRewardBindingRollout::EosAware => 3,
+            };
+            let logp =
+                Var::from_tensor(&Tensor::zeros((3, width), DType::F32, &Device::Cpu).unwrap())
+                    .unwrap();
+            Self {
+                inner: StatefulCandidatePolicy {
+                    inner: CandidatePolicy { logp },
+                    sampler: 0,
+                },
+                rollout,
+            }
+        }
+    }
+
+    impl Policy for TpRewardBindingPolicy {
+        fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
+            let ordinary = self.inner.generate(prompt, cfg)?;
+            match self.rollout {
+                TpRewardBindingRollout::Ordinary => {
+                    assert_eq!(cfg.max_new_tokens, 2);
+                    Ok(ordinary)
+                }
+                TpRewardBindingRollout::EosAware => {
+                    assert_eq!(cfg.max_new_tokens, 3);
+                    let eos = cfg
+                        .eos_token_id
+                        .expect("EOS-aware reward binding requires an EOS token");
+                    let row = |completion: [u32; 3]| {
+                        prompt.iter().copied().chain(completion).collect::<Vec<_>>()
+                    };
+                    Ok(Rollout::new(
+                        vec![row([7, eos, eos]), row([8, 9, eos]), row([4, 5, 6])],
+                        prompt.len(),
+                        vec![2, 3, 3],
+                        None,
+                    ))
+                }
+            }
+        }
+
+        fn token_logprobs(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+            self.inner.token_logprobs(rollout)
+        }
+
+        fn set_adapter_enabled(&mut self, enabled: bool) {
+            self.inner.set_adapter_enabled(enabled);
+        }
+
+        fn adapter_enabled(&self) -> bool {
+            self.inner.adapter_enabled()
+        }
+
+        fn trainable_vars(&self) -> Vec<Var> {
+            self.inner.trainable_vars()
+        }
+
+        fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+            self.inner.sampler_state()
+        }
+
+        fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
+            self.inner.restore_sampler_state(state)
+        }
+    }
+
+    impl TensorParallelPolicy for TpRewardBindingPolicy {
+        fn generate_at_tensor_parallel_instrumented(
+            &mut self,
+            prompt: &[u32],
+            cfg: &GenConfig,
+            _global_row_base: u64,
+            _comm: &dyn Comm,
+            _telemetry: Option<&mut dyn ModelTelemetryRecorder>,
+        ) -> CandleResult<Rollout> {
+            self.generate(prompt, cfg)
+        }
+
+        fn token_logprobs_tensor_parallel(
+            &self,
+            rollout: &Rollout,
+            _comm: &dyn Comm,
+        ) -> CandleResult<Tensor> {
+            self.token_logprobs(rollout)
+        }
+
+        fn token_logprobs_tensor_parallel_detached(
+            &self,
+            rollout: &Rollout,
+            _comm: &dyn Comm,
+        ) -> CandleResult<Tensor> {
+            Ok(self.token_logprobs(rollout)?.detach())
+        }
+
+        fn backward_tensor_parallel(
+            &self,
+            loss: &Tensor,
+            _comm: &dyn Comm,
+        ) -> CandleResult<GradStore> {
+            loss.backward()
+        }
+
+        fn supports_sharded_tensor_parallel_backward(&self) -> bool {
+            true
+        }
+    }
+
+    struct TpRewardBindingReward {
+        rank: usize,
+        rewards: [f32; 3],
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl RewardFn for TpRewardBindingReward {
+        type Target = ();
+
+        fn reward(&self, _sample: &Sample<()>, _completion: &str) -> Result<f32, RewardError> {
+            panic!("TP reward binding uses the detailed group seam")
+        }
+
+        fn reward_group_detailed(
+            &self,
+            _sample: &Sample<()>,
+            completions: &[String],
+        ) -> Result<Vec<RewardOutcome>, RewardError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(completions.len(), self.rewards.len());
+            Ok(self
+                .rewards
+                .into_iter()
+                .enumerate()
+                .map(|(index, reward)| RewardOutcome {
+                    reward,
+                    diagnostic: Some(format!(
+                        "binding:rank{}:row{index}:{}",
+                        self.rank, completions[index]
+                    )),
+                    metadata: Some(serde_json::json!({
+                        "completion": completions[index],
+                        "reward_bits": reward.to_bits(),
+                        "row": index,
+                        "scoring_rank": self.rank,
+                    })),
+                })
+                .collect())
+        }
+    }
+
+    struct TpRewardBindingOutcome {
+        rank: usize,
+        reward_calls: usize,
+        candidates: Vec<CandidateRecord>,
+        payload: Option<RolloutLedgerStep>,
+        manifest_exists: bool,
+        window_exists: bool,
+    }
+
+    #[allow(clippy::cognitive_complexity)] // two-rank collector/publication harness
+    fn run_tp_reward_binding_case(
+        label: &str,
+        scale_rewards: ScaleRewards,
+        primary_rewards: [f32; 3],
+        rollout: TpRewardBindingRollout,
+    ) -> Vec<TpRewardBindingOutcome> {
+        let tmp = WireTmp::new(label);
+        let ledger_root = tmp.0.join("ledger");
+        let outcomes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        std::thread::scope(|scope| {
+            let handles =
+                crate::comm::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(5))
+                    .into_iter()
+                    .enumerate()
+                    .map(|(rank, tp_comm)| {
+                        let root = tmp.0.clone();
+                        let ledger_root = ledger_root.clone();
+                        let outcomes = std::sync::Arc::clone(&outcomes);
+                        scope.spawn(move || {
+                            let run = RunDir::create(&root, format!("rank-{rank}")).unwrap();
+                            let eos_aware = matches!(rollout, TpRewardBindingRollout::EosAware);
+                            let config = TrainerConfig {
+                                steps: 1,
+                                group_size: 3,
+                                grad_accum_steps: 1,
+                                max_new_tokens: if eos_aware { 3 } else { 2 },
+                                eos_token_id: eos_aware.then_some(99),
+                                truncation_masking: eos_aware,
+                                scale_rewards,
+                                beta: 0.0,
+                                candidate_log_top_k: 3,
+                                checkpoint_every: None,
+                                ..TrainerConfig::default()
+                            };
+                            let mut trainer = Trainer::new(config, &run).unwrap();
+                            let mut policy = TpRewardBindingPolicy::new(rollout);
+                            let reward_calls =
+                                std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                            let reward = TpRewardBindingReward {
+                                rank,
+                                // A peer-local reversal makes an accidental
+                                // non-primary score impossible to hide.
+                                rewards: if rank == 0 {
+                                    primary_rewards
+                                } else {
+                                    [primary_rewards[2], primary_rewards[1], primary_rewards[0]]
+                                },
+                                calls: std::sync::Arc::clone(&reward_calls),
+                            };
+                            if rank == 1 {
+                                // Thread-local: harmless when the peer owns no
+                                // writer, fatal if it ever enters publication.
+                                crate::rollout_ledger::inject_post_manifest_panic_once();
+                            }
+                            let published = trainer
+                                .collect_rollout_ledger_step_tensor_parallel(
+                                    0,
+                                    &mut policy,
+                                    &reward,
+                                    &CandidateCodec,
+                                    &[Sample::new("TP reward binding prompt", ())],
+                                    &ledger_root,
+                                    &"c".repeat(64),
+                                    None,
+                                    &tp_comm,
+                                )
+                                .unwrap();
+                            let candidate_raw =
+                                std::fs::read_to_string(run.candidates_path()).unwrap_or_default();
+                            let candidates = candidate_raw
+                                .lines()
+                                .map(|line| serde_json::from_str(line).unwrap())
+                                .collect();
+                            let payload = (rank == 0).then(|| {
+                                serde_json::from_slice(
+                                    &std::fs::read(published.join("window.json")).unwrap(),
+                                )
+                                .unwrap()
+                            });
+                            outcomes.lock().unwrap().push(TpRewardBindingOutcome {
+                                rank,
+                                reward_calls: reward_calls.load(Ordering::SeqCst),
+                                candidates,
+                                payload,
+                                manifest_exists: published.join("manifest.json").is_file(),
+                                window_exists: published.join("window.json").is_file(),
+                            });
+                        })
+                    })
+                    .collect::<Vec<_>>();
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
+        let mut outcomes = std::sync::Arc::try_unwrap(outcomes)
+            .ok()
+            .unwrap()
+            .into_inner()
+            .unwrap();
+        outcomes.sort_by_key(|outcome| outcome.rank);
+        outcomes
+    }
+
+    #[allow(clippy::cognitive_complexity)] // exact row-wise artifact/diagnostic binding
+    fn assert_tp_reward_binding(
+        outcomes: &[TpRewardBindingOutcome],
+        scale_rewards: ScaleRewards,
+        rewards: [f32; 3],
+        advantages: [f32; 3],
+        completions: [&str; 3],
+        loss_mask: &[Vec<u8>],
+    ) {
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(outcomes[0].rank, 0);
+        assert_eq!(outcomes[1].rank, 1);
+        assert_eq!(outcomes[0].reward_calls, 1);
+        assert_eq!(outcomes[1].reward_calls, 0, "TP peer scored rewards");
+        assert!(outcomes.iter().all(|outcome| outcome.manifest_exists));
+        assert!(outcomes.iter().all(|outcome| outcome.window_exists));
+        assert!(
+            outcomes[1].candidates.is_empty(),
+            "TP peer published candidate diagnostics"
+        );
+        assert!(outcomes[1].payload.is_none());
+
+        let payload = outcomes[0].payload.as_ref().unwrap();
+        assert_eq!(payload.scale_rewards, scale_rewards);
+        assert_eq!(payload.groups.len(), 1);
+        let group = &payload.groups[0];
+        assert_eq!(group.reward_bits, rewards.map(f32::to_bits).to_vec());
+        assert_eq!(group.advantage_bits, advantages.map(f32::to_bits).to_vec());
+        assert_eq!(group.loss_mask.as_slice(), loss_mask);
+
+        let mut candidates = outcomes[0].candidates.clone();
+        candidates.sort_by_key(|record| record.group_index);
+        assert_eq!(candidates.len(), 3);
+        for index in 0..3 {
+            let record = &candidates[index];
+            assert_eq!(record.rank, 0);
+            assert_eq!(record.world_size, 2);
+            assert_eq!(record.group_index, index);
+            assert_eq!(record.reward.to_bits(), rewards[index].to_bits());
+            assert_eq!(record.completion, completions[index]);
+            let expected_diagnostic = format!("binding:rank0:row{index}:{}", completions[index]);
+            assert_eq!(
+                record.reward_diagnostic.as_deref(),
+                Some(expected_diagnostic.as_str())
+            );
+            let metadata = record.reward_metadata.as_ref().unwrap();
+            assert_eq!(
+                metadata["completion"],
+                serde_json::json!(completions[index])
+            );
+            assert_eq!(
+                metadata["reward_bits"],
+                serde_json::json!(rewards[index].to_bits())
+            );
+            assert_eq!(metadata["row"], serde_json::json!(index));
+            assert_eq!(metadata["scoring_rank"], serde_json::json!(0));
+        }
+    }
+
     struct CoordinatedTpRunResult {
         rank: usize,
         result: Result<(Vec<Metrics>, RunStop), TrainerError>,
@@ -18592,6 +19030,213 @@ mod tests {
             results[1].candidates.is_empty(),
             "non-primary TP rank wrote candidate diagnostics"
         );
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // exact TP reward-order/scaling contracts
+    fn tensor_parallel_collector_binds_ordered_reward_and_advantage_bits() {
+        for (scale_label, scale) in [("group", ScaleRewards::Group), ("none", ScaleRewards::None)] {
+            for case in reward_binding_cases() {
+                let outcomes = run_tp_reward_binding_case(
+                    &format!("tp-binding-{scale_label}-{}", case.label),
+                    scale,
+                    case.rewards,
+                    TpRewardBindingRollout::Ordinary,
+                );
+                let advantages = match scale {
+                    ScaleRewards::Group => case.group_advantages,
+                    ScaleRewards::None => case.none_advantages,
+                };
+                assert_tp_reward_binding(
+                    &outcomes,
+                    scale,
+                    case.rewards,
+                    advantages,
+                    ["7,7", "9,9", "2,2"],
+                    &[vec![1, 1], vec![1, 1], vec![1, 1]],
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // EOS/mask/reward binding checklist
+    fn eos_truncation_mask_preserves_later_reward_and_advantage_binding() {
+        // Same independent mean/std calculation as above. Row 2 is uniquely
+        // full-width without EOS, yet its nonzero reward and positive advantage
+        // must survive unchanged in the raw ledger and candidate diagnostic.
+        let normalized = 0.999_950_002_499_875_f64 as f32;
+        let rewards = [-1.0_f32, 1.0, 3.0];
+        let advantages = [-normalized, 0.0, normalized];
+        let outcomes = run_tp_reward_binding_case(
+            "tp-binding-eos-truncation",
+            ScaleRewards::Group,
+            rewards,
+            TpRewardBindingRollout::EosAware,
+        );
+        assert_tp_reward_binding(
+            &outcomes,
+            ScaleRewards::Group,
+            rewards,
+            advantages,
+            ["7,99", "8,9,99", "4,5,6"],
+            &[vec![1, 1, 0], vec![1, 1, 1], vec![0, 0, 0]],
+        );
+
+        let payload = outcomes[0].payload.as_ref().unwrap();
+        assert_eq!(payload.eos_token_id, Some(99));
+        assert!(payload.truncation_masking);
+        let group = &payload.groups[0];
+        assert_eq!(group.completion_lens, vec![2, 3, 3]);
+        assert_eq!(group.token_ids[0], vec![1, 7, 99, 99]);
+        assert_eq!(group.token_ids[1], vec![1, 8, 9, 99]);
+        assert_eq!(group.token_ids[2], vec![1, 4, 5, 6]);
+        assert_eq!(group.loss_mask[2], vec![0, 0, 0]);
+        assert_eq!(group.reward_bits[2], 3.0_f32.to_bits());
+        assert_eq!(group.advantage_bits[2], normalized.to_bits());
+        let later = outcomes[0]
+            .candidates
+            .iter()
+            .find(|record| record.group_index == 2)
+            .unwrap();
+        assert_eq!(later.reward.to_bits(), 3.0_f32.to_bits());
+        assert_eq!(later.completion, "4,5,6");
+        assert_eq!(
+            later.reward_diagnostic.as_deref(),
+            Some("binding:rank0:row2:4,5,6")
+        );
+
+        // Re-run the same EOS geometry through a world-one ledger so the
+        // production separated learner can consume it (the TP collector above
+        // deliberately commits a TP=2 identity). This leg pins reconstruction,
+        // detached scoring, the update, sampler handoff, and metrics publication.
+        let tmp = WireTmp::new("ledger-eos-reconstruction-binding");
+        let ledger_root = tmp.0.join("ledger");
+        let run = RunDir::create(&tmp.0, "run").unwrap();
+        let config = TrainerConfig {
+            steps: 1,
+            group_size: 3,
+            grad_accum_steps: 1,
+            max_new_tokens: 3,
+            eos_token_id: Some(99),
+            truncation_masking: true,
+            scale_rewards: ScaleRewards::Group,
+            beta: 0.0,
+            candidate_log_top_k: 3,
+            checkpoint_every: None,
+            ..TrainerConfig::default()
+        };
+        let mut trainer = Trainer::new(config, &run).unwrap();
+        let mut collector = TpRewardBindingPolicy::new(TpRewardBindingRollout::EosAware);
+        let reward_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reward = TpRewardBindingReward {
+            rank: 0,
+            rewards,
+            calls: std::sync::Arc::clone(&reward_calls),
+        };
+        let published = trainer
+            .collect_rollout_ledger_step(
+                0,
+                &mut collector,
+                &reward,
+                &CandidateCodec,
+                &[Sample::new("separated EOS reward binding prompt", ())],
+                &ledger_root,
+                &"d".repeat(64),
+                None,
+            )
+            .unwrap();
+        assert_eq!(reward_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(collector.inner.sampler, 1);
+        assert!(published.join("manifest.json").is_file());
+        let separated_payload: RolloutLedgerStep =
+            serde_json::from_slice(&std::fs::read(published.join("window.json")).unwrap()).unwrap();
+        assert_eq!(separated_payload.eos_token_id, Some(99));
+        assert!(separated_payload.truncation_masking);
+        assert_eq!(separated_payload.window_tokens, 8);
+        assert_eq!(separated_payload.live_items, 1);
+        let separated_group = &separated_payload.groups[0];
+        assert_eq!(separated_group.completion_lens, vec![2, 3, 3]);
+        assert_eq!(separated_group.token_ids[2], vec![1, 4, 5, 6]);
+        assert_eq!(
+            separated_group.reward_bits,
+            rewards.map(f32::to_bits).to_vec()
+        );
+        assert_eq!(
+            separated_group.advantage_bits,
+            advantages.map(f32::to_bits).to_vec()
+        );
+        assert_eq!(
+            separated_group.loss_mask,
+            vec![vec![1, 1, 0], vec![1, 1, 1], vec![0, 0, 0]]
+        );
+
+        let reconstructed = trainer
+            .collected_group_from_ledger(separated_group)
+            .unwrap();
+        assert_eq!(reconstructed.rewards, rewards.to_vec());
+        assert_eq!(reconstructed.advantages, advantages.map(f64::from).to_vec());
+        assert_eq!(
+            reconstructed.mask_rows,
+            vec![
+                vec![1.0, 1.0, 0.0],
+                vec![1.0, 1.0, 1.0],
+                vec![0.0, 0.0, 0.0],
+            ]
+        );
+        assert!(reconstructed.surrogate_live);
+        assert_eq!(reconstructed.stat.rewards, vec![-1.0_f32, 1.0, 3.0]);
+        assert_eq!(
+            reconstructed.stat.completion_len.to_bits(),
+            (8.0_f32 / 3.0).to_bits()
+        );
+        assert_eq!(reconstructed.stat.completion_tokens, 8);
+        assert_eq!(reconstructed.stat.dropped, 1);
+        assert_eq!(reconstructed.stat.truncated, 1);
+        assert!(!reconstructed.stat.degenerate);
+        assert!(reconstructed.stat.ratio_stats.is_none());
+
+        let mut learner = TpRewardBindingPolicy::new(TpRewardBindingRollout::EosAware);
+        let (metrics, continuation) = trainer
+            .train_rollout_ledger_step(0, &mut learner, &ledger_root, &"d".repeat(64), None)
+            .unwrap();
+        assert_eq!(learner.inner.sampler, 1);
+        assert_eq!(continuation.completed_step(), 1);
+        let learned_logprobs = learner
+            .inner
+            .inner
+            .logp
+            .as_tensor()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert!(
+            learned_logprobs.iter().any(|&value| value != 0.0),
+            "separated learner did not update its 3x3 trainable tensor"
+        );
+
+        // Independent population metrics over [-1, 1, 3]: mean 1, scaled
+        // squared deviations 8/9 at scale 3, hence population std
+        // sqrt((8/9)/3) * 3. The length mean is (2 + 3 + 3) / 3.
+        let reward_population_std = ((8.0_f64 / 9.0) / 3.0).sqrt() * 3.0;
+        assert_eq!(metrics.step, 0);
+        assert_eq!(metrics.reward_mean.to_bits(), 1.0_f32.to_bits());
+        assert_eq!(
+            metrics.reward_std.to_bits(),
+            (reward_population_std as f32).to_bits()
+        );
+        assert_eq!(metrics.frac_truncated.to_bits(), (1.0_f32 / 3.0).to_bits());
+        assert_eq!(metrics.dropped_rows, 1);
+        assert_eq!(metrics.completion_len.to_bits(), (8.0_f32 / 3.0).to_bits());
+        assert_eq!(metrics.frac_reward_zero_std.to_bits(), 0.0_f32.to_bits());
+
+        let persisted_raw = std::fs::read_to_string(run.metrics_path()).unwrap();
+        let persisted = persisted_raw
+            .lines()
+            .map(|line| serde_json::from_str::<Metrics>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(persisted, vec![metrics]);
     }
 
     #[test]
