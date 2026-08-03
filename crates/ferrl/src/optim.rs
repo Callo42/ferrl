@@ -341,6 +341,23 @@ mod tests {
         assert!((vec1_f64(&after.second_moments[0])[0] - expected_v).abs() < 1e-15);
     }
 
+    /// Independently evaluate `beta^t` from an explicit, ascending list of set-bit
+    /// positions. The caller supplies the bit contract rather than deriving it from the
+    /// `usize` exponent being checked.
+    fn power_from_explicit_set_bits(beta: f64, set_bits: &[u32]) -> f64 {
+        let mut factor = beta;
+        let mut current_bit = 0;
+        let mut product = 1.0;
+        for &set_bit in set_bits {
+            while current_bit < set_bit {
+                factor *= factor;
+                current_bit += 1;
+            }
+            product *= factor;
+        }
+        product
+    }
+
     /// Run `n` `AdamW` steps whose gradient is the constant `c`: for `L(w) = sum(w · c)`,
     /// `dL/dw = c` regardless of `w`, so the moment evolution depends only on the
     /// optimizer state — letting the resume test isolate momentum from weight-dependent
@@ -569,6 +586,60 @@ mod tests {
             beta_to_step(beta, i32_max - 1).to_bits(),
             beta.powf((i32_max - 1) as f64).to_bits(),
             "the selected post-canary beta/step pair must reject a powf dispatch mutant"
+        );
+    }
+
+    /// Large-branch powers must consume the exact restored exponent rather than its
+    /// predecessor or successor, including when `usize` is only 32 bits wide.
+    #[test]
+    fn large_bias_power_rejects_adjacent_exponents_on_all_targets() {
+        // t = 2^31 + 2^4 + 2^0 is just beyond candle's i32 exponent boundary and is
+        // representable by 32-bit usize. The arrays bind the expected t, t - 1, and
+        // t + 1 bit contracts without inspecting the `step_t` under test.
+        let step_t = (1usize << 31) | (1usize << 4) | 1;
+        let expected_bits = [0, 4, 31];
+        let predecessor_bits = [4, 31];
+        let successor_bits = [1, 4, 31];
+        let beta = 0.999_999_999_9_f64;
+
+        let expected = power_from_explicit_set_bits(beta, &expected_bits);
+        assert_eq!(beta_to_step(beta, step_t).to_bits(), expected.to_bits());
+
+        let predecessor = power_from_explicit_set_bits(beta, &predecessor_bits);
+        let successor = power_from_explicit_set_bits(beta, &successor_bits);
+        assert_ne!(expected.to_bits(), predecessor.to_bits());
+        assert_ne!(expected.to_bits(), successor.to_bits());
+    }
+
+    /// Full-width large-counter powers must preserve high `usize` bits rather than
+    /// discard every exponent bit above bit 52.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn full_width_large_bias_power_preserves_explicit_high_bits() {
+        // t = 2^54 + 2^31 + 2^4 + 2^0. The explicit arrays below deliberately do
+        // not inspect `step_t`: they independently bind the expected exponent and the
+        // three mutation controls (t - 1, t + 1, and loss of every bit above bit 52).
+        let step_t = (1usize << 54) | (1usize << 31) | (1usize << 4) | 1;
+        let expected_bits = [0, 4, 31, 54];
+        let predecessor_bits = [4, 31, 54];
+        let successor_bits = [1, 4, 31, 54];
+        let high_bit_loss_bits = [0, 4, 31];
+        // This beta leaves beta^t finite/non-zero, while each adjacent exponent still
+        // moves the result by multiple f64 ulps and high-bit loss is material.
+        let beta = 0.999_999_999_999_999_f64;
+
+        let expected = power_from_explicit_set_bits(beta, &expected_bits);
+        assert_eq!(beta_to_step(beta, step_t).to_bits(), expected.to_bits());
+
+        let predecessor = power_from_explicit_set_bits(beta, &predecessor_bits);
+        let successor = power_from_explicit_set_bits(beta, &successor_bits);
+        assert_ne!(expected.to_bits(), predecessor.to_bits());
+        assert_ne!(expected.to_bits(), successor.to_bits());
+
+        let high_bit_loss = power_from_explicit_set_bits(beta, &high_bit_loss_bits);
+        assert!(
+            (expected - high_bit_loss).abs() > 0.9,
+            "discarding exponent bits above bit 52 must materially change beta^t"
         );
     }
 
