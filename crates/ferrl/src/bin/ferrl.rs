@@ -2616,10 +2616,10 @@ where
     let model_setup = (|| {
         let loader_opts = cfg.loader_opts();
         let (policy, tok, identity) = load_policy(&cfg.model_dir, device, &loader_opts)?;
-        let checkpoint_policy_sha256 = cfg
-            .trainer
-            .checkpoint_every
-            .map(|_| identity.policy_sha256.clone());
+        // Every distributed Trainer run needs this verified identity, even when
+        // ordinary checkpointing is disabled. World-1 installs the same value so
+        // enabling DP cannot silently change the builder contract.
+        let frozen_policy_sha256 = identity.policy_sha256.clone();
         let tcfg = cfg.resolved_trainer_config(&tok)?;
         if cfg.tensor_parallel.enabled && !policy.supports_cli_tensor_parallel() {
             return Err(CliError::msg(
@@ -2636,14 +2636,14 @@ where
                  policy does not provide cross-rank backward semantics",
             ));
         }
-        Ok((policy, tok, tcfg, identity, checkpoint_policy_sha256))
+        Ok((policy, tok, tcfg, identity, frozen_policy_sha256))
     })();
-    let (mut policy, tok, tcfg, policy_identity, checkpoint_policy_sha256) =
+    let (mut policy, tok, tcfg, policy_identity, frozen_policy_sha256) =
         coordinate_distributed_result(launch_comm, "model and EOS setup", model_setup)?;
     validate_resolved_eos_consensus(tcfg.eos_token_id, launch_comm)?;
     validate_data_parallel_policy_preflight(
         &policy,
-        &policy_identity,
+        &policy_identity.policy_sha256,
         distributed_launch_comm
             .as_ref()
             .map(|comm| comm as &dyn ferrl::Comm),
@@ -2741,7 +2741,7 @@ where
             tcfg,
             &run,
             distributed_comm,
-            checkpoint_policy_sha256.as_deref(),
+            &frozen_policy_sha256,
             &launch_sha256,
             candidate_signer,
         )?;
@@ -2967,7 +2967,7 @@ fn open_trainer(
     config: TrainerConfig,
     run: &RunDir,
     distributed_comm: Option<SharedComm>,
-    checkpoint_policy_sha256: Option<&str>,
+    frozen_policy_sha256: &str,
     candidate_launch_sha256: &str,
     candidate_signer: CandidateSigner,
 ) -> Result<Trainer, CliError> {
@@ -2976,11 +2976,7 @@ fn open_trainer(
     } else {
         Trainer::new(config, run)?
     };
-    let trainer = if let Some(digest) = checkpoint_policy_sha256 {
-        trainer.with_checkpoint_policy_sha256(digest)
-    } else {
-        trainer
-    };
+    let trainer = trainer.with_frozen_policy_sha256(frozen_policy_sha256);
     Ok(trainer.with_candidate_provenance(candidate_launch_sha256, candidate_signer)?)
 }
 
@@ -3220,56 +3216,14 @@ fn validate_launch_value_consensus(
 
 fn validate_data_parallel_policy_preflight<P: Policy>(
     policy: &P,
-    identity: &ferrl::PolicyLoadIdentity,
+    policy_sha256: &str,
     comm: Option<&dyn ferrl::Comm>,
 ) -> Result<(), CliError> {
     let Some(comm) = comm.filter(|comm| comm.world_size() > 1) else {
         return Ok(());
     };
-    let local = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let vars = policy.trainable_vars();
-        let schema = vars
-            .iter()
-            .map(|var| {
-                let tensor = var.as_tensor();
-                (tensor.dims().to_vec(), tensor.dtype().as_str().to_owned())
-            })
-            .collect::<Vec<_>>();
-        let contract = serde_json::to_vec(&(
-            "ferrl.dp-policy-preflight.v1",
-            identity.policy_sha256.as_str(),
-            identity.model_family,
-            &schema,
-        ))
-        .map_err(|error| CliError::msg(format!("serialize DP policy preflight: {error}")))?;
-        let tensors = vars
-            .iter()
-            .map(|var| var.as_tensor().clone())
-            .collect::<Vec<_>>();
-        Ok((contract, tensors))
-    }))
-    .unwrap_or_else(|_| {
-        Err(CliError::msg(
-            "policy panicked while exposing the DP trainable tensor schema",
-        ))
-    });
-    let (contract, tensors) =
-        coordinate_distributed_result(Some(comm), "DP policy schema observation", local)?;
-    validate_launch_value_consensus(
-        "DP frozen model and trainable tensor schema",
-        &contract,
-        Some(comm),
-    )?;
-    let local = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        comm.validate_all_reduce_sum(&tensors)
-            .map_err(CliError::from)
-    }))
-    .unwrap_or_else(|_| {
-        Err(CliError::msg(
-            "DP backend tensor capability validator panicked",
-        ))
-    });
-    coordinate_distributed_result(Some(comm), "DP backend tensor capability preflight", local)
+    Trainer::validate_data_parallel_policy_preflight(policy, policy_sha256, comm)?;
+    Ok(())
 }
 
 fn validate_launch_config_consensus(
@@ -8545,7 +8499,7 @@ mod tests {
                                         TrainerConfig::default(),
                                         &run,
                                         Some(trainer_comm),
-                                        None,
+                                        &"22".repeat(32),
                                         &"11".repeat(32),
                                         CandidateSigner::generate()?,
                                     )
@@ -10107,20 +10061,30 @@ mod tests {
             for (rank, result, rollout_calls, out_dir) in results {
                 let error = result.unwrap_err();
                 match failure {
-                    "model"
-                    | "schema-count"
-                    | "schema-order"
-                    | "schema-shape"
-                    | "schema-dtype" => assert!(
-                        error.contains("DP frozen model and trainable tensor schema"),
+                    "model" => assert!(
+                        error.contains("frozen-policy identity"),
                         "{failure} rank {rank}: {error}"
                     ),
+                    "schema-count" | "schema-order" | "schema-shape" | "schema-dtype"
+                        if rank == 1 =>
+                    {
+                        assert!(
+                            error.contains("ordered optimizer-variable schema differs"),
+                            "{failure} rank {rank}: {error}"
+                        );
+                    }
+                    "schema-count" | "schema-order" | "schema-shape" | "schema-dtype" => {
+                        assert!(
+                            error.contains("ordered optimizer-variable schema failed on a peer"),
+                            "{failure} rank {rank}: {error}"
+                        );
+                    }
                     "policy-panic" if rank == 1 => assert!(
-                        error.contains("policy panicked while exposing"),
+                        error.contains("injected trainable schema panic"),
                         "{failure} rank {rank}: {error}"
                     ),
                     "policy-panic" => assert!(
-                        error.contains("DP policy schema observation failed on a peer"),
+                        error.contains("early policy-variable observation failed on a peer"),
                         "{failure} rank {rank}: {error}"
                     ),
                     "backend-reject" if rank == 1 => assert!(
@@ -10133,7 +10097,7 @@ mod tests {
                     ),
                     "backend-reject" | "backend-panic" => assert!(
                         error.contains(
-                            "DP backend tensor capability preflight failed on a peer distributed rank"
+                            "complete optimizer-variable payload validation failed on a peer"
                         ),
                         "{failure} rank {rank}: {error}"
                     ),
@@ -10142,7 +10106,7 @@ mod tests {
                 assert_eq!(rollout_calls, 0, "{failure} rank {rank} reached rollout");
                 assert!(
                     !out_dir.exists(),
-                    "{failure} rank {rank} published a run directory"
+                    "{failure} rank {rank} crossed the CLI's early no-run-publication boundary"
                 );
             }
             let expected_validator_calls = usize::from(failure.starts_with("backend-")) * 2;

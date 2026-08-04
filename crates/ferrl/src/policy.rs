@@ -42,7 +42,8 @@ pub struct Rollout {
     /// path's logits at the sampling temperature, nucleus-renormalized when top-p
     /// is active), captured by the sampler at draw time. Row `i` has exactly
     /// [`completion_lens`](Self::completion_lens)`[i]` entries (one per real
-    /// draw; EOS padding was never sampled, so it carries no log-prob).
+    /// draw; EOS padding was never sampled, so it carries no log-prob), and every
+    /// entry must be finite and non-positive.
     ///
     /// `None` when the policy does not capture them (toy/test policies;
     /// [`Rollout::rectangular`] always sets `None`; capturing policies construct
@@ -89,8 +90,8 @@ impl Rollout {
     /// [`Policy`] implementor never needs a struct literal and a future field
     /// addition is not automatically a source break for it. `rollout_logprobs`,
     /// when `Some`, must carry one row per sequence with exactly
-    /// `completion_lens[i]` entries in row `i` (the trainer validates this and
-    /// fails loud on a mismatch).
+    /// `completion_lens[i]` entries in row `i`, each finite and non-positive (the
+    /// trainer validates this and fails loud on a mismatch).
     #[must_use]
     pub fn new(
         token_ids: Vec<Vec<u32>>,
@@ -154,6 +155,22 @@ pub(crate) fn validate_completion_semantics(
     }
     if first_eos.is_some() && completion[expected..].iter().any(|&token| token != eos) {
         return Err("completion contains a live non-EOS token after its first EOS".into());
+    }
+    Ok(())
+}
+
+/// Validate one captured behavior-policy log-probability at a consumer boundary.
+///
+/// A log-probability is necessarily finite and non-positive. Keeping this scalar
+/// domain check here makes direct training, evaluation, and persisted-ledger
+/// replay share one definition while each caller retains its own row/column
+/// shape checks and error type.
+pub(crate) fn validate_behavior_logprob_value(value: f32) -> Result<(), &'static str> {
+    if !value.is_finite() {
+        return Err("must be finite");
+    }
+    if value > 0.0 {
+        return Err("must be non-positive");
     }
     Ok(())
 }

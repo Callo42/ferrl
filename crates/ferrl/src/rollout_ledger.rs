@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::grpo::{finite_moments, group_advantages, ScaleRewards, GROUP_STD_EPS};
-use crate::policy::validate_completion_semantics;
+use crate::policy::{validate_behavior_logprob_value, validate_completion_semantics};
 
 /// The only rollout-ledger format this release accepts.
 pub const ROLLOUT_LEDGER_FORMAT_VERSION: u32 = 6;
@@ -1872,12 +1872,12 @@ fn validate_behavior_capture(
                     )));
                 }
                 for (column, &bits) in values.iter().enumerate() {
-                    let value = finite_f32(bits, &format!("behavior row {row} column {column}"))?;
-                    if value > 0.0 {
-                        return Err(RolloutLedgerError::Invalid(format!(
-                            "behavior row {row} column {column} is a positive logprob"
-                        )));
-                    }
+                    let value = f32::from_bits(bits);
+                    validate_behavior_logprob_value(value).map_err(|detail| {
+                        RolloutLedgerError::Invalid(format!(
+                            "behavior row {row} column {column} {detail}"
+                        ))
+                    })?;
                 }
             }
         }
@@ -3307,6 +3307,14 @@ mod tests {
             },
             |value| {
                 value.groups[0].behavior_logprob_bits.as_mut().unwrap()[0][0] = f32::NAN.to_bits();
+            },
+            |value| {
+                value.groups[0].behavior_logprob_bits.as_mut().unwrap()[0][0] =
+                    f32::INFINITY.to_bits();
+            },
+            |value| {
+                value.groups[0].behavior_logprob_bits.as_mut().unwrap()[0][0] =
+                    f32::NEG_INFINITY.to_bits();
             },
             |value| value.groups[0].advantage_bits[0] = 0.0_f32.to_bits(),
         ];

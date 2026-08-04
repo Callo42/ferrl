@@ -48,7 +48,10 @@
 //! full width and decoding is the entire post-prompt slice, unchanged.
 
 use crate::grpo::finite_moments;
-use crate::policy::{validate_generated_rollout_semantics, GenConfig, Policy, Rollout};
+use crate::policy::{
+    validate_behavior_logprob_value, validate_generated_rollout_semantics, GenConfig, Policy,
+    Rollout,
+};
 use crate::reward::{validate_reward_values, RewardError, RewardFn};
 use crate::sample::Sample;
 use crate::trainer::TokenizerLike;
@@ -133,7 +136,11 @@ pub enum EvalError {
 /// and the mean of the complete group is the per-prompt score. The aggregate
 /// `*_reward_mean` fields are the unweighted mean over prompts of those per-prompt
 /// scores. The adapter-enabled flag is restored to its entry value before returning
-/// — on success, on a returned error, and on a panic (an RAII guard).
+/// — on success, on a returned error, and on a panic (an RAII guard). Evaluation
+/// snapshots the sampler before its first adapter hook: successful evaluation
+/// keeps the generated sampler progression, while a returned error restores the
+/// entry adapter mode first and then restores and verifies the exact entry sampler
+/// bytes.
 ///
 /// `gen` drives [`Policy::generate`]. For a [`crate::QwenPolicy`], `gen.temperature`
 /// **must** equal the temperature the policy was built with — that policy bakes its
@@ -173,45 +180,70 @@ pub fn evaluate<P: Policy, R: RewardFn>(
     if samples.is_empty() {
         return Err(EvalError::Contract("no eval samples".into()));
     }
-    // Restore the adapter flag on the way out — on success, on a `?` early return,
-    // and on a panic — via the guard's Drop.
+    // Capture stochastic state before even the first adapter getter/toggle: the
+    // public Policy seam does not require adapter hooks to preserve its sampler.
+    let sampler_prestate = policy.sampler_state()?;
+    // Restore the adapter flag on the way out — on success and on a panic via
+    // Drop, or explicitly before sampler rollback on a returned error.
     let prior = policy.adapter_enabled();
-    let guard = AdapterRestore { policy, prior };
-    // A policy that cannot disable its adapter (full fine-tuning: the base
-    // weights ARE the trained weights) would make base-vs-trained a
-    // comparison of the policy against itself — fail loud instead of
-    // reporting a meaningless zero gap.
-    guard.policy.set_adapter_enabled(false);
-    if guard.policy.adapter_enabled() {
-        return Err(EvalError::Contract(
-            "the policy cannot disable its adapter (full fine-tuning mode?) — the \
-             base-vs-trained comparison is unavailable; evaluate against a separately \
-             loaded base policy instead"
-                .into(),
-        ));
-    }
-    let per_prompt = score_all(guard.policy, reward_fn, tokenizer, samples, gen)?;
+    let mut guard = AdapterRestore {
+        policy,
+        prior,
+        restored: false,
+    };
+    let evaluated = (|| {
+        // A policy that cannot disable its adapter (full fine-tuning: the base
+        // weights ARE the trained weights) would make base-vs-trained a
+        // comparison of the policy against itself — fail loud instead of
+        // reporting a meaningless zero gap.
+        guard.policy.set_adapter_enabled(false);
+        if guard.policy.adapter_enabled() {
+            return Err(EvalError::Contract(
+                "the policy cannot disable its adapter (full fine-tuning mode?) — the \
+                 base-vs-trained comparison is unavailable; evaluate against a separately \
+                 loaded base policy instead"
+                    .into(),
+            ));
+        }
+        let per_prompt = score_all(guard.policy, reward_fn, tokenizer, samples, gen)?;
 
-    let n = per_prompt.len();
-    let base_means: Vec<f32> = per_prompt.iter().map(|prompt| prompt.base_mean).collect();
-    let adapter_means: Vec<f32> = per_prompt
-        .iter()
-        .map(|prompt| prompt.adapter_mean)
-        .collect();
-    let base_reward_mean = validated_mean(&base_means);
-    let adapter_reward_mean = validated_mean(&adapter_means);
-    if representable_improvement(base_reward_mean, adapter_reward_mean).is_none() {
-        return Err(EvalError::Contract(format!(
-            "adapter/base reward improvement is outside finite f32: adapter={adapter_reward_mean:e}, base={base_reward_mean:e}"
-        )));
+        let n = per_prompt.len();
+        let base_means: Vec<f32> = per_prompt.iter().map(|prompt| prompt.base_mean).collect();
+        let adapter_means: Vec<f32> = per_prompt
+            .iter()
+            .map(|prompt| prompt.adapter_mean)
+            .collect();
+        let base_reward_mean = validated_mean(&base_means);
+        let adapter_reward_mean = validated_mean(&adapter_means);
+        if representable_improvement(base_reward_mean, adapter_reward_mean).is_none() {
+            return Err(EvalError::Contract(format!(
+                "adapter/base reward improvement is outside finite f32: adapter={adapter_reward_mean:e}, base={base_reward_mean:e}"
+            )));
+        }
+        Ok(EvalReport {
+            n_prompts: n,
+            group_size: gen.group_size,
+            base_reward_mean,
+            adapter_reward_mean,
+            per_prompt,
+        })
+    })();
+    match evaluated {
+        Ok(report) => Ok(report),
+        Err(error) => {
+            // Adapter hooks may themselves advance the sampler. Restore the
+            // original mode first, disarming Drop so it cannot run that hook a
+            // second time after the exact sampler rollback below.
+            guard.restore_now();
+            let rollback = restore_eval_sampler(guard.policy, &sampler_prestate);
+            match rollback {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(EvalError::Contract(format!(
+                    "evaluation failed ({error}); exact sampler rollback also failed ({rollback}); discard the policy instance"
+                ))),
+            }
+        }
     }
-    Ok(EvalReport {
-        n_prompts: n,
-        group_size: gen.group_size,
-        base_reward_mean,
-        adapter_reward_mean,
-        per_prompt,
-    })
 }
 
 /// Restores a policy's adapter-enabled flag when dropped, so [`evaluate`] leaves
@@ -219,12 +251,37 @@ pub fn evaluate<P: Policy, R: RewardFn>(
 struct AdapterRestore<'a, P: Policy> {
     policy: &'a mut P,
     prior: bool,
+    restored: bool,
+}
+
+impl<P: Policy> AdapterRestore<'_, P> {
+    fn restore_now(&mut self) {
+        if !self.restored {
+            // Mark first so an adapter hook panic cannot make Drop invoke the
+            // same potentially sampler-mutating hook a second time.
+            self.restored = true;
+            self.policy.set_adapter_enabled(self.prior);
+        }
+    }
 }
 
 impl<P: Policy> Drop for AdapterRestore<'_, P> {
     fn drop(&mut self) {
-        self.policy.set_adapter_enabled(self.prior);
+        self.restore_now();
     }
+}
+
+/// Restore and then re-read the sampler so an eval failure cannot silently leave
+/// a partially advanced stochastic policy behind.
+fn restore_eval_sampler<P: Policy>(policy: &mut P, expected: &[u8]) -> Result<(), EvalError> {
+    policy.restore_sampler_state(expected)?;
+    let actual = policy.sampler_state()?;
+    if actual != expected {
+        return Err(EvalError::Contract(
+            "policy did not restore the exact pre-evaluation sampler state".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Score each prompt base-then-adapter; the caller's guard restores the flag.
@@ -370,6 +427,11 @@ fn validate_rollout_logprobs(rollout: &Rollout) -> Result<(), EvalError> {
                 row.len()
             )));
         }
+        for (column, &value) in row.iter().enumerate() {
+            validate_behavior_logprob_value(value).map_err(|detail| {
+                EvalError::Contract(format!("rollout_logprobs row {i} column {column} {detail}"))
+            })?;
+        }
     }
     Ok(())
 }
@@ -503,6 +565,111 @@ mod tests {
                 .chars()
                 .filter_map(|c| c.to_digit(10))
                 .sum::<u32>() as f32)
+        }
+    }
+
+    struct InvalidCapturePolicy {
+        inner: ScriptedPolicy,
+        invalid: f32,
+        sampler: u64,
+        generation_calls: usize,
+    }
+
+    impl Policy for InvalidCapturePolicy {
+        fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
+            self.generation_calls += 1;
+            self.sampler = self.sampler.wrapping_add(1);
+            let mut rollout = self.inner.generate(prompt, cfg)?;
+            let mut rows = rollout
+                .completion_lens
+                .iter()
+                .map(|&len| vec![-0.5; len])
+                .collect::<Vec<_>>();
+            rows[1][1] = self.invalid;
+            rollout.rollout_logprobs = Some(rows);
+            Ok(rollout)
+        }
+
+        fn token_logprobs(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+            self.inner.token_logprobs(rollout)
+        }
+
+        fn set_adapter_enabled(&mut self, enabled: bool) {
+            self.sampler = self.sampler.wrapping_add(1);
+            self.inner.set_adapter_enabled(enabled);
+        }
+
+        fn adapter_enabled(&self) -> bool {
+            self.inner.adapter_enabled()
+        }
+
+        fn trainable_vars(&self) -> Vec<Var> {
+            self.inner.trainable_vars()
+        }
+
+        fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+            Ok(self.sampler.to_le_bytes().to_vec())
+        }
+
+        fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
+            let bytes: [u8; 8] = state.try_into().map_err(|error| {
+                candle_core::Error::msg(format!("invalid eval test sampler state: {error}"))
+            })?;
+            self.sampler = u64::from_le_bytes(bytes);
+            Ok(())
+        }
+    }
+
+    struct SuccessfulSamplerPolicy {
+        inner: ScriptedPolicy,
+        sampler: u64,
+        generation_calls: usize,
+    }
+
+    impl Policy for SuccessfulSamplerPolicy {
+        fn generate(&mut self, prompt: &[u32], cfg: &GenConfig) -> CandleResult<Rollout> {
+            self.generation_calls += 1;
+            self.sampler = self.sampler.wrapping_add(cfg.group_size as u64);
+            self.inner.generate(prompt, cfg)
+        }
+
+        fn token_logprobs(&self, rollout: &Rollout) -> CandleResult<Tensor> {
+            self.inner.token_logprobs(rollout)
+        }
+
+        fn set_adapter_enabled(&mut self, enabled: bool) {
+            self.inner.set_adapter_enabled(enabled);
+        }
+
+        fn adapter_enabled(&self) -> bool {
+            self.inner.adapter_enabled()
+        }
+
+        fn trainable_vars(&self) -> Vec<Var> {
+            self.inner.trainable_vars()
+        }
+
+        fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+            Ok(self.sampler.to_le_bytes().to_vec())
+        }
+
+        fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
+            let bytes: [u8; 8] = state.try_into().map_err(|error| {
+                candle_core::Error::msg(format!("invalid successful eval sampler state: {error}"))
+            })?;
+            self.sampler = u64::from_le_bytes(bytes);
+            Ok(())
+        }
+    }
+
+    struct BehaviorLogprobCountingReward<'a>(&'a Cell<usize>);
+
+    impl RewardFn for BehaviorLogprobCountingReward<'_> {
+        type Target = ();
+
+        fn reward(&self, _sample: &Sample<()>, _completion: &str) -> Result<f32, RewardError> {
+            self.0.set(self.0.get() + 1);
+            Ok(0.0)
         }
     }
 
@@ -778,6 +945,78 @@ mod tests {
             validate_rollout(&bad_count, &[5], &gen(2, 2)),
             Err(EvalError::Contract(_))
         ));
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn behavior_logprob_domain_fails_before_eval_reward_or_report_consumption() {
+        for invalid in [0.125, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let calls = Cell::new(0);
+            let mut policy = InvalidCapturePolicy {
+                inner: ScriptedPolicy::new(0, 1),
+                invalid,
+                sampler: 41,
+                generation_calls: 0,
+            };
+            let sampler_before = policy.sampler_state().unwrap();
+            let error = evaluate(
+                &mut policy,
+                &BehaviorLogprobCountingReward(&calls),
+                &DigitCodec,
+                &[Sample::new("5", ())],
+                &gen(2, 2),
+            )
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                EvalError::Contract(message)
+                    if message.contains("row 1 column 1")
+                        && (message.contains("finite") || message.contains("non-positive"))
+            ));
+            assert_eq!(calls.get(), 0, "invalid capture reached eval reward");
+            assert_eq!(
+                policy.generation_calls, 1,
+                "invalid capture was not generated"
+            );
+            assert_eq!(
+                policy.sampler_state().unwrap(),
+                sampler_before,
+                "invalid capture did not restore the exact sampler prestate"
+            );
+            assert!(
+                policy.adapter_enabled(),
+                "eval did not restore adapter mode"
+            );
+        }
+    }
+
+    #[test]
+    fn successful_eval_keeps_generated_sampler_progression_and_restores_adapter() {
+        let mut policy = SuccessfulSamplerPolicy {
+            inner: ScriptedPolicy::new(0, 1),
+            sampler: 73,
+            generation_calls: 0,
+        };
+        let report = evaluate(
+            &mut policy,
+            &DigitSumReward,
+            &DigitCodec,
+            &[Sample::new("5", ())],
+            &gen(2, 2),
+        )
+        .unwrap();
+
+        assert_eq!(report.base_reward_mean, 0.0);
+        assert_eq!(report.adapter_reward_mean, 2.0);
+        assert_eq!(policy.generation_calls, 2);
+        assert_eq!(
+            policy.sampler_state().unwrap(),
+            77_u64.to_le_bytes().to_vec()
+        );
+        assert!(
+            policy.adapter_enabled(),
+            "eval did not restore adapter mode"
+        );
     }
 
     #[test]
