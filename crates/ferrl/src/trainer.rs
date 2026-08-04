@@ -1301,6 +1301,8 @@ pub struct Trainer {
     rollout_ledger_payload_forgery: Option<RolloutLedgerPayloadForgery>,
     #[cfg(test)]
     tensor_parallel_request_row_base_override: Option<u64>,
+    #[cfg(test)]
+    optimizer_construction_fault: Option<TestOptimizerConstructionFault>,
 }
 
 #[cfg(test)]
@@ -1319,6 +1321,13 @@ type RolloutLedgerPayloadForgeryWitness =
 struct RolloutLedgerPayloadForgery {
     kind: RolloutLedgerPayloadForgeryKind,
     locally_validated: RolloutLedgerPayloadForgeryWitness,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TestOptimizerConstructionFault {
+    Error,
+    Panic,
 }
 
 /// Per-inner-step quantities folded into the step's [`Metrics`].
@@ -2013,6 +2022,8 @@ impl Trainer {
             rollout_ledger_payload_forgery: None,
             #[cfg(test)]
             tensor_parallel_request_row_base_override: None,
+            #[cfg(test)]
+            optimizer_construction_fault: None,
         })
     }
 
@@ -2031,6 +2042,11 @@ impl Trainer {
     #[cfg(test)]
     fn inject_tensor_parallel_request_row_base_override(&mut self, row_base: u64) {
         self.tensor_parallel_request_row_base_override = Some(row_base);
+    }
+
+    #[cfg(test)]
+    fn inject_optimizer_construction_fault(&mut self, fault: TestOptimizerConstructionFault) {
+        self.optimizer_construction_fault = Some(fault);
     }
 
     /// Install a cooperative **preemption flag**. When the flag flips to `true`
@@ -2646,6 +2662,11 @@ impl Trainer {
     /// that rollback could not restore the exact pre-call state; callers must
     /// discard that policy instance.
     ///
+    /// In a distributed learner, the complete ordered final optimizer-variable
+    /// vector (count, shape, dtype, and backend reduction support) is validated
+    /// over the active execution communicator before Adam allocation or ledger
+    /// consumption.
+    ///
     /// `policy_sha256` has the same externally verified frozen-model/execution
     /// meaning as on [`collect_rollout_ledger_step`](Self::collect_rollout_ledger_step).
     ///
@@ -2748,11 +2769,22 @@ impl Trainer {
             "rollout-ledger learner root/config contract",
             &consensus,
         )?;
-        let (vars, mut opt, step_beta, _controls, sampler_prestate, lineage, validated) =
-            Self::coordinate_comm_call(execution_comm, "rollout-ledger learner preflight", || {
+        let vars = Self::coordinate_comm_call(
+            execution_comm,
+            "rollout-ledger final optimizer-variable preparation",
+            || {
                 self.require_rollout_ledger_step_in_range(step)?;
                 validate_external_policy_sha256(policy_sha256)?;
-                let vars = policy.trainable_vars();
+                Ok(policy.trainable_vars())
+            },
+        )?;
+        // The separated learner uses the active execution world for gradient
+        // payloads: direct DP (and TP-world-1 over DP) select `self.comm`, while
+        // sharded TP selects the explicit TP communicator. Bind and backend-
+        // validate the final exact handles before Adam allocation or ledger I/O.
+        Self::preflight_data_parallel_optimizer_vars_on(execution_comm, &vars)?;
+        let (mut opt, step_beta, _controls, sampler_prestate, lineage, validated) =
+            Self::coordinate_comm_call(execution_comm, "rollout-ledger learner preflight", || {
                 let mut opt = self.new_optimizer(vars.clone())?;
                 if let Some(state) = continuation {
                     opt.load_state(state.optimizer_state())?;
@@ -2805,7 +2837,6 @@ impl Trainer {
                     )?
                 };
                 Ok((
-                    vars,
                     opt,
                     step_beta,
                     controls,
@@ -4774,7 +4805,20 @@ impl Trainer {
             beta2: self.config.adam_beta2,
             ..Default::default()
         };
-        Ok(FerrlAdamW::new(vars, params)?)
+        let optimizer = FerrlAdamW::new(vars, params)?;
+        #[cfg(test)]
+        match self.optimizer_construction_fault {
+            Some(TestOptimizerConstructionFault::Error) => {
+                return Err(TrainerError::Contract(
+                    "injected optimizer construction error after FerrlAdamW::new".into(),
+                ));
+            }
+            Some(TestOptimizerConstructionFault::Panic) => {
+                panic!("injected optimizer construction panic after FerrlAdamW::new");
+            }
+            None => {}
+        }
+        Ok(optimizer)
     }
 
     fn require_same_rollout_ledger_vars(
@@ -7060,13 +7104,15 @@ impl Trainer {
                 }
                 Ok(opt)
             };
-            let opt = if resume_state.is_some() {
-                Self::coordinate_comm_call(
-                    execution_comm,
-                    "ordinary checkpoint optimizer handoff",
-                    build_optimizer,
-                )?
+            let opt = if resume_state.is_some() || execution_comm.world_size() > 1 {
+                let label = if resume_state.is_some() {
+                    "ordinary checkpoint optimizer handoff"
+                } else {
+                    "fresh optimizer construction"
+                };
+                Self::coordinate_comm_call(execution_comm, label, build_optimizer)?
             } else {
+                // Preserve the historical world-1 fresh-run panic behavior.
                 build_optimizer()?
             };
             Ok((vars, opt))
@@ -11181,6 +11227,47 @@ mod tests {
         }
     }
 
+    impl TensorParallelPolicy for DpPreflightPolicy {
+        fn supports_sharded_tensor_parallel_backward(&self) -> bool {
+            true
+        }
+
+        fn generate_at_tensor_parallel_instrumented(
+            &mut self,
+            prompt: &[u32],
+            cfg: &GenConfig,
+            _global_row_base: u64,
+            _comm: &dyn Comm,
+            _telemetry: Option<&mut dyn ModelTelemetryRecorder>,
+        ) -> CandleResult<Rollout> {
+            self.generate(prompt, cfg)
+        }
+
+        fn token_logprobs_tensor_parallel(
+            &self,
+            rollout: &Rollout,
+            _comm: &dyn Comm,
+        ) -> CandleResult<Tensor> {
+            self.token_logprobs(rollout)
+        }
+
+        fn token_logprobs_tensor_parallel_detached(
+            &self,
+            rollout: &Rollout,
+            _comm: &dyn Comm,
+        ) -> CandleResult<Tensor> {
+            Ok(self.token_logprobs(rollout)?.detach())
+        }
+
+        fn backward_tensor_parallel(
+            &self,
+            loss: &Tensor,
+            _comm: &dyn Comm,
+        ) -> CandleResult<GradStore> {
+            self.backward(loss)
+        }
+    }
+
     struct DpPreflightReward {
         calls: Arc<std::sync::atomic::AtomicUsize>,
     }
@@ -11626,6 +11713,362 @@ mod tests {
                 assert_eq!(validator_calls.load(Ordering::SeqCst), 0);
                 assert!(observed.is_empty());
             }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum SeparatedLearnerPreflightEntry {
+        DirectDataParallel,
+        TensorParallel,
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn separated_learner_backend_preflight_is_complete_pre_adam_and_pre_consumption() {
+        for entry in [
+            SeparatedLearnerPreflightEntry::DirectDataParallel,
+            SeparatedLearnerPreflightEntry::TensorParallel,
+        ] {
+            for case in [
+                DpPolicyPreflightCase::BackendRejectLaterTensor,
+                DpPolicyPreflightCase::BackendPanicLaterTensor,
+            ] {
+                let tmp = WireTmp::new(&format!("separated-learner-backend-{entry:?}-{case:?}"));
+                let ledger_root = tmp.0.join("missing-ledger");
+                let validator_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let tensor_payload_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let rollout_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let scoring_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let backward_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let observed: DpObservedPayloads = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+                let results = std::thread::scope(|scope| {
+                    crate::comm::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(5))
+                        .into_iter()
+                        .map(|inner| {
+                            let rank = inner.rank();
+                            let root = tmp.0.clone();
+                            let ledger_root = ledger_root.clone();
+                            let validator_calls = Arc::clone(&validator_calls);
+                            let tensor_payload_calls = Arc::clone(&tensor_payload_calls);
+                            let rollout_calls = Arc::clone(&rollout_calls);
+                            let scoring_calls = Arc::clone(&scoring_calls);
+                            let backward_calls = Arc::clone(&backward_calls);
+                            let observed = Arc::clone(&observed);
+                            scope.spawn(move || {
+                                let run = RunDir::create(
+                                    &root,
+                                    format!("{entry:?}-{case:?}-rank-{rank}"),
+                                )
+                                .unwrap();
+                                let mut comm = Some(DpPreflightComm {
+                                    inner,
+                                    case,
+                                    inject_here: rank == 1,
+                                    validator_calls,
+                                    tensor_payload_calls,
+                                    observed,
+                                });
+                                let config = TrainerConfig {
+                                    steps: 1,
+                                    group_size: 2,
+                                    max_new_tokens: 2,
+                                    beta: 0.0,
+                                    lr: 0.0,
+                                    ..TrainerConfig::default()
+                                };
+                                let mut trainer = match entry {
+                                    SeparatedLearnerPreflightEntry::DirectDataParallel => {
+                                        Trainer::with_comm(config, &run, comm.take().unwrap())
+                                            .unwrap()
+                                    }
+                                    SeparatedLearnerPreflightEntry::TensorParallel => {
+                                        Trainer::new(config, &run).unwrap()
+                                    }
+                                };
+                                // If Adam moves ahead of the backend gate, this
+                                // post-FerrlAdamW::new panic wins and the test fails.
+                                trainer.inject_optimizer_construction_fault(
+                                    TestOptimizerConstructionFault::Panic,
+                                );
+                                let metrics_sentinel =
+                                    format!("metrics-prestate-{entry:?}-{case:?}-{rank}\n")
+                                        .into_bytes();
+                                std::fs::write(run.metrics_path(), &metrics_sentinel).unwrap();
+                                let mut policy = DpPreflightPolicy::new(
+                                    case,
+                                    rank,
+                                    rollout_calls,
+                                    scoring_calls,
+                                    backward_calls,
+                                );
+                                let ids_before = policy
+                                    .vars
+                                    .iter()
+                                    .map(|var| var.as_tensor().id())
+                                    .collect::<Vec<_>>();
+                                let values_before =
+                                    crate::checkpoint::trainable_var_value_sha256(&policy.vars);
+                                let result = match entry {
+                                    SeparatedLearnerPreflightEntry::DirectDataParallel => trainer
+                                        .train_rollout_ledger_step(
+                                            0,
+                                            &mut policy,
+                                            &ledger_root,
+                                            &"31".repeat(32),
+                                            None,
+                                        ),
+                                    SeparatedLearnerPreflightEntry::TensorParallel => trainer
+                                        .train_rollout_ledger_step_tensor_parallel(
+                                            0,
+                                            &mut policy,
+                                            &ledger_root,
+                                            &"31".repeat(32),
+                                            None,
+                                            comm.as_ref().unwrap(),
+                                        ),
+                                };
+                                (
+                                    rank,
+                                    result.unwrap_err().to_string(),
+                                    metrics_sentinel,
+                                    std::fs::read(run.metrics_path()).unwrap(),
+                                    ids_before,
+                                    policy
+                                        .vars
+                                        .iter()
+                                        .map(|var| var.as_tensor().id())
+                                        .collect::<Vec<_>>(),
+                                    values_before,
+                                    crate::checkpoint::trainable_var_value_sha256(&policy.vars),
+                                )
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .map(|handle| handle.join().unwrap())
+                        .collect::<Vec<_>>()
+                });
+
+                for (
+                    rank,
+                    error,
+                    metrics_before,
+                    metrics_after,
+                    ids_before,
+                    ids_after,
+                    values_before,
+                    values_after,
+                ) in results
+                {
+                    if rank == 1 {
+                        let expected = match case {
+                            DpPolicyPreflightCase::BackendRejectLaterTensor => {
+                                "rejection of ordered optimizer tensor 2"
+                            }
+                            DpPolicyPreflightCase::BackendPanicLaterTensor => {
+                                "panic while validating ordered optimizer tensor 2"
+                            }
+                            _ => unreachable!(),
+                        };
+                        assert!(error.contains(expected), "{entry:?} {case:?}: {error}");
+                    } else {
+                        assert!(
+                            error.contains(
+                                "complete optimizer-variable payload validation failed on a peer"
+                            ),
+                            "{entry:?} {case:?}: {error}"
+                        );
+                    }
+                    assert!(
+                        !error.contains("injected optimizer construction panic"),
+                        "{entry:?} {case:?}: Adam ran before backend validation: {error}"
+                    );
+                    assert_eq!(metrics_after, metrics_before);
+                    assert_eq!(ids_after, ids_before);
+                    assert_eq!(values_after, values_before);
+                }
+                assert_eq!(validator_calls.load(Ordering::SeqCst), 2);
+                assert_eq!(tensor_payload_calls.load(Ordering::SeqCst), 0);
+                assert_eq!(rollout_calls.load(Ordering::SeqCst), 0);
+                assert_eq!(scoring_calls.load(Ordering::SeqCst), 0);
+                assert_eq!(backward_calls.load(Ordering::SeqCst), 0);
+                let mut observed = observed.lock().unwrap().clone();
+                observed.sort_by_key(|(rank, _)| *rank);
+                assert_eq!(
+                    observed,
+                    vec![
+                        (0, canonical_dp_preflight_metadata()),
+                        (1, canonical_dp_preflight_metadata()),
+                    ]
+                );
+                assert!(
+                    !ledger_root.exists(),
+                    "{entry:?} {case:?} consumed/published ledger state"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn distributed_fresh_optimizer_construction_error_and_panic_abort_in_lockstep() {
+        for fault in [
+            TestOptimizerConstructionFault::Error,
+            TestOptimizerConstructionFault::Panic,
+        ] {
+            let tmp = WireTmp::new(&format!("fresh-optimizer-{fault:?}"));
+            let validator_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let tensor_payload_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let rollout_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let reward_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let scoring_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let backward_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let observed: DpObservedPayloads = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+            let results = std::thread::scope(|scope| {
+                crate::comm::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(5))
+                    .into_iter()
+                    .map(|inner| {
+                        let rank = inner.rank();
+                        let root = tmp.0.clone();
+                        let validator_calls = Arc::clone(&validator_calls);
+                        let tensor_payload_calls = Arc::clone(&tensor_payload_calls);
+                        let rollout_calls = Arc::clone(&rollout_calls);
+                        let reward_calls = Arc::clone(&reward_calls);
+                        let scoring_calls = Arc::clone(&scoring_calls);
+                        let backward_calls = Arc::clone(&backward_calls);
+                        let observed = Arc::clone(&observed);
+                        scope.spawn(move || {
+                            let run =
+                                RunDir::create(&root, format!("{fault:?}-rank-{rank}")).unwrap();
+                            let comm = DpPreflightComm {
+                                inner,
+                                case: DpPolicyPreflightCase::BackendRejectLaterTensor,
+                                inject_here: false,
+                                validator_calls,
+                                tensor_payload_calls,
+                                observed,
+                            };
+                            let config = TrainerConfig {
+                                steps: 1,
+                                group_size: 2,
+                                max_new_tokens: 2,
+                                beta: 0.0,
+                                lr: 0.0,
+                                candidate_log_top_k: 1,
+                                ..TrainerConfig::default()
+                            };
+                            let mut trainer = Trainer::with_comm(config, &run, comm)
+                                .unwrap()
+                                .with_frozen_policy_sha256("41".repeat(32));
+                            if rank == 1 {
+                                trainer.inject_optimizer_construction_fault(fault);
+                            }
+                            let candidate_sentinel =
+                                format!("candidate-prestate-{fault:?}-{rank}\n").into_bytes();
+                            let metrics_sentinel =
+                                format!("metrics-prestate-{fault:?}-{rank}\n").into_bytes();
+                            std::fs::write(run.candidates_path(), &candidate_sentinel).unwrap();
+                            std::fs::write(run.metrics_path(), &metrics_sentinel).unwrap();
+                            let mut policy = DpPreflightPolicy::new(
+                                DpPolicyPreflightCase::BackendRejectLaterTensor,
+                                rank,
+                                rollout_calls,
+                                scoring_calls,
+                                backward_calls,
+                            );
+                            let ids_before = policy
+                                .vars
+                                .iter()
+                                .map(|var| var.as_tensor().id())
+                                .collect::<Vec<_>>();
+                            let values_before =
+                                crate::checkpoint::trainable_var_value_sha256(&policy.vars);
+                            let result = trainer.train(
+                                &mut policy,
+                                &DpPreflightReward {
+                                    calls: reward_calls,
+                                },
+                                &CandidateCodec,
+                                &[Sample::new("prompt", ())],
+                            );
+                            (
+                                rank,
+                                result.unwrap_err().to_string(),
+                                candidate_sentinel,
+                                std::fs::read(run.candidates_path()).unwrap(),
+                                metrics_sentinel,
+                                std::fs::read(run.metrics_path()).unwrap(),
+                                ids_before,
+                                policy
+                                    .vars
+                                    .iter()
+                                    .map(|var| var.as_tensor().id())
+                                    .collect::<Vec<_>>(),
+                                values_before,
+                                crate::checkpoint::trainable_var_value_sha256(&policy.vars),
+                                std::fs::read_dir(run.checkpoints_dir()).map_or(0, Iterator::count),
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|handle| handle.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+
+            for (
+                rank,
+                error,
+                candidate_before,
+                candidate_after,
+                metrics_before,
+                metrics_after,
+                ids_before,
+                ids_after,
+                values_before,
+                values_after,
+                checkpoint_entries,
+            ) in results
+            {
+                if rank == 1 {
+                    let expected = match fault {
+                        TestOptimizerConstructionFault::Error => {
+                            "injected optimizer construction error after FerrlAdamW::new"
+                        }
+                        TestOptimizerConstructionFault::Panic => {
+                            "injected optimizer construction panic after FerrlAdamW::new"
+                        }
+                    };
+                    assert!(error.contains(expected), "{fault:?} rank {rank}: {error}");
+                } else {
+                    assert!(
+                        error.contains("fresh optimizer construction failed on a peer rank"),
+                        "{fault:?} rank {rank}: {error}"
+                    );
+                }
+                assert_eq!(candidate_after, candidate_before);
+                assert_eq!(metrics_after, metrics_before);
+                assert_eq!(ids_after, ids_before);
+                assert_eq!(values_after, values_before);
+                assert_eq!(checkpoint_entries, 0);
+            }
+            assert_eq!(validator_calls.load(Ordering::SeqCst), 2);
+            assert_eq!(tensor_payload_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(rollout_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(reward_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(scoring_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(backward_calls.load(Ordering::SeqCst), 0);
+            let mut observed = observed.lock().unwrap().clone();
+            observed.sort_by_key(|(rank, _)| *rank);
+            assert_eq!(
+                observed,
+                vec![
+                    (0, canonical_dp_preflight_metadata()),
+                    (1, canonical_dp_preflight_metadata()),
+                ]
+            );
         }
     }
 
@@ -13172,6 +13615,7 @@ mod tests {
         UniformWrongNoninitialPrefix,
         PostEosLiveToken,
         ShortenedWithoutEos,
+        SignedZeroBehaviorLogprobs,
         PositiveBehaviorLogprob,
         NanBehaviorLogprob,
         PositiveInfiniteBehaviorLogprob,
@@ -13224,6 +13668,16 @@ mod tests {
                 }
                 MalformedRolloutSemantics::ShortenedWithoutEos => {
                     rollout.completion_lens.fill(1);
+                }
+                MalformedRolloutSemantics::SignedZeroBehaviorLogprobs => {
+                    let mut rows = rollout
+                        .completion_lens
+                        .iter()
+                        .map(|&len| vec![-0.5; len])
+                        .collect::<Vec<_>>();
+                    rows[0][0] = 0.0;
+                    rows[0][1] = -0.0;
+                    rollout.rollout_logprobs = Some(rows);
                 }
                 MalformedRolloutSemantics::PositiveBehaviorLogprob
                 | MalformedRolloutSemantics::NanBehaviorLogprob
@@ -14560,6 +15014,43 @@ mod tests {
         ] {
             assert_direct_rollout_semantics_rejected(label, mode, None);
         }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn direct_training_accepts_both_signs_of_zero_behavior_logprob() {
+        let tmp = WireTmp::new("direct-signed-zero-behavior-logprobs");
+        let run = RunDir::create(&tmp.0, "run").unwrap();
+        let mut config = candidate_ledger_config();
+        config.tis = true;
+        config.lr = 0.0;
+        let mut trainer = Trainer::new(config, &run).unwrap();
+        let calls = std::cell::Cell::new(0);
+        let mut policy = MalformedSemanticCandidatePolicy::new(
+            MalformedRolloutSemantics::SignedZeroBehaviorLogprobs,
+        );
+
+        let (history, stop) = trainer
+            .train(
+                &mut policy,
+                &CountingCandidateReward { calls: &calls },
+                &CandidateCodec,
+                &[Sample::new("prompt", ())],
+            )
+            .unwrap();
+
+        assert_eq!(stop, RunStop::Completed);
+        assert_eq!(history.len(), 1);
+        assert_eq!(calls.get(), 1);
+        assert!(policy.scoring_calls.get() > 0);
+        assert!(policy.backward_calls.get() > 0);
+        assert_eq!(policy.inner.sampler, 1);
+        assert_eq!(
+            crate::telemetry::read_metrics(run.metrics_path())
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]

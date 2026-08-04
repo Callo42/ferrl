@@ -991,6 +991,38 @@ mod tests {
     }
 
     #[test]
+    fn evaluation_accepts_both_signs_of_zero_behavior_logprob() {
+        for signed_zero in [0.0_f32, -0.0_f32] {
+            let calls = Cell::new(0);
+            let mut policy = InvalidCapturePolicy {
+                inner: ScriptedPolicy::new(0, 1),
+                invalid: signed_zero,
+                sampler: 41,
+                generation_calls: 0,
+            };
+
+            let report = evaluate(
+                &mut policy,
+                &BehaviorLogprobCountingReward(&calls),
+                &DigitCodec,
+                &[Sample::new("5", ())],
+                &gen(2, 2),
+            )
+            .unwrap();
+
+            assert_eq!(report.per_prompt.len(), 1);
+            assert_eq!(
+                calls.get(),
+                4,
+                "signed zero bits {:08x}",
+                signed_zero.to_bits()
+            );
+            assert_eq!(policy.generation_calls, 2);
+            assert!(policy.adapter_enabled());
+        }
+    }
+
+    #[test]
     fn successful_eval_keeps_generated_sampler_progression_and_restores_adapter() {
         let mut policy = SuccessfulSamplerPolicy {
             inner: ScriptedPolicy::new(0, 1),

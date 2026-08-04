@@ -198,7 +198,8 @@ pub struct RolloutLedgerControls {
     pub eos_token_id: Option<u32>,
     /// Whether full-width non-EOS completions are wholly masked.
     pub truncation_masking: bool,
-    /// Effective TIS cap, or `None` when TIS is disabled.
+    /// Effective TIS cap, finite in both f64 and the learner's f32 domain, or
+    /// `None` when TIS is disabled.
     pub tis_imp_ratio_cap_bits: Option<u64>,
     /// Resolved learning rate as exact f64 bits.
     pub effective_lr_bits: u64,
@@ -313,7 +314,8 @@ pub struct RolloutLedgerStep {
     pub eos_token_id: Option<u32>,
     /// Whether full-width non-EOS completions are wholly masked.
     pub truncation_masking: bool,
-    /// Effective TIS cap as exact finite f64 bits, or `None` when TIS is disabled.
+    /// Effective TIS cap as exact f64 bits, finite after learner-side f32
+    /// narrowing, or `None` when TIS is disabled.
     pub tis_imp_ratio_cap_bits: Option<u64>,
     /// Resolved learning rate as exact finite f64 bits.
     pub effective_lr_bits: u64,
@@ -1379,9 +1381,10 @@ fn validate_controls(controls: &RolloutLedgerControls) -> Result<(), RolloutLedg
     }
     if let Some(bits) = controls.tis_imp_ratio_cap_bits {
         let cap = f64::from_bits(bits);
-        if !cap.is_finite() || cap < 1.0 {
+        if !cap.is_finite() || cap < 1.0 || !(cap as f32).is_finite() {
             return Err(RolloutLedgerError::Invalid(
-                "enabled TIS requires a finite importance-ratio cap >= 1".into(),
+                "enabled TIS requires an importance-ratio cap that is finite, >= 1, and remains finite when narrowed to f32"
+                    .into(),
             ));
         }
     }
@@ -2445,6 +2448,76 @@ mod tests {
         assert!(published.join(MANIFEST_FILE).is_file());
         let reader = RolloutLedgerReader::open(&tmp.0, expectations()).unwrap();
         assert_eq!(reader.read_step(7).unwrap().as_step(), &expected);
+    }
+
+    #[test]
+    fn signed_zero_behavior_logprobs_round_trip_with_exact_wire_bits() {
+        let tmp = TempDir::new("signed-zero-behavior-logprobs");
+        let mut expected = step();
+        let captured = expected.groups[0].behavior_logprob_bits.as_mut().unwrap();
+        captured[0][0] = 0.0_f32.to_bits();
+        captured[0][1] = (-0.0_f32).to_bits();
+
+        RolloutLedgerWriter::create(&tmp.0, identity())
+            .unwrap()
+            .write_step(&expected)
+            .unwrap();
+        let validated = RolloutLedgerReader::open(
+            &tmp.0,
+            RolloutLedgerExpectations {
+                identity: identity(),
+                controls: controls_from_step(&expected),
+            },
+        )
+        .unwrap()
+        .read_step(7)
+        .unwrap()
+        .into_step();
+        let round_tripped = validated.groups[0].behavior_logprob_bits.as_ref().unwrap();
+        assert_eq!(round_tripped[0][0], 0.0_f32.to_bits());
+        assert_eq!(round_tripped[0][1], (-0.0_f32).to_bits());
+        assert_ne!(round_tripped[0][0], round_tripped[0][1]);
+    }
+
+    #[test]
+    fn writer_rejects_tis_cap_that_overflows_f32_before_step_visibility() {
+        let tmp = TempDir::new("writer-unrepresentable-tis-cap");
+        let writer = RolloutLedgerWriter::create(&tmp.0, identity()).unwrap();
+        let mut invalid = step();
+        invalid.tis_imp_ratio_cap_bits = Some((f64::from(f32::MAX) * 2.0).to_bits());
+
+        assert!(matches!(
+            writer.write_step(&invalid),
+            Err(RolloutLedgerError::Invalid(message))
+                if message.contains("remains finite when narrowed to f32")
+        ));
+        assert!(
+            !tmp.0.join(step_dir_name(7)).exists(),
+            "invalid cap created a reader-visible step directory"
+        );
+    }
+
+    #[test]
+    fn reader_rejects_authenticated_tis_cap_that_overflows_f32() {
+        let tmp = TempDir::new("reader-unrepresentable-tis-cap");
+        RolloutLedgerWriter::create(&tmp.0, identity())
+            .unwrap()
+            .write_step(&step())
+            .unwrap();
+        // Mutate the persisted payload and reseal its manifest length/checksum,
+        // proving the semantic reader gate (rather than checksum or expectation
+        // mismatch handling) rejects the finite-f64 / infinite-f32 cap.
+        rewrite_payload(&tmp.0, |value| {
+            value.tis_imp_ratio_cap_bits = Some((f64::from(f32::MAX) * 2.0).to_bits());
+        });
+
+        assert!(matches!(
+            RolloutLedgerReader::open(&tmp.0, expectations())
+                .unwrap()
+                .read_step(7),
+            Err(RolloutLedgerError::Invalid(message))
+                if message.contains("remains finite when narrowed to f32")
+        ));
     }
 
     #[test]
