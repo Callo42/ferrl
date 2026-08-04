@@ -757,14 +757,16 @@ C_(k+1)`; outer checkpoint progress stays distinct from Adam's update counter.
 
 ## Training run layout (`runs/`)
 
-Each training run writes to `runs/<run_id>/`:
+Each training run has a `runs/<run_id>/` directory. [`ferrl::telemetry::RunDir`]
+eagerly creates only the run directory and `checkpoints/`; the applicable files below
+are persisted as the training pipeline produces them:
 
 ```
 runs/<run_id>/
 ├── launch.json       # immutable full launch/run/model/tokenizer/ledger binding
 ├── prompt.txt        # exact rendered prompt bytes (TriMul launches)
 ├── prompt.sha256     # compatibility digest sidecar for prompt.txt
-├── config.json       # the trainer config written by the generic Trainer
+├── config.json       # training-pipeline configuration
 ├── candidates.jsonl  # optional launch-bound, per-row-digested candidate ledger
 ├── metrics.jsonl     # one JSON object per step:
 │                     #   step, reward_mean, reward_std, frac_reward_zero_std,
@@ -775,16 +777,23 @@ runs/<run_id>/
 │                     #   step_secs, tokens_per_sec, cuda_mem_* when enabled,
 │                     #   cuda_mem_probe_events and decoder_cache_snapshots when present
 ├── checkpoints/      # identity-bound adapter or full-FT trainer checkpoints
-└── run.log           # human-readable log
+└── eval-report.json  # immutable held-out evaluation report, when evaluation runs
 ```
 
-Logging is structured via `tracing` + `tracing-subscriber`: the trainer enters a
-`run{rank=N world=N}` span and a per-step `step{step=N}` span, so every event carries
-rank / world / step (at ERROR level, the fields survive even `RUST_LOG=warn`). `runs/`
-is git-ignored. The on-disk layout is created by [`ferrl::telemetry::RunDir`] and metrics
-are appended by `ferrl::telemetry::MetricsWriter`; with `gpu_memory_probe: true`,
-CUDA runs also persist stable phase-level memory probe events and any model-provided
-decoder cache snapshots, such as Gemma 4 per-layer seen/retained token counts. The
+Logging is structured via `tracing` + `tracing-subscriber`: the `Trainer` enters a
+`run{rank=N world=N}` span around its run loop and, for each optimizer step, a nested
+`step{step=N}` span.
+Events emitted while the run span is entered carry rank / world; events emitted while the
+nested step span is entered also carry step (at ERROR level, the fields survive even
+`RUST_LOG=warn`). CLI setup, evaluation, and post-run events are not automatically wrapped;
+their call sites must enter the relevant spans when this context is required. Formatted tracing
+output goes to standard output (stdout), not to `runs/<run_id>/`; launchers or operators that
+need a durable human-readable log must capture stdout.
+`runs/` is git-ignored. The on-disk layout is created by
+[`ferrl::telemetry::RunDir`] and metrics are appended by
+`ferrl::telemetry::MetricsWriter`; with `gpu_memory_probe: true`, CUDA runs also persist
+stable phase-level memory probe events and any model-provided decoder cache snapshots,
+such as Gemma 4 per-layer seen/retained token counts. The
 `ferrl runreport` subcommand reads a
 run's `metrics.jsonl` and prints a health summary — reward trend, throughput, and grad-norm
 anomalies (human, `--json`, or `--strict`). Pass the original top-level run config with

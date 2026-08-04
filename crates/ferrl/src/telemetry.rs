@@ -1,13 +1,17 @@
 //! Run telemetry: structured tracing plus a per-run on-disk layout.
 //!
-//! Every production training run materializes a `runs/<run_id>/` directory whose
-//! immutable `launch.json` commits the resolved launch before telemetry begins.
-//! The directory also contains `config.json`, `metrics.jsonl` (one [`Metrics`]
-//! object per optimizer step), an optional launch-bound `candidates.jsonl`
-//! stream, a `checkpoints/` subdirectory, and `run.log`. TriMul launches also
-//! freeze `prompt.txt` plus its compatibility `prompt.sha256` sidecar.
-//! [`init_tracing`] wires up `tracing` once for the process; [`RunDir`] owns the
-//! directory; [`MetricsWriter`] appends step metrics as JSON Lines; and
+//! Every production training run has a `runs/<run_id>/` directory. [`RunDir`]
+//! eagerly creates only that directory and its `checkpoints/` subdirectory.
+//! Production then persists applicable artifacts there: immutable `launch.json`,
+//! `config.json`, `metrics.jsonl` (one [`Metrics`] object per optimizer step),
+//! the optional launch-bound `candidates.jsonl` stream, TriMul's `prompt.txt`
+//! plus compatibility `prompt.sha256` sidecar, and `eval-report.json` after
+//! held-out evaluation.
+//!
+//! [`init_tracing`] wires up formatted structured tracing to standard output
+//! (stdout); it does not create a per-run log file. A launcher or
+//! operator that needs a durable human-readable log must capture stdout.
+//! [`MetricsWriter`] appends step metrics as JSON Lines, and
 //! [`CandidateWriter`] appends sampled-completion provenance as JSON Lines.
 
 use std::fs::{self, File, OpenOptions};
@@ -174,6 +178,10 @@ impl TelemetryError {
 /// Initialize the global `tracing` subscriber from the `RUST_LOG` environment
 /// variable, falling back to `info`.
 ///
+/// Formatted structured events go to standard output (stdout), not to a file in
+/// [`RunDir`]. Launchers and operators must capture stdout if they need a durable
+/// human-readable log.
+///
 /// Uses [`try_init`](tracing_subscriber::util::SubscriberInitExt::try_init), so
 /// it is safe to call more than once (and from tests): a second call returns
 /// `Ok(())` without replacing the existing subscriber rather than panicking.
@@ -193,13 +201,13 @@ pub fn init_tracing() -> Result<(), TelemetryError> {
     Ok(())
 }
 
-/// Build the per-run `rank`/`world` span that stamps **every** event emitted while it
-/// is entered with this rank's identity.
+/// Build the per-run `rank`/`world` span that stamps events emitted while it is
+/// entered with this rank's identity.
 ///
 /// Under data parallelism every rank logs to the same stdout/stderr, so without a rank
-/// stamp the interleaved lines are unattributable. Enter this span once for the lifetime
-/// of a run (hold the returned guard) and every `tracing` event below it — the policy's,
-/// the reward's, the trainer's — carries `rank` and `world`:
+/// stamp the interleaved lines are unattributable. Enter this span whenever rank/world
+/// context is needed (hold the returned guard); `tracing` events emitted while it is
+/// entered — the policy's, the reward's, the trainer's — carry `rank` and `world`:
 ///
 /// ```
 /// let _run = ferrl::run_span(0, 1).entered();
@@ -207,23 +215,25 @@ pub fn init_tracing() -> Result<(), TelemetryError> {
 /// ```
 ///
 /// [`Trainer`](crate::trainer::Trainer) enters this span around its run loop and a
-/// nested per-step `step` span inside it, so a trainer's own events are
-/// `rank`/`world`/`step`-stamped automatically; a launcher wraps its setup/eval/gate
-/// events by entering this span itself.
+/// nested per-step `step` span inside it. Events emitted while those spans are entered
+/// inherit `rank`/`world`/`step` as applicable. CLI setup, evaluation, and post-run
+/// events are not automatically wrapped; their call sites must enter the relevant span
+/// when this context is required.
 ///
 /// The span is created at **ERROR** level — the max severity — deliberately. A span is
 /// only entered while its level passes the active filter, so an `info`-level context
 /// span would silently drop out under `RUST_LOG=warn`/`error` (the very filters used to
 /// quiet a long run) and the warnings/errors that matter most — e.g. the preemption
 /// warn — would emit *without* rank/world/step. ERROR level keeps the context enabled
-/// for any filter that emits anything at all, so emitted warnings/errors always carry it.
+/// for any filter that emits anything at all, so warnings/errors emitted while the span
+/// is entered carry it.
 #[must_use]
 pub fn run_span(rank: usize, world: usize) -> tracing::Span {
     tracing::error_span!("run", rank, world)
 }
 
 /// The per-step span nested under [`run_span`]: stamps `step` onto every event emitted
-/// during one optimizer step.
+/// while it is entered during one optimizer step.
 ///
 /// ERROR level for the same reason as [`run_span`] — the context must survive a
 /// `RUST_LOG=warn`/`error` filter so emitted warnings/errors keep their `step`. Kept a
@@ -237,8 +247,9 @@ pub(crate) fn step_span(step: u64) -> tracing::Span {
 
 /// Owns the on-disk `runs/<run_id>/` directory for a single training run.
 ///
-/// Construction creates the directory tree eagerly. Paths to the standard
-/// artifacts are exposed via accessors so callers never hand-build them.
+/// Construction eagerly creates only the run root and `checkpoints/`
+/// subdirectory. Paths to persisted artifacts are exposed via accessors so
+/// callers never hand-build them.
 #[derive(Debug, Clone)]
 pub struct RunDir {
     run_id: String,
@@ -258,7 +269,13 @@ impl RunDir {
     pub const PROMPT_SHA256_FILE: &'static str = "prompt.sha256";
     /// Standard filename for the serialized run configuration.
     pub const CONFIG_FILE: &'static str = "config.json";
-    /// Standard filename for the human-readable run log.
+    /// Compatibility-only filename for the legacy `run.log` path.
+    ///
+    /// Ferrl does not create or write this path; callers needing a durable
+    /// human-readable log must capture stdout.
+    #[deprecated(
+        note = "Ferrl does not create or write this path; callers needing a durable human-readable log must capture stdout."
+    )]
     pub const LOG_FILE: &'static str = "run.log";
     /// Durable held-out evaluation report, published once after evaluation.
     pub const EVAL_REPORT_FILE: &'static str = "eval-report.json";
@@ -374,10 +391,16 @@ impl RunDir {
         self.root.join(Self::CONFIG_FILE)
     }
 
-    /// Path to `run.log`.
+    /// Compatibility-only path to the legacy `run.log` location.
+    ///
+    /// Ferrl does not create or write this path; callers needing a durable
+    /// human-readable log must capture stdout.
+    #[deprecated(
+        note = "Ferrl does not create or write this path; callers needing a durable human-readable log must capture stdout."
+    )]
     #[must_use]
     pub fn log_path(&self) -> PathBuf {
-        self.root.join(Self::LOG_FILE)
+        self.root.join("run.log")
     }
 
     /// Path to the immutable held-out evaluation report.
@@ -2827,20 +2850,59 @@ mod tests {
         assert!(out.contains("step=3"), "step lost under warn filter: {out}");
     }
 
+    fn assert_exact_eager_layout_without_run_log(rd: &RunDir) {
+        assert_eq!(
+            rd.checkpoints_dir(),
+            rd.root().join(RunDir::CHECKPOINTS_DIR)
+        );
+        assert!(rd.checkpoints_dir().is_dir());
+
+        let entries = std::fs::read_dir(rd.root())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            entries,
+            vec![std::ffi::OsString::from(RunDir::CHECKPOINTS_DIR)]
+        );
+        assert!(
+            !rd.root().join("run.log").exists(),
+            "tracing output must not materialize as a per-run file"
+        );
+    }
+
     #[test]
-    #[allow(clippy::cognitive_complexity)] // one compact inventory of the complete layout
-    fn rundir_creates_layout_and_paths() {
-        let tmp = TempDir::new("rundir");
+    fn rundir_create_materializes_exact_eager_layout_without_run_log() {
+        let tmp = TempDir::new("rundir-create");
         let rd = RunDir::create(tmp.path(), "run-001").unwrap();
         assert_eq!(rd.run_id(), "run-001");
-        assert!(rd.root().is_dir());
-        assert!(rd.checkpoints_dir().is_dir());
-        assert!(rd.metrics_path().ends_with("metrics.jsonl"));
-        assert!(rd.launch_path().ends_with("launch.json"));
-        assert!(rd.prompt_path().ends_with("prompt.txt"));
-        assert!(rd.prompt_sha256_path().ends_with("prompt.sha256"));
-        assert!(rd.config_path().ends_with("config.json"));
-        assert!(rd.log_path().ends_with("run.log"));
+        assert_eq!(rd.root(), tmp.path().join("run-001"));
+        assert_exact_eager_layout_without_run_log(&rd);
+    }
+
+    #[test]
+    #[allow(deprecated)] // compatibility-only legacy log-path API
+    fn rundir_legacy_log_path_api_remains_compatible() {
+        let tmp = TempDir::new("rundir-legacy-log");
+        let rd = RunDir::create(tmp.path(), "run-001").unwrap();
+        assert_eq!(RunDir::LOG_FILE, "run.log");
+        let log_path = rd.log_path();
+        assert_eq!(log_path, rd.root().join("run.log"));
+        assert!(
+            !log_path.exists(),
+            "legacy accessor must not materialize a file"
+        );
+    }
+
+    #[test]
+    fn rundir_open_materializes_exact_eager_layout_without_run_log() {
+        let tmp = TempDir::new("rundir-open");
+        let root = tmp.path().join("run-001");
+        std::fs::create_dir(&root).unwrap();
+        let rd = RunDir::open(tmp.path(), "run-001").unwrap();
+        assert_eq!(rd.run_id(), "run-001");
+        assert_eq!(rd.root(), root);
+        assert_exact_eager_layout_without_run_log(&rd);
     }
 
     #[test]
