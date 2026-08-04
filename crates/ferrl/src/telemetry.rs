@@ -201,13 +201,13 @@ pub fn init_tracing() -> Result<(), TelemetryError> {
     Ok(())
 }
 
-/// Build the per-run `rank`/`world` span that stamps **every** event emitted while it
-/// is entered with this rank's identity.
+/// Build the per-run `rank`/`world` span that stamps events emitted while it is
+/// entered with this rank's identity.
 ///
 /// Under data parallelism every rank logs to the same stdout/stderr, so without a rank
-/// stamp the interleaved lines are unattributable. Enter this span once for the lifetime
-/// of a run (hold the returned guard) and every `tracing` event below it — the policy's,
-/// the reward's, the trainer's — carries `rank` and `world`:
+/// stamp the interleaved lines are unattributable. Enter this span whenever rank/world
+/// context is needed (hold the returned guard); `tracing` events emitted while it is
+/// entered — the policy's, the reward's, the trainer's — carry `rank` and `world`:
 ///
 /// ```
 /// let _run = ferrl::run_span(0, 1).entered();
@@ -215,23 +215,25 @@ pub fn init_tracing() -> Result<(), TelemetryError> {
 /// ```
 ///
 /// [`Trainer`](crate::trainer::Trainer) enters this span around its run loop and a
-/// nested per-step `step` span inside it, so a trainer's own events are
-/// `rank`/`world`/`step`-stamped automatically; a launcher wraps its setup/eval/gate
-/// events by entering this span itself.
+/// nested per-step `step` span inside it. Events emitted while those spans are entered
+/// inherit `rank`/`world`/`step` as applicable. CLI setup, evaluation, and post-run
+/// events are not automatically wrapped; their call sites must enter the relevant span
+/// when this context is required.
 ///
 /// The span is created at **ERROR** level — the max severity — deliberately. A span is
 /// only entered while its level passes the active filter, so an `info`-level context
 /// span would silently drop out under `RUST_LOG=warn`/`error` (the very filters used to
 /// quiet a long run) and the warnings/errors that matter most — e.g. the preemption
 /// warn — would emit *without* rank/world/step. ERROR level keeps the context enabled
-/// for any filter that emits anything at all, so emitted warnings/errors always carry it.
+/// for any filter that emits anything at all, so warnings/errors emitted while the span
+/// is entered carry it.
 #[must_use]
 pub fn run_span(rank: usize, world: usize) -> tracing::Span {
     tracing::error_span!("run", rank, world)
 }
 
 /// The per-step span nested under [`run_span`]: stamps `step` onto every event emitted
-/// during one optimizer step.
+/// while it is entered during one optimizer step.
 ///
 /// ERROR level for the same reason as [`run_span`] — the context must survive a
 /// `RUST_LOG=warn`/`error` filter so emitted warnings/errors keep their `step`. Kept a
@@ -2876,6 +2878,20 @@ mod tests {
         assert_eq!(rd.run_id(), "run-001");
         assert_eq!(rd.root(), tmp.path().join("run-001"));
         assert_exact_eager_layout_without_run_log(&rd);
+    }
+
+    #[test]
+    #[allow(deprecated)] // compatibility-only legacy log-path API
+    fn rundir_legacy_log_path_api_remains_compatible() {
+        let tmp = TempDir::new("rundir-legacy-log");
+        let rd = RunDir::create(tmp.path(), "run-001").unwrap();
+        assert_eq!(RunDir::LOG_FILE, "run.log");
+        let log_path = rd.log_path();
+        assert_eq!(log_path, rd.root().join("run.log"));
+        assert!(
+            !log_path.exists(),
+            "legacy accessor must not materialize a file"
+        );
     }
 
     #[test]

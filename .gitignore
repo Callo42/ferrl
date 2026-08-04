@@ -7,8 +7,10 @@
 **/*.rs.bk
 
 # --- Training run outputs ---
-# Each `runs/<run_id>/` holds config.json, metrics.jsonl, checkpoints and a human
-# log. These are produced by training and are not source; never commit them.
+# Each `runs/<run_id>/` holds persisted training artifacts such as config.json,
+# metrics.jsonl, and checkpoints. Formatted tracing goes to stdout; capture it
+# externally for a durable human-readable log. Run artifacts are not source;
+# never commit them.
 /runs
 
 # --- Slurm job output ---
