@@ -1,4 +1,5 @@
-//! A candle-bit-identical `AdamW` that ferrl owns: [`FerrlAdamW`].
+//! A candle-bit-identical (for `i32`-representable step exponents) `AdamW` that ferrl
+//! owns: [`FerrlAdamW`].
 //!
 //! ## Why clone candle's optimizer
 //!
@@ -10,13 +11,15 @@
 //! bias-correction counter at zero, so the resumed trajectory diverges from an
 //! uninterrupted one (see [`crate::trainer::Trainer::train_from`]).
 //!
-//! [`FerrlAdamW`] clones candle-nn 0.10.2's `AdamW` update line-for-line and ferrl
-//! owns it, so a later phase can read, serialize, and restore that state. This first
-//! step is a pure drop-in: it changes *nothing* about the update — it computes the
-//! identical step candle does, which a permanent equivalence canary
-//! (`ferrl_adamw_step_is_bit_identical_to_candle`) pins bit-for-bit. (The clone is
-//! candle's `Optimizer` impl and its moment-bearing struct; candle's unused inherent
-//! convenience constructors — `new_lr`/`params`/`set_params` — are omitted.)
+//! [`FerrlAdamW`] clones candle-nn 0.10.2's `AdamW` update line-for-line while its
+//! counter remains representable by candle's `i32` exponent, and ferrl owns it so a
+//! later phase can read, serialize, and restore that state. For those ordinary steps
+//! it is a pure drop-in: it computes the identical step candle does, which a permanent
+//! equivalence canary (`ferrl_adamw_step_is_bit_identical_to_candle`) pins bit-for-bit.
+//! A restored `usize` counter beyond that boundary uses the same mathematical
+//! bias-correction power without narrowing the exponent. (The clone is candle's
+//! `Optimizer` impl and its moment-bearing struct; candle's unused inherent convenience
+//! constructors — `new_lr`/`params`/`set_params` — are omitted.)
 //!
 //! ## The update (decoupled `AdamW`)
 //!
@@ -36,9 +39,9 @@
 //!
 //! ## Staying in sync with candle
 //!
-//! Because this is a deliberate clone, the canary doubles as a drift alarm: if a
-//! future candle-nn changes the `AdamW` algorithm, the bit-for-bit assertion goes
-//! red and we re-sync intentionally rather than silently diverging.
+//! Because this is a deliberate clone, the ordinary-step canary doubles as a drift
+//! alarm: if a future candle-nn changes the `AdamW` algorithm, the bit-for-bit
+//! assertion goes red and we re-sync intentionally rather than silently diverging.
 
 use candle_core::backprop::GradStore;
 use candle_core::{Result as CandleResult, Tensor, Var};
@@ -55,14 +58,17 @@ struct VarAdamW {
     second_moment: Var,
 }
 
-/// `AdamW`'s `Optimizer` impl, cloned line-for-line from candle-nn 0.10.2 so ferrl
-/// owns the optimizer state needed for momentum-faithful checkpoint resume.
+/// `AdamW`'s `Optimizer` impl, cloned line-for-line from candle-nn 0.10.2 for steps
+/// representable by candle's `i32` exponent, so ferrl owns the optimizer state needed
+/// for momentum-faithful checkpoint resume.
 ///
 /// It implements [`candle_nn::Optimizer`] with the same [`ParamsAdamW`] config, so
 /// it is a drop-in replacement for [`candle_nn::optim::AdamW`]. The step is
-/// bit-identical to candle's — pinned by an equivalence canary in this module's
-/// tests. The reuse of candle's [`ParamsAdamW`] (rather than a duplicate config)
-/// keeps that canary a fair, apples-to-apples comparison.
+/// bit-identical to candle's for those ordinary steps — pinned by an equivalence
+/// canary in this module's tests. Restored counters above candle's exponent boundary
+/// use a non-wrapping equivalent power calculation. The reuse of candle's
+/// [`ParamsAdamW`] (rather than a duplicate config) keeps that canary a fair,
+/// apples-to-apples comparison.
 #[derive(Debug)]
 pub struct FerrlAdamW {
     vars: Vec<VarAdamW>,
@@ -87,6 +93,34 @@ pub struct OptimizerState {
     pub first_moments: Vec<Tensor>,
     /// Raw second-moment buffers `v`, one per optimized var, in optimizer order.
     pub second_moments: Vec<Tensor>,
+}
+
+/// Compute `beta.powi(step_t)` without narrowing a restored `usize` counter.
+///
+/// For `step_t` values candle can express, this deliberately calls `powi` with the
+/// same `i32` exponent and therefore preserves candle's rounding and operation order.
+/// Beyond that range it uses exponentiation by squaring, which is `O(log(step_t))` and
+/// so does not turn a corrupted-but-representable restored counter into impractical
+/// linear work. The large-counter branch assumes the trainer-validated Adam domain:
+/// finite `0.0 <= beta < 1.0` and a positive step counter.
+fn beta_to_step(beta: f64, step_t: usize) -> f64 {
+    if let Ok(step_t) = i32::try_from(step_t) {
+        return beta.powi(step_t);
+    }
+
+    let mut remaining = step_t;
+    let mut factor = beta;
+    let mut product = 1.0;
+    while remaining != 0 {
+        if remaining & 1 != 0 {
+            product *= factor;
+        }
+        remaining >>= 1;
+        if remaining != 0 {
+            factor *= factor;
+        }
+    }
+    product
 }
 
 impl FerrlAdamW {
@@ -222,14 +256,22 @@ impl Optimizer for FerrlAdamW {
     }
 
     fn step(&mut self, grads: &GradStore) -> CandleResult<()> {
-        self.step_t += 1;
+        // Check before any state changes: an exhausted counter cannot produce a valid
+        // next bias-correction exponent, and must leave the optimizer transactional.
+        let step_t = self
+            .step_t
+            .checked_add(1)
+            .ok_or_else(|| candle_core::Error::Msg("AdamW step counter overflow".to_owned()))?;
         let lr = self.params.lr;
         let lambda = self.params.weight_decay;
         let lr_lambda = lr * lambda;
         let beta1 = self.params.beta1;
         let beta2 = self.params.beta2;
-        let scale_m = 1f64 / (1f64 - beta1.powi(self.step_t as i32));
-        let scale_v = 1f64 / (1f64 - beta2.powi(self.step_t as i32));
+        let scale_m = 1f64 / (1f64 - beta_to_step(beta1, step_t));
+        let scale_v = 1f64 / (1f64 - beta_to_step(beta2, step_t));
+        // Keep candle's observable timing for ordinary tensor-operation failures: once
+        // the next step has been accepted, the counter advances before parameter work.
+        self.step_t = step_t;
         // `&self.vars` is the clippy-preferred idiom for candle's `self.vars.iter()`
         // — identical iteration; the only cosmetic deviation from the upstream clone.
         for var in &self.vars {
@@ -261,6 +303,59 @@ mod tests {
 
     fn vec1(t: &candle_core::Tensor) -> Vec<f32> {
         t.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+    }
+
+    fn vec1_f64(t: &candle_core::Tensor) -> Vec<f64> {
+        t.flatten_all().unwrap().to_vec1::<f64>().unwrap()
+    }
+
+    /// Independently derive a scalar `AdamW` update with `powf`, rather than the
+    /// production integer-exponent helper. The large-counter test inputs are exactly
+    /// representable as `f64`; callers allow the documented rounding delta separately.
+    fn independently_derived_scalar_adamw_step(
+        params: &ParamsAdamW,
+        step_t: usize,
+        theta: f64,
+        first_moment: f64,
+        second_moment: f64,
+        gradient: f64,
+    ) -> (f64, f64, f64, f64) {
+        let next_m = first_moment * params.beta1 + gradient * (1.0 - params.beta1);
+        let next_v = second_moment * params.beta2 + gradient * gradient * (1.0 - params.beta2);
+        let scale_m = 1.0 / (1.0 - params.beta1.powf(step_t as f64));
+        let scale_v = 1.0 / (1.0 - params.beta2.powf(step_t as f64));
+        let next_theta = theta * (1.0 - params.lr * params.weight_decay)
+            - params.lr * (next_m * scale_m) / ((next_v * scale_v).sqrt() + params.eps);
+        (next_m, next_v, scale_v, next_theta)
+    }
+
+    fn assert_scalar_adamw_state(
+        opt: &FerrlAdamW,
+        expected_step_t: usize,
+        expected_m: f64,
+        expected_v: f64,
+    ) {
+        let after = opt.state().unwrap();
+        assert_eq!(after.step_t, expected_step_t);
+        assert!((vec1_f64(&after.first_moments[0])[0] - expected_m).abs() < 1e-15);
+        assert!((vec1_f64(&after.second_moments[0])[0] - expected_v).abs() < 1e-15);
+    }
+
+    /// Independently evaluate `beta^t` from an explicit, ascending list of set-bit
+    /// positions. The caller supplies the bit contract rather than deriving it from the
+    /// `usize` exponent being checked.
+    fn power_from_explicit_set_bits(beta: f64, set_bits: &[u32]) -> f64 {
+        let mut factor = beta;
+        let mut current_bit = 0;
+        let mut product = 1.0;
+        for &set_bit in set_bits {
+            while current_bit < set_bit {
+                factor *= factor;
+                current_bit += 1;
+            }
+            product *= factor;
+        }
+        product
     }
 
     /// Run `n` `AdamW` steps whose gradient is the constant `c`: for `L(w) = sum(w · c)`,
@@ -468,6 +563,293 @@ mod tests {
         assert!(
             opt.load_state(&wrong_shape).is_err(),
             "moment-shape mismatch must fail loud"
+        );
+    }
+
+    /// The production bias-correction dispatch must retain candle's `powi` bits for
+    /// every ordinary `i32` exponent, not merely for the first few canary steps.
+    #[test]
+    fn ordinary_bias_correction_dispatch_is_bit_identical_to_powi() {
+        // The `i32::MAX - 1` case is deliberately after the 12-step candle canary yet
+        // still ordinary. This beta produces different bits through `powf`, so the
+        // assertions below kill a mutant that switches to `powf` after that canary.
+        let beta = 0.999_999_999_9_f64;
+        let i32_max = usize::try_from(i32::MAX).unwrap();
+        for step_t in [1, 12, 13, i32_max - 1, i32_max] {
+            assert_eq!(
+                beta_to_step(beta, step_t).to_bits(),
+                beta.powi(i32::try_from(step_t).unwrap()).to_bits(),
+                "ordinary step {step_t} must retain candle's powi bits"
+            );
+        }
+        assert_ne!(
+            beta_to_step(beta, i32_max - 1).to_bits(),
+            beta.powf((i32_max - 1) as f64).to_bits(),
+            "the selected post-canary beta/step pair must reject a powf dispatch mutant"
+        );
+    }
+
+    /// Large-branch powers must consume the exact restored exponent rather than its
+    /// predecessor or successor, including when `usize` is only 32 bits wide.
+    #[test]
+    fn large_bias_power_rejects_adjacent_exponents_on_all_targets() {
+        // t = 2^31 + 2^4 + 2^0 is just beyond candle's i32 exponent boundary and is
+        // representable by 32-bit usize. The arrays bind the expected t, t - 1, and
+        // t + 1 bit contracts without inspecting the `step_t` under test.
+        let step_t = (1usize << 31) | (1usize << 4) | 1;
+        let expected_bits = [0, 4, 31];
+        let predecessor_bits = [4, 31];
+        let successor_bits = [1, 4, 31];
+        let beta = 0.999_999_999_9_f64;
+
+        let expected = power_from_explicit_set_bits(beta, &expected_bits);
+        assert_eq!(beta_to_step(beta, step_t).to_bits(), expected.to_bits());
+
+        let predecessor = power_from_explicit_set_bits(beta, &predecessor_bits);
+        let successor = power_from_explicit_set_bits(beta, &successor_bits);
+        assert_ne!(expected.to_bits(), predecessor.to_bits());
+        assert_ne!(expected.to_bits(), successor.to_bits());
+    }
+
+    /// Full-width large-counter powers must preserve high `usize` bits rather than
+    /// discard every exponent bit above bit 52.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn full_width_large_bias_power_preserves_explicit_high_bits() {
+        // t = 2^54 + 2^31 + 2^4 + 2^0. The explicit arrays below deliberately do
+        // not inspect `step_t`: they independently bind the expected exponent and the
+        // three mutation controls (t - 1, t + 1, and loss of every bit above bit 52).
+        let step_t = (1usize << 54) | (1usize << 31) | (1usize << 4) | 1;
+        let expected_bits = [0, 4, 31, 54];
+        let predecessor_bits = [4, 31, 54];
+        let successor_bits = [1, 4, 31, 54];
+        let high_bit_loss_bits = [0, 4, 31];
+        // This beta leaves beta^t finite/non-zero, while each adjacent exponent still
+        // moves the result by multiple f64 ulps and high-bit loss is material.
+        let beta = 0.999_999_999_999_999_f64;
+
+        let expected = power_from_explicit_set_bits(beta, &expected_bits);
+        assert_eq!(beta_to_step(beta, step_t).to_bits(), expected.to_bits());
+
+        let predecessor = power_from_explicit_set_bits(beta, &predecessor_bits);
+        let successor = power_from_explicit_set_bits(beta, &successor_bits);
+        assert_ne!(expected.to_bits(), predecessor.to_bits());
+        assert_ne!(expected.to_bits(), successor.to_bits());
+
+        let high_bit_loss = power_from_explicit_set_bits(beta, &high_bit_loss_bits);
+        assert!(
+            (expected - high_bit_loss).abs() > 0.9,
+            "discarding exponent bits above bit 52 must materially change beta^t"
+        );
+    }
+
+    /// A checkpoint may legitimately carry a `usize` step count past candle's `i32`
+    /// `powi` boundary. The production `load_state` + `Optimizer::step` path must use
+    /// the positive, large exponent rather than cast it to a negative `i32` exponent.
+    #[test]
+    fn restored_step_past_i32_boundary_uses_non_wrapping_bias_correction() {
+        let dev = Device::Cpu;
+        // This beta keeps beta^t materially non-zero at t = i32::MAX + 1, making the
+        // scale sensitive to the exponent sign. A legacy `as i32` cast produces
+        // i32::MIN and therefore the reciprocal power, yielding a plainly different
+        // update rather than a test that happens to pass after underflow.
+        let params = ParamsAdamW {
+            lr: 0.1,
+            beta1: 0.999_999_999_9,
+            beta2: 0.5,
+            eps: 1e-8,
+            weight_decay: 0.01,
+        };
+        let initial_theta = 1.25_f64;
+        let initial_m = 0.4_f64;
+        let initial_v = 0.25_f64;
+        let gradient = 0.125_f64;
+        let w =
+            Var::from_tensor(&Tensor::from_vec(vec![initial_theta], (1,), &dev).unwrap()).unwrap();
+        let mut opt = FerrlAdamW::new(vec![w.clone()], params.clone()).unwrap();
+        let step_t = usize::try_from(i32::MAX).unwrap() + 1;
+        let restored = OptimizerState {
+            // The counter is incremented first, so load one less than the boundary
+            // step we want to exercise.
+            step_t: step_t - 1,
+            first_moments: vec![Tensor::from_vec(vec![initial_m], (1,), &dev).unwrap()],
+            second_moments: vec![Tensor::from_vec(vec![initial_v], (1,), &dev).unwrap()],
+        };
+        opt.load_state(&restored).unwrap();
+
+        let gradient_tensor = Tensor::from_vec(vec![gradient], (1,), &dev).unwrap();
+        let grads = (w.as_tensor() * &gradient_tensor)
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .backward()
+            .unwrap();
+        opt.step(&grads).unwrap();
+
+        let (next_m, next_v, scale_v, expected_theta) = independently_derived_scalar_adamw_step(
+            &params,
+            step_t,
+            initial_theta,
+            initial_m,
+            initial_v,
+            gradient,
+        );
+        let actual_theta = vec1_f64(w.as_tensor())[0];
+        // `powf` is an independent oracle, while production uses integer squaring;
+        // allow their small, implementation-order rounding difference at this scale.
+        assert!(
+            (actual_theta - expected_theta).abs() < 1e-8,
+            "large restored counter update differed: actual {actual_theta}, expected {expected_theta}"
+        );
+        assert_scalar_adamw_state(&opt, step_t, next_m, next_v);
+
+        // Mutation control for the old cast/wrap implementation: its negative exponent
+        // takes the opposite-direction parameter step for these explicit values.
+        let legacy_scale_m = 1.0 / (1.0 - params.beta1.powi(step_t as i32));
+        let legacy_theta = initial_theta * (1.0 - params.lr * params.weight_decay)
+            - params.lr * (next_m * legacy_scale_m) / ((next_v * scale_v).sqrt() + params.eps);
+        assert!(legacy_theta.is_finite());
+        assert!(
+            (actual_theta - legacy_theta).abs() > 0.1,
+            "the legacy wrapping exponent must produce a materially different update"
+        );
+    }
+
+    /// A large restored `usize` counter must retain all of its bits: clamping at
+    /// `i32::MAX`, saturating at `u32::MAX`, and truncating the
+    /// exponentiation-by-squaring counter to `u32` all produce materially wrong
+    /// `AdamW` updates for this persisted-state continuation.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn restored_step_past_u32_boundary_preserves_full_exponent() {
+        let dev = Device::Cpu;
+        // At t = 2^33 + 16, this beta gives a material correction scale. The
+        // `i32::MAX` clamp, `u32::MAX` saturation, and u32 truncation (which leaves
+        // exponent 16) are all far enough away to make the parameter controls
+        // unambiguously different.
+        let params = ParamsAdamW {
+            lr: 0.1,
+            beta1: 0.999_999_999_9,
+            beta2: 0.5,
+            eps: 1e-8,
+            weight_decay: 0.01,
+        };
+        let initial_theta = 1.25_f64;
+        let initial_m = 0.4_f64;
+        let initial_v = 0.25_f64;
+        let gradient = 0.125_f64;
+        let w =
+            Var::from_tensor(&Tensor::from_vec(vec![initial_theta], (1,), &dev).unwrap()).unwrap();
+        let mut opt = FerrlAdamW::new(vec![w.clone()], params.clone()).unwrap();
+        let step_t = (usize::try_from(u32::MAX).unwrap() + 1) * 2 + 16;
+        let restored = OptimizerState {
+            step_t: step_t - 1,
+            first_moments: vec![Tensor::from_vec(vec![initial_m], (1,), &dev).unwrap()],
+            second_moments: vec![Tensor::from_vec(vec![initial_v], (1,), &dev).unwrap()],
+        };
+        opt.load_state(&restored).unwrap();
+
+        let gradient_tensor = Tensor::from_vec(vec![gradient], (1,), &dev).unwrap();
+        let grads = (w.as_tensor() * &gradient_tensor)
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .backward()
+            .unwrap();
+        opt.step(&grads).unwrap();
+
+        let (next_m, next_v, scale_v, expected_theta) = independently_derived_scalar_adamw_step(
+            &params,
+            step_t,
+            initial_theta,
+            initial_m,
+            initial_v,
+            gradient,
+        );
+        let actual_theta = vec1_f64(w.as_tensor())[0];
+        // `powf` is an independent oracle, while production uses integer squaring;
+        // allow their small, implementation-order rounding difference at this scale.
+        assert!(
+            (actual_theta - expected_theta).abs() < 1e-8,
+            "full-width restored counter update differed: actual {actual_theta}, expected {expected_theta}"
+        );
+        assert_scalar_adamw_state(&opt, step_t, next_m, next_v);
+
+        let clamped_scale_m = 1.0 / (1.0 - params.beta1.powi(i32::MAX));
+        let clamped_theta = initial_theta * (1.0 - params.lr * params.weight_decay)
+            - params.lr * (next_m * clamped_scale_m) / ((next_v * scale_v).sqrt() + params.eps);
+        assert!(
+            (actual_theta - clamped_theta).abs() > 0.1,
+            "i32::MAX clamping must produce a materially different update"
+        );
+
+        let saturated_step_t = usize::try_from(u32::MAX).unwrap();
+        let saturated_scale_m = 1.0 / (1.0 - params.beta1.powf(saturated_step_t as f64));
+        let saturated_theta = initial_theta * (1.0 - params.lr * params.weight_decay)
+            - params.lr * (next_m * saturated_scale_m) / ((next_v * scale_v).sqrt() + params.eps);
+        assert!(
+            (actual_theta - saturated_theta).abs() > 0.05,
+            "u32::MAX saturation must produce a materially different update"
+        );
+
+        let low_u32_mask = usize::try_from(u32::MAX).unwrap();
+        let truncated_step_t = u32::try_from(step_t & low_u32_mask).unwrap();
+        assert_eq!(truncated_step_t, 16);
+        let truncated_scale_m =
+            1.0 / (1.0 - params.beta1.powi(i32::try_from(truncated_step_t).unwrap()));
+        let truncated_theta = initial_theta * (1.0 - params.lr * params.weight_decay)
+            - params.lr * (next_m * truncated_scale_m) / ((next_v * scale_v).sqrt() + params.eps);
+        assert!(
+            (actual_theta - truncated_theta).abs() > 1e6,
+            "u32 exponent truncation must produce a materially different update"
+        );
+    }
+
+    /// Counter overflow fails before touching the restored counter, moments, or
+    /// parameter, so an invalid checkpoint cannot partially advance the optimizer.
+    #[test]
+    fn max_restored_step_counter_fails_without_mutating_optimizer() {
+        let dev = Device::Cpu;
+        let params = ParamsAdamW {
+            lr: 0.1,
+            beta1: 0.9,
+            beta2: 0.99,
+            eps: 1e-8,
+            weight_decay: 0.01,
+        };
+        let w = Var::from_tensor(&Tensor::from_vec(vec![1.25_f64], (1,), &dev).unwrap()).unwrap();
+        let mut opt = FerrlAdamW::new(vec![w.clone()], params).unwrap();
+        let restored = OptimizerState {
+            step_t: usize::MAX,
+            first_moments: vec![Tensor::from_vec(vec![0.4_f64], (1,), &dev).unwrap()],
+            second_moments: vec![Tensor::from_vec(vec![0.25_f64], (1,), &dev).unwrap()],
+        };
+        opt.load_state(&restored).unwrap();
+        let before = opt.state().unwrap();
+        let theta_before = vec1_f64(w.as_tensor());
+
+        let gradient = Tensor::from_vec(vec![0.125_f64], (1,), &dev).unwrap();
+        let grads = (w.as_tensor() * &gradient)
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .backward()
+            .unwrap();
+        assert!(
+            opt.step(&grads).is_err(),
+            "usize::MAX must fail before stepping"
+        );
+
+        let after = opt.state().unwrap();
+        assert_eq!(after.step_t, before.step_t);
+        assert_eq!(vec1_f64(w.as_tensor()), theta_before);
+        assert_eq!(
+            vec1_f64(&after.first_moments[0]),
+            vec1_f64(&before.first_moments[0])
+        );
+        assert_eq!(
+            vec1_f64(&after.second_moments[0]),
+            vec1_f64(&before.second_moments[0])
         );
     }
 }

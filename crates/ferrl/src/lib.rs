@@ -52,10 +52,11 @@
 //! - the GRPO training loop ([`trainer`]) — the `Trainer` that drives rollout →
 //!   reward → advantages → masked clipped surrogate (+ optional KL) →
 //!   canary-guarded [`FerrlAdamW`] step;
-//! - a candle-bit-identical `AdamW` ([`optim`]) — [`FerrlAdamW`], a line-for-line
-//!   clone of candle's optimizer that ferrl owns so it can persist and restore the
-//!   moment state ([`OptimizerState`]) for momentum-faithful resume, pinned to candle
-//!   by a permanent equivalence canary;
+//! - an `AdamW` ([`optim`]) — [`FerrlAdamW`], a candle-bit-identical, line-for-line
+//!   clone for `i32`-representable step exponents that ferrl owns so it can persist and
+//!   restore the moment state ([`OptimizerState`]) for momentum-faithful resume, pinned
+//!   to candle by a permanent equivalence canary; restored larger counters use
+//!   non-narrowing bias correction;
 //! - checkpointing ([`checkpoint`]) — explicit legacy-v1 adapter-only save/load for
 //!   eval ([`save_adapter`]), and an identity/integrity-bound, momentum-faithful
 //!   ordinary format-v4 checkpoint ([`save_checkpoint`]) that binds immutable policy
