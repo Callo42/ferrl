@@ -6694,7 +6694,9 @@ fn an_uncovered_var_on_one_rank_aborts_every_rank_in_lockstep() {
                     // contract holds), but rank 0's backward never covers it.
                     let mut policy = GatedExtraPolicy::new(SEED, rank == 1);
                     let run = RunDir::create(base, format!("rank{rank}")).unwrap();
-                    let mut trainer = Trainer::with_comm(cfg, &run, comm).unwrap();
+                    let mut trainer = Trainer::with_comm(cfg, &run, comm)
+                        .unwrap()
+                        .with_frozen_policy_sha256(checkpoint_policy_sha256());
                     let err = trainer
                         .train(&mut policy, &EchoOrFlatReward, &CharTokenizer, &samples)
                         .unwrap_err();
@@ -7134,6 +7136,7 @@ fn resume_latest_under_dp_broadcasts_a_rank0_scan_failure_instead_of_hanging() {
                     let run = RunDir::create(basep, format!("sf-rank{rank}")).unwrap();
                     let mut trainer = Trainer::with_comm(scripted_cfg(), &run, comm)
                         .unwrap()
+                        .with_frozen_policy_sha256(checkpoint_policy_sha256())
                         .with_checkpoints_dir(ckpt);
                     trainer
                         .resume_latest(
@@ -7342,7 +7345,9 @@ fn dp_resume_latest_coordinates_legacy_and_step_mismatch_as_scan_failed() {
 
                             assert_eq!(
                                 scalar_calls.load(Ordering::SeqCst),
-                                1,
+                                // Mandatory identity consensus contributes ten
+                                // calls before the one discovery broadcast.
+                                11,
                                 "{tag} rank {rank}: later scalar collective"
                             );
                             assert_eq!(
@@ -7535,13 +7540,17 @@ fn ordinary_dp_resume_panic_contains_the_complete_preflight_before_any_mutation(
     let checkpoint = tmp.path().join("rank0/checkpoints/step-1");
     assert!(checkpoint.is_dir(), "seed checkpoint was not published");
 
+    // Every explicit DP resume now starts with ten identity collectives: one
+    // local-validation status, eight SHA-256 word broadcasts, and one final
+    // consensus status. The per-case suffixes below retain the original oracle
+    // and still prove that no later collective was entered.
     for (case, fault, expected_scalars) in [
-        ("lora-recipe", ResumePreflightPanic::LoraRecipe, 3),
-        ("trainable-vars", ResumePreflightPanic::TrainableVars, 1),
+        ("lora-recipe", ResumePreflightPanic::LoraRecipe, 13),
+        ("trainable-vars", ResumePreflightPanic::TrainableVars, 11),
         (
             "sampler-validation",
             ResumePreflightPanic::SamplerValidation,
-            14,
+            24,
         ),
     ] {
         let reward_calls = Arc::new(AtomicUsize::new(0));
@@ -8342,7 +8351,9 @@ fn assert_real_model_lockstep(tag: &str, make_policy: fn(u64) -> Qwen3_5Policy) 
                     let rank = comm.rank();
                     let mut policy = make_policy(7);
                     let run = RunDir::create(base, format!("rank{rank}")).unwrap();
-                    let mut trainer = Trainer::with_comm(cfg, &run, comm).unwrap();
+                    let mut trainer = Trainer::with_comm(cfg, &run, comm)
+                        .unwrap()
+                        .with_frozen_policy_sha256(checkpoint_policy_sha256());
                     let history = trainer
                         .train(&mut policy, &SpreadReward, &ByteCodec, &samples)
                         .unwrap();
@@ -8417,7 +8428,9 @@ fn nccl_tiny_qwen35_lora_smoke_reaches_update_path() {
     );
     std::fs::create_dir_all(&root).unwrap();
     let run = RunDir::create(&root, format!("rank{rank}")).unwrap();
-    let mut trainer = Trainer::with_comm(cfg, &run, comm).unwrap();
+    let mut trainer = Trainer::with_comm(cfg, &run, comm)
+        .unwrap()
+        .with_frozen_policy_sha256(checkpoint_policy_sha256());
     let samples = ["abc", "bcd"]
         .map(|s| Sample::new(s, ()))
         .into_iter()
