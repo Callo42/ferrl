@@ -23,8 +23,9 @@
 //! - **Durability and provenance:** identity-bound ordinary [`checkpoint`]
 //!   packages, the versioned separated [`rollout_ledger`] contract, and
 //!   [`telemetry`] for launch/config identity, metrics, candidate rows, and
-//!   held-out reports. The binary adds launch authentication and strict TriMul
-//!   artifact publication over those library boundaries.
+//!   held-out reports. The [`discovery`] facade adds generic local launch and
+//!   candidate authentication plus manifest-last accepted-artifact publication;
+//!   the binary retains the stricter task-specific TriMul audit boundary.
 //! - **Model generality:** [`model`] and [`policy`] define the grad-forward,
 //!   cached-decoder, generation, and token-scoring contracts. [`lm_policy`]
 //!   instantiates them for Qwen3, dense Llama-3.x, Qwen3.5/3.6 dense and `MoE`,
@@ -77,6 +78,7 @@ pub mod countdown;
 pub mod cuda_compat;
 pub mod data;
 pub mod dense;
+pub mod discovery;
 pub mod eval;
 mod full_ft;
 pub mod gdn;
