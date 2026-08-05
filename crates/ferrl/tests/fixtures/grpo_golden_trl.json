@@ -1,5 +1,5 @@
 {
-  "_comment": "REAL-TRL GRPO loss golden: produced by TRL's GRPOTrainer._compute_loss over the shared crafted batch below. Regenerate via scripts/oracle/gen_grpo_golden_trl.py in the pinned ferrl-oracle env.",
+  "_comment": "REAL-TRL GRPO loss golden: produced by TRL's GRPOTrainer._compute_loss over the shared crafted batch below. Regenerate via scripts/oracle/gen_grpo_golden_trl.py in the ferrl-oracle env with trl==1.5.1.",
   "trl_version": "1.5.1",
   "torch_version": "2.12.0+cpu",
   "transformers_version": "5.11.0",

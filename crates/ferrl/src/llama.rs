@@ -99,7 +99,7 @@ impl DenseArch for LlamaArch {
 
     fn spec(cfg: &Config, dtype: DType, device: &Device) -> CandleResult<DenseSpec> {
         // Fail loud on Config options this forward does not implement, rather
-        // than silently loading a non-parity model (the P3 pattern). Flash
+        // than silently loading a non-parity model. Flash
         // attention is a fused GPU kernel with no backward and different
         // masking semantics; this update path implements only the non-flash
         // F32 SDPA the shipped CPU/parity path uses.
@@ -359,8 +359,8 @@ mod tests {
     // All measured under the seeded `WEIGHT_SEED`/`WEIGHT_STD` weights (the
     // measured worst per gate is recorded next to each constant; logit scale
     // ≈ 6–7), then set with ~10–30x headroom for cross-host float
-    // reassociation (CI's CPU is not the dev host's — the P2 platform
-    // lesson; the floors themselves are deterministic under the seed). Tight
+    // reassociation (CI's CPU is not the dev host's; the floors themselves are
+    // deterministic under the seed). Tight
     // envelopes are what make these gates non-vacuous: at the old 1e-3 with
     // unseeded N(0, 0.2) weights, even removing RoPE entirely passed most
     // draws, while here the RoPE-scaling signal alone is ~1.2 in logit space
@@ -641,7 +641,7 @@ mod tests {
     #[test]
     fn load_rejects_flash_attn() {
         // A valid llama Config we don't implement must fail loud, not load a
-        // silently non-parity model (the P3 pattern).
+        // silently non-parity model.
         let mut cfg = tiny_cfg();
         cfg.use_flash_attn = true;
         let vb = tiny_vb(&cfg);
@@ -657,7 +657,7 @@ mod tests {
         // hidden_size not divisible by num_attention_heads: the shipped model
         // errors at a reshape mid-forward; ours derives a truncated head_dim
         // and would silently run a degenerate non-parity model — so the load
-        // must fail loud instead (the P3 pattern).
+        // must fail loud instead.
         let mut cfg = tiny_cfg();
         cfg.hidden_size = 10; // 10 % 2 == 0 would pass; use 4 heads: 10 % 4 != 0
         cfg.num_attention_heads = 4;
@@ -1439,7 +1439,7 @@ mod tests {
         );
     }
 
-    // ---- activation checkpointing (P7) --------------------------------------
+    // ---- activation checkpointing -------------------------------------------
 
     /// A fixed non-uniform probe loss over the logits — no gradient cancels
     /// by symmetry.
@@ -1450,7 +1450,7 @@ mod tests {
         logits.mul(&w).unwrap().sum_all().unwrap()
     }
 
-    /// Checkpointing on the second architecture: stitched gradients match the
+    /// Checkpointing on Llama: stitched gradients match the
     /// uncut backward on every adapter var, and a raw `loss.backward()` after
     /// a checkpointed forward reaches none (the tape really is cut).
     #[test]
@@ -1516,7 +1516,7 @@ mod tests {
         }
     }
 
-    /// The narrowed scoring forward on the second architecture: values and
+    /// The narrowed Llama scoring forward: values and
     /// adapter gradients exactly match `forward` + narrow (plain and
     /// checkpointed), and the narrowed detached walk captures no tape.
     #[test]

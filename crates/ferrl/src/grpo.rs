@@ -113,8 +113,8 @@ pub enum ScaleRewards {
 /// to the pre-seam behavior. Note: GSPO practice pairs `Sequence` with a much
 /// tighter clip band (the paper uses ~`3e-4`–`4e-4`) — the knob does not
 /// re-default `clip_eps`. Whether to adopt `Sequence` for mixture-of-experts
-/// training is an M3′-era decision; this seam exists so that decision is a
-/// config flip.
+/// training uses `Sequence` in its pinned recipe; this seam keeps that choice a
+/// config value rather than a separate objective implementation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImportanceSamplingLevel {
@@ -1046,7 +1046,7 @@ mod tests {
 
     #[test]
     fn loss_type_default_is_dapo() {
-        // The R1 default switch (maintainer-confirmed): token-level batch
+        // The maintained default is token-level batch
         // normalizer, matching TRL's shipped default; Grpo stays selectable.
         assert_eq!(LossType::default(), LossType::Dapo);
     }

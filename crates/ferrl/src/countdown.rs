@@ -1,6 +1,6 @@
 //! The Countdown task — a verifiable arithmetic reward for GRPO.
 //!
-//! Countdown is the P4 task: given a small multiset of `numbers` and a `target`,
+//! Given a small multiset of `numbers` and a `target`, the policy must
 //! write an arithmetic expression that uses **each number exactly once** with the
 //! operators `+ - * /` (and parentheses) and evaluates to the target. It is an
 //! exact, deterministic, verifiable reward — the kind GRPO is built for — and is
@@ -39,10 +39,9 @@
 //!
 //! # Where the run lives
 //!
-//! The real GPU training run that drives [`crate::QwenPolicy`] over this reward —
-//! the P4 gate (reward rises **and** the trained adapter beats base on a held-out
-//! Countdown eval, via [`crate::evaluate`]) — lives in
-//! `examples/countdown_grpo.rs`, outside the coverage-gated library.
+//! The runnable [`crate::QwenPolicy`] training example lives in
+//! `examples/countdown_grpo.rs`, outside the coverage-gated library; held-out
+//! adapter-vs-base evaluation uses [`crate::evaluate`].
 
 use crate::reward::{RewardError, RewardFn};
 use crate::sample::Sample;

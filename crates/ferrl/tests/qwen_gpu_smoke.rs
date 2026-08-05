@@ -1,13 +1,13 @@
-//! P4-PR1 GPU smoke gate for [`ferrl::QwenPolicy`] (`#[ignore]`d).
+//! GPU smoke gate for [`ferrl::QwenPolicy`] (`#[ignore]`d).
 //!
 //! Drives the **real** `Qwen3-0.6B-Base` checkpoint through one GRPO run on a
-//! CUDA device: rollout (uncached, adapter-aware sampling) -> reward -> advantages
+//! CUDA device: cached merged-weight rollout -> reward -> advantages
 //! -> backward through the grad-bearing Qwen forward -> grad-coverage canary ->
 //! `AdamW`. It validates that the whole train path runs on a GPU without OOM and
-//! produces finite metrics — the P4-PR1 gate. It is **not** a convergence test
-//! (two steps); reward-rise vs a held-out eval is the later P4 gate.
+//! produces finite metrics. It is **not** a convergence test (two steps);
+//! reward-rise and held-out evaluation are separate longer-run checks.
 //!
-//! Like the P3 real-weights gates this is `#[ignore]`d (needs the staged
+//! Like the real-weights gates this is `#[ignore]`d (needs the staged
 //! checkpoint via `FERRL_QWEN_WEIGHTS`) and additionally needs a CUDA build and a
 //! GPU. Run it on a GPU node:
 //!
@@ -17,8 +17,8 @@
 //!     cargo test -p ferrl --features cuda --test qwen_gpu_smoke -- --ignored
 //! ```
 //!
-//! Everything runs in F32 (the bf16 checkpoint is upcast on load); the bf16-base /
-//! f32-adapter split is a later memory optimization (see `PLAN.md`).
+//! This smoke deliberately runs in F32 by upcasting the checkpoint; production
+//! loaders also support a bf16 base with F32 adapter state.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -248,7 +248,7 @@ fn arm_adapter(policy: &QwenPolicy, device: &Device) {
 #[ignore = "needs the real Qwen3-0.6B-Base checkpoint (FERRL_QWEN_WEIGHTS) + a CUDA build/GPU"]
 #[allow(clippy::print_stderr)] // a manual gate: the printed agreement/diff numbers are the deliverable
 fn merged_decoder_bf16_faithfulness_on_gpu() {
-    // The P6-C **required manual bf16 GPU gate**: prove the cached `MergedDecoder`
+    // The **required manual bf16 GPU gate**: prove the cached `MergedDecoder`
     // rollout (the production path) is faithful to the uncached adapter-aware forward
     // in the real **bf16-base / F32-adapter** dtype split — the regime CPU CI cannot
     // reach (candle's CPU backend has no bf16 matmul). The CPU gates pin the F32 family
@@ -362,8 +362,8 @@ fn merged_decoder_bf16_faithfulness_on_gpu() {
 #[ignore = "needs the real Qwen3-0.6B-Base checkpoint (FERRL_QWEN_WEIGHTS) + a CUDA build/GPU"]
 #[allow(clippy::print_stderr)] // a manual gate: the printed timings are the deliverable
 fn cached_rollout_perf_witness_on_gpu() {
-    // The throughput witness the whole of P6-C exists for: the cached decoder's
-    // incremental forward cost is O(L) per token vs the uncached forward's O(L²)
+    // The cached-decoder throughput witness: incremental forward cost is O(L)
+    // per token vs the uncached forward's O(L²)
     // (it re-runs the full prefix every step). Times the FORWARD cost of both over a
     // real generation length on the real model; a scalar read at the end of each phase
     // forces the CUDA stream to drain so the wall-clock is honest. The asymptotic gap
@@ -449,7 +449,7 @@ fn assert_logprobs_close(a: &[Vec<f32>], b: &[Vec<f32>], tol: f32) {
 #[test]
 #[ignore = "needs the real Qwen3-0.6B-Base checkpoint (FERRL_QWEN_WEIGHTS) + a CUDA build/GPU"]
 fn qwen_checkpoint_roundtrip_and_eval_on_gpu() {
-    // P4-PR2 on CUDA: the adapter save/load device transfer (GPU -> CPU on save,
+    // On CUDA, cover the adapter save/load device transfer (GPU -> CPU on save,
     // CPU -> GPU on load) and the eval harness, which the CPU tests cannot cover.
     let dir = weights_dir();
     let cfg = load_config(&dir);
@@ -515,7 +515,7 @@ fn cuda_preflight_agrees_on_a_supported_gpu() {
     // warn-only heuristic; on an untabulated driver it may *conservatively* say `TooOld`
     // even though the guard passed, which is acceptable (it never blocks). So the real
     // `222` translation is exercised by the deliberately-mismatched build documented in
-    // the PR (an old-driver node), which CI/this suite cannot stage.
+    // a deliberately mismatched old-driver validation, which CI/this suite cannot stage.
     let device = Device::new_cuda(0)
         .expect("CUDA device 0 — build with --features cuda and run on a GPU node");
     ferrl::guard_first_kernel(&device).expect("guard_first_kernel must pass on a supported GPU");

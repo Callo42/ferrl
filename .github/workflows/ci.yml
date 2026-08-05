@@ -1,11 +1,12 @@
 name: CI
 
-# ferrl CI — candle-native GRPO RL library, CPU-only on GitHub runners.
+# ferrl CI — candle-native RL-discovery platform, CPU-only on GitHub runners.
 # GPU runs are manual on a Slurm cluster and are deliberately NOT part of CI.
 #
-# Quality gate mirrors the locked bar: rustfmt, curated clippy with -D warnings,
-# test + doctests, cargo-llvm-cov with a HARD --fail-under-lines 90, rustdoc with
-# -D warnings, and a Conventional-Commits check via cocogitto on PRs.
+# Quality gate: rustfmt; curated clippy with -D warnings; the gate-feature
+# TriMul contract; tests + doctests; cargo-llvm-cov with a HARD
+# --fail-under-lines 90; rustdoc with -D warnings; supply-chain checks; the 1.87
+# MSRV; and a Conventional-Commits check via cocogitto on PRs.
 
 on:
   push:

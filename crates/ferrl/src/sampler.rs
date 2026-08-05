@@ -6,9 +6,8 @@
 //! checkpoint cannot capture the rollout RNG: a resumed run re-seeds sampling and
 //! its trajectory diverges from an uninterrupted one. [`GrpoSampler`] reproduces
 //! candle's temperature multinomial sampling on a ferrl-owned
-//! [`Xoshiro256PlusPlus`] whose full state is
-//! `serde`-serializable, so a later phase (P6-B checkpoint v2) can snapshot and
-//! restore it for bit-exact resume.
+//! [`Xoshiro256PlusPlus`] whose full state is `serde`-serializable, so ordinary
+//! checkpoints and separated continuations can restore sampling exactly.
 //!
 //! ## What it reproduces (and what it deliberately changes)
 //!
@@ -17,10 +16,9 @@
 //! category from the resulting probabilities with rand's `WeightedIndex` — the same
 //! draw candle's `LogitsProcessor::sample` performs. The one deliberate change is
 //! the RNG: candle uses `StdRng` (a `ChaCha` CSPRNG with no accessor); ferrl uses a
-//! serializable `Xoshiro256PlusPlus`. ferrl never needed candle-stream parity —
-//! float non-associativity already makes sampled trajectories platform-dependent
-//! (see the P2 build note), so the swap costs nothing, and it is exactly what makes
-//! a capturable, restorable RNG possible.
+//! serializable `Xoshiro256PlusPlus`. Ferrl needs reproducible continuation of
+//! its own stream rather than candle-stream parity; the owned RNG is what makes
+//! a capturable, restorable rollout state possible.
 //!
 //! The design pass named `ChaCha12Rng`. rand 0.10's own `StdRng` *is* `ChaCha12` (now
 //! sourced from the `chacha20` crate), but — like candle's `StdRng` — derives no
@@ -109,7 +107,7 @@ impl GrpoSampler {
     ///
     /// - **Decode order:** a batched group decode (draws interleaved across rows)
     ///   and a sequential one (each row drained in turn) consume the same per-row
-    ///   substreams → bit-identical sequences (the PR-A property, preserved).
+    ///   substreams → bit-identical sequences (the batch-invariance contract).
     /// - **World size / shard layout:** the caller passes each row's *global*
     ///   index in the flattened rollout stream, so a row gets the identical
     ///   substream no matter which data-parallel rank decodes it or how the global
@@ -190,7 +188,7 @@ impl GrpoSampler {
     /// `LogitsProcessor` runs, on ferrl's own (serializable) RNG. Delegates to
     /// [`sample_with`](Self::sample_with) at the baked temperature with no nucleus
     /// filtering, so the token stream (and RNG consumption) is bit-identical to the
-    /// pre-R2 sampler.
+    /// sampler behavior before explicit eval-time sampling overrides.
     ///
     /// # Errors
     ///
@@ -327,7 +325,7 @@ mod tests {
         }
     }
 
-    /// THE capture/restore property P6-B's resume needs: serialize the sampler
+    /// The capture/restore property resume needs: serialize the sampler
     /// mid-stream, keep drawing, then restore the snapshot and redraw — the restored
     /// stream is bit-identical to the original continuation. This is what lets a
     /// checkpoint resume the rollout RNG exactly (PR3 persists this serde blob).

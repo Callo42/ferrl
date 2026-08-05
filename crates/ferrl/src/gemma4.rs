@@ -3,8 +3,8 @@
 //! This module is the native Gemma 4 support surface: it accepts the public
 //! Hugging Face `config.json` shapes (`model_type: "gemma4"` or
 //! `"gemma4_unified"`, decoder under `text_config`) and fails loud on text
-//! variants the native ferrl forward does not yet implement. The initial target
-//! is the dense Gemma 4 text decoder; vision/audio wrappers are tolerated
+//! variants the native ferrl forward does not implement. The supported target is
+//! the dense Gemma 4 text decoder; vision/audio wrappers are tolerated
 //! because text-only RL never requests those tensors.
 
 use std::cell::RefCell;
@@ -598,13 +598,14 @@ impl Gemma4TextConfig {
         }
         if !self.attention_k_eq_v {
             bail!(
-                "gemma4 config: attention_k_eq_v=false unsupported (global layers unify K/V \
-                 in the initial target)"
+                "gemma4 config: attention_k_eq_v=false unsupported (the supported dense-text \
+                 contract unifies K/V in global layers)"
             );
         }
         if self.num_kv_shared_layers != 0 {
             bail!(
-                "gemma4 config: num_kv_shared_layers {} unsupported (initial target uses 0)",
+                "gemma4 config: num_kv_shared_layers {} unsupported (the supported dense-text \
+                 contract requires 0)",
                 self.num_kv_shared_layers
             );
         }
@@ -644,8 +645,8 @@ impl Gemma4TextConfig {
         }
         if !self.tie_word_embeddings {
             bail!(
-                "gemma4 config: tie_word_embeddings=false unsupported (initial target uses \
-                 tied embeddings)"
+                "gemma4 config: tie_word_embeddings=false unsupported (the supported dense-text \
+                 contract requires tied embeddings)"
             );
         }
         if !(self.rms_norm_eps.is_finite() && self.rms_norm_eps > 0.0) {

@@ -1,6 +1,6 @@
 //! Checkpoint / resume / eval through the real `QwenPolicy` path (tiny CPU model).
 //!
-//! These are the P4-PR2 deliverables exercised end-to-end on a runnable-on-CPU
+//! These checkpoint/resume contracts are exercised end-to-end on a runnable-on-CPU
 //! Qwen3 config (the same tiny scaffold `qwen.rs`/`lm_policy.rs` use in-crate):
 //!
 //! 1. an adapter saved from one model loads bit-exactly into a *fresh* model and
@@ -299,7 +299,7 @@ fn llama_weight_map(cfg: &LlamaConfig) -> HashMap<String, Tensor> {
 
 #[test]
 fn llama_adapter_round_trips_into_a_fresh_model() {
-    // The M1 mirror of `adapter_round_trips_into_a_fresh_model`: the adapter
+    // The Llama mirror of `adapter_round_trips_into_a_fresh_model`: the adapter
     // checkpoint POSITIONAL contract (`trainable_vars()` order is the schema —
     // see `checkpoint.rs`) must hold for the second `GradModel` too. Save from
     // a trained-ish LlamaPolicy, load into a fresh model over the same base

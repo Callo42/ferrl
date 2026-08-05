@@ -1,4 +1,4 @@
-//! Data-parallel equivalence gates (PR-F, P8 CPU-side).
+//! CPU-side data-parallel equivalence gates.
 //!
 //! The DP correctness story has two halves, and the gates split accordingly:
 //!
@@ -8,7 +8,7 @@
 //!    only the **summation association** differs (per-shard then cross-rank,
 //!    vs one linear fold), so f32 non-associativity makes bit-exactness
 //!    impossible *by construction* and the gate is a measured reassociation
-//!    envelope (the `frozen_linear` / P6-C class). The policies here are
+//!    envelope (the `frozen_linear` reassociation class). The policies here are
 //!    **deterministic** (scripted rollouts that are a pure function of the
 //!    prompt, real `LoRA` gradients) — a deliberate simplification that isolates
 //!    the envelope to gradient arithmetic alone. (A *stochastic* sampler is now
@@ -2434,7 +2434,7 @@ fn assert_lockstep(ranks: &[RankRun], what: &str) {
 /// and global-norm clipping is bitwise invariant to power-of-2 scales, so a
 /// missed `world` divisor or a localized Dapo normalizer (both exact 2x)
 /// leaves the final weights untouched — but the reported pre-clip norm sees
-/// the 2x directly (found by the PR-F mutation sweep: M2/M3 survived the
+/// the 2x directly (the mutation sweep found that M2/M3 survived the
 /// weight envelope alone).
 fn assert_grad_norms_match(world: &[Metrics], single: &[Metrics], what: &str) {
     assert_eq!(world.len(), single.len(), "{what}: step counts differ");
@@ -6640,7 +6640,7 @@ fn an_all_degenerate_local_shard_neither_deadlocks_nor_diverges() {
     // The zeros oracle: a single-rank run at accum 2 consumes the identical
     // global window ('e' degenerate + 'a' live) with the identical loss scale
     // and live count, so the empty shard's contribution must be EXACTLY zeros
-    // — folding anything else in (the PR-F mutation sweep's M6 planted the
+    // — folding anything else in (the mutation sweep's M6 planted the
     // weights themselves) diverges from this reference immediately, while
     // lockstep alone stays green (both ranks share the corrupted sum).
     let single = run_scripted_single(
@@ -6663,7 +6663,7 @@ fn an_all_degenerate_local_shard_neither_deadlocks_nor_diverges() {
 /// and in lockstep: the locally-uncovered rank via the grad-coverage canary,
 /// its peers via the globalized verdict — NOT a 300s timeout (a half-stepped
 /// world or a stalled collective is exactly what the global uncovered count
-/// exists to prevent; the PR-F mutation sweep's M8 showed no other gate
+/// exists to prevent; the mutation sweep's M8 showed no other gate
 /// exercises a partially-covering rank).
 #[test]
 fn an_uncovered_var_on_one_rank_aborts_every_rank_in_lockstep() {
@@ -6729,7 +6729,7 @@ fn an_uncovered_var_on_one_rank_aborts_every_rank_in_lockstep() {
 /// The world-1 path must issue ZERO collective calls — the byte-for-byte
 /// legacy-path promise is the `world_size() > 1` guard discipline, and the
 /// weight-bits trio gate alone cannot see a guard regression (an identity
-/// reduce keeps the weights bitwise; the PR-F mutation sweep's M9).
+/// reduce keeps the weights bitwise; the mutation sweep's M9).
 #[test]
 fn world_one_training_issues_no_collective_calls() {
     let tmp = TempDir::new("spy");

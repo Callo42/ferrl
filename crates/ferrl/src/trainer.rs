@@ -1,4 +1,4 @@
-//! The GRPO trainer — the fifth and final seam.
+//! The model- and task-generic GRPO trainer.
 //!
 //! [`Trainer`] drives one GRPO optimizer step at a time over a [`Policy`] and a
 //! [`RewardFn`], owning the pieces candle does not provide: the rollout →
@@ -9,8 +9,8 @@
 //!
 //! It is generic over the [`Policy`] and [`RewardFn`] traits and never names a
 //! concrete model: the trainable parameters reach it only through
-//! [`Policy::trainable_vars`], so the *same* `Trainer` drives the toy policy in
-//! the integration tests today and a real Qwen policy later, unchanged.
+//! [`Policy::trainable_vars`], so the same `Trainer` drives test policies and
+//! every supported real-model family unchanged.
 //!
 //! # Differentiable GRPO vs the scalar oracle
 //!
@@ -508,7 +508,7 @@ pub struct TrainerConfig {
     /// completion can terminate, so masking would zero every row).
     /// `#[serde(default)]` via `default_truncation_masking` (`true`) —
     /// **including for older `config.json` files** (like clipping, this is a
-    /// correctness guard, not a behavior an old config opted out of; a pre-R1
+    /// correctness guard, not a behavior an old config opted out of; an older
     /// run with an EOS token resumes with masking active). Detection assumes
     /// the single-EOS rollout contract ([`crate::policy::GenConfig`]): TRL
     /// additionally treats a trailing *pad* token as terminated, a state
@@ -10439,7 +10439,7 @@ mod tests {
     fn masked_mean_tensor_ignores_nonfinite_masked_cell() {
         // A NaN/inf value at a masked-out (m == 0) position must not leak into the
         // reduction (0 * inf): the tensor must match the scalar oracle and stay
-        // finite. This is the P4-padding guard.
+        // finite. This is the padding guard.
         let values = mat(&[&[1.0, f32::NAN], &[5.0, f32::INFINITY]]);
         let mask = mat(&[&[1.0, 0.0], &[1.0, 0.0]]);
         let v = vec![vec![1.0f64, f64::NAN], vec![5.0, f64::INFINITY]];
@@ -12823,7 +12823,7 @@ mod tests {
         };
         let back: TrainerConfig =
             serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
-        // Whole-config JSON equality covers every R1 field in one shot.
+        // Whole-config JSON equality covers every recipe-control field in one shot.
         assert_eq!(
             serde_json::to_value(&back).unwrap(),
             serde_json::to_value(&cfg).unwrap()
@@ -12846,8 +12846,8 @@ mod tests {
         assert_eq!(back2.eos_token_id, Some(151_643));
     }
 
-    /// A pre-R1 (and pre-grad-accum) `config.json`, shared by the back-compat
-    /// deserialization tests below.
+    /// A legacy `config.json` predating the recipe-control and gradient-
+    /// accumulation fields, shared by the back-compat deserialization tests below.
     const OLD_CONFIG_JSON: &str = r#"{"steps":10,"group_size":8,"max_new_tokens":16,
         "temperature":1.0,"mu":1,"beta":0.0,"clip_eps":0.2,"lr":0.001,"weight_decay":0.0,
         "loss_type":"grpo","scale_rewards":"group"}"#;
@@ -12874,7 +12874,7 @@ mod tests {
 
     #[test]
     fn r1_config_fields_default_for_old_configs() {
-        // R1 fields, absent from a pre-R1 config.json, fill from their serde
+        // Recipe-control fields absent from the legacy config fill from serde
         // defaults — note loss_type stays the EXPLICIT legacy "grpo" the file
         // recorded, while clipping (a safety net) and truncation masking
         // default on.
@@ -22354,7 +22354,7 @@ mod tests {
         ));
     }
 
-    // ---- R2: rollout-logprob capture, ratio telemetry, TIS -------------------
+    // ---- rollout-logprob capture, ratio telemetry, TIS ----------------------
 
     #[test]
     fn completion_dims_rejects_a_misaligned_rollout_logprob_capture() {
@@ -22419,7 +22419,7 @@ mod tests {
 
     #[test]
     fn r2_config_fields_default_for_old_configs_and_roundtrip() {
-        // A pre-R2 config.json fills tis (off) and the cap (2.0) from serde.
+        // A legacy config predating TIS fills tis (off) and the cap (2.0) from serde.
         let cfg: TrainerConfig = serde_json::from_str(OLD_CONFIG_JSON).unwrap();
         assert!(!cfg.tis);
         assert_eq!(cfg.tis_imp_ratio_cap, 2.0);

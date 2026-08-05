@@ -4494,7 +4494,7 @@ mod tests {
         let m1 = load_adapter(&dir_v1, &vars).unwrap();
         assert_eq!(m1.lora_recipe.as_deref(), Some("attn:qv|mlp:-"));
 
-        // ...and a manifest without the field (pre-R1 checkpoint) loads as None.
+        // ...and a legacy manifest without the field loads as None.
         let j = r#"{"format_version":1,"step":7,"num_vars":2}"#;
         let m: CheckpointManifest = serde_json::from_str(j).unwrap();
         assert_eq!(m.lora_recipe, None);

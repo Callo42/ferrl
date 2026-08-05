@@ -1,5 +1,4 @@
-//! A grad-bearing, uncached `qwen3_5` (Qwen3.5 / Qwen3.6) text forward — the
-//! third [`GradModel`], and the first **hybrid** one.
+//! A grad-bearing, uncached `qwen3_5` (Qwen3.5 / Qwen3.6) hybrid text forward.
 //!
 //! The `qwen3_5` family interleaves two token mixers (`layer_types`, 3:1 in the
 //! shipped configs): **`GatedDeltaNet` linear attention** (a gated delta-rule
@@ -32,8 +31,8 @@
 //! - **Partial rotary** `partial_rotary_factor 0.25`: rotate-half on the first
 //!   `head_dim/4` dims only ([`crate::blocks::rope_partial`]); the interleaved
 //!   M-`RoPE` of the reference is an exact no-op for text-only inputs (all
-//!   three T/H/W position rows are identical), pinned by the PR-1 real-geometry
-//!   rope oracle gate.
+//!   three T/H/W position rows are identical), pinned by the committed
+//!   real-geometry `RoPE` oracle.
 //! - **fp32 boundaries exactly as the reference**: the delta-rule state, its
 //!   decay gate `g`, and the attention softmax run in F32 under a BF16 model;
 //!   everything else stays in the activation dtype.
@@ -46,7 +45,7 @@
 //! this family: grouped `conv1d` → the shifted-taps composite
 //! ([`crate::gdn::causal_depthwise_conv1d`]) and the missing `softplus` → the
 //! stable composite ([`crate::gdn::stable_softplus`]) — both with committed
-//! transformers-fallback fixtures from PR-1.
+//! Transformers-reference fixtures.
 //!
 //! ## Training form vs decode form
 //!
@@ -93,7 +92,7 @@ use crate::tensor_parallel::plan_from_comm;
 /// Delta-rule chunk length for training and multi-token prefill — the
 /// reference kernel default, and what the pinned oracle executes. A pure
 /// compute-scheduling constant (output is chunk-size invariant up to float
-/// reassociation, pinned by the PR-1 cross-checks), not a quality knob.
+/// reassociation, pinned by oracle cross-checks), not a quality knob.
 pub const GDN_CHUNK_SIZE: usize = 64;
 
 /// The checkpoint prefix the whole `qwen3_5` family ships its text decoder
@@ -174,8 +173,7 @@ fn default_true() -> bool {
 ///
 /// Unknown JSON keys are tolerated (vision/MTP knobs ride along in shipped
 /// configs); **known-but-unsupported values fail loud** in
-/// [`validate`](Self::validate) — the P3 discipline: never silently load a
-/// non-parity model.
+/// [`validate`](Self::validate): never silently load a non-parity model.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Qwen3_5TextConfig {
     /// Vocabulary size (248320 for the shipped family).
@@ -433,7 +431,7 @@ impl Qwen3_5TextConfig {
     }
 
     /// Fail loud on any config value this forward does not implement, rather
-    /// than silently loading a non-parity model (the P3 / M1 discipline).
+    /// than silently loading a non-parity model.
     ///
     /// # Errors
     ///
@@ -714,7 +712,7 @@ pub fn tensors_from_pretrained(
 // ---------------------------------------------------------------------------
 
 /// Which projections carry a trainable `LoRA` adapter — the configurable
-/// recipe of the M2′ design. This is the **hybrid** (`qwen3_5`) recipe, with
+/// recipe for the **hybrid** (`qwen3_5`) family, with
 /// `GatedDeltaNet` opt-ins; the dense models ([`crate::qwen`],
 /// [`crate::llama`]) use [`crate::lora::DenseLoraTargets`] instead.
 ///
@@ -1079,8 +1077,8 @@ struct Qwen3_5GatedDeltaNet {
     /// `[num_v_heads]`, stored **as loaded**; cast to F32 at use (added to
     /// the fp32 `a` projection).
     dt_bias: Tensor,
-    /// Plain-`w` gated norm over `head_v` (weight in the activation dtype —
-    /// the PR-1 convention pin).
+    /// Plain-`w` gated norm over `head_v` (weight in the activation dtype,
+    /// pinned by the reference-convention oracle).
     norm: RmsNormGated,
     out_proj: Proj,
     dims: GdnDims,
@@ -1449,7 +1447,7 @@ enum Mixer {
     Full(Qwen3_5Attention),
 }
 
-/// A layer's feed-forward slot — the SECOND layer menu (M3′): the dense
+/// A layer's feed-forward slot: dense
 /// members run a plain `SwiGLU` MLP, the `MoE` members the sparse block, in
 /// EVERY layer (the family deletes the per-layer dense/sparse knobs).
 #[derive(Debug)]
@@ -1715,9 +1713,8 @@ impl Qwen3_5Layer {
     }
 }
 
-/// A grad-bearing, uncached `qwen3_5` text forward with a configurable
-/// [`LoraTargets`] adapter recipe — the third [`GradModel`] implementor, and
-/// the first hybrid (`GatedDeltaNet` + gated GQA) one.
+/// A grad-bearing, uncached `qwen3_5` hybrid (`GatedDeltaNet` + gated GQA)
+/// text forward with a configurable [`LoraTargets`] adapter recipe.
 ///
 /// Loaded from the same safetensors as the HF reference (the
 /// `model.language_model.*` multimodal layout every family checkpoint ships);
@@ -1838,7 +1835,7 @@ impl Qwen3_5GradModel {
     /// - On `MoE` members the packed routed tensors are ONE var each and the
     ///   **router trains too** — full-FT moves routing during training, which
     ///   is exactly why GSPO (sequence-level importance sampling) is the
-    ///   pinned recipe for `MoE` runs (the M3′ lock).
+    ///   pinned recipe for `MoE` runs.
     /// - [`merged_decoder`](Self::merged_decoder) **deep-copies** every
     ///   weight (one full-model copy per rebuild): the vars' storage mutates
     ///   in place under optimizer steps, so a storage-sharing snapshot would
@@ -1943,8 +1940,8 @@ impl Qwen3_5GradModel {
                 t.rms_norm_eps,
             ),
             // Partial rotary: the table is just NARROWER (width = rot_dim/2
-            // freqs over denominators of rot_dim) — the construction the PR-1
-            // real-geometry rope oracle gate pinned at the 0.8B geometry.
+            // freqs over denominators of rot_dim) — the construction the
+            // real-geometry RoPE oracle pins at the 0.8B geometry.
             rot: RotaryTables::new(
                 t.rotary_dim(),
                 t.rope_parameters.rope_theta,
@@ -3052,7 +3049,7 @@ mod tests {
     const WEIGHT_SEED: u64 = 0x5157_454E_3335; // "QWEN35"
 
     /// Weight std. At tiny dims, weak weights make attention near-uniform and
-    /// the equivalence gates near-vacuous (the M1 lesson); 0.5 keeps the
+    /// the equivalence gates near-vacuous; 0.5 keeps the
     /// hybrid recurrence finite while staying decisively non-uniform.
     const WEIGHT_STD: f32 = 0.5;
 
@@ -3340,11 +3337,11 @@ mod tests {
     //
     // Measured under the seeded WEIGHT_SEED/WEIGHT_STD weights (worst measured
     // value recorded next to each constant), then set with wide headroom for
-    // cross-host float reassociation (the P2 platform lesson).
+    // cross-host float reassociation.
 
     /// Cached (merged-decoder) vs uncached forward, adapter armed. The decode
     /// path crosses the chunked/recurrent kernel boundary (independent ports,
-    /// PR-1 cross-checked at 5e-5 kernel-level), so its floor is the highest.
+    /// oracle-cross-checked at 5e-5 kernel-level), so its floor is the highest.
     /// Measured worst under the seeded weights (2026-06-11): prefill 3.8e-5,
     /// chunked continuation 7.0e-5, token-by-token decode 1.2e-4 (the
     /// std-0.5 tiny weights run hotter than the real 0.8B, whose same trio
@@ -4367,7 +4364,7 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
-    // ---- activation checkpointing (P7) --------------------------------------
+    // ---- activation checkpointing -------------------------------------------
 
     /// A fixed non-uniform probe loss over the logits — no gradient cancels
     /// by symmetry.
@@ -4583,7 +4580,7 @@ mod tests {
         assert!(err.to_string().contains("no checkpointed forward"));
     }
 
-    // ---- the sparse feed-forward menu (M3' PR-2) -----------------------------
+    // ---- the sparse feed-forward menu ----------------------------------------
 
     fn tiny_moe_model() -> Qwen3_5GradModel {
         let cfg = tiny_moe_cfg();
@@ -4833,7 +4830,7 @@ mod tests {
         assert!(d <= MERGED_TOL, "sparse token-by-token decode diff {d}");
     }
 
-    /// P7 over the sparse menu: the checkpointed segment closure must rebuild
+    /// Activation checkpointing over the sparse menu: the segment closure must rebuild
     /// the `MoE` feed-forward (host-side routing recomputes deterministically
     /// in the re-run); stitched gradients match the uncut backward, the
     /// boundary cut holds, and a detached walk captures no tape.
@@ -4874,7 +4871,7 @@ mod tests {
         );
     }
 
-    /// The narrowed scoring forward (PR-B) over the sparse menu: routing runs
+    /// The narrowed scoring forward over the sparse menu: routing runs
     /// full-width in the layer walk (the narrow folds into norm-and-head
     /// AFTER the layers), so values and adapter gradients must match
     /// `forward` + narrow exactly, plain and checkpointed.
@@ -4911,7 +4908,7 @@ mod tests {
         assert_grads_match(&g_narrow, &stitched, &vars, 1e-5);
     }
 
-    // ---- full fine-tuning (PR-E) ---------------------------------------------
+    // ---- full fine-tuning ----------------------------------------------------
 
     fn tiny_full_ft_model() -> Qwen3_5GradModel {
         let cfg = tiny_cfg();

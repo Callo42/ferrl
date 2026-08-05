@@ -1,4 +1,4 @@
-//! The GSPO × `MoE` × checkpointing end-to-end gate (M3′ PR-2).
+//! The GSPO × `MoE` × activation-checkpointing end-to-end gate.
 //!
 //! The locked `MoE` training recipe (GSPO adoption, 2026-06-12) is
 //! sequence-level importance sampling. This gate runs the REAL `Trainer` over
@@ -7,8 +7,8 @@
 //! configuration where the sequence-level ratio, the detached `logp_old`/KL
 //! scorings, and the sparse forward all genuinely execute — twice: activation
 //! checkpointing OFF and ON, over policies with synced adapters and a shared
-//! sampler seed. The trained vars must agree within float tolerance: the P7
-//! e2e pattern, instantiated on the `MoE` model and the locked recipe.
+//! sampler seed. The trained vars must agree within float tolerance across the
+//! ordinary and rematerialized paths.
 
 use candle_core::{DType, Device};
 use ferrl::grpo::ImportanceSamplingLevel;
@@ -78,7 +78,7 @@ fn gspo_training_on_the_moe_model_matches_across_checkpointing() {
     let mut on = build_policy();
     // The base weights are the same fixture; the adapter `A` factors are
     // drawn per load — sync them (invisible to the forward at `B = 0`, but
-    // `dL/dB ∝ A`, the R2 lesson).
+    // `dL/dB ∝ A`).
     for (va, vb) in off.trainable_vars().iter().zip(on.trainable_vars()) {
         vb.set(va.as_tensor()).unwrap();
     }

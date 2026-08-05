@@ -3345,8 +3345,8 @@ mod tests {
 
     #[test]
     fn metrics_deserializes_old_log_without_new_fields() {
-        // A pre-PR#3 metrics.jsonl line lacks frac_reward_zero_std and dropped_rows;
-        // #[serde(default)] must let it deserialize (defaulting both to 0). The R2
+        // A legacy metrics.jsonl line predating frac_reward_zero_std and dropped_rows
+        // must deserialize through #[serde(default)] (defaulting both to 0). The
         // rollout-ratio fields default to their NEUTRAL values: ratios to 1.0
         // (on-policy — what an old record implicitly assumed), the capped
         // fraction to 0.
@@ -3356,7 +3356,7 @@ mod tests {
             (m.step, m.frac_reward_zero_std, m.dropped_rows),
             (3, 0.0, 0)
         );
-        // The PR-4 timing fields are absent from an old record → default to 0.0.
+        // The timing fields are absent from an old record → default to 0.0.
         assert_eq!((m.step_secs, m.tokens_per_sec), (0.0, 0.0));
         assert_eq!(
             (

@@ -1,8 +1,8 @@
-# ferrl task runner — the single entry point for the local quality bar.
+# ferrl task runner — the single entry point for the core local CPU quality bar.
 #
-# Every recipe mirrors a CI job (see .github/workflows/ci.yml) so that a green
-# `just gate` locally is a faithful predictor of green CI. CI itself can call
-# these recipes too, which keeps the contract in exactly one place.
+# The core recipes align with the matching GitHub CI steps. CI additionally
+# exercises the gate-feature TriMul contract, supply-chain policy, the declared
+# MSRV, and PR commit ranges; see `.github/workflows/ci.yml`.
 #
 # ---------------------------------------------------------------------------
 # NFS-home note (the cargo SQLite deadlock)
@@ -132,10 +132,10 @@ fmt:
 
 # --- Linting ----------------------------------------------------------------
 
-# The full static gate that CI's fmt+clippy jobs run: fmt is verified (not
-# rewritten) and clippy is run with -D warnings against the curated lint set
-# declared in Cargo.toml [workspace.lints].
-[doc("Static gate: fmt --check + curated clippy -D warnings (mirrors CI)")]
+# The core static gate: fmt is verified (not rewritten) and default-feature
+# clippy is run with -D warnings against the curated lint set declared in
+# Cargo.toml [workspace.lints]. CI also lints the gate-feature TriMul target.
+[doc("Core static gate: fmt --check + curated clippy -D warnings")]
 lint: fmt-check clippy
 
 # Verify formatting without modifying files (mirrors the CI `fmt` job).
@@ -193,11 +193,11 @@ cov-html:
 doc:
     RUSTDOCFLAGS="-D warnings" just _cargo doc --no-deps
 
-# --- The full local bar -----------------------------------------------------
+# --- The core local CPU bar ------------------------------------------------
 
-# Run the entire locked quality bar exactly as CI would, in CI order. A green
-# `just gate` is the contract for "safe to push".
-[doc("Full local quality bar: fmt-check + clippy + check + test + cov + doc")]
+# Run the core local CPU quality bar in CI order. A green `just gate` is the
+# pre-push baseline; GitHub CI adds the jobs named at the top of this file.
+[doc("Core local CPU bar: fmt-check + clippy + check + test + cov + doc")]
 gate: fmt-check clippy check test cov doc
     @echo ">> gate: all checks passed"
 

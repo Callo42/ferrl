@@ -12,8 +12,8 @@
 //! uninterrupted one (see [`crate::trainer::Trainer::train_from`]).
 //!
 //! [`FerrlAdamW`] clones candle-nn 0.10.2's `AdamW` update line-for-line while its
-//! counter remains representable by candle's `i32` exponent, and ferrl owns it so a
-//! later phase can read, serialize, and restore that state. For those ordinary steps
+//! counter remains representable by candle's `i32` exponent, and ferrl owns it so
+//! checkpoints can read, serialize, and restore that state. For those ordinary steps
 //! it is a pure drop-in: it computes the identical step candle does, which a permanent
 //! equivalence canary (`ferrl_adamw_step_is_bit_identical_to_candle`) pins bit-for-bit.
 //! A restored `usize` counter beyond that boundary uses the same mathematical

@@ -1,13 +1,12 @@
 //! The model-generality seam: [`GradModel`] / [`CachedDecoder`].
 //!
-//! These two traits are the *entire* surface a model must provide for the
-//! generic policy ([`crate::lm_policy::LmPolicy`]) — and through it the
-//! `Trainer`, checkpointing, and eval, which only know the [`crate::Policy`]
-//! seam — to RL-fine-tune it. [`crate::qwen::QwenGradModel`] (with
-//! [`crate::qwen::MergedDecoder`] as its cached decoder) is the first
-//! implementor; a second architecture only needs its own grad-bearing forward
-//! and merged-weight cached decoder on the shared building blocks in
-//! [`crate::blocks`].
+//! These two traits are the complete surface a model family provides to the
+//! generic policy ([`crate::lm_policy::LmPolicy`]) — and through it to the
+//! `Trainer`, checkpointing, evaluation, and discovery loop, which only know
+//! the [`crate::Policy`] seam. Qwen3, dense Llama-3.x, Qwen3.5/3.6, and dense
+//! Gemma 4 implement the contract today. Another architecture supplies its own
+//! grad-bearing forward and merged-weight cached decoder over shared building
+//! blocks such as [`crate::blocks`].
 //!
 //! ## The two-forward split (the contract in one paragraph)
 //!

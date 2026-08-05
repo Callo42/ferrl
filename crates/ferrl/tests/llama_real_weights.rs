@@ -1,4 +1,4 @@
-//! Real-weights M1 gates for the custom dense-Llama forward (`#[ignore]`d).
+//! Real-weight gates for the custom dense-Llama forward (`#[ignore]`d).
 //!
 //! These scale `llama.rs`'s tiny-config gates to the **real** `Llama-3.2-1B`
 //! checkpoint: per-position equivalence vs candle's shipped `llama::Llama`,
@@ -49,8 +49,8 @@ const ALPHA: f64 = 8.0;
 /// 128 256-wide tied-head matmul. Calibrated with headroom: the measured
 /// worst-position divergence on the real Llama-3.2-1B checkpoint is 1.7e-5
 /// (12 positions), so 5e-4 (~30x) clears f32 matmul reduction-order noise
-/// across hosts (the gate runs on whichever cluster CPU is free — the P2
-/// platform lesson) while still catching any real parity regression (a
+/// across hosts (the gate runs on whichever cluster CPU is free) while still
+/// catching any real parity regression (a
 /// broken llama3 `RoPE`-scaling branch / GQA repeat / tied head would
 /// diverge by orders of magnitude; the inv-freq pins and tiny-model
 /// every-position gates in `llama.rs` pin the building blocks exactly, so a

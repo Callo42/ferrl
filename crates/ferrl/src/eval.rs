@@ -3,8 +3,8 @@
 //! [`evaluate`] scores a [`Policy`] on a set of held-out prompts twice — once with
 //! the `LoRA` adapter **on** (the trained policy) and once with it **off** (the
 //! frozen base) — and reports the mean reward of each. The gap
-//! ([`EvalReport::improvement`]) is the headline the P4 gate turns on: the adapter
-//! must beat the base on a held-out set.
+//! ([`EvalReport::improvement`]) measures whether training improved the policy on
+//! a task-semantic held-out set.
 //!
 //! It is model-agnostic. It drives any [`Policy`] through the same
 //! [`GenConfig`]-shaped generation the trainer uses, so the toy policy and the
@@ -84,7 +84,7 @@ pub struct EvalReport {
 
 impl EvalReport {
     /// `adapter_reward_mean - base_reward_mean` — positive iff the adapter helped
-    /// on the held-out set (the quantity the P4 gate checks).
+    /// on the held-out set.
     ///
     /// This is the difference of two **sampled** Monte-Carlo means (see the module
     /// docs): on a small `group_size` its sign carries sampling noise, so resolve

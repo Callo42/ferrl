@@ -9,9 +9,8 @@
 //! signature from the Qwen config type to plain scalars (and gained
 //! [`RotaryTables::with_inv_freq`] for precomputed frequencies), and
 //! [`causal_mask`] became a delegation to the offset-aware [`causal_mask_at`] —
-//! so a second architecture (e.g. a dense Llama-3.x, which uses the same
-//! rotate-half `RoPE` family, GQA, and causal masking) can reuse them instead
-//! of re-deriving them.
+//! so Qwen3, dense Llama-3.x, Qwen3.5/3.6, and dense Gemma 4 can reuse common
+//! pieces instead of re-deriving them.
 //!
 //! Everything here is grad-bearing (pure tensor ops, no autograd-cutting custom
 //! kernels), so the blocks are safe in both the update (grad) forward and the
@@ -51,8 +50,8 @@ pub(crate) fn windowed(h: &Tensor, window: Option<(usize, usize)>) -> CandleResu
 /// `batch × seq` factor is gone. Every output element is the same
 /// dot-product over the same `in`-axis either way; values (and the `x`
 /// gradient) agree with the broadcast path up to **f32 reassociation** of the
-/// gemm's accumulation (measured ≲ 1e-7 on CPU — the same class as the
-/// P6-C merged-weight reassociation; the equivalence tests pin a tight
+/// gemm's accumulation (measured ≲ 1e-7 on CPU — the same class as ordinary
+/// merged-weight reassociation; the equivalence tests pin a tight
 /// envelope, and the cached/uncached identity gates stay *exact* because both
 /// paths share this primitive).
 ///

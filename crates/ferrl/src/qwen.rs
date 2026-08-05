@@ -1748,7 +1748,7 @@ mod tests {
         );
     }
 
-    // ---- activation checkpointing (P7) --------------------------------------
+    // ---- activation checkpointing -------------------------------------------
 
     /// A fixed non-uniform probe loss over the logits, in the logits' dtype —
     /// no gradient cancels by symmetry.
@@ -1835,7 +1835,7 @@ mod tests {
         }
     }
 
-    // ---- narrowed scoring forward (PR-B) -------------------------------
+    // ---- narrowed scoring forward --------------------------------------
 
     /// Every adapter var must appear in BOTH stores, with gradients within
     /// `tol` of each other (`0.0` = exact).
@@ -1932,7 +1932,7 @@ mod tests {
         );
     }
 
-    /// The P7 gate's finite-difference half, in f64 end-to-end (the trainer
+    /// The activation-checkpointing finite-difference gate, in f64 end-to-end (the trainer
     /// gradcheck convention) so central differences are sharp: the stitched
     /// analytic gradient matches `(L(θ+ε) − L(θ−ε)) / 2ε` on the
     /// strongest entry (max |gradient|) of the first and last adapter vars

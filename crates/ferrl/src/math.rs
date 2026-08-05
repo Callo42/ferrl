@@ -212,7 +212,7 @@ mod tests {
 
     #[test]
     fn loads_the_math_fixture_dataset() {
-        // The committed demo dataset parses into typed samples via the PR-③ loader,
+        // The committed demo dataset parses into typed samples via the JSONL loader,
         // and a model that answered each one correctly would score full reward.
         let samples =
             crate::data::read_jsonl::<MathProblem, _>("tests/fixtures/math_dataset.jsonl").unwrap();

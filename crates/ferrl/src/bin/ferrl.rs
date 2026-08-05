@@ -1,5 +1,5 @@
-//! `ferrl` — the single-binary front door: train a built-in task end-to-end from a
-//! JSON run config, and report on a finished run.
+//! `ferrl` — the single-binary discovery front door: train a built-in verifiable
+//! task, score and audit TriMul candidates, and report on finished runs.
 //!
 //! ```text
 //! ferrl train --config run.json                    # train a built-in task
@@ -98,7 +98,7 @@ const TRIMUL_CASE_SEED_MAX: u64 = u32::MAX as u64;
 #[command(
     name = "ferrl",
     version,
-    about = "candle-native GRPO trainer — single-binary ops"
+    about = "candle-native RL discovery — train, verify, and publish artifacts"
 )]
 struct Cli {
     /// The subcommand to run.
@@ -1124,7 +1124,7 @@ impl TensorParallelCfg {
 /// [`TrainerConfig`] under `trainer`.
 #[derive(Debug)]
 struct RunConfig {
-    /// Which built-in task to train: `"countdown"` or `"math"`.
+    /// Which built-in task to train: `"countdown"`, `"math"`, or `"trimul"`.
     task: String,
     /// Checkpoint directory (`config.json` + `model.safetensors` + `tokenizer.json`).
     model_dir: PathBuf,
@@ -1132,8 +1132,8 @@ struct RunConfig {
     device: DeviceSel,
     /// Where run directories are written (default `runs/`).
     out_dir: PathBuf,
-    /// Launch-authentication boundary. Local ephemeral authentication is sufficient
-    /// for no-admin discovery but cannot authorize artifact publication.
+    /// Launch-authentication boundary. Local ephemeral mode supports operator-attested
+    /// artifact publication; external mode adds protected launch authenticity.
     launch_authentication: LaunchAuthenticationMode,
     /// Policy-load knobs.
     policy: PolicyCfg,
@@ -1573,12 +1573,10 @@ impl RunConfig {
     ///
     /// Unlike countdown/math this does **not** use [`train_eval_split`]: that helper
     /// deduplicates whole samples, so a unit-target dataset of one repeated prompt would
-    /// collapse to a single row. TriMul is one launch-bound task whose secret seed
-    /// perturbs those configured cases; it does not yet provide a genuinely held-out
-    /// case/reward boundary. The trainer cycles prompts mod the train length, so a
-    /// one-prompt train set *is* the single-task regime. `eval` runs that same prompt
-    /// through the same reward, so a non-zero `data.eval_n` gives an adapter-vs-base
-    /// reward comparison rather than held-out TriMul evidence.
+    /// collapse to a single row. TriMul is one launch-bound prompt repeated across the
+    /// requested train/eval counts. Training and held-out evaluation use distinct
+    /// verifier rewards and case-generation seeds; the split vectors intentionally
+    /// carry the same prompt bytes while the reward boundary supplies the held-out cases.
     #[cfg(test)]
     fn trimul_splits(&self) -> Result<Splits<()>, CliError> {
         let prompt_file_bytes = self.trimul_prompt_file_bytes()?;

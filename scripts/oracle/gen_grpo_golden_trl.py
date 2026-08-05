@@ -35,8 +35,10 @@ reviewed act (same contract as the qwen3_5 tiny-oracle fixture).
 Everything runs in float64 so the recorded values are reference-accurate
 (ferrl's f32 tensor path compares at a loose-but-honest tolerance).
 
-Run in the pinned ``ferrl-oracle`` conda env on the cluster (after
-``pip install trl``):
+Prepare the pinned ``ferrl-oracle`` conda environment, then activate it:
+
+    bash scripts/oracle/setup_env.sh  # installs trl==1.5.1
+    conda activate ferrl-oracle
 
     python3 scripts/oracle/gen_grpo_golden_trl.py \
         > crates/ferrl/tests/fixtures/grpo_golden_trl.json
@@ -52,6 +54,19 @@ import torch
 import transformers
 import trl
 from trl.trainer.grpo_trainer import GRPOTrainer
+
+
+PINNED_TRL_VERSION = "1.5.1"
+
+
+def require_pinned_trl() -> None:
+    """Refuse to regenerate the oracle with an unreviewed TRL version."""
+    if trl.__version__ != PINNED_TRL_VERSION:
+        raise SystemExit(
+            "expected trl=="
+            f"{PINNED_TRL_VERSION}, found trl=={trl.__version__}; "
+            "install the pinned version or deliberately update the oracle contract"
+        )
 
 
 class _Args:
@@ -115,6 +130,7 @@ def make_trainer(
 
 
 def main() -> None:
+    require_pinned_trl()
     torch.set_default_dtype(torch.float64)
 
     # One fixed batch geometry: B=4 completions of width T=3 over a P=2
@@ -201,7 +217,7 @@ def main() -> None:
             "REAL-TRL GRPO loss golden: produced by TRL's "
             "GRPOTrainer._compute_loss over the shared crafted batch below. "
             "Regenerate via scripts/oracle/gen_grpo_golden_trl.py in the "
-            "pinned ferrl-oracle env."
+            f"ferrl-oracle env with trl=={PINNED_TRL_VERSION}."
         ),
         "trl_version": trl.__version__,
         "torch_version": torch.__version__,

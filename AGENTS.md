@@ -9,22 +9,29 @@ see [`CONTRIBUTING.md`](CONTRIBUTING.md).
   branch and **wait for human review.** A human reviews and merges.
 - **Every change goes through a PR**, and the **CI gate must be green** before you
   ask for review.
-- **Run the full local gate before pushing** — `just gate` (fmt, clippy
-  `-D warnings`, tests + coverage ≥ 90, docs). Don't push red.
+- **Run the core local CPU gate before pushing** — `just gate` (fmt, clippy
+  `-D warnings`, check, tests + coverage ≥ 90, docs). GitHub CI adds the
+  feature-gated verifier target, supply-chain, MSRV, and commit-range checks.
+  Don't push red.
 - **Conventional Commits** for every commit message (`cog check` enforces it).
 - **No secrets, credentials, machine-specific paths, or personal data** in commits.
 
 ## Project shape
 
-ferrl is a candle-native GRPO reinforcement-learning library for RL-fine-tuning
-LLMs. We **own the RL layer** (GRPO loss, reward interface, LoRA adapters, rollout,
-trainer, and a grad-bearing model forward) and **delegate all tensor math,
-autograd, GPU, and the base model forward to [candle](https://github.com/huggingface/candle)**.
+ferrl is a candle-native, RL-driven **discovery platform**: given a verifiable
+task and a base model, it searches with reinforcement learning and emits a
+verified performance artifact. TriMul GPU-kernel discovery is the first target;
+GRPO + LoRA is the first training recipe. We own the RL, reward-verification,
+search, provenance, and artifact boundaries, including the grad-bearing model
+forwards they require. We delegate tensor math, autograd, GPU primitives, and
+the shipped inference stack to [candle](https://github.com/huggingface/candle).
 
 - Library crate: `crates/ferrl`.
-- Core seams: `RewardFn` (user rewards, plain `f32`), `Policy` (generate +
-  token-logprobs + adapter toggle), `LoraLinear` (frozen base + low-rank A/B),
-  the GRPO math, and the `Trainer`.
+- Core seams: `Sample` + `RewardFn` (typed tasks and scalar verifiable rewards),
+  `Policy` (generate + token-logprobs + adapter toggle), `LoraLinear` (frozen
+  base + low-rank A/B), the GRPO math, and `Trainer`. Discovery adds the
+  `trimul`, `sandbox`, and `verifier_executor` boundaries plus launch-bound
+  candidate, evaluation, and artifact provenance in the CLI and telemetry.
 - Data parallelism: a `Comm` seam (`SoloComm`/`LocalComm`, plus an NCCL bridge behind
   `--features nccl`) all-reduces LoRA gradients for single-node multi-GPU DP, with
   DP-coordinated resume. The same communicator seam drives single-node tensor-parallel
@@ -35,9 +42,11 @@ autograd, GPU, and the base model forward to [candle](https://github.com/hugging
   checkpoints, post-run health, and advertised output. Slurm/NCCL
   launches must set a launch-unique `FERRL_NCCL_RENDEZVOUS`; ferrl uses it to bootstrap
   before loading rank-local configs, then validates every enabled TP rank/world plan.
-- Telemetry: `tracing` (every event stamped with `rank`/`world`/`step`); each run writes
-  `runs/<run_id>/` (config + metrics.jsonl + checkpoints), summarized by the `runreport`
-  example. `runs/` and `target/` are git-ignored.
+- Telemetry: `tracing` (run/step events stamped with `rank`/`world`/`step`);
+  applicable files under `runs/<run_id>/` include immutable launch/config and
+  prompt evidence, `metrics.jsonl`, optional `candidates.jsonl`, checkpoints,
+  and `eval-report.json`. The `ferrl runreport` subcommand summarizes a finished
+  run. `runs/` and `target/` are git-ignored.
 
 ## Gotchas to respect
 
