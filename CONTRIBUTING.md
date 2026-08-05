@@ -7,8 +7,10 @@ codebase stays maintainable and scalable. Please read this before opening a PR.
 
 - **Never push directly to `main`.** It is protected; all changes land via a pull
   request from a feature branch.
-- **Every PR is reviewed at least once before merge**, and **CI must be green**
-  before it can be merged. Both are enforced by branch protection.
+- **Every PR is reviewed by a human maintainer before merge**, and **CI must be
+  green**. Branch protection enforces the PR path and required checks; the
+  project review policy is human-enforced because this solo-maintainer repo does
+  not encode a required approval count that its owner could not satisfy.
 - Branch naming: `feat/…`, `fix/…`, `docs/…`, `refactor/…`, `test/…`, `ci/…`.
 - Keep PRs focused and reviewable.
 
@@ -21,21 +23,29 @@ codebase stays maintainable and scalable. Please read this before opening a PR.
 
 ## Quality gate
 
-CI runs on every push and PR (CPU; GPU work is manual, never in CI):
+CI runs on pushes to `main` and on pull requests targeting `main` (CPU; GPU
+work is manual, never in CI):
 
 | Check | Command |
 |---|---|
 | Format | `cargo fmt --all --check` |
-| Lint | `cargo clippy --all-targets -- -D warnings` |
-| Tests + coverage (≥ 90%) | `cargo llvm-cov --fail-under-lines 90` |
+| Lint | `cargo clippy --all-targets -- -D warnings` plus the `gate`-feature TriMul target |
+| Tests + coverage (≥ 90%) | `cargo llvm-cov --workspace --fail-under-lines 90`, doctests, verifier-driver syntax, and the `gate`-feature TriMul test |
 | Docs | `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` |
+| Supply chain | `cargo deny check` and `cargo audit` |
+| MSRV | `cargo +1.87 check --locked --workspace` |
+| Commit range (PRs) | `cog check --from-latest-tag` |
 
-Run the whole bar locally before pushing:
+Run the core CPU bar locally before pushing:
 
 ```sh
 just bootstrap   # one-time: toolchain components + pre-commit + cargo-llvm-cov
-just gate        # fmt + clippy + check + test + doc
+just gate        # fmt + clippy + check + test + coverage + docs
 ```
+
+GitHub CI additionally compiles/tests the feature-gated TriMul verifier contract
+and runs the supply-chain, MSRV, and PR commit-range jobs listed above. GPU
+feature builds and runtime gates remain manual because GitHub runners are CPU-only.
 
 The toolchain is pinned in `rust-toolchain.toml`. Lints (`deny(unsafe_code)` — the
 default build is `unsafe`-free; the optional `--features nccl` FFI module is the one

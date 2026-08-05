@@ -1,8 +1,8 @@
-//! The real Countdown GRPO run — the P4 gate, now exercising P6-A EOS/length masking.
+//! A real-model Countdown GRPO run with EOS/length-aware training and evaluation.
 //!
 //! Drives [`ferrl::QwenPolicy`] (real `Qwen3-0.6B-Base`, bf16 base / F32 `LoRA`
 //! adapter on CUDA) through a GRPO run over the verifiable [`ferrl::countdown`]
-//! reward, then checks the P4 gate: **the training reward rises AND the trained
+//! reward, then checks the example's acceptance condition: **the training reward rises AND the trained
 //! adapter beats base on a held-out Countdown eval** (via [`ferrl::evaluate`]).
 //!
 //! This is a *run harness*, not a CI test: it needs the staged checkpoint and a
@@ -10,11 +10,11 @@
 //! library (`cargo llvm-cov` skips `examples/`). The CI-tested task logic it drives
 //! lives in `src/countdown.rs`.
 //!
-//! This harness deliberately pins the **pre-R1 recipe** its gate margins were
+//! This harness deliberately pins the earlier GRPO recipe its gate margins were
 //! calibrated on (see `build_trainer_config`). The goal-gate **ladder** runs the
-//! modern recipe instead — see the sibling `countdown_grpo_qwen35` harness.
+//! current default recipe instead — see the sibling `countdown_grpo_qwen35` harness.
 //!
-//! # EOS / length masking (P6-A)
+//! # EOS / length masking
 //!
 //! The run is EOS-aware: each sampled completion stops at the model's
 //! end-of-sequence token, and only the real (EOS-inclusive) tokens feed the loss,
@@ -30,8 +30,9 @@
 //!
 //! # Running it
 //!
-//! Build on the login node, run on a GPU node (see the scope card for the CUDA
-//! recipe). It logs via `tracing` (no stdout prints), so pass `--nocapture`-style
+//! Build with `--features cuda` under a compatible toolkit/driver setup (see the
+//! README's GPU-build guidance), then run on a GPU node. It logs via `tracing`
+//! (no stdout prints), so pass `--nocapture`-style
 //! visibility by running the binary directly:
 //!
 //! ```text
@@ -187,11 +188,11 @@ fn build_trainer_config(eos_token_id: Option<u32>) -> TrainerConfig {
         checkpoint_every: Some(env_parse("FERRL_CD_CKPT", 50u64)),
         eos_token_id,
         // Calibration pin: this gate's margins (FERRL_CD_MARGIN, reward-trend,
-        // beats-base) were established on the pre-R1 recipe — classic Grpo
+        // beats-base) were established on the earlier recipe — classic Grpo
         // reduction, no clipping, no truncation masking. Keep that trajectory
         // until the margins are deliberately recalibrated on the modern
-        // recipe (the 0.8B PoC ladder runs the R1 defaults instead). R2 note:
-        // at the FERRL_CD_TEMP=1.0 default, scoring is bit-identical to the
+        // recipe (the 0.8B PoC ladder runs the current defaults instead). At
+        // the FERRL_CD_TEMP=1.0 default, scoring is bit-identical to the
         // calibrated runs; a non-1.0 temperature now also rescales scoring
         // (temperature-consistent scoring) — a deliberate recipe change, so
         // re-calibrate before leaning on the margins at another temperature.
@@ -269,7 +270,7 @@ fn main() -> Result<()> {
     let (history, _stop) = trainer.train(&mut policy, &reward, &tok, &train_samples)?;
 
     // Held-out eval AFTER training: `evaluate` scores base (adapter off) vs the
-    // trained adapter (adapter on) in one pass — the P4 comparison. There is no
+    // trained adapter (adapter on) in one pass. There is no
     // pre-train eval: the adapter starts as a no-op (`B = 0`), so base == adapter,
     // and that extra sampling only fragments GPU memory ahead of the first grad step.
     let post = evaluate(&mut policy, &reward, &tok, &eval_samples, &gen)?;
@@ -310,14 +311,14 @@ fn main() -> Result<()> {
     );
     info!(
         gate_met,
-        "P4 gate: training reward rises AND the adapter beats base on held-out Countdown"
+        "acceptance: training reward rises AND the adapter beats base on held-out Countdown"
     );
 
     if gate_met {
         Ok(())
     } else {
         Err(anyhow!(
-            "P4 gate NOT met: reward_rises={reward_rises} (first={first}, last={last}), \
+            "acceptance NOT met: reward_rises={reward_rises} (first={first}, last={last}), \
              beats_base={beats_base} (improvement={improvement}, margin={margin})"
         ))
     }

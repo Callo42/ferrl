@@ -1,4 +1,4 @@
-//! Full fine-tuning end-to-end gates (PR-E).
+//! Full fine-tuning end-to-end gates.
 //!
 //! The REAL `Trainer` over the committed tiny fixtures with EVERY base
 //! weight trainable: (1) updates genuinely run and move the base weights

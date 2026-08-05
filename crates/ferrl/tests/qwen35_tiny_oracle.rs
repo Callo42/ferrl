@@ -22,7 +22,7 @@ use std::path::PathBuf;
 /// Measured worst under the committed fixture (2026-06-11): 3.15e-5
 /// (`full_b2`); every cached-path gate measured ≤ 1.19e-5; `full_b1` and the
 /// 14-token case 1.18e-5. Set ~10x above the measured floor for cross-host
-/// float reassociation (the P2 platform lesson) while staying ~500x below the
+/// float reassociation while staying ~500x below the
 /// `PERTURBATION_FLOOR` teeth, so the gate cannot silently go vacuous.
 const ORACLE_TOL: f32 = 3e-4;
 
@@ -265,7 +265,7 @@ fn perturbed_rms_eps_is_caught_by_the_gate() {
 
 #[test]
 fn perturbed_rope_theta_is_caught_by_the_gate() {
-    // The permanent vacuity guard (the M1 rope lesson institutionalized): a
+    // The permanent vacuity guard: a
     // model built from the SAME weights but a wrong rope base must land far
     // outside ORACLE_TOL on the same case the real gate uses. If this margin
     // ever collapses, the oracle gate has lost its teeth, not the model its

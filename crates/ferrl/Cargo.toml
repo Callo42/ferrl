@@ -1,8 +1,8 @@
 [package]
 name = "ferrl"
 version = "0.1.0"
-description = "A candle-native GRPO reinforcement-learning library for RL-fine-tuning LLMs in Rust."
-keywords = ["rl", "grpo", "llm", "candle", "fine-tuning"]
+description = "A candle-native RL-driven discovery platform for verified performance artifacts."
+keywords = ["rl", "llm", "gpu", "candle", "optimization"]
 categories = ["science", "algorithms"]
 readme = "../../README.md"
 edition.workspace = true

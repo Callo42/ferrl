@@ -1,132 +1,61 @@
 //! # ferrl
 //!
-//! `ferrl` is a [candle](https://github.com/huggingface/candle)-native
-//! [GRPO](https://arxiv.org/abs/2402.03300) reinforcement-learning library for
-//! RL-fine-tuning large language models in Rust. The current native model
-//! families are Qwen3, Qwen3.5/3.6, and dense Gemma 4 text.
+//! `ferrl` is a [candle](https://github.com/huggingface/candle)-native,
+//! RL-driven discovery platform. Given a typed task with a verifiable reward and
+//! a language-model policy, it samples candidates, improves the policy with
+//! reinforcement learning, verifies candidates, and retains the best supported
+//! artifact. [GRPO](https://arxiv.org/abs/2402.03300) + `LoRA` is the first
+//! recipe; [`trimul`] GPU-kernel discovery is the first artifact task.
 //!
-//! ## Division of labor
+//! The CLI has a closed built-in registry for [`countdown`], [`math`], and
+//! [`trimul`]. Rust callers can compose custom typed tasks from [`sample`],
+//! [`reward`], [`policy`], and [`trainer`] while the pre-`1.0` surface evolves.
 //!
-//! `ferrl` owns only the *reinforcement-learning layer*:
+//! ## Owned boundaries
 //!
-//! - the pure GRPO math ([`grpo`]) — advantages, the k3 KL estimator, the
-//!   clipped surrogate, and the masked-mean reductions;
-//! - the [`reward`] abstraction (scalar rewards, never tensors);
-//! - a reference verifiable task ([`countdown`]) — the Countdown arithmetic task: a
-//!   solvable-by-construction problem generator, a few-shot prompt builder, and a
-//!   shaped, exact [`CountdownReward`] (the P4 task);
-//! - the [`policy`] abstraction over generation and per-token log-probabilities;
-//! - a manual `LoRA` adapter ([`lora`]);
-//! - the **full fine-tuning opt-in** (`full_ft`, internal) — a `Var`-registry
-//!   `VarBuilder` backend that wraps every base weight a load fetches in a
-//!   trainable `Var`, in deterministic load order (the positional checkpoint
-//!   contract); `LoRA` stays the default, and the mode is entered per model
-//!   ([`Qwen3_5GradModel::load_full_ft`](qwen35::Qwen3_5GradModel::load_full_ft));
-//! - grad-safe building blocks and the grad-coverage canary ([`nn`]);
-//! - the model-generality seam ([`model`]) — the [`GradModel`] / [`CachedDecoder`]
-//!   traits: the entire surface a model must provide (grad-bearing full-sequence
-//!   forward, trainable `LoRA` vars, adapter toggle, merged cached decoder) for
-//!   the generic policy to RL-fine-tune it;
-//! - architecture-neutral decoder building blocks ([`blocks`]) — frozen linear,
-//!   GQA `repeat_kv`, rotate-half `RoPE` tables, and the causal-mask builders,
-//!   shared by every model implementation;
-//! - a grad-bearing, uncached `Qwen3` forward ([`qwen`]) — the trainable update
-//!   path, weight-identical to candle's shipped (no-grad) forward; the first
-//!   [`GradModel`] implementor;
-//! - a grad-bearing, uncached dense Llama-3.x forward ([`llama`]) — the second
-//!   [`GradModel`] implementor (plain GQA / rotate-half `RoPE` with optional
-//!   llama3 scaling / `SwiGLU`, no QK-norm, no biases), weight-identical to
-//!   candle's shipped `llama::Llama` and pinned to it by the same per-position
-//!   equivalence oracle — the witness that swapping the model is a bounded,
-//!   gated exercise;
-//! - a [`Policy`] over any [`GradModel`] ([`lm_policy`]) — [`LmPolicy`] wraps a
-//!   grad forward as the trainer's policy seam, with KV-cached, adapter-aware
-//!   rollout; [`QwenPolicy`] and [`LlamaPolicy`] are its instantiations, so the
-//!   same `Trainer` drives Qwen3, Llama, and the P2 toy unchanged;
-//! - a ferrl-owned rollout sampler ([`sampler`]) — [`GrpoSampler`] reproduces
-//!   candle's temperature multinomial sampling on a `serde`-serializable
-//!   `Xoshiro256PlusPlus`, so the rollout RNG can be captured and restored for
-//!   momentum-faithful resume (replacing candle's accessor-less `LogitsProcessor`);
-//! - a real-model tokenizer adapter ([`tokenizer`]) — [`HfTokenizer`] wraps a
-//!   Hugging Face fast tokenizer behind the trainer's [`TokenizerLike`] bridge;
-//! - the GRPO training loop ([`trainer`]) — the `Trainer` that drives rollout →
-//!   reward → advantages → masked clipped surrogate (+ optional KL) →
-//!   canary-guarded [`FerrlAdamW`] step;
-//! - an `AdamW` ([`optim`]) — [`FerrlAdamW`], a candle-bit-identical, line-for-line
-//!   clone for `i32`-representable step exponents that ferrl owns so it can persist and
-//!   restore the moment state ([`OptimizerState`]) for momentum-faithful resume, pinned
-//!   to candle by a permanent equivalence canary; restored larger counters use
-//!   non-narrowing bias correction;
-//! - checkpointing ([`checkpoint`]) — explicit legacy-v1 adapter-only save/load for
-//!   eval ([`save_adapter`]), and an identity/integrity-bound, momentum-faithful
-//!   ordinary format-v4 checkpoint ([`save_checkpoint`]) that binds immutable policy
-//!   content, canonical learner semantics/topology, exact recipe/schema, adapter and
-//!   Adam payloads, sampler state, and the completed-step relationship under one
-//!   state-envelope root before [`Trainer::resume`] mutates live state;
-//! - the separated rollout/learner artifact contract ([`rollout_ledger`]) — a
-//!   strict, checksummed, no-replace whole-window package whose reader validates
-//!   learner pre-state identity, mandatory structured controls, and every
-//!   rollout/reward/mask invariant before returning [`ValidatedRolloutLedgerStep`].
-//!   Format v6 also binds sampler prestate and chain lineage, the independently
-//!   encoded selected prompt for every group, transfers the
-//!   collector's exact post-rollout sampler blob, and returns an opaque
-//!   learner-produced receipt for a versioned adapter + Adam + sampler
-//!   continuation whose policy/config/schema/payload lineage is verified. Under
-//!   data parallelism it publishes immutable rank shards behind one global
-//!   manifest-last commit marker and validates the complete world before replay.
-//!   Under tensor parallelism every model shard executes and validates the same
-//!   logical world-one package, execution rank 0 alone publishes it, replicated
-//!   `LoRA` gradients are sum-reduced before Adam, and continuation v3 binds both
-//!   DP/TP topology plus canonical communicator-rank shard ordering;
-//! - held-out evaluation ([`eval`]) — the base model vs. the trained adapter,
-//!   mean reward over a held-out set (the P4 gate's comparison);
-//! - activation checkpointing ([`remat`]) — candle ships no checkpoint
-//!   primitive, so ferrl orchestrates layer-boundary rematerialization itself:
-//!   the checkpointed forward cuts the autograd graph at every layer boundary
-//!   and `backward` re-runs one layer at a time, stitching the full gradient
-//!   from the boundary tape (the primary single-card memory lever — opt-in via
-//!   each model's `set_activation_checkpointing`);
-//! - `MoE` primitives ([`moe`]) — the qwen3.5/3.6 sparse layer's kernels
-//!   (top-k router with unconditional renorm, packed-weight experts, the
-//!   sigmoid-gated shared expert), grad-bearing and oracle-pinned, wired into
-//!   [`qwen35`]'s feed-forward layer menu so the same `Qwen3_5GradModel`
-//!   loads both the dense and the `MoE` family members (M3′);
-//! - the distributed communication seam ([`comm`]) — the [`Comm`] trait
-//!   (rank identity + sum-reductions) drives data-parallel accumulated-gradient
-//!   reduction and tensor-parallel activations, rewards, control, and adapter
-//!   gradients while keeping every rank in lockstep;
-//!   [`SoloComm`] is the world-1 default (the single-rank path stays
-//!   bit-identical to the pre-DP trainer), [`LocalComm`] runs an N-thread
-//!   single-process world for CPU-testable DP/TP equivalence oracles, and
-//!   [`NcclComm`] is the real multi-GPU implementation whose `unsafe` cudarc
-//!   collective is quarantined behind `--features nccl`;
-//! - a CUDA driver-compatibility preflight ([`cuda_compat`]) — translates the cryptic
-//!   `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` (a build-PTX-newer-than-driver mismatch) into
-//!   an actionable rebuild/upgrade message; a no-op without the `cuda` feature;
-//! - run telemetry ([`telemetry`]).
+//! - **Tasks and verification:** scalar, fallible [`reward`] functions over
+//!   typed [`sample`] values; exact arithmetic reference tasks; the verifier-
+//!   backed [`trimul`] reward; and the [`sandbox`] / [`verifier_executor`]
+//!   execution tiers for untrusted generated code.
+//! - **RL and trainable state:** pure [`grpo`] math, the generic [`trainer`],
+//!   manual [`lora`] adapters, opt-in full fine-tuning, [`optim`], reproducible
+//!   [`sampler`] state, held-out [`eval`], and layer-boundary [`remat`].
+//! - **Durability and provenance:** identity-bound ordinary [`checkpoint`]
+//!   packages, the versioned separated [`rollout_ledger`] contract, and
+//!   [`telemetry`] for launch/config identity, metrics, candidate rows, and
+//!   held-out reports. The binary adds launch authentication and strict TriMul
+//!   artifact publication over those library boundaries.
+//! - **Model generality:** [`model`] and [`policy`] define the grad-forward,
+//!   cached-decoder, generation, and token-scoring contracts. [`lm_policy`]
+//!   instantiates them for Qwen3, dense Llama-3.x, Qwen3.5/3.6 dense and `MoE`,
+//!   and dense Gemma 4 text; [`loader`] provides the supported automatic
+//!   checkpoint dispatch.
+//! - **Distributed execution:** [`comm`] and [`tensor_parallel`] keep world-one,
+//!   data-parallel, and supported tensor-parallel paths on one coordination
+//!   contract. The optional NCCL bridge contains the crate's only gated
+//!   `unsafe`; default builds remain `unsafe`-free.
+//! - **Operational compatibility:** [`cuda_compat`] turns PTX/driver mismatches
+//!   into actionable diagnostics.
 //!
-//! Everything below the RL layer — tensors, autograd, optimizers, devices, and
-//! the model itself — is **delegated** to `candle-core`, `candle-nn`, and
-//! `candle-transformers`. In particular `ferrl` does not implement its own
-//! autodiff: it builds a loss [`candle_core::Tensor`] from candle ops and calls
-//! [`candle_core::Tensor::backward`].
+//! `candle-core`, `candle-nn`, and `candle-transformers` remain the compute
+//! substrate: tensors, autograd, GPU primitives, and shipped inference
+//! implementations. Ferrl builds its differentiable loss and grad-bearing model
+//! paths from candle operations rather than implementing another autodiff engine.
 //!
 //! ## Correctness oracles
 //!
-//! Because the autodiff is not ours, correctness is pinned by oracles rather
-//! than by re-deriving gradients: the pure GRPO math is checked against a
-//! committed golden JSON fixture computed with `NumPy` (`std(ddof=1)`, matching
-//! TRL/candle — `scripts/gen_golden.py`); and a grad-coverage canary asserts that
-//! trainable `LoRA` [`candle_core::Var`]s appear in the grad store after
-//! `backward` with the expected (init-dependent) non-zero gradients — candle
-//! optimizers *silently* skip params missing from the grad store (see [`lora`]).
-//! The custom [`qwen`] forward is pinned to candle's shipped Qwen3 forward by a
-//! per-position equivalence oracle — on a tiny config in CI and on the real
-//! `Qwen3-0.6B-Base` checkpoint in `#[ignore]`d, weights-gated tests. Finally, an
-//! end-to-end **finite-difference gradcheck** pins candle's analytic gradient of
-//! the GRPO loss — the exact `grpo_loss` the trainer back-propagates — against
-//! central differences w.r.t. the `LoRA` parameters, exercising the clipped
-//! surrogate, the k3 KL penalty, and both masked reductions.
+//! GRPO is pinned two ways: a `NumPy` fixture covers independent scalar math and
+//! advantage normalization, while a fixture generated by TRL 1.5.1's own
+//! `GRPOTrainer._compute_loss` covers Ferrl's differentiable clipped/KL loss and
+//! GRPO, Dr.GRPO, DAPO, token-level, and sequence-level variants. A grad-coverage
+//! canary rejects trainable variables missing from candle's gradient store, and
+//! finite-difference tests pin the production loss gradient.
+//!
+//! Native model forwards are checked position-by-position against committed
+//! official-reference fixtures for Qwen3, Llama-3.x, Qwen3.5/3.6, and dense
+//! Gemma 4 text. Cached decoders, distributed execution, checkpoints, rollout
+//! ledgers, verifier isolation, held-out evaluation, and artifact publication
+//! retain separate positive and fail-closed negative-control gates.
 //!
 //! ## Stability
 //!

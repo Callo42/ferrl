@@ -38,8 +38,8 @@
 //!    Implausibly fast timings (below the configured floor — a glitch or forged
 //!    grade) still score `0`. The final artifact gate remains stricter than the
 //!    training reward: secret-seed re-verification of the launch-bound cases plus a
-//!    repeated same-metric latency audit. A distinct genuinely held-out case/reward
-//!    boundary is outside this contract.
+//!    repeated same-metric latency audit. Training-time evaluation separately uses
+//!    a distinct case-generation seed and verifier reward for genuinely held-out cases.
 //!
 //! ## What lives where
 //!

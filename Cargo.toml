@@ -1,8 +1,8 @@
 # ferrl workspace manifest.
 #
-# Single crate for now (crates/ferrl), but kept as a workspace so the lint and
-# dependency policy lives in one place and future crates (e.g. a CLI front-end)
-# inherit it. The [workspace.lints] table below is the LOCKED quality bar: CI
+# The library and CLI currently share one crate (`crates/ferrl`); the workspace
+# keeps lint and dependency policy centralized for any later crate split. The
+# [workspace.lints] table below is the locked quality bar: CI
 # runs `cargo clippy --all-targets -- -D warnings`, so every lint set to `warn`
 # here becomes a hard error. The set is deliberately CURATED — `clippy::all`
 # plus a hand-picked slice of pedantic — so that correct, idiomatic code
@@ -22,18 +22,19 @@ edition = "2021"
 # crates requiring Cargo's `edition2024` feature (stabilized 1.85); (2) candle-core
 # 0.10.2 calls the `is_multiple_of` integer method (the `unsigned_is_multiple_of`
 # library feature, stabilized 1.87) — the binding constraint. Enforced by the
-# `msrv` CI job (`cargo +1.87 check --locked`); verified building the full tree
-# before PR-①. 1.82 was the original aspirational floor (never CI-enforced); the
-# real floor surfaced when PR-① added the gate. Bump on purpose.
+# `msrv` CI job (`cargo +1.87 check --locked`). The earlier aspirational 1.82
+# floor was never CI-enforced; dependency auditing established 1.87 as the real
+# floor. Bump it only on purpose.
 rust-version = "1.87"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Callo42/ferrl"
 authors = ["Callo42"]
 
 [workspace.dependencies]
-# Math / tensor / autograd / GPU / model backend. We OWN only the RL layer and
-# DELEGATE every tensor op, the autograd graph, GPU dispatch, and the model
-# forward to candle. The three crates MUST move in lockstep: pin them to the
+# Math / tensor / autograd / GPU and shipped inference backend. Ferrl owns the
+# discovery, RL, verification, and grad-bearing-forward layers while delegating
+# primitive tensor ops, autograd, and GPU dispatch to candle. The three crates
+# MUST move in lockstep: pin them to the
 # SAME version so candle-nn / candle-transformers never resolve a candle-core
 # that differs from the one ferrl links. 0.10.2 is the current coherent set
 # (published 2026-04-01) and is the first line that ships the Qwen3 model.
@@ -83,7 +84,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 # RNG for GRPO sampling / group construction and reproducible test fixtures. The
 # `serde` feature serializes the sampler RNG state (`GrpoSampler`'s
-# `Xoshiro256PlusPlus`) so a checkpoint can capture and restore it (P6-B resume).
+# `Xoshiro256PlusPlus`) so checkpoints and continuations can capture and restore it.
 rand = { version = "0.10", features = ["serde"] }
 # Optional CUDA driver/runtime bindings. candle pulls cudarc transitively but not
 # its `runtime` module; ferrl takes a direct OPTIONAL dep (activated only by the

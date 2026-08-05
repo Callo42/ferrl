@@ -1,25 +1,23 @@
-//! The Countdown GRPO **goal-gate ladder** harness for the qwen3.5/3.6 family —
-//! rung 1: the 0.8B `PoC` on the modern (R-track) recipe.
+//! The Countdown GRPO ladder harness for the qwen3.5/3.6 family.
 //!
 //! Drives [`ferrl::Qwen3_5Policy`] (real `Qwen3.5-0.8B-Base`, bf16 base / F32
 //! `LoRA` adapter on CUDA) through a GRPO run over the verifiable
-//! [`ferrl::countdown`] reward, then gates like the P4 harness: **the training
-//! reward rises AND the trained adapter beats base on a held-out Countdown
+//! [`ferrl::countdown`] reward, then applies the same acceptance condition as the
+//! Qwen3 harness: **the training reward rises AND the trained adapter beats base on a held-out Countdown
 //! eval** (via [`ferrl::evaluate`]).
 //!
-//! Rung 1 (0.8B `PoC`) → rung 2 (9B dry-run) → rung 3 (27B, the goal gate) are
-//! this same harness pointed at bigger checkpoints — every knob is an env
-//! override (`FERRL_CD35_*`), so a rung is a config, not a rebuild. Like
+//! The completed 0.8B `PoC` → 9B dry-run → 27B ladder used this same
+//! harness with progressively larger checkpoints. Every knob is an env override
+//! (`FERRL_CD35_*`), so a rung is a config, not a rebuild. Like
 //! `countdown_grpo`, this is a *run harness*, not a CI test: it needs a staged
 //! checkpoint and a GPU (`cargo llvm-cov` skips `examples/`).
 //!
 //! # The modern recipe (how this differs from `countdown_grpo`)
 //!
-//! The legacy harness deliberately pins the pre-R1 recipe its gate margins were
-//! calibrated on. This harness runs the **R-track library defaults** — token-level
+//! The legacy harness deliberately pins the earlier recipe its gate margins were
+//! calibrated on. This harness runs the **current library defaults** — token-level
 //! DAPO loss, global-norm grad clipping at `1.0`, truncation masking ON,
-//! symmetric `0.2` clip, no TIS — plus the two ladder knobs `PLAN.md` names
-//! explicitly:
+//! symmetric `0.2` clip, no TIS — plus two explicit ladder knobs:
 //!
 //! - **`warmup_steps`** — default **20** here (the library default is `0` so the
 //!   toy/CI config stays deterministic; ladder run configs set it explicitly).
@@ -29,19 +27,18 @@
 //!   `k = FERRL_CD35_EVAL_K` completions per prompt. `FERRL_CD35_EVAL_SAMPLING=off`
 //!   recovers the trainer-distribution eval for an A/B comparison.
 //!
-//! **Gate margins are NOT yet calibrated on this recipe.** The first rung-1 runs
-//! establish them (tune `FERRL_CD35_MARGIN`); the legacy harness's margins were
-//! calibrated on a different recipe and model and do not transfer.
+//! The established ladder threshold is a `0.05` reward/eval margin
+//! (`FERRL_CD35_MARGIN`). Override it only as part of a deliberate recalibration;
+//! margins from the sibling Qwen3 harness do not transfer automatically.
 //!
 //! # Rung-1 decision knobs
 //!
 //! - **`FERRL_CD35_TARGETS`** — `industrial` (default; `attn:qkvo|mlp:gud|gdn:-`)
-//!   or `all-linear` (adds the `GatedDeltaNet` projections). A/B-ing these on
-//!   rung 1 renders the deferred **GDN-LoRA verdict**.
+//!   or `all-linear` (adds the `GatedDeltaNet` projections) for a controlled
+//!   adapter-target ablation.
 //! - **`FERRL_CD35_REMAT`** — `on` turns on activation checkpointing
-//!   (default off, matching the library default). A/B-ing it on one config is
-//!   the deferred **real peak-memory measurement**; recompute is deterministic,
-//!   so the trajectory should match the uncheckpointed run.
+//!   (default off, matching the library default). Paired runs can compare peak
+//!   memory while checking that deterministic recomputation preserves trajectory.
 //!
 //! # Fail-loud knobs (a typo must not burn a GPU run)
 //!
@@ -55,8 +52,9 @@
 //!
 //! # Running it
 //!
-//! Build on the login node, run on a GPU node (see the scope card for the CUDA
-//! recipe). It logs via `tracing` (no stdout prints):
+//! Build with `--features cuda` under a compatible toolkit/driver setup (see the
+//! README's GPU-build guidance), then run on a GPU node. It logs via `tracing`
+//! (no stdout prints):
 //!
 //! ```text
 //! cargo build --release --features cuda --example countdown_grpo_qwen35
@@ -333,7 +331,7 @@ fn eval_top_p() -> Result<Option<f64>> {
     }
 }
 
-/// The eval-only sampling override (the R2 eval convention), pre-flight
+/// The eval-only sampling override, pre-flight
 /// validated HERE so a typo'd eval knob aborts before training rather than
 /// after the last step. `FERRL_CD35_EVAL_SAMPLING=off` drops the override and
 /// evaluates on the trainer distribution instead (the legacy comparison).
@@ -351,7 +349,7 @@ fn eval_sampling_override() -> Result<Option<EvalSampling>> {
     }))
 }
 
-/// The held-out eval generation config — the R2 **eval convention**: avg@k with
+/// The held-out eval generation config: avg@k with
 /// `k = FERRL_CD35_EVAL_K` completions per prompt (default: the training group
 /// size), sampled per [`eval_sampling_override`].
 fn build_eval_gen(tcfg: &TrainerConfig) -> Result<GenConfig> {
@@ -405,8 +403,8 @@ fn resolve_eos_strict(dir: &Path, tokenizer: &HfTokenizer) -> Result<Option<u32>
 /// Report the run's reward trend, held-out eval, and EOS witness, then apply
 /// the ladder gate: the training reward **rises** AND the trained adapter
 /// **beats base** on held-out Countdown, each by `FERRL_CD35_MARGIN`. The
-/// margins are NOT yet calibrated on the modern recipe — rung-1 runs establish
-/// them; a bare `> 0` would pass on Monte-Carlo noise.
+/// default `0.05` margin is the established ladder threshold; a bare `> 0`
+/// would pass on Monte-Carlo noise.
 fn report_and_gate(history: &[Metrics], post: &EvalReport, gen: &GenConfig) -> Result<()> {
     let (first, last) = reward_trend(history);
     let improvement = post.improvement();

@@ -1130,8 +1130,8 @@ impl LoraLinear {
     ///
     /// For a real model the frozen base is loaded in BF16 (halving weight **and**
     /// activation memory), but a BF16 *adapter* would lose the GRPO update: a tiny
-    /// `lr · grad` step rounds away in BF16's ~3 significant digits — the precision
-    /// collapse P3 flagged. Keeping `A`/`B` (and therefore their gradients and the
+    /// `lr · grad` step rounds away in BF16's ~3 significant digits. Keeping
+    /// `A`/`B` (and therefore their gradients and the
     /// optimizer's moment estimates) in F32 preserves the update; the [`forward`](Self::forward)
     /// casts them down to the activation dtype only for the matmul, so the big
     /// activations stay BF16. This is standard mixed-precision: an F32 master copy,

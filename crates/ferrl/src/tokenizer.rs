@@ -2,9 +2,8 @@
 //!
 //! [`HfTokenizer`] wraps a Hugging Face `tokenizers::Tokenizer` (loaded from a
 //! `tokenizer.json`) and implements the trainer's [`TokenizerLike`] bridge, so a
-//! real model (e.g. `Qwen3-0.6B-Base`) plugs into the GRPO loop the same way the
-//! P2 toy's char codec does. The toy keeps a trivial in-test codec; this is the
-//! production path that loads an actual model's vocabulary.
+//! real model plugs into the GRPO loop through the same interface as a test
+//! tokenizer. This is the production path that loads an actual model vocabulary.
 //!
 //! ## Why the trait stays infallible
 //!

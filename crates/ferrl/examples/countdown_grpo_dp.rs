@@ -1,6 +1,5 @@
-//! Data-parallel Countdown GRPO — the P9 gate the NCCL [`Comm`](ferrl::Comm)
-//! bridge unlocks: a **real multi-GPU GRPO training run**, not just a synthetic
-//! all-reduce.
+//! Data-parallel Countdown GRPO over the NCCL [`Comm`](ferrl::Comm) bridge: a
+//! **real multi-GPU GRPO training run**, not just a synthetic all-reduce.
 //!
 //! Launch one process per GPU on one node, with **every rank able to see all the
 //! allocated GPUs** so each binds its own by `SLURM_LOCALID` — e.g. `srun --ntasks=2
@@ -149,7 +148,7 @@ mod dp {
 
     /// The Countdown training prompts (every rank generates the identical set from
     /// the same `FERRL_CDDP_DATA_SEED`; the trainer shards it per rank). No held-out
-    /// split — this gate proves DP correctness + learning, not the P4 beats-base
+    /// split — this gate proves DP correctness + learning, not the held-out beats-base
     /// claim (that is `countdown_grpo`'s job, and a held-out *win* is downstream).
     fn build_train_samples() -> Vec<Sample<CountdownProblem>> {
         let cd_cfg = CountdownConfig {

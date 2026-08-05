@@ -1,12 +1,12 @@
-//! End-to-end P2 gate: a tiny CPU GRPO loop on an *echo* task.
+//! End-to-end CPU GRPO gate on a tiny *echo* task.
 //!
 //! A `LoRA`-adapted one-layer LM over a small vocab must learn to copy its
 //! prompt symbol. The model is built only from `ferrl`'s public API — a frozen
 //! base weight + a `LoraLinear` adapter, a grad-safe `rms_norm_slow` `RmsNorm`,
 //! and a categorical sampler — so it exercises all five seams (`RewardFn`,
-//! `Policy`, `LoraLinear`, the GRPO math, and the `Trainer`) exactly as a real
-//! Qwen policy will at P4. The toy lives in the test crate, not the library, so
-//! `ferrl` stays a model-agnostic RL layer.
+//! `Policy`, `LoraLinear`, the GRPO math, and the `Trainer`) through the same
+//! generic contracts as real model policies. The toy lives in the test crate,
+//! not the library.
 //!
 //! Gates proven here:
 //! 1. **reward trends up** — the loop learns the echo map (β = 0, μ = 1);
@@ -56,8 +56,8 @@ fn checkpoint_policy_sha256() -> String {
 // ---- the toy policy --------------------------------------------------------
 
 /// A one-layer `LoRA` LM over a `vocab`-symbol alphabet. The forward is
-/// `one_hot(x) -> LoraLinear -> rms_norm_slow -> logits`, mirroring the P1
-/// grad-flow template so the canary is meaningful and grads must cross the norm.
+/// `one_hot(x) -> LoraLinear -> rms_norm_slow -> logits`, mirroring the
+/// production grad-flow shape so the canary is meaningful and grads must cross the norm.
 struct EchoPolicy {
     lora: LoraLinear,
     norm: RmsNorm,
@@ -602,7 +602,7 @@ fn gate_reward_trends_up() {
         temperature: TEMP,
         lr: 0.05,
         // Trend-gate calibration pin: these margins were calibrated WITHOUT
-        // global-norm clipping (pre-R1); the R1 default Some(1.0) binds on this
+        // global-norm clipping; the maintained default Some(1.0) binds on this
         // toy's early gradients and shifts the trajectory toward the margin.
         // Clipping has its own dedicated unit + integration coverage.
         max_grad_norm: None,
@@ -1329,14 +1329,14 @@ fn gate_grad_accum_effective_batch_learns() {
     // gate: the effective batch (4 * 8 = 32) matches the WIDE-MARGIN group-32 learning gates
     // (gate_reward_trends_up / gate_dr_grpo) — `late` lands in [0.80, 1.0] vs the 0.5 floor —
     // so it learns the echo map with ample margin (it shares those gates' rare, pre-existing
-    // contention flakiness — a separate known issue, the P2 lesson — not flake-proof). The
+    // contention flakiness — a separate known issue — not flake-proof). The
     // smaller two-prompt window (effective batch 8) keeps its own non-flaky mechanism
     // coverage in `gate_grad_accum_two_prompt_window`.
     //
     // A *small* effective batch is what lets a group-4 run land in a CPU-dependent weak
-    // optimum (the P2 platform-dependence lesson — float non-associativity, dev host !=
+    // optimum (float non-associativity, dev host !=
     // CI; at grad_accum_steps 2 this config plateaued ~0.59 on a CI runner under the
-    // P6-B Xoshiro swap), which is why this gate is dialed up to the robust batch size.
+    // Xoshiro swap), which is why this gate is dialed up to the robust batch size.
     // lr stays at the proven-safe 0.05. The learning signal is a single fixed floor
     // `late > 0.5` (~0.3 above the ~1/VOCAB untrained baseline): at this effective batch
     // `late` lands in [0.80, 1.0] across the verification runs, so the floor carries
@@ -1380,13 +1380,13 @@ fn gate_grad_accum_two_prompt_window() {
     // learning gate above (which dials the effective batch up to 32). Here
     // grad_accum_steps = 2 over group_size 4 forms an effective batch of 8 — the
     // SMALLEST accumulation window — and each optimizer step folds TWO prompts' group-4
-    // gradients (each scaled 1/2) into one AdamW update. This preserves the original P5
+    // gradients (each scaled 1/2) into one AdamW update. This preserves the original
     // two-prompt coverage that raising the at-scale gate to effective batch 32 would
     // otherwise erase.
     //
     // This gate asserts the MECHANISM, not a converged-optimum learning LEVEL. At this
-    // small effective batch the converged reward is float-/contention-dependent (the P2
-    // platform lesson: float non-associativity; dev host != CI): across 200+ full-suite
+    // small effective batch the converged reward is float-/contention-dependent (float
+    // non-associativity; dev host != CI): across 200+ full-suite
     // samples the last-40 mean ranged ~0.39..1.0, and a fixed `late` floor flakes under
     // heavy parallel-suite load (it dipped to 0.394 once the heavier resume gate joined
     // the suite). So the learning OUTCOME is left to the wide-margin at-scale sibling
@@ -1460,7 +1460,7 @@ fn gate_grad_accum_two_prompt_window() {
 
 #[test]
 fn interrupted_run_resumes_bit_identically() {
-    // THE P6-B capstone gate: a run interrupted at INTERRUPT_AT and resumed from a
+    // Resume capstone: a run interrupted at INTERRUPT_AT and resumed from a
     // momentum-faithful format-v4 checkpoint reproduces the uninterrupted run's post-resume
     // trajectory BIT-FOR-BIT. `Trainer::resume` restores the adapter weights, the
     // optimizer moments + step counter, AND the sampler RNG, so every post-resume window
@@ -2164,7 +2164,7 @@ fn empty_prompt_is_a_typed_error() {
     );
 }
 
-// ---- the detached-scoring seam (P7) -----------------------------------------
+// ---- the detached-scoring seam ----------------------------------------------
 
 /// Wraps [`EchoPolicy`], counting `Policy::token_logprobs_detached` calls —
 /// the wiring witness that the trainer routes BOTH value scorings (the

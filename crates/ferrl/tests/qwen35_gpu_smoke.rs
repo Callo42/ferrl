@@ -1,4 +1,4 @@
-//! M2′ bf16 GPU gates for the `qwen3_5` path (`#[ignore]`d).
+//! Bf16 GPU gates for the `qwen3_5` path (`#[ignore]`d).
 //!
 //! The CPU suites validate the hybrid forward at F32, where the fp32
 //! boundaries the reference mandates (delta-rule state/gates, attention
@@ -249,7 +249,7 @@ fn qwen35_bf16_forward_matches_reference_on_gpu() {
              max-abs {max_abs:.4} (scale {max_logit:.2}, rel {rel:.4})"
         );
         assert!(max_abs.is_finite(), "p{i}: non-finite bf16 divergence");
-        // Same backstops as the M1 bf16 gates: honest bf16 noise sits at a few
+        // Same backstops as the Qwen3/Llama bf16 gates: honest bf16 noise sits at a few
         // percent of the logit scale (llama measured rel 0.0095, qwen 0.054);
         // 0.5 cleaves between noise and a real break.
         assert!(
@@ -425,7 +425,7 @@ fn qwen35_policy_grpo_smoke_on_gpu() {
     // generic `Trainer` on CUDA — cached hybrid rollout -> reward ->
     // advantages -> backward through the bf16 chunked-GDN forward ->
     // grad-coverage canary -> FerrlAdamW. Two steps; `grad_norm > 0`
-    // witnesses a real optimizer step (the M1 reusability bar, third model).
+    // witnesses a real optimizer step through the generic model seam.
     let device = cuda();
     let model = load_bf16(&device);
     let mut policy = Qwen3_5Policy::new(model, 1234, 1.0);

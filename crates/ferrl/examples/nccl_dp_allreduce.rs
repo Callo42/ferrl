@@ -1,5 +1,5 @@
 //! Multi-process NCCL all-reduce equivalence check — the GPU gate for the
-//! [`NcclComm`](ferrl::NcclComm) data-parallel bridge (P8).
+//! [`NcclComm`](ferrl::NcclComm) data-parallel bridge.
 //!
 //! Launch one process per GPU on one node, with **every rank able to see all the
 //! allocated GPUs** so each binds its own by `SLURM_LOCALID` — e.g. `srun --ntasks=2

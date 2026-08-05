@@ -8,54 +8,41 @@ artifact it finds. The first target is a faster, correct **TriMul GPU kernel**.
 ferrl **owns the RL, reward-verification, and search layer** — with
 [GRPO](https://arxiv.org/abs/2402.03300) + LoRA as the first recipe — including rollout,
 training, candidate verification, and artifact extraction. It **delegates tensor math,
-autograd, GPU, and model code** to candle (`candle-core`, `candle-nn`,
-`candle-transformers`). We do not reimplement autodiff or kernels; we orchestrate
-candle's.
+autograd, GPU primitives, and the shipped inference stack** to candle
+(`candle-core`, `candle-nn`, `candle-transformers`). Ferrl supplies the
+gradient-bearing forwards, RL machinery, and verifier boundaries candle does not.
 
-> Status: the training stack runs end-to-end on real hardware, single-GPU **and**
-> single-node multi-GPU. The single-GPU core — GRPO trainer (gradient accumulation,
-> EOS/length masking, momentum-faithful checkpoint/resume), manual LoRA with a
-> bf16-base / F32-adapter dtype split, a KV-cached merged-weight rollout, opt-in
-> activation checkpointing (layer-boundary rematerialization — candle ships no
-> checkpoint primitive), and a held-out eval harness — scales to a **Qwen3.6-27B
-> LoRA-GRPO run end-to-end on a single H200** (forward-equivalent to the reference,
-> rematerialization fits the activation footprint, training reward rises). Grad-bearing
-> forwards exist for **four architecture families** — Qwen3 (dense), dense Llama-3.x, the
-> hybrid `qwen3_5` family (GatedDeltaNet + gated GQA, i.e. Qwen3.5/3.6), and dense
-> Gemma 4 text (`gemma4`, with `gemma4_unified` accepted as the same dense text
-> loader shape) — behind the `GradModel`/`CachedDecoder` trait seam, so one generic
-> policy and trainer drive all four unchanged. Committed tiny external oracles from
-> the official Transformers implementations cover native Qwen3, dense Llama, the
-> `qwen3_5` family, and Gemma 4's upstream dense text `gemma4` / `gemma4_text`
-> reference shape; Gemma's unified alias is covered by config/loader gates.
->
-> **Single-node data parallelism is in and verified on multi-GPU hardware**: an
-> all-reduce of LoRA gradients over an NCCL `Comm` bridge (`--features nccl` — the
-> crate's only `unsafe`, developed CPU-mock-first), DP-coordinated checkpoint resume +
-> restart-on-preemption, and run observability (per-step timing, a `summarize` health
-> view, the `runreport` tool, and rank/world/step-stamped `tracing` logs); verified
-> bit-identical across ranks on multi-A100. **Single-node tensor-parallel execution is
-> also available** for Qwen3 and dense Gemma 4 rollout/scoring. Sharded training through
-> `ferrl train` is currently fail-closed except for activation-checkpointed dense Gemma 4,
-> whose rematerialized backward reduces replicated-boundary cotangents and whose final
-> adapter gradients are reduced over the NCCL TP communicator. Dense Gemma 4 streams each
-> rank's frozen projection shards
-> directly from single-file or indexed safetensors on Unix; shared weights and LoRA adapters
-> stay replicated. Qwen3 currently retains a fully replicated frozen-base fallback. The
-> separated rollout-ledger API also supports this sharded TP execution contract, with every
-> TP rank validating one logical window and rank 0 owning its durable side effects. Combined
-> sharded DP x TP remains future work.
+## Current capabilities
+
+The stack runs end-to-end on real hardware and has produced a strict,
+held-out-audited TriMul artifact win from an RL-trained native Gemma 4 policy.
+Its single-GPU training path has also completed a Qwen3.6-27B LoRA-GRPO run on a
+single H200, and single-node data parallelism has been verified in rank lockstep
+on multiple A100s.
+
+| Model family | World-one training | Tensor-parallel execution | Notes |
+|---|---|---|---|
+| Qwen3 | CLI + Rust API | Rollout/scoring | TP keeps a replicated frozen-base fallback; sharded learning fails closed. |
+| Qwen3.5/3.6 dense + MoE | CLI + Rust API | Not supported | Native hybrid GatedDeltaNet/GQA forward; no sharded learning. |
+| Llama-3.x dense | Rust API | Not supported | `LlamaPolicy` is available, but the CLI auto-loader does not select Llama checkpoints. |
+| Dense Gemma 4 text | CLI + Rust API | Rollout/scoring; training with activation checkpointing | Streams rank-local frozen projection shards from safetensors on Unix. |
+
+The `Comm` seam makes data-parallel LoRA training model-generic and provides
+coordinated checkpoint/resume. Qwen3 and dense Gemma 4 use single-node TP for
+rollout/scoring; only activation-checkpointed dense Gemma 4 currently supports
+sharded TP learning. Combined sharded DP × TP remains deliberately unsupported.
 
 ---
 
-## Why a separate RL layer
+## Why a separate discovery layer
 
-Most of the heavy lifting in RL fine-tuning is ordinary deep-learning compute that
-candle already does well. What is *specific* to GRPO — group-relative advantages, the
-k3 KL estimate, the clipped surrogate, masked aggregation over variable-length
-completions, and making sure every trainable LoRA parameter actually receives a
-gradient — is small, subtle, and easy to get silently wrong. ferrl isolates exactly
-that surface so it can be tested to a high bar.
+Most model and tensor compute already belongs in candle. Discovery adds a smaller,
+load-bearing surface: define a typed task and verifiable reward, sample and update a
+policy, execute untrusted candidates, reject reward hacking, compare against a fixed
+baseline, and publish only a correct artifact with durable provenance. GRPO's
+group-relative advantages, clipped objective, KL term, masking, and LoRA gradient
+coverage are similarly compact and easy to get silently wrong. Ferrl isolates and
+tests those boundaries while candle remains the compute substrate.
 
 ---
 
@@ -69,23 +56,25 @@ ferrl/
 ├── rustfmt.toml  clippy.toml  # max_width=100; cognitive-complexity threshold 7
 ├── cog.toml                   # cocogitto (Conventional Commits + SemVer)
 ├── justfile                   # task runner (NFS-home-aware cargo wrapper)
-├── scripts/gen_golden.py      # the Python GRPO oracle (regenerates the fixture)
+├── scripts/                   # NumPy/TRL and model-family oracle generators
 ├── .github/workflows/ci.yml   # CPU-only CI gate
 └── crates/ferrl/
     ├── src/
-    │   ├── grpo.rs                          # GRPO math (advantages, k3 KL, surrogate)
-    │   ├── trainer.rs  eval.rs              # training loop + held-out eval harness
-    │   ├── lora.rs  optim.rs  sampler.rs  checkpoint.rs
-    │   ├── model.rs                         # the GradModel / CachedDecoder trait seam
-    │   ├── qwen.rs  llama.rs  qwen35.rs  gemma4.rs
-    │   │                                      # the model layer (grad forwards + cached decoders)
-    │   ├── blocks.rs  gdn.rs  remat.rs      # shared blocks, GatedDeltaNet math, activation ckpt
-    │   ├── moe.rs                           # qwen3.5/3.6 sparse-MoE kernels (router/experts, M3′)
-    │   ├── lm_policy.rs                     # Policy over any GradModel (Qwen/Llama/Qwen3_5/Gemma4)
-    │   ├── comm.rs  comm/                   # distributed Comm seam (Solo/Local + NCCL bridge)
-    │   ├── full_ft.rs                       # opt-in full fine-tune (vs LoRA)
-    │   └── {lib,policy,reward,nn,tokenizer,countdown,telemetry,cuda_compat}.rs
-    └── tests/fixtures/grpo_golden.json      # committed oracle output
+    │   ├── bin/ferrl.rs                     # train, score, audit, report, and verifier CLI
+    │   ├── {sample,reward,countdown,math,trimul}.rs
+    │   │                                      # typed tasks and verifiable rewards
+    │   ├── {sandbox,verifier_executor}.rs   # untrusted-candidate execution tiers
+    │   ├── {grpo,trainer,eval}.rs           # RL math, training, held-out evaluation
+    │   ├── {checkpoint,rollout_ledger,telemetry}.rs
+    │   │                                      # resume, separated execution, provenance
+    │   ├── {model,policy,lm_policy,loader}.rs
+    │   │                                      # model/policy seams and checkpoint dispatch
+    │   ├── {qwen,llama,qwen35,gemma4}.rs    # grad forwards + cached decoders
+    │   ├── {blocks,gdn,moe,remat}.rs        # shared model and rematerialization primitives
+    │   ├── {lora,optim,sampler}.rs          # trainable state and reproducible sampling
+    │   ├── {comm,tensor_parallel}.rs  comm/ # world-1, DP, and TP communication
+    │   └── cuda_compat.rs                   # PTX/driver preflight
+    └── tests/fixtures/                      # committed GRPO and model-family oracles
 ```
 
 ---
@@ -104,6 +93,9 @@ Ruff + mypy + pytest Python setup). All of it runs on cloud CI on GitHub Actions
 | Tests       | `cargo test` + doctests; `proptest` for numeric invariants. |
 | Coverage    | `cargo-llvm-cov` with a hard gate `--fail-under-lines 90`. Examples/bin are excluded from coverage so the gate is achievable from commit 1 (which ships the pure GRPO math + tests). |
 | Toolchain   | `rust-toolchain.toml` pins stable + `rustfmt`, `clippy`, `llvm-tools-preview`. |
+| Feature contract | CI lints and tests the `gate`-feature TriMul verifier target and syntax-checks its Python driver. |
+| Supply chain | CI runs `cargo deny check` and `cargo audit`. |
+| Compatibility | CI checks the declared Rust 1.87 MSRV against the committed lockfile. |
 | Commits     | Conventional Commits + SemVer via [`cocogitto`](https://github.com/cocogitto/cocogitto) (`cog.toml`, tag prefix `v`, changelog). |
 | Hooks       | [`pre-commit`](https://pre-commit.com): trailing-whitespace, end-of-file-fixer, check-merge-conflict, check-toml, check-yaml, detect-private-key, plus local `cargo fmt` / `cargo clippy` (commit stage) and the `cog` commit-msg hook. Heavy test runs stay in CI. |
 | License     | Dual **MIT OR Apache-2.0**. |
@@ -112,12 +104,12 @@ Ruff + mypy + pytest Python setup). All of it runs on cloud CI on GitHub Actions
 
 Because ferrl no longer owns autodiff, correctness is pinned against references:
 
-1. **GRPO math vs TRL / DeepSeekMath** — a committed golden JSON
-   (`crates/ferrl/tests/fixtures/grpo_golden.json`) computed with **NumPy**
-   (`std(ddof=1)`, matching TRL `nanstd` / candle `Tensor::var`) by
-   `scripts/gen_golden.py`. The Rust test `grpo::tests::matches_golden_fixture`
-   loads it and asserts agreement (scaled **and** unscaled advantages). See
-   [Oracle](#oracle--golden-fixture).
+1. **GRPO math vs independent fixtures** — the NumPy fixture
+   (`grpo_golden.json`) pins advantage normalization and scalar identities,
+   including `std(ddof=1)`. A second fixture (`grpo_golden_trl.json`) is produced
+   by TRL 1.5.1's own `GRPOTrainer._compute_loss` and pins Ferrl's production
+   clipped/KL loss, token- and sequence-level importance sampling, and GRPO,
+   Dr.GRPO, and DAPO reductions. See [Oracle](#oracle--golden-fixture).
 2. **Model forward vs official model-family references** — committed tiny fp32 CPU
    checkpoints and per-position logits generated by the pinned official Transformers
    implementations cover native Qwen3, dense Llama-3.x (including Llama-3 RoPE
@@ -150,13 +142,17 @@ just check       # cargo check
 just test        # cargo test + doctests
 just cov         # cargo-llvm-cov, --fail-under-lines 90
 just doc         # rustdoc, deny broken intra-doc links
-just gate        # the full CI gate locally: fmt + clippy + check + test + cov + doc
+just gate        # core local CPU gate: fmt + clippy + check + test + cov + doc
 ```
 
-### Regenerating the GRPO golden fixture
+GitHub CI adds the feature-gated TriMul contract, supply-chain, MSRV, and PR
+commit-range jobs described in [Quality bar](#quality-bar).
 
-The fixture is committed and CI never regenerates it. Regenerate only when the GRPO
-math itself changes. The oracle **requires NumPy** (it computes the group std via
+### Regenerating the GRPO oracle fixtures
+
+The fixtures are committed and CI never regenerates them. Regenerate only when the
+corresponding GRPO contract intentionally changes. The NumPy oracle **requires NumPy**
+(it computes the group std via
 `numpy.std(ddof=1)`, so the fixture stays independent of the Rust formula):
 
 ```sh
@@ -165,6 +161,9 @@ just gen-golden
 ```
 
 The script emits stable, indented JSON, so a no-op regeneration produces no diff.
+The real-TRL fixture is regenerated separately with
+`scripts/oracle/gen_grpo_golden_trl.py` in its pinned oracle environment; its
+recorded dependency versions must change only in a deliberate compatibility update.
 
 ---
 
@@ -197,7 +196,7 @@ default):
 
 ```jsonc
 {
-  "task": "countdown",                 // built-in: "countdown" or "math"
+  "task": "countdown",                 // built-in: "countdown", "math", or "trimul"
   "model_dir": "/path/to/qwen3-0.6b-base",
   "device": "cpu",                     // or "cuda" (needs a --features cuda build)
   "data": { "train_n": 64, "eval_n": 16 },
@@ -550,13 +549,21 @@ Then load a policy (`ferrl::load_qwen_policy`), build a config
 
 ## Oracle + golden fixture
 
-`scripts/gen_golden.py` computes, for tiny fixed examples, the GRPO advantages, the
-k3 KL estimate, the clipped surrogate, and both masked-mean reductions — mirroring
-TRL's `GRPOTrainer` and the DeepSeekMath objective — and writes them to
-`crates/ferrl/tests/fixtures/grpo_golden.json`. The numbers are deliberately small and
-round so every field is hand-checkable with a calculator.
+Ferrl keeps two complementary GRPO fixtures so a shared transcription mistake cannot
+validate itself:
 
-The fixture schema (consumed verbatim by the Rust test):
+- `scripts/gen_golden.py` uses NumPy to compute tiny, hand-checkable advantages,
+  k3 KL values, clipped-surrogate terms, sequence ratios, and masked reductions. It
+  writes `crates/ferrl/tests/fixtures/grpo_golden.json`; this is the independent
+  normalization/scalar-math oracle.
+- `scripts/oracle/gen_grpo_golden_trl.py` drives TRL 1.5.1's actual
+  `GRPOTrainer._compute_loss` over crafted tensors. Its committed
+  `grpo_golden_trl.json` pins Ferrl's differentiable production loss across
+  asymmetric clipping, optional KL, token- and sequence-level importance sampling,
+  and GRPO/Dr.GRPO/DAPO reductions. The generator records the TRL, PyTorch, and
+  Transformers versions so regeneration is an explicit compatibility update.
+
+The NumPy fixture schema (consumed verbatim by the Rust test):
 
 ```jsonc
 {
@@ -638,8 +645,8 @@ their independently identity-bound v3 envelope described below.
 
 ## Separated rollout/learner ledger
 
-`ferrl::rollout_ledger` defines the first Phase 1.5C boundary between rollout
-collection and learning. It is separate from `candidates.jsonl`: candidate rows
+`ferrl::rollout_ledger` defines the versioned boundary between rollout collection
+and learning. It is separate from `candidates.jsonl`: candidate rows
 are top-K decoded text for artifact triage, while a rollout ledger package holds
 every ordered prompt group required for one optimizer window.
 
@@ -925,15 +932,29 @@ toolkit you can build with.
 | 565.57.01                    | 12.7             | 8.6     |
 | 570.26                       | 12.8             | 8.7     |
 | 575.51.03                    | 12.9             | 8.8     |
+| 580.65.06                    | 13.0             | 9.0     |
+| 590.44.01                    | 13.1             | 9.1     |
+| 595.45.04                    | 13.2             | 9.2     |
+| 610.43.02                    | 13.3             | 9.3     |
 
 (CUDA 12.6 reuses ISA 8.5; CUDA 12.7 — the r565 driver generation, which reports CUDA
-12.7 via the driver API — introduced ISA 8.6.)
+12.7 via the driver API — introduced ISA 8.6. CUDA 13.0–13.3 map to PTX ISA
+9.0–9.3 respectively.)
+
+Sources: NVIDIA's current [CUDA Toolkit release notes](https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/)
+for Linux toolkit driver versions and the [PTX ISA reference](https://docs.nvidia.com/cuda/parallel-thread-execution/)
+for the current and historical ISA sequence.
 
 The driver column is NVIDIA's minimum for the full toolkit. The built-in preflight
 instead names the driver that can *JIT* your build's PTX ISA — the floor that error 222
 actually keys on — which can be lower (e.g. `555.42.02` for ISA 8.5, even from a CUDA 12.6
 build). Both are correct; error 222 only concerns PTX JIT, so follow whichever number the
 preflight prints.
+
+The proactive helper's embedded lookup currently covers CUDA through 12.9. For a
+newer toolkit or driver it returns `Unknown` rather than guessing; use the current
+table above, and rely on the reactive first-kernel guard as the authoritative runtime
+check.
 
 #### Built-in preflight
 

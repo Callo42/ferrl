@@ -1,6 +1,6 @@
 # TriMul Discovery Run Contract
 
-This is the acceptance contract for ferrl's first TriMul kernel-discovery run. It is
+This is the acceptance contract for ferrl TriMul kernel-discovery runs. It is
 intentionally narrow: it locks what must be recorded, re-run, and reported before a
 candidate kernel can count as a discovery artifact. It is not a general task SDK.
 
@@ -486,7 +486,7 @@ statistics, and the machine grade. No CUDA tensor or allocator block crosses the
 boundary. A separate non-dumpable controller owns the trusted status/output channels;
 candidate Python owns only its untrusted request/result channel and never inherits the
 grade socket. Launcher/init/shell stdout remains diagnostic only.
-The first discovery run still needs dynamic checks on top candidates because the
+Every discovery run still needs dynamic checks on top candidates because the
 training loop is optimizing against that reward.
 
 For every candidate considered before the artifact audit:
@@ -529,7 +529,7 @@ The final report must fit this outline:
 1. Verdict: `accepted_artifact`, `no_win`, or `invalid_run`.
 2. Discovery provenance: ferrl commit, launch/config/candidate hashes, exact launch
    authentication, original verifier tier, source inspection, model, seeds, and run health.
-3. Independent paired audit: audit id, dedicated preflight identity, executing-device
+3. Independent paired audit: audit id, selected-tier preflight identity, executing-device
    identity, all eleven paired speedups, the 2% material threshold, win count,
    operator-trusted attempt boundary, and accept/reject reason.
 4. Artifact bundle path and manifest hash.

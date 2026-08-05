@@ -310,8 +310,7 @@ impl Default for GenConfig {
 ///
 /// A GRPO update needs three per-token log-probabilities of the *same* sampled
 /// completions. All three are obtained from this one trait — no extra method is
-/// required, so adding the inner optimization loop (`μ > 1`) later is **not** a
-/// breaking change:
+/// required for the inner optimization loop (`μ > 1`):
 ///
 /// - **current** `logp` — [`token_logprobs`](Policy::token_logprobs) with the
 ///   adapter [enabled](Policy::set_adapter_enabled). Lives on the autograd tape;

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build + dump the committed tiny qwen3_5_moe oracle fixture (M3' PR-2).
+"""Build and dump the committed tiny qwen3_5_moe oracle fixture.
 
 The MoE twin of `gen_qwen35_tiny_golden.py`: constructs a tiny
 `Qwen3_5MoeForConditionalGeneration` (the REAL reference class — production

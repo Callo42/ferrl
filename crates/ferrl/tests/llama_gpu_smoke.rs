@@ -1,4 +1,4 @@
-//! M1 bf16 GPU gates for the dense-Llama path (`#[ignore]`d).
+//! Bf16 GPU gates for the dense-Llama path (`#[ignore]`d).
 //!
 //! The CPU suite validates [`ferrl::LlamaGradModel`] at F32, where the
 //! attention F32 force-cast pair is a same-dtype `to_dtype` — an op-free
@@ -344,8 +344,8 @@ fn arm_adapter(policy: &LlamaPolicy, device: &Device) {
 #[ignore = "needs the real Llama-3.2-1B checkpoint (FERRL_LLAMA_WEIGHTS) + a CUDA build/GPU"]
 #[allow(clippy::print_stderr)] // a manual gate: the printed agreement/diff numbers are the deliverable
 fn llama_merged_decoder_bf16_faithfulness_on_gpu() {
-    // Deferred bullet 3: bf16 merged-weight fidelity — the same REQUIRED gate
-    // the Qwen path ran for P6-C, on the Llama twin. Cached `LlamaMergedDecoder`
+    // bf16 merged-weight fidelity — the same REQUIRED gate as the Qwen path,
+    // on the Llama twin. Cached `LlamaMergedDecoder`
     // (production rollout) vs the uncached adapter-aware forward under the
     // bf16-base / F32-adapter split — the regime CPU CI cannot reach (candle's
     // CPU backend has no bf16 matmul). The CPU gates pin the F32 family; this
@@ -425,7 +425,7 @@ fn llama_merged_decoder_bf16_faithfulness_on_gpu() {
         max_abs.is_finite(),
         "bf16 cached logits diverged non-finitely from uncached"
     );
-    // Same backstops as the Qwen P6-C gate (which measured 21/21, rel 0.054):
+    // Same backstops as the Qwen gate (which measured 21/21, rel 0.054):
     // a correct bf16 merge sits at a few percent of the logit scale; a wrong
     // scale / dropped or corrupted delta lands comparable to the logits.
     assert!(

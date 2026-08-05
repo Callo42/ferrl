@@ -1,13 +1,12 @@
 # cargo-deny configuration — ferrl's supply-chain gate.
 #
-# Run in CI by the `supply-chain` job (`cargo deny check`) alongside `cargo audit`
-# (PR-①, v0.2.0 BYOT infra warm-up). cargo-deny owns licenses / bans / sources and
+# Run in CI by the `supply-chain` job (`cargo deny check`) alongside `cargo audit`.
+# cargo-deny owns licenses / bans / sources and
 # also scans advisories; cargo-audit is the canonical RUSTSEC vulnerability scan
 # kept as belt-and-suspenders. Schema: https://embarkstudios.github.io/cargo-deny/
 #
-# Tuned against the actual resolved dependency tree — every list below was
-# self-gated with `cargo deny check` on the cluster before this PR opened, so CI
-# is green on open.
+# Tuned against the actual resolved dependency tree; CI rechecks the policy on
+# every proposed dependency change.
 
 [graph]
 # Evaluate the tree for the platform ferrl actually builds on (x86_64 Linux —

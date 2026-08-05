@@ -741,7 +741,7 @@ mod tests {
 
     /// Non-vacuity: the oracle gate must have teeth. Perturbing the decay or
     /// the query scale by a few percent must blow well past the tolerance —
-    /// if it doesn't, the gate is decoration (the M1 vacuous-rope lesson).
+    /// if it doesn't, the gate is decoration.
     #[test]
     fn oracle_gate_has_teeth_under_perturbations() {
         let c = gdn_case("recurrent_no_state");

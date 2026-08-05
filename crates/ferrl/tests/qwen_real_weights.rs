@@ -1,6 +1,6 @@
-//! Real-weights P3 gates for the custom Qwen3 forward (`#[ignore]`d).
+//! Real-weight gates for the custom Qwen3 forward (`#[ignore]`d).
 //!
-//! These scale PR-A's tiny-config gates to the **real** `Qwen3-0.6B-Base`
+//! These scale the committed tiny-config gates to the **real** `Qwen3-0.6B-Base`
 //! checkpoint: per-position equivalence vs candle's shipped forward, per-branch
 //! `LoRA`-grad coverage **and** liveness on a real backward, and a tokenizer
 //! round-trip. The weights are not in the repo (and Hugging Face is unreachable
@@ -16,9 +16,9 @@
 //!
 //! `FERRL_QWEN_WEIGHTS` points at the **directory** holding `config.json`,
 //! `model.safetensors`, and `tokenizer.json`. The bf16 checkpoint is loaded
-//! upcast to f32, so both forwards run in clean CPU f32 (the bf16 adapter-dtype
-//! split — f32 adapter over a bf16 frozen base — is a P4/GPU concern; see
-//! `PLAN.md`). `--test-threads=1` keeps at most one f32 copy of the 0.6B weights
+//! upcast to f32, so both forwards run in clean CPU f32. The production loader
+//! separately supports an F32 adapter over a bf16 frozen base. `--test-threads=1`
+//! keeps at most one f32 copy of the 0.6B weights
 //! resident at a time.
 
 use std::path::{Path, PathBuf};
@@ -86,7 +86,7 @@ fn max_abs(a: &Tensor, b: &Tensor) -> f32 {
         .unwrap()
 }
 
-/// Assert `cfg` really is the 0.6B-Base shape — the parity traps PR-A pinned:
+/// Assert `cfg` really is the 0.6B-Base shape covered by the parity contract:
 /// GQA 16Q/8KV, `head_dim` 128 (so attention width 2048 > hidden 1024), tied head.
 fn assert_0p6b_shape(cfg: &Config) {
     assert_eq!(cfg.hidden_size, 1024);

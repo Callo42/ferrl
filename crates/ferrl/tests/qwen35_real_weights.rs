@@ -1,4 +1,4 @@
-//! Real-weights M2′ gates for the `qwen3_5` forward (`#[ignore]`d).
+//! Real-weight gates for the `qwen3_5` forward (`#[ignore]`d).
 //!
 //! These scale the committed tiny-oracle gates to a **real, staged** qwen3.5/3.6
 //! **dense** checkpoint. candle ships no `qwen3_5`, so the reference is the
@@ -45,7 +45,7 @@ const RANK: usize = 4;
 const ALPHA: f64 = 8.0;
 
 /// Max-abs per-position logit divergence allowed between our f32 forward and
-/// the transformers fp32 dump. Same envelope family as the M1 gates (Qwen3
+/// the transformers fp32 dump. Same envelope family as the Qwen3
 /// 0.6B/28 layers measured worst 2.4e-4 under tol 2e-3; Llama 1B/16 layers
 /// 1.7e-5 under 5e-4) — here the stack is 24 hybrid layers and the dump
 /// crosses *implementations* (torch vs candle), not just op families.
@@ -107,7 +107,7 @@ fn oracle_ids(dump: &HashMap<String, Tensor>, i: usize) -> Vec<u32> {
 /// layers). What stays gate-specific is the **dense**
 /// assumption: the var-count formula and `branch_split` below count 3 MLP
 /// projections per layer, which holds only for dense members — the `MoE`
-/// family (M3′ track) has its own gate. The forward-equivalence assertions
+/// family has its own sparse-model gate. The forward-equivalence assertions
 /// then bind the run to whatever member is staged, against its paired oracle
 /// dump.
 fn assert_dense_family_member(cfg: &Qwen3_5Config) {

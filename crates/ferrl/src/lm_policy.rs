@@ -2,10 +2,9 @@
 //!
 //! [`LmPolicy`] bridges a grad-bearing model forward (the update path) to the
 //! trainer's [`Policy`] seam, generically over the [`GradModel`] /
-//! [`CachedDecoder`] traits — so the *same*
-//! [`Trainer`] that drives the P2 echo toy drives any real model unchanged.
-//! [`QwenPolicy`] (= `LmPolicy<QwenGradModel>`) is the production instantiation
-//! over Qwen3-0.6B-Base.
+//! [`CachedDecoder`] traits — so the same [`Trainer`] drives test policies and
+//! every supported real-model family unchanged. Type aliases expose the native
+//! Qwen3, Llama-3.x, Qwen3.5/3.6, and dense Gemma 4 instantiations.
 //!
 //! ## Generation is KV-cached over merged weights, and adapter-aware
 //!
@@ -119,20 +118,17 @@ pub struct LmPolicy<M: GradModel> {
     enabled: bool,
 }
 
-/// The production policy over the real Qwen3 model — the first [`LmPolicy`]
-/// instantiation (and the name every pre-M1 call site uses).
+/// The production policy over the native Qwen3 model.
 pub type QwenPolicy = LmPolicy<QwenGradModel>;
 
-/// The policy over a dense Llama-3.x model — the second [`LmPolicy`]
-/// instantiation, and the witness that the [`GradModel`] seam is real: the same
-/// generic policy (and through it the same `Trainer`) drives
-/// [`LlamaGradModel`](crate::llama::LlamaGradModel) with zero policy changes.
+/// The policy over a dense Llama-3.x model. The same generic policy (and through
+/// it the same `Trainer`) drives
+/// [`LlamaGradModel`](crate::llama::LlamaGradModel) without model-specific trainer code.
 pub type LlamaPolicy = LmPolicy<crate::llama::LlamaGradModel>;
 
-/// The policy over the hybrid `qwen3_5` (Qwen3.5 / Qwen3.6) model — the third
-/// [`LmPolicy`] instantiation, and the first whose decoder state is not purely
-/// KV-shaped (conv + delta-rule recurrent state on the linear-attention
-/// layers); the generic policy drives it through the same
+/// The policy over the hybrid `qwen3_5` (Qwen3.5 / Qwen3.6) model. Its decoder
+/// state combines convolutional and delta-rule recurrent state on the
+/// linear-attention layers with KV state on full-attention layers; the generic policy drives it through the same
 /// [`CachedDecoder`] contract with zero changes.
 pub type Qwen3_5Policy = LmPolicy<crate::qwen35::Qwen3_5GradModel>;
 
@@ -929,8 +925,8 @@ impl<M: GradModel> Policy for LmPolicy<M> {
         // scores (and samples) at ITS OWN temperature, so a mismatched blob is a
         // cross-run restore the trait contract promises to fail loud on — the
         // restored RNG would otherwise continue a token stream the scorer
-        // doesn't score (pre-R2 the blob's temperature silently won; post-R2 the
-        // policy's silently would — neither is acceptable, so reject).
+        // doesn't score (older behavior let the blob's temperature silently win;
+        // letting the policy silently win is equally invalid, so reject).
         if (restored.temperature() - self.temperature).abs() > f64::EPSILON {
             candle_core::bail!(
                 "sampler state was checkpointed at temperature {} but this policy runs at {}; \
@@ -1867,7 +1863,7 @@ mod tests {
         assert_eos_rollout_invariants(&r, eos, 1);
     }
 
-    /// The P6-C cached-rollout equivalence gate: the cached [`generate`] must
+    /// The cached-rollout equivalence gate: cached [`generate`] must
     /// reproduce the uncached oracle's token stream bit-for-bit. Both paths fork
     /// per-row substreams from the same global indices (base 0), so the streams must
     /// match; and since global-index forking is a pure `&self` operation, neither
@@ -1994,7 +1990,7 @@ mod tests {
         assert_cached_matches_uncached(&mut policy, &prompt, &cfg_eos);
     }
 
-    /// THE R2 capture-alignment gate: every captured behavior log-prob must agree
+    /// The capture-alignment gate: every captured behavior log-prob must agree
     /// with the scoring path's log-prob of the same (sequence, draw) — at the
     /// policy temperature. Generation samples from `softmax(merged_logits / T)` and
     /// scoring computes `log_softmax(uncached_logits / T)` (temperature-consistent
@@ -2426,7 +2422,7 @@ mod tests {
         // Deterministic proof (no sampling) that gradients reach BOTH LoRA factors
         // (A and B) of q AND v THROUGH `token_logprobs` — the narrow/log_softmax/
         // gather must not detach A. At zero-B init dL/dA is structurally 0, so a
-        // severed A-path is invisible to a single backward (the P3 PR-B trap); the
+        // severed A-path is invisible to a single backward; the
         // two-phase check (force B nonzero) closes it.
         let policy = tiny_policy();
         let rollout = Rollout::rectangular(vec![vec![1u32, 2, 3, 4, 5], vec![5, 4, 3, 2, 1]], 2);
@@ -2618,7 +2614,7 @@ mod tests {
 
     #[test]
     fn rollout_ratio_telemetry_is_near_one_for_an_f32_policy() {
-        // End-to-end pipeline gate for the R2 telemetry: on an all-F32 model the
+        // End-to-end pipeline gate for rollout-ratio telemetry: on an all-F32 model the
         // rollout (merged cached decode) and the scoring forward differ only by
         // float reassociation, so the train/rollout ratio must sit hard against 1
         // on every step — and nothing may approach the TIS cap. A capture
@@ -2885,7 +2881,7 @@ mod tests {
         assert!(policy.adapter_enabled(), "adapter flag restored");
     }
 
-    // ---- LlamaPolicy: the M1 second-implementor gates ------------------------
+    // ---- LlamaPolicy: generic-model seam gates -------------------------------
     //
     // Everything below reuses the GENERIC machinery above unchanged
     // (`assert_cached_matches_uncached`, `force_b_nonzero`, the codec/reward/
@@ -3028,8 +3024,8 @@ mod tests {
 
     #[test]
     fn llama_drives_a_grpo_step_through_the_trainer_on_cpu() {
-        // THE M1 extended reusability gate: the SAME `Trainer` (and the same
-        // codec + reward scaffold) that drives the P2 echo toy and the Qwen
+        // The model-generality gate: the SAME `Trainer` (and the same codec +
+        // reward scaffold) that drives the echo toy and the Qwen
         // policy drives `LmPolicy<LlamaGradModel>` UNCHANGED — rollout via the
         // Llama merged decoder, reward, advantages, backward THROUGH the Llama
         // forward, grad-coverage canary, FerrlAdamW. `grad_norm > 0` witnesses
@@ -3473,7 +3469,7 @@ mod tests {
         }
     }
 
-    // ---- detached scoring + checkpointed backward (P7) ----------------------
+    // ---- detached scoring + checkpointed backward ---------------------------
 
     /// Force every adapter `B` nonzero so the adapter path is live in the
     /// scored logits (at the `B = 0` init both scorings would trivially agree).
@@ -3781,7 +3777,7 @@ mod tests {
     /// The full trainer loop with checkpointing ON equals the loop with it
     /// OFF: paired policies (shared base weights + sampler seed, adapter vars
     /// synced — independently drawn `A` factors are invisible to the forward
-    /// at `B = 0` but `dL/dB ∝ A`, the R2 lesson), identical config with
+    /// at `B = 0` but `dL/dB ∝ A`), identical config with
     /// `mu = 2` inner epochs and `beta > 0` (so the detached `logp_old` + KL
     /// reference scorings and the repeated live-forward/backward tape
     /// pairings all run through the real `Trainer`), then the trained vars

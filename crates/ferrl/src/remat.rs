@@ -2,8 +2,8 @@
 //!
 //! candle ships no checkpoint primitive, so ferrl orchestrates one at the
 //! layer-boundary seam: the binding memory wall of the uncached grad forward
-//! is the **retained activation graph** (params fit on one card long before
-//! activations do — see the P7 plan), and every intermediate tensor stays
+//! is the **retained activation graph** (parameters can fit on one card before
+//! the uncheckpointed activation graph does), and every intermediate tensor stays
 //! alive exactly as long as something references the op graph that produced
 //! it. Cutting the graph at layer boundaries and re-running one layer at a
 //! time inside backward trades ~one extra forward (~33 % recompute) for an

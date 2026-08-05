@@ -25,8 +25,10 @@
 //! Without the `cuda` feature every entry point is a no-op (there is no GPU build
 //! to be incompatible with), so callers need no `cfg`.
 //!
-//! The compatibility numbers (CUDA toolkit ↔ PTX ISA ↔ minimum Linux driver) mirror
-//! the table in the project README's "GPU builds" section.
+//! The embedded proactive table currently covers CUDA through 12.9. The README's
+//! "GPU builds" section carries the current external compatibility table; a
+//! newer unembedded version yields [`CompatReport::Unknown`] rather than a false
+//! warning, while the reactive first-kernel guard remains authoritative.
 
 // The pure, CUDA-type-free compatibility logic: PTX-version parsing, the
 // CUDA↔ISA↔driver tables, and message rendering. Gated on `any(cuda, test)` so the

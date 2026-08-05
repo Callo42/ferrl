@@ -407,7 +407,7 @@ mod tests {
         (0..n).map(|i| i as f32 * 0.1 - 0.5).collect()
     }
 
-    /// The P1 gate: a `LoRA` adapter trains under `AdamW` when the gradient must
+    /// A `LoRA` adapter trains under `AdamW` when the gradient must
     /// traverse a `rms_norm_slow` backward (norm placed downstream of the `LoRA`),
     /// and the grad-coverage canary is green on the first backward.
     #[test]
