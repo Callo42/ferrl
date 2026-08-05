@@ -2,8 +2,9 @@
 # Set up the pinned `ferrl-oracle` conda env on the cluster (M2' D3 decision).
 #
 # transformers is pinned to v5.11.0 (newest stable containing qwen3_5; hard
-# floor v5.7.0 = the GDN multi-token cached-forward fix). torch is CPU-only:
-# logit/fixture dumps need no GPU and the CPU path is deterministic.
+# floor v5.7.0 = the GDN multi-token cached-forward fix). TRL is pinned to
+# v1.5.1 for the independent GRPO-loss fixture. torch is CPU-only: logit/fixture
+# dumps need no GPU and the CPU path is deterministic.
 #
 # Run on the login node:  bash scripts/oracle/setup_env.sh
 # Override CONDA_ROOT if conda is not installed at ~/miniconda3.
@@ -13,6 +14,7 @@ CONDA_ROOT="${CONDA_ROOT:-$HOME/miniconda3}"
 ENV_NAME="ferrl-oracle"
 TRANSFORMERS_PIN="5.11.0"
 TORCH_PIN="2.12.0"
+TRL_PIN="1.5.1"
 
 if [ ! -f "$CONDA_ROOT/etc/profile.d/conda.sh" ]; then
     echo "error: no conda at CONDA_ROOT=$CONDA_ROOT (set CONDA_ROOT to your conda install)" >&2
@@ -34,25 +36,32 @@ python -m pip install --upgrade pip
 
 # torch is pinned exactly: the fixtures are a numeric contract, and a torch
 # bump can shift the reference numerics — regeneration under a different
-# version must be a deliberate, reviewed act (the Rust gates assert both
-# pins from the fixture metadata). Prefer the CPU-only wheel; fall back to
-# the PyPI build if the PyTorch index is unreachable.
+# version must be a deliberate, reviewed act (the Rust gate asserts all three
+# dependency pins from the fixture metadata). Prefer the CPU-only wheel; fall
+# back to the PyPI build if the PyTorch index is unreachable.
 if ! python -m pip install --index-url https://download.pytorch.org/whl/cpu "torch==$TORCH_PIN"; then
     echo "download.pytorch.org unreachable; falling back to PyPI torch"
     python -m pip install "torch==$TORCH_PIN"
 fi
 
-python -m pip install "transformers==$TRANSFORMERS_PIN" safetensors modelscope
+python -m pip install \
+    "transformers==$TRANSFORMERS_PIN" \
+    "trl==$TRL_PIN" \
+    safetensors \
+    modelscope
 
 python - <<'PYEOF'
 import torch
 import transformers
+import trl
 from transformers.models.qwen3_5 import modeling_qwen3_5 as m
 
 print("torch", torch.__version__)
 print("transformers", transformers.__version__)
+print("trl", trl.__version__)
 assert transformers.__version__ == "5.11.0", transformers.__version__
 assert torch.__version__.startswith("2.12.0"), torch.__version__
+assert trl.__version__ == "1.5.1", trl.__version__
 for fn in ("torch_chunk_gated_delta_rule", "torch_recurrent_gated_delta_rule"):
     assert hasattr(m, fn), f"missing {fn} in qwen3_5 modeling"
 print("qwen3_5 reference kernels present")

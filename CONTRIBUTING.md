@@ -5,12 +5,15 @@ codebase stays maintainable and scalable. Please read this before opening a PR.
 
 ## Workflow — pull requests only
 
-- **Never push directly to `main`.** It is protected; all changes land via a pull
-  request from a feature branch.
+- **Project policy: never push directly to `main`.** Submit ordinary changes through
+  a pull request from a feature branch.
 - **Every PR is reviewed by a human maintainer before merge**, and **CI must be
-  green**. Branch protection enforces the PR path and required checks; the
-  project review policy is human-enforced because this solo-maintainer repo does
-  not encode a required approval count that its owner could not satisfy.
+  green**. Branch protection enforces the PR path and required checks for non-admin
+  actors. Repository admins are technically exempt because admin enforcement is
+  disabled, so the protection is not an absolute admin block; ordinary changes still
+  follow the PR policy, while the exemption supports maintainer release operations.
+  Human review is likewise policy-enforced because this solo-maintainer repo does not
+  encode a required approval count that its owner could not satisfy.
 - Branch naming: `feat/…`, `fix/…`, `docs/…`, `refactor/…`, `test/…`, `ci/…`.
 - Keep PRs focused and reviewable.
 
@@ -30,7 +33,7 @@ work is manual, never in CI):
 |---|---|
 | Format | `cargo fmt --all --check` |
 | Lint | `cargo clippy --all-targets -- -D warnings` plus the `gate`-feature TriMul target |
-| Tests + coverage (≥ 90%) | `cargo llvm-cov --workspace --fail-under-lines 90`, doctests, verifier-driver syntax, and the `gate`-feature TriMul test |
+| Tests + coverage (≥ 90%) | `cargo llvm-cov --workspace --ignore-filename-regex '(examples|bin)/|loader\.rs' --fail-under-lines 90`, doctests, verifier-driver syntax, and the `gate`-feature TriMul test |
 | Docs | `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` |
 | Supply chain | `cargo deny check` and `cargo audit` |
 | MSRV | `cargo +1.87 check --locked --workspace` |

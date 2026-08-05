@@ -162,8 +162,9 @@ just gen-golden
 
 The script emits stable, indented JSON, so a no-op regeneration produces no diff.
 The real-TRL fixture is regenerated separately with
-`scripts/oracle/gen_grpo_golden_trl.py` in its pinned oracle environment; its
-recorded dependency versions must change only in a deliberate compatibility update.
+`scripts/oracle/gen_grpo_golden_trl.py` in the oracle environment created by
+`scripts/oracle/setup_env.sh`, which pins `trl==1.5.1`; its recorded PyTorch and
+Transformers versions must change only in a deliberate compatibility update.
 
 ---
 
@@ -902,25 +903,26 @@ preflight" below).
 1. Find your driver's CUDA ceiling: run `nvidia-smi`. The top-right **"CUDA Version"**
    field is the maximum CUDA toolkit your driver can run (distinct from the driver
    number on the left, e.g. `550.54.14`).
-2. Build ferrl with a CUDA toolkit **at or below** that ceiling (the table below maps
-   driver minimums to the maximum toolkit), **or** upgrade your NVIDIA driver to the
-   minimum for the toolkit you want.
+2. Build ferrl with an exact CUDA toolkit release supported by that driver (the table
+   below gives the initial GA release floors), **or** upgrade your NVIDIA driver to
+   the minimum for the toolkit release you want.
 3. If several CUDA toolkits are installed (e.g. a distro toolkit plus an HPC SDK), the
    kernels are compiled with whichever `nvcc` is **first on `PATH`** — put the toolkit
    you intend to build with first.
 
 A CUDA **major-family** minimum driver (e.g. "CUDA 12.x runs on ≥ 525.60.13") does
-**not** cover PTX JIT of a newer ISA. Meet the **per-toolkit** minimum in the table
-below, not just the family floor.
+**not** cover PTX JIT of a newer ISA. Meet the minimum for your **exact toolkit
+release**, not just the family floor.
 
 #### Compatibility table
 
-Driver minimums are **Linux x86_64** (Windows minimums differ — see the NVIDIA CUDA
-Toolkit Release Notes). Match your driver against the first column to find the newest
-toolkit you can build with.
+Driver minimums are **Linux x86_64 GA-release floors** (Windows minimums differ — see
+the NVIDIA CUDA Toolkit Release Notes). They do not cover every update within a minor
+toolkit line: update releases can require a higher driver. Match the table only for an
+initial GA release; for an Update release, use its exact row in NVIDIA's release notes.
 
-| Your driver ≥ (Linux x86_64) | Max CUDA toolkit | PTX ISA |
-| ---------------------------- | ---------------- | ------- |
+| Your driver ≥ (Linux x86_64) | CUDA toolkit (GA) | PTX ISA |
+| ---------------------------- | ----------------- | ------- |
 | 520.61.05                    | 11.8             | 7.8     |
 | 525.60.13                    | 12.0             | 8.0     |
 | 530.30.02                    | 12.1             | 8.1     |
@@ -945,11 +947,11 @@ Sources: NVIDIA's current [CUDA Toolkit release notes](https://docs.nvidia.com/c
 for Linux toolkit driver versions and the [PTX ISA reference](https://docs.nvidia.com/cuda/parallel-thread-execution/)
 for the current and historical ISA sequence.
 
-The driver column is NVIDIA's minimum for the full toolkit. The built-in preflight
-instead names the driver that can *JIT* your build's PTX ISA — the floor that error 222
-actually keys on — which can be lower (e.g. `555.42.02` for ISA 8.5, even from a CUDA 12.6
-build). Both are correct; error 222 only concerns PTX JIT, so follow whichever number the
-preflight prints.
+The driver column is NVIDIA's minimum for the listed GA toolkit release. The built-in
+preflight instead names the driver that can *JIT* your build's PTX ISA — the floor that
+error 222 actually keys on — which can be lower (e.g. `555.42.02` for ISA 8.5, even from
+a CUDA 12.6 build). Both are correct; error 222 only concerns PTX JIT, so follow
+whichever number the preflight prints.
 
 The proactive helper's embedded lookup currently covers CUDA through 12.9. For a
 newer toolkit or driver it returns `Unknown` rather than guessing; use the current
