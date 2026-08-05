@@ -1,12 +1,14 @@
 # ferrl
 
-**ferrl** is a [candle](https://github.com/huggingface/candle)-native
-[GRPO](https://arxiv.org/abs/2402.03300) reinforcement-learning library, in Rust,
-for RL-fine-tuning LLMs. The first target is **Qwen3-0.6B-Base**.
+**ferrl** is a [candle](https://github.com/huggingface/candle)-native, RL-driven
+**discovery platform** in Rust. Given a task with a verifiable reward and a base model,
+ferrl searches with reinforcement learning and emits the best-performing verified
+artifact it finds. The first target is a faster, correct **TriMul GPU kernel**.
 
-ferrl **owns only the RL layer** — the GRPO loss, the reward trait, manual LoRA, the
-rollout loop, the trainer, and the custom-gradient forward. It **delegates all tensor
-math, autograd, GPU, and model code** to candle (`candle-core`, `candle-nn`,
+ferrl **owns the RL, reward-verification, and search layer** — with
+[GRPO](https://arxiv.org/abs/2402.03300) + LoRA as the first recipe — including rollout,
+training, candidate verification, and artifact extraction. It **delegates tensor math,
+autograd, GPU, and model code** to candle (`candle-core`, `candle-nn`,
 `candle-transformers`). We do not reimplement autodiff or kernels; we orchestrate
 candle's.
 
