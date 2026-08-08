@@ -1633,6 +1633,21 @@ fn exact_execution_samples<T: Serialize + DeserializeOwned>(
     Ok((reconstructed, bytes))
 }
 
+fn preflight_prompt_tokenization<T>(
+    samples: &[Sample<T>],
+    kind: &'static str,
+    tokenizer: &dyn TokenizerLike,
+) -> Result<(), DiscoveryError> {
+    for (index, sample) in samples.iter().enumerate() {
+        if tokenizer.encode(&sample.prompt).is_empty() {
+            return Err(DiscoveryError::InvalidConfiguration(format!(
+                "{kind} prompt at index {index} encoded to zero tokens with the loaded tokenizer"
+            )));
+        }
+    }
+    Ok(())
+}
+
 struct LoadedDiscoveryContext<'a, T, K> {
     task: &'a T,
     config: &'a DiscoveryConfig,
@@ -1676,6 +1691,8 @@ where
         exact_execution_samples(task.training_samples(), "ordered training samples")?;
     let (held_out_samples, held_out_samples_bytes) =
         exact_execution_samples(task.held_out_samples(), "ordered held-out samples")?;
+    preflight_prompt_tokenization(&training_samples, "ordered training samples", tokenizer)?;
+    preflight_prompt_tokenization(&held_out_samples, "ordered held-out samples", tokenizer)?;
     let training_samples_sha256 = sha256_hex(&training_samples_bytes);
     let held_out_samples_sha256 = sha256_hex(&held_out_samples_bytes);
     let signer =
@@ -2310,6 +2327,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2356,9 +2374,29 @@ mod tests {
         }
     }
 
+    struct FailingTokenizer {
+        fail_prompt: &'static str,
+    }
+
+    impl TokenizerLike for FailingTokenizer {
+        fn encode(&self, text: &str) -> Vec<u32> {
+            if text == self.fail_prompt {
+                Vec::new()
+            } else {
+                vec![1]
+            }
+        }
+
+        fn decode(&self, ids: &[u32]) -> String {
+            ids.iter().map(u32::to_string).collect::<Vec<_>>().join(",")
+        }
+    }
+
     struct TestPolicy {
         logprobs: Var,
         adapter_enabled: bool,
+        generate_calls: usize,
+        token_logprobs_calls: Cell<usize>,
     }
 
     impl TestPolicy {
@@ -2369,12 +2407,23 @@ mod tests {
             Self {
                 logprobs,
                 adapter_enabled: true,
+                generate_calls: 0,
+                token_logprobs_calls: Cell::new(0),
             }
+        }
+
+        fn generate_calls(&self) -> usize {
+            self.generate_calls
+        }
+
+        fn token_logprobs_calls(&self) -> usize {
+            self.token_logprobs_calls.get()
         }
     }
 
     impl Policy for TestPolicy {
         fn generate(&mut self, prompt: &[u32], config: &GenConfig) -> CandleResult<Rollout> {
+            self.generate_calls += 1;
             let rows = (0..config.group_size)
                 .map(|index| {
                     let mut row = prompt.to_vec();
@@ -2396,6 +2445,8 @@ mod tests {
         }
 
         fn token_logprobs(&self, _rollout: &Rollout) -> CandleResult<Tensor> {
+            self.token_logprobs_calls
+                .set(self.token_logprobs_calls.get().saturating_add(1));
             Ok(self.logprobs.as_tensor().clone())
         }
 
@@ -2427,7 +2478,16 @@ mod tests {
         }
     }
 
-    struct TestReward;
+    #[derive(Default)]
+    struct TestReward {
+        calls: Cell<usize>,
+    }
+
+    impl TestReward {
+        fn calls(&self) -> usize {
+            self.calls.get()
+        }
+    }
 
     impl RewardFn for TestReward {
         type Target = ();
@@ -2437,6 +2497,7 @@ mod tests {
             _sample: &Sample<Self::Target>,
             completion: &str,
         ) -> Result<f32, RewardError> {
+            self.calls.set(self.calls.get().saturating_add(1));
             Ok(if completion.starts_with('9') {
                 1.0
             } else {
@@ -2506,13 +2567,29 @@ mod tests {
 
     impl TestTask {
         fn new(mode: VerifyMode) -> Self {
+            Self::with_samples(
+                mode,
+                vec![Sample::new("train", ())],
+                vec![Sample::new("held-out", ())],
+            )
+        }
+
+        fn with_samples(
+            mode: VerifyMode,
+            train: Vec<Sample<()>>,
+            held_out: Vec<Sample<()>>,
+        ) -> Self {
             Self {
                 identity: TaskIdentity::new("test.discovery", 1).unwrap(),
-                train: vec![Sample::new("train", ())],
-                held_out: vec![Sample::new("held-out", ())],
-                reward: TestReward,
+                train,
+                held_out,
+                reward: TestReward::default(),
                 mode,
             }
+        }
+
+        fn reward_calls(&self) -> usize {
+            self.reward.calls()
         }
     }
 
@@ -2660,11 +2737,32 @@ mod tests {
         mode: VerifyMode,
         config: &DiscoveryConfig,
     ) -> Result<DiscoveryOutcome, DiscoveryError> {
-        let task = TestTask::new(mode);
+        run_injected_with_tokenizer(TestTask::new(mode), config, &TestTokenizer).0
+    }
+
+    fn run_injected_with_task(
+        task: TestTask,
+        config: &DiscoveryConfig,
+    ) -> (
+        Result<DiscoveryOutcome, DiscoveryError>,
+        TestTask,
+        TestPolicy,
+    ) {
+        run_injected_with_tokenizer(task, config, &TestTokenizer)
+    }
+
+    fn run_injected_with_tokenizer<T: TokenizerLike>(
+        task: TestTask,
+        config: &DiscoveryConfig,
+        tokenizer: &T,
+    ) -> (
+        Result<DiscoveryOutcome, DiscoveryError>,
+        TestTask,
+        TestPolicy,
+    ) {
         let model = test_model();
         let ferrl_source = clean_test_source();
         let metric_contract = task.metric_contract();
-        let tokenizer = TestTokenizer;
         let mut policy = TestPolicy::new();
         let context = LoadedDiscoveryContext {
             task: &task,
@@ -2672,10 +2770,11 @@ mod tests {
             model: &model,
             ferrl_source: &ferrl_source,
             metric_contract: &metric_contract,
-            tokenizer: &tokenizer,
+            tokenizer,
             eos_token_id: None,
         };
-        run_with_loaded_policy(&context, &mut policy)
+        let outcome = run_with_loaded_policy(&context, &mut policy);
+        (outcome, task, policy)
     }
 
     #[test]
@@ -2781,6 +2880,80 @@ mod tests {
             .any(|row| row == candidate_copy));
     }
 
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn injected_policy_rejects_later_training_prompt_with_empty_tokenization() {
+        let temp = TestDir::new("preflight-training-token");
+        let config = test_config(&temp.0, 1);
+        let task = TestTask::with_samples(
+            VerifyMode::Win,
+            vec![Sample::new("train-valid", ()), Sample::new("bad-train", ())],
+            vec![Sample::new("held-out", ())],
+        );
+        let tokenizer = FailingTokenizer {
+            fail_prompt: "bad-train",
+        };
+        let (outcome, task, policy) = run_injected_with_tokenizer(task, &config, &tokenizer);
+        let err = outcome.unwrap_err();
+        let message = err.to_string();
+        assert!(matches!(err, DiscoveryError::InvalidConfiguration(_)));
+        assert!(message.contains("ordered training samples"));
+        assert!(message.contains("index 1"));
+        assert_eq!(task.reward_calls(), 0);
+        assert_eq!(policy.generate_calls(), 0);
+        assert_eq!(policy.token_logprobs_calls(), 0);
+        assert!(!temp.0.join("runs").exists());
+        assert!(!temp.0.join("artifact").exists());
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn injected_policy_rejects_later_held_out_prompt_with_empty_tokenization() {
+        let temp = TestDir::new("preflight-heldout-token");
+        let config = test_config(&temp.0, 1);
+        let task = TestTask::with_samples(
+            VerifyMode::Win,
+            vec![Sample::new("train", ()), Sample::new("train-2", ())],
+            vec![Sample::new("held-out", ()), Sample::new("bad-held-out", ())],
+        );
+        let tokenizer = FailingTokenizer {
+            fail_prompt: "bad-held-out",
+        };
+        let (outcome, task, policy) = run_injected_with_tokenizer(task, &config, &tokenizer);
+        let err = outcome.unwrap_err();
+        let message = err.to_string();
+        assert!(matches!(err, DiscoveryError::InvalidConfiguration(_)));
+        assert!(message.contains("ordered held-out samples"));
+        assert!(message.contains("index 1"));
+        assert_eq!(task.reward_calls(), 0);
+        assert_eq!(policy.generate_calls(), 0);
+        assert_eq!(policy.token_logprobs_calls(), 0);
+        assert!(!temp.0.join("runs").exists());
+        assert!(!temp.0.join("artifact").exists());
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn injected_policy_runs_policy_activity_on_normal_prompts() {
+        let temp = TestDir::new("preflight-control");
+        let mut config = test_config(&temp.0, 1);
+        config.artifact_output = temp.0.join("new-parent").join("artifact");
+        let (outcome, task, policy) =
+            run_injected_with_task(TestTask::new(VerifyMode::Win), &config);
+        let outcome = outcome.unwrap();
+        let DiscoveryOutcome::Verified(artifact) = outcome else {
+            panic!("expected verified outcome");
+        };
+        assert!(artifact.manifest_path().is_file());
+        assert!(artifact.payload_path().is_file());
+        assert!(artifact.candidate_path().is_file());
+        assert!(artifact.verification_evidence_path().is_file());
+        assert!(policy.generate_calls() > 0);
+        assert!(policy.token_logprobs_calls() > 0);
+        assert!(task.reward_calls() > 0);
+        assert!(temp.0.join("runs").exists());
+        assert!(config.artifact_output.exists());
+    }
     #[test]
     fn injected_policy_returns_completed_no_win_on_threshold_equality() {
         let temp = TestDir::new("no-win");
