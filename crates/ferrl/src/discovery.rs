@@ -146,9 +146,12 @@ use sha2::{Digest, Sha256};
 
 use crate::eval::{evaluate, EvalError, EvalReport};
 use crate::hf::{resolve_checkpoint_eos, CheckpointEosSelection, HfError};
-use crate::loader::{load_auto_policy_with_identity, LoaderError, LoaderOpts, PolicyLoadIdentity};
+use crate::loader::{
+    load_auto_policy_with_identity, AutoPolicy, LoaderError, LoaderOpts, PolicyLoadIdentity,
+};
 use crate::policy::{EvalSampling, GenConfig, Policy};
 use crate::telemetry::{CandidateRecord, CandidateSigner, RunDir, TelemetryError};
+use crate::tokenizer::HfTokenizer;
 use crate::trainer::{RunStop, TokenizerLike, Trainer, TrainerConfig, TrainerError};
 
 /// The search-reward error and extension trait used by [`DiscoveryTask`].
@@ -1067,43 +1070,11 @@ impl<T: DiscoveryTask> Discovery<T> {
     /// exclusive artifact publication failure.
     pub fn run(self) -> Result<DiscoveryOutcome, DiscoveryError> {
         self.validate_before_load()?;
-        let ferrl_source = BuildSourceIdentity::current()?;
-        let metric_contract = self.task.metric_contract();
-        metric_contract.validate()?;
-        let device = open_device(self.model.device)?;
-        let execution_device = execution_device_from_opened(&device, self.model.device)?;
-        if matches!(self.model.device, ExecutionDevice::Cuda { .. }) {
-            crate::guard_first_kernel(&device)
-                .map_err(|error| DiscoveryError::Device(Box::new(error)))?;
+        let lifecycle = DiscoveryLifecycle::production(&self);
+        match crate::orchestration::run_lifecycle(lifecycle)? {
+            crate::orchestration::LifecycleOutcome::Completed(outcome)
+            | crate::orchestration::LifecycleOutcome::Preempted(outcome) => Ok(outcome),
         }
-        let mut loader = LoaderOpts {
-            seed: self.config.seed,
-            temperature: self.config.temperature,
-            ..LoaderOpts::default()
-        };
-        if matches!(self.model.device, ExecutionDevice::Cuda { .. }) {
-            loader.base_dtype = DType::BF16;
-        }
-        let (mut policy, tokenizer, identity) =
-            load_auto_policy_with_identity(&self.model.checkpoint_dir, &device, &loader)
-                .map_err(|error| DiscoveryError::ModelLoad(Box::new(error)))?;
-        let eos = resolve_checkpoint_eos(
-            &self.model.checkpoint_dir,
-            &tokenizer,
-            checkpoint_eos_selection(self.model.generation_end),
-        )
-        .map_err(|error| DiscoveryError::GenerationEnd(Box::new(error)))?;
-        let identity = ModelIdentity::from_loader(identity, execution_device);
-        let context = LoadedDiscoveryContext {
-            task: &self.task,
-            config: &self.config,
-            model: &identity,
-            ferrl_source: &ferrl_source,
-            metric_contract: &metric_contract,
-            tokenizer: &tokenizer,
-            eos_token_id: eos,
-        };
-        run_with_loaded_policy(&context, &mut policy)
     }
 
     #[allow(clippy::cognitive_complexity)]
@@ -1626,11 +1597,8 @@ fn exact_execution_samples<T: Serialize + DeserializeOwned>(
     samples: &[Sample<T>],
     kind: &'static str,
 ) -> Result<(Vec<Sample<T>>, Vec<u8>), DiscoveryError> {
-    let bytes = serde_json::to_vec(samples)
-        .map_err(|source| DiscoveryError::Serialization { kind, source })?;
-    let reconstructed = serde_json::from_slice(&bytes)
-        .map_err(|source| DiscoveryError::Serialization { kind, source })?;
-    Ok((reconstructed, bytes))
+    crate::orchestration::exact_execution_samples(samples, kind)
+        .map_err(|source| DiscoveryError::Serialization { kind, source })
 }
 
 fn preflight_prompt_tokenization<T>(
@@ -1638,16 +1606,11 @@ fn preflight_prompt_tokenization<T>(
     kind: &'static str,
     tokenizer: &dyn TokenizerLike,
 ) -> Result<(), DiscoveryError> {
-    for (index, sample) in samples.iter().enumerate() {
-        if tokenizer.encode(&sample.prompt).is_empty() {
-            return Err(DiscoveryError::InvalidConfiguration(format!(
-                "{kind} prompt at index {index} encoded to zero tokens with the loaded tokenizer"
-            )));
-        }
-    }
-    Ok(())
+    crate::orchestration::preflight_prompt_tokenization(samples, kind, tokenizer)
+        .map_err(DiscoveryError::InvalidConfiguration)
 }
 
+#[allow(dead_code)]
 struct LoadedDiscoveryContext<'a, T, K> {
     task: &'a T,
     config: &'a DiscoveryConfig,
@@ -1663,271 +1626,654 @@ struct RankedFinalEvidence<A, V> {
     evidence: FinalEvidence<A, V>,
 }
 
-#[allow(clippy::cognitive_complexity)]
-fn run_with_loaded_policy<T, P, K>(
-    context: &LoadedDiscoveryContext<'_, T, K>,
-    policy: &mut P,
-) -> Result<DiscoveryOutcome, DiscoveryError>
+enum DiscoveryPolicySlot<'a, P> {
+    Owned(P),
+    Borrowed(&'a mut P),
+}
+
+impl<P> DiscoveryPolicySlot<'_, P> {
+    fn as_mut_policy(&mut self) -> &mut P {
+        match self {
+            Self::Owned(policy) => policy,
+            Self::Borrowed(policy) => policy,
+        }
+    }
+}
+
+enum DiscoveryTokenizerSlot<'a, K> {
+    Owned(K),
+    Borrowed(&'a K),
+}
+
+impl<K: TokenizerLike> DiscoveryTokenizerSlot<'_, K> {
+    fn as_tokenizer(&self) -> &dyn TokenizerLike {
+        match self {
+            Self::Owned(tokenizer) => tokenizer,
+            Self::Borrowed(tokenizer) => *tokenizer,
+        }
+    }
+}
+
+type DiscoveryLoader<'a, P, K> = Box<
+    dyn FnOnce(
+            &ModelSelection,
+            &DiscoveryConfig,
+        ) -> Result<(P, K, ModelIdentity, Option<u32>), DiscoveryError>
+        + 'a,
+>;
+
+#[allow(dead_code, clippy::large_enum_variant)]
+enum DiscoverySetup<'a, P, K> {
+    Production {
+        selection: &'a ModelSelection,
+    },
+    Loaded {
+        policy: &'a mut P,
+        tokenizer: &'a K,
+        model: ModelIdentity,
+        ferrl_source: BuildSourceIdentity,
+        metric_contract: MetricContract,
+        eos_token_id: Option<u32>,
+    },
+    Consumed,
+}
+
+struct DiscoveryRunState<'a, Target, A, V, P, K> {
+    policy: DiscoveryPolicySlot<'a, P>,
+    tokenizer: DiscoveryTokenizerSlot<'a, K>,
+    model: ModelIdentity,
+    ferrl_source: BuildSourceIdentity,
+    metric_contract: MetricContract,
+    eos_token_id: Option<u32>,
+    training_samples: Vec<Sample<Target>>,
+    held_out_samples: Vec<Sample<Target>>,
+    training_samples_sha256: String,
+    held_out_samples_sha256: String,
+    launch_bytes: Option<Vec<u8>>,
+    launch_sha256: Option<String>,
+    run_id: Option<String>,
+    signing_public_key: Option<String>,
+    run: Option<RunDir>,
+    trainer: Option<Trainer>,
+    history: Option<Vec<crate::telemetry::Metrics>>,
+    held_out: Option<HeldOutReport>,
+    held_out_report_bytes: Option<Vec<u8>>,
+    candidates: Vec<AuthenticatedCandidate>,
+    best: Option<RankedFinalEvidence<A, V>>,
+    candidates_checked: usize,
+    no_win_reason: NoWinReason,
+    no_win_detail: String,
+}
+
+struct DiscoveryLifecycle<'a, T, P, K> {
+    task: &'a T,
+    config: &'a DiscoveryConfig,
+    setup: DiscoverySetup<'a, P, K>,
+    production_loader: Option<DiscoveryLoader<'a, P, K>>,
+}
+
+#[allow(dead_code)]
+impl<'a, T, P, K> DiscoveryLifecycle<'a, T, P, K> {
+    fn loaded<'context>(
+        context: &'a LoadedDiscoveryContext<'context, T, K>,
+        policy: &'a mut P,
+    ) -> Self
+    where
+        'context: 'a,
+    {
+        Self {
+            task: context.task,
+            config: context.config,
+            setup: DiscoverySetup::Loaded {
+                policy,
+                tokenizer: context.tokenizer,
+                model: context.model.clone(),
+                ferrl_source: context.ferrl_source.clone(),
+                metric_contract: context.metric_contract.clone(),
+                eos_token_id: context.eos_token_id,
+            },
+            production_loader: None,
+        }
+    }
+}
+
+impl<'a, T> DiscoveryLifecycle<'a, T, AutoPolicy, HfTokenizer>
+where
+    T: DiscoveryTask,
+{
+    #[allow(clippy::cognitive_complexity)]
+    fn production(discovery: &'a Discovery<T>) -> Self {
+        Self {
+            task: &discovery.task,
+            config: &discovery.config,
+            setup: DiscoverySetup::Production {
+                selection: &discovery.model,
+            },
+            production_loader: Some(Box::new(|selection, config| {
+                let device = open_device(selection.device)?;
+                let execution_device = execution_device_from_opened(&device, selection.device)?;
+                if matches!(selection.device, ExecutionDevice::Cuda { .. }) {
+                    crate::guard_first_kernel(&device)
+                        .map_err(|error| DiscoveryError::Device(Box::new(error)))?;
+                }
+                let mut loader = LoaderOpts {
+                    seed: config.seed,
+                    temperature: config.temperature,
+                    ..LoaderOpts::default()
+                };
+                if matches!(selection.device, ExecutionDevice::Cuda { .. }) {
+                    loader.base_dtype = DType::BF16;
+                }
+                let (policy, tokenizer, identity) =
+                    load_auto_policy_with_identity(&selection.checkpoint_dir, &device, &loader)
+                        .map_err(|error| DiscoveryError::ModelLoad(Box::new(error)))?;
+                let eos = resolve_checkpoint_eos(
+                    &selection.checkpoint_dir,
+                    &tokenizer,
+                    checkpoint_eos_selection(selection.generation_end),
+                )
+                .map_err(|error| DiscoveryError::GenerationEnd(Box::new(error)))?;
+                Ok((
+                    policy,
+                    tokenizer,
+                    ModelIdentity::from_loader(identity, execution_device),
+                    eos,
+                ))
+            })),
+        }
+    }
+}
+
+impl<'a, T, P, K> crate::orchestration::Lifecycle for DiscoveryLifecycle<'a, T, P, K>
 where
     T: DiscoveryTask,
     P: Policy,
     K: TokenizerLike,
 {
-    let task = context.task;
-    let config = context.config;
-    let model = context.model;
-    let ferrl_source = context.ferrl_source;
-    let metric_contract = context.metric_contract;
-    let tokenizer = context.tokenizer;
-    let eos_token_id = context.eos_token_id;
-    ferrl_source.validate()?;
-    metric_contract.validate()?;
-    if task.training_samples().is_empty() || task.held_out_samples().is_empty() {
-        return Err(DiscoveryError::InvalidConfiguration(
-            "training and task-semantic held-out samples must both be non-empty".into(),
-        ));
-    }
-    let (training_samples, training_samples_bytes) =
-        exact_execution_samples(task.training_samples(), "ordered training samples")?;
-    let (held_out_samples, held_out_samples_bytes) =
-        exact_execution_samples(task.held_out_samples(), "ordered held-out samples")?;
-    preflight_prompt_tokenization(&training_samples, "ordered training samples", tokenizer)?;
-    preflight_prompt_tokenization(&held_out_samples, "ordered held-out samples", tokenizer)?;
-    let training_samples_sha256 = sha256_hex(&training_samples_bytes);
-    let held_out_samples_sha256 = sha256_hex(&held_out_samples_bytes);
-    let signer =
-        CandidateSigner::generate().map_err(|error| DiscoveryError::Launch(Box::new(error)))?;
-    let signing_public_key = signer.public_key_hex();
-    let launch_payload = LaunchPayload {
-        contract: LAUNCH_CONTRACT,
-        contract_version: 1,
-        launch_authentication: LOCAL_EPHEMERAL_AUTHENTICATION,
-        launch_trust_boundary: LOCAL_EPHEMERAL_TRUST_BOUNDARY,
-        ferrl_source,
-        task: task.identity(),
-        model,
-        metric_contract,
-        execution: model.execution_device,
-        resolved_eos_token_id: eos_token_id,
-        training_samples_sha256: &training_samples_sha256,
-        training_samples_count: training_samples.len(),
-        held_out_samples_sha256: &held_out_samples_sha256,
-        held_out_samples_count: held_out_samples.len(),
-        steps: config.steps,
-        group_size: config.group_size,
-        max_new_tokens: config.max_new_tokens,
-        eval_group_size: config.eval_group_size,
-        temperature: config.temperature,
-        learning_rate: config.learning_rate,
-        seed: config.seed,
-        candidate_signing_public_key: &signing_public_key,
-    };
-    let payload_bytes =
-        serde_json::to_vec(&launch_payload).map_err(|source| DiscoveryError::Serialization {
-            kind: "discovery launch payload",
-            source,
-        })?;
-    let launch_sha256 = sha256_hex(&payload_bytes);
-    let run_id = format!("discovery-{}", &launch_sha256[..20]);
-    let launch = LaunchManifest {
-        contract: LAUNCH_CONTRACT,
-        launch_authentication: LOCAL_EPHEMERAL_AUTHENTICATION,
-        launch_trust_boundary: LOCAL_EPHEMERAL_TRUST_BOUNDARY,
-        payload_sha256: &launch_sha256,
-        payload: &launch_payload,
-    };
-    let mut launch_bytes =
-        serde_json::to_vec_pretty(&launch).map_err(|source| DiscoveryError::Serialization {
-            kind: "discovery launch manifest",
-            source,
-        })?;
-    launch_bytes.push(b'\n');
+    type Error = DiscoveryError;
+    type State = DiscoveryRunState<'a, T::Target, T::Artifact, T::VerificationEvidence, P, K>;
+    type Completed = DiscoveryOutcome;
+    type Preempted = DiscoveryOutcome;
 
-    let run = RunDir::create(&config.runs_root, &run_id)
-        .map_err(|error| DiscoveryError::Launch(Box::new(error)))?;
-    run.write_immutable_launch(&launch_bytes, None)
-        .map_err(|error| DiscoveryError::Launch(Box::new(error)))?;
-    let trainer_config = config.trainer_config(eos_token_id);
-    if trainer_config.candidate_log_top_k != trainer_config.group_size {
-        return Err(DiscoveryError::InvalidConfiguration(
-            "discovery requires complete candidate logging".into(),
-        ));
+    #[allow(clippy::cognitive_complexity)]
+    fn setup(&mut self) -> Result<Self::State, Self::Error> {
+        let setup = std::mem::replace(&mut self.setup, DiscoverySetup::Consumed);
+        let (policy, tokenizer, model, ferrl_source, metric_contract, eos_token_id) = match setup {
+            DiscoverySetup::Production { selection } => {
+                let ferrl_source = BuildSourceIdentity::current()?;
+                let metric_contract = self.task.metric_contract();
+                metric_contract.validate()?;
+                let loader = self.production_loader.take().ok_or_else(|| {
+                    DiscoveryError::InvalidConfiguration(
+                        "discovery production loader was entered more than once".into(),
+                    )
+                })?;
+                let (policy, tokenizer, model, eos_token_id) = loader(selection, self.config)?;
+                (
+                    DiscoveryPolicySlot::Owned(policy),
+                    DiscoveryTokenizerSlot::Owned(tokenizer),
+                    model,
+                    ferrl_source,
+                    metric_contract,
+                    eos_token_id,
+                )
+            }
+            DiscoverySetup::Loaded {
+                policy,
+                tokenizer,
+                model,
+                ferrl_source,
+                metric_contract,
+                eos_token_id,
+            } => {
+                ferrl_source.validate()?;
+                metric_contract.validate()?;
+                if self.task.training_samples().is_empty()
+                    || self.task.held_out_samples().is_empty()
+                {
+                    return Err(DiscoveryError::InvalidConfiguration(
+                        "training and task-semantic held-out samples must both be non-empty".into(),
+                    ));
+                }
+                (
+                    DiscoveryPolicySlot::Borrowed(policy),
+                    DiscoveryTokenizerSlot::Borrowed(tokenizer),
+                    model,
+                    ferrl_source,
+                    metric_contract,
+                    eos_token_id,
+                )
+            }
+            DiscoverySetup::Consumed => {
+                return Err(DiscoveryError::InvalidConfiguration(
+                    "discovery adapter setup was entered more than once".into(),
+                ));
+            }
+        };
+        Ok(DiscoveryRunState {
+            policy,
+            tokenizer,
+            model,
+            ferrl_source,
+            metric_contract,
+            eos_token_id,
+            training_samples: Vec::new(),
+            held_out_samples: Vec::new(),
+            training_samples_sha256: String::new(),
+            held_out_samples_sha256: String::new(),
+            launch_bytes: None,
+            launch_sha256: None,
+            run_id: None,
+            signing_public_key: None,
+            run: None,
+            trainer: None,
+            history: None,
+            held_out: None,
+            held_out_report_bytes: None,
+            candidates: Vec::new(),
+            best: None,
+            candidates_checked: 0,
+            no_win_reason: NoWinReason::CandidatesRejected,
+            no_win_detail: "every candidate was rejected by the final verifier".to_owned(),
+        })
     }
-    let mut trainer = Trainer::new(trainer_config, &run)
-        .map_err(|error| DiscoveryError::Training(Box::new(error)))?
-        .with_frozen_policy_sha256(model.policy_sha256.clone())
-        .with_candidate_provenance(&launch_sha256, signer)
-        .map_err(|error| DiscoveryError::Training(Box::new(error)))?;
-    if let Some(flag) = config.preemption_flag.clone() {
-        trainer = trainer.with_preemption_flag(flag);
+
+    fn preflight(&mut self, state: &mut Self::State) -> Result<(), Self::Error> {
+        let (training_samples, training_bytes) =
+            exact_execution_samples(self.task.training_samples(), "ordered training samples")?;
+        let (held_out_samples, held_out_bytes) =
+            exact_execution_samples(self.task.held_out_samples(), "ordered held-out samples")?;
+        preflight_prompt_tokenization(
+            &training_samples,
+            "ordered training samples",
+            state.tokenizer.as_tokenizer(),
+        )?;
+        preflight_prompt_tokenization(
+            &held_out_samples,
+            "ordered held-out samples",
+            state.tokenizer.as_tokenizer(),
+        )?;
+        state.training_samples = training_samples;
+        state.held_out_samples = held_out_samples;
+        state.training_samples_sha256 = sha256_hex(&training_bytes);
+        state.held_out_samples_sha256 = sha256_hex(&held_out_bytes);
+        Ok(())
     }
-    let (history, stop) = trainer
-        .train(policy, task.search_reward(), tokenizer, &training_samples)
-        .map_err(|error| DiscoveryError::Training(Box::new(error)))?;
-    if stop == RunStop::Preempted {
+
+    #[allow(clippy::cognitive_complexity)]
+    fn launch_and_build_trainer(&mut self, state: &mut Self::State) -> Result<(), Self::Error> {
+        let signer =
+            CandidateSigner::generate().map_err(|error| DiscoveryError::Launch(Box::new(error)))?;
+        let signing_public_key = signer.public_key_hex();
+        let launch_payload = LaunchPayload {
+            contract: LAUNCH_CONTRACT,
+            contract_version: 1,
+            launch_authentication: LOCAL_EPHEMERAL_AUTHENTICATION,
+            launch_trust_boundary: LOCAL_EPHEMERAL_TRUST_BOUNDARY,
+            ferrl_source: &state.ferrl_source,
+            task: self.task.identity(),
+            model: &state.model,
+            metric_contract: &state.metric_contract,
+            execution: state.model.execution_device,
+            resolved_eos_token_id: state.eos_token_id,
+            training_samples_sha256: &state.training_samples_sha256,
+            training_samples_count: state.training_samples.len(),
+            held_out_samples_sha256: &state.held_out_samples_sha256,
+            held_out_samples_count: state.held_out_samples.len(),
+            steps: self.config.steps,
+            group_size: self.config.group_size,
+            max_new_tokens: self.config.max_new_tokens,
+            eval_group_size: self.config.eval_group_size,
+            temperature: self.config.temperature,
+            learning_rate: self.config.learning_rate,
+            seed: self.config.seed,
+            candidate_signing_public_key: &signing_public_key,
+        };
+        let payload_bytes = serde_json::to_vec(&launch_payload).map_err(|source| {
+            DiscoveryError::Serialization {
+                kind: "discovery launch payload",
+                source,
+            }
+        })?;
+        let launch_sha256 = sha256_hex(&payload_bytes);
+        let run_id = format!("discovery-{}", &launch_sha256[..20]);
+        let launch = LaunchManifest {
+            contract: LAUNCH_CONTRACT,
+            launch_authentication: LOCAL_EPHEMERAL_AUTHENTICATION,
+            launch_trust_boundary: LOCAL_EPHEMERAL_TRUST_BOUNDARY,
+            payload_sha256: &launch_sha256,
+            payload: &launch_payload,
+        };
+        let mut launch_bytes =
+            serde_json::to_vec_pretty(&launch).map_err(|source| DiscoveryError::Serialization {
+                kind: "discovery launch manifest",
+                source,
+            })?;
+        launch_bytes.push(b'\n');
+        let run = RunDir::create(&self.config.runs_root, &run_id)
+            .map_err(|error| DiscoveryError::Launch(Box::new(error)))?;
+        run.write_immutable_launch(&launch_bytes, None)
+            .map_err(|error| DiscoveryError::Launch(Box::new(error)))?;
+        let trainer_config = self.config.trainer_config(state.eos_token_id);
+        if trainer_config.candidate_log_top_k != trainer_config.group_size {
+            return Err(DiscoveryError::InvalidConfiguration(
+                "discovery requires complete candidate logging".into(),
+            ));
+        }
+        let mut trainer = Trainer::new(trainer_config, &run)
+            .map_err(|error| DiscoveryError::Training(Box::new(error)))?
+            .with_frozen_policy_sha256(state.model.policy_sha256.clone())
+            .with_candidate_provenance(&launch_sha256, signer)
+            .map_err(|error| DiscoveryError::Training(Box::new(error)))?;
+        if let Some(flag) = self.config.preemption_flag.clone() {
+            trainer = trainer.with_preemption_flag(flag);
+        }
+        state.launch_bytes = Some(launch_bytes);
+        state.launch_sha256 = Some(launch_sha256);
+        state.run_id = Some(run_id);
+        state.signing_public_key = Some(signing_public_key);
+        state.run = Some(run);
+        state.trainer = Some(trainer);
+        Ok(())
+    }
+
+    #[allow(clippy::cognitive_complexity)]
+    fn train(
+        &mut self,
+        state: &mut Self::State,
+    ) -> Result<crate::orchestration::TrainOutcome<Self::Preempted>, Self::Error> {
+        let run = state.run.clone().ok_or_else(|| {
+            DiscoveryError::InvalidConfiguration("training requires a published run".into())
+        })?;
+        let (history, stop) = {
+            let trainer = state.trainer.as_mut().ok_or_else(|| {
+                DiscoveryError::InvalidConfiguration(
+                    "training requires a constructed trainer".into(),
+                )
+            })?;
+            trainer
+                .train(
+                    state.policy.as_mut_policy(),
+                    self.task.search_reward(),
+                    state.tokenizer.as_tokenizer(),
+                    &state.training_samples,
+                )
+                .map_err(|error| DiscoveryError::Training(Box::new(error)))?
+        };
         let completed_steps = u64::try_from(history.len()).map_err(|_| {
             DiscoveryError::PreemptionCheckpoint(
                 "completed history length does not fit the checkpoint step domain".into(),
             )
         })?;
-        let latest = crate::latest_checkpoint(run.checkpoints_dir())
-            .map_err(|error| DiscoveryError::PreemptionCheckpointScan(Box::new(error)))?
-            .ok_or_else(|| {
-                DiscoveryError::PreemptionCheckpoint(
-                    "trainer returned Preempted without a complete checkpoint".into(),
-                )
-            })?;
-        if latest.step != completed_steps {
-            return Err(DiscoveryError::PreemptionCheckpoint(format!(
-                "newest complete checkpoint step {} does not match completed history length \
-                 {completed_steps}",
-                latest.step
-            )));
-        }
-        return Ok(DiscoveryOutcome::Preempted(PreemptedReport {
-            run_dir: run.root().to_path_buf(),
-            completed_steps: latest.step,
-            checkpoint_path: latest.dir,
-        }));
-    }
-
-    let eval = evaluate(
-        policy,
-        task.search_reward(),
-        tokenizer,
-        &held_out_samples,
-        &config.eval_config(eos_token_id),
-    )
-    .map_err(|error| DiscoveryError::Evaluation(Box::new(error)))?;
-    let held_out = HeldOutReport::from_eval(&eval);
-    let published_held_out = PublishedHeldOutReport {
-        contract: HELD_OUT_REPORT_CONTRACT,
-        contract_version: 1,
-        launch_sha256: &launch_sha256,
-        task: task.identity(),
-        held_out_samples_sha256: &held_out_samples_sha256,
-        held_out_samples_count: held_out_samples.len(),
-        report: &eval,
-    };
-    let mut expected_held_out_bytes =
-        serde_json::to_vec_pretty(&published_held_out).map_err(|source| {
-            DiscoveryError::Serialization {
-                kind: "launch-bound held-out report",
-                source,
+        state.history = Some(history);
+        if stop == RunStop::Preempted {
+            let latest = crate::latest_checkpoint(run.checkpoints_dir())
+                .map_err(|error| DiscoveryError::PreemptionCheckpointScan(Box::new(error)))?
+                .ok_or_else(|| {
+                    DiscoveryError::PreemptionCheckpoint(
+                        "trainer returned Preempted without a complete checkpoint".into(),
+                    )
+                })?;
+            if latest.step != completed_steps {
+                return Err(DiscoveryError::PreemptionCheckpoint(format!(
+                    "newest complete checkpoint step {} does not match completed history length \
+                     {completed_steps}",
+                    latest.step
+                )));
             }
-        })?;
-    expected_held_out_bytes.push(b'\n');
-    run.write_eval_report(&published_held_out)
-        .map_err(|error| DiscoveryError::Launch(Box::new(error)))?;
-    let held_out_report_bytes =
-        fs::read(run.eval_report_path()).map_err(|source| DiscoveryError::HeldOutReportIo {
-            path: run.eval_report_path(),
-            source,
-        })?;
-    if held_out_report_bytes != expected_held_out_bytes {
-        return Err(DiscoveryError::InvalidCandidateEvidence(
-            "published held-out report bytes differ from the launch-bound report".into(),
-        ));
+            return Ok(crate::orchestration::TrainOutcome::preempted(
+                DiscoveryOutcome::Preempted(PreemptedReport {
+                    run_dir: run.root().to_path_buf(),
+                    completed_steps: latest.step,
+                    checkpoint_path: latest.dir,
+                }),
+            ));
+        }
+        Ok(crate::orchestration::TrainOutcome::completed())
     }
-    let mut candidates = load_and_validate_candidates(
-        &run.candidates_path(),
-        &launch_sha256,
-        &signing_public_key,
-        config.steps,
-        config.group_size,
-        config.max_new_tokens,
-    )?;
-    candidates.sort_by(|left, right| {
-        right
-            .record
-            .reward
-            .total_cmp(&left.record.reward)
-            .then_with(|| left.record.step.cmp(&right.record.step))
-            .then_with(|| left.record.prompt_index.cmp(&right.record.prompt_index))
-            .then_with(|| left.record.group_index.cmp(&right.record.group_index))
-    });
 
-    let mut checked = 0;
-    let mut saw_measured = false;
-    let mut last_reason = NoWinReason::CandidatesRejected;
-    let mut last_detail = "every candidate was rejected by the final verifier".to_owned();
-    let mut best: Option<RankedFinalEvidence<T::Artifact, T::VerificationEvidence>> = None;
-    for (candidate_index, candidate) in candidates.iter().enumerate() {
-        checked += 1;
-        let decision = task
-            .verify_candidate(Candidate {
-                record: &candidate.record,
-                provenance_sha256: candidate.provenance_sha256.as_str(),
-            })
-            .map_err(DiscoveryError::TaskVerification)?;
-        let evidence = match decision {
-            CandidateVerification::Rejected { reason } => {
-                if !saw_measured {
-                    last_reason = NoWinReason::CandidatesRejected;
-                    last_detail = if reason.trim().is_empty() {
-                        "candidate rejected without task detail".into()
-                    } else {
-                        reason
-                    };
+    fn post_run_health(&mut self, state: &mut Self::State) -> Result<(), Self::Error> {
+        let history = state.history.as_deref().ok_or_else(|| {
+            DiscoveryError::InvalidConfiguration(
+                "post-run health requires completed training".into(),
+            )
+        })?;
+        if crate::summarize(history).is_none() {
+            return Err(DiscoveryError::InvalidConfiguration(
+                "post-run health requires at least one completed training metric".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::cognitive_complexity)]
+    fn evaluate_and_publish(&mut self, state: &mut Self::State) -> Result<(), Self::Error> {
+        let run = state.run.clone().ok_or_else(|| {
+            DiscoveryError::InvalidConfiguration("evaluation requires a published run".into())
+        })?;
+        let launch_sha256 = state.launch_sha256.clone().ok_or_else(|| {
+            DiscoveryError::InvalidConfiguration("evaluation requires launch identity".into())
+        })?;
+        let eval = evaluate(
+            state.policy.as_mut_policy(),
+            self.task.search_reward(),
+            state.tokenizer.as_tokenizer(),
+            &state.held_out_samples,
+            &self.config.eval_config(state.eos_token_id),
+        )
+        .map_err(|error| DiscoveryError::Evaluation(Box::new(error)))?;
+        let held_out = HeldOutReport::from_eval(&eval);
+        let published_held_out = PublishedHeldOutReport {
+            contract: HELD_OUT_REPORT_CONTRACT,
+            contract_version: 1,
+            launch_sha256: &launch_sha256,
+            task: self.task.identity(),
+            held_out_samples_sha256: &state.held_out_samples_sha256,
+            held_out_samples_count: state.held_out_samples.len(),
+            report: &eval,
+        };
+        let mut expected_held_out_bytes =
+            serde_json::to_vec_pretty(&published_held_out).map_err(|source| {
+                DiscoveryError::Serialization {
+                    kind: "launch-bound held-out report",
+                    source,
                 }
-                continue;
-            }
-            CandidateVerification::Measured(evidence) => evidence,
-        };
-        saw_measured = true;
-        evidence.metric.validate_against(metric_contract)?;
-        if !evidence.held_out_correct {
-            last_reason = NoWinReason::HeldOutIncorrect;
-            last_detail = "final verifier did not prove task-semantic held-out correctness".into();
-            continue;
+            })?;
+        expected_held_out_bytes.push(b'\n');
+        run.write_eval_report(&published_held_out)
+            .map_err(|error| DiscoveryError::Launch(Box::new(error)))?;
+        let held_out_report_bytes =
+            fs::read(run.eval_report_path()).map_err(|source| DiscoveryError::HeldOutReportIo {
+                path: run.eval_report_path(),
+                source,
+            })?;
+        if held_out_report_bytes != expected_held_out_bytes {
+            return Err(DiscoveryError::InvalidCandidateEvidence(
+                "published held-out report bytes differ from the launch-bound report".into(),
+            ));
         }
-        if !evidence.metric.is_material_win() {
-            last_reason = NoWinReason::NoMaterialMetricWin;
-            last_detail = format!(
-                "directional improvement {} did not strictly exceed materiality margin {}",
-                evidence.metric.directional_improvement(),
-                evidence.metric.minimum_material_improvement
-            );
-            continue;
-        }
-        let replace = match best.as_ref() {
-            None => true,
-            Some(current) => metric_is_stronger(
-                &evidence.metric,
-                &current.evidence.metric,
-                metric_contract.direction,
-            ),
-        };
-        if replace {
-            best = Some(RankedFinalEvidence {
-                candidate_index,
-                evidence,
-            });
-        }
+        state.held_out = Some(held_out);
+        state.held_out_report_bytes = Some(held_out_report_bytes);
+        Ok(())
     }
-    if let Some(best) = best {
-        let artifact = publish_verified_artifact(
-            &config.artifact_output,
-            task.identity(),
-            model,
-            ferrl_source,
-            &run_id,
+
+    #[allow(clippy::cognitive_complexity)]
+    fn load_and_select_candidates(&mut self, state: &mut Self::State) -> Result<(), Self::Error> {
+        let run = state.run.clone().ok_or_else(|| {
+            DiscoveryError::InvalidConfiguration(
+                "candidate loading requires a published run".into(),
+            )
+        })?;
+        let launch_sha256 = state.launch_sha256.clone().ok_or_else(|| {
+            DiscoveryError::InvalidConfiguration(
+                "candidate loading requires launch identity".into(),
+            )
+        })?;
+        let signing_public_key = state.signing_public_key.clone().ok_or_else(|| {
+            DiscoveryError::InvalidConfiguration(
+                "candidate loading requires signing identity".into(),
+            )
+        })?;
+        let mut candidates = load_and_validate_candidates(
+            &run.candidates_path(),
             &launch_sha256,
             &signing_public_key,
-            &candidates[best.candidate_index],
-            &launch_bytes,
-            &held_out_report_bytes,
-            best.evidence,
+            self.config.steps,
+            self.config.group_size,
+            self.config.max_new_tokens,
         )?;
-        return Ok(DiscoveryOutcome::Verified(artifact));
+        candidates.sort_by(|left, right| {
+            right
+                .record
+                .reward
+                .total_cmp(&left.record.reward)
+                .then_with(|| left.record.step.cmp(&right.record.step))
+                .then_with(|| left.record.prompt_index.cmp(&right.record.prompt_index))
+                .then_with(|| left.record.group_index.cmp(&right.record.group_index))
+        });
+        let mut checked = 0;
+        let mut saw_measured = false;
+        let mut last_reason = NoWinReason::CandidatesRejected;
+        let mut last_detail = "every candidate was rejected by the final verifier".to_owned();
+        let mut best: Option<RankedFinalEvidence<T::Artifact, T::VerificationEvidence>> = None;
+        for (candidate_index, candidate) in candidates.iter().enumerate() {
+            checked += 1;
+            let decision = self
+                .task
+                .verify_candidate(Candidate {
+                    record: &candidate.record,
+                    provenance_sha256: candidate.provenance_sha256.as_str(),
+                })
+                .map_err(DiscoveryError::TaskVerification)?;
+            let evidence = match decision {
+                CandidateVerification::Rejected { reason } => {
+                    if !saw_measured {
+                        last_reason = NoWinReason::CandidatesRejected;
+                        last_detail = if reason.trim().is_empty() {
+                            "candidate rejected without task detail".into()
+                        } else {
+                            reason
+                        };
+                    }
+                    continue;
+                }
+                CandidateVerification::Measured(evidence) => evidence,
+            };
+            saw_measured = true;
+            evidence.metric.validate_against(&state.metric_contract)?;
+            if !evidence.held_out_correct {
+                last_reason = NoWinReason::HeldOutIncorrect;
+                last_detail =
+                    "final verifier did not prove task-semantic held-out correctness".into();
+                continue;
+            }
+            if !evidence.metric.is_material_win() {
+                last_reason = NoWinReason::NoMaterialMetricWin;
+                last_detail = format!(
+                    "directional improvement {} did not strictly exceed materiality margin {}",
+                    evidence.metric.directional_improvement(),
+                    evidence.metric.minimum_material_improvement
+                );
+                continue;
+            }
+            let replace = match best.as_ref() {
+                None => true,
+                Some(current) => metric_is_stronger(
+                    &evidence.metric,
+                    &current.evidence.metric,
+                    state.metric_contract.direction,
+                ),
+            };
+            if replace {
+                best = Some(RankedFinalEvidence {
+                    candidate_index,
+                    evidence,
+                });
+            }
+        }
+        state.candidates = candidates;
+        state.best = best;
+        state.candidates_checked = checked;
+        state.no_win_reason = last_reason;
+        state.no_win_detail = last_detail;
+        Ok(())
     }
-    Ok(DiscoveryOutcome::NoWin(NoWinReport {
-        run_dir: run.root().to_path_buf(),
-        held_out,
-        candidates_checked: checked,
-        reason: last_reason,
-        detail: last_detail,
-    }))
+
+    #[allow(clippy::cognitive_complexity)]
+    fn map_completed(self, mut state: Self::State) -> Result<Self::Completed, Self::Error> {
+        let run = state.run.take().ok_or_else(|| {
+            DiscoveryError::InvalidConfiguration(
+                "completed mapping requires a published run".into(),
+            )
+        })?;
+        let held_out = state.held_out.take().ok_or_else(|| {
+            DiscoveryError::InvalidConfiguration(
+                "completed mapping requires held-out evaluation".into(),
+            )
+        })?;
+        let launch_bytes = state.launch_bytes.take().ok_or_else(|| {
+            DiscoveryError::InvalidConfiguration("completed mapping requires launch bytes".into())
+        })?;
+        let held_out_report_bytes = state.held_out_report_bytes.take().ok_or_else(|| {
+            DiscoveryError::InvalidConfiguration(
+                "completed mapping requires held-out report bytes".into(),
+            )
+        })?;
+        let launch_sha256 = state.launch_sha256.take().ok_or_else(|| {
+            DiscoveryError::InvalidConfiguration(
+                "completed mapping requires launch identity".into(),
+            )
+        })?;
+        let run_id = state.run_id.take().ok_or_else(|| {
+            DiscoveryError::InvalidConfiguration("completed mapping requires run identity".into())
+        })?;
+        let signing_public_key = state.signing_public_key.take().ok_or_else(|| {
+            DiscoveryError::InvalidConfiguration(
+                "completed mapping requires signing identity".into(),
+            )
+        })?;
+        if let Some(best) = state.best.take() {
+            let artifact = publish_verified_artifact(
+                &self.config.artifact_output,
+                self.task.identity(),
+                &state.model,
+                &state.ferrl_source,
+                &run_id,
+                &launch_sha256,
+                &signing_public_key,
+                &state.candidates[best.candidate_index],
+                &launch_bytes,
+                &held_out_report_bytes,
+                best.evidence,
+            )?;
+            return Ok(DiscoveryOutcome::Verified(artifact));
+        }
+        Ok(DiscoveryOutcome::NoWin(NoWinReport {
+            run_dir: run.root().to_path_buf(),
+            held_out,
+            candidates_checked: state.candidates_checked,
+            reason: state.no_win_reason,
+            detail: state.no_win_detail,
+        }))
+    }
+}
+
+#[allow(dead_code)]
+fn run_with_loaded_policy<'a, 'context, T, P, K>(
+    context: &'a LoadedDiscoveryContext<'context, T, K>,
+    policy: &'a mut P,
+) -> Result<DiscoveryOutcome, DiscoveryError>
+where
+    'context: 'a,
+    T: DiscoveryTask,
+    P: Policy,
+    K: TokenizerLike,
+{
+    let lifecycle = DiscoveryLifecycle::loaded(context, policy);
+    match crate::orchestration::run_lifecycle(lifecycle)? {
+        crate::orchestration::LifecycleOutcome::Completed(outcome)
+        | crate::orchestration::LifecycleOutcome::Preempted(outcome) => Ok(outcome),
+    }
 }
 
 fn metric_is_stronger(
@@ -1994,29 +2340,17 @@ fn load_and_validate_candidates(
                 line: line_number,
                 source,
             })?;
-        let mut canonical =
-            serde_json::to_vec(&record).map_err(|source| DiscoveryError::Serialization {
-                kind: "canonical authenticated candidate row",
-                source,
-            })?;
-        canonical.push(b'\n');
-        if canonical != exact_row_bytes {
-            return Err(DiscoveryError::InvalidCandidateEvidence(format!(
-                "candidate line {line_number} is not the canonical CandidateWriter JSONL encoding"
-            )));
-        }
-        record
-            .verify_signed_provenance(signing_public_key)
-            .map_err(|source| {
-                DiscoveryError::InvalidCandidateEvidence(format!(
-                    "candidate line {line_number} failed signed provenance: {source}"
-                ))
-            })?;
-        if record.launch_sha256.as_deref() != Some(launch_sha256) {
-            return Err(DiscoveryError::InvalidCandidateEvidence(format!(
-                "candidate line {line_number} is bound to a different launch"
-            )));
-        }
+        crate::telemetry::verify_signed_candidate_row(
+            json_bytes,
+            signing_public_key,
+            launch_sha256,
+            &record,
+        )
+        .map_err(|source| {
+            DiscoveryError::InvalidCandidateEvidence(format!(
+                "candidate line {line_number} failed signed provenance: {source}"
+            ))
+        })?;
         if record.rank != 0 || record.world_size != 1 {
             return Err(DiscoveryError::InvalidCandidateEvidence(format!(
                 "candidate line {line_number} is not world-one rank 0"
@@ -2948,12 +3282,30 @@ mod tests {
         assert!(artifact.payload_path().is_file());
         assert!(artifact.candidate_path().is_file());
         assert!(artifact.verification_evidence_path().is_file());
-        assert!(policy.generate_calls() > 0);
+        assert!(
+            policy.generate_calls() > 0,
+            "Discovery did not enter the library-owned common lifecycle"
+        );
         assert!(policy.token_logprobs_calls() > 0);
         assert!(task.reward_calls() > 0);
         assert!(temp.0.join("runs").exists());
         assert!(config.artifact_output.exists());
     }
+    #[test]
+    fn sdk_production_entry_cannot_bypass_the_common_library_lifecycle() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/discovery.rs"));
+        let start = source
+            .find("pub fn run(self) -> Result<DiscoveryOutcome, DiscoveryError> {")
+            .expect("Discovery::run source");
+        let end = source[start..]
+            .find("    #[allow(clippy::cognitive_complexity)]\n    fn validate_before_load")
+            .map(|offset| start + offset)
+            .expect("Discovery::run boundary");
+        let entry = &source[start..end];
+        assert!(entry.contains("crate::orchestration::run_lifecycle(lifecycle)"));
+        assert!(!entry.contains("run_with_loaded_policy"));
+    }
+
     #[test]
     fn injected_policy_returns_completed_no_win_on_threshold_equality() {
         let temp = TestDir::new("no-win");

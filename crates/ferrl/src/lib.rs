@@ -94,6 +94,8 @@ pub mod model;
 pub mod moe;
 pub mod nn;
 pub mod optim;
+#[doc(hidden)]
+pub mod orchestration;
 pub mod policy;
 pub mod qwen;
 pub mod qwen35;

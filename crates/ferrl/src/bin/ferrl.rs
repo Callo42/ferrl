@@ -54,30 +54,48 @@ use std::time::Duration;
 
 use candle_core::{DType, Device};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use ferrl::countdown::{build_prompt, generate_dataset, CountdownConfig, CountdownProblem};
+use ferrl::orchestration::{
+    CliEosSelection, CliExecution, CliLaunchAttestor, CliLaunchInput, CliOrchestrationError,
+    CliRunHealthPolicy, CliRunOutcome, CliTrainingRequest, LaunchAttestation,
+    LaunchAttestationRequest, LaunchAuthenticationMode, LaunchConfigSnapshot, LaunchManifest,
+    LaunchRunIdentity, LaunchTrustPolicy, LaunchVerifierIdentity, CANDIDATE_RECORD_DOMAIN,
+    LAUNCH_ATTESTATION_ALGORITHM, LAUNCH_ATTESTATION_CONTRACT_VERSION, LAUNCH_ATTESTATION_DOMAIN,
+    LAUNCH_ATTESTATION_KIND, LAUNCH_ATTESTATION_REQUEST_KIND, LAUNCH_CONTRACT_VERSION, LAUNCH_KIND,
+    LAUNCH_PAYLOAD_DOMAIN, LAUNCH_TRUST_POLICY_KIND,
+};
+#[cfg(test)]
+use ferrl::orchestration::{
+    LaunchCandidateLedger, LaunchModelIdentity, LaunchPayload, LaunchPromptIdentity, LaunchTrustKey,
+};
+#[cfg(test)]
+use ferrl::policy::{GenConfig, Policy, TensorParallelPolicy};
+#[cfg(test)]
+use ferrl::telemetry::CandidateSigner;
+use ferrl::telemetry::{CandidateRecord, RegressionFailure};
+#[cfg(test)]
+use ferrl::Trainer;
+use ferrl::{
+    compare_distributed_metrics, compare_metrics, math_split_key, read_jsonl, summarize,
+    train_eval_split_by_key, BaseQuantization, CountdownReward, LoaderOpts, MathProblem,
+    MathReward, RegressionBudget, RegressionReport, RewardFn, RunDir, Sample, TensorParallelPlan,
+    TrainerConfig, TrimulReward, VerifierExecutorConfig,
+};
+#[cfg(test)]
+use ferrl::{evaluate, RunStop, TokenizerLike};
 use ring::rand::{SecureRandom as _, SystemRandom};
 use ring::signature::{UnparsedPublicKey, ED25519};
 use serde::{
-    de::Error as _,
+    de::{DeserializeOwned, Error as _},
     ser::{Error as _, SerializeStruct},
     Deserialize, Serialize,
 };
 use sha2::{Digest, Sha256};
-use tracing::info;
-
-use ferrl::countdown::{build_prompt, generate_dataset, CountdownConfig, CountdownProblem};
-use ferrl::policy::{GenConfig, Policy, TensorParallelPolicy};
-use ferrl::telemetry::{CandidateRecord, CandidateSigner, RegressionFailure};
-use ferrl::{
-    compare_distributed_metrics, compare_metrics, evaluate, math_split_key, read_jsonl, summarize,
-    train_eval_split_by_key, BaseQuantization, CountdownReward, LoaderOpts, MathProblem,
-    MathReward, RegressionBudget, RegressionReport, RewardFn, RunDir, RunStop, Sample,
-    TensorParallelPlan, TokenizerLike, Trainer, TrainerConfig, TrimulReward,
-    VerifierExecutorConfig,
-};
 
 /// A task's train/eval split: `(train, eval)` samples of the task's target type.
 type Splits<T> = (Vec<Sample<T>>, Vec<Sample<T>>);
 
+#[cfg(test)]
 #[derive(Debug, Serialize)]
 struct DurableEvalReport<'a> {
     contract: &'static str,
@@ -479,6 +497,9 @@ enum CliError {
     /// A data-parallel collective or launch-configuration error.
     #[error(transparent)]
     Comm(#[from] ferrl::CommError),
+    /// The hidden concrete library-owned CLI lifecycle failed.
+    #[error(transparent)]
+    Orchestration(#[from] CliOrchestrationError),
     /// A CUDA device error (only on a `--features cuda` build).
     #[cfg(feature = "cuda")]
     #[error("{0}")]
@@ -728,18 +749,6 @@ struct TrimulCfg {
     baseline: Option<BaselineCfg>,
     /// Versioned shaped training-reward profile.
     reward: ferrl::trimul::TrimulRewardProfile,
-}
-
-/// How the immutable launch is authenticated before candidate rows are published.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum LaunchAuthenticationMode {
-    /// Process-local discovery integrity. This mode requires no administrator service
-    /// and retains an explicit operator-trust boundary when its candidate is audited.
-    #[default]
-    LocalEphemeralV1,
-    /// Root-trusted external launch attestation for an optional stronger discovery boundary.
-    ExternalAttestedV1,
 }
 
 /// Discovery-health policy schema.
@@ -1515,6 +1524,7 @@ impl RunConfig {
         }
     }
 
+    #[cfg(test)]
     fn resolve_eos_token_id(
         &self,
         tokenizer: &ferrl::HfTokenizer,
@@ -1532,6 +1542,7 @@ impl RunConfig {
             .map_err(|error| CliError::msg(format!("checkpoint EOS resolution failed: {error}")))
     }
 
+    #[cfg(test)]
     fn resolved_trainer_config(
         &self,
         tokenizer: &ferrl::HfTokenizer,
@@ -1781,67 +1792,9 @@ struct LoadedRunConfig {
     consensus_digest: [u8; 32],
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LaunchConfigSnapshot {
-    source_sha256: String,
-    resolved_sha256: String,
-    resolved: serde_json::Value,
-}
-
-const LAUNCH_CONTRACT_VERSION: u32 = 2;
-const LAUNCH_KIND: &str = "ferrl.run-launch";
-const LAUNCH_PAYLOAD_DOMAIN: &str = "ferrl.run-launch.payload.v2";
-const CANDIDATE_RECORD_DOMAIN: &str = CandidateRecord::DIGEST_DOMAIN;
-const LAUNCH_ATTESTATION_CONTRACT_VERSION: u32 = 1;
-const LAUNCH_ATTESTATION_KIND: &str = "ferrl.run-launch-attestation";
-const LAUNCH_ATTESTATION_ALGORITHM: &str = "ed25519";
-const LAUNCH_ATTESTATION_DOMAIN: &str = "ferrl.run-launch-attestation.v1";
-const LAUNCH_ATTESTATION_REQUEST_KIND: &str = "ferrl.run-launch-attestation-request";
-const LAUNCH_TRUST_POLICY_KIND: &str = "ferrl.run-launch-trust-policy";
 const LAUNCH_ATTESTOR_SOCKET: &str = "/run/ferrl/launch-attestor.sock";
 const LAUNCH_TRUST_POLICY: &str = "/etc/ferrl/launch-trust.json";
 const MAX_ATTESTATION_RESPONSE_BYTES: u64 = 16 * 1024;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LaunchManifest {
-    contract_version: u32,
-    kind: String,
-    payload_sha256: String,
-    payload: LaunchPayload,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    attestation: Option<LaunchAttestation>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LaunchPayload {
-    task: String,
-    ferrl_commit: String,
-    authentication: LaunchAuthenticationMode,
-    run: LaunchRunIdentity,
-    config: LaunchConfigSnapshot,
-    model: LaunchModelIdentity,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    prompt: Option<LaunchPromptIdentity>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    verifier: Option<LaunchVerifierIdentity>,
-    candidate_ledger: LaunchCandidateLedger,
-}
-
-/// Launch-bound TriMul assets and selected verifier assurance evidence.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LaunchVerifierIdentity {
-    assets: ferrl::trimul::TrimulVerifierIdentity,
-    isolation: ferrl::VerifierIsolationEvidence,
-    isolation_evidence_sha256: String,
-    timing_metric: String,
-    runtime_hardening_contract: String,
-    runtime_preflight: ferrl::trimul::TrimulRuntimePreflightEvidence,
-    runtime_preflight_evidence_sha256: String,
-}
 
 fn verifier_isolation_evidence_sha256(evidence: &ferrl::VerifierIsolationEvidence) -> String {
     ferrl::trimul::verifier_isolation_evidence_sha256(evidence)
@@ -1887,99 +1840,6 @@ fn launch_verifier_identity(
     })
 }
 
-fn portable_verifier_consensus(identity: &LaunchVerifierIdentity) -> Result<Vec<u8>, CliError> {
-    serde_json::to_vec(&(
-        identity.isolation.contract_version,
-        identity.isolation.tier,
-        identity.isolation.uid_boundary,
-        identity.isolation.asset_transport,
-        &identity.isolation.apptainer_sha256,
-        identity.isolation.apptainer_len_bytes,
-        &identity.isolation.apptainer_version,
-        &identity.timing_metric,
-        &identity.runtime_hardening_contract,
-        identity.runtime_preflight.contract_version,
-        &identity.runtime_preflight.probe_submission_sha256,
-        &identity.runtime_preflight.runtime_hardening,
-    ))
-    .map_err(|error| CliError::msg(format!("serialize verifier consensus evidence: {error}")))
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LaunchRunIdentity {
-    group_id: String,
-    run_id: String,
-    data_parallel_rank: usize,
-    data_parallel_world_size: usize,
-    tensor_parallel_rank: usize,
-    tensor_parallel_world_size: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LaunchModelIdentity {
-    family: String,
-    checkpoint_policy_sha256: String,
-    tokenizer_sha256: String,
-    resolved_eos_token_id: Option<u32>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LaunchPromptIdentity {
-    file: String,
-    sha256: String,
-    len_bytes: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LaunchCandidateLedger {
-    file: String,
-    format_version: u32,
-    row_digest_domain: String,
-    row_signature_algorithm: String,
-    signing_public_key: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LaunchAttestation {
-    contract_version: u32,
-    kind: String,
-    algorithm: String,
-    key_id: String,
-    launch_payload_sha256: String,
-    signature: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LaunchAttestationRequest {
-    contract_version: u32,
-    kind: String,
-    algorithm: String,
-    launch_payload_sha256: String,
-    launch_payload_json_hex: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LaunchTrustPolicy {
-    contract_version: u32,
-    kind: String,
-    keys: Vec<LaunchTrustKey>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LaunchTrustKey {
-    key_id: String,
-    algorithm: String,
-    public_key: String,
-}
-
 trait LaunchAttestor {
     fn attest(&self, manifest: &LaunchManifest) -> Result<LaunchAttestation, CliError>;
 }
@@ -2022,33 +1882,6 @@ fn validated_build_source_identity(
         commit,
         dirty: false,
     })
-}
-
-impl LaunchManifest {
-    fn new(payload: LaunchPayload) -> Result<Self, CliError> {
-        let payload_bytes = serde_json::to_vec(&payload)
-            .map_err(|error| CliError::msg(format!("serialize launch payload: {error}")))?;
-        Ok(Self {
-            contract_version: LAUNCH_CONTRACT_VERSION,
-            kind: LAUNCH_KIND.to_owned(),
-            payload_sha256: domain_sha256(LAUNCH_PAYLOAD_DOMAIN, &[&payload_bytes]),
-            payload,
-            attestation: None,
-        })
-    }
-
-    fn attest(mut self, attestor: &dyn LaunchAttestor) -> Result<Self, CliError> {
-        if self.attestation.is_some() {
-            return Err(CliError::msg("launch manifest is already attested"));
-        }
-        self.attestation = Some(attestor.attest(&self)?);
-        Ok(self)
-    }
-
-    fn to_pretty_bytes(&self) -> Result<Vec<u8>, CliError> {
-        serde_json::to_vec_pretty(self)
-            .map_err(|error| CliError::msg(format!("serialize launch manifest: {error}")))
-    }
 }
 
 impl LaunchAttestor for SystemLaunchAttestor {
@@ -2513,14 +2346,9 @@ fn run_training<R: RewardFn>(
     launch_runtime: Option<LaunchRuntime>,
 ) -> Result<(), CliError>
 where
-    R::Target: Serialize,
+    R::Target: Serialize + DeserializeOwned,
 {
-    let launch_attestor = SystemLaunchAttestor;
-    let launch_attestor: Option<&dyn LaunchAttestor> = match cfg.launch_authentication {
-        LaunchAuthenticationMode::LocalEphemeralV1 => None,
-        LaunchAuthenticationMode::ExternalAttestedV1 => Some(&launch_attestor),
-    };
-    run_training_with_loader(
+    let request = cli_training_request(
         cfg,
         device,
         reward,
@@ -2532,27 +2360,153 @@ where
         verifier_identity,
         launch,
         launch_runtime,
-        launch_attestor,
-        |model_dir, device, opts| {
-            ferrl::load_auto_policy_with_identity(model_dir, device, opts).map_err(CliError::from)
-        },
-    )
+    )?;
+    let system_attestor = SystemLaunchAttestor;
+    let bridge = CoreLaunchAttestor {
+        inner: &system_attestor,
+    };
+    let attestor = (cfg.launch_authentication == LaunchAuthenticationMode::ExternalAttestedV1)
+        .then_some(&bridge as &dyn CliLaunchAttestor);
+    match ferrl::orchestration::run_cli_training(request, attestor) {
+        Ok(outcome) => {
+            present_cli_run_outcome(outcome);
+            Ok(())
+        }
+        Err(error) => {
+            if let Some(report) = error.health_report() {
+                print!("{}", report.render());
+            }
+            Err(error.into())
+        }
+    }
 }
 
-/// CLI-only policy capabilities that are intentionally inherent on [`ferrl::AutoPolicy`].
-///
-/// Keeping this narrow adapter separate from the public [`Policy`] contract lets the
-/// production loader seam remain mutation-sensitive in tests without widening the library API.
+/// CLI-only policy capabilities used by mutation-sensitive unit controls.
+#[cfg(test)]
 trait CliTrainingPolicy: Policy + TensorParallelPolicy {
     fn supports_cli_tensor_parallel(&self) -> bool;
 }
 
+#[cfg(test)]
 impl CliTrainingPolicy for ferrl::AutoPolicy {
     fn supports_cli_tensor_parallel(&self) -> bool {
         self.supports_tensor_parallel()
     }
 }
 
+struct CoreLaunchAttestor<'a> {
+    inner: &'a dyn LaunchAttestor,
+}
+
+impl CliLaunchAttestor for CoreLaunchAttestor<'_> {
+    fn attest(
+        &self,
+        manifest: &LaunchManifest,
+    ) -> Result<LaunchAttestation, CliOrchestrationError> {
+        self.inner
+            .attest(manifest)
+            .map_err(|error| CliOrchestrationError::msg(error.to_string()))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cli_training_request<'a, R: RewardFn>(
+    cfg: &'a RunConfig,
+    device: &'a Device,
+    reward: &'a R,
+    eval_reward: &'a R,
+    train: &'a [Sample<R::Target>],
+    eval: &'a [Sample<R::Target>],
+    rendered_prompt_bytes: Option<&'a [u8]>,
+    verifier_assets: Option<&'a ferrl::trimul::TrimulVerifierAssets>,
+    verifier_identity: Option<&'a LaunchVerifierIdentity>,
+    launch: &'a LaunchContext,
+    launch_runtime: Option<LaunchRuntime>,
+) -> Result<CliTrainingRequest<'a, R>, CliError>
+where
+    R::Target: Serialize + DeserializeOwned,
+{
+    let execution = if cfg.tensor_parallel.enabled {
+        let runtime =
+            launch_runtime.ok_or_else(|| CliError::msg("distributed launch runtime is missing"))?;
+        CliExecution::TensorParallel {
+            plan: cfg.tensor_parallel_plan(),
+            comm: runtime.comm,
+        }
+    } else if cfg.distributed.enabled {
+        let runtime =
+            launch_runtime.ok_or_else(|| CliError::msg("distributed launch runtime is missing"))?;
+        CliExecution::DataParallel(runtime.comm)
+    } else {
+        CliExecution::WorldOne
+    };
+    let eos_selection = match cfg.eos_selection {
+        EosSelection::Checkpoint => CliEosSelection::CheckpointDefault,
+        EosSelection::Explicit => CliEosSelection::Explicit(
+            cfg.trainer
+                .eos_token_id
+                .ok_or_else(|| CliError::msg("explicit EOS selector has no numeric token id"))?,
+        ),
+        EosSelection::Disabled => CliEosSelection::Disabled,
+    };
+    let health_policy = CliRunHealthPolicy::from_json_value(
+        serde_json::to_value(&cfg.run_health)
+            .map_err(|error| CliError::msg(format!("serialize run_health: {error}")))?,
+    )?;
+    Ok(CliTrainingRequest {
+        launch: CliLaunchInput {
+            task: cfg.task.clone(),
+            ferrl_commit: launch.ferrl_commit.clone(),
+            authentication: cfg.launch_authentication,
+            run: launch.run.clone(),
+            config: launch.config.clone(),
+            output_root: cfg.out_dir.clone(),
+        },
+        model_dir: &cfg.model_dir,
+        device,
+        loader_opts: cfg.loader_opts(),
+        activation_checkpointing: cfg.policy.activation_checkpointing,
+        eos_selection,
+        trainer_config: cfg.trainer.clone(),
+        training_samples: train,
+        evaluation_samples: eval,
+        reward,
+        evaluation_reward: eval_reward,
+        rendered_prompt_bytes,
+        verifier_assets,
+        verifier_identity: verifier_identity.cloned(),
+        execution,
+        health_policy,
+        health_policy_is_default: cfg.run_health.is_default(),
+        data_seed: cfg.data.seed,
+        trimul_held_out_secret_seed: cfg.trimul.held_out_secret_seed,
+    })
+}
+
+fn present_cli_run_outcome(outcome: CliRunOutcome) {
+    match outcome {
+        CliRunOutcome::Completed(run) if run.should_present() => {
+            if let Some(report) = run.health_report() {
+                print!("{}", report.render());
+            }
+            println!("ferrl: run complete -> {}", run.run_dir().display());
+            println!(
+                "ferrl: inspect with `ferrl runreport {}`",
+                run.run_dir().display()
+            );
+        }
+        CliRunOutcome::Preempted(run) if run.should_present() => {
+            println!("ferrl: run preempted before held-out evaluation");
+            println!(
+                "ferrl: inspect with `ferrl runreport {}`",
+                run.run_dir().display()
+            );
+        }
+        CliRunOutcome::Completed(_) | CliRunOutcome::Preempted(_) => {}
+    }
+}
+
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn run_training_with_loader<P, R>(
     cfg: &RunConfig,
@@ -2577,226 +2531,37 @@ fn run_training_with_loader<P, R>(
 where
     P: CliTrainingPolicy,
     R: RewardFn,
-    R::Target: Serialize,
+    R::Target: Serialize + DeserializeOwned,
 {
-    let tensor_parallel_plan = cfg.tensor_parallel_plan();
-    let (tensor_parallel_runtime, distributed_launch_comm, distributed_comm) =
-        if cfg.tensor_parallel.enabled {
-            (launch_runtime, None, None)
-        } else if cfg.distributed.enabled {
-            let runtime = launch_runtime
-                .ok_or_else(|| CliError::msg("distributed launch runtime is missing"))?;
-            let comm = SharedComm::from_box(runtime.comm);
-            (None, Some(comm.clone()), Some(comm))
-        } else {
-            (None, None, None)
-        };
-    let tensor_parallel_comm = tensor_parallel_runtime
-        .as_ref()
-        .map(|runtime| runtime.comm.as_ref());
-    let launch_comm = tensor_parallel_comm.or_else(|| {
-        distributed_launch_comm
-            .as_ref()
-            .map(|comm| comm as &dyn ferrl::Comm)
-    });
-    info!(
-        task = %cfg.task,
-        steps = cfg.trainer.steps,
-        group_size = cfg.trainer.group_size,
-        activation_checkpointing = cfg.policy.activation_checkpointing,
-        train = train.len(),
-        eval = eval.len(),
-        tensor_parallel_rank = tensor_parallel_plan.rank(),
-        tensor_parallel_world = tensor_parallel_plan.world_size(),
-        "ferrl train: starting"
-    );
-
-    let model_setup = (|| {
-        let loader_opts = cfg.loader_opts();
-        let (policy, tok, identity) = load_policy(&cfg.model_dir, device, &loader_opts)?;
-        // Every distributed Trainer run needs this verified identity, even when
-        // ordinary checkpointing is disabled. World-1 installs the same value so
-        // enabling DP cannot silently change the builder contract.
-        let frozen_policy_sha256 = identity.policy_sha256.clone();
-        let tcfg = cfg.resolved_trainer_config(&tok)?;
-        if cfg.tensor_parallel.enabled && !policy.supports_cli_tensor_parallel() {
-            return Err(CliError::msg(
-                "loaded checkpoint family does not support tensor_parallel execution; supported \
-                 families are qwen3 (including legacy configs without model_type) and dense \
-                 gemma4/gemma4_unified; qwen3_5/qwen3_5_moe (Qwen3.5/3.6) are unsupported",
-            ));
-        }
-        if tensor_parallel_plan.is_sharded() && !policy.supports_sharded_tensor_parallel_backward()
-        {
-            return Err(CliError::msg(
-                "sharded tensor_parallel training is supported only for dense \
-                 gemma4/gemma4_unified policies with activation checkpointing; the loaded \
-                 policy does not provide cross-rank backward semantics",
-            ));
-        }
-        Ok((policy, tok, tcfg, identity, frozen_policy_sha256))
-    })();
-    let (mut policy, tok, tcfg, policy_identity, frozen_policy_sha256) =
-        coordinate_distributed_result(launch_comm, "model and EOS setup", model_setup)?;
-    validate_resolved_eos_consensus(tcfg.eos_token_id, launch_comm)?;
-    validate_data_parallel_policy_preflight(
-        &policy,
-        &policy_identity.policy_sha256,
-        distributed_launch_comm
-            .as_ref()
-            .map(|comm| comm as &dyn ferrl::Comm),
-    )?;
-    let prompt_sha256 = rendered_prompt_bytes.map(sha256_hex);
-    let verifier_assets_identity = verifier_assets.map(|assets| assets.identity().clone());
-    if (verifier_assets.is_some() || verifier_identity.is_some()) != (cfg.task == "trimul")
-        || verifier_assets.is_some() != verifier_identity.is_some()
-    {
-        return Err(CliError::msg(
-            "TriMul launch requires both verifier assets and isolation evidence, while non-TriMul launches require neither",
-        ));
-    }
-    let portable_verifier = verifier_identity
-        .map(portable_verifier_consensus)
-        .transpose()?;
-    let common_provenance = serde_json::to_vec(&(
-        &launch.ferrl_commit,
-        &launch.run.group_id,
-        &policy_identity.policy_sha256,
-        &policy_identity.tokenizer_sha256,
-        policy_identity.model_family,
-        &prompt_sha256,
-        &verifier_assets_identity,
-        &portable_verifier,
-    ))
-    .map_err(|error| CliError::msg(format!("serialize launch provenance: {error}")))?;
-    validate_launch_value_consensus(
-        "model/checkpoint/tokenizer/prompt provenance",
-        &common_provenance,
-        launch_comm,
-    )?;
-    let gen = GenConfig::from(&tcfg);
-
-    let attestation_setup = (|| {
-        let candidate_signer = CandidateSigner::generate()?;
-        let signing_public_key = candidate_signer.public_key_hex();
-        let manifest = LaunchManifest::new(LaunchPayload {
-            task: cfg.task.clone(),
-            ferrl_commit: launch.ferrl_commit.clone(),
-            authentication: cfg.launch_authentication,
-            run: launch.run.clone(),
-            config: launch.config.clone(),
-            model: LaunchModelIdentity {
-                family: policy_identity.model_family.to_owned(),
-                checkpoint_policy_sha256: policy_identity.policy_sha256.clone(),
-                tokenizer_sha256: policy_identity.tokenizer_sha256.clone(),
-                resolved_eos_token_id: tcfg.eos_token_id,
-            },
-            prompt: rendered_prompt_bytes.map(|bytes| LaunchPromptIdentity {
-                file: RunDir::PROMPT_FILE.to_owned(),
-                sha256: sha256_hex(bytes),
-                len_bytes: bytes.len(),
-            }),
-            verifier: verifier_identity.cloned(),
-            candidate_ledger: LaunchCandidateLedger {
-                file: RunDir::CANDIDATES_FILE.to_owned(),
-                format_version: 1,
-                row_digest_domain: CANDIDATE_RECORD_DOMAIN.to_owned(),
-                row_signature_algorithm: "ed25519".to_owned(),
-                signing_public_key,
-            },
-        })?;
-        let manifest = match cfg.launch_authentication {
-            LaunchAuthenticationMode::LocalEphemeralV1 => manifest,
-            LaunchAuthenticationMode::ExternalAttestedV1 => {
-                let attestor = launch_attestor.ok_or_else(|| {
-                    CliError::msg(
-                        "launch_authentication = \"external_attested_v1\" requires the protected external launch attestor",
-                    )
-                })?;
-                manifest.attest(attestor)?
-            }
-        };
-        Ok((candidate_signer, manifest))
-    })();
-    let (candidate_signer, manifest) =
-        coordinate_distributed_result(launch_comm, "launch authentication", attestation_setup)?;
-    coordinate_distributed_result(
-        launch_comm,
-        "launch-bound verifier revalidation",
-        verifier_assets.map_or(Ok(()), |assets| {
-            assets
-                .verify_current()
-                .map_err(|error| CliError::msg(error.to_string()))
-        }),
-    )?;
-
-    let publication_setup = (|| {
-        let launch_sha256 = manifest.payload_sha256.clone();
-        let manifest_bytes = manifest.to_pretty_bytes()?;
-        let run = RunDir::create(&cfg.out_dir, launch.run.run_id.clone())?;
-        run.write_immutable_launch(&manifest_bytes, rendered_prompt_bytes)?;
-        let trainer = open_trainer(
-            tcfg,
-            &run,
-            distributed_comm,
-            &frozen_policy_sha256,
-            &launch_sha256,
-            candidate_signer,
-        )?;
-        Ok((run, trainer, launch_sha256))
-    })();
-    let (run, mut trainer, launch_sha256) = coordinate_distributed_result(
-        launch_comm,
-        "run directory and trainer setup",
-        publication_setup,
-    )?;
-    let (history, _stop) = train_with_optional_tensor_parallel(
-        &mut trainer,
-        &mut policy,
+    let request = cli_training_request(
+        cfg,
+        device,
         reward,
-        &tok,
+        eval_reward,
         train,
-        tensor_parallel_comm,
+        eval,
+        rendered_prompt_bytes,
+        verifier_assets,
+        verifier_identity,
+        launch,
+        launch_runtime,
     )?;
-    run_on_tensor_parallel_primary(tensor_parallel_comm, "post-run health", || {
-        if let Some(summary) = summarize(&history) {
-            info!(steps = summary.steps, "ferrl train: complete");
-            apply_train_run_health_policy(cfg, &history, &summary, &run)?;
-        }
-        Ok(())
-    })?;
-
-    if !eval.is_empty() {
-        let report = evaluate_and_publish_report(
-            &mut policy,
-            eval_reward,
-            &tok,
-            eval,
-            &gen,
-            cfg,
-            &run,
-            &launch_sha256,
-            verifier_assets_identity.as_ref(),
-            launch_comm,
-        )?;
-        info!(
-            base = report.base_reward_mean,
-            adapter = report.adapter_reward_mean,
-            improvement = report.improvement(),
-            "ferrl train: held-out eval (adapter vs base)"
-        );
-    }
-
-    run_on_tensor_parallel_primary(tensor_parallel_comm, "run completion output", || {
-        println!("ferrl: run complete -> {}", run.root().display());
-        println!(
-            "ferrl: inspect with `ferrl runreport {}`",
-            run.root().display()
-        );
-        Ok(())
-    })
+    let bridge = launch_attestor.map(|inner| CoreLaunchAttestor { inner });
+    let attestor = bridge.as_ref().map(|value| value as &dyn CliLaunchAttestor);
+    let outcome = ferrl::orchestration::run_cli_training_with_test_loader(
+        request,
+        attestor,
+        |policy: &P| policy.supports_cli_tensor_parallel(),
+        |model_dir, device, options| {
+            load_policy(model_dir, device, options)
+                .map_err(|error| CliOrchestrationError::msg(error.to_string()))
+        },
+    )?;
+    present_cli_run_outcome(outcome);
+    Ok(())
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn evaluate_and_publish_report<P, R>(
     policy: &mut P,
@@ -2829,6 +2594,7 @@ where
     Ok(report)
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn publish_eval_report<T: Serialize>(
     cfg: &RunConfig,
@@ -2883,6 +2649,7 @@ fn publish_eval_report<T: Serialize>(
     )
 }
 
+#[cfg(test)]
 fn distributed_launch_binding(
     local_launch_sha256: &str,
     comm: Option<&dyn ferrl::Comm>,
@@ -2921,6 +2688,7 @@ fn distributed_launch_binding(
     Ok((publishing, sha256_hex(&group)))
 }
 
+#[cfg(test)]
 fn train_with_optional_tensor_parallel<P, R>(
     trainer: &mut Trainer,
     policy: &mut P,
@@ -2934,11 +2702,16 @@ where
     R: RewardFn,
 {
     match tensor_parallel_comm {
-        Some(comm) => Ok(trainer.train_tensor_parallel(policy, reward, tokenizer, train, comm)?),
-        None => Ok(trainer.train(policy, reward, tokenizer, train)?),
+        Some(comm) => trainer
+            .train_tensor_parallel(policy, reward, tokenizer, train, comm)
+            .map_err(CliError::from),
+        None => trainer
+            .train(policy, reward, tokenizer, train)
+            .map_err(CliError::from),
     }
 }
 
+#[cfg(test)]
 fn apply_train_run_health_policy(
     cfg: &RunConfig,
     history: &[ferrl::Metrics],
@@ -2961,6 +2734,7 @@ fn apply_train_run_health_policy(
     Ok(())
 }
 
+#[cfg(test)]
 fn open_trainer(
     config: TrainerConfig,
     run: &RunDir,
@@ -2978,6 +2752,7 @@ fn open_trainer(
     Ok(trainer.with_candidate_provenance(candidate_launch_sha256, candidate_signer)?)
 }
 
+#[cfg(test)]
 #[derive(Clone)]
 struct SharedComm {
     inner: std::sync::Arc<std::sync::Mutex<Box<dyn ferrl::Comm>>>,
@@ -2985,6 +2760,7 @@ struct SharedComm {
     world_size: usize,
 }
 
+#[cfg(test)]
 impl SharedComm {
     fn from_box(comm: Box<dyn ferrl::Comm>) -> Self {
         let rank = comm.rank();
@@ -3007,6 +2783,7 @@ impl SharedComm {
     }
 }
 
+#[cfg(test)]
 impl std::fmt::Debug for SharedComm {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SharedComm")
@@ -3016,6 +2793,7 @@ impl std::fmt::Debug for SharedComm {
     }
 }
 
+#[cfg(test)]
 impl ferrl::Comm for SharedComm {
     fn rank(&self) -> usize {
         self.rank
@@ -3212,18 +2990,6 @@ fn validate_launch_value_consensus(
     coordinate_distributed_result(Some(comm), "launch provenance consensus", local)
 }
 
-fn validate_data_parallel_policy_preflight<P: Policy>(
-    policy: &P,
-    policy_sha256: &str,
-    comm: Option<&dyn ferrl::Comm>,
-) -> Result<(), CliError> {
-    let Some(comm) = comm.filter(|comm| comm.world_size() > 1) else {
-        return Ok(());
-    };
-    Trainer::validate_data_parallel_policy_preflight(policy, policy_sha256, comm)?;
-    Ok(())
-}
-
 fn validate_launch_config_consensus(
     digest: &[u8; 32],
     comm: Option<&dyn ferrl::Comm>,
@@ -3249,6 +3015,7 @@ fn validate_launch_config_consensus(
     coordinate_distributed_result(Some(comm), "run config consensus", local)
 }
 
+#[cfg(test)]
 fn validate_resolved_eos_consensus(
     eos_token_id: Option<u32>,
     comm: Option<&dyn ferrl::Comm>,
@@ -3280,6 +3047,7 @@ fn coordinate_distributed_result<T>(
     }
 }
 
+#[cfg(test)]
 fn run_on_tensor_parallel_primary(
     comm: Option<&dyn ferrl::Comm>,
     label: &'static str,
@@ -4263,20 +4031,29 @@ fn load_bound_run_candidate_impl(
             )));
         }
         let record = parse_strict_candidate_row(&ledger_path, index + 1, raw_line)?;
-        record.verify_signed_provenance(&ledger.signing_public_key)?;
-        if record.launch_sha256.as_deref() != Some(launch.payload_sha256.as_str()) {
-            return Err(CliError::msg(format!(
-                "candidate ledger {} row {} belongs to a different launch",
+        ferrl::telemetry::verify_signed_candidate_row(
+            raw_line.as_bytes(),
+            &ledger.signing_public_key,
+            &launch.payload_sha256,
+            &record,
+        )
+        .map_err(|error| {
+            CliError::msg(format!(
+                "candidate ledger {} row {} failed canonical launch authentication: {error}",
                 ledger_path.display(),
                 index + 1
-            )));
-        }
-        verify_candidate_verifier_provenance(&record, &launch, index + 1)?;
-        if record.rank != launch.payload.run.data_parallel_rank
-            || record.world_size != launch.payload.run.data_parallel_world_size
-        {
+            ))
+        })?;
+        ferrl::orchestration::verify_cli_candidate_verifier_provenance(
+            &record,
+            &launch,
+            index + 1,
+        )?;
+        let (expected_rank, expected_world) =
+            ferrl::orchestration::launch_candidate_topology(&launch.payload.run);
+        if record.rank != expected_rank || record.world_size != expected_world {
             return Err(CliError::msg(format!(
-                "candidate ledger {} row {} rank/world disagree with launch.json",
+                "candidate ledger {} row {} rank/world disagree with active execution topology",
                 ledger_path.display(),
                 index + 1
             )));
@@ -4315,98 +4092,6 @@ fn load_bound_run_candidate_impl(
         candidate,
         candidate_row_bytes,
     })
-}
-
-fn verify_candidate_verifier_provenance(
-    record: &CandidateRecord,
-    launch: &LaunchManifest,
-    row_number: usize,
-) -> Result<(), CliError> {
-    let verifier = launch.payload.verifier.as_ref().ok_or_else(|| {
-        CliError::msg("TriMul launch manifest is missing verifier isolation evidence")
-    })?;
-    let metadata = record
-        .reward_metadata
-        .as_ref()
-        .and_then(serde_json::Value::as_object)
-        .ok_or_else(|| {
-            CliError::msg(format!(
-                "candidate ledger row {row_number} is missing structured verifier reward metadata"
-            ))
-        })?;
-    let expected_tier = verifier.isolation.tier.as_str();
-    let expected_metric = ferrl::trimul::timing_metric_for_tier(verifier.isolation.tier);
-    if metadata
-        .get("verifier_isolation_tier")
-        .and_then(serde_json::Value::as_str)
-        != Some(expected_tier)
-        || metadata
-            .get("verifier_isolation_evidence_sha256")
-            .and_then(serde_json::Value::as_str)
-            != Some(verifier.isolation_evidence_sha256.as_str())
-        || metadata
-            .get("timing_metric")
-            .and_then(serde_json::Value::as_str)
-            != Some(expected_metric)
-        || metadata
-            .get("runtime_preflight_evidence_sha256")
-            .and_then(serde_json::Value::as_str)
-            != Some(verifier.runtime_preflight_evidence_sha256.as_str())
-    {
-        return Err(CliError::msg(format!(
-            "candidate ledger row {row_number} verifier tier/evidence does not match launch.json"
-        )));
-    }
-    let extracted = metadata
-        .get("submission_extracted")
-        .and_then(serde_json::Value::as_bool)
-        .ok_or_else(|| {
-            CliError::msg(format!(
-                "candidate ledger row {row_number} omits submission extraction evidence"
-            ))
-        })?;
-    let executed = metadata
-        .get("verification_executed")
-        .and_then(serde_json::Value::as_bool)
-        .ok_or_else(|| {
-            CliError::msg(format!(
-                "candidate ledger row {row_number} omits verification execution evidence"
-            ))
-        })?;
-    if extracted != executed {
-        return Err(CliError::msg(format!(
-            "candidate ledger row {row_number} has inconsistent extraction/execution evidence"
-        )));
-    }
-    if executed {
-        let runtime_hardening = metadata
-            .get("runtime_hardening")
-            .and_then(serde_json::Value::as_array);
-        let runtime_digest = runtime_hardening
-            .map(|records| runtime_hardening_evidence_sha256(records))
-            .transpose()?;
-        let expected_runtime = verifier.runtime_preflight.runtime_hardening.first();
-        if metadata.get("verifier_isolation_evidence")
-            != Some(&serde_json::to_value(&verifier.isolation).map_err(|error| {
-                CliError::msg(format!("serialize launch verifier evidence: {error}"))
-            })?)
-            || runtime_hardening.is_none_or(Vec::is_empty)
-            || runtime_hardening.is_some_and(|records| {
-                records
-                    .iter()
-                    .any(|record| Some(record) != expected_runtime)
-            })
-            || metadata
-                .get("runtime_hardening_evidence_sha256")
-                .and_then(serde_json::Value::as_str)
-                != runtime_digest.as_deref()
-        {
-            return Err(CliError::msg(format!(
-                "candidate ledger row {row_number} omits or changes protected verifier run evidence"
-            )));
-        }
-    }
-    Ok(())
 }
 
 fn parse_exact_launch_manifest(
@@ -4475,18 +4160,6 @@ fn parse_strict_candidate_row(
             ledger_path.display()
         ))
     })?;
-    let canonical = serde_json::to_string(&record).map_err(|error| {
-        CliError::msg(format!(
-            "serialize candidate ledger {} row {row_number}: {error}",
-            ledger_path.display()
-        ))
-    })?;
-    if canonical != raw_line {
-        return Err(CliError::msg(format!(
-            "candidate ledger {} row {row_number} is not in the exact production encoding",
-            ledger_path.display()
-        )));
-    }
     Ok(record)
 }
 
@@ -7217,6 +6890,25 @@ mod tests {
     const REJECTING_LAUNCH_ATTESTOR: RejectingLaunchAttestor = RejectingLaunchAttestor;
     const RANK_ONE_REJECTING_ATTESTOR: RankOneRejectingAttestor = RankOneRejectingAttestor;
 
+    #[test]
+    fn production_cli_train_cannot_bypass_the_concrete_library_engine() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/bin/ferrl.rs"));
+        let start = source
+            .find("fn run_training<R: RewardFn>(")
+            .expect("production run_training source");
+        let end = source[start..]
+            .find("/// CLI-only policy capabilities used by mutation-sensitive unit controls.")
+            .map(|offset| start + offset)
+            .expect("production run_training boundary");
+        let entry = &source[start..end];
+        assert!(entry.contains("cli_training_request("));
+        assert!(entry.contains("ferrl::orchestration::run_cli_training(request, attestor)"));
+        assert!(!entry.contains("load_auto_policy_with_identity"));
+        assert!(!entry.contains("Trainer::"));
+        assert!(!entry.contains("evaluate("));
+        assert!(!entry.contains("LaunchManifest::"));
+    }
+
     struct TestLaunchAttestor;
     struct RejectingLaunchAttestor;
     struct RankOneRejectingAttestor;
@@ -7314,8 +7006,9 @@ mod tests {
         }
     }
 
-    fn attest_launch_for_test(manifest: LaunchManifest) -> LaunchManifest {
-        manifest.attest(&TEST_LAUNCH_ATTESTOR).unwrap()
+    fn attest_launch_for_test(mut manifest: LaunchManifest) -> LaunchManifest {
+        manifest.attestation = Some(TEST_LAUNCH_ATTESTOR.attest(&manifest).unwrap());
+        manifest
     }
 
     struct TestDir(PathBuf);
@@ -10264,7 +9957,7 @@ mod tests {
         assert_eq!(
             seen.len(),
             3,
-            "expected train plus base/adapter eval generation"
+            "CLI test path did not enter the library-owned common lifecycle"
         );
         assert!(seen.iter().all(|value| *value == Some(3)), "{seen:?}");
         drop(seen);
@@ -13669,7 +13362,7 @@ benchmarks:
             .to_string();
 
         assert!(
-            error.contains("rank/world disagree with launch.json"),
+            error.contains("rank/world disagree with active execution topology"),
             "{error}"
         );
     }
