@@ -3,7 +3,15 @@
 //! The stable SDK is [`crate::discovery`].  This module is deliberately hidden:
 //! its concrete CLI request types exist only because the package binary is a
 //! separate Rust crate.  They are input records, not algorithm, plugin, or
-//! lifecycle extension points.  The lifecycle itself is private to the library.
+//! extension points.  The trusted execution engine itself is private
+//! to the library.
+//!
+//! Downstream callers cannot inject a policy, tokenizer, loader identity, or
+//! tensor-parallel capability callback:
+//!
+//! ```compile_fail
+//! use ferrl::orchestration::run_cli_training_with_test_loader;
+//! ```
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -20,7 +28,7 @@ use crate::comm::{Comm, CommError};
 use crate::eval::evaluate;
 use crate::hf::{resolve_checkpoint_eos, validate_resolved_eos_consensus, CheckpointEosSelection};
 use crate::loader::{load_auto_policy_with_identity, AutoPolicy, LoaderOpts, PolicyLoadIdentity};
-use crate::policy::{GenConfig, Policy, TensorParallelPolicy};
+use crate::policy::{EvalSampling, GenConfig, Policy, TensorParallelPolicy};
 use crate::reward::RewardFn;
 use crate::sample::Sample;
 use crate::telemetry::{summarize, CandidateRecord, CandidateSigner, Metrics, RunDir, RunSummary};
@@ -28,7 +36,7 @@ use crate::tensor_parallel::TensorParallelPlan;
 use crate::tokenizer::HfTokenizer;
 use crate::trainer::{RunStop, TokenizerLike, Trainer, TrainerConfig};
 
-/// Error returned by the hidden concrete CLI engine.
+/// Error returned by the hidden concrete CLI adapter.
 #[doc(hidden)]
 #[derive(Debug)]
 pub enum CliOrchestrationError {
@@ -285,7 +293,7 @@ pub struct LaunchManifest {
 
 /// Narrow attestation primitive used by the concrete CLI engine.
 ///
-/// This is not a lifecycle callback: Ferrl constructs the complete immutable
+/// This is not a phase callback: Ferrl constructs the complete immutable
 /// manifest and chooses when it is invoked.  The binary supplies its protected
 /// system transport as the only production implementation.
 #[doc(hidden)]
@@ -363,85 +371,117 @@ impl LaunchManifest {
     }
 }
 
-/// Result returned by the library-owned training boundary.
-pub(crate) struct TrainOutcome<P> {
-    stop: RunStop,
-    preempted: Option<P>,
+/// Error returned by the private concrete execution engine.
+#[derive(Debug)]
+pub(crate) enum EngineError {
+    /// Configuration, topology, or invariant failure.
+    Configuration(String),
+    /// Production policy/tokenizer loading failure.
+    ModelLoad(Box<crate::loader::LoaderError>),
+    /// Checkpoint/tokenizer EOS resolution failure.
+    GenerationEnd(Box<crate::hf::HfError>),
+    /// Immutable launch or run-directory failure.
+    Launch(Box<crate::telemetry::TelemetryError>),
+    /// Training or trainer construction failure.
+    Training(Box<crate::trainer::TrainerError>),
+    /// Held-out evaluation failure.
+    Evaluation(Box<crate::eval::EvalError>),
+    /// Preemption checkpoint scan failure.
+    PreemptionCheckpointScan(Box<crate::checkpoint::CheckpointError>),
+    /// Preemption checkpoint invariant failure.
+    PreemptionCheckpoint(String),
+    /// Candidate ledger I/O failure.
+    CandidateIo {
+        /// Candidate ledger path.
+        path: PathBuf,
+        /// Underlying I/O source.
+        source: std::io::Error,
+    },
+    /// Candidate JSON decoding failure.
+    CandidateJson {
+        /// Candidate ledger path.
+        path: PathBuf,
+        /// One-based row number.
+        line: usize,
+        /// Underlying JSON source.
+        source: serde_json::Error,
+    },
+    /// Candidate provenance or coordinate failure.
+    InvalidCandidateEvidence(String),
+    /// Held-out report read-back failure.
+    HeldOutReportIo {
+        /// Published report path.
+        path: PathBuf,
+        /// Underlying I/O source.
+        source: std::io::Error,
+    },
+    /// Serialization failure with its contract label.
+    Serialization {
+        /// Contract component being serialized.
+        kind: &'static str,
+        /// Underlying JSON source.
+        source: serde_json::Error,
+    },
+    /// A configurable CLI health policy rejected the run.
+    Health(CliRunHealthReport),
+    /// Message-only failure used by the CLI adapter and test controls.
+    Message(String),
 }
 
-impl<P> TrainOutcome<P> {
-    pub(crate) fn completed() -> Self {
-        Self {
-            stop: RunStop::Completed,
-            preempted: None,
+impl std::fmt::Display for EngineError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Configuration(message)
+            | Self::Message(message)
+            | Self::PreemptionCheckpoint(message)
+            | Self::InvalidCandidateEvidence(message) => formatter.write_str(message),
+            Self::ModelLoad(error) => write!(formatter, "model load failed: {error}"),
+            Self::GenerationEnd(error) => {
+                write!(formatter, "generation-end resolution failed: {error}")
+            }
+            Self::Launch(error) => write!(formatter, "launch setup failed: {error}"),
+            Self::Training(error) => write!(formatter, "training failed: {error}"),
+            Self::Evaluation(error) => write!(formatter, "held-out evaluation failed: {error}"),
+            Self::PreemptionCheckpointScan(error) => {
+                write!(formatter, "preemption checkpoint scan failed: {error}")
+            }
+            Self::CandidateIo { path, source } => {
+                write!(
+                    formatter,
+                    "read candidate ledger {}: {source}",
+                    path.display()
+                )
+            }
+            Self::CandidateJson { path, line, source } => write!(
+                formatter,
+                "invalid candidate JSON at {} line {line}: {source}",
+                path.display()
+            ),
+            Self::HeldOutReportIo { path, source } => {
+                write!(
+                    formatter,
+                    "read held-out report {}: {source}",
+                    path.display()
+                )
+            }
+            Self::Serialization { kind, source } => {
+                write!(formatter, "serialize {kind}: {source}")
+            }
+            Self::Health(_) => formatter.write_str("run_health policy failed"),
         }
     }
-
-    pub(crate) fn preempted(result: P) -> Self {
-        Self {
-            stop: RunStop::Preempted,
-            preempted: Some(result),
-        }
-    }
-
-    fn stop(&self) -> RunStop {
-        self.stop
-    }
-
-    fn into_preempted(self) -> P {
-        self.preempted
-            .expect("preempted training outcome must carry a terminal result")
-    }
 }
 
-/// Terminal result of the private common lifecycle engine.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum LifecycleOutcome<C, P> {
-    Completed(C),
-    Preempted(P),
-}
-
-/// Sealed-to-the-library implementation detail for the two concrete run modes.
-///
-/// This is `pub(crate)` solely so `discovery.rs` can supply the SDK mode.  No
-/// downstream crate, including the package binary, can implement it.
-pub(crate) trait Lifecycle {
-    type Error;
-    type State;
-    type Completed;
-    type Preempted;
-
-    fn setup(&mut self) -> Result<Self::State, Self::Error>;
-    fn preflight(&mut self, state: &mut Self::State) -> Result<(), Self::Error>;
-    fn launch_and_build_trainer(&mut self, state: &mut Self::State) -> Result<(), Self::Error>;
-    fn train(
-        &mut self,
-        state: &mut Self::State,
-    ) -> Result<TrainOutcome<Self::Preempted>, Self::Error>;
-    fn post_run_health(&mut self, state: &mut Self::State) -> Result<(), Self::Error>;
-    fn evaluate_and_publish(&mut self, state: &mut Self::State) -> Result<(), Self::Error>;
-    fn load_and_select_candidates(&mut self, state: &mut Self::State) -> Result<(), Self::Error>;
-    fn map_completed(self, state: Self::State) -> Result<Self::Completed, Self::Error>;
-}
-
-/// Execute the only trusted lifecycle ordering used by SDK discovery and CLI training.
-pub(crate) fn run_lifecycle<L>(
-    mut lifecycle: L,
-) -> Result<LifecycleOutcome<L::Completed, L::Preempted>, L::Error>
-where
-    L: Lifecycle,
-{
-    let mut state = lifecycle.setup()?;
-    lifecycle.preflight(&mut state)?;
-    lifecycle.launch_and_build_trainer(&mut state)?;
-    let training = lifecycle.train(&mut state)?;
-    if training.stop() == RunStop::Preempted {
-        return Ok(LifecycleOutcome::Preempted(training.into_preempted()));
-    }
-    lifecycle.post_run_health(&mut state)?;
-    lifecycle.evaluate_and_publish(&mut state)?;
-    lifecycle.load_and_select_candidates(&mut state)?;
-    Ok(LifecycleOutcome::Completed(lifecycle.map_completed(state)?))
+/// A closed EOS choice consumed by the concrete engine.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum EngineEosSelection {
+    /// Resolve one checkpoint-declared EOS id.
+    CheckpointDefault,
+    /// Validate and use an explicit EOS id.
+    Explicit(u32),
+    /// Disable EOS stopping.
+    Disabled,
 }
 
 /// Serialize an execution dataset and immediately deserialize it back before use.
@@ -625,579 +665,1358 @@ pub enum CliRunOutcome {
     Preempted(CliPreemptedRun),
 }
 
-/// Run production CLI training through the concrete library engine.
-#[doc(hidden)]
-pub fn run_cli_training<R>(
-    request: CliTrainingRequest<'_, R>,
-    attestor: Option<&dyn CliLaunchAttestor>,
-) -> Result<CliRunOutcome, CliOrchestrationError>
-where
-    R: RewardFn,
-    R::Target: Serialize + DeserializeOwned,
-{
-    run_cli_training_inner(
-        request,
-        attestor,
-        AutoPolicy::supports_tensor_parallel,
-        |model_dir, device, options| {
-            load_auto_policy_with_identity(model_dir, device, options)
-                .map_err(|error| CliOrchestrationError::msg(error.to_string()))
-        },
-    )
+/// Closed SDK inputs adapted into the private concrete engine.
+pub(crate) struct DiscoveryLaunchInput<'a> {
+    pub(crate) task: &'a crate::discovery::TaskIdentity,
+    pub(crate) metric_contract: crate::discovery::MetricContract,
+    pub(crate) ferrl_source: crate::discovery::BuildSourceIdentity,
+    pub(crate) execution_device: crate::discovery::ExecutionDevice,
+    pub(crate) runs_root: &'a Path,
+    pub(crate) steps: u64,
+    pub(crate) group_size: usize,
+    pub(crate) max_new_tokens: usize,
+    pub(crate) eval_group_size: usize,
+    pub(crate) temperature: f64,
+    pub(crate) learning_rate: f64,
+    pub(crate) seed: u64,
+    pub(crate) preemption_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
-/// Test-only policy-loading entry for binary unit controls.
-///
-/// Production callers use [`run_cli_training`].  This narrow loader injection
-/// exists solely so the package binary can retain mutation-sensitive unit
-/// controls without giving callers any lifecycle phase authority.
-#[doc(hidden)]
-pub fn run_cli_training_with_test_loader<P, R, F, C>(
-    request: CliTrainingRequest<'_, R>,
-    attestor: Option<&dyn CliLaunchAttestor>,
-    supports_tensor_parallel: C,
-    loader: F,
-) -> Result<CliRunOutcome, CliOrchestrationError>
+/// Closed SDK training inputs.  The engine, not the adapter, loads the model.
+pub(crate) struct DiscoveryTrainingRequest<'a, R>
 where
-    P: Policy + TensorParallelPolicy,
     R: RewardFn,
-    R::Target: Serialize + DeserializeOwned,
-    F: FnOnce(
-        &Path,
-        &Device,
-        &LoaderOpts,
-    ) -> Result<(P, HfTokenizer, PolicyLoadIdentity), CliOrchestrationError>,
-    C: Fn(&P) -> bool,
 {
-    run_cli_training_inner(request, attestor, supports_tensor_parallel, loader)
+    pub(crate) model_dir: &'a Path,
+    pub(crate) device: &'a Device,
+    pub(crate) loader_opts: LoaderOpts,
+    pub(crate) eos_selection: EngineEosSelection,
+    pub(crate) trainer_config: TrainerConfig,
+    pub(crate) training_samples: &'a [Sample<R::Target>],
+    pub(crate) evaluation_samples: &'a [Sample<R::Target>],
+    pub(crate) reward: &'a R,
+    pub(crate) evaluation_reward: &'a R,
+    pub(crate) launch: DiscoveryLaunchInput<'a>,
 }
 
-fn run_cli_training_inner<P, R, F, C>(
-    request: CliTrainingRequest<'_, R>,
-    attestor: Option<&dyn CliLaunchAttestor>,
-    supports_tensor_parallel: C,
-    loader: F,
-) -> Result<CliRunOutcome, CliOrchestrationError>
+struct CliEngineLaunch<'a> {
+    launch: CliLaunchInput,
+    attestor: Option<&'a dyn CliLaunchAttestor>,
+    health_policy: CliRunHealthPolicy,
+    health_policy_is_default: bool,
+    activation_checkpointing: bool,
+    data_seed: u64,
+    trimul_held_out_secret_seed: Option<u64>,
+}
+
+enum EngineMode<'a> {
+    Discovery(DiscoveryLaunchInput<'a>),
+    Cli(CliEngineLaunch<'a>),
+}
+
+struct EnginePlan<'a, R>
 where
-    P: Policy + TensorParallelPolicy,
     R: RewardFn,
-    R::Target: Serialize + DeserializeOwned,
-    F: FnOnce(
-        &Path,
-        &Device,
-        &LoaderOpts,
-    ) -> Result<(P, HfTokenizer, PolicyLoadIdentity), CliOrchestrationError>,
-    C: Fn(&P) -> bool,
 {
-    let lifecycle = CliLifecycle {
-        request,
-        attestor,
-        loader: Some(loader),
-        supports_tensor_parallel,
-        _policy: std::marker::PhantomData,
-    };
-    match run_lifecycle(lifecycle)? {
-        LifecycleOutcome::Completed(completed) => Ok(CliRunOutcome::Completed(completed)),
-        LifecycleOutcome::Preempted(preempted) => Ok(CliRunOutcome::Preempted(preempted)),
+    mode: EngineMode<'a>,
+    model_dir: &'a Path,
+    device: &'a Device,
+    loader_opts: LoaderOpts,
+    eos_selection: EngineEosSelection,
+    trainer_config: TrainerConfig,
+    training_samples: &'a [Sample<R::Target>],
+    evaluation_samples: &'a [Sample<R::Target>],
+    reward: &'a R,
+    evaluation_reward: &'a R,
+    rendered_prompt_bytes: Option<&'a [u8]>,
+    verifier_assets: Option<&'a crate::trimul::TrimulVerifierAssets>,
+    verifier_identity: Option<LaunchVerifierIdentity>,
+    execution: CliExecution,
+}
+
+impl<'a, R> EnginePlan<'a, R>
+where
+    R: RewardFn,
+{
+    fn from_discovery(request: DiscoveryTrainingRequest<'a, R>) -> Self {
+        Self {
+            mode: EngineMode::Discovery(request.launch),
+            model_dir: request.model_dir,
+            device: request.device,
+            loader_opts: request.loader_opts,
+            eos_selection: request.eos_selection,
+            trainer_config: request.trainer_config,
+            training_samples: request.training_samples,
+            evaluation_samples: request.evaluation_samples,
+            reward: request.reward,
+            evaluation_reward: request.evaluation_reward,
+            rendered_prompt_bytes: None,
+            verifier_assets: None,
+            verifier_identity: None,
+            execution: CliExecution::WorldOne,
+        }
+    }
+
+    fn from_cli(
+        request: CliTrainingRequest<'a, R>,
+        attestor: Option<&'a dyn CliLaunchAttestor>,
+    ) -> Self {
+        Self {
+            mode: EngineMode::Cli(CliEngineLaunch {
+                launch: request.launch,
+                attestor,
+                health_policy: request.health_policy,
+                health_policy_is_default: request.health_policy_is_default,
+                activation_checkpointing: request.activation_checkpointing,
+                data_seed: request.data_seed,
+                trimul_held_out_secret_seed: request.trimul_held_out_secret_seed,
+            }),
+            model_dir: request.model_dir,
+            device: request.device,
+            loader_opts: request.loader_opts,
+            eos_selection: match request.eos_selection {
+                CliEosSelection::CheckpointDefault => EngineEosSelection::CheckpointDefault,
+                CliEosSelection::Explicit(id) => EngineEosSelection::Explicit(id),
+                CliEosSelection::Disabled => EngineEosSelection::Disabled,
+            },
+            trainer_config: request.trainer_config,
+            training_samples: request.training_samples,
+            evaluation_samples: request.evaluation_samples,
+            reward: request.reward,
+            evaluation_reward: request.evaluation_reward,
+            rendered_prompt_bytes: request.rendered_prompt_bytes,
+            verifier_assets: request.verifier_assets,
+            verifier_identity: request.verifier_identity,
+            execution: request.execution,
+        }
     }
 }
 
-struct CliLifecycle<'request, 'attestor, P, R, F, C>
-where
-    R: RewardFn,
-{
-    request: CliTrainingRequest<'request, R>,
-    attestor: Option<&'attestor dyn CliLaunchAttestor>,
-    loader: Option<F>,
-    supports_tensor_parallel: C,
-    _policy: std::marker::PhantomData<fn() -> P>,
+/// Evaluation bytes and typed report owned by the engine.
+pub(crate) struct EngineEvaluation {
+    pub(crate) report: crate::eval::EvalReport,
+    pub(crate) bytes: Vec<u8>,
 }
 
-struct CliRunState<P, T> {
-    runtime: CliRuntime,
-    policy: P,
-    tokenizer: HfTokenizer,
+/// Exact authenticated candidate view returned by the engine.
+#[derive(Debug)]
+pub(crate) struct AuthenticatedCandidate {
+    pub(crate) record: CandidateRecord,
+    pub(crate) exact_row_bytes: Vec<u8>,
+    pub(crate) provenance_sha256: String,
+}
+
+/// Completed result from the shared engine.
+pub(crate) struct EngineCompletedRun {
+    pub(crate) run: RunDir,
+    pub(crate) launch_bytes: Vec<u8>,
+    pub(crate) launch_sha256: String,
+    pub(crate) signing_public_key: String,
+    pub(crate) model_identity: Option<crate::discovery::ModelIdentity>,
+    pub(crate) source_identity: Option<crate::discovery::BuildSourceIdentity>,
+    pub(crate) metric_contract: Option<crate::discovery::MetricContract>,
+    pub(crate) evaluation: Option<EngineEvaluation>,
+    pub(crate) candidates: Vec<AuthenticatedCandidate>,
+    pub(crate) health_report: Option<CliRunHealthReport>,
+    pub(crate) presentation_rank: bool,
+}
+
+/// Preempted result from the shared engine.
+pub(crate) struct EnginePreemptedRun {
+    pub(crate) run_dir: PathBuf,
+    pub(crate) completed_steps: Option<u64>,
+    pub(crate) checkpoint_path: Option<PathBuf>,
+    pub(crate) presentation_rank: bool,
+}
+
+/// Terminal result from the shared concrete engine.
+pub(crate) enum EngineOutcome {
+    /// Training completed and all engine-owned evidence phases ran.
+    Completed(Box<EngineCompletedRun>),
+    /// Training stopped before health, evaluation, and candidate phases.
+    Preempted(EnginePreemptedRun),
+}
+
+/// Run production CLI training through the one library-owned engine.
+#[doc(hidden)]
+pub fn run_cli_training<'a, R>(
+    request: CliTrainingRequest<'a, R>,
+    attestor: Option<&'a dyn CliLaunchAttestor>,
+) -> Result<CliRunOutcome, CliOrchestrationError>
+where
+    R: RewardFn,
+    R::Target: Serialize + DeserializeOwned,
+{
+    let plan = EnginePlan::from_cli(request, attestor);
+    match run_production_engine(plan).map_err(cli_engine_error)? {
+        EngineOutcome::Completed(completed) => Ok(CliRunOutcome::Completed(CliCompletedRun {
+            run_dir: completed.run.root().to_path_buf(),
+            health_report: completed.health_report,
+            presentation_rank: completed.presentation_rank,
+        })),
+        EngineOutcome::Preempted(preempted) => Ok(CliRunOutcome::Preempted(CliPreemptedRun {
+            run_dir: preempted.run_dir,
+            presentation_rank: preempted.presentation_rank,
+        })),
+    }
+}
+
+pub(crate) fn run_discovery_training<R>(
+    request: DiscoveryTrainingRequest<'_, R>,
+) -> Result<EngineOutcome, EngineError>
+where
+    R: RewardFn,
+    R::Target: Serialize + DeserializeOwned,
+{
+    run_production_engine(EnginePlan::from_discovery(request))
+}
+
+fn cli_engine_error(error: EngineError) -> CliOrchestrationError {
+    match error {
+        EngineError::Health(report) => CliOrchestrationError::RunHealth(report),
+        other => CliOrchestrationError::msg(other.to_string()),
+    }
+}
+
+fn run_production_engine<'a, R>(plan: EnginePlan<'a, R>) -> Result<EngineOutcome, EngineError>
+where
+    R: RewardFn,
+    R::Target: Serialize + DeserializeOwned,
+{
+    ConcreteEngine::new(
+        plan,
+        Box::new(|model_dir, device, options| {
+            load_auto_policy_with_identity(model_dir, device, options)
+                .map_err(|error| EngineError::ModelLoad(Box::new(error)))
+        }),
+        AutoPolicy::supports_tensor_parallel,
+        resolve_production_eos,
+    )
+    .run()
+}
+
+fn resolve_production_eos(
+    model_dir: &Path,
+    tokenizer: &HfTokenizer,
+    selection: EngineEosSelection,
+) -> Result<Option<u32>, EngineError> {
+    resolve_checkpoint_eos(
+        model_dir,
+        tokenizer,
+        engine_checkpoint_eos_selection(selection),
+    )
+    .map_err(|error| EngineError::GenerationEnd(Box::new(error)))
+}
+
+/// Test-only generic loader seam.  It is deliberately compiled only with the
+/// library's own unit tests; no package or downstream caller can reach it.
+#[cfg(test)]
+pub(crate) fn run_discovery_with_test_loader<'a, P, K, R, F>(
+    request: DiscoveryTrainingRequest<'a, R>,
+    loader: F,
+    supports_tensor_parallel: fn(&P) -> bool,
+) -> Result<(EngineOutcome, P), EngineError>
+where
+    P: Policy + TensorParallelPolicy,
+    K: TokenizerLike,
+    R: RewardFn,
+    R::Target: Serialize + DeserializeOwned,
+    F: FnOnce(&Path, &Device, &LoaderOpts) -> Result<(P, K, PolicyLoadIdentity), EngineError> + 'a,
+{
+    ConcreteEngine::new(
+        EnginePlan::from_discovery(request),
+        Box::new(loader),
+        supports_tensor_parallel,
+        resolve_test_eos::<K>,
+    )
+    .run_with_policy()
+}
+
+#[cfg(test)]
+fn resolve_test_eos<K: TokenizerLike>(
+    _model_dir: &Path,
+    _tokenizer: &K,
+    selection: EngineEosSelection,
+) -> Result<Option<u32>, EngineError> {
+    match selection {
+        EngineEosSelection::Disabled => Ok(None),
+        EngineEosSelection::CheckpointDefault | EngineEosSelection::Explicit(_) => {
+            Err(EngineError::Configuration(
+                "test-only injected loader requires EOS stopping to be disabled".into(),
+            ))
+        }
+    }
+}
+
+struct EngineLaunchArtifacts {
+    candidate_signer: CandidateSigner,
+    manifest: Option<LaunchManifest>,
+    launch_bytes: Vec<u8>,
+    launch_sha256: String,
+    signing_public_key: String,
+    run_id: String,
+}
+
+#[derive(Serialize)]
+struct DiscoveryEngineLaunchPayload<'a> {
+    contract: &'static str,
+    contract_version: u32,
+    launch_authentication: &'static str,
+    launch_trust_boundary: &'static str,
+    ferrl_source: &'a crate::discovery::BuildSourceIdentity,
+    task: &'a crate::discovery::TaskIdentity,
+    model: &'a crate::discovery::ModelIdentity,
+    metric_contract: &'a crate::discovery::MetricContract,
+    execution: crate::discovery::ExecutionDevice,
+    resolved_eos_token_id: Option<u32>,
+    training_samples_sha256: &'a str,
+    training_samples_count: usize,
+    held_out_samples_sha256: &'a str,
+    held_out_samples_count: usize,
+    steps: u64,
+    group_size: usize,
+    max_new_tokens: usize,
+    eval_group_size: usize,
+    temperature: f64,
+    learning_rate: f64,
+    seed: u64,
+    candidate_signing_public_key: &'a str,
+}
+
+#[derive(Serialize)]
+struct DiscoveryEngineLaunchManifest<'a> {
+    contract: &'static str,
+    launch_authentication: &'static str,
+    launch_trust_boundary: &'static str,
+    payload_sha256: &'a str,
+    payload: &'a DiscoveryEngineLaunchPayload<'a>,
+}
+
+type EngineLoader<'a, P, K> = Box<
+    dyn FnOnce(&Path, &Device, &LoaderOpts) -> Result<(P, K, PolicyLoadIdentity), EngineError> + 'a,
+>;
+
+struct ConcreteEngine<'a, R, P, K>
+where
+    R: RewardFn,
+    P: Policy + TensorParallelPolicy,
+    K: TokenizerLike,
+{
+    plan: EnginePlan<'a, R>,
+    loader: Option<EngineLoader<'a, P, K>>,
+    supports_tensor_parallel: fn(&P) -> bool,
+    resolve_eos: fn(&Path, &K, EngineEosSelection) -> Result<Option<u32>, EngineError>,
+    runtime: Option<CliRuntime>,
+    policy: Option<P>,
+    tokenizer: Option<K>,
     trainer_config: TrainerConfig,
-    policy_identity: PolicyLoadIdentity,
-    frozen_policy_sha256: String,
-    generation_config: GenConfig,
-    training_samples: Vec<Sample<T>>,
-    evaluation_samples: Vec<Sample<T>>,
+    policy_identity: Option<PolicyLoadIdentity>,
+    model_identity: Option<crate::discovery::ModelIdentity>,
+    generation_config: Option<GenConfig>,
+    training_samples: Vec<Sample<R::Target>>,
+    evaluation_samples: Vec<Sample<R::Target>>,
     verifier_assets_identity: Option<crate::trimul::TrimulVerifierIdentity>,
     verifier_identity: Option<LaunchVerifierIdentity>,
     manifest: Option<LaunchManifest>,
     run: Option<RunDir>,
     trainer: Option<Trainer>,
+    launch_bytes: Option<Vec<u8>>,
     launch_sha256: Option<String>,
+    signing_public_key: Option<String>,
     history: Option<Vec<Metrics>>,
+    evaluation: Option<EngineEvaluation>,
+    candidates: Vec<AuthenticatedCandidate>,
     health_report: Option<CliRunHealthReport>,
-    selected_candidate: Option<CandidateRecord>,
+    training_samples_sha256: String,
+    evaluation_samples_sha256: String,
 }
 
-impl<'request, 'attestor, P, R, F, C> Lifecycle for CliLifecycle<'request, 'attestor, P, R, F, C>
+impl<'a, R, P, K> ConcreteEngine<'a, R, P, K>
 where
-    P: Policy + TensorParallelPolicy,
     R: RewardFn,
     R::Target: Serialize + DeserializeOwned,
-    F: FnOnce(
-        &Path,
-        &Device,
-        &LoaderOpts,
-    ) -> Result<(P, HfTokenizer, PolicyLoadIdentity), CliOrchestrationError>,
-    C: Fn(&P) -> bool,
+    P: Policy + TensorParallelPolicy,
+    K: TokenizerLike,
 {
-    type Error = CliOrchestrationError;
-    type State = CliRunState<P, R::Target>;
-    type Completed = CliCompletedRun;
-    type Preempted = CliPreemptedRun;
+    fn new(
+        plan: EnginePlan<'a, R>,
+        loader: EngineLoader<'a, P, K>,
+        supports_tensor_parallel: fn(&P) -> bool,
+        resolve_eos: fn(&Path, &K, EngineEosSelection) -> Result<Option<u32>, EngineError>,
+    ) -> Self {
+        Self {
+            trainer_config: plan.trainer_config.clone(),
+            plan,
+            loader: Some(loader),
+            supports_tensor_parallel,
+            resolve_eos,
+            runtime: None,
+            policy: None,
+            tokenizer: None,
+            policy_identity: None,
+            model_identity: None,
+            generation_config: None,
+            training_samples: Vec::new(),
+            evaluation_samples: Vec::new(),
+            verifier_assets_identity: None,
+            verifier_identity: None,
+            manifest: None,
+            run: None,
+            trainer: None,
+            launch_bytes: None,
+            launch_sha256: None,
+            signing_public_key: None,
+            history: None,
+            evaluation: None,
+            candidates: Vec::new(),
+            health_report: None,
+            training_samples_sha256: String::new(),
+            evaluation_samples_sha256: String::new(),
+        }
+    }
+
+    fn run(mut self) -> Result<EngineOutcome, EngineError> {
+        self.run_inner()
+    }
+
+    #[cfg(test)]
+    fn run_with_policy(mut self) -> Result<(EngineOutcome, P), EngineError> {
+        let outcome = self.run_inner()?;
+        let policy = self
+            .policy
+            .take()
+            .ok_or_else(|| EngineError::Configuration("test engine lost loaded policy".into()))?;
+        Ok((outcome, policy))
+    }
+
+    fn run_inner(&mut self) -> Result<EngineOutcome, EngineError> {
+        self.setup()?;
+        self.preflight()?;
+        self.launch_and_build_trainer()?;
+        if let Some(preempted) = self.train()? {
+            return Ok(preempted);
+        }
+        self.post_run_health()?;
+        self.evaluate_and_publish()?;
+        self.load_and_rank_candidates()?;
+        self.completed()
+    }
 
     #[allow(clippy::cognitive_complexity)]
-    fn setup(&mut self) -> Result<Self::State, Self::Error> {
-        self.request
-            .health_policy
-            .validate(&self.request.trainer_config)?;
-        let runtime = CliRuntime::from_execution(std::mem::replace(
-            &mut self.request.execution,
-            CliExecution::WorldOne,
-        ));
-        let launch = runtime.launch.clone();
-        let launch_comm = launch.as_ref().map(|comm| comm as &dyn Comm);
+    fn setup(&mut self) -> Result<(), EngineError> {
+        if let EngineMode::Cli(cli) = &self.plan.mode {
+            cli.health_policy
+                .validate(&self.plan.trainer_config)
+                .map_err(|error| EngineError::Configuration(error.to_string()))?;
+        }
+        let execution = std::mem::replace(&mut self.plan.execution, CliExecution::WorldOne);
+        let runtime = CliRuntime::from_execution(execution);
+        validate_engine_topology(&self.plan.mode, &runtime)?;
+        tracing::info!(
+            task = %engine_task_name(&self.plan.mode),
+            steps = self.plan.trainer_config.steps,
+            group_size = self.plan.trainer_config.group_size,
+            train = self.plan.training_samples.len(),
+            eval = self.plan.evaluation_samples.len(),
+            activation_checkpointing = engine_activation_checkpointing(&self.plan.mode),
+            tensor_parallel_rank = runtime.tensor_parallel_plan.rank(),
+            tensor_parallel_world = runtime.tensor_parallel_plan.world_size(),
+            "ferrl shared orchestration: starting"
+        );
+        self.runtime = Some(runtime);
+
+        let runtime = self.runtime.as_ref().expect("runtime was just installed");
+        let launch_comm = runtime.launch.as_ref().map(|comm| comm as &dyn Comm);
         let distributed = runtime.distributed.clone();
         let tensor_parallel_plan = runtime.tensor_parallel_plan;
-        tracing::info!(
-            task = %self.request.launch.task,
-            steps = self.request.trainer_config.steps,
-            group_size = self.request.trainer_config.group_size,
-            activation_checkpointing = self.request.activation_checkpointing,
-            train = self.request.training_samples.len(),
-            eval = self.request.evaluation_samples.len(),
-            tensor_parallel_rank = tensor_parallel_plan.rank(),
-            tensor_parallel_world = tensor_parallel_plan.world_size(),
-            "ferrl train: starting"
-        );
-
         let loader = self.loader.take().ok_or_else(|| {
-            CliOrchestrationError::msg("CLI policy loader was entered more than once")
+            EngineError::Configuration("policy loader was entered more than once".into())
         })?;
         let model_setup = (|| {
             let (policy, tokenizer, identity) = loader(
-                self.request.model_dir,
-                self.request.device,
-                &self.request.loader_opts,
+                self.plan.model_dir,
+                self.plan.device,
+                &self.plan.loader_opts,
             )?;
-            let frozen_policy_sha256 = identity.policy_sha256.clone();
-            let mut trainer_config = self.request.trainer_config.clone();
-            trainer_config.eos_token_id = resolve_checkpoint_eos(
-                self.request.model_dir,
-                &tokenizer,
-                cli_checkpoint_eos_selection(self.request.eos_selection),
-            )
-            .map_err(|error| {
-                CliOrchestrationError::msg(format!("checkpoint EOS resolution failed: {error}"))
-            })?;
+            let mut trainer_config = self.plan.trainer_config.clone();
+            trainer_config.eos_token_id =
+                (self.resolve_eos)(self.plan.model_dir, &tokenizer, self.plan.eos_selection)?;
             if runtime.tensor_parallel.is_some() && !(self.supports_tensor_parallel)(&policy) {
-                return Err(CliOrchestrationError::msg(
-                    "loaded checkpoint family does not support tensor_parallel execution; supported \
-                     families are qwen3 (including legacy configs without model_type) and dense \
-                     gemma4/gemma4_unified; qwen3_5/qwen3_5_moe (Qwen3.5/3.6) are unsupported",
+                return Err(EngineError::Configuration(
+                    "loaded checkpoint family does not support tensor_parallel execution; supported families are qwen3 (including legacy configs without model_type) and dense gemma4/gemma4_unified; qwen3_5/qwen3_5_moe (Qwen3.5/3.6) are unsupported".into(),
                 ));
             }
             if tensor_parallel_plan.is_sharded()
                 && !policy.supports_sharded_tensor_parallel_backward()
             {
-                return Err(CliOrchestrationError::msg(
-                    "sharded tensor_parallel training is supported only for dense \
-                     gemma4/gemma4_unified policies with activation checkpointing; the loaded \
-                     policy does not provide cross-rank backward semantics",
+                return Err(EngineError::Configuration(
+                    "sharded tensor_parallel training is supported only for dense gemma4/gemma4_unified policies with activation checkpointing; the loaded policy does not provide cross-rank backward semantics".into(),
                 ));
             }
-            Ok((
-                policy,
-                tokenizer,
-                trainer_config,
-                identity,
-                frozen_policy_sha256,
-            ))
+            Ok((policy, tokenizer, trainer_config, identity))
         })();
-        let (policy, tokenizer, trainer_config, policy_identity, frozen_policy_sha256) =
-            coordinate_cli_result(launch_comm, "model and EOS setup", model_setup)?;
+        let (policy, tokenizer, trainer_config, policy_identity) =
+            coordinate_engine_result(launch_comm, "model and EOS setup", model_setup)?;
         if let Some(comm) = launch_comm {
             validate_resolved_eos_consensus(trainer_config.eos_token_id, comm)
-                .map_err(|error| CliOrchestrationError::msg(error.to_string()))?;
+                .map_err(|error| EngineError::Configuration(error.to_string()))?;
         }
         validate_data_parallel_policy_preflight(
             &policy,
             &policy_identity.policy_sha256,
             distributed.as_ref().map(|comm| comm as &dyn Comm),
-        )?;
+        )
+        .map_err(|error| EngineError::Configuration(error.to_string()))?;
+        if let Some(comm) = runtime.tensor_parallel.as_ref() {
+            validate_tensor_parallel_policy_preflight(&policy, comm, launch_comm)?;
+        }
 
-        let prompt_sha256 = self.request.rendered_prompt_bytes.map(sha256_hex);
         let verifier_assets_identity = self
-            .request
+            .plan
             .verifier_assets
             .map(|assets| assets.identity().clone());
-        if (self.request.verifier_assets.is_some() || self.request.verifier_identity.is_some())
-            != (self.request.launch.task == "trimul")
-            || self.request.verifier_assets.is_some() != self.request.verifier_identity.is_some()
-        {
-            return Err(CliOrchestrationError::msg(
-                "TriMul launch requires both verifier assets and isolation evidence, while non-TriMul launches require neither",
-            ));
+        if let EngineMode::Cli(cli) = &self.plan.mode {
+            let is_trimul = cli.launch.task == "trimul";
+            if self.plan.verifier_assets.is_some() != is_trimul
+                || self.plan.verifier_identity.is_some() != is_trimul
+                || self.plan.verifier_assets.is_some() != self.plan.verifier_identity.is_some()
+            {
+                return Err(EngineError::Configuration(
+                    "TriMul launch requires both verifier assets and isolation evidence, while non-TriMul launches require neither".into(),
+                ));
+            }
+            let prompt_sha256 = self.plan.rendered_prompt_bytes.map(sha256_hex);
+            let portable_verifier = self
+                .plan
+                .verifier_identity
+                .as_ref()
+                .map(portable_verifier_consensus)
+                .transpose()
+                .map_err(|error| EngineError::Message(error.to_string()))?;
+            let common_provenance = serde_json::to_vec(&(
+                &cli.launch.ferrl_commit,
+                &cli.launch.run.group_id,
+                &policy_identity.policy_sha256,
+                &policy_identity.tokenizer_sha256,
+                policy_identity.model_family,
+                &prompt_sha256,
+                &verifier_assets_identity,
+                &portable_verifier,
+            ))
+            .map_err(|error| EngineError::Serialization {
+                kind: "launch provenance",
+                source: error,
+            })?;
+            validate_engine_value_consensus(
+                "model/checkpoint/tokenizer/prompt provenance",
+                &common_provenance,
+                launch_comm,
+            )?;
         }
-        let portable_verifier = self
-            .request
-            .verifier_identity
-            .as_ref()
-            .map(portable_verifier_consensus)
-            .transpose()?;
-        let common_provenance = serde_json::to_vec(&(
-            &self.request.launch.ferrl_commit,
-            &self.request.launch.run.group_id,
-            &policy_identity.policy_sha256,
-            &policy_identity.tokenizer_sha256,
-            policy_identity.model_family,
-            &prompt_sha256,
-            &verifier_assets_identity,
-            &portable_verifier,
-        ))
-        .map_err(|error| {
-            CliOrchestrationError::msg(format!("serialize launch provenance: {error}"))
-        })?;
-        validate_launch_value_consensus(
-            "model/checkpoint/tokenizer/prompt provenance",
-            &common_provenance,
-            launch_comm,
-        )?;
 
-        Ok(CliRunState {
-            runtime,
-            policy,
-            tokenizer,
-            trainer_config: trainer_config.clone(),
-            policy_identity,
-            frozen_policy_sha256,
-            generation_config: GenConfig::from(&trainer_config),
-            training_samples: Vec::new(),
-            evaluation_samples: Vec::new(),
-            verifier_assets_identity,
-            verifier_identity: self.request.verifier_identity.clone(),
-            manifest: None,
-            run: None,
-            trainer: None,
-            launch_sha256: None,
-            history: None,
-            health_report: None,
-            selected_candidate: None,
-        })
+        self.model_identity = match &self.plan.mode {
+            EngineMode::Discovery(spec) => Some(crate::discovery::ModelIdentity::from_loader(
+                policy_identity.clone(),
+                spec.execution_device,
+            )),
+            EngineMode::Cli(_) => None,
+        };
+        self.policy = Some(policy);
+        self.tokenizer = Some(tokenizer);
+        self.trainer_config = trainer_config.clone();
+        self.policy_identity = Some(policy_identity);
+        self.generation_config = Some(GenConfig::from(&trainer_config));
+        self.verifier_assets_identity = verifier_assets_identity;
+        self.verifier_identity = self.plan.verifier_identity.clone();
+        Ok(())
     }
 
-    fn preflight(&mut self, state: &mut Self::State) -> Result<(), Self::Error> {
+    fn preflight(&mut self) -> Result<(), EngineError> {
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| EngineError::Configuration("tokenizer was not loaded".into()))?;
         let local = (|| {
-            let (training_samples, _) =
-                exact_execution_samples(self.request.training_samples, "ordered training samples")
-                    .map_err(|error| {
-                        CliOrchestrationError::msg(format!(
-                            "serialize ordered training samples: {error}"
-                        ))
+            let (training_samples, training_bytes) =
+                exact_execution_samples(self.plan.training_samples, "ordered training samples")
+                    .map_err(|source| EngineError::Serialization {
+                        kind: "ordered training samples",
+                        source,
                     })?;
-            let (evaluation_samples, _) = exact_execution_samples(
-                self.request.evaluation_samples,
-                "ordered held-out samples",
-            )
-            .map_err(|error| {
-                CliOrchestrationError::msg(format!("serialize ordered held-out samples: {error}"))
-            })?;
-            preflight_prompt_tokenization(
-                &training_samples,
-                "ordered training samples",
-                &state.tokenizer,
-            )
-            .map_err(CliOrchestrationError::msg)?;
+            let (evaluation_samples, evaluation_bytes) =
+                exact_execution_samples(self.plan.evaluation_samples, "ordered held-out samples")
+                    .map_err(|source| EngineError::Serialization {
+                    kind: "ordered held-out samples",
+                    source,
+                })?;
+            preflight_prompt_tokenization(&training_samples, "ordered training samples", tokenizer)
+                .map_err(EngineError::Configuration)?;
             preflight_prompt_tokenization(
                 &evaluation_samples,
                 "ordered held-out samples",
-                &state.tokenizer,
+                tokenizer,
             )
-            .map_err(CliOrchestrationError::msg)?;
-            Ok((training_samples, evaluation_samples))
+            .map_err(EngineError::Configuration)?;
+            Ok((
+                training_samples,
+                evaluation_samples,
+                sha256_hex(&training_bytes),
+                sha256_hex(&evaluation_bytes),
+            ))
         })();
-        let launch = state.runtime.launch.clone();
-        let (training_samples, evaluation_samples) = coordinate_cli_result(
-            launch.as_ref().map(|comm| comm as &dyn Comm),
-            "exact sample reconstruction and tokenizer preflight",
-            local,
-        )?;
-        state.training_samples = training_samples;
-        state.evaluation_samples = evaluation_samples;
+        let launch_comm = self.engine_comm();
+        let (training_samples, evaluation_samples, training_sha256, evaluation_sha256) =
+            coordinate_engine_result(
+                launch_comm,
+                "exact sample reconstruction and tokenizer preflight",
+                local,
+            )?;
+        self.training_samples = training_samples;
+        self.evaluation_samples = evaluation_samples;
+        self.training_samples_sha256 = training_sha256;
+        self.evaluation_samples_sha256 = evaluation_sha256;
         Ok(())
     }
 
     #[allow(clippy::cognitive_complexity)]
-    fn launch_and_build_trainer(&mut self, state: &mut Self::State) -> Result<(), Self::Error> {
-        let launch = state.runtime.launch.clone();
-        let launch_comm = launch.as_ref().map(|comm| comm as &dyn Comm);
-        let attestation_setup = (|| {
-            let candidate_signer = CandidateSigner::generate()
-                .map_err(|error| CliOrchestrationError::msg(error.to_string()))?;
-            let signing_public_key = candidate_signer.public_key_hex();
-            let manifest = LaunchManifest::new(LaunchPayload {
-                task: self.request.launch.task.clone(),
-                ferrl_commit: self.request.launch.ferrl_commit.clone(),
-                authentication: self.request.launch.authentication,
-                run: self.request.launch.run.clone(),
-                config: self.request.launch.config.clone(),
-                model: LaunchModelIdentity {
-                    family: state.policy_identity.model_family.to_owned(),
-                    checkpoint_policy_sha256: state.policy_identity.policy_sha256.clone(),
-                    tokenizer_sha256: state.policy_identity.tokenizer_sha256.clone(),
-                    resolved_eos_token_id: state.trainer_config.eos_token_id,
-                },
-                prompt: self
-                    .request
-                    .rendered_prompt_bytes
-                    .map(|bytes| LaunchPromptIdentity {
-                        file: RunDir::PROMPT_FILE.to_owned(),
-                        sha256: sha256_hex(bytes),
-                        len_bytes: bytes.len(),
-                    }),
-                verifier: state.verifier_identity.clone(),
-                candidate_ledger: LaunchCandidateLedger {
-                    file: RunDir::CANDIDATES_FILE.to_owned(),
-                    format_version: 1,
-                    row_digest_domain: CANDIDATE_RECORD_DOMAIN.to_owned(),
-                    row_signature_algorithm: "ed25519".to_owned(),
-                    signing_public_key,
-                },
-            })?;
-            let manifest = match self.request.launch.authentication {
-                LaunchAuthenticationMode::LocalEphemeralV1 => manifest,
-                LaunchAuthenticationMode::ExternalAttestedV1 => {
-                    let attestor = self.attestor.ok_or_else(|| {
-                        CliOrchestrationError::msg(
-                            "launch_authentication = \"external_attested_v1\" requires the protected external launch attestor",
-                        )
-                    })?;
-                    manifest.attest(attestor)?
-                }
-            };
-            Ok((candidate_signer, manifest))
-        })();
-        let (candidate_signer, manifest) =
-            coordinate_cli_result(launch_comm, "launch authentication", attestation_setup)?;
-        coordinate_cli_result(
+    fn launch_and_build_trainer(&mut self) -> Result<(), EngineError> {
+        if matches!(&self.plan.mode, EngineMode::Discovery(_))
+            && self.trainer_config.candidate_log_top_k != self.trainer_config.group_size
+        {
+            return Err(EngineError::Configuration(
+                "discovery requires complete candidate logging".into(),
+            ));
+        }
+        let launch = self.build_launch_artifacts();
+        let launch_comm = self.engine_comm();
+        let artifacts = coordinate_engine_result(launch_comm, "launch authentication", launch)?;
+        let verifier_check = self.plan.verifier_assets.map_or(Ok(()), |assets| {
+            assets
+                .verify_current()
+                .map_err(|error| EngineError::Message(error.to_string()))
+        });
+        coordinate_engine_result(
             launch_comm,
             "launch-bound verifier revalidation",
-            self.request.verifier_assets.map_or(Ok(()), |assets| {
-                assets
-                    .verify_current()
-                    .map_err(|error| CliOrchestrationError::msg(error.to_string()))
-            }),
+            verifier_check,
         )?;
-
-        let publication_setup = (|| {
-            let launch_sha256 = manifest.payload_sha256.clone();
-            let manifest_bytes = manifest.to_pretty_bytes()?;
-            let run = RunDir::create(
-                &self.request.launch.output_root,
-                self.request.launch.run.run_id.clone(),
-            )
-            .map_err(|error| CliOrchestrationError::msg(error.to_string()))?;
-            run.write_immutable_launch(&manifest_bytes, self.request.rendered_prompt_bytes)
-                .map_err(|error| CliOrchestrationError::msg(error.to_string()))?;
-            let trainer = open_cli_trainer(
-                state.trainer_config.clone(),
+        let publication = (|| {
+            let output_root = match &self.plan.mode {
+                EngineMode::Discovery(spec) => spec.runs_root,
+                EngineMode::Cli(cli) => cli.launch.output_root.as_path(),
+            };
+            let run = RunDir::create(output_root, artifacts.run_id.clone())
+                .map_err(|error| EngineError::Launch(Box::new(error)))?;
+            run.write_immutable_launch(&artifacts.launch_bytes, self.plan.rendered_prompt_bytes)
+                .map_err(|error| EngineError::Launch(Box::new(error)))?;
+            let policy_sha256 = self
+                .policy_identity
+                .as_ref()
+                .ok_or_else(|| {
+                    EngineError::Configuration("launch requires policy identity".into())
+                })?
+                .policy_sha256
+                .clone();
+            let mut trainer = open_engine_trainer(
+                self.trainer_config.clone(),
                 &run,
-                state.runtime.distributed.clone(),
-                &state.frozen_policy_sha256,
-                &launch_sha256,
-                candidate_signer,
-            )?;
-            Ok((run, trainer, launch_sha256))
-        })();
-        let (run, trainer, launch_sha256) = coordinate_cli_result(
-            launch_comm,
-            "run directory and trainer setup",
-            publication_setup,
-        )?;
-        state.manifest = Some(manifest);
-        state.run = Some(run);
-        state.trainer = Some(trainer);
-        state.launch_sha256 = Some(launch_sha256);
-        Ok(())
-    }
-
-    fn train(
-        &mut self,
-        state: &mut Self::State,
-    ) -> Result<TrainOutcome<Self::Preempted>, Self::Error> {
-        let tensor_parallel = state.runtime.tensor_parallel.clone();
-        let (history, stop) = {
-            let trainer = state.trainer.as_mut().ok_or_else(|| {
-                CliOrchestrationError::msg("training requires a constructed trainer")
-            })?;
-            match tensor_parallel.as_ref() {
-                Some(comm) => trainer
-                    .train_tensor_parallel(
-                        &mut state.policy,
-                        self.request.reward,
-                        &state.tokenizer,
-                        &state.training_samples,
-                        comm,
-                    )
-                    .map_err(|error| CliOrchestrationError::msg(error.to_string()))?,
-                None => trainer
-                    .train(
-                        &mut state.policy,
-                        self.request.reward,
-                        &state.tokenizer,
-                        &state.training_samples,
-                    )
-                    .map_err(|error| CliOrchestrationError::msg(error.to_string()))?,
-            }
-        };
-        let run = state
-            .run
-            .clone()
-            .ok_or_else(|| CliOrchestrationError::msg("training requires a published run"))?;
-        state.history = Some(history);
-        if stop == RunStop::Preempted {
-            let presentation_rank = run_on_tensor_parallel_primary(
-                tensor_parallel.as_ref(),
-                "run completion output",
-                || Ok(()),
-            )?
-            .is_some();
-            return Ok(TrainOutcome::preempted(CliPreemptedRun {
-                run_dir: run.root().to_path_buf(),
-                presentation_rank,
-            }));
-        }
-        Ok(TrainOutcome::completed())
-    }
-
-    fn post_run_health(&mut self, state: &mut Self::State) -> Result<(), Self::Error> {
-        let history = state.history.as_ref().ok_or_else(|| {
-            CliOrchestrationError::msg("post-run health requires completed training")
-        })?;
-        let run = state.run.clone().ok_or_else(|| {
-            CliOrchestrationError::msg("post-run health requires a published run")
-        })?;
-        let tensor_parallel = state.runtime.tensor_parallel.clone();
-        let report =
-            run_on_tensor_parallel_primary(tensor_parallel.as_ref(), "post-run health", || {
-                let Some(summary) = summarize(history) else {
-                    return Ok(None);
-                };
-                tracing::info!(steps = summary.steps, "ferrl train: complete");
-                let report = evaluate_cli_run_health(
-                    &self.request.health_policy,
-                    history,
-                    &summary,
-                    &run,
-                    &state.trainer_config,
-                )?;
-                if report.is_fail() {
-                    return Err(CliOrchestrationError::RunHealth(report));
+                self.runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.distributed.clone()),
+                &policy_sha256,
+                &artifacts.launch_sha256,
+                artifacts.candidate_signer,
+            )
+            .map_err(|error| EngineError::Training(Box::new(error)))?;
+            if let EngineMode::Discovery(spec) = &self.plan.mode {
+                if let Some(flag) = spec.preemption_flag.clone() {
+                    trainer = trainer.with_preemption_flag(flag);
                 }
-                Ok((!self.request.health_policy_is_default).then_some(report))
+            }
+            Ok((run, trainer))
+        })();
+        let (run, trainer) =
+            coordinate_engine_result(launch_comm, "run directory and trainer setup", publication)?;
+        self.launch_bytes = Some(artifacts.launch_bytes);
+        self.launch_sha256 = Some(artifacts.launch_sha256);
+        self.signing_public_key = Some(artifacts.signing_public_key);
+        self.manifest = artifacts.manifest;
+        self.run = Some(run);
+        self.trainer = Some(trainer);
+        Ok(())
+    }
+
+    fn build_launch_artifacts(&self) -> Result<EngineLaunchArtifacts, EngineError> {
+        let signer =
+            CandidateSigner::generate().map_err(|error| EngineError::Message(error.to_string()))?;
+        let signing_public_key = signer.public_key_hex();
+        match &self.plan.mode {
+            EngineMode::Cli(cli) => {
+                let manifest = LaunchManifest::new(LaunchPayload {
+                    task: cli.launch.task.clone(),
+                    ferrl_commit: cli.launch.ferrl_commit.clone(),
+                    authentication: cli.launch.authentication,
+                    run: cli.launch.run.clone(),
+                    config: cli.launch.config.clone(),
+                    model: LaunchModelIdentity {
+                        family: self
+                            .policy_identity
+                            .as_ref()
+                            .ok_or_else(|| {
+                                EngineError::Configuration("launch requires policy identity".into())
+                            })?
+                            .model_family
+                            .to_owned(),
+                        checkpoint_policy_sha256: self
+                            .policy_identity
+                            .as_ref()
+                            .expect("policy identity checked above")
+                            .policy_sha256
+                            .clone(),
+                        tokenizer_sha256: self
+                            .policy_identity
+                            .as_ref()
+                            .expect("policy identity checked above")
+                            .tokenizer_sha256
+                            .clone(),
+                        resolved_eos_token_id: self.trainer_config.eos_token_id,
+                    },
+                    prompt: self
+                        .plan
+                        .rendered_prompt_bytes
+                        .map(|bytes| LaunchPromptIdentity {
+                            file: RunDir::PROMPT_FILE.to_owned(),
+                            sha256: sha256_hex(bytes),
+                            len_bytes: bytes.len(),
+                        }),
+                    verifier: self.verifier_identity.clone(),
+                    candidate_ledger: LaunchCandidateLedger {
+                        file: RunDir::CANDIDATES_FILE.to_owned(),
+                        format_version: 1,
+                        row_digest_domain: CANDIDATE_RECORD_DOMAIN.to_owned(),
+                        row_signature_algorithm: "ed25519".to_owned(),
+                        signing_public_key,
+                    },
+                })
+                .map_err(|error| EngineError::Message(error.to_string()))?;
+                let manifest = match cli.launch.authentication {
+                    LaunchAuthenticationMode::LocalEphemeralV1 => manifest,
+                    LaunchAuthenticationMode::ExternalAttestedV1 => {
+                        let attestor = cli.attestor.ok_or_else(|| {
+                            EngineError::Message(
+                                "launch_authentication = \"external_attested_v1\" requires the protected external launch attestor".into(),
+                            )
+                        })?;
+                        manifest
+                            .attest(attestor)
+                            .map_err(|error| EngineError::Message(error.to_string()))?
+                    }
+                };
+                let launch_bytes = manifest
+                    .to_pretty_bytes()
+                    .map_err(|error| EngineError::Message(error.to_string()))?;
+                Ok(EngineLaunchArtifacts {
+                    candidate_signer: signer,
+                    launch_sha256: manifest.payload_sha256.clone(),
+                    launch_bytes,
+                    run_id: cli.launch.run.run_id.clone(),
+                    signing_public_key: manifest
+                        .payload
+                        .candidate_ledger
+                        .signing_public_key
+                        .clone(),
+                    manifest: Some(manifest),
+                })
+            }
+            EngineMode::Discovery(spec) => {
+                let model = self.model_identity.as_ref().ok_or_else(|| {
+                    EngineError::Configuration("discovery launch requires model identity".into())
+                })?;
+                let payload = DiscoveryEngineLaunchPayload {
+                    contract: "ferrl.discovery-launch.v1",
+                    contract_version: 1,
+                    launch_authentication: "local_ephemeral_v1",
+                    launch_trust_boundary: concat!(
+                        "same-process signed candidate binding; not resistant to another process ",
+                        "controlling the same UID"
+                    ),
+                    ferrl_source: &spec.ferrl_source,
+                    task: spec.task,
+                    model,
+                    metric_contract: &spec.metric_contract,
+                    execution: spec.execution_device,
+                    resolved_eos_token_id: self.trainer_config.eos_token_id,
+                    training_samples_sha256: &self.training_samples_sha256,
+                    training_samples_count: self.training_samples.len(),
+                    held_out_samples_sha256: &self.evaluation_samples_sha256,
+                    held_out_samples_count: self.evaluation_samples.len(),
+                    steps: spec.steps,
+                    group_size: spec.group_size,
+                    max_new_tokens: spec.max_new_tokens,
+                    eval_group_size: spec.eval_group_size,
+                    temperature: spec.temperature,
+                    learning_rate: spec.learning_rate,
+                    seed: spec.seed,
+                    candidate_signing_public_key: &signing_public_key,
+                };
+                let payload_bytes =
+                    serde_json::to_vec(&payload).map_err(|source| EngineError::Serialization {
+                        kind: "discovery launch payload",
+                        source,
+                    })?;
+                let launch_sha256 = sha256_hex(&payload_bytes);
+                let run_id = format!("discovery-{}", &launch_sha256[..20]);
+                let manifest = DiscoveryEngineLaunchManifest {
+                    contract: "ferrl.discovery-launch.v1",
+                    launch_authentication: "local_ephemeral_v1",
+                    launch_trust_boundary: payload.launch_trust_boundary,
+                    payload_sha256: &launch_sha256,
+                    payload: &payload,
+                };
+                let mut launch_bytes = serde_json::to_vec_pretty(&manifest).map_err(|source| {
+                    EngineError::Serialization {
+                        kind: "discovery launch manifest",
+                        source,
+                    }
+                })?;
+                launch_bytes.push(b'\n');
+                Ok(EngineLaunchArtifacts {
+                    candidate_signer: signer,
+                    manifest: None,
+                    launch_bytes,
+                    signing_public_key,
+                    launch_sha256,
+                    run_id,
+                })
+            }
+        }
+    }
+
+    fn train(&mut self) -> Result<Option<EngineOutcome>, EngineError> {
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or_else(|| EngineError::Configuration("training runtime is missing".into()))?;
+        let tensor_parallel = runtime.tensor_parallel.clone();
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| EngineError::Configuration("training tokenizer is missing".into()))?;
+        let samples = &self.training_samples;
+        let reward = self.plan.reward;
+        let (history, stop) =
+            {
+                let policy = self.policy.as_mut().ok_or_else(|| {
+                    EngineError::Configuration("training policy is missing".into())
+                })?;
+                let trainer = self.trainer.as_mut().ok_or_else(|| {
+                    EngineError::Configuration("training trainer is missing".into())
+                })?;
+                match tensor_parallel.as_ref() {
+                    Some(comm) => trainer
+                        .train_tensor_parallel(policy, reward, tokenizer, samples, comm)
+                        .map_err(|error| EngineError::Training(Box::new(error)))?,
+                    None => trainer
+                        .train(policy, reward, tokenizer, samples)
+                        .map_err(|error| EngineError::Training(Box::new(error)))?,
+                }
+            };
+        self.history = Some(history);
+        if stop != RunStop::Preempted {
+            return Ok(None);
+        }
+        let run = self.run.as_ref().ok_or_else(|| {
+            EngineError::Configuration("preemption requires a published run".into())
+        })?;
+        let (completed_steps, checkpoint_path) = if matches!(
+            &self.plan.mode,
+            EngineMode::Discovery(_)
+        ) {
+            let history_len = self.history.as_ref().map_or(0, Vec::len);
+            let completed_steps = u64::try_from(history_len).map_err(|_| {
+                EngineError::PreemptionCheckpoint(
+                    "completed history length does not fit the checkpoint step domain".into(),
+                )
             })?;
-        if let Some(report) = report.flatten() {
-            state.health_report = Some(report);
+            let latest = crate::latest_checkpoint(run.checkpoints_dir())
+                .map_err(|error| EngineError::PreemptionCheckpointScan(Box::new(error)))?
+                .ok_or_else(|| {
+                    EngineError::PreemptionCheckpoint(
+                        "trainer returned Preempted without a complete checkpoint".into(),
+                    )
+                })?;
+            if latest.step != completed_steps {
+                return Err(EngineError::PreemptionCheckpoint(format!(
+                    "newest complete checkpoint step {} does not match completed history length {completed_steps}",
+                    latest.step
+                )));
+            }
+            (Some(latest.step), Some(latest.dir))
+        } else {
+            (None, None)
+        };
+        Ok(Some(EngineOutcome::Preempted(EnginePreemptedRun {
+            run_dir: run.root().to_path_buf(),
+            completed_steps,
+            checkpoint_path,
+            presentation_rank: self.presentation_rank()?,
+        })))
+    }
+
+    fn post_run_health(&mut self) -> Result<(), EngineError> {
+        let history = self.history.as_ref().ok_or_else(|| {
+            EngineError::Configuration("post-run health requires completed training".into())
+        })?;
+        let run = self.run.clone().ok_or_else(|| {
+            EngineError::Configuration("post-run health requires a published run".into())
+        })?;
+        match &self.plan.mode {
+            EngineMode::Discovery(_) => {
+                if summarize(history).is_none() {
+                    return Err(EngineError::Configuration(
+                        "post-run health requires at least one completed training metric".into(),
+                    ));
+                }
+            }
+            EngineMode::Cli(cli) => {
+                let policy = cli.health_policy.clone();
+                let trainer = self.trainer_config.clone();
+                let tensor_parallel = self
+                    .runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.tensor_parallel.clone());
+                let local = run_on_tensor_parallel_primary_engine(
+                    tensor_parallel.as_ref(),
+                    "tensor-parallel post-run health",
+                    || {
+                        let Some(summary) = summarize(history) else {
+                            return Ok(None);
+                        };
+                        tracing::info!(steps = summary.steps, "ferrl train: complete");
+                        let report =
+                            evaluate_cli_run_health(&policy, history, &summary, &run, &trainer)
+                                .map_err(|error| EngineError::Message(error.to_string()))?;
+                        if report.is_fail() {
+                            return Err(EngineError::Health(report));
+                        }
+                        Ok((!cli.health_policy_is_default).then_some(report))
+                    },
+                );
+                let report =
+                    coordinate_engine_result(self.engine_comm(), "post-run health", local)?;
+                self.health_report = report.flatten();
+            }
         }
         Ok(())
     }
 
-    fn evaluate_and_publish(&mut self, state: &mut Self::State) -> Result<(), Self::Error> {
-        if state.evaluation_samples.is_empty() {
+    fn evaluation_generation_config(&self) -> GenConfig {
+        match &self.plan.mode {
+            EngineMode::Discovery(spec) => GenConfig {
+                group_size: spec.eval_group_size,
+                max_new_tokens: spec.max_new_tokens,
+                temperature: spec.temperature,
+                eos_token_id: self.trainer_config.eos_token_id,
+                eval_sampling: Some(EvalSampling::default()),
+            },
+            EngineMode::Cli(_) => self
+                .generation_config
+                .expect("CLI evaluation generation config is installed during setup"),
+        }
+    }
+
+    fn evaluate_and_publish(&mut self) -> Result<(), EngineError> {
+        if self.evaluation_samples.is_empty() {
             return Ok(());
         }
-        let run = state
+        let run = self.run.clone().ok_or_else(|| {
+            EngineError::Configuration("evaluation requires a published run".into())
+        })?;
+        let launch_sha256 = self.launch_sha256.clone().ok_or_else(|| {
+            EngineError::Configuration("evaluation requires launch identity".into())
+        })?;
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| EngineError::Configuration("evaluation tokenizer is missing".into()))?;
+        let generation_config = self.evaluation_generation_config();
+        let local = {
+            let policy = self
+                .policy
+                .as_mut()
+                .ok_or_else(|| EngineError::Configuration("evaluation policy is missing".into()))?;
+            evaluate(
+                policy,
+                self.plan.evaluation_reward,
+                tokenizer,
+                &self.evaluation_samples,
+                &generation_config,
+            )
+            .map_err(|error| EngineError::Evaluation(Box::new(error)))
+        };
+        let report = coordinate_engine_result(self.engine_comm(), "held-out evaluation", local)?;
+        let bytes = match &self.plan.mode {
+            EngineMode::Discovery(spec) => publish_discovery_eval_report(
+                spec,
+                &self.evaluation_samples,
+                &report,
+                &run,
+                &launch_sha256,
+            )?,
+            EngineMode::Cli(cli) => {
+                publish_cli_eval_report(
+                    &cli.launch.task,
+                    cli.data_seed,
+                    cli.trimul_held_out_secret_seed,
+                    &self.evaluation_samples,
+                    &report,
+                    &run,
+                    &launch_sha256,
+                    self.verifier_assets_identity.as_ref(),
+                    self.engine_comm(),
+                )
+                .map_err(|error| EngineError::Message(error.to_string()))?;
+                Vec::new()
+            }
+        };
+        if matches!(&self.plan.mode, EngineMode::Cli(_)) {
+            tracing::info!(
+                base = report.base_reward_mean,
+                adapter = report.adapter_reward_mean,
+                improvement = report.improvement(),
+                "ferrl train: held-out eval (adapter vs base)"
+            );
+        }
+        self.evaluation = Some(EngineEvaluation { report, bytes });
+        Ok(())
+    }
+
+    fn load_and_rank_candidates(&mut self) -> Result<(), EngineError> {
+        let run = self.run.clone().ok_or_else(|| {
+            EngineError::Configuration("candidate loading requires a published run".into())
+        })?;
+        let launch_sha256 = self.launch_sha256.as_deref().ok_or_else(|| {
+            EngineError::Configuration("candidate loading requires launch identity".into())
+        })?;
+        let signing_public_key = self.signing_public_key.as_deref().ok_or_else(|| {
+            EngineError::Configuration("candidate loading requires signing identity".into())
+        })?;
+        let local = match &self.plan.mode {
+            EngineMode::Discovery(spec) => load_authenticated_candidates(
+                &run.candidates_path(),
+                launch_sha256,
+                signing_public_key,
+                EngineCandidateValidation::Discovery {
+                    steps: spec.steps,
+                    group_size: spec.group_size,
+                    max_new_tokens: spec.max_new_tokens,
+                },
+            ),
+            EngineMode::Cli(cli) => {
+                let Some(manifest) = self.manifest.as_ref() else {
+                    return Err(EngineError::Configuration(
+                        "candidate loading requires an authenticated launch".into(),
+                    ));
+                };
+                load_authenticated_candidates(
+                    &run.candidates_path(),
+                    launch_sha256,
+                    signing_public_key,
+                    EngineCandidateValidation::Cli {
+                        task: &cli.launch.task,
+                        manifest,
+                        topology: self
+                            .runtime
+                            .as_ref()
+                            .expect("runtime installed")
+                            .candidate_topology(manifest),
+                        steps: self.trainer_config.steps,
+                        group_size: self.trainer_config.group_size,
+                        max_new_tokens: self.trainer_config.max_new_tokens,
+                    },
+                )
+            }
+        };
+        let candidates = coordinate_engine_result(
+            self.engine_comm(),
+            "candidate loading and authentication",
+            local,
+        )?;
+        self.candidates = candidates;
+        Ok(())
+    }
+
+    fn completed(&mut self) -> Result<EngineOutcome, EngineError> {
+        let presentation_rank = self.presentation_rank()?;
+        let run = self
             .run
-            .clone()
-            .ok_or_else(|| CliOrchestrationError::msg("evaluation requires a published run"))?;
-        let launch_sha256 = state
-            .launch_sha256
-            .clone()
-            .ok_or_else(|| CliOrchestrationError::msg("evaluation requires launch identity"))?;
-        let launch_comm = state.runtime.launch.clone();
-        let local = evaluate(
-            &mut state.policy,
-            self.request.evaluation_reward,
-            &state.tokenizer,
-            &state.evaluation_samples,
-            &state.generation_config,
-        )
-        .map_err(|error| CliOrchestrationError::msg(error.to_string()));
-        let report = coordinate_cli_result(
-            launch_comm.as_ref().map(|comm| comm as &dyn Comm),
-            "held-out evaluation",
-            local,
-        )?;
-        publish_cli_eval_report(
-            &self.request.launch.task,
-            self.request.data_seed,
-            self.request.trimul_held_out_secret_seed,
-            &state.evaluation_samples,
-            &report,
-            &run,
-            &launch_sha256,
-            state.verifier_assets_identity.as_ref(),
-            launch_comm.as_ref().map(|comm| comm as &dyn Comm),
-        )?;
-        tracing::info!(
-            base = report.base_reward_mean,
-            adapter = report.adapter_reward_mean,
-            improvement = report.improvement(),
-            "ferrl train: held-out eval (adapter vs base)"
-        );
-        Ok(())
-    }
-
-    fn load_and_select_candidates(&mut self, state: &mut Self::State) -> Result<(), Self::Error> {
-        let run = state.run.clone().ok_or_else(|| {
-            CliOrchestrationError::msg("candidate loading requires a published run")
-        })?;
-        let manifest = state.manifest.clone().ok_or_else(|| {
-            CliOrchestrationError::msg("candidate loading requires an authenticated launch")
-        })?;
-        let topology = state.runtime.candidate_topology(&manifest);
-        let local = load_cli_candidate_selection(&run, &manifest, &state.trainer_config, topology);
-        let launch = state.runtime.launch.clone();
-        let selected = coordinate_cli_result(
-            launch.as_ref().map(|comm| comm as &dyn Comm),
-            "candidate loading and selection",
-            local,
-        )?;
-        state.selected_candidate = selected;
-        Ok(())
-    }
-
-    fn map_completed(self, mut state: Self::State) -> Result<Self::Completed, Self::Error> {
-        let _selected_candidate = state.selected_candidate.take();
-        let tensor_parallel = state.runtime.tensor_parallel.clone();
-        let presentation_rank = run_on_tensor_parallel_primary(
-            tensor_parallel.as_ref(),
-            "run completion output",
-            || Ok(()),
-        )?
-        .is_some();
-        let run = state.run.take().ok_or_else(|| {
-            CliOrchestrationError::msg("completed mapping requires a published run")
-        })?;
-        Ok(CliCompletedRun {
-            run_dir: run.root().to_path_buf(),
-            health_report: state.health_report.take(),
+            .take()
+            .ok_or_else(|| EngineError::Configuration("completed run is missing".into()))?;
+        Ok(EngineOutcome::Completed(Box::new(EngineCompletedRun {
+            run,
+            launch_bytes: self.launch_bytes.take().ok_or_else(|| {
+                EngineError::Configuration("completed launch bytes are missing".into())
+            })?,
+            launch_sha256: self.launch_sha256.take().ok_or_else(|| {
+                EngineError::Configuration("completed launch identity is missing".into())
+            })?,
+            signing_public_key: self.signing_public_key.take().ok_or_else(|| {
+                EngineError::Configuration("completed signing identity is missing".into())
+            })?,
+            model_identity: self.model_identity.take(),
+            source_identity: match &self.plan.mode {
+                EngineMode::Discovery(spec) => Some(spec.ferrl_source.clone()),
+                EngineMode::Cli(_) => None,
+            },
+            metric_contract: match &self.plan.mode {
+                EngineMode::Discovery(spec) => Some(spec.metric_contract.clone()),
+                EngineMode::Cli(_) => None,
+            },
+            evaluation: self.evaluation.take(),
+            candidates: std::mem::take(&mut self.candidates),
+            health_report: self.health_report.take(),
             presentation_rank,
-        })
+        })))
+    }
+
+    fn engine_comm(&self) -> Option<&dyn Comm> {
+        self.runtime
+            .as_ref()
+            .and_then(|runtime| runtime.launch.as_ref())
+            .map(|comm| comm as &dyn Comm)
+    }
+
+    fn presentation_rank(&self) -> Result<bool, EngineError> {
+        let comm = self
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.tensor_parallel.as_ref());
+        Ok(
+            run_on_tensor_parallel_primary_engine(comm, "run completion output", || Ok(()))?
+                .is_some(),
+        )
     }
 }
 
-fn cli_checkpoint_eos_selection(selection: CliEosSelection) -> CheckpointEosSelection {
+fn engine_checkpoint_eos_selection(selection: EngineEosSelection) -> CheckpointEosSelection {
     match selection {
-        CliEosSelection::CheckpointDefault => CheckpointEosSelection::CheckpointDefault,
-        CliEosSelection::Explicit(token_id) => CheckpointEosSelection::Explicit(token_id),
-        CliEosSelection::Disabled => CheckpointEosSelection::Disabled,
+        EngineEosSelection::CheckpointDefault => CheckpointEosSelection::CheckpointDefault,
+        EngineEosSelection::Explicit(token_id) => CheckpointEosSelection::Explicit(token_id),
+        EngineEosSelection::Disabled => CheckpointEosSelection::Disabled,
     }
+}
+
+fn engine_task_name<'a>(mode: &'a EngineMode<'a>) -> &'a str {
+    match mode {
+        EngineMode::Discovery(spec) => spec.task.name(),
+        EngineMode::Cli(cli) => &cli.launch.task,
+    }
+}
+
+fn engine_activation_checkpointing(mode: &EngineMode<'_>) -> bool {
+    match mode {
+        EngineMode::Discovery(_) => false,
+        EngineMode::Cli(cli) => cli.activation_checkpointing,
+    }
+}
+
+fn validate_engine_topology(
+    mode: &EngineMode<'_>,
+    runtime: &CliRuntime,
+) -> Result<(), EngineError> {
+    match mode {
+        EngineMode::Discovery(_) => {
+            if runtime.launch.is_some()
+                || runtime.distributed.is_some()
+                || runtime.tensor_parallel.is_some()
+                || runtime.tensor_parallel_plan.is_sharded()
+            {
+                return Err(EngineError::Configuration(
+                    "SDK discovery supports only world-one execution".into(),
+                ));
+            }
+        }
+        EngineMode::Cli(cli) => {
+            let run = &cli.launch.run;
+            match (
+                runtime.distributed.as_ref(),
+                runtime.tensor_parallel.as_ref(),
+            ) {
+                (None, None) => {
+                    if run.data_parallel_rank != 0
+                        || run.data_parallel_world_size != 1
+                        || run.tensor_parallel_rank != 0
+                        || run.tensor_parallel_world_size != 1
+                    {
+                        return Err(EngineError::Configuration(
+                            "world-one launch identity disagrees with the active topology".into(),
+                        ));
+                    }
+                }
+                (Some(comm), None) => {
+                    if run.data_parallel_rank != comm.rank()
+                        || run.data_parallel_world_size != comm.world_size()
+                        || run.tensor_parallel_rank != 0
+                        || run.tensor_parallel_world_size != 1
+                    {
+                        return Err(EngineError::Configuration(
+                            "data-parallel launch identity disagrees with the active topology"
+                                .into(),
+                        ));
+                    }
+                }
+                (None, Some(comm)) => {
+                    crate::validate_comm_plan(runtime.tensor_parallel_plan, comm)
+                        .map_err(|error| EngineError::Configuration(error.to_string()))?;
+                    if run.tensor_parallel_rank != comm.rank()
+                        || run.tensor_parallel_world_size != comm.world_size()
+                        || run.data_parallel_rank != 0
+                        || run.data_parallel_world_size != 1
+                    {
+                        return Err(EngineError::Configuration(
+                            "tensor-parallel launch identity disagrees with the active topology"
+                                .into(),
+                        ));
+                    }
+                }
+                (Some(_), Some(_)) => {
+                    return Err(EngineError::Configuration(
+                        "combined data-parallel and tensor-parallel execution is unsupported"
+                            .into(),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn engine_panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        message
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.as_str()
+    } else {
+        "non-string panic payload"
+    }
+}
+
+fn coordinate_engine_result<T>(
+    comm: Option<&dyn Comm>,
+    label: &'static str,
+    local: Result<T, EngineError>,
+) -> Result<T, EngineError> {
+    let Some(comm) = comm.filter(|comm| comm.world_size() > 1) else {
+        return local;
+    };
+    let failed_local = if local.is_err() { 1.0 } else { 0.0 };
+    let failed_global = comm.all_reduce_scalar_sum(failed_local);
+    match (local, failed_global) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(EngineError::Message(error.to_string())),
+        (Ok(_), Ok(failed)) if failed > 0.0 => Err(EngineError::Message(format!(
+            "{label} failed on a peer distributed rank; aborting in lockstep"
+        ))),
+        (Ok(value), Ok(_)) => Ok(value),
+    }
+}
+
+fn validate_engine_value_consensus(
+    label: &'static str,
+    value: &[u8],
+    comm: Option<&dyn Comm>,
+) -> Result<(), EngineError> {
+    let Some(comm) = comm.filter(|comm| comm.world_size() > 1) else {
+        return Ok(());
+    };
+    let digest: [u8; 32] = Sha256::digest(value).into();
+    let world = comm.world_size() as f64;
+    let mut mismatch = false;
+    for byte in digest {
+        let scalar = f64::from(byte);
+        let sum = comm
+            .all_reduce_scalar_sum(scalar)
+            .map_err(|error| EngineError::Message(error.to_string()))?;
+        mismatch |= sum != world * scalar;
+    }
+    coordinate_engine_result(
+        Some(comm),
+        "launch provenance consensus",
+        if mismatch {
+            Err(EngineError::Message(format!(
+                "launch ranks disagree on {label}; all ranks must bind identical bytes"
+            )))
+        } else {
+            Ok(())
+        },
+    )
+}
+
+fn run_on_tensor_parallel_primary_engine<T>(
+    comm: Option<&SharedComm>,
+    label: &'static str,
+    operation: impl FnOnce() -> Result<T, EngineError>,
+) -> Result<Option<T>, EngineError> {
+    let local = if comm.is_none_or(|comm| comm.world_size() <= 1 || comm.rank() == 0) {
+        operation().map(Some)
+    } else {
+        Ok(None)
+    };
+    coordinate_engine_result(comm.map(|comm| comm as &dyn Comm), label, local)
+}
+
+#[derive(Serialize)]
+struct DiscoveryEngineHeldOutReport<'a> {
+    contract: &'static str,
+    contract_version: u32,
+    launch_sha256: &'a str,
+    task: &'a crate::discovery::TaskIdentity,
+    held_out_samples_sha256: &'a str,
+    held_out_samples_count: usize,
+    report: &'a crate::eval::EvalReport,
+}
+
+fn publish_discovery_eval_report<T: Serialize>(
+    spec: &DiscoveryLaunchInput<'_>,
+    evaluation_samples: &[Sample<T>],
+    report: &crate::eval::EvalReport,
+    run: &RunDir,
+    launch_sha256: &str,
+) -> Result<Vec<u8>, EngineError> {
+    let eval_samples =
+        serde_json::to_vec(evaluation_samples).map_err(|source| EngineError::Serialization {
+            kind: "discovery held-out samples",
+            source,
+        })?;
+    let eval_samples_sha256 = sha256_hex(&eval_samples);
+    let durable = DiscoveryEngineHeldOutReport {
+        contract: "ferrl.discovery-held-out-report.v1",
+        contract_version: 1,
+        launch_sha256,
+        task: spec.task,
+        held_out_samples_sha256: &eval_samples_sha256,
+        held_out_samples_count: evaluation_samples.len(),
+        report,
+    };
+    let mut expected =
+        serde_json::to_vec_pretty(&durable).map_err(|source| EngineError::Serialization {
+            kind: "discovery held-out report",
+            source,
+        })?;
+    expected.push(b'\n');
+    run.write_eval_report(&durable)
+        .map_err(|error| EngineError::Launch(Box::new(error)))?;
+    let actual =
+        fs::read(run.eval_report_path()).map_err(|source| EngineError::HeldOutReportIo {
+            path: run.eval_report_path(),
+            source,
+        })?;
+    if actual != expected {
+        return Err(EngineError::InvalidCandidateEvidence(
+            "published held-out report bytes differ from the launch-bound report".into(),
+        ));
+    }
+    Ok(actual)
 }
 
 #[derive(Clone)]
@@ -1336,23 +2155,21 @@ pub fn launch_candidate_topology(run: &LaunchRunIdentity) -> (usize, usize) {
     }
 }
 
-fn open_cli_trainer(
+fn open_engine_trainer(
     config: TrainerConfig,
     run: &RunDir,
     distributed_comm: Option<SharedComm>,
     frozen_policy_sha256: &str,
     candidate_launch_sha256: &str,
     candidate_signer: CandidateSigner,
-) -> Result<Trainer, CliOrchestrationError> {
+) -> Result<Trainer, crate::trainer::TrainerError> {
     let trainer = match distributed_comm {
         Some(comm) => Trainer::with_comm(config, run, comm),
         None => Trainer::new(config, run),
-    }
-    .map_err(|error| CliOrchestrationError::msg(error.to_string()))?;
+    }?;
     trainer
         .with_frozen_policy_sha256(frozen_policy_sha256)
         .with_candidate_provenance(candidate_launch_sha256, candidate_signer)
-        .map_err(|error| CliOrchestrationError::msg(error.to_string()))
 }
 
 fn coordinate_cli_result<T>(
@@ -1375,6 +2192,7 @@ fn coordinate_cli_result<T>(
     }
 }
 
+#[cfg(test)]
 fn run_on_tensor_parallel_primary<T>(
     comm: Option<&SharedComm>,
     label: &'static str,
@@ -1426,6 +2244,29 @@ fn validate_data_parallel_policy_preflight<P: Policy>(
     };
     Trainer::validate_data_parallel_policy_preflight(policy, policy_sha256, comm)
         .map_err(|error| CliOrchestrationError::msg(error.to_string()))
+}
+
+fn validate_tensor_parallel_policy_preflight<P: TensorParallelPolicy>(
+    policy: &P,
+    comm: &dyn Comm,
+    launch_comm: Option<&dyn Comm>,
+) -> Result<(), EngineError> {
+    let local = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        policy
+            .validate_tensor_parallel_execution(comm)
+            .map_err(|error| EngineError::Configuration(error.to_string()))
+    }))
+    .unwrap_or_else(|payload| {
+        Err(EngineError::Configuration(format!(
+            "tensor-parallel policy capability preflight panicked: {}",
+            engine_panic_payload_message(payload.as_ref())
+        )))
+    });
+    coordinate_engine_result(
+        launch_comm,
+        "tensor-parallel policy capability preflight",
+        local,
+    )
 }
 
 #[derive(Serialize)]
@@ -2328,96 +3169,321 @@ fn resolve_candidates_path(input: &Path) -> PathBuf {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct CandidateTopology {
+pub(crate) struct CandidateTopology {
     rank: usize,
     world_size: usize,
 }
 
+/// Closed candidate-ledger validation modes used by the shared engine.
+#[derive(Clone, Copy)]
+pub(crate) enum EngineCandidateValidation<'a> {
+    /// Complete world-one SDK ledger with task-independent provenance.
+    Discovery {
+        /// Trainer step budget.
+        steps: u64,
+        /// Candidate group size.
+        group_size: usize,
+        /// Maximum generated width.
+        max_new_tokens: usize,
+    },
+    /// CLI ledger bound to its immutable launch and active topology.
+    Cli {
+        /// Built-in task name.
+        task: &'a str,
+        /// Immutable launch manifest for task-specific provenance.
+        manifest: &'a LaunchManifest,
+        /// Active rank/world coordinates.
+        topology: CandidateTopology,
+        /// Trainer step budget.
+        steps: u64,
+        /// Candidate group size.
+        group_size: usize,
+        /// Maximum generated width.
+        max_new_tokens: usize,
+    },
+}
+
 #[allow(clippy::cognitive_complexity)]
+pub(crate) fn load_authenticated_candidates(
+    path: &Path,
+    launch_sha256: &str,
+    signing_public_key: &str,
+    validation: EngineCandidateValidation<'_>,
+) -> Result<Vec<AuthenticatedCandidate>, EngineError> {
+    if !path.exists() {
+        if matches!(validation, EngineCandidateValidation::Discovery { .. }) {
+            return Err(EngineError::InvalidCandidateEvidence(
+                "candidate ledger is missing".into(),
+            ));
+        }
+        return Ok(Vec::new());
+    }
+    let bytes = read_engine_regular_bytes(path)?;
+    if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+        return Err(EngineError::InvalidCandidateEvidence(format!(
+            "candidate ledger {} has an unterminated final row",
+            path.display()
+        )));
+    }
+    let text = std::str::from_utf8(&bytes).map_err(|error| {
+        EngineError::InvalidCandidateEvidence(format!(
+            "candidate ledger {} is not UTF-8: {error}",
+            path.display()
+        ))
+    })?;
+    let mut records = Vec::new();
+    let mut positions = BTreeSet::new();
+    for (index, raw_line) in text.split_terminator('\n').enumerate() {
+        let row_number = index + 1;
+        if raw_line.trim().is_empty() {
+            return Err(EngineError::InvalidCandidateEvidence(format!(
+                "candidate ledger {} contains blank row {row_number}",
+                path.display()
+            )));
+        }
+        let record = parse_engine_candidate_row(path, row_number, raw_line)?;
+        crate::telemetry::verify_signed_candidate_row(
+            raw_line.as_bytes(),
+            signing_public_key,
+            launch_sha256,
+            &record,
+        )
+        .map_err(|error| {
+            EngineError::InvalidCandidateEvidence(format!(
+                "candidate ledger {} row {row_number} failed canonical launch authentication: {error}",
+                path.display()
+            ))
+        })?;
+        let (steps, group_size, max_new_tokens, topology, task, manifest) = match validation {
+            EngineCandidateValidation::Discovery {
+                steps,
+                group_size,
+                max_new_tokens,
+            } => (
+                steps,
+                group_size,
+                max_new_tokens,
+                CandidateTopology {
+                    rank: 0,
+                    world_size: 1,
+                },
+                None,
+                None,
+            ),
+            EngineCandidateValidation::Cli {
+                task,
+                manifest,
+                topology,
+                steps,
+                group_size,
+                max_new_tokens,
+            } => (
+                steps,
+                group_size,
+                max_new_tokens,
+                topology,
+                Some(task),
+                Some(manifest),
+            ),
+        };
+        if let (Some("trimul"), Some(manifest)) = (task, manifest) {
+            verify_cli_candidate_verifier_provenance(&record, manifest, row_number)
+                .map_err(|error| EngineError::InvalidCandidateEvidence(error.to_string()))?;
+        }
+        if record.rank != topology.rank || record.world_size != topology.world_size {
+            return Err(EngineError::InvalidCandidateEvidence(format!(
+                "candidate ledger {} row {row_number} rank/world disagree with active execution topology",
+                path.display()
+            )));
+        }
+        if record.step >= steps || record.group_index >= group_size {
+            return Err(EngineError::InvalidCandidateEvidence(format!(
+                "candidate ledger {} row {row_number} coordinates exceed the launch config",
+                path.display()
+            )));
+        }
+        if record.completion_len_tokens == 0 || record.completion_len_tokens > max_new_tokens {
+            return Err(EngineError::InvalidCandidateEvidence(format!(
+                "candidate ledger {} row {row_number} completion length {} is outside the launch-bound range 1..={max_new_tokens}",
+                path.display(),
+                record.completion_len_tokens
+            )));
+        }
+        if matches!(validation, EngineCandidateValidation::Discovery { .. })
+            && record.prompt_index != record.step
+        {
+            return Err(EngineError::InvalidCandidateEvidence(format!(
+                "candidate ledger {} row {row_number} has an impossible training position",
+                path.display()
+            )));
+        }
+        if !positions.insert((record.step, record.prompt_index, record.group_index)) {
+            return Err(EngineError::InvalidCandidateEvidence(format!(
+                "candidate ledger {} row {row_number} duplicates a training position",
+                path.display()
+            )));
+        }
+        let provenance_sha256 = record.record_sha256.clone().ok_or_else(|| {
+            EngineError::InvalidCandidateEvidence(format!(
+                "candidate ledger {} row {row_number} has no validated provenance digest",
+                path.display()
+            ))
+        })?;
+        let mut exact_row_bytes = raw_line.as_bytes().to_vec();
+        exact_row_bytes.push(b'\n');
+        records.push(AuthenticatedCandidate {
+            record,
+            exact_row_bytes,
+            provenance_sha256,
+        });
+    }
+    if let EngineCandidateValidation::Discovery {
+        steps, group_size, ..
+    } = validation
+    {
+        let steps_usize = usize::try_from(steps).map_err(|_| {
+            EngineError::InvalidCandidateEvidence(
+                "configured step count does not fit candidate coverage arithmetic".into(),
+            )
+        })?;
+        let expected = steps_usize.checked_mul(group_size).ok_or_else(|| {
+            EngineError::InvalidCandidateEvidence("candidate coverage count overflows usize".into())
+        })?;
+        if records.len() != expected {
+            return Err(EngineError::InvalidCandidateEvidence(format!(
+                "candidate ledger has {} rows, expected complete logging of {expected}",
+                records.len()
+            )));
+        }
+    }
+    records.sort_by(|left, right| {
+        right
+            .record
+            .reward
+            .total_cmp(&left.record.reward)
+            .then_with(|| left.record.step.cmp(&right.record.step))
+            .then_with(|| left.record.prompt_index.cmp(&right.record.prompt_index))
+            .then_with(|| left.record.group_index.cmp(&right.record.group_index))
+    });
+    Ok(records)
+}
+
+#[cfg(test)]
 fn load_cli_candidate_selection(
     run: &RunDir,
     manifest: &LaunchManifest,
     trainer_config: &TrainerConfig,
     topology: CandidateTopology,
 ) -> Result<Option<CandidateRecord>, CliOrchestrationError> {
-    let path = run.candidates_path();
-    if !path.exists() {
-        return Ok(None);
-    }
-    let bytes = read_regular_bytes(&path)?;
-    if !bytes.is_empty() && !bytes.ends_with(b"\n") {
-        return Err(CliOrchestrationError::msg(format!(
-            "candidate ledger {} has an unterminated final row",
-            path.display()
-        )));
-    }
-    let text = std::str::from_utf8(&bytes).map_err(|error| {
-        CliOrchestrationError::msg(format!(
-            "candidate ledger {} is not UTF-8: {error}",
-            path.display()
-        ))
-    })?;
-    let mut selected = None;
-    for (index, raw_line) in text.split_terminator('\n').enumerate() {
-        if raw_line.trim().is_empty() {
-            return Err(CliOrchestrationError::msg(format!(
-                "candidate ledger {} contains blank row {}",
-                path.display(),
-                index + 1
-            )));
-        }
-        let record = parse_strict_candidate_row(&path, index + 1, raw_line)?;
-        crate::telemetry::verify_signed_candidate_row(
-            raw_line.as_bytes(),
-            &manifest.payload.candidate_ledger.signing_public_key,
-            &manifest.payload_sha256,
-            &record,
-        )
-        .map_err(|error| {
-            CliOrchestrationError::msg(format!(
-                "candidate ledger {} row {} failed canonical launch authentication: {error}",
-                path.display(),
-                index + 1
-            ))
-        })?;
-        if manifest.payload.task == "trimul" {
-            verify_cli_candidate_verifier_provenance(&record, manifest, index + 1)?;
-        }
-        if record.rank != topology.rank || record.world_size != topology.world_size {
-            return Err(CliOrchestrationError::msg(format!(
-                "candidate ledger {} row {} rank/world disagree with active execution topology",
-                path.display(),
-                index + 1
-            )));
-        }
-        if record.step >= trainer_config.steps
-            || record.group_index >= trainer_config.group_size
-            || record.completion_len_tokens > trainer_config.max_new_tokens
-        {
-            return Err(CliOrchestrationError::msg(format!(
-                "candidate ledger {} row {} coordinates exceed the launch config",
-                path.display(),
-                index + 1
-            )));
-        }
-        if selected
-            .as_ref()
-            .is_none_or(|current: &CandidateRecord| cli_candidate_is_better(&record, current))
-        {
-            selected = Some(record);
-        }
-    }
-    Ok(selected)
+    let candidates = load_authenticated_candidates(
+        &run.candidates_path(),
+        &manifest.payload_sha256,
+        &manifest.payload.candidate_ledger.signing_public_key,
+        EngineCandidateValidation::Cli {
+            task: &manifest.payload.task,
+            manifest,
+            topology,
+            steps: trainer_config.steps,
+            group_size: trainer_config.group_size,
+            max_new_tokens: trainer_config.max_new_tokens,
+        },
+    )
+    .map_err(|error| CliOrchestrationError::msg(error.to_string()))?;
+    Ok(candidates
+        .into_iter()
+        .next()
+        .map(|candidate| candidate.record))
 }
 
-fn cli_candidate_is_better(candidate: &CandidateRecord, current: &CandidateRecord) -> bool {
-    candidate
-        .reward
-        .total_cmp(&current.reward)
-        .then_with(|| current.step.cmp(&candidate.step))
-        .then_with(|| current.prompt_index.cmp(&candidate.prompt_index))
-        .then_with(|| current.group_index.cmp(&candidate.group_index))
-        .is_gt()
+/// Exact authenticated candidate returned to the separate Phase-2.3 artifact adapter.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct CliAuthenticatedCandidate {
+    candidate: CandidateRecord,
+    row_bytes: Vec<u8>,
+}
+
+impl CliAuthenticatedCandidate {
+    /// Borrow the canonical authenticated candidate row.
+    #[must_use]
+    pub fn candidate(&self) -> &CandidateRecord {
+        &self.candidate
+    }
+
+    /// Borrow the exact canonical JSON row bytes authenticated by the launch.
+    #[must_use]
+    pub fn row_bytes(&self) -> &[u8] {
+        &self.row_bytes
+    }
+}
+
+/// Authenticate one CLI launch's candidate ledger for the artifact adapter.
+#[doc(hidden)]
+pub fn load_cli_authenticated_candidate(
+    run_dir: &Path,
+    manifest: &LaunchManifest,
+    candidate_sha256: &str,
+    trainer_config: &TrainerConfig,
+) -> Result<CliAuthenticatedCandidate, CliOrchestrationError> {
+    decode_lower_hex("candidate record SHA-256", candidate_sha256, 32)?;
+    let ledger = &manifest.payload.candidate_ledger;
+    if ledger.file != RunDir::CANDIDATES_FILE
+        || ledger.format_version != 1
+        || ledger.row_digest_domain != CANDIDATE_RECORD_DOMAIN
+        || ledger.row_signature_algorithm != "ed25519"
+    {
+        return Err(CliOrchestrationError::msg(
+            "unsupported candidate-ledger contract in launch.json",
+        ));
+    }
+    let candidates = load_authenticated_candidates(
+        &run_dir.join(&ledger.file),
+        &manifest.payload_sha256,
+        &ledger.signing_public_key,
+        EngineCandidateValidation::Cli {
+            task: &manifest.payload.task,
+            manifest,
+            topology: {
+                let (rank, world_size) = launch_candidate_topology(&manifest.payload.run);
+                CandidateTopology { rank, world_size }
+            },
+            steps: trainer_config.steps,
+            group_size: trainer_config.group_size,
+            max_new_tokens: trainer_config.max_new_tokens,
+        },
+    )
+    .map_err(|error| CliOrchestrationError::msg(error.to_string()))?;
+    let mut selected = None;
+    for candidate in candidates {
+        if candidate.record.record_sha256.as_deref() == Some(candidate_sha256) {
+            if selected.is_some() {
+                return Err(CliOrchestrationError::msg(format!(
+                    "candidate digest {candidate_sha256} occurs more than once in {}",
+                    run_dir.join(&ledger.file).display()
+                )));
+            }
+            selected = Some(candidate);
+        }
+    }
+    let candidate = selected.ok_or_else(|| {
+        CliOrchestrationError::msg(format!(
+            "candidate digest {candidate_sha256} was not found in {}",
+            run_dir.join(&ledger.file).display()
+        ))
+    })?;
+    let row_bytes = candidate
+        .exact_row_bytes
+        .strip_suffix(b"\n")
+        .ok_or_else(|| {
+            CliOrchestrationError::msg(
+                "authenticated candidate row lost its required JSONL terminator",
+            )
+        })?
+        .to_vec();
+    Ok(CliAuthenticatedCandidate {
+        candidate: candidate.record,
+        row_bytes,
+    })
 }
 
 /// Verify task-specific TriMul verifier provenance on an authenticated CLI row.
@@ -2536,6 +3602,101 @@ fn runtime_hardening_evidence_sha256(
     ))
 }
 
+fn parse_engine_candidate_row(
+    ledger_path: &Path,
+    row_number: usize,
+    raw_line: &str,
+) -> Result<CandidateRecord, EngineError> {
+    const FIELDS: &[&str] = &[
+        "launch_sha256",
+        "record_sha256",
+        "record_signature",
+        "step",
+        "rank",
+        "world_size",
+        "prompt_index",
+        "group_index",
+        "reward",
+        "completion_len_tokens",
+        "reward_diagnostic",
+        "reward_metadata",
+        "completion",
+    ];
+    let value: serde_json::Value =
+        serde_json::from_str(raw_line).map_err(|source| EngineError::CandidateJson {
+            path: ledger_path.to_path_buf(),
+            line: row_number,
+            source,
+        })?;
+    let object = value.as_object().ok_or_else(|| {
+        EngineError::InvalidCandidateEvidence(format!(
+            "candidate ledger {} row {row_number} is not a JSON object",
+            ledger_path.display()
+        ))
+    })?;
+    if let Some(field) = object
+        .keys()
+        .find(|field| !FIELDS.contains(&field.as_str()))
+    {
+        return Err(EngineError::InvalidCandidateEvidence(format!(
+            "candidate ledger {} row {row_number} contains unknown field {field:?}",
+            ledger_path.display()
+        )));
+    }
+    serde_json::from_value(value).map_err(|source| EngineError::CandidateJson {
+        path: ledger_path.to_path_buf(),
+        line: row_number,
+        source,
+    })
+}
+
+fn read_engine_regular_bytes(path: &Path) -> Result<Vec<u8>, EngineError> {
+    let path_metadata = fs::symlink_metadata(path).map_err(|source| EngineError::CandidateIo {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !path_metadata.file_type().is_file() {
+        return Err(EngineError::InvalidCandidateEvidence(format!(
+            "provenance input {} is not a regular file",
+            path.display()
+        )));
+    }
+    let mut file = File::open(path).map_err(|source| EngineError::CandidateIo {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let file_metadata = file.metadata().map_err(|source| EngineError::CandidateIo {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if path_metadata.dev() != file_metadata.dev() || path_metadata.ino() != file_metadata.ino()
+        {
+            return Err(EngineError::InvalidCandidateEvidence(format!(
+                "provenance input {} changed while it was opened",
+                path.display()
+            )));
+        }
+    }
+    let expected_len = file_metadata.len();
+    let mut bytes = Vec::with_capacity(usize::try_from(expected_len).unwrap_or(0));
+    file.read_to_end(&mut bytes)
+        .map_err(|source| EngineError::CandidateIo {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if bytes.len() as u64 != expected_len {
+        return Err(EngineError::InvalidCandidateEvidence(format!(
+            "provenance input {} changed length while it was captured",
+            path.display()
+        )));
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
 fn parse_strict_candidate_row(
     ledger_path: &Path,
     row_number: usize,
@@ -2583,44 +3744,6 @@ fn parse_strict_candidate_row(
             ledger_path.display()
         ))
     })
-}
-
-fn read_regular_bytes(path: &Path) -> Result<Vec<u8>, CliOrchestrationError> {
-    let path_metadata = fs::symlink_metadata(path)
-        .map_err(|error| CliOrchestrationError::msg(format!("read {}: {error}", path.display())))?;
-    if !path_metadata.file_type().is_file() {
-        return Err(CliOrchestrationError::msg(format!(
-            "provenance input {} is not a regular file",
-            path.display()
-        )));
-    }
-    let mut file = File::open(path)
-        .map_err(|error| CliOrchestrationError::msg(format!("read {}: {error}", path.display())))?;
-    let file_metadata = file
-        .metadata()
-        .map_err(|error| CliOrchestrationError::msg(format!("read {}: {error}", path.display())))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        if path_metadata.dev() != file_metadata.dev() || path_metadata.ino() != file_metadata.ino()
-        {
-            return Err(CliOrchestrationError::msg(format!(
-                "provenance input {} changed while it was opened",
-                path.display()
-            )));
-        }
-    }
-    let expected_len = file_metadata.len();
-    let mut bytes = Vec::with_capacity(usize::try_from(expected_len).unwrap_or(0));
-    file.read_to_end(&mut bytes)
-        .map_err(|error| CliOrchestrationError::msg(format!("read {}: {error}", path.display())))?;
-    if bytes.len() as u64 != expected_len {
-        return Err(CliOrchestrationError::msg(format!(
-            "provenance input {} changed length while it was captured",
-            path.display()
-        )));
-    }
-    Ok(bytes)
 }
 
 fn portable_verifier_consensus(
@@ -2696,157 +3819,545 @@ fn domain_sha256(domain: &str, fields: &[&[u8]]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::Path;
-    use std::rc::Rc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
+    use candle_core::{Result as CandleResult, Tensor, Var};
     use serde_json::json;
+
+    use crate::policy::Rollout;
 
     use super::*;
 
-    #[derive(Clone)]
-    struct ProbeLifecycle {
-        events: Rc<RefCell<Vec<&'static str>>>,
-        failure: Option<&'static str>,
-        stop: RunStop,
+    struct ProbeTokenizer {
+        reject: bool,
     }
 
-    impl ProbeLifecycle {
+    impl TokenizerLike for ProbeTokenizer {
+        fn encode(&self, _text: &str) -> Vec<u32> {
+            if self.reject {
+                Vec::new()
+            } else {
+                vec![1]
+            }
+        }
+
+        fn decode(&self, ids: &[u32]) -> String {
+            ids.iter().map(u32::to_string).collect::<Vec<_>>().join(",")
+        }
+    }
+
+    struct ProbePolicy {
+        logp: Var,
+        adapter_enabled: bool,
+        panic_on_tp_preflight_rank_one: bool,
+    }
+
+    impl ProbePolicy {
         fn new() -> Self {
             Self {
-                events: Rc::new(RefCell::new(Vec::new())),
-                failure: None,
-                stop: RunStop::Completed,
-            }
-        }
-
-        fn hit(&mut self, phase: &'static str) -> Result<(), &'static str> {
-            self.events.borrow_mut().push(phase);
-            if self.failure == Some(phase) {
-                Err(phase)
-            } else {
-                Ok(())
+                logp: Var::from_tensor(
+                    &Tensor::zeros((2, 1), candle_core::DType::F32, &Device::Cpu).unwrap(),
+                )
+                .unwrap(),
+                adapter_enabled: true,
+                panic_on_tp_preflight_rank_one: false,
             }
         }
     }
 
-    impl Lifecycle for ProbeLifecycle {
-        type Error = &'static str;
-        type State = ();
-        type Completed = &'static str;
-        type Preempted = &'static str;
+    impl Policy for ProbePolicy {
+        fn generate(&mut self, prompt: &[u32], config: &GenConfig) -> CandleResult<Rollout> {
+            let rows = (0..config.group_size)
+                .map(|index| {
+                    let mut row = prompt.to_vec();
+                    row.push(u32::try_from(index + 1).unwrap());
+                    row
+                })
+                .collect();
+            Ok(Rollout::new(
+                rows,
+                prompt.len(),
+                vec![config.max_new_tokens; config.group_size],
+                None,
+            ))
+        }
 
-        fn setup(&mut self) -> Result<Self::State, Self::Error> {
-            self.hit("setup")?;
+        fn token_logprobs(&self, _rollout: &Rollout) -> CandleResult<Tensor> {
+            Ok(self.logp.as_tensor().clone())
+        }
+
+        fn set_adapter_enabled(&mut self, enabled: bool) {
+            self.adapter_enabled = enabled;
+        }
+
+        fn adapter_enabled(&self) -> bool {
+            self.adapter_enabled
+        }
+
+        fn trainable_vars(&self) -> Vec<Var> {
+            vec![self.logp.clone()]
+        }
+
+        fn sampler_state(&self) -> CandleResult<Vec<u8>> {
+            Ok(Vec::new())
+        }
+
+        fn restore_sampler_state(&mut self, state: &[u8]) -> CandleResult<()> {
+            if state.is_empty() {
+                Ok(())
+            } else {
+                candle_core::bail!("probe policy has no sampler state")
+            }
+        }
+    }
+
+    impl TensorParallelPolicy for ProbePolicy {
+        fn validate_tensor_parallel_execution(&self, comm: &dyn Comm) -> CandleResult<()> {
+            assert!(
+                !(self.panic_on_tp_preflight_rank_one && comm.rank() == 1),
+                "probe TP preflight panic"
+            );
             Ok(())
         }
 
-        fn preflight(&mut self, _state: &mut Self::State) -> Result<(), Self::Error> {
-            self.hit("preflight")
-        }
-
-        fn launch_and_build_trainer(
+        fn generate_at_tensor_parallel_instrumented(
             &mut self,
-            _state: &mut Self::State,
-        ) -> Result<(), Self::Error> {
-            self.hit("launch")
+            prompt: &[u32],
+            config: &GenConfig,
+            _global_row_base: u64,
+            _comm: &dyn Comm,
+            _telemetry: Option<&mut dyn crate::telemetry::ModelTelemetryRecorder>,
+        ) -> CandleResult<Rollout> {
+            self.generate(prompt, config)
         }
 
-        fn train(
-            &mut self,
-            _state: &mut Self::State,
-        ) -> Result<TrainOutcome<Self::Preempted>, Self::Error> {
-            self.hit("train")?;
-            Ok(match self.stop {
-                RunStop::Completed => TrainOutcome::completed(),
-                RunStop::Preempted => TrainOutcome::preempted("checkpoint"),
-            })
+        fn token_logprobs_tensor_parallel(
+            &self,
+            rollout: &Rollout,
+            _comm: &dyn Comm,
+        ) -> CandleResult<Tensor> {
+            self.token_logprobs(rollout)
         }
 
-        fn post_run_health(&mut self, _state: &mut Self::State) -> Result<(), Self::Error> {
-            self.hit("health")
+        fn token_logprobs_tensor_parallel_detached(
+            &self,
+            rollout: &Rollout,
+            _comm: &dyn Comm,
+        ) -> CandleResult<Tensor> {
+            self.token_logprobs_detached(rollout)
         }
+    }
 
-        fn evaluate_and_publish(&mut self, _state: &mut Self::State) -> Result<(), Self::Error> {
-            self.hit("eval")
+    struct ProbeReward;
+
+    impl RewardFn for ProbeReward {
+        type Target = ();
+
+        fn reward(
+            &self,
+            _sample: &Sample<Self::Target>,
+            completion: &str,
+        ) -> Result<f32, crate::reward::RewardError> {
+            Ok(if completion == "2" { 1.0 } else { 0.0 })
         }
+    }
 
-        fn load_and_select_candidates(
-            &mut self,
-            _state: &mut Self::State,
-        ) -> Result<(), Self::Error> {
-            self.hit("candidates")
+    fn cli_probe_request<'a>(
+        root: &'a Path,
+        device: &'a Device,
+        training_samples: &'a [Sample<()>],
+        reward: &'a ProbeReward,
+    ) -> CliTrainingRequest<'a, ProbeReward> {
+        CliTrainingRequest {
+            launch: CliLaunchInput {
+                task: "countdown".into(),
+                ferrl_commit: "ab".repeat(20),
+                authentication: LaunchAuthenticationMode::LocalEphemeralV1,
+                run: LaunchRunIdentity {
+                    group_id: "countdown-probe".into(),
+                    run_id: "countdown-probe".into(),
+                    data_parallel_rank: 0,
+                    data_parallel_world_size: 1,
+                    tensor_parallel_rank: 0,
+                    tensor_parallel_world_size: 1,
+                },
+                config: LaunchConfigSnapshot {
+                    source_sha256: "01".repeat(32),
+                    resolved_sha256: "02".repeat(32),
+                    resolved: json!({"task": "countdown"}),
+                },
+                output_root: root.to_path_buf(),
+            },
+            model_dir: Path::new("probe-model"),
+            device,
+            loader_opts: LoaderOpts::default(),
+            activation_checkpointing: false,
+            eos_selection: CliEosSelection::Disabled,
+            trainer_config: TrainerConfig::builder()
+                .steps(1)
+                .group_size(2)
+                .max_new_tokens(1)
+                .candidate_log_top_k(2)
+                .build(),
+            training_samples,
+            evaluation_samples: &[],
+            reward,
+            evaluation_reward: reward,
+            rendered_prompt_bytes: None,
+            verifier_assets: None,
+            verifier_identity: None,
+            execution: CliExecution::WorldOne,
+            health_policy: CliRunHealthPolicy::default(),
+            health_policy_is_default: true,
+            data_seed: 1,
+            trimul_held_out_secret_seed: None,
         }
+    }
 
-        fn map_completed(self, _state: Self::State) -> Result<Self::Completed, Self::Error> {
-            self.events.borrow_mut().push("complete");
-            if self.failure == Some("complete") {
-                return Err("complete");
-            }
-            Ok("result")
+    fn run_cli_probe<'a>(
+        request: CliTrainingRequest<'a, ProbeReward>,
+        tokenizer_rejects: bool,
+    ) -> Result<(EngineOutcome, ProbePolicy), EngineError> {
+        fn supports_tensor_parallel(_: &ProbePolicy) -> bool {
+            true
+        }
+        let plan = EnginePlan::from_cli(request, None);
+        ConcreteEngine::new(
+            plan,
+            Box::new(move |_model_dir, _device, _options| {
+                Ok((
+                    ProbePolicy::new(),
+                    ProbeTokenizer {
+                        reject: tokenizer_rejects,
+                    },
+                    PolicyLoadIdentity {
+                        policy_sha256: "11".repeat(32),
+                        tokenizer_sha256: "22".repeat(32),
+                        model_family: "qwen3",
+                    },
+                ))
+            }),
+            supports_tensor_parallel,
+            resolve_test_eos::<ProbeTokenizer>,
+        )
+        .run_with_policy()
+    }
+
+    #[test]
+    fn tensor_parallel_policy_preflight_panic_is_coordinated_in_lockstep() {
+        let results = std::thread::scope(|scope| {
+            crate::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(2))
+                .into_iter()
+                .map(|comm| {
+                    scope.spawn(move || {
+                        let mut policy = ProbePolicy::new();
+                        policy.panic_on_tp_preflight_rank_one = true;
+                        validate_tensor_parallel_policy_preflight(&policy, &comm, Some(&comm))
+                            .map_err(|error| error.to_string())
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(results[0]
+            .as_ref()
+            .unwrap_err()
+            .contains("failed on a peer distributed rank"));
+        assert!(results[1]
+            .as_ref()
+            .unwrap_err()
+            .contains("probe TP preflight panic"));
+    }
+
+    #[test]
+    fn data_parallel_eval_publishes_on_primary_without_nonprimary_readback() {
+        let temporary = TestDir::new("dp-eval-publication");
+        let results = std::thread::scope(|scope| {
+            crate::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(3))
+                .into_iter()
+                .enumerate()
+                .map(|(rank, comm)| {
+                    let output_root = temporary.0.clone();
+                    scope.spawn(move || {
+                        let samples = vec![Sample::new("probe", ())];
+                        let reward = ProbeReward;
+                        let device = Device::Cpu;
+                        let request = CliTrainingRequest {
+                            launch: CliLaunchInput {
+                                task: "countdown".into(),
+                                ferrl_commit: "ab".repeat(20),
+                                authentication: LaunchAuthenticationMode::LocalEphemeralV1,
+                                run: LaunchRunIdentity {
+                                    group_id: "countdown-dp-probe".into(),
+                                    run_id: format!("countdown-dp-probe-rank{rank}"),
+                                    data_parallel_rank: rank,
+                                    data_parallel_world_size: 2,
+                                    tensor_parallel_rank: 0,
+                                    tensor_parallel_world_size: 1,
+                                },
+                                config: LaunchConfigSnapshot {
+                                    source_sha256: "01".repeat(32),
+                                    resolved_sha256: "02".repeat(32),
+                                    resolved: json!({"task": "countdown"}),
+                                },
+                                output_root,
+                            },
+                            model_dir: Path::new("probe-model"),
+                            device: &device,
+                            loader_opts: LoaderOpts::default(),
+                            activation_checkpointing: false,
+                            eos_selection: CliEosSelection::Disabled,
+                            trainer_config: TrainerConfig::builder()
+                                .steps(1)
+                                .group_size(2)
+                                .max_new_tokens(1)
+                                .candidate_log_top_k(2)
+                                .build(),
+                            training_samples: &samples,
+                            evaluation_samples: &samples,
+                            reward: &reward,
+                            evaluation_reward: &reward,
+                            rendered_prompt_bytes: None,
+                            verifier_assets: None,
+                            verifier_identity: None,
+                            execution: CliExecution::DataParallel(Box::new(comm)),
+                            health_policy: CliRunHealthPolicy::default(),
+                            health_policy_is_default: true,
+                            data_seed: 1,
+                            trimul_held_out_secret_seed: None,
+                        };
+                        run_cli_probe(request, false)
+                            .and_then(|(outcome, _policy)| match outcome {
+                                EngineOutcome::Completed(completed) => {
+                                    Ok(completed.run.root().to_path_buf())
+                                }
+                                EngineOutcome::Preempted(_) => Err(EngineError::Configuration(
+                                    "DP evaluation probe unexpectedly preempted".into(),
+                                )),
+                            })
+                            .map_err(|error| error.to_string())
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let rank_zero = results[0].as_ref().unwrap();
+        let rank_one = results[1].as_ref().unwrap();
+        assert!(rank_zero.join(RunDir::EVAL_REPORT_FILE).is_file());
+        assert!(!rank_one.join(RunDir::EVAL_REPORT_FILE).exists());
+    }
+
+    #[test]
+    fn data_parallel_health_failure_aborts_every_rank_in_lockstep() {
+        let temporary = TestDir::new("dp-health-lockstep");
+        let results = std::thread::scope(|scope| {
+            crate::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(3))
+                .into_iter()
+                .enumerate()
+                .map(|(rank, comm)| {
+                    let output_root = temporary.0.clone();
+                    scope.spawn(move || {
+                        let samples = vec![Sample::new("probe", ())];
+                        let reward = ProbeReward;
+                        let device = Device::Cpu;
+                        let health_policy = if rank == 1 {
+                            CliRunHealthPolicy::from_json_value(json!({
+                                "reward_collapse": {
+                                    "window": 1,
+                                    "min": 2.0,
+                                    "action": "fail"
+                                }
+                            }))
+                            .unwrap()
+                        } else {
+                            CliRunHealthPolicy::default()
+                        };
+                        let request = CliTrainingRequest {
+                            launch: CliLaunchInput {
+                                task: "countdown".into(),
+                                ferrl_commit: "ab".repeat(20),
+                                authentication: LaunchAuthenticationMode::LocalEphemeralV1,
+                                run: LaunchRunIdentity {
+                                    group_id: "countdown-dp-health-probe".into(),
+                                    run_id: format!("countdown-dp-health-probe-rank{rank}"),
+                                    data_parallel_rank: rank,
+                                    data_parallel_world_size: 2,
+                                    tensor_parallel_rank: 0,
+                                    tensor_parallel_world_size: 1,
+                                },
+                                config: LaunchConfigSnapshot {
+                                    source_sha256: "01".repeat(32),
+                                    resolved_sha256: "02".repeat(32),
+                                    resolved: json!({"task": "countdown"}),
+                                },
+                                output_root,
+                            },
+                            model_dir: Path::new("probe-model"),
+                            device: &device,
+                            loader_opts: LoaderOpts::default(),
+                            activation_checkpointing: false,
+                            eos_selection: CliEosSelection::Disabled,
+                            trainer_config: TrainerConfig::builder()
+                                .steps(1)
+                                .group_size(2)
+                                .max_new_tokens(1)
+                                .candidate_log_top_k(2)
+                                .build(),
+                            training_samples: &samples,
+                            evaluation_samples: &samples,
+                            reward: &reward,
+                            evaluation_reward: &reward,
+                            rendered_prompt_bytes: None,
+                            verifier_assets: None,
+                            verifier_identity: None,
+                            execution: CliExecution::DataParallel(Box::new(comm)),
+                            health_policy,
+                            health_policy_is_default: rank == 0,
+                            data_seed: 1,
+                            trimul_held_out_secret_seed: None,
+                        };
+                        run_cli_probe(request, false).map_err(|error| error.to_string())
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        match &results[0] {
+            Err(error) => assert!(error.contains("failed on a peer distributed rank")),
+            Ok(_) => panic!("rank zero unexpectedly passed asymmetric DP health"),
+        }
+        match &results[1] {
+            Err(error) => assert!(error.contains("run_health policy failed")),
+            Ok(_) => panic!("rank one unexpectedly passed failing DP health"),
         }
     }
 
     #[test]
-    fn library_lifecycle_runs_every_trusted_phase_in_exact_order() {
-        let lifecycle = ProbeLifecycle::new();
-        let events = Rc::clone(&lifecycle.events);
-        assert_eq!(
-            run_lifecycle(lifecycle).unwrap(),
-            LifecycleOutcome::Completed("result")
-        );
-        assert_eq!(
-            *events.borrow(),
-            vec![
-                "setup",
-                "preflight",
-                "launch",
-                "train",
-                "health",
-                "eval",
-                "candidates",
-                "complete"
-            ]
-        );
+    fn cli_adapter_traverses_the_same_concrete_engine_and_short_circuits_preflight() {
+        let temporary = TestDir::new("cli-shared-engine");
+        let samples = vec![Sample::new("probe", ())];
+        let reward = ProbeReward;
+        let device = Device::Cpu;
+        let (outcome, _policy) = run_cli_probe(
+            cli_probe_request(temporary.0.as_path(), &device, &samples, &reward),
+            false,
+        )
+        .unwrap();
+        let EngineOutcome::Completed(completed) = outcome else {
+            panic!("probe CLI run unexpectedly preempted");
+        };
+        assert!(completed.run.root().join(RunDir::LAUNCH_FILE).is_file());
+        assert!(!completed.candidates.is_empty());
+
+        let rejected_root = temporary.0.join("rejected");
+        let Err(error) = run_cli_probe(
+            cli_probe_request(&rejected_root, &device, &samples, &reward),
+            true,
+        ) else {
+            panic!("rejected tokenizer unexpectedly passed preflight");
+        };
+        assert!(error.to_string().contains("encoded to zero tokens"));
+        assert!(!rejected_root.exists());
     }
 
     #[test]
-    fn library_lifecycle_short_circuits_each_failed_phase() {
-        for failed in [
-            "setup",
-            "preflight",
-            "launch",
-            "train",
-            "health",
-            "eval",
-            "candidates",
-            "complete",
-        ] {
-            let mut lifecycle = ProbeLifecycle::new();
-            lifecycle.failure = Some(failed);
-            let events = Rc::clone(&lifecycle.events);
-            assert_eq!(run_lifecycle(lifecycle).unwrap_err(), failed);
-            let events = events.borrow();
-            assert_eq!(events.last(), Some(&failed), "{failed}: {events:?}");
-        }
+    fn sdk_and_cli_adapters_share_preflight_and_fail_before_mutation() {
+        let temporary = TestDir::new("adapter-preflight-parity");
+        let samples = vec![Sample::new("probe", ())];
+        let reward = ProbeReward;
+        let device = Device::Cpu;
+
+        let cli_root = temporary.0.join("cli-rejected");
+        let Err(cli_error) = run_cli_probe(
+            cli_probe_request(&cli_root, &device, &samples, &reward),
+            true,
+        ) else {
+            panic!("CLI adapter unexpectedly bypassed shared tokenizer preflight");
+        };
+
+        let discovery_root = temporary.0.join("sdk-rejected");
+        let task = crate::discovery::TaskIdentity::new("probe", 1).unwrap();
+        let request = DiscoveryTrainingRequest {
+            model_dir: Path::new("probe-model"),
+            device: &device,
+            loader_opts: LoaderOpts::default(),
+            eos_selection: EngineEosSelection::Disabled,
+            trainer_config: TrainerConfig::builder()
+                .steps(1)
+                .group_size(2)
+                .max_new_tokens(1)
+                .candidate_log_top_k(2)
+                .build(),
+            training_samples: &samples,
+            evaluation_samples: &[],
+            reward: &reward,
+            evaluation_reward: &reward,
+            launch: DiscoveryLaunchInput {
+                task: &task,
+                metric_contract: crate::discovery::MetricContract::new(
+                    "probe-score",
+                    "points",
+                    crate::discovery::MetricDirection::HigherIsBetter,
+                    0.0,
+                    0.0,
+                ),
+                ferrl_source: crate::discovery::BuildSourceIdentity::for_orchestration_test(),
+                execution_device: crate::discovery::ExecutionDevice::Cpu,
+                runs_root: &discovery_root,
+                steps: 1,
+                group_size: 2,
+                max_new_tokens: 1,
+                eval_group_size: 1,
+                temperature: 1.0,
+                learning_rate: 1e-3,
+                seed: 1,
+                preemption_flag: None,
+            },
+        };
+        let Err(discovery_error) = run_discovery_with_test_loader(
+            request,
+            |_model_dir, _device, _options| {
+                Ok((
+                    ProbePolicy::new(),
+                    ProbeTokenizer { reject: true },
+                    PolicyLoadIdentity {
+                        policy_sha256: "11".repeat(32),
+                        tokenizer_sha256: "22".repeat(32),
+                        model_family: "qwen3",
+                    },
+                ))
+            },
+            |_| true,
+        ) else {
+            panic!("SDK adapter unexpectedly bypassed shared tokenizer preflight");
+        };
+
+        assert!(cli_error.to_string().contains("encoded to zero tokens"));
+        assert!(discovery_error
+            .to_string()
+            .contains("encoded to zero tokens"));
+        assert!(!cli_root.exists());
+        assert!(!discovery_root.exists());
     }
 
     #[test]
-    fn library_lifecycle_preemption_skips_every_post_training_phase() {
-        let mut lifecycle = ProbeLifecycle::new();
-        lifecycle.stop = RunStop::Preempted;
-        let events = Rc::clone(&lifecycle.events);
-        assert_eq!(
-            run_lifecycle(lifecycle).unwrap(),
-            LifecycleOutcome::Preempted("checkpoint")
+    fn shared_engine_phase_helpers_are_fail_closed_before_mutation() {
+        let samples = vec![Sample::new("prompt", ())];
+        let (_, bytes) = exact_execution_samples(&samples, "test samples").unwrap();
+        assert!(!bytes.is_empty());
+        assert!(
+            preflight_prompt_tokenization(&samples, "test samples", &OneTokenTokenizer,).is_ok()
         );
-        assert_eq!(
-            *events.borrow(),
-            vec!["setup", "preflight", "launch", "train"]
-        );
+        assert!(preflight_prompt_tokenization(&samples, "test samples", &EmptyTokenizer,).is_err());
     }
 
     struct TestDir(PathBuf);
@@ -3429,6 +4940,188 @@ mod tests {
         let rules: Vec<_> = report.findings.iter().map(|finding| finding.rule).collect();
         assert!(rules.contains(&"reward_collapse"));
         assert!(rules.contains(&"source_dominance"));
+    }
+
+    #[test]
+    fn cli_candidate_health_reader_preserves_correctness_and_source_buckets() {
+        let temporary = TestDir::new("candidate-health-inputs");
+        let first = RunDir::create(&temporary.0, "first").unwrap();
+        let second = RunDir::create(&temporary.0, "second").unwrap();
+        let signer = CandidateSigner::generate().unwrap();
+        let manifest = candidate_test_manifest(0, 1, signer.public_key_hex());
+        fs::write(
+            first.candidates_path(),
+            signed_candidate_row(
+                &signer,
+                &manifest,
+                0,
+                0,
+                1,
+                1.0,
+                1,
+                "correct",
+                Some(json!({"correct": true, "source_sha256": "source-a"})),
+            ),
+        )
+        .unwrap();
+        fs::write(
+            second.candidates_path(),
+            signed_candidate_row(
+                &signer,
+                &manifest,
+                1,
+                0,
+                1,
+                0.0,
+                1,
+                "unknown",
+                Some(json!({})),
+            ),
+        )
+        .unwrap();
+
+        let health = read_cli_candidate_health_inputs(&[
+            first.root().to_path_buf(),
+            second.candidates_path(),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(health.total, 2);
+        assert_eq!(health.source_buckets["source-a"], 1);
+        assert_eq!(health.source_buckets["__unknown_source__"], 1);
+        assert_eq!(health.steps[&0].correctness_supported, 1);
+        assert_eq!(health.steps[&0].correct, 1);
+        assert_eq!(health.steps[&1].correctness_supported, 0);
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn correctness_health_rejects_each_incomplete_evidence_shape() {
+        let history = vec![Metrics::at_step(0), Metrics::at_step(1)];
+        let rule = CliWindowThreshold {
+            window: 2,
+            min: 0.75,
+            action: CliHealthAction::Warn,
+        };
+        let context = CliRunHealthContext {
+            group_size: 2,
+            prompt_groups_per_step: 1,
+        };
+        let finding = |history: &[Metrics], candidates: Option<&CliCandidateHealth>| {
+            let mut report = CliRunHealthReport::default();
+            push_correctness_collapse_finding(history, context, candidates, &rule, &mut report);
+            report.findings.into_iter().next().unwrap().message
+        };
+
+        assert!(finding(&history[..1], None).contains("only 1 metric rows"));
+        assert!(finding(&history, None).contains("ledger unavailable"));
+        assert!(finding(&history, Some(&CliCandidateHealth::default())).contains("ledger is empty"));
+
+        let mut missing = CliCandidateHealth {
+            total: 1,
+            ..CliCandidateHealth::default()
+        };
+        missing.steps.insert(0, CliCandidateStepHealth::default());
+        assert!(finding(&history, Some(&missing)).contains("missing rows"));
+
+        let step = |indices: BTreeSet<usize>, supported: usize, correct: usize| {
+            let mut step = CliCandidateStepHealth {
+                total: 2,
+                correctness_supported: supported,
+                correct,
+                ..CliCandidateStepHealth::default()
+            };
+            step.prompt_groups.insert(
+                0,
+                CliCandidatePromptGroupHealth {
+                    group_indices: indices,
+                },
+            );
+            step
+        };
+        let mut partial = CliCandidateHealth {
+            total: 2,
+            ..CliCandidateHealth::default()
+        };
+        partial.steps.insert(0, step(BTreeSet::from([0]), 1, 1));
+        partial.steps.insert(1, step(BTreeSet::from([0]), 1, 1));
+        assert!(finding(&history, Some(&partial)).contains("lacks full group coverage"));
+
+        let mut unsupported = CliCandidateHealth {
+            total: 4,
+            ..CliCandidateHealth::default()
+        };
+        unsupported
+            .steps
+            .insert(0, step(BTreeSet::from([0, 1]), 0, 0));
+        unsupported
+            .steps
+            .insert(1, step(BTreeSet::from([0, 1]), 0, 0));
+        assert!(finding(&history, Some(&unsupported)).contains("metadata unavailable"));
+
+        let mut low_fraction = CliCandidateHealth {
+            total: 4,
+            ..CliCandidateHealth::default()
+        };
+        low_fraction
+            .steps
+            .insert(0, step(BTreeSet::from([0, 1]), 2, 1));
+        low_fraction
+            .steps
+            .insert(1, step(BTreeSet::from([0, 1]), 2, 0));
+        assert!(finding(&history, Some(&low_fraction)).contains("1/4 = 0.250"));
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn grad_health_and_report_render_cover_warn_and_fail_verdicts() {
+        let history = vec![
+            Metrics {
+                grad_norm: 1.0,
+                ..Metrics::at_step(1)
+            },
+            Metrics {
+                grad_norm: 3.0,
+                ..Metrics::at_step(2)
+            },
+            Metrics {
+                grad_norm: 9.0,
+                ..Metrics::at_step(3)
+            },
+        ];
+        let noisy_history = vec![
+            Metrics {
+                grad_norm: f32::NAN,
+                ..Metrics::at_step(0)
+            },
+            Metrics {
+                grad_norm: -1.0,
+                ..Metrics::at_step(1)
+            },
+            Metrics {
+                grad_norm: 3.0,
+                ..Metrics::at_step(2)
+            },
+        ];
+        assert_eq!(median_positive_grad_norm(&[]), 0.0);
+        assert_eq!(median_positive_grad_norm(&noisy_history), 3.0);
+        assert_eq!(median_positive_grad_norm(&history), 3.0);
+
+        let mut report = CliRunHealthReport::default();
+        push_grad_spike_finding(
+            &history,
+            &CliFactorThreshold {
+                factor: 2.0,
+                action: CliHealthAction::Warn,
+            },
+            &mut report,
+        );
+        assert!(report.render().contains("WARN grad_spike"));
+        report.push("forced", CliHealthAction::Fail, "failed".into());
+        assert!(report.is_fail());
+        let rendered = report.render();
+        assert!(rendered.contains("run health policy — FAIL"));
+        assert!(rendered.contains("FAIL forced: failed"));
     }
 
     #[test]
