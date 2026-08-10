@@ -987,6 +987,36 @@ impl CandidateRecord {
     }
 }
 
+/// Verify one decoded candidate row's canonical encoding, launch binding, and
+/// launch-key signature.
+///
+/// # Errors
+///
+/// Returns [`TelemetryError::CandidateProvenance`] when canonical encoding,
+/// launch binding, digest, or signature validation fails.
+#[doc(hidden)]
+pub fn verify_signed_candidate_row(
+    raw_row: &[u8],
+    signing_public_key: &str,
+    expected_launch_sha256: &str,
+    record: &CandidateRecord,
+) -> Result<(), TelemetryError> {
+    let expected = serde_json::to_vec(record)
+        .map_err(|error| TelemetryError::CandidateProvenance(error.to_string()))?;
+    if expected != raw_row {
+        return Err(TelemetryError::CandidateProvenance(
+            "candidate row is not in the exact production encoding (canonical candidate JSON)"
+                .into(),
+        ));
+    }
+    if record.launch_sha256.as_deref() != Some(expected_launch_sha256) {
+        return Err(TelemetryError::CandidateProvenance(
+            "candidate row belongs to a different launch".into(),
+        ));
+    }
+    record.verify_signed_provenance(signing_public_key)
+}
+
 /// Process-local Ed25519 capability used to authenticate production candidate
 /// rows to an externally attested launch.
 ///

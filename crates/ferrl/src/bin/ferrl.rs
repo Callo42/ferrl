@@ -12,9 +12,9 @@
 //! ```
 //!
 //! `train` reads a `RunConfig` (a serialized [`TrainerConfig`](ferrl::TrainerConfig)
-//! plus a model directory, a device, and a task selector), loads a supported policy via
-//! [`ferrl::load_auto_policy`], builds the named task's train/eval splits, and runs
-//! the GRPO [`Trainer`](ferrl::Trainer). The task registry is closed (the worked
+//! plus a model directory, a device, and a task selector), builds the named
+//! task's train/eval splits, and adapts those closed inputs into the shared
+//! concrete orchestration engine. The task registry is closed (the worked
 //! examples `countdown` and `math`, plus the `trimul` kernel-discovery task — which
 //! runs a sandboxed GPU eval as its reward); a *custom* task is wired in Rust against
 //! the library — see `examples/minimal_task.rs` and the README's "Wire your own task".
@@ -54,6 +54,33 @@ use std::time::Duration;
 
 use candle_core::{DType, Device};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+#[cfg(test)]
+use ferrl::orchestration::LaunchRunIdentity;
+use ferrl::orchestration::{
+    CliBuiltinTask, CliDeviceSelection, CliEosSelection, CliLaunchAttestor, CliLaunchRuntime,
+    CliOrchestrationError, CliRunHealthPolicy, CliRunOutcome, CliTrainSetup, CliTrimulBaseline,
+    CliTrimulTask, LaunchAttestation, LaunchAttestationRequest, LaunchAuthenticationMode,
+    LaunchConfigSnapshot, LaunchManifest, LaunchTrustPolicy, LaunchVerifierIdentity,
+    CANDIDATE_RECORD_DOMAIN, LAUNCH_ATTESTATION_ALGORITHM, LAUNCH_ATTESTATION_CONTRACT_VERSION,
+    LAUNCH_ATTESTATION_DOMAIN, LAUNCH_ATTESTATION_KIND, LAUNCH_ATTESTATION_REQUEST_KIND,
+    LAUNCH_CONTRACT_VERSION, LAUNCH_KIND, LAUNCH_PAYLOAD_DOMAIN, LAUNCH_TRUST_POLICY_KIND,
+    LEGACY_LAUNCH_CONTRACT_VERSION, LEGACY_LAUNCH_PAYLOAD_DOMAIN,
+};
+#[cfg(test)]
+use ferrl::orchestration::{
+    LaunchCandidateLedger, LaunchModelIdentity, LaunchPayload, LaunchPromptIdentity,
+    LaunchSampleIdentity, LaunchTrustKey,
+};
+#[cfg(test)]
+use ferrl::telemetry::CandidateSigner;
+use ferrl::telemetry::{CandidateRecord, RegressionFailure};
+use ferrl::{
+    compare_distributed_metrics, compare_metrics, summarize, BaseQuantization, LoaderOpts,
+    RegressionBudget, RegressionReport, RewardFn, RunDir, Sample, TensorParallelPlan,
+    TrainerConfig, TrimulReward, VerifierExecutorConfig,
+};
+#[cfg(test)]
+use ferrl::{math_split_key, read_jsonl, train_eval_split_by_key, MathProblem};
 use ring::rand::{SecureRandom as _, SystemRandom};
 use ring::signature::{UnparsedPublicKey, ED25519};
 use serde::{
@@ -62,33 +89,10 @@ use serde::{
     Deserialize, Serialize,
 };
 use sha2::{Digest, Sha256};
-use tracing::info;
-
-use ferrl::countdown::{build_prompt, generate_dataset, CountdownConfig, CountdownProblem};
-use ferrl::policy::{GenConfig, Policy, TensorParallelPolicy};
-use ferrl::telemetry::{CandidateRecord, CandidateSigner, RegressionFailure};
-use ferrl::{
-    compare_distributed_metrics, compare_metrics, evaluate, math_split_key, read_jsonl, summarize,
-    train_eval_split_by_key, BaseQuantization, CountdownReward, LoaderOpts, MathProblem,
-    MathReward, RegressionBudget, RegressionReport, RewardFn, RunDir, RunStop, Sample,
-    TensorParallelPlan, TokenizerLike, Trainer, TrainerConfig, TrimulReward,
-    VerifierExecutorConfig,
-};
 
 /// A task's train/eval split: `(train, eval)` samples of the task's target type.
+#[cfg(test)]
 type Splits<T> = (Vec<Sample<T>>, Vec<Sample<T>>);
-
-#[derive(Debug, Serialize)]
-struct DurableEvalReport<'a> {
-    contract: &'static str,
-    publishing_launch_sha256: String,
-    launch_group_sha256: String,
-    task: &'a str,
-    split_key_contract: &'static str,
-    eval_samples_sha256: String,
-    evaluation_boundary_sha256: String,
-    report: &'a ferrl::EvalReport,
-}
 
 /// Largest case-generation seed accepted by the protected TriMul evaluator.
 const TRIMUL_CASE_SEED_MAX: u64 = u32::MAX as u64;
@@ -479,6 +483,9 @@ enum CliError {
     /// A data-parallel collective or launch-configuration error.
     #[error(transparent)]
     Comm(#[from] ferrl::CommError),
+    /// The hidden concrete library-owned orchestration engine failed.
+    #[error(transparent)]
+    Orchestration(#[from] CliOrchestrationError),
     /// A CUDA device error (only on a `--features cuda` build).
     #[cfg(feature = "cuda")]
     #[error("{0}")]
@@ -501,35 +508,6 @@ enum DeviceSel {
     Cpu,
     /// CUDA device 0 (requires a `--features cuda` build).
     Cuda,
-}
-
-impl DeviceSel {
-    /// Open the selected device, running the CUDA preflight when applicable.
-    fn open(self) -> Result<Device, CliError> {
-        match self {
-            DeviceSel::Cpu => Ok(Device::Cpu),
-            DeviceSel::Cuda => open_cuda(),
-        }
-    }
-}
-
-/// Open CUDA device 0 with the driver-compat preflight (a `--features cuda` build).
-#[cfg(feature = "cuda")]
-fn open_cuda() -> Result<Device, CliError> {
-    let device = Device::new_cuda(0)?;
-    if let Some(w) = ferrl::check_driver_compat(&device).warning() {
-        tracing::warn!("{w}");
-    }
-    ferrl::guard_first_kernel(&device)?;
-    Ok(device)
-}
-
-/// Without the `cuda` feature there is no CUDA backend to open.
-#[cfg(not(feature = "cuda"))]
-fn open_cuda() -> Result<Device, CliError> {
-    Err(CliError::msg(
-        "device \"cuda\" requires building ferrl with --features cuda; use device \"cpu\" otherwise",
-    ))
 }
 
 /// The dtype the frozen base weights load in.
@@ -728,18 +706,6 @@ struct TrimulCfg {
     baseline: Option<BaselineCfg>,
     /// Versioned shaped training-reward profile.
     reward: ferrl::trimul::TrimulRewardProfile,
-}
-
-/// How the immutable launch is authenticated before candidate rows are published.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum LaunchAuthenticationMode {
-    /// Process-local discovery integrity. This mode requires no administrator service
-    /// and retains an explicit operator-trust boundary when its candidate is audited.
-    #[default]
-    LocalEphemeralV1,
-    /// Root-trusted external launch attestation for an optional stronger discovery boundary.
-    ExternalAttestedV1,
 }
 
 /// Discovery-health policy schema.
@@ -1311,10 +1277,6 @@ impl RunConfig {
         Ok(())
     }
 
-    fn open_device(&self) -> Result<Device, CliError> {
-        self.device.open()
-    }
-
     /// Read and parse a run config from `path`.
     fn load(path: &Path) -> Result<Self, CliError> {
         Self::load_for_launch(path).map(|loaded| loaded.config)
@@ -1515,6 +1477,7 @@ impl RunConfig {
         }
     }
 
+    #[cfg(test)]
     fn resolve_eos_token_id(
         &self,
         tokenizer: &ferrl::HfTokenizer,
@@ -1532,6 +1495,7 @@ impl RunConfig {
             .map_err(|error| CliError::msg(format!("checkpoint EOS resolution failed: {error}")))
     }
 
+    #[cfg(test)]
     fn resolved_trainer_config(
         &self,
         tokenizer: &ferrl::HfTokenizer,
@@ -1543,19 +1507,8 @@ impl RunConfig {
 
     /// Build the Countdown train/eval splits: generate `train_n + eval_n` problems
     /// and hold out `eval_n` via the dedup-aware [`train_eval_split`].
-    fn countdown_splits(&self) -> Splits<CountdownProblem> {
-        let cd = CountdownConfig::default();
-        let n = self.data.train_n + self.data.eval_n;
-        let samples: Vec<Sample<CountdownProblem>> = generate_dataset(self.data.seed, n, &cd)
-            .into_iter()
-            .map(|p| Sample::new(build_prompt(&p), p))
-            .collect();
-        train_eval_split_by_key(samples, self.data.eval_n, self.data.seed, |sample| {
-            sample.target.split_key()
-        })
-    }
-
     /// Build the math train/eval splits from the configured JSONL `data.path`.
+    #[cfg(test)]
     fn math_splits(&self) -> Result<Splits<MathProblem>, CliError> {
         let path = self.data.path.as_ref().ok_or_else(|| {
             CliError::msg("task \"math\" requires data.path (a JSONL dataset of {prompt, target})")
@@ -1585,6 +1538,7 @@ impl RunConfig {
     }
 
     /// Read the complete rendered TriMul model prompt file bytes.
+    #[cfg(test)]
     fn trimul_prompt_file_bytes(&self) -> Result<Vec<u8>, CliError> {
         let Some(path) = &self.trimul.prompt_path else {
             return Err(CliError::msg(
@@ -1595,6 +1549,7 @@ impl RunConfig {
     }
 
     /// Decode the exact TriMul prompt text fed to the model from launch-file bytes.
+    #[cfg(test)]
     fn trimul_prompt_text(&self, prompt_file_bytes: &[u8]) -> Result<String, CliError> {
         let prompt = std::str::from_utf8(prompt_file_bytes)
             .map_err(|e| CliError::msg(format!("trimul prompt is not valid UTF-8: {e}")))?;
@@ -1605,6 +1560,7 @@ impl RunConfig {
     }
 
     /// Build the repeated TriMul train/eval splits from the exact model prompt.
+    #[cfg(test)]
     fn trimul_splits_from_prompt(&self, prompt: &str) -> Splits<()> {
         let train = std::iter::repeat_with(|| Sample::new(prompt.to_owned(), ()))
             .take(self.data.train_n)
@@ -1739,6 +1695,7 @@ impl RunConfig {
         Ok(reward)
     }
 
+    #[cfg(test)]
     fn build_trimul_held_out_reward_with_assets(
         &self,
         assets: ferrl::trimul::TrimulVerifierAssets,
@@ -1781,67 +1738,9 @@ struct LoadedRunConfig {
     consensus_digest: [u8; 32],
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LaunchConfigSnapshot {
-    source_sha256: String,
-    resolved_sha256: String,
-    resolved: serde_json::Value,
-}
-
-const LAUNCH_CONTRACT_VERSION: u32 = 2;
-const LAUNCH_KIND: &str = "ferrl.run-launch";
-const LAUNCH_PAYLOAD_DOMAIN: &str = "ferrl.run-launch.payload.v2";
-const CANDIDATE_RECORD_DOMAIN: &str = CandidateRecord::DIGEST_DOMAIN;
-const LAUNCH_ATTESTATION_CONTRACT_VERSION: u32 = 1;
-const LAUNCH_ATTESTATION_KIND: &str = "ferrl.run-launch-attestation";
-const LAUNCH_ATTESTATION_ALGORITHM: &str = "ed25519";
-const LAUNCH_ATTESTATION_DOMAIN: &str = "ferrl.run-launch-attestation.v1";
-const LAUNCH_ATTESTATION_REQUEST_KIND: &str = "ferrl.run-launch-attestation-request";
-const LAUNCH_TRUST_POLICY_KIND: &str = "ferrl.run-launch-trust-policy";
 const LAUNCH_ATTESTOR_SOCKET: &str = "/run/ferrl/launch-attestor.sock";
 const LAUNCH_TRUST_POLICY: &str = "/etc/ferrl/launch-trust.json";
 const MAX_ATTESTATION_RESPONSE_BYTES: u64 = 16 * 1024;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LaunchManifest {
-    contract_version: u32,
-    kind: String,
-    payload_sha256: String,
-    payload: LaunchPayload,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    attestation: Option<LaunchAttestation>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LaunchPayload {
-    task: String,
-    ferrl_commit: String,
-    authentication: LaunchAuthenticationMode,
-    run: LaunchRunIdentity,
-    config: LaunchConfigSnapshot,
-    model: LaunchModelIdentity,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    prompt: Option<LaunchPromptIdentity>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    verifier: Option<LaunchVerifierIdentity>,
-    candidate_ledger: LaunchCandidateLedger,
-}
-
-/// Launch-bound TriMul assets and selected verifier assurance evidence.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LaunchVerifierIdentity {
-    assets: ferrl::trimul::TrimulVerifierIdentity,
-    isolation: ferrl::VerifierIsolationEvidence,
-    isolation_evidence_sha256: String,
-    timing_metric: String,
-    runtime_hardening_contract: String,
-    runtime_preflight: ferrl::trimul::TrimulRuntimePreflightEvidence,
-    runtime_preflight_evidence_sha256: String,
-}
 
 fn verifier_isolation_evidence_sha256(evidence: &ferrl::VerifierIsolationEvidence) -> String {
     ferrl::trimul::verifier_isolation_evidence_sha256(evidence)
@@ -1887,105 +1786,13 @@ fn launch_verifier_identity(
     })
 }
 
-fn portable_verifier_consensus(identity: &LaunchVerifierIdentity) -> Result<Vec<u8>, CliError> {
-    serde_json::to_vec(&(
-        identity.isolation.contract_version,
-        identity.isolation.tier,
-        identity.isolation.uid_boundary,
-        identity.isolation.asset_transport,
-        &identity.isolation.apptainer_sha256,
-        identity.isolation.apptainer_len_bytes,
-        &identity.isolation.apptainer_version,
-        &identity.timing_metric,
-        &identity.runtime_hardening_contract,
-        identity.runtime_preflight.contract_version,
-        &identity.runtime_preflight.probe_submission_sha256,
-        &identity.runtime_preflight.runtime_hardening,
-    ))
-    .map_err(|error| CliError::msg(format!("serialize verifier consensus evidence: {error}")))
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LaunchRunIdentity {
-    group_id: String,
-    run_id: String,
-    data_parallel_rank: usize,
-    data_parallel_world_size: usize,
-    tensor_parallel_rank: usize,
-    tensor_parallel_world_size: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LaunchModelIdentity {
-    family: String,
-    checkpoint_policy_sha256: String,
-    tokenizer_sha256: String,
-    resolved_eos_token_id: Option<u32>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LaunchPromptIdentity {
-    file: String,
-    sha256: String,
-    len_bytes: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LaunchCandidateLedger {
-    file: String,
-    format_version: u32,
-    row_digest_domain: String,
-    row_signature_algorithm: String,
-    signing_public_key: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LaunchAttestation {
-    contract_version: u32,
-    kind: String,
-    algorithm: String,
-    key_id: String,
-    launch_payload_sha256: String,
-    signature: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LaunchAttestationRequest {
-    contract_version: u32,
-    kind: String,
-    algorithm: String,
-    launch_payload_sha256: String,
-    launch_payload_json_hex: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LaunchTrustPolicy {
-    contract_version: u32,
-    kind: String,
-    keys: Vec<LaunchTrustKey>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LaunchTrustKey {
-    key_id: String,
-    algorithm: String,
-    public_key: String,
-}
-
 trait LaunchAttestor {
     fn attest(&self, manifest: &LaunchManifest) -> Result<LaunchAttestation, CliError>;
 }
 
 struct SystemLaunchAttestor;
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct LaunchContext {
     ferrl_commit: String,
@@ -2022,33 +1829,6 @@ fn validated_build_source_identity(
         commit,
         dirty: false,
     })
-}
-
-impl LaunchManifest {
-    fn new(payload: LaunchPayload) -> Result<Self, CliError> {
-        let payload_bytes = serde_json::to_vec(&payload)
-            .map_err(|error| CliError::msg(format!("serialize launch payload: {error}")))?;
-        Ok(Self {
-            contract_version: LAUNCH_CONTRACT_VERSION,
-            kind: LAUNCH_KIND.to_owned(),
-            payload_sha256: domain_sha256(LAUNCH_PAYLOAD_DOMAIN, &[&payload_bytes]),
-            payload,
-            attestation: None,
-        })
-    }
-
-    fn attest(mut self, attestor: &dyn LaunchAttestor) -> Result<Self, CliError> {
-        if self.attestation.is_some() {
-            return Err(CliError::msg("launch manifest is already attested"));
-        }
-        self.attestation = Some(attestor.attest(&self)?);
-        Ok(self)
-    }
-
-    fn to_pretty_bytes(&self) -> Result<Vec<u8>, CliError> {
-        serde_json::to_vec_pretty(self)
-            .map_err(|error| CliError::msg(format!("serialize launch manifest: {error}")))
-    }
 }
 
 impl LaunchAttestor for SystemLaunchAttestor {
@@ -2335,7 +2115,6 @@ fn train(args: &TrainArgs) -> Result<(), CliError> {
         args,
         launch_runtime,
         embedded_build_source_identity(),
-        prepare_launch_device,
     )
 }
 
@@ -2344,21 +2123,14 @@ fn train_with_launch_runtime(
     args: &TrainArgs,
     launch_runtime: Option<LaunchRuntime>,
     build_source: BuildSourceIdentity,
-    prepare_device: impl FnOnce(&RunConfig, Option<&LaunchRuntime>) -> Result<Device, CliError>,
 ) -> Result<(), CliError> {
-    train_with_launch_runtime_and_source_result(
-        args,
-        launch_runtime,
-        Ok(build_source),
-        prepare_device,
-    )
+    train_with_launch_runtime_and_source_result(args, launch_runtime, Ok(build_source))
 }
 
 fn train_with_launch_runtime_and_source_result(
     args: &TrainArgs,
     launch_runtime: Option<LaunchRuntime>,
     local_build_source: Result<BuildSourceIdentity, CliError>,
-    prepare_device: impl FnOnce(&RunConfig, Option<&LaunchRuntime>) -> Result<Device, CliError>,
 ) -> Result<(), CliError> {
     let launch_comm = launch_runtime.as_ref().map(|runtime| runtime.comm.as_ref());
     let build_source = coordinate_distributed_result(
@@ -2371,688 +2143,166 @@ fn train_with_launch_runtime_and_source_result(
         "run config load",
         RunConfig::load_for_launch(&args.config),
     )?;
-    let cfg = loaded.config;
-    validate_launch_runtime(&cfg, launch_runtime.as_ref())?;
-    validate_launch_config_consensus(&loaded.consensus_digest, launch_comm)?;
-    debug_assert!(!build_source.dirty);
-    let ferrl_commit = build_source.commit;
-    validate_launch_value_consensus("training commit", ferrl_commit.as_bytes(), launch_comm)?;
-    let launch = LaunchContext {
-        ferrl_commit,
-        run: synchronized_run_identity(&cfg, launch_comm)?,
-        config: loaded.launch_config,
-    };
-    let data_parallel_world = if cfg.distributed.enabled {
-        launch_comm
-            .ok_or_else(|| {
-                CliError::msg(
-                    "distributed execution has no live communicator after launch validation",
-                )
-            })?
-            .world_size()
-    } else {
-        1
-    };
-    cfg.trainer
-        .validate_reward_group_world(data_parallel_world)
-        .map_err(|error| CliError::msg(error.to_string()))?;
-    let local_device = prepare_device(&cfg, launch_runtime.as_ref());
-    let device = coordinate_distributed_result(launch_comm, "device setup", local_device)?;
-    match cfg.task.as_str() {
-        "countdown" => {
-            let (train, eval) = cfg.countdown_splits();
-            run_training(
-                &cfg,
-                &device,
-                &CountdownReward::default(),
-                &CountdownReward::default(),
-                &train,
-                &eval,
-                None,
-                None,
-                None,
-                &launch,
-                launch_runtime,
-            )
-        }
-        "math" => {
-            let (train, eval) = coordinate_distributed_result(
-                launch_comm,
-                "math dataset setup",
-                cfg.math_splits(),
-            )?;
-            run_training(
-                &cfg,
-                &device,
-                &MathReward::default(),
-                &MathReward::default(),
-                &train,
-                &eval,
-                None,
-                None,
-                None,
-                &launch,
-                launch_runtime,
-            )
-        }
-        "trimul" => {
-            let (
-                prompt_file_bytes,
-                train,
-                eval,
-                reward,
-                eval_reward,
-                verifier_assets,
-                verifier_identity,
-            ) = coordinate_distributed_result(
-                launch_comm,
-                "TriMul reward and dataset setup",
-                (|| {
-                    let prompt_file_bytes = cfg.trimul_prompt_file_bytes()?;
-                    let prompt = cfg.trimul_prompt_text(&prompt_file_bytes)?;
-                    let (train, eval) = cfg.trimul_splits_from_prompt(&prompt);
-                    let verifier_assets = cfg.capture_trimul_verifier_assets()?;
-                    let reward = cfg.preflight_trimul_reward(
-                        cfg.build_trimul_reward_with_assets(verifier_assets.clone())?,
-                    )?;
-                    let eval_reward = if eval.is_empty() {
-                        None
-                    } else {
-                        Some(cfg.preflight_trimul_reward(
-                            cfg.build_trimul_held_out_reward_with_assets(verifier_assets.clone())?,
-                        )?)
-                    };
-                    let verifier_identity = launch_verifier_identity(&reward, &verifier_assets)?;
-                    Ok((
-                        prompt_file_bytes,
-                        train,
-                        eval,
-                        reward,
-                        eval_reward,
-                        verifier_assets,
-                        verifier_identity,
-                    ))
-                })(),
-            )?;
-            run_training(
-                &cfg,
-                &device,
-                &reward,
-                eval_reward.as_ref().unwrap_or(&reward),
-                &train,
-                &eval,
-                Some(&prompt_file_bytes),
-                Some(&verifier_assets),
-                Some(&verifier_identity),
-                &launch,
-                launch_runtime,
-            )
-        }
-        other => Err(CliError::msg(format!(
-            "unknown task {other:?}; built-in tasks are \"countdown\", \"math\", and \"trimul\""
-        ))),
-    }
-}
-
-/// Run GRPO training (and, when `eval` is non-empty, a held-out eval) for any task.
-///
-/// Monomorphized per task by the [`train`] dispatch — the one place the concrete
-/// reward and its typed target are known.
-#[allow(clippy::too_many_arguments)] // one typed task launch plus immutable launch context
-fn run_training<R: RewardFn>(
-    cfg: &RunConfig,
-    device: &Device,
-    reward: &R,
-    eval_reward: &R,
-    train: &[Sample<R::Target>],
-    eval: &[Sample<R::Target>],
-    rendered_prompt_bytes: Option<&[u8]>,
-    verifier_assets: Option<&ferrl::trimul::TrimulVerifierAssets>,
-    verifier_identity: Option<&LaunchVerifierIdentity>,
-    launch: &LaunchContext,
-    launch_runtime: Option<LaunchRuntime>,
-) -> Result<(), CliError>
-where
-    R::Target: Serialize,
-{
-    let launch_attestor = SystemLaunchAttestor;
-    let launch_attestor: Option<&dyn LaunchAttestor> = match cfg.launch_authentication {
-        LaunchAuthenticationMode::LocalEphemeralV1 => None,
-        LaunchAuthenticationMode::ExternalAttestedV1 => Some(&launch_attestor),
-    };
-    run_training_with_loader(
-        cfg,
-        device,
-        reward,
-        eval_reward,
-        train,
-        eval,
-        rendered_prompt_bytes,
-        verifier_assets,
-        verifier_identity,
-        launch,
-        launch_runtime,
-        launch_attestor,
-        |model_dir, device, opts| {
-            ferrl::load_auto_policy_with_identity(model_dir, device, opts).map_err(CliError::from)
-        },
-    )
-}
-
-/// CLI-only policy capabilities that are intentionally inherent on [`ferrl::AutoPolicy`].
-///
-/// Keeping this narrow adapter separate from the public [`Policy`] contract lets the
-/// production loader seam remain mutation-sensitive in tests without widening the library API.
-trait CliTrainingPolicy: Policy + TensorParallelPolicy {
-    fn supports_cli_tensor_parallel(&self) -> bool;
-}
-
-impl CliTrainingPolicy for ferrl::AutoPolicy {
-    fn supports_cli_tensor_parallel(&self) -> bool {
-        self.supports_tensor_parallel()
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_training_with_loader<P, R>(
-    cfg: &RunConfig,
-    device: &Device,
-    reward: &R,
-    eval_reward: &R,
-    train: &[Sample<R::Target>],
-    eval: &[Sample<R::Target>],
-    rendered_prompt_bytes: Option<&[u8]>,
-    verifier_assets: Option<&ferrl::trimul::TrimulVerifierAssets>,
-    verifier_identity: Option<&LaunchVerifierIdentity>,
-    launch: &LaunchContext,
-    launch_runtime: Option<LaunchRuntime>,
-    launch_attestor: Option<&dyn LaunchAttestor>,
-    load_policy: impl FnOnce(
-        &Path,
-        &Device,
-        &LoaderOpts,
-    )
-        -> Result<(P, ferrl::HfTokenizer, ferrl::PolicyLoadIdentity), CliError>,
-) -> Result<(), CliError>
-where
-    P: CliTrainingPolicy,
-    R: RewardFn,
-    R::Target: Serialize,
-{
-    let tensor_parallel_plan = cfg.tensor_parallel_plan();
-    let (tensor_parallel_runtime, distributed_launch_comm, distributed_comm) =
-        if cfg.tensor_parallel.enabled {
-            (launch_runtime, None, None)
-        } else if cfg.distributed.enabled {
-            let runtime = launch_runtime
-                .ok_or_else(|| CliError::msg("distributed launch runtime is missing"))?;
-            let comm = SharedComm::from_box(runtime.comm);
-            (None, Some(comm.clone()), Some(comm))
-        } else {
-            (None, None, None)
-        };
-    let tensor_parallel_comm = tensor_parallel_runtime
-        .as_ref()
-        .map(|runtime| runtime.comm.as_ref());
-    let launch_comm = tensor_parallel_comm.or_else(|| {
-        distributed_launch_comm
-            .as_ref()
-            .map(|comm| comm as &dyn ferrl::Comm)
+    validate_launch_runtime(&loaded.config, launch_runtime.as_ref())?;
+    let setup = coordinate_distributed_result(
+        launch_comm,
+        "CLI train setup adaptation",
+        cli_train_setup(loaded, build_source),
+    )?;
+    let runtime = launch_runtime.map(|runtime| CliLaunchRuntime {
+        device: runtime.device,
+        comm: runtime.comm,
     });
-    info!(
-        task = %cfg.task,
-        steps = cfg.trainer.steps,
-        group_size = cfg.trainer.group_size,
-        activation_checkpointing = cfg.policy.activation_checkpointing,
-        train = train.len(),
-        eval = eval.len(),
-        tensor_parallel_rank = tensor_parallel_plan.rank(),
-        tensor_parallel_world = tensor_parallel_plan.world_size(),
-        "ferrl train: starting"
-    );
-
-    let model_setup = (|| {
-        let loader_opts = cfg.loader_opts();
-        let (policy, tok, identity) = load_policy(&cfg.model_dir, device, &loader_opts)?;
-        // Every distributed Trainer run needs this verified identity, even when
-        // ordinary checkpointing is disabled. World-1 installs the same value so
-        // enabling DP cannot silently change the builder contract.
-        let frozen_policy_sha256 = identity.policy_sha256.clone();
-        let tcfg = cfg.resolved_trainer_config(&tok)?;
-        if cfg.tensor_parallel.enabled && !policy.supports_cli_tensor_parallel() {
-            return Err(CliError::msg(
-                "loaded checkpoint family does not support tensor_parallel execution; supported \
-                 families are qwen3 (including legacy configs without model_type) and dense \
-                 gemma4/gemma4_unified; qwen3_5/qwen3_5_moe (Qwen3.5/3.6) are unsupported",
-            ));
+    let system_attestor = SystemLaunchAttestor;
+    let bridge = CoreLaunchAttestor {
+        inner: &system_attestor,
+    };
+    let attestor = (setup.authentication == LaunchAuthenticationMode::ExternalAttestedV1)
+        .then_some(&bridge as &dyn CliLaunchAttestor);
+    match ferrl::orchestration::run_cli_train_setup(&setup, runtime, attestor) {
+        Ok(outcome) => {
+            present_cli_run_outcome(outcome);
+            Ok(())
         }
-        if tensor_parallel_plan.is_sharded() && !policy.supports_sharded_tensor_parallel_backward()
-        {
-            return Err(CliError::msg(
-                "sharded tensor_parallel training is supported only for dense \
-                 gemma4/gemma4_unified policies with activation checkpointing; the loaded \
-                 policy does not provide cross-rank backward semantics",
-            ));
-        }
-        Ok((policy, tok, tcfg, identity, frozen_policy_sha256))
-    })();
-    let (mut policy, tok, tcfg, policy_identity, frozen_policy_sha256) =
-        coordinate_distributed_result(launch_comm, "model and EOS setup", model_setup)?;
-    validate_resolved_eos_consensus(tcfg.eos_token_id, launch_comm)?;
-    validate_data_parallel_policy_preflight(
-        &policy,
-        &policy_identity.policy_sha256,
-        distributed_launch_comm
-            .as_ref()
-            .map(|comm| comm as &dyn ferrl::Comm),
-    )?;
-    let prompt_sha256 = rendered_prompt_bytes.map(sha256_hex);
-    let verifier_assets_identity = verifier_assets.map(|assets| assets.identity().clone());
-    if (verifier_assets.is_some() || verifier_identity.is_some()) != (cfg.task == "trimul")
-        || verifier_assets.is_some() != verifier_identity.is_some()
-    {
-        return Err(CliError::msg(
-            "TriMul launch requires both verifier assets and isolation evidence, while non-TriMul launches require neither",
-        ));
-    }
-    let portable_verifier = verifier_identity
-        .map(portable_verifier_consensus)
-        .transpose()?;
-    let common_provenance = serde_json::to_vec(&(
-        &launch.ferrl_commit,
-        &launch.run.group_id,
-        &policy_identity.policy_sha256,
-        &policy_identity.tokenizer_sha256,
-        policy_identity.model_family,
-        &prompt_sha256,
-        &verifier_assets_identity,
-        &portable_verifier,
-    ))
-    .map_err(|error| CliError::msg(format!("serialize launch provenance: {error}")))?;
-    validate_launch_value_consensus(
-        "model/checkpoint/tokenizer/prompt provenance",
-        &common_provenance,
-        launch_comm,
-    )?;
-    let gen = GenConfig::from(&tcfg);
-
-    let attestation_setup = (|| {
-        let candidate_signer = CandidateSigner::generate()?;
-        let signing_public_key = candidate_signer.public_key_hex();
-        let manifest = LaunchManifest::new(LaunchPayload {
-            task: cfg.task.clone(),
-            ferrl_commit: launch.ferrl_commit.clone(),
-            authentication: cfg.launch_authentication,
-            run: launch.run.clone(),
-            config: launch.config.clone(),
-            model: LaunchModelIdentity {
-                family: policy_identity.model_family.to_owned(),
-                checkpoint_policy_sha256: policy_identity.policy_sha256.clone(),
-                tokenizer_sha256: policy_identity.tokenizer_sha256.clone(),
-                resolved_eos_token_id: tcfg.eos_token_id,
-            },
-            prompt: rendered_prompt_bytes.map(|bytes| LaunchPromptIdentity {
-                file: RunDir::PROMPT_FILE.to_owned(),
-                sha256: sha256_hex(bytes),
-                len_bytes: bytes.len(),
-            }),
-            verifier: verifier_identity.cloned(),
-            candidate_ledger: LaunchCandidateLedger {
-                file: RunDir::CANDIDATES_FILE.to_owned(),
-                format_version: 1,
-                row_digest_domain: CANDIDATE_RECORD_DOMAIN.to_owned(),
-                row_signature_algorithm: "ed25519".to_owned(),
-                signing_public_key,
-            },
-        })?;
-        let manifest = match cfg.launch_authentication {
-            LaunchAuthenticationMode::LocalEphemeralV1 => manifest,
-            LaunchAuthenticationMode::ExternalAttestedV1 => {
-                let attestor = launch_attestor.ok_or_else(|| {
-                    CliError::msg(
-                        "launch_authentication = \"external_attested_v1\" requires the protected external launch attestor",
-                    )
-                })?;
-                manifest.attest(attestor)?
+        Err(error) => {
+            if let Some(report) = error.health_report() {
+                print!("{}", report.render());
             }
-        };
-        Ok((candidate_signer, manifest))
-    })();
-    let (candidate_signer, manifest) =
-        coordinate_distributed_result(launch_comm, "launch authentication", attestation_setup)?;
-    coordinate_distributed_result(
-        launch_comm,
-        "launch-bound verifier revalidation",
-        verifier_assets.map_or(Ok(()), |assets| {
-            assets
-                .verify_current()
-                .map_err(|error| CliError::msg(error.to_string()))
-        }),
-    )?;
-
-    let publication_setup = (|| {
-        let launch_sha256 = manifest.payload_sha256.clone();
-        let manifest_bytes = manifest.to_pretty_bytes()?;
-        let run = RunDir::create(&cfg.out_dir, launch.run.run_id.clone())?;
-        run.write_immutable_launch(&manifest_bytes, rendered_prompt_bytes)?;
-        let trainer = open_trainer(
-            tcfg,
-            &run,
-            distributed_comm,
-            &frozen_policy_sha256,
-            &launch_sha256,
-            candidate_signer,
-        )?;
-        Ok((run, trainer, launch_sha256))
-    })();
-    let (run, mut trainer, launch_sha256) = coordinate_distributed_result(
-        launch_comm,
-        "run directory and trainer setup",
-        publication_setup,
-    )?;
-    let (history, _stop) = train_with_optional_tensor_parallel(
-        &mut trainer,
-        &mut policy,
-        reward,
-        &tok,
-        train,
-        tensor_parallel_comm,
-    )?;
-    run_on_tensor_parallel_primary(tensor_parallel_comm, "post-run health", || {
-        if let Some(summary) = summarize(&history) {
-            info!(steps = summary.steps, "ferrl train: complete");
-            apply_train_run_health_policy(cfg, &history, &summary, &run)?;
+            Err(error.into())
         }
-        Ok(())
-    })?;
-
-    if !eval.is_empty() {
-        let report = evaluate_and_publish_report(
-            &mut policy,
-            eval_reward,
-            &tok,
-            eval,
-            &gen,
-            cfg,
-            &run,
-            &launch_sha256,
-            verifier_assets_identity.as_ref(),
-            launch_comm,
-        )?;
-        info!(
-            base = report.base_reward_mean,
-            adapter = report.adapter_reward_mean,
-            improvement = report.improvement(),
-            "ferrl train: held-out eval (adapter vs base)"
-        );
     }
+}
 
-    run_on_tensor_parallel_primary(tensor_parallel_comm, "run completion output", || {
-        println!("ferrl: run complete -> {}", run.root().display());
-        println!(
-            "ferrl: inspect with `ferrl runreport {}`",
-            run.root().display()
-        );
-        Ok(())
+fn cli_train_setup(
+    loaded: LoadedRunConfig,
+    build_source: BuildSourceIdentity,
+) -> Result<CliTrainSetup, CliError> {
+    debug_assert!(!build_source.dirty);
+    let cfg = loaded.config;
+    let task = match cfg.task.as_str() {
+        "countdown" => CliBuiltinTask::Countdown {
+            train_n: cfg.data.train_n,
+            eval_n: cfg.data.eval_n,
+            seed: cfg.data.seed,
+        },
+        "math" => CliBuiltinTask::Math {
+            path: cfg.data.path.clone().ok_or_else(|| {
+                CliError::msg("task \"math\" requires data.path (a JSONL dataset of {prompt, target})")
+            })?,
+            eval_n: cfg.data.eval_n,
+            seed: cfg.data.seed,
+        },
+        "trimul" => CliBuiltinTask::Trimul(Box::new(CliTrimulTask {
+            prompt_path: cfg.trimul.prompt_path.clone().ok_or_else(|| {
+                CliError::msg("task \"trimul\" requires trimul.prompt_path (the complete rendered model prompt file)")
+            })?,
+            submission_extract_mode: cfg.trimul_submission_extract_mode()?,
+            image: cfg.trimul.image.clone(),
+            eval_dir: cfg.trimul.eval_dir.clone(),
+            scratch_root: cfg.trimul.scratch_root.clone(),
+            verifier_isolation_tier: cfg.trimul.verifier_isolation_tier,
+            verifier_apptainer_bin: cfg.trimul.verifier_apptainer_bin.clone(),
+            verifier_executor_socket: cfg.trimul.verifier_executor_socket.clone(),
+            scratch_max_bytes: cfg.trimul.scratch_max_bytes,
+            secret_seed: cfg.trimul.secret_seed,
+            held_out_secret_seed: cfg.trimul.held_out_secret_seed,
+            wall_secs: cfg.trimul.wall_secs,
+            verifier_cuda_visible_devices: cfg.trimul.verifier_cuda_visible_devices.clone(),
+            verifier_cuda_device_pool: cfg.trimul.verifier_cuda_device_pool.clone(),
+            verifier_parallelism: cfg.trimul.verifier_parallelism,
+            verifier_max_procs: cfg.trimul.verifier_max_procs,
+            baseline: cfg.trimul.baseline.as_ref().map(|baseline| CliTrimulBaseline {
+                ns: baseline.ns,
+                gpu: baseline.gpu.clone(),
+                metric: baseline.metric.clone(),
+                isolation_tier: baseline.isolation_tier,
+                isolation_evidence_sha256: baseline.isolation_evidence_sha256.clone(),
+            }),
+            reward_profile: cfg.trimul.reward,
+            train_n: cfg.data.train_n,
+            eval_n: cfg.data.eval_n,
+            data_seed: cfg.data.seed,
+        })),
+        other => {
+            return Err(CliError::msg(format!(
+                "unknown task {other:?}; built-in tasks are \"countdown\", \"math\", and \"trimul\""
+            )))
+        }
+    };
+    let eos_selection = match cfg.eos_selection {
+        EosSelection::Checkpoint => CliEosSelection::CheckpointDefault,
+        EosSelection::Explicit => CliEosSelection::Explicit(
+            cfg.trainer
+                .eos_token_id
+                .ok_or_else(|| CliError::msg("explicit EOS selector has no numeric token id"))?,
+        ),
+        EosSelection::Disabled => CliEosSelection::Disabled,
+    };
+    let health_policy = CliRunHealthPolicy::from_json_value(
+        serde_json::to_value(&cfg.run_health)
+            .map_err(|error| CliError::msg(format!("serialize run_health: {error}")))?,
+    )?;
+    let loader_opts = cfg.loader_opts();
+    let tensor_parallel_plan = cfg.tensor_parallel_plan();
+    let health_policy_is_default = cfg.run_health.is_default();
+    Ok(CliTrainSetup {
+        task,
+        ferrl_commit: build_source.commit,
+        authentication: cfg.launch_authentication,
+        launch_config: loaded.launch_config,
+        config_consensus_digest: loaded.consensus_digest,
+        model_dir: cfg.model_dir,
+        output_root: cfg.out_dir,
+        device: match cfg.device {
+            DeviceSel::Cpu => CliDeviceSelection::Cpu,
+            DeviceSel::Cuda => CliDeviceSelection::Cuda,
+        },
+        loader_opts,
+        activation_checkpointing: cfg.policy.activation_checkpointing,
+        eos_selection,
+        trainer_config: cfg.trainer,
+        data_parallel: cfg.distributed.enabled,
+        tensor_parallel_plan,
+        health_policy,
+        health_policy_is_default,
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn evaluate_and_publish_report<P, R>(
-    policy: &mut P,
-    reward: &R,
-    tokenizer: &dyn TokenizerLike,
-    eval: &[Sample<R::Target>],
-    gen: &GenConfig,
-    cfg: &RunConfig,
-    run: &RunDir,
-    launch_sha256: &str,
-    verifier_assets: Option<&ferrl::trimul::TrimulVerifierIdentity>,
-    launch_comm: Option<&dyn ferrl::Comm>,
-) -> Result<ferrl::EvalReport, CliError>
-where
-    P: Policy,
-    R: RewardFn,
-    R::Target: Serialize,
-{
-    let local = evaluate(policy, reward, tokenizer, eval, gen).map_err(CliError::from);
-    let report = coordinate_distributed_result(launch_comm, "held-out evaluation", local)?;
-    publish_eval_report(
-        cfg,
-        eval,
-        &report,
-        run,
-        launch_sha256,
-        verifier_assets,
-        launch_comm,
-    )?;
-    Ok(report)
+struct CoreLaunchAttestor<'a> {
+    inner: &'a dyn LaunchAttestor,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn publish_eval_report<T: Serialize>(
-    cfg: &RunConfig,
-    eval: &[Sample<T>],
-    report: &ferrl::EvalReport,
-    run: &RunDir,
-    launch_sha256: &str,
-    verifier_assets: Option<&ferrl::trimul::TrimulVerifierIdentity>,
-    launch_comm: Option<&dyn ferrl::Comm>,
-) -> Result<(), CliError> {
-    let (publishing_launch_sha256, launch_group_sha256) =
-        distributed_launch_binding(launch_sha256, launch_comm)?;
-    let eval_samples = serde_json::to_vec(eval)
-        .map_err(|error| CliError::msg(format!("serialize held-out samples: {error}")))?;
-    let split_key_contract = match cfg.task.as_str() {
-        "countdown" => "ferrl.countdown-split-key.sorted-multiset-target.v1",
-        "math" => "ferrl.math-split-key.normalized-prompt-answer.v1",
-        "trimul" => "ferrl.trimul-held-out-boundary.v1",
-        _ => "ferrl.unknown-split-key.v1",
-    };
-    let boundary = serde_json::to_vec(&(
-        "ferrl.eval-boundary.v1",
-        &cfg.task,
-        cfg.data.seed,
-        cfg.trimul.held_out_secret_seed,
-        &eval_samples,
-        verifier_assets,
-    ))
-    .map_err(|error| CliError::msg(format!("serialize held-out boundary: {error}")))?;
-    let durable = DurableEvalReport {
-        contract: "ferrl.eval-report.v2",
-        publishing_launch_sha256,
-        launch_group_sha256,
-        task: &cfg.task,
-        split_key_contract,
-        eval_samples_sha256: sha256_hex(&eval_samples),
-        evaluation_boundary_sha256: sha256_hex(&boundary),
-        report,
-    };
-    let consensus = serde_json::to_vec(&durable)
-        .map_err(|error| CliError::msg(format!("serialize held-out report: {error}")))?;
-    validate_launch_value_consensus("held-out evaluation report", &consensus, launch_comm)?;
-    let publication = if launch_comm.is_none_or(|comm| comm.rank() == 0) {
-        run.write_eval_report(&durable).map_err(CliError::from)
-    } else {
-        Ok(())
-    };
-    coordinate_distributed_result(
-        launch_comm,
-        "held-out evaluation report publication",
-        publication,
-    )
+impl CliLaunchAttestor for CoreLaunchAttestor<'_> {
+    fn attest(
+        &self,
+        manifest: &LaunchManifest,
+    ) -> Result<LaunchAttestation, CliOrchestrationError> {
+        self.inner
+            .attest(manifest)
+            .map_err(|error| CliOrchestrationError::msg(error.to_string()))
+    }
 }
 
-fn distributed_launch_binding(
-    local_launch_sha256: &str,
-    comm: Option<&dyn ferrl::Comm>,
-) -> Result<(String, String), CliError> {
-    let local = decode_lower_hex("launch payload SHA-256", local_launch_sha256, 32)?;
-    let Some(comm) = comm.filter(|comm| comm.world_size() > 1) else {
-        let group = serde_json::to_vec(&("ferrl.launch-group.v1", [local_launch_sha256]))
-            .map_err(|error| CliError::msg(format!("serialize launch group: {error}")))?;
-        return Ok((local_launch_sha256.to_owned(), sha256_hex(&group)));
-    };
-    let mut launches = Vec::with_capacity(comm.world_size());
-    for source_rank in 0..comm.world_size() {
-        let mut bytes = Vec::with_capacity(local.len());
-        for byte in &local {
-            let contribution = if comm.rank() == source_rank {
-                f64::from(*byte)
-            } else {
-                0.0
-            };
-            let value = comm.all_reduce_scalar_sum(contribution)?;
-            if !value.is_finite() || value.fract() != 0.0 || !(0.0..=255.0).contains(&value) {
-                return Err(CliError::msg("distributed launch digest byte is invalid"));
+fn present_cli_run_outcome(outcome: CliRunOutcome) {
+    match outcome {
+        CliRunOutcome::Completed(run) if run.should_present() => {
+            if let Some(report) = run.health_report() {
+                print!("{}", report.render());
             }
-            bytes.push(value as u8);
+            println!("ferrl: run complete -> {}", run.run_dir().display());
+            println!(
+                "ferrl: inspect with `ferrl runreport {}`",
+                run.run_dir().display()
+            );
         }
-        launches.push(
-            bytes
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>(),
-        );
-    }
-    let publishing = launches[0].clone();
-    let group = serde_json::to_vec(&("ferrl.launch-group.v1", &launches))
-        .map_err(|error| CliError::msg(format!("serialize launch group: {error}")))?;
-    Ok((publishing, sha256_hex(&group)))
-}
-
-fn train_with_optional_tensor_parallel<P, R>(
-    trainer: &mut Trainer,
-    policy: &mut P,
-    reward: &R,
-    tokenizer: &dyn TokenizerLike,
-    train: &[Sample<R::Target>],
-    tensor_parallel_comm: Option<&dyn ferrl::Comm>,
-) -> Result<(Vec<ferrl::Metrics>, RunStop), CliError>
-where
-    P: Policy + TensorParallelPolicy,
-    R: RewardFn,
-{
-    match tensor_parallel_comm {
-        Some(comm) => Ok(trainer.train_tensor_parallel(policy, reward, tokenizer, train, comm)?),
-        None => Ok(trainer.train(policy, reward, tokenizer, train)?),
-    }
-}
-
-fn apply_train_run_health_policy(
-    cfg: &RunConfig,
-    history: &[ferrl::Metrics],
-    summary: &ferrl::RunSummary,
-    run: &RunDir,
-) -> Result<(), CliError> {
-    let health_report = evaluate_run_health_policy(
-        &cfg.run_health,
-        history,
-        summary,
-        RunHealthEvalCtx::from_trainer(&cfg.trainer),
-        run.root(),
-    )?;
-    if !cfg.run_health.is_default() {
-        print_run_health_report(&health_report);
-    }
-    if health_report.is_fail() {
-        return Err(CliError::msg("run_health policy failed"));
-    }
-    Ok(())
-}
-
-fn open_trainer(
-    config: TrainerConfig,
-    run: &RunDir,
-    distributed_comm: Option<SharedComm>,
-    frozen_policy_sha256: &str,
-    candidate_launch_sha256: &str,
-    candidate_signer: CandidateSigner,
-) -> Result<Trainer, CliError> {
-    let trainer = if let Some(comm) = distributed_comm {
-        Trainer::with_comm(config, run, comm)?
-    } else {
-        Trainer::new(config, run)?
-    };
-    let trainer = trainer.with_frozen_policy_sha256(frozen_policy_sha256);
-    Ok(trainer.with_candidate_provenance(candidate_launch_sha256, candidate_signer)?)
-}
-
-#[derive(Clone)]
-struct SharedComm {
-    inner: std::sync::Arc<std::sync::Mutex<Box<dyn ferrl::Comm>>>,
-    rank: usize,
-    world_size: usize,
-}
-
-impl SharedComm {
-    fn from_box(comm: Box<dyn ferrl::Comm>) -> Self {
-        let rank = comm.rank();
-        let world_size = comm.world_size();
-        Self {
-            inner: std::sync::Arc::new(std::sync::Mutex::new(comm)),
-            rank,
-            world_size,
+        CliRunOutcome::Preempted(run) if run.should_present() => {
+            println!("ferrl: run preempted before held-out evaluation");
+            println!(
+                "ferrl: inspect with `ferrl runreport {}`",
+                run.run_dir().display()
+            );
         }
-    }
-
-    fn with_comm<T>(
-        &self,
-        op: impl FnOnce(&dyn ferrl::Comm) -> Result<T, ferrl::CommError>,
-    ) -> Result<T, ferrl::CommError> {
-        let comm = self.inner.lock().map_err(|_| {
-            ferrl::CommError::Poisoned("shared launch communicator mutex was poisoned".into())
-        })?;
-        op(comm.as_ref())
-    }
-}
-
-impl std::fmt::Debug for SharedComm {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SharedComm")
-            .field("rank", &self.rank)
-            .field("world_size", &self.world_size)
-            .finish_non_exhaustive()
-    }
-}
-
-impl ferrl::Comm for SharedComm {
-    fn rank(&self) -> usize {
-        self.rank
-    }
-
-    fn world_size(&self) -> usize {
-        self.world_size
-    }
-
-    fn validate_all_reduce_sum(
-        &self,
-        tensors: &[candle_core::Tensor],
-    ) -> Result<(), ferrl::CommError> {
-        // Keep the guard outside the unwind boundary: peer-error coordination still needs this
-        // wrapper after a rank-local backend validator panics.
-        let comm = self.inner.lock().map_err(|_| {
-            ferrl::CommError::Poisoned("shared launch communicator mutex was poisoned".into())
-        })?;
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            comm.validate_all_reduce_sum(tensors)
-        }))
-        .unwrap_or_else(|_| {
-            Err(ferrl::CommError::Mismatch(
-                "backend tensor capability validator panicked".into(),
-            ))
-        })
-    }
-
-    fn all_reduce_sum(
-        &self,
-        tensors: &mut Vec<candle_core::Tensor>,
-    ) -> Result<(), ferrl::CommError> {
-        self.with_comm(|comm| comm.all_reduce_sum(tensors))
-    }
-
-    fn all_reduce_scalar_sum(&self, value: f64) -> Result<f64, ferrl::CommError> {
-        self.with_comm(|comm| comm.all_reduce_scalar_sum(value))
+        CliRunOutcome::Completed(_) | CliRunOutcome::Preempted(_) => {}
     }
 }
 
@@ -3128,6 +2378,7 @@ fn validate_full_git_commit(value: &str) -> Result<String, CliError> {
     }
 }
 
+#[cfg(test)]
 fn synchronized_run_identity(
     cfg: &RunConfig,
     comm: Option<&dyn ferrl::Comm>,
@@ -3187,6 +2438,7 @@ fn synchronized_run_identity(
     })
 }
 
+#[cfg(test)]
 fn validate_launch_value_consensus(
     label: &'static str,
     value: &[u8],
@@ -3212,43 +2464,7 @@ fn validate_launch_value_consensus(
     coordinate_distributed_result(Some(comm), "launch provenance consensus", local)
 }
 
-fn validate_data_parallel_policy_preflight<P: Policy>(
-    policy: &P,
-    policy_sha256: &str,
-    comm: Option<&dyn ferrl::Comm>,
-) -> Result<(), CliError> {
-    let Some(comm) = comm.filter(|comm| comm.world_size() > 1) else {
-        return Ok(());
-    };
-    Trainer::validate_data_parallel_policy_preflight(policy, policy_sha256, comm)?;
-    Ok(())
-}
-
-fn validate_launch_config_consensus(
-    digest: &[u8; 32],
-    comm: Option<&dyn ferrl::Comm>,
-) -> Result<(), CliError> {
-    let Some(comm) = comm.filter(|comm| comm.world_size() > 1) else {
-        return Ok(());
-    };
-    let world = comm.world_size() as f64;
-    let mut mismatch = false;
-    for byte in digest {
-        let value = f64::from(*byte);
-        let sum = comm.all_reduce_scalar_sum(value)?;
-        mismatch |= sum != world * value;
-    }
-    let local = if mismatch {
-        Err(CliError::msg(
-            "launch ranks disagree on run config outside tensor_parallel.rank; configs must \
-             otherwise be identical",
-        ))
-    } else {
-        Ok(())
-    };
-    coordinate_distributed_result(Some(comm), "run config consensus", local)
-}
-
+#[cfg(test)]
 fn validate_resolved_eos_consensus(
     eos_token_id: Option<u32>,
     comm: Option<&dyn ferrl::Comm>,
@@ -3280,19 +2496,6 @@ fn coordinate_distributed_result<T>(
     }
 }
 
-fn run_on_tensor_parallel_primary(
-    comm: Option<&dyn ferrl::Comm>,
-    label: &'static str,
-    op: impl FnOnce() -> Result<(), CliError>,
-) -> Result<(), CliError> {
-    let local = if comm.is_none_or(|comm| comm.world_size() <= 1 || comm.rank() == 0) {
-        op()
-    } else {
-        Ok(())
-    };
-    coordinate_distributed_result(comm, label, local)
-}
-
 #[cfg(feature = "nccl")]
 fn open_nccl_launch_runtime() -> Result<LaunchRuntime, CliError> {
     let comm = ferrl::NcclComm::from_slurm_env()?;
@@ -3308,41 +2511,6 @@ fn open_nccl_launch_runtime() -> Result<LaunchRuntime, CliError> {
     Err(CliError::msg(
         "distributed or tensor_parallel execution requires building ferrl with --features nccl",
     ))
-}
-
-#[cfg(feature = "nccl")]
-fn prepare_launch_device(
-    cfg: &RunConfig,
-    runtime: Option<&LaunchRuntime>,
-) -> Result<Device, CliError> {
-    let Some(runtime) = runtime else {
-        return cfg.open_device();
-    };
-    if cfg.device != DeviceSel::Cuda {
-        return Err(CliError::msg(
-            "distributed or tensor_parallel execution requires device = \"cuda\"",
-        ));
-    }
-    let device = &runtime.device;
-    if let Some(w) = ferrl::check_driver_compat(device).warning() {
-        tracing::warn!("{w}");
-    }
-    ferrl::guard_first_kernel(device)?;
-    Ok(device.clone())
-}
-
-#[cfg(not(feature = "nccl"))]
-fn prepare_launch_device(
-    cfg: &RunConfig,
-    runtime: Option<&LaunchRuntime>,
-) -> Result<Device, CliError> {
-    if runtime.is_some() {
-        Err(CliError::msg(
-            "distributed or tensor_parallel execution requires building ferrl with --features nccl",
-        ))
-    } else {
-        cfg.open_device()
-    }
 }
 
 /// This node's first GPU product name, read from `nvidia-smi`, or `None` if it cannot
@@ -4229,6 +3397,7 @@ fn load_bound_run_candidate_impl(
             "launch-bound prompt bytes do not match launch.json",
         ));
     }
+    verify_trimul_launch_sample_identity(&launch, &config, &prompt_bytes)?;
     let ledger = &launch.payload.candidate_ledger;
     if ledger.file != RunDir::CANDIDATES_FILE
         || ledger.format_version != 1
@@ -4239,74 +3408,14 @@ fn load_bound_run_candidate_impl(
             "unsupported candidate-ledger contract in launch.json",
         ));
     }
-    let ledger_path = run_dir.join(&ledger.file);
-    let ledger_bytes = read_regular_bytes(&ledger_path)?;
-    if !ledger_bytes.is_empty() && !ledger_bytes.ends_with(b"\n") {
-        return Err(CliError::msg(format!(
-            "candidate ledger {} has an unterminated final row",
-            ledger_path.display()
-        )));
-    }
-    let ledger_text = std::str::from_utf8(&ledger_bytes).map_err(|error| {
-        CliError::msg(format!(
-            "candidate ledger {} is not UTF-8: {error}",
-            ledger_path.display()
-        ))
-    })?;
-    let mut selected = None;
-    for (index, raw_line) in ledger_text.split_terminator('\n').enumerate() {
-        if raw_line.trim().is_empty() {
-            return Err(CliError::msg(format!(
-                "candidate ledger {} contains blank row {}",
-                ledger_path.display(),
-                index + 1
-            )));
-        }
-        let record = parse_strict_candidate_row(&ledger_path, index + 1, raw_line)?;
-        record.verify_signed_provenance(&ledger.signing_public_key)?;
-        if record.launch_sha256.as_deref() != Some(launch.payload_sha256.as_str()) {
-            return Err(CliError::msg(format!(
-                "candidate ledger {} row {} belongs to a different launch",
-                ledger_path.display(),
-                index + 1
-            )));
-        }
-        verify_candidate_verifier_provenance(&record, &launch, index + 1)?;
-        if record.rank != launch.payload.run.data_parallel_rank
-            || record.world_size != launch.payload.run.data_parallel_world_size
-        {
-            return Err(CliError::msg(format!(
-                "candidate ledger {} row {} rank/world disagree with launch.json",
-                ledger_path.display(),
-                index + 1
-            )));
-        }
-        if record.step >= config.trainer.steps
-            || record.group_index >= config.trainer.group_size
-            || record.completion_len_tokens > config.trainer.max_new_tokens
-        {
-            return Err(CliError::msg(format!(
-                "candidate ledger {} row {} coordinates exceed the launch config",
-                ledger_path.display(),
-                index + 1
-            )));
-        }
-        if record.record_sha256.as_deref() == Some(candidate_sha256) {
-            if selected.is_some() {
-                return Err(CliError::msg(format!(
-                    "candidate digest {candidate_sha256} occurs more than once in {}",
-                    ledger_path.display()
-                )));
-            }
-            selected = Some((record, raw_line.as_bytes().to_vec()));
-        }
-    }
-    let (candidate, candidate_row_bytes) = selected.ok_or_else(|| {
-        CliError::msg(format!(
-            "candidate digest {candidate_sha256} was not found in {}",
-            ledger_path.display()
-        ))
-    })?;
+    let authenticated = ferrl::orchestration::load_cli_authenticated_candidate(
+        run_dir,
+        &launch,
+        candidate_sha256,
+        &config.trainer,
+    )?;
+    let candidate = authenticated.candidate().clone();
+    let candidate_row_bytes = authenticated.row_bytes().to_vec();
     Ok(BoundRunCandidate {
         launch,
         launch_bytes,
@@ -4317,94 +3426,57 @@ fn load_bound_run_candidate_impl(
     })
 }
 
-fn verify_candidate_verifier_provenance(
-    record: &CandidateRecord,
-    launch: &LaunchManifest,
-    row_number: usize,
-) -> Result<(), CliError> {
-    let verifier = launch.payload.verifier.as_ref().ok_or_else(|| {
-        CliError::msg("TriMul launch manifest is missing verifier isolation evidence")
-    })?;
-    let metadata = record
-        .reward_metadata
-        .as_ref()
-        .and_then(serde_json::Value::as_object)
-        .ok_or_else(|| {
-            CliError::msg(format!(
-                "candidate ledger row {row_number} is missing structured verifier reward metadata"
-            ))
-        })?;
-    let expected_tier = verifier.isolation.tier.as_str();
-    let expected_metric = ferrl::trimul::timing_metric_for_tier(verifier.isolation.tier);
-    if metadata
-        .get("verifier_isolation_tier")
-        .and_then(serde_json::Value::as_str)
-        != Some(expected_tier)
-        || metadata
-            .get("verifier_isolation_evidence_sha256")
-            .and_then(serde_json::Value::as_str)
-            != Some(verifier.isolation_evidence_sha256.as_str())
-        || metadata
-            .get("timing_metric")
-            .and_then(serde_json::Value::as_str)
-            != Some(expected_metric)
-        || metadata
-            .get("runtime_preflight_evidence_sha256")
-            .and_then(serde_json::Value::as_str)
-            != Some(verifier.runtime_preflight_evidence_sha256.as_str())
-    {
-        return Err(CliError::msg(format!(
-            "candidate ledger row {row_number} verifier tier/evidence does not match launch.json"
-        )));
-    }
-    let extracted = metadata
-        .get("submission_extracted")
-        .and_then(serde_json::Value::as_bool)
-        .ok_or_else(|| {
-            CliError::msg(format!(
-                "candidate ledger row {row_number} omits submission extraction evidence"
-            ))
-        })?;
-    let executed = metadata
-        .get("verification_executed")
-        .and_then(serde_json::Value::as_bool)
-        .ok_or_else(|| {
-            CliError::msg(format!(
-                "candidate ledger row {row_number} omits verification execution evidence"
-            ))
-        })?;
-    if extracted != executed {
-        return Err(CliError::msg(format!(
-            "candidate ledger row {row_number} has inconsistent extraction/execution evidence"
-        )));
-    }
-    if executed {
-        let runtime_hardening = metadata
-            .get("runtime_hardening")
-            .and_then(serde_json::Value::as_array);
-        let runtime_digest = runtime_hardening
-            .map(|records| runtime_hardening_evidence_sha256(records))
-            .transpose()?;
-        let expected_runtime = verifier.runtime_preflight.runtime_hardening.first();
-        if metadata.get("verifier_isolation_evidence")
-            != Some(&serde_json::to_value(&verifier.isolation).map_err(|error| {
-                CliError::msg(format!("serialize launch verifier evidence: {error}"))
-            })?)
-            || runtime_hardening.is_none_or(Vec::is_empty)
-            || runtime_hardening.is_some_and(|records| {
-                records
-                    .iter()
-                    .any(|record| Some(record) != expected_runtime)
-            })
-            || metadata
-                .get("runtime_hardening_evidence_sha256")
-                .and_then(serde_json::Value::as_str)
-                != runtime_digest.as_deref()
-        {
-            return Err(CliError::msg(format!(
-                "candidate ledger row {row_number} omits or changes protected verifier run evidence"
-            )));
+fn trimul_repeated_sample_sha256(prompt: &str, count: usize) -> Result<String, CliError> {
+    let sample = Sample::new(prompt.to_owned(), ());
+    let sample_bytes = serde_json::to_vec(&sample)
+        .map_err(|error| CliError::msg(format!("serialize TriMul sample identity: {error}")))?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"[");
+    for index in 0..count {
+        if index != 0 {
+            hasher.update(b",");
         }
+        hasher.update(&sample_bytes);
+    }
+    hasher.update(b"]");
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn verify_trimul_launch_sample_identity(
+    launch: &LaunchManifest,
+    config: &RunConfig,
+    prompt_bytes: &[u8],
+) -> Result<(), CliError> {
+    if launch.contract_version == LEGACY_LAUNCH_CONTRACT_VERSION {
+        return Ok(());
+    }
+    let prompt = std::str::from_utf8(prompt_bytes)
+        .map_err(|error| CliError::msg(format!("trimul prompt is not valid UTF-8: {error}")))?;
+    let training = launch.payload.training_samples.as_ref().ok_or_else(|| {
+        CliError::msg("launch v3 manifest is missing ordered training sample identity")
+    })?;
+    let held_out = launch.payload.held_out_samples.as_ref().ok_or_else(|| {
+        CliError::msg("launch v3 manifest is missing ordered held-out sample identity")
+    })?;
+    if training.count != config.data.train_n || held_out.count != config.data.eval_n {
+        return Err(CliError::msg(format!(
+            "launch-bound TriMul sample counts disagree with resolved config: train {} vs {}, held-out {} vs {}",
+            training.count, config.data.train_n, held_out.count, config.data.eval_n
+        )));
+    }
+    let training_sha256 = trimul_repeated_sample_sha256(prompt, training.count)?;
+    if training.sha256 != training_sha256 {
+        return Err(CliError::msg(format!(
+            "launch-bound TriMul training sample digest mismatch: recorded {}, computed {training_sha256}",
+            training.sha256
+        )));
+    }
+    let held_out_sha256 = trimul_repeated_sample_sha256(prompt, held_out.count)?;
+    if held_out.sha256 != held_out_sha256 {
+        return Err(CliError::msg(format!(
+            "launch-bound TriMul held-out sample digest mismatch: recorded {}, computed {held_out_sha256}",
+            held_out.sha256
+        )));
     }
     Ok(())
 }
@@ -4426,68 +3498,6 @@ fn parse_exact_launch_manifest(
         )));
     }
     Ok(launch)
-}
-
-fn parse_strict_candidate_row(
-    ledger_path: &Path,
-    row_number: usize,
-    raw_line: &str,
-) -> Result<CandidateRecord, CliError> {
-    const FIELDS: &[&str] = &[
-        "launch_sha256",
-        "record_sha256",
-        "record_signature",
-        "step",
-        "rank",
-        "world_size",
-        "prompt_index",
-        "group_index",
-        "reward",
-        "completion_len_tokens",
-        "reward_diagnostic",
-        "reward_metadata",
-        "completion",
-    ];
-    let value: serde_json::Value = serde_json::from_str(raw_line).map_err(|error| {
-        CliError::msg(format!(
-            "parse candidate ledger {} row {row_number}: {error}",
-            ledger_path.display()
-        ))
-    })?;
-    let object = value.as_object().ok_or_else(|| {
-        CliError::msg(format!(
-            "candidate ledger {} row {row_number} is not a JSON object",
-            ledger_path.display()
-        ))
-    })?;
-    if let Some(field) = object
-        .keys()
-        .find(|field| !FIELDS.contains(&field.as_str()))
-    {
-        return Err(CliError::msg(format!(
-            "candidate ledger {} row {row_number} contains unknown field {field:?}",
-            ledger_path.display()
-        )));
-    }
-    let record: CandidateRecord = serde_json::from_value(value).map_err(|error| {
-        CliError::msg(format!(
-            "parse candidate ledger {} row {row_number}: {error}",
-            ledger_path.display()
-        ))
-    })?;
-    let canonical = serde_json::to_string(&record).map_err(|error| {
-        CliError::msg(format!(
-            "serialize candidate ledger {} row {row_number}: {error}",
-            ledger_path.display()
-        ))
-    })?;
-    if canonical != raw_line {
-        return Err(CliError::msg(format!(
-            "candidate ledger {} row {row_number} is not in the exact production encoding",
-            ledger_path.display()
-        )));
-    }
-    Ok(record)
 }
 
 fn verify_launch_config_identity(
@@ -4560,12 +3570,41 @@ fn verify_launch_config_identity(
 }
 
 fn verify_launch_manifest_payload(manifest: &LaunchManifest) -> Result<(), CliError> {
-    if manifest.contract_version != LAUNCH_CONTRACT_VERSION || manifest.kind != LAUNCH_KIND {
+    if manifest.kind != LAUNCH_KIND {
         return Err(CliError::msg(format!(
             "unsupported launch manifest contract {} / {:?}",
             manifest.contract_version, manifest.kind
         )));
     }
+    let payload_domain = match manifest.contract_version {
+        LAUNCH_CONTRACT_VERSION => {
+            let training = manifest.payload.training_samples.as_ref().ok_or_else(|| {
+                CliError::msg("launch v3 manifest is missing ordered training sample identity")
+            })?;
+            validate_lower_sha256("launch training_samples sha256", &training.sha256)?;
+            let held_out = manifest.payload.held_out_samples.as_ref().ok_or_else(|| {
+                CliError::msg("launch v3 manifest is missing ordered held-out sample identity")
+            })?;
+            validate_lower_sha256("launch held_out_samples sha256", &held_out.sha256)?;
+            LAUNCH_PAYLOAD_DOMAIN
+        }
+        LEGACY_LAUNCH_CONTRACT_VERSION => {
+            if manifest.payload.training_samples.is_some()
+                || manifest.payload.held_out_samples.is_some()
+            {
+                return Err(CliError::msg(
+                    "launch v2 manifest must not carry v3 sample identity fields",
+                ));
+            }
+            LEGACY_LAUNCH_PAYLOAD_DOMAIN
+        }
+        _ => {
+            return Err(CliError::msg(format!(
+                "unsupported launch manifest contract {} / {:?}",
+                manifest.contract_version, manifest.kind
+            )))
+        }
+    };
     validate_lower_sha256("launch payload_sha256", &manifest.payload_sha256)?;
     validate_lower_sha256(
         "launch config source_sha256",
@@ -4740,7 +3779,7 @@ fn verify_launch_manifest_payload(manifest: &LaunchManifest) -> Result<(), CliEr
     }
     let payload_bytes = serde_json::to_vec(&manifest.payload)
         .map_err(|error| CliError::msg(format!("serialize launch payload: {error}")))?;
-    let expected = domain_sha256(LAUNCH_PAYLOAD_DOMAIN, &[&payload_bytes]);
+    let expected = domain_sha256(payload_domain, &[&payload_bytes]);
     if manifest.payload_sha256 != expected {
         return Err(CliError::msg(format!(
             "launch payload hash mismatch: recorded {}, computed {expected}",
@@ -7206,25 +6245,47 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::{Result as CandleResult, Tensor, Var};
+    use candle_core::Tensor;
+    use ferrl::policy::GenConfig;
     use ferrl::Comm as _;
-    use ring::rand::SystemRandom;
     use ring::signature::{Ed25519KeyPair, KeyPair as _};
-    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::OnceLock;
 
     const TEST_ATTESTATION_KEY_ID: &str = "test-root-1";
     const TEST_LAUNCH_ATTESTOR: TestLaunchAttestor = TestLaunchAttestor;
-    const REJECTING_LAUNCH_ATTESTOR: RejectingLaunchAttestor = RejectingLaunchAttestor;
-    const RANK_ONE_REJECTING_ATTESTOR: RankOneRejectingAttestor = RankOneRejectingAttestor;
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // explicit forbidden-operation inventory
+    fn production_cli_train_is_only_parsing_transport_and_presentation() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/bin/ferrl.rs"));
+        let start = source
+            .find("fn train_with_launch_runtime_and_source_result(")
+            .expect("production train adapter source");
+        let end = source[start..]
+            .find("struct CoreLaunchAttestor")
+            .map(|offset| start + offset)
+            .expect("production train adapter boundary");
+        let entry = &source[start..end];
+        assert!(entry.contains("RunConfig::load_for_launch"));
+        assert!(entry.contains("coordinate_distributed_result"));
+        assert!(entry.contains("cli_train_setup(loaded, build_source)"));
+        assert!(entry.contains("ferrl::orchestration::run_cli_train_setup"));
+        assert!(entry.contains("present_cli_run_outcome"));
+        assert!(entry.contains("CliBuiltinTask::Countdown"));
+        assert!(entry.contains("CliBuiltinTask::Math"));
+        assert!(entry.contains("CliBuiltinTask::Trimul"));
+        assert!(!entry.contains("open_cuda"));
+        assert!(!entry.contains("prepare_launch_device"));
+        assert!(!entry.contains("countdown_splits"));
+        assert!(!entry.contains("math_splits"));
+        assert!(!entry.contains("trimul_splits"));
+        assert!(!entry.contains("build_trimul_reward"));
+        assert!(!entry.contains("synchronized_run_identity"));
+        assert!(!entry.contains("cli_training_request"));
+        assert!(!entry.contains("run_cli_training("));
+    }
 
     struct TestLaunchAttestor;
-    struct RejectingLaunchAttestor;
-    struct RankOneRejectingAttestor;
-    struct MutatingLaunchAttestor {
-        path: PathBuf,
-        replacement: Vec<u8>,
-        rank: Option<usize>,
-    }
 
     fn test_attestation_pkcs8() -> &'static [u8] {
         static KEY: OnceLock<Vec<u8>> = OnceLock::new();
@@ -7272,50 +6333,9 @@ mod tests {
         }
     }
 
-    impl LaunchAttestor for RejectingLaunchAttestor {
-        fn attest(&self, _manifest: &LaunchManifest) -> Result<LaunchAttestation, CliError> {
-            Err(CliError::msg("test launch attestor rejected request"))
-        }
-    }
-
-    impl LaunchAttestor for RankOneRejectingAttestor {
-        fn attest(&self, manifest: &LaunchManifest) -> Result<LaunchAttestation, CliError> {
-            if manifest.payload.run.data_parallel_rank == 1 {
-                Err(CliError::msg("test rank-one attestor rejection"))
-            } else {
-                TEST_LAUNCH_ATTESTOR.attest(manifest)
-            }
-        }
-    }
-
-    impl LaunchAttestor for MutatingLaunchAttestor {
-        fn attest(&self, manifest: &LaunchManifest) -> Result<LaunchAttestation, CliError> {
-            let attestation = TEST_LAUNCH_ATTESTOR.attest(manifest)?;
-            if self
-                .rank
-                .is_none_or(|rank| rank == manifest.payload.run.data_parallel_rank)
-            {
-                let replacement_path = self.path.with_extension(format!(
-                    "ferrl-replacement-{}",
-                    manifest.payload.run.data_parallel_rank
-                ));
-                std::fs::write(&replacement_path, &self.replacement).map_err(|source| {
-                    CliError::Io {
-                        path: replacement_path.clone(),
-                        source,
-                    }
-                })?;
-                std::fs::rename(&replacement_path, &self.path).map_err(|source| CliError::Io {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            }
-            Ok(attestation)
-        }
-    }
-
-    fn attest_launch_for_test(manifest: LaunchManifest) -> LaunchManifest {
-        manifest.attest(&TEST_LAUNCH_ATTESTOR).unwrap()
+    fn attest_launch_for_test(mut manifest: LaunchManifest) -> LaunchManifest {
+        manifest.attestation = Some(TEST_LAUNCH_ATTESTOR.attest(&manifest).unwrap());
+        manifest
     }
 
     struct TestDir(PathBuf);
@@ -7527,14 +6547,6 @@ mod tests {
         let path = tmp.path().join("run.json");
         std::fs::write(&path, countdown_train_config(extra_fields)).unwrap();
         (tmp, path)
-    }
-
-    fn test_policy_identity() -> ferrl::PolicyLoadIdentity {
-        ferrl::PolicyLoadIdentity {
-            policy_sha256: "00".repeat(32),
-            tokenizer_sha256: "11".repeat(32),
-            model_family: "qwen3",
-        }
     }
 
     fn test_build_source_identity() -> BuildSourceIdentity {
@@ -7944,6 +6956,15 @@ mod tests {
     ) -> (LaunchManifest, CandidateSigner) {
         let context = launch_context_for_test(cfg, run_id.to_owned(), 0, 1);
         let signer = CandidateSigner::generate().unwrap();
+        let (training_samples_sha256, held_out_samples_sha256) = if cfg.task == "trimul" {
+            let prompt_text = std::str::from_utf8(prompt).unwrap();
+            (
+                trimul_repeated_sample_sha256(prompt_text, cfg.data.train_n).unwrap(),
+                trimul_repeated_sample_sha256(prompt_text, cfg.data.eval_n).unwrap(),
+            )
+        } else {
+            ("55".repeat(32), "66".repeat(32))
+        };
         let manifest = LaunchManifest::new(LaunchPayload {
             task: cfg.task.clone(),
             ferrl_commit: context.ferrl_commit,
@@ -7960,6 +6981,14 @@ mod tests {
                 file: RunDir::PROMPT_FILE.to_owned(),
                 sha256: sha256_hex(prompt),
                 len_bytes: prompt.len(),
+            }),
+            training_samples: Some(LaunchSampleIdentity {
+                sha256: training_samples_sha256,
+                count: cfg.data.train_n,
+            }),
+            held_out_samples: Some(LaunchSampleIdentity {
+                sha256: held_out_samples_sha256,
+                count: cfg.data.eval_n,
             }),
             verifier: (cfg.task == "trimul").then(|| {
                 test_launch_verifier_identity(
@@ -7983,6 +7012,16 @@ mod tests {
             manifest
         };
         (manifest, signer)
+    }
+
+    fn legacy_launch_v2_for_test(launch: LaunchManifest) -> LaunchManifest {
+        let mut legacy = launch;
+        legacy.contract_version = LEGACY_LAUNCH_CONTRACT_VERSION;
+        legacy.payload.training_samples = None;
+        legacy.payload.held_out_samples = None;
+        let payload_bytes = serde_json::to_vec(&legacy.payload).unwrap();
+        legacy.payload_sha256 = domain_sha256(LEGACY_LAUNCH_PAYLOAD_DOMAIN, &[&payload_bytes]);
+        legacy
     }
 
     fn candidate_for_test(
@@ -8475,150 +7514,6 @@ mod tests {
     }
 
     #[test]
-    fn data_parallel_retains_launch_coordination_through_trainer_setup() {
-        let tmp = TestDir::new("dp-launch-setup-coordination");
-        let results = std::thread::scope(|scope| {
-            let handles: Vec<_> =
-                ferrl::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(1))
-                    .into_iter()
-                    .map(|comm| {
-                        let root = tmp.path().to_path_buf();
-                        scope.spawn(move || {
-                            let rank = comm.rank();
-                            let launch_comm = SharedComm::from_box(Box::new(comm));
-                            let trainer_comm = launch_comm.clone();
-                            let local = if rank == 1 {
-                                Err(CliError::msg("rank-local DP trainer setup failed"))
-                            } else {
-                                (|| {
-                                    let run =
-                                        RunDir::create(&root, format!("dp-setup-rank-{rank}"))?;
-                                    open_trainer(
-                                        TrainerConfig::default(),
-                                        &run,
-                                        Some(trainer_comm),
-                                        &"22".repeat(32),
-                                        &"11".repeat(32),
-                                        CandidateSigner::generate()?,
-                                    )
-                                })()
-                            };
-                            coordinate_distributed_result(
-                                Some(&launch_comm),
-                                "data-parallel model and trainer setup",
-                                local,
-                            )
-                            .map(|_| ())
-                            .map_err(|err| err.to_string())
-                        })
-                    })
-                    .collect();
-            handles
-                .into_iter()
-                .map(|handle| handle.join().unwrap())
-                .collect::<Vec<_>>()
-        });
-        assert!(results[0]
-            .as_ref()
-            .unwrap_err()
-            .contains("failed on a peer distributed rank"));
-        assert_eq!(
-            results[1].as_ref().unwrap_err(),
-            "rank-local DP trainer setup failed"
-        );
-    }
-
-    fn candidate_health_run_config() -> RunConfig {
-        let mut cfg: RunConfig = serde_json::from_str(&countdown_train_config("")).unwrap();
-        cfg.trainer.candidate_log_top_k = 2;
-        cfg.run_health = correctness_collapse_policy();
-        cfg
-    }
-
-    fn healthy_candidate_history() -> Vec<ferrl::Metrics> {
-        vec![
-            run_health_test_metric(0, 2.0, 1.0),
-            run_health_test_metric(1, 2.0, 1.0),
-        ]
-    }
-
-    fn write_healthy_candidate_ledger(run: &RunDir) {
-        write_candidate_jsonl(
-            &run.candidates_path(),
-            [
-                (0, 0, true, "source-0-0".to_string()),
-                (0, 1, true, "source-0-1".to_string()),
-                (1, 0, true, "source-1-0".to_string()),
-                (1, 1, true, "source-1-1".to_string()),
-            ],
-        );
-    }
-
-    fn run_coordinated_candidate_health(with_primary_ledger: bool) -> Vec<(usize, usize, String)> {
-        let tmp = TestDir::new("tp-primary-candidate-health");
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = ferrl::LocalComm::world(2)
-                .into_iter()
-                .enumerate()
-                .map(|(rank, comm)| {
-                    let root = tmp.path().to_path_buf();
-                    scope.spawn(move || {
-                        let cfg = candidate_health_run_config();
-                        let history = healthy_candidate_history();
-                        let summary = summarize(&history).unwrap();
-                        let run =
-                            RunDir::create(&root, format!("candidate-health-rank-{rank}")).unwrap();
-                        if rank == 0 && with_primary_ledger {
-                            write_healthy_candidate_ledger(&run);
-                        }
-                        let mut calls = 0;
-                        let result =
-                            run_on_tensor_parallel_primary(Some(&comm), "post-run health", || {
-                                calls += 1;
-                                apply_train_run_health_policy(&cfg, &history, &summary, &run)
-                            })
-                            .map_or_else(|err| err.to_string(), |()| String::new());
-                        (rank, calls, result)
-                    })
-                })
-                .collect();
-            let mut results: Vec<_> = handles
-                .into_iter()
-                .map(|handle| handle.join().unwrap())
-                .collect();
-            results.sort_by_key(|(rank, _, _)| *rank);
-            results
-        })
-    }
-
-    #[test]
-    fn tensor_parallel_postprocess_uses_primary_candidate_ledger_only() {
-        let tmp = TestDir::new("tp-empty-peer-health");
-        let cfg = candidate_health_run_config();
-        let history = healthy_candidate_history();
-        let summary = summarize(&history).unwrap();
-        let empty_peer = RunDir::create(tmp.path(), "empty-peer").unwrap();
-        assert!(apply_train_run_health_policy(&cfg, &history, &summary, &empty_peer).is_err());
-
-        let results = run_coordinated_candidate_health(true);
-        assert_eq!(results[0], (0, 1, String::new()));
-        assert_eq!(results[1], (1, 0, String::new()));
-    }
-
-    #[test]
-    fn tensor_parallel_postprocess_primary_health_failure_reaches_all_ranks() {
-        let results = run_coordinated_candidate_health(false);
-        assert_eq!(results[0].0, 0);
-        assert_eq!(results[0].1, 1);
-        assert_eq!(results[0].2, "run_health policy failed");
-        assert_eq!(results[1].0, 1);
-        assert_eq!(results[1].1, 0);
-        assert!(results[1]
-            .2
-            .contains("post-run health failed on a peer distributed rank"));
-    }
-
-    #[test]
     fn tensor_parallel_multi_rank_requires_cuda_device() {
         let (_tmp, path) = write_countdown_train_config(
             "tensor-parallel-requires-cuda",
@@ -8684,254 +7579,6 @@ mod tests {
         assert!(err.contains("held-out eval"));
     }
 
-    #[derive(Clone, Default)]
-    struct CliTpCalls {
-        generate: usize,
-        live_logp: usize,
-        detached_logp: usize,
-        comms: Vec<(usize, usize)>,
-    }
-
-    struct CliTpPolicy {
-        logp: Var,
-        enabled: bool,
-        calls: Arc<Mutex<CliTpCalls>>,
-    }
-
-    impl Policy for CliTpPolicy {
-        fn generate(
-            &mut self,
-            _prompt: &[u32],
-            _cfg: &GenConfig,
-        ) -> CandleResult<ferrl::policy::Rollout> {
-            panic!("CLI tensor_parallel helper must not call Policy::generate")
-        }
-
-        fn token_logprobs(&self, _rollout: &ferrl::policy::Rollout) -> CandleResult<Tensor> {
-            panic!("CLI tensor_parallel helper must not call Policy::token_logprobs")
-        }
-
-        fn token_logprobs_detached(
-            &self,
-            _rollout: &ferrl::policy::Rollout,
-        ) -> CandleResult<Tensor> {
-            panic!("CLI tensor_parallel helper must not call Policy::token_logprobs_detached")
-        }
-
-        fn set_adapter_enabled(&mut self, enabled: bool) {
-            self.enabled = enabled;
-        }
-
-        fn adapter_enabled(&self) -> bool {
-            self.enabled
-        }
-
-        fn trainable_vars(&self) -> Vec<Var> {
-            vec![self.logp.clone()]
-        }
-
-        fn sampler_state(&self) -> CandleResult<Vec<u8>> {
-            Ok(Vec::new())
-        }
-
-        fn restore_sampler_state(&mut self, _state: &[u8]) -> CandleResult<()> {
-            Ok(())
-        }
-    }
-
-    impl TensorParallelPolicy for CliTpPolicy {
-        fn supports_sharded_tensor_parallel_backward(&self) -> bool {
-            true
-        }
-
-        fn generate_at_tensor_parallel_instrumented(
-            &mut self,
-            prompt: &[u32],
-            _cfg: &GenConfig,
-            _global_row_base: u64,
-            comm: &dyn ferrl::Comm,
-            _telemetry: Option<&mut dyn ferrl::ModelTelemetryRecorder>,
-        ) -> CandleResult<ferrl::policy::Rollout> {
-            let mut calls = self.calls.lock().unwrap();
-            calls.generate += 1;
-            calls.comms.push((comm.rank(), comm.world_size()));
-            Ok(ferrl::policy::Rollout {
-                token_ids: vec![vec![prompt[0], 1], vec![prompt[0], 2]],
-                prompt_len: prompt.len(),
-                completion_lens: vec![1, 1],
-                rollout_logprobs: Some(vec![vec![-0.5], vec![-0.5]]),
-            })
-        }
-
-        fn token_logprobs_tensor_parallel(
-            &self,
-            _rollout: &ferrl::policy::Rollout,
-            comm: &dyn ferrl::Comm,
-        ) -> CandleResult<Tensor> {
-            let mut calls = self.calls.lock().unwrap();
-            calls.live_logp += 1;
-            calls.comms.push((comm.rank(), comm.world_size()));
-            Ok(self.logp.as_tensor().clone())
-        }
-
-        fn token_logprobs_tensor_parallel_detached(
-            &self,
-            _rollout: &ferrl::policy::Rollout,
-            comm: &dyn ferrl::Comm,
-        ) -> CandleResult<Tensor> {
-            let mut calls = self.calls.lock().unwrap();
-            calls.detached_logp += 1;
-            calls.comms.push((comm.rank(), comm.world_size()));
-            Ok(self.logp.as_tensor().detach())
-        }
-
-        fn backward_tensor_parallel(
-            &self,
-            loss: &Tensor,
-            _comm: &dyn ferrl::Comm,
-        ) -> CandleResult<candle_core::backprop::GradStore> {
-            loss.backward()
-        }
-    }
-
-    struct CliTpCodec;
-
-    impl TokenizerLike for CliTpCodec {
-        fn encode(&self, _text: &str) -> Vec<u32> {
-            vec![42]
-        }
-
-        fn decode(&self, ids: &[u32]) -> String {
-            ids.iter().map(u32::to_string).collect::<Vec<_>>().join(",")
-        }
-    }
-
-    struct CliTpReward;
-
-    impl RewardFn for CliTpReward {
-        type Target = ();
-
-        fn reward(
-            &self,
-            _sample: &Sample<()>,
-            completion: &str,
-        ) -> Result<f32, ferrl::RewardError> {
-            Ok(match completion {
-                "1" => 0.0,
-                "2" => 2.0,
-                other => panic!("unexpected completion {other}"),
-            })
-        }
-    }
-
-    fn cli_tp_policy() -> (CliTpPolicy, Arc<Mutex<CliTpCalls>>) {
-        let calls = Arc::new(Mutex::new(CliTpCalls::default()));
-        let logp =
-            Var::from_tensor(&Tensor::from_vec(vec![-0.4f32, -0.6], (2, 1), &Device::Cpu).unwrap())
-                .unwrap();
-        (
-            CliTpPolicy {
-                logp,
-                enabled: true,
-                calls: Arc::clone(&calls),
-            },
-            calls,
-        )
-    }
-
-    #[test]
-    fn train_helper_routes_tensor_parallel_comm_through_public_trainer_hook() {
-        let tmp = TestDir::new("tensor-parallel-train-helper-dispatch");
-        let run = RunDir::create(tmp.path(), "tp-train-helper-dispatch").unwrap();
-        let cfg = TrainerConfig {
-            steps: 1,
-            group_size: 2,
-            max_new_tokens: 1,
-            lr: 0.0,
-            beta: 0.1,
-            ..TrainerConfig::default()
-        };
-        let mut trainer = Trainer::new(cfg, &run).unwrap();
-        let (mut policy, calls) = cli_tp_policy();
-        let comm = ferrl::LocalComm::world(1).pop().unwrap();
-
-        train_with_optional_tensor_parallel(
-            &mut trainer,
-            &mut policy,
-            &CliTpReward,
-            &CliTpCodec,
-            &[Sample::new("prompt", ())],
-            Some(&comm),
-        )
-        .unwrap();
-
-        let calls = calls.lock().unwrap();
-        assert_eq!(calls.generate, 1);
-        assert!(calls.live_logp >= 1, "live TP scoring was not used");
-        assert!(
-            calls.detached_logp >= 2,
-            "old/reference TP detached scoring was not used"
-        );
-        assert!(
-            calls
-                .comms
-                .iter()
-                .all(|&(rank, world)| (rank, world) == (0, 1)),
-            "trainer did not pass the explicit TP communicator: {:?}",
-            calls.comms
-        );
-    }
-
-    #[test]
-    fn train_helper_routes_live_world_two_through_public_tp_hooks() {
-        let tmp = TestDir::new("tensor-parallel-train-helper-world-two");
-        let results = std::thread::scope(|scope| {
-            let handles: Vec<_> = ferrl::LocalComm::world(2)
-                .into_iter()
-                .enumerate()
-                .map(|(rank, comm)| {
-                    let root = tmp.path().to_path_buf();
-                    scope.spawn(move || {
-                        let run = RunDir::create(&root, format!("tp-helper-rank-{rank}")).unwrap();
-                        let cfg = TrainerConfig {
-                            steps: 1,
-                            group_size: 2,
-                            max_new_tokens: 1,
-                            lr: 0.0,
-                            beta: 0.1,
-                            ..TrainerConfig::default()
-                        };
-                        let mut trainer = Trainer::new(cfg, &run).unwrap();
-                        let (mut policy, calls) = cli_tp_policy();
-                        train_with_optional_tensor_parallel(
-                            &mut trainer,
-                            &mut policy,
-                            &CliTpReward,
-                            &CliTpCodec,
-                            &[Sample::new("prompt", ())],
-                            Some(&comm),
-                        )
-                        .unwrap();
-                        let calls = calls.lock().unwrap().clone();
-                        (rank, calls)
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|handle| handle.join().unwrap())
-                .collect::<Vec<_>>()
-        });
-        for (rank, calls) in results {
-            assert_eq!(calls.generate, 1, "rank {rank} skipped TP rollout");
-            assert!(calls.live_logp > 0, "rank {rank} skipped TP scoring");
-            assert!(calls
-                .comms
-                .iter()
-                .all(|&(seen_rank, world)| (seen_rank, world) == (rank, 2)));
-        }
-    }
-
     fn write_tp_auto_policy_config(
         root: &Path,
         model_dir: &Path,
@@ -8976,16 +7623,6 @@ mod tests {
         path
     }
 
-    fn prepare_test_launch_device(
-        _cfg: &RunConfig,
-        runtime: Option<&LaunchRuntime>,
-    ) -> Result<Device, CliError> {
-        Ok(runtime
-            .ok_or_else(|| CliError::msg("test launch runtime is missing"))?
-            .device
-            .clone())
-    }
-
     fn run_train_configs_world_two(configs: [PathBuf; 2]) -> Vec<Result<(), String>> {
         std::thread::scope(|scope| {
             let handles: Vec<_> = ferrl::LocalComm::world(2)
@@ -9002,7 +7639,6 @@ mod tests {
                             &args,
                             Some(runtime),
                             test_build_source_identity(),
-                            prepare_test_launch_device,
                         )
                         .map_err(|err| err.to_string())
                     })
@@ -9054,172 +7690,6 @@ mod tests {
         );
         assert_eq!(identities[0].data_parallel_world_size, 2);
         assert_eq!(identities[1].data_parallel_rank, 1);
-    }
-
-    fn eval_report_fixture(adapter_reward_mean: f32) -> ferrl::EvalReport {
-        ferrl::EvalReport {
-            n_prompts: 1,
-            group_size: 1,
-            base_reward_mean: 0.25,
-            adapter_reward_mean,
-            per_prompt: vec![ferrl::PromptEval {
-                base_mean: 0.25,
-                adapter_mean: adapter_reward_mean,
-            }],
-        }
-    }
-
-    #[test]
-    fn distributed_eval_report_binds_launch_group_and_publishes_immutably() {
-        let tmp = TestDir::new("distributed-eval-report-publication");
-        let roots = [tmp.path().join("rank0"), tmp.path().join("rank1")];
-        let cfg: RunConfig = serde_json::from_str(&countdown_train_config("")).unwrap();
-        let results = std::thread::scope(|scope| {
-            ferrl::LocalComm::world(2)
-                .into_iter()
-                .zip(roots.iter())
-                .map(|(comm, root)| {
-                    let cfg = &cfg;
-                    scope.spawn(move || {
-                        let run = RunDir::create(root, format!("run-rank{}", comm.rank())).unwrap();
-                        let samples = [Sample::new(
-                            "held out",
-                            CountdownProblem {
-                                numbers: vec![1, 2],
-                                target: 3,
-                            },
-                        )];
-                        let launch = if comm.rank() == 0 {
-                            "00".repeat(32)
-                        } else {
-                            "11".repeat(32)
-                        };
-                        publish_eval_report(
-                            cfg,
-                            &samples,
-                            &eval_report_fixture(0.75),
-                            &run,
-                            &launch,
-                            None,
-                            Some(&comm),
-                        )
-                        .map(|()| run)
-                        .map_err(|error| error.to_string())
-                    })
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|handle| handle.join().unwrap())
-                .collect::<Vec<_>>()
-        });
-        assert!(results.iter().all(Result::is_ok), "{results:?}");
-        let rank_zero = results[0].as_ref().unwrap();
-        let value: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(rank_zero.eval_report_path()).unwrap()).unwrap();
-        assert_eq!(value["publishing_launch_sha256"], "00".repeat(32));
-        assert!(value["launch_group_sha256"].as_str().is_some());
-        assert!(!results[1].as_ref().unwrap().eval_report_path().exists());
-        assert!(rank_zero.write_eval_report(&value).is_err());
-    }
-
-    #[test]
-    fn distributed_eval_report_result_divergence_fails_in_lockstep() {
-        let tmp = TestDir::new("distributed-eval-report-divergence");
-        let cfg: RunConfig = serde_json::from_str(&countdown_train_config("")).unwrap();
-        let results = std::thread::scope(|scope| {
-            ferrl::LocalComm::world(2)
-                .into_iter()
-                .map(|comm| {
-                    let cfg = &cfg;
-                    let root = tmp.path().join(format!("rank{}", comm.rank()));
-                    scope.spawn(move || {
-                        let run =
-                            RunDir::create(&root, format!("run-rank{}", comm.rank())).unwrap();
-                        publish_eval_report(
-                            cfg,
-                            &[Sample::new(
-                                "held out",
-                                CountdownProblem {
-                                    numbers: vec![1, 2],
-                                    target: 3,
-                                },
-                            )],
-                            &eval_report_fixture(if comm.rank() == 0 { 0.75 } else { 0.5 }),
-                            &run,
-                            &if comm.rank() == 0 {
-                                "00".repeat(32)
-                            } else {
-                                "11".repeat(32)
-                            },
-                            None,
-                            Some(&comm),
-                        )
-                        .map_err(|error| error.to_string())
-                    })
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|handle| handle.join().unwrap())
-                .collect::<Vec<_>>()
-        });
-        assert!(
-            results.iter().all(|result| result
-                .as_ref()
-                .unwrap_err()
-                .contains("launch ranks disagree on held-out evaluation report")),
-            "{results:?}"
-        );
-    }
-
-    #[test]
-    fn distributed_eval_report_publication_failure_is_lockstep() {
-        let tmp = TestDir::new("distributed-eval-report-publication-failure");
-        let cfg: RunConfig = serde_json::from_str(&countdown_train_config("")).unwrap();
-        let results = std::thread::scope(|scope| {
-            ferrl::LocalComm::world(2)
-                .into_iter()
-                .map(|comm| {
-                    let cfg = &cfg;
-                    let root = tmp.path().join(format!("rank{}", comm.rank()));
-                    scope.spawn(move || {
-                        let run =
-                            RunDir::create(&root, format!("run-rank{}", comm.rank())).unwrap();
-                        if comm.rank() == 0 {
-                            run.write_eval_report(&serde_json::json!({ "occupied": true }))
-                                .unwrap();
-                        }
-                        publish_eval_report(
-                            cfg,
-                            &[Sample::new(
-                                "held out",
-                                CountdownProblem {
-                                    numbers: vec![1, 2],
-                                    target: 3,
-                                },
-                            )],
-                            &eval_report_fixture(0.75),
-                            &run,
-                            &if comm.rank() == 0 {
-                                "00".repeat(32)
-                            } else {
-                                "11".repeat(32)
-                            },
-                            None,
-                            Some(&comm),
-                        )
-                        .map_err(|error| error.to_string())
-                    })
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|handle| handle.join().unwrap())
-                .collect::<Vec<_>>()
-        });
-        assert!(results[0].is_err(), "{results:?}");
-        assert!(results[1]
-            .as_ref()
-            .unwrap_err()
-            .contains("publication failed on a peer distributed rank"));
     }
 
     #[test]
@@ -9707,1233 +8177,6 @@ mod tests {
         assert_eq!(gen.eos_token_id, Some(3));
     }
 
-    struct EosRecordingPolicy {
-        logp: Var,
-        preflight_vars: Vec<Var>,
-        enabled: bool,
-        seen: Arc<Mutex<Vec<Option<u32>>>>,
-        panic_on_trainable_vars: bool,
-    }
-
-    impl EosRecordingPolicy {
-        fn new(seen: Arc<Mutex<Vec<Option<u32>>>>) -> Self {
-            Self::new_with_shape(seen, (2, 2))
-        }
-
-        fn new_with_shape(seen: Arc<Mutex<Vec<Option<u32>>>>, shape: (usize, usize)) -> Self {
-            Self::new_with_trainable_schema(seen, vec![(vec![shape.0, shape.1], DType::F32)])
-        }
-
-        fn new_with_trainable_schema(
-            seen: Arc<Mutex<Vec<Option<u32>>>>,
-            schema: Vec<(Vec<usize>, DType)>,
-        ) -> Self {
-            let mut vars = schema
-                .into_iter()
-                .map(|(shape, dtype)| Var::zeros(shape, dtype, &Device::Cpu).unwrap())
-                .collect::<Vec<_>>();
-            let logp = vars.remove(0);
-            Self {
-                logp,
-                preflight_vars: vars,
-                enabled: true,
-                seen,
-                panic_on_trainable_vars: false,
-            }
-        }
-    }
-
-    impl Policy for EosRecordingPolicy {
-        fn generate(
-            &mut self,
-            prompt: &[u32],
-            cfg: &GenConfig,
-        ) -> CandleResult<ferrl::policy::Rollout> {
-            self.seen.lock().unwrap().push(cfg.eos_token_id);
-            let eos = cfg
-                .eos_token_id
-                .ok_or_else(|| candle_core::Error::msg("production setup lost resolved EOS"))?;
-            let rows = (0..cfg.group_size)
-                .map(|_| {
-                    let mut row = prompt.to_vec();
-                    row.push(0);
-                    row.push(eos);
-                    row.resize(prompt.len() + cfg.max_new_tokens, eos);
-                    row
-                })
-                .collect();
-            Ok(ferrl::policy::Rollout::new(
-                rows,
-                prompt.len(),
-                vec![2; cfg.group_size],
-                None,
-            ))
-        }
-
-        fn token_logprobs(&self, _rollout: &ferrl::policy::Rollout) -> CandleResult<Tensor> {
-            Ok(self.logp.as_tensor().clone())
-        }
-
-        fn set_adapter_enabled(&mut self, enabled: bool) {
-            self.enabled = enabled;
-        }
-
-        fn adapter_enabled(&self) -> bool {
-            self.enabled
-        }
-
-        fn trainable_vars(&self) -> Vec<Var> {
-            assert!(
-                !self.panic_on_trainable_vars,
-                "injected trainable schema panic"
-            );
-            std::iter::once(self.logp.clone())
-                .chain(self.preflight_vars.iter().cloned())
-                .collect()
-        }
-
-        fn sampler_state(&self) -> CandleResult<Vec<u8>> {
-            Ok(Vec::new())
-        }
-
-        fn restore_sampler_state(&mut self, _state: &[u8]) -> CandleResult<()> {
-            Ok(())
-        }
-    }
-
-    impl TensorParallelPolicy for EosRecordingPolicy {
-        fn generate_at_tensor_parallel_instrumented(
-            &mut self,
-            prompt: &[u32],
-            cfg: &GenConfig,
-            _global_row_base: u64,
-            _comm: &dyn ferrl::Comm,
-            _telemetry: Option<&mut dyn ferrl::ModelTelemetryRecorder>,
-        ) -> CandleResult<ferrl::policy::Rollout> {
-            self.generate(prompt, cfg)
-        }
-
-        fn token_logprobs_tensor_parallel(
-            &self,
-            rollout: &ferrl::policy::Rollout,
-            _comm: &dyn ferrl::Comm,
-        ) -> CandleResult<Tensor> {
-            self.token_logprobs(rollout)
-        }
-
-        fn token_logprobs_tensor_parallel_detached(
-            &self,
-            rollout: &ferrl::policy::Rollout,
-            _comm: &dyn ferrl::Comm,
-        ) -> CandleResult<Tensor> {
-            self.token_logprobs_detached(rollout)
-        }
-    }
-
-    type TensorMetadata = (Vec<usize>, String);
-    type ObservedPreflightPayloads = Arc<Mutex<Vec<(usize, Vec<TensorMetadata>)>>>;
-
-    #[derive(Debug)]
-    struct RejectingPolicyPreflightComm<C> {
-        inner: C,
-        reject: bool,
-        panic: bool,
-        validator_calls: Arc<std::sync::atomic::AtomicUsize>,
-        payload_calls: Arc<std::sync::atomic::AtomicUsize>,
-        expected_preflight_payload: Vec<TensorMetadata>,
-        observed_preflight_payloads: ObservedPreflightPayloads,
-    }
-
-    impl<C: ferrl::Comm> ferrl::Comm for RejectingPolicyPreflightComm<C> {
-        fn rank(&self) -> usize {
-            self.inner.rank()
-        }
-
-        fn world_size(&self) -> usize {
-            self.inner.world_size()
-        }
-
-        fn validate_all_reduce_sum(&self, tensors: &[Tensor]) -> Result<(), ferrl::CommError> {
-            let observed = tensors
-                .iter()
-                .map(|tensor| (tensor.dims().to_vec(), tensor.dtype().as_str().to_owned()))
-                .collect::<Vec<_>>();
-            self.observed_preflight_payloads
-                .lock()
-                .unwrap()
-                .push((self.rank(), observed.clone()));
-            if observed != self.expected_preflight_payload {
-                return Err(ferrl::CommError::Mismatch(format!(
-                    "test observed DP preflight payload mismatch: expected {:?}, got {:?}",
-                    self.expected_preflight_payload, observed
-                )));
-            }
-            self.validator_calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            assert!(!self.panic, "injected DP backend validator panic");
-            if self.reject {
-                Err(ferrl::CommError::Mismatch(
-                    "injected DP backend tensor rejection".into(),
-                ))
-            } else {
-                self.inner.validate_all_reduce_sum(tensors)
-            }
-        }
-
-        fn all_reduce_sum(&self, tensors: &mut Vec<Tensor>) -> Result<(), ferrl::CommError> {
-            self.payload_calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.inner.all_reduce_sum(tensors)
-        }
-
-        fn all_reduce_scalar_sum(&self, value: f64) -> Result<f64, ferrl::CommError> {
-            self.inner.all_reduce_scalar_sum(value)
-        }
-    }
-
-    impl CliTrainingPolicy for EosRecordingPolicy {
-        fn supports_cli_tensor_parallel(&self) -> bool {
-            false
-        }
-    }
-
-    struct EosSetupReward;
-
-    impl RewardFn for EosSetupReward {
-        type Target = ();
-
-        fn reward(
-            &self,
-            _sample: &Sample<()>,
-            _completion: &str,
-        ) -> Result<f32, ferrl::RewardError> {
-            Ok(0.0)
-        }
-    }
-
-    struct RankSelectiveEvalReward {
-        fail: bool,
-    }
-
-    impl RewardFn for RankSelectiveEvalReward {
-        type Target = ();
-
-        fn reward(
-            &self,
-            _sample: &Sample<()>,
-            _completion: &str,
-        ) -> Result<f32, ferrl::RewardError> {
-            if self.fail {
-                Err(ferrl::RewardError::msg("injected rank-local eval failure"))
-            } else {
-                Ok(0.5)
-            }
-        }
-    }
-
-    fn dp_preflight_schema(failure: &str, rank: usize) -> Vec<(Vec<usize>, DType)> {
-        let first = (vec![2, 2], DType::F32);
-        let second = (vec![3], DType::F64);
-        let third = (vec![1, 4], DType::BF16);
-        match (failure, rank) {
-            ("schema-count", 1) => vec![first, second],
-            ("schema-order", 1) => vec![first, third, second],
-            ("schema-shape", 1) => vec![first, (vec![4], DType::F64), third],
-            ("schema-dtype", 1) => vec![first, (vec![3], DType::F16), third],
-            _ => vec![first, second, third],
-        }
-    }
-
-    fn dp_preflight_tensor_metadata(schema: &[(Vec<usize>, DType)]) -> Vec<TensorMetadata> {
-        schema
-            .iter()
-            .map(|(shape, dtype)| (shape.clone(), dtype.as_str().to_owned()))
-            .collect()
-    }
-
-    #[test]
-    #[allow(clippy::cognitive_complexity)] // one production-path table spans every preflight failure boundary
-    fn production_dp_policy_preflight_stops_before_payload_rollout_or_publication() {
-        for failure in [
-            "model",
-            "schema-count",
-            "schema-order",
-            "schema-shape",
-            "schema-dtype",
-            "policy-panic",
-            "backend-reject",
-            "backend-panic",
-        ] {
-            let tmp = TestDir::new(&format!("production-dp-policy-preflight-{failure}"));
-            let model_dir = tmp.path().join("model");
-            write_generation_metadata_fixture(
-                &model_dir,
-                Some(serde_json::json!(3)),
-                &serde_json::json!(4),
-            );
-            let validator_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let payload_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let expected_preflight_payload =
-                dp_preflight_tensor_metadata(&dp_preflight_schema("baseline", 0));
-            let observed_preflight_payloads = Arc::new(Mutex::new(Vec::new()));
-            let results = std::thread::scope(|scope| {
-                ferrl::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(5))
-                    .into_iter()
-                    .map(|comm| {
-                        let rank = comm.rank();
-                        let model_dir = model_dir.clone();
-                        let out_dir = tmp.path().join(format!("rank-{rank}-runs"));
-                        let validator_calls = Arc::clone(&validator_calls);
-                        let payload_calls = Arc::clone(&payload_calls);
-                        let expected_preflight_payload = expected_preflight_payload.clone();
-                        let observed_preflight_payloads = Arc::clone(&observed_preflight_payloads);
-                        scope.spawn(move || {
-                            let mut value: serde_json::Value =
-                                serde_json::from_str(&countdown_train_config("")).unwrap();
-                            value["model_dir"] = serde_json::json!(model_dir);
-                            value["out_dir"] = serde_json::json!(&out_dir);
-                            value["distributed"] = serde_json::json!({ "enabled": true });
-                            value["trainer"]["max_new_tokens"] = serde_json::json!(2);
-                            let cfg: RunConfig = serde_json::from_value(value).unwrap();
-                            let launch =
-                                launch_context_for_test(&cfg, format!("test-rank{rank}"), rank, 2);
-                            let seen = Arc::new(Mutex::new(Vec::new()));
-                            let loader_seen = Arc::clone(&seen);
-                            let result = run_training_with_loader(
-                                &cfg,
-                                &Device::Cpu,
-                                &EosSetupReward,
-                                &EosSetupReward,
-                                &[Sample::new("hello", ())],
-                                &[],
-                                None,
-                                None,
-                                None,
-                                &launch,
-                                Some(LaunchRuntime {
-                                    device: Device::Cpu,
-                                    comm: Box::new(RejectingPolicyPreflightComm {
-                                        inner: comm,
-                                        reject: failure == "backend-reject" && rank == 1,
-                                        panic: failure == "backend-panic" && rank == 1,
-                                        validator_calls,
-                                        payload_calls,
-                                        expected_preflight_payload,
-                                        observed_preflight_payloads,
-                                    }),
-                                }),
-                                None,
-                                move |model_dir, _device, _opts| {
-                                    let tokenizer = ferrl::HfTokenizer::from_file(
-                                        model_dir.join("tokenizer.json"),
-                                    )
-                                    .map_err(|error| CliError::msg(error.to_string()))?;
-                                    let mut policy = EosRecordingPolicy::new_with_trainable_schema(
-                                        loader_seen,
-                                        dp_preflight_schema(failure, rank),
-                                    );
-                                    policy.panic_on_trainable_vars =
-                                        failure == "policy-panic" && rank == 1;
-                                    let mut identity = test_policy_identity();
-                                    if failure == "model" && rank == 1 {
-                                        identity.policy_sha256 = "22".repeat(32);
-                                    }
-                                    Ok((policy, tokenizer, identity))
-                                },
-                            );
-                            let rollout_calls = seen.lock().unwrap().len();
-                            (
-                                rank,
-                                result.map_err(|error| error.to_string()),
-                                rollout_calls,
-                                out_dir,
-                            )
-                        })
-                    })
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .map(|handle| handle.join().unwrap())
-                    .collect::<Vec<_>>()
-            });
-
-            for (rank, result, rollout_calls, out_dir) in results {
-                let error = result.unwrap_err();
-                match failure {
-                    "model" => assert!(
-                        error.contains("frozen-policy identity"),
-                        "{failure} rank {rank}: {error}"
-                    ),
-                    "schema-count" | "schema-order" | "schema-shape" | "schema-dtype"
-                        if rank == 1 =>
-                    {
-                        assert!(
-                            error.contains("ordered optimizer-variable schema differs"),
-                            "{failure} rank {rank}: {error}"
-                        );
-                    }
-                    "schema-count" | "schema-order" | "schema-shape" | "schema-dtype" => {
-                        assert!(
-                            error.contains("ordered optimizer-variable schema failed on a peer"),
-                            "{failure} rank {rank}: {error}"
-                        );
-                    }
-                    "policy-panic" if rank == 1 => assert!(
-                        error.contains("injected trainable schema panic"),
-                        "{failure} rank {rank}: {error}"
-                    ),
-                    "policy-panic" => assert!(
-                        error.contains("early policy-variable observation failed on a peer"),
-                        "{failure} rank {rank}: {error}"
-                    ),
-                    "backend-reject" if rank == 1 => assert!(
-                        error.contains("injected DP backend tensor rejection"),
-                        "{failure} rank {rank}: {error}"
-                    ),
-                    "backend-panic" if rank == 1 => assert!(
-                        error.contains("backend tensor capability validator panicked"),
-                        "{failure} rank {rank}: {error}"
-                    ),
-                    "backend-reject" | "backend-panic" => assert!(
-                        error.contains(
-                            "complete optimizer-variable payload validation failed on a peer"
-                        ),
-                        "{failure} rank {rank}: {error}"
-                    ),
-                    _ => unreachable!(),
-                }
-                assert_eq!(rollout_calls, 0, "{failure} rank {rank} reached rollout");
-                assert!(
-                    !out_dir.exists(),
-                    "{failure} rank {rank} crossed the CLI's early no-run-publication boundary"
-                );
-            }
-            let expected_validator_calls = usize::from(failure.starts_with("backend-")) * 2;
-            assert_eq!(
-                validator_calls.load(std::sync::atomic::Ordering::SeqCst),
-                expected_validator_calls,
-                "{failure} validator call count"
-            );
-            assert_eq!(
-                payload_calls.load(std::sync::atomic::Ordering::SeqCst),
-                0,
-                "{failure} entered a tensor payload collective"
-            );
-            let mut observed = observed_preflight_payloads.lock().unwrap().clone();
-            observed.sort_by_key(|(rank, _)| *rank);
-            if failure.starts_with("backend-") {
-                assert_eq!(
-                    observed,
-                    vec![
-                        (0, expected_preflight_payload.clone()),
-                        (1, expected_preflight_payload.clone()),
-                    ],
-                    "{failure} backend validator received the complete ordered tensor payload before its injected failure"
-                );
-            } else {
-                assert!(
-                    observed.is_empty(),
-                    "{failure} reached backend validation after a failed consensus: {observed:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn distributed_evaluation_failure_aborts_before_report_collectives() {
-        let tmp = TestDir::new("distributed-evaluation-failure");
-        let model_dir = tmp.path().join("model");
-        write_generation_metadata_fixture(
-            &model_dir,
-            Some(serde_json::json!(3)),
-            &serde_json::json!(4),
-        );
-        let tokenizer = ferrl::HfTokenizer::from_file(model_dir.join("tokenizer.json")).unwrap();
-        let results = std::thread::scope(|scope| {
-            ferrl::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(5))
-                .into_iter()
-                .map(|comm| {
-                    let rank = comm.rank();
-                    let tokenizer = &tokenizer;
-                    let root = tmp.path().join(format!("rank-{rank}"));
-                    scope.spawn(move || {
-                        let cfg: RunConfig =
-                            serde_json::from_str(&countdown_train_config("")).unwrap();
-                        let run = RunDir::create(&root, format!("eval-rank{rank}")).unwrap();
-                        let mut policy = EosRecordingPolicy::new(Arc::new(Mutex::new(Vec::new())));
-                        let reward = RankSelectiveEvalReward { fail: rank == 1 };
-                        let gen = GenConfig {
-                            group_size: 1,
-                            max_new_tokens: 2,
-                            eos_token_id: Some(3),
-                            ..GenConfig::default()
-                        };
-                        let result = evaluate_and_publish_report(
-                            &mut policy,
-                            &reward,
-                            tokenizer,
-                            &[Sample::new("hello", ())],
-                            &gen,
-                            &cfg,
-                            &run,
-                            &if rank == 0 {
-                                "00".repeat(32)
-                            } else {
-                                "11".repeat(32)
-                            },
-                            None,
-                            Some(&comm),
-                        )
-                        .map_err(|error| error.to_string());
-                        (rank, result, run.eval_report_path())
-                    })
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|handle| handle.join().unwrap())
-                .collect::<Vec<_>>()
-        });
-
-        for (rank, result, report_path) in results {
-            let error = result.unwrap_err();
-            if rank == 1 {
-                assert!(
-                    error.contains("injected rank-local eval failure"),
-                    "{error}"
-                );
-            } else {
-                assert!(
-                    error.contains("held-out evaluation failed on a peer distributed rank"),
-                    "{error}"
-                );
-            }
-            assert!(
-                !report_path.exists(),
-                "rank {rank} published an eval report"
-            );
-        }
-    }
-
-    #[test]
-    #[allow(clippy::cognitive_complexity)] // one production seam with exact persisted assertions
-    fn local_ephemeral_production_training_needs_no_attestor_and_persists_signed_rows() {
-        let tmp = TestDir::new("production-checkpoint-eos-resolution");
-        let model_dir = tmp.path().join("model");
-        let out_dir = tmp.path().join("runs");
-        write_generation_metadata_fixture(
-            &model_dir,
-            Some(serde_json::json!(3)),
-            &serde_json::json!(4),
-        );
-        let mut value: serde_json::Value =
-            serde_json::from_str(&countdown_train_config("")).unwrap();
-        value["model_dir"] = serde_json::json!(model_dir);
-        value["out_dir"] = serde_json::json!(out_dir);
-        value["trainer"]["max_new_tokens"] = serde_json::json!(2);
-        value["trainer"]["candidate_log_top_k"] = serde_json::json!(1);
-        let cfg: RunConfig = serde_json::from_value(value).unwrap();
-        let launch = launch_context_for_test(&cfg, "test-run".to_owned(), 0, 1);
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let loader_seen = Arc::clone(&seen);
-
-        run_training_with_loader(
-            &cfg,
-            &Device::Cpu,
-            &EosSetupReward,
-            &EosSetupReward,
-            &[Sample::new("hello", ())],
-            &[Sample::new("hello", ())],
-            None,
-            None,
-            None,
-            &launch,
-            None,
-            None,
-            move |model_dir, _device, _opts| {
-                let tokenizer = ferrl::HfTokenizer::from_file(model_dir.join("tokenizer.json"))
-                    .map_err(|error| CliError::msg(error.to_string()))?;
-                Ok((
-                    EosRecordingPolicy::new(loader_seen),
-                    tokenizer,
-                    test_policy_identity(),
-                ))
-            },
-        )
-        .unwrap();
-
-        let seen = seen.lock().unwrap();
-        assert_eq!(
-            seen.len(),
-            3,
-            "expected train plus base/adapter eval generation"
-        );
-        assert!(seen.iter().all(|value| *value == Some(3)), "{seen:?}");
-        drop(seen);
-
-        let run_root = std::fs::read_dir(&out_dir)
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
-        let persisted: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(run_root.join("config.json")).unwrap()).unwrap();
-        assert_eq!(persisted["eos_token_id"], serde_json::json!(3));
-        let launch: LaunchManifest =
-            serde_json::from_slice(&std::fs::read(run_root.join(RunDir::LAUNCH_FILE)).unwrap())
-                .unwrap();
-        verify_launch_manifest_payload(&launch).unwrap();
-        assert_eq!(
-            launch.payload.authentication,
-            LaunchAuthenticationMode::LocalEphemeralV1
-        );
-        assert!(launch.attestation.is_none());
-        assert_eq!(launch.payload.ferrl_commit, "01".repeat(20));
-        assert_eq!(launch.payload.model.resolved_eos_token_id, Some(3));
-        assert_eq!(launch.payload.model.tokenizer_sha256, "11".repeat(32));
-        assert_eq!(launch.payload.config.resolved["task"], "countdown");
-        let eval_report: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(run_root.join(RunDir::EVAL_REPORT_FILE)).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(eval_report["contract"], "ferrl.eval-report.v2");
-        assert_eq!(
-            eval_report["publishing_launch_sha256"],
-            launch.payload_sha256
-        );
-        assert!(eval_report["launch_group_sha256"].as_str().is_some());
-        assert_eq!(
-            eval_report["split_key_contract"],
-            "ferrl.countdown-split-key.sorted-multiset-target.v1"
-        );
-        assert_eq!(eval_report["report"]["n_prompts"], 1);
-        let candidate: CandidateRecord = serde_json::from_str(
-            std::fs::read_to_string(run_root.join(RunDir::CANDIDATES_FILE))
-                .unwrap()
-                .lines()
-                .next()
-                .unwrap(),
-        )
-        .unwrap();
-        candidate
-            .verify_signed_provenance(&launch.payload.candidate_ledger.signing_public_key)
-            .unwrap();
-        assert_eq!(
-            candidate.launch_sha256.as_deref(),
-            Some(launch.payload_sha256.as_str())
-        );
-    }
-
-    #[test]
-    fn production_training_rejects_attestation_failure_before_rollout_or_run_publication() {
-        let tmp = TestDir::new("production-attestation-rejection");
-        let model_dir = tmp.path().join("model");
-        let out_dir = tmp.path().join("runs-must-not-exist");
-        write_generation_metadata_fixture(
-            &model_dir,
-            Some(serde_json::json!(3)),
-            &serde_json::json!(4),
-        );
-        let mut value: serde_json::Value =
-            serde_json::from_str(&countdown_train_config("")).unwrap();
-        value["model_dir"] = serde_json::json!(model_dir);
-        value["out_dir"] = serde_json::json!(&out_dir);
-        value["launch_authentication"] = serde_json::json!("external_attested_v1");
-        value["trainer"]["max_new_tokens"] = serde_json::json!(2);
-        value["trainer"]["candidate_log_top_k"] = serde_json::json!(1);
-        let cfg: RunConfig = serde_json::from_value(value).unwrap();
-        let launch = launch_context_for_test(&cfg, "test-run".to_owned(), 0, 1);
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let loader_seen = Arc::clone(&seen);
-
-        let error = run_training_with_loader(
-            &cfg,
-            &Device::Cpu,
-            &EosSetupReward,
-            &EosSetupReward,
-            &[Sample::new("hello", ())],
-            &[],
-            None,
-            None,
-            None,
-            &launch,
-            None,
-            Some(&REJECTING_LAUNCH_ATTESTOR),
-            move |model_dir, _device, _opts| {
-                let tokenizer = ferrl::HfTokenizer::from_file(model_dir.join("tokenizer.json"))
-                    .map_err(|error| CliError::msg(error.to_string()))?;
-                Ok((
-                    EosRecordingPolicy::new(loader_seen),
-                    tokenizer,
-                    test_policy_identity(),
-                ))
-            },
-        )
-        .unwrap_err()
-        .to_string();
-
-        assert!(
-            error.contains("launch attestor rejected request"),
-            "{error}"
-        );
-        assert!(
-            seen.lock().unwrap().is_empty(),
-            "attestation failure reached rollout"
-        );
-        assert!(
-            !out_dir.exists(),
-            "attestation failure created a run directory"
-        );
-    }
-
-    #[test]
-    fn external_attestation_mode_never_falls_back_when_attestor_is_missing() {
-        let tmp = TestDir::new("production-missing-attestor");
-        let model_dir = tmp.path().join("model");
-        let out_dir = tmp.path().join("runs-must-not-exist");
-        write_generation_metadata_fixture(
-            &model_dir,
-            Some(serde_json::json!(3)),
-            &serde_json::json!(4),
-        );
-        let mut value: serde_json::Value =
-            serde_json::from_str(&countdown_train_config("")).unwrap();
-        value["model_dir"] = serde_json::json!(model_dir);
-        value["out_dir"] = serde_json::json!(&out_dir);
-        value["launch_authentication"] = serde_json::json!("external_attested_v1");
-        value["trainer"]["max_new_tokens"] = serde_json::json!(2);
-        value["trainer"]["candidate_log_top_k"] = serde_json::json!(1);
-        let cfg: RunConfig = serde_json::from_value(value).unwrap();
-        let launch = launch_context_for_test(&cfg, "test-run".to_owned(), 0, 1);
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let loader_seen = Arc::clone(&seen);
-
-        let error = run_training_with_loader(
-            &cfg,
-            &Device::Cpu,
-            &EosSetupReward,
-            &EosSetupReward,
-            &[Sample::new("hello", ())],
-            &[],
-            None,
-            None,
-            None,
-            &launch,
-            None,
-            None,
-            move |model_dir, _device, _opts| {
-                let tokenizer = ferrl::HfTokenizer::from_file(model_dir.join("tokenizer.json"))
-                    .map_err(|error| CliError::msg(error.to_string()))?;
-                Ok((
-                    EosRecordingPolicy::new(loader_seen),
-                    tokenizer,
-                    test_policy_identity(),
-                ))
-            },
-        )
-        .unwrap_err()
-        .to_string();
-
-        assert!(error.contains("requires the protected external launch attestor"));
-        assert!(seen.lock().unwrap().is_empty(), "fallback reached rollout");
-        assert!(!out_dir.exists(), "fallback published a run directory");
-    }
-
-    #[test]
-    fn distributed_training_coordinates_attestation_failure_before_rollout_or_publication() {
-        let tmp = TestDir::new("distributed-attestation-rejection");
-        let model_dir = tmp.path().join("model");
-        write_generation_metadata_fixture(
-            &model_dir,
-            Some(serde_json::json!(3)),
-            &serde_json::json!(4),
-        );
-        let results = std::thread::scope(|scope| {
-            ferrl::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(5))
-                .into_iter()
-                .map(|comm| {
-                    let rank = comm.rank();
-                    let model_dir = model_dir.clone();
-                    let out_dir = tmp.path().join(format!("rank-{rank}-runs"));
-                    scope.spawn(move || {
-                        let mut value: serde_json::Value =
-                            serde_json::from_str(&countdown_train_config("")).unwrap();
-                        value["model_dir"] = serde_json::json!(model_dir);
-                        value["out_dir"] = serde_json::json!(&out_dir);
-                        value["launch_authentication"] = serde_json::json!("external_attested_v1");
-                        value["distributed"] = serde_json::json!({ "enabled": true });
-                        value["trainer"]["max_new_tokens"] = serde_json::json!(2);
-                        value["trainer"]["candidate_log_top_k"] = serde_json::json!(1);
-                        let cfg: RunConfig = serde_json::from_value(value).unwrap();
-                        let launch = launch_context_for_test(
-                            &cfg,
-                            format!("test-group-rank{rank}"),
-                            rank,
-                            2,
-                        );
-                        let seen = Arc::new(Mutex::new(Vec::new()));
-                        let loader_seen = Arc::clone(&seen);
-                        let result = run_training_with_loader(
-                            &cfg,
-                            &Device::Cpu,
-                            &EosSetupReward,
-                            &EosSetupReward,
-                            &[Sample::new("hello", ())],
-                            &[],
-                            None,
-                            None,
-                            None,
-                            &launch,
-                            Some(LaunchRuntime {
-                                device: Device::Cpu,
-                                comm: Box::new(comm),
-                            }),
-                            Some(&RANK_ONE_REJECTING_ATTESTOR),
-                            move |model_dir, _device, _opts| {
-                                let tokenizer =
-                                    ferrl::HfTokenizer::from_file(model_dir.join("tokenizer.json"))
-                                        .map_err(|error| CliError::msg(error.to_string()))?;
-                                Ok((
-                                    EosRecordingPolicy::new(loader_seen),
-                                    tokenizer,
-                                    test_policy_identity(),
-                                ))
-                            },
-                        );
-                        let rollout_calls = seen.lock().unwrap().len();
-                        (
-                            rank,
-                            result.map_err(|error| error.to_string()),
-                            rollout_calls,
-                            out_dir,
-                        )
-                    })
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|handle| handle.join().unwrap())
-                .collect::<Vec<_>>()
-        });
-
-        for (rank, result, rollout_calls, out_dir) in results {
-            let error = result.unwrap_err();
-            if rank == 1 {
-                assert!(
-                    error.contains("test rank-one attestor rejection"),
-                    "rank {rank}: {error}"
-                );
-            } else {
-                assert!(
-                    error.contains("launch authentication failed on a peer distributed rank"),
-                    "rank {rank}: {error}"
-                );
-            }
-            assert_eq!(rollout_calls, 0, "rank {rank} reached rollout");
-            assert!(!out_dir.exists(), "rank {rank} published a run directory");
-        }
-    }
-
-    #[test]
-    fn post_attestation_trimul_asset_substitutions_stop_before_rollout_or_publication() {
-        for target in ["image.sif", "eval/eval.py", "eval/task.yml"] {
-            let tmp = TestDir::new(&format!("trimul-attested-substitution-{target}"));
-            let model_dir = tmp.path().join("model");
-            let out_dir = tmp.path().join("runs-must-not-exist");
-            write_generation_metadata_fixture(
-                &model_dir,
-                Some(serde_json::json!(3)),
-                &serde_json::json!(4),
-            );
-            let cfg = trimul_config_with_verifier_fixture(tmp.path(), &model_dir, &out_dir);
-            let verifier_assets = cfg.capture_trimul_verifier_assets().unwrap();
-            let verifier_identity = test_launch_verifier_identity(
-                verifier_assets.identity().clone(),
-                cfg.trimul.verifier_isolation_tier,
-            );
-            let launch = launch_context_for_test(&cfg, "test-run".to_owned(), 0, 1);
-            let seen = Arc::new(Mutex::new(Vec::new()));
-            let loader_seen = Arc::clone(&seen);
-            let attestor = MutatingLaunchAttestor {
-                path: tmp.path().join(target),
-                replacement: b"post-attestation replacement".to_vec(),
-                rank: None,
-            };
-
-            let error = run_training_with_loader(
-                &cfg,
-                &Device::Cpu,
-                &EosSetupReward,
-                &EosSetupReward,
-                &[Sample::new("hello", ())],
-                &[],
-                Some(b"exact prompt"),
-                Some(&verifier_assets),
-                Some(&verifier_identity),
-                &launch,
-                None,
-                Some(&attestor),
-                move |model_dir, _device, _opts| {
-                    let tokenizer = ferrl::HfTokenizer::from_file(model_dir.join("tokenizer.json"))
-                        .map_err(|error| CliError::msg(error.to_string()))?;
-                    Ok((
-                        EosRecordingPolicy::new(loader_seen),
-                        tokenizer,
-                        test_policy_identity(),
-                    ))
-                },
-            )
-            .unwrap_err()
-            .to_string();
-
-            assert!(
-                error.contains("changed after verifier attestation"),
-                "{target}: {error}"
-            );
-            assert!(seen.lock().unwrap().is_empty(), "{target} reached rollout");
-            assert!(!out_dir.exists(), "{target} reached run publication");
-        }
-    }
-
-    #[test]
-    fn distributed_post_attestation_trimul_substitution_returns_all_ranks_before_rollout() {
-        let tmp = TestDir::new("distributed-trimul-attested-substitution");
-        let model_dir = tmp.path().join("model");
-        write_generation_metadata_fixture(
-            &model_dir,
-            Some(serde_json::json!(3)),
-            &serde_json::json!(4),
-        );
-        let results = std::thread::scope(|scope| {
-            ferrl::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(5))
-                .into_iter()
-                .map(|comm| {
-                    let rank = comm.rank();
-                    let root = tmp.path().join(format!("rank-{rank}"));
-                    std::fs::create_dir_all(&root).unwrap();
-                    let model_dir = model_dir.clone();
-                    scope.spawn(move || {
-                        let out_dir = root.join("runs-must-not-exist");
-                        let mut cfg =
-                            trimul_config_with_verifier_fixture(&root, &model_dir, &out_dir);
-                        cfg.distributed.enabled = true;
-                        let verifier_assets = cfg.capture_trimul_verifier_assets().unwrap();
-                        let verifier_identity = test_launch_verifier_identity(
-                            verifier_assets.identity().clone(),
-                            cfg.trimul.verifier_isolation_tier,
-                        );
-                        let launch = launch_context_for_test(
-                            &cfg,
-                            format!("test-group-rank{rank}"),
-                            rank,
-                            2,
-                        );
-                        let seen = Arc::new(Mutex::new(Vec::new()));
-                        let loader_seen = Arc::clone(&seen);
-                        let attestor = MutatingLaunchAttestor {
-                            path: root.join("eval/task.yml"),
-                            replacement: b"rank-local post-attestation replacement".to_vec(),
-                            rank: Some(1),
-                        };
-                        let result = run_training_with_loader(
-                            &cfg,
-                            &Device::Cpu,
-                            &EosSetupReward,
-                            &EosSetupReward,
-                            &[Sample::new("hello", ())],
-                            &[],
-                            Some(b"exact prompt"),
-                            Some(&verifier_assets),
-                            Some(&verifier_identity),
-                            &launch,
-                            Some(LaunchRuntime {
-                                device: Device::Cpu,
-                                comm: Box::new(comm),
-                            }),
-                            Some(&attestor),
-                            move |model_dir, _device, _opts| {
-                                let tokenizer =
-                                    ferrl::HfTokenizer::from_file(model_dir.join("tokenizer.json"))
-                                        .map_err(|error| CliError::msg(error.to_string()))?;
-                                Ok((
-                                    EosRecordingPolicy::new(loader_seen),
-                                    tokenizer,
-                                    test_policy_identity(),
-                                ))
-                            },
-                        );
-                        let rollout_calls = seen.lock().unwrap().len();
-                        (
-                            rank,
-                            result.map_err(|error| error.to_string()),
-                            rollout_calls,
-                            out_dir,
-                        )
-                    })
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|handle| handle.join().unwrap())
-                .collect::<Vec<_>>()
-        });
-
-        for (rank, result, rollout_calls, out_dir) in results {
-            let error = result.unwrap_err();
-            if rank == 1 {
-                assert!(
-                    error.contains("changed after verifier attestation"),
-                    "{error}"
-                );
-            } else {
-                assert!(
-                    error.contains(
-                        "launch-bound verifier revalidation failed on a peer distributed rank"
-                    ),
-                    "{error}"
-                );
-            }
-            assert_eq!(rollout_calls, 0, "rank {rank} reached rollout");
-            assert!(!out_dir.exists(), "rank {rank} reached publication");
-        }
-    }
-
-    #[test]
-    fn production_training_rejects_existing_launch_before_rollout() {
-        let tmp = TestDir::new("production-launch-create-new");
-        let model_dir = tmp.path().join("model");
-        let out_dir = tmp.path().join("runs");
-        write_generation_metadata_fixture(
-            &model_dir,
-            Some(serde_json::json!(3)),
-            &serde_json::json!(4),
-        );
-        let mut value: serde_json::Value =
-            serde_json::from_str(&countdown_train_config("")).unwrap();
-        value["model_dir"] = serde_json::json!(model_dir);
-        value["out_dir"] = serde_json::json!(out_dir);
-        value["trainer"]["max_new_tokens"] = serde_json::json!(2);
-        let cfg: RunConfig = serde_json::from_value(value).unwrap();
-        let launch = launch_context_for_test(&cfg, "test-run".to_owned(), 0, 1);
-        let existing = RunDir::create(&cfg.out_dir, "test-run").unwrap();
-        existing.write_immutable_launch(b"{}", None).unwrap();
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let loader_seen = Arc::clone(&seen);
-
-        let error = run_training_with_loader(
-            &cfg,
-            &Device::Cpu,
-            &EosSetupReward,
-            &EosSetupReward,
-            &[Sample::new("hello", ())],
-            &[],
-            None,
-            None,
-            None,
-            &launch,
-            None,
-            None,
-            move |model_dir, _device, _opts| {
-                let tokenizer = ferrl::HfTokenizer::from_file(model_dir.join("tokenizer.json"))
-                    .map_err(|error| CliError::msg(error.to_string()))?;
-                Ok((
-                    EosRecordingPolicy::new(loader_seen),
-                    tokenizer,
-                    test_policy_identity(),
-                ))
-            },
-        )
-        .unwrap_err()
-        .to_string();
-
-        assert!(error.contains("duplicate run_id"), "{error}");
-        assert!(
-            seen.lock().unwrap().is_empty(),
-            "rollout reached after launch rejection"
-        );
-    }
-
-    #[test]
-    fn distributed_production_setup_rejects_resolved_eos_drift_before_run_publication() {
-        let tmp = TestDir::new("production-resolved-eos-consensus");
-        let model_dir = tmp.path().join("model");
-        write_generation_metadata_fixture(
-            &model_dir,
-            Some(serde_json::json!(0)),
-            &serde_json::json!(4),
-        );
-        let results = std::thread::scope(|scope| {
-            ferrl::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(5))
-                .into_iter()
-                .map(|comm| {
-                    let rank = comm.rank();
-                    let model_dir = model_dir.clone();
-                    let out_dir = tmp.path().join(format!("rank-{rank}-runs"));
-                    std::fs::create_dir_all(&out_dir).unwrap();
-                    let sentinel = out_dir.join("sentinel");
-                    std::fs::write(&sentinel, format!("rank-{rank}")).unwrap();
-                    scope.spawn(move || {
-                        let mut value: serde_json::Value =
-                            serde_json::from_str(&countdown_train_config("")).unwrap();
-                        value["model_dir"] = serde_json::json!(model_dir);
-                        value["out_dir"] = serde_json::json!(out_dir);
-                        value["distributed"] = serde_json::json!({ "enabled": true });
-                        value["trainer"]["max_new_tokens"] = serde_json::json!(2);
-                        if rank == 1 {
-                            value["trainer"]["eos_token_id"] = serde_json::json!("none");
-                        }
-                        let cfg: RunConfig = serde_json::from_value(value).unwrap();
-                        let launch = launch_context_for_test(
-                            &cfg,
-                            format!("test-group-rank{rank}"),
-                            rank,
-                            2,
-                        );
-                        let seen = Arc::new(Mutex::new(Vec::new()));
-                        let loader_seen = Arc::clone(&seen);
-                        let result = run_training_with_loader(
-                            &cfg,
-                            &Device::Cpu,
-                            &EosSetupReward,
-                            &EosSetupReward,
-                            &[Sample::new("hello", ())],
-                            &[],
-                            None,
-                            None,
-                            None,
-                            &launch,
-                            Some(LaunchRuntime {
-                                device: Device::Cpu,
-                                comm: Box::new(comm),
-                            }),
-                            None,
-                            move |model_dir, _device, _opts| {
-                                let tokenizer =
-                                    ferrl::HfTokenizer::from_file(model_dir.join("tokenizer.json"))
-                                        .map_err(|error| CliError::msg(error.to_string()))?;
-                                Ok((
-                                    EosRecordingPolicy::new(loader_seen),
-                                    tokenizer,
-                                    test_policy_identity(),
-                                ))
-                            },
-                        );
-                        let entries = std::fs::read_dir(&cfg.out_dir)
-                            .unwrap()
-                            .map(|entry| entry.unwrap().file_name())
-                            .collect::<Vec<_>>();
-                        (
-                            rank,
-                            result.map_err(|error| error.to_string()),
-                            entries,
-                            sentinel,
-                        )
-                    })
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|handle| handle.join().unwrap())
-                .collect::<Vec<_>>()
-        });
-
-        for (rank, result, entries, sentinel) in results {
-            let error = result.unwrap_err();
-            assert!(
-                error.contains("resolved EOS consensus"),
-                "rank {rank}: {error}"
-            );
-            assert_eq!(entries, vec![sentinel.file_name().unwrap().to_os_string()]);
-        }
-    }
-
-    #[test]
-    fn distributed_production_rejects_tokenizer_identity_drift_before_rollout_or_publication() {
-        let tmp = TestDir::new("production-tokenizer-identity-consensus");
-        let model_dir = tmp.path().join("model");
-        write_generation_metadata_fixture(
-            &model_dir,
-            Some(serde_json::json!(3)),
-            &serde_json::json!(4),
-        );
-        let results = std::thread::scope(|scope| {
-            ferrl::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(5))
-                .into_iter()
-                .map(|comm| {
-                    let rank = comm.rank();
-                    let model_dir = model_dir.clone();
-                    let out_dir = tmp.path().join(format!("tokenizer-rank-{rank}-runs"));
-                    std::fs::create_dir_all(&out_dir).unwrap();
-                    let sentinel = out_dir.join("sentinel");
-                    std::fs::write(&sentinel, format!("rank-{rank}")).unwrap();
-                    scope.spawn(move || {
-                        let mut value: serde_json::Value =
-                            serde_json::from_str(&countdown_train_config("")).unwrap();
-                        value["model_dir"] = serde_json::json!(model_dir);
-                        value["out_dir"] = serde_json::json!(out_dir);
-                        value["distributed"] = serde_json::json!({ "enabled": true });
-                        value["trainer"]["max_new_tokens"] = serde_json::json!(2);
-                        let cfg: RunConfig = serde_json::from_value(value).unwrap();
-                        let launch = launch_context_for_test(
-                            &cfg,
-                            format!("test-group-rank{rank}"),
-                            rank,
-                            2,
-                        );
-                        let seen = Arc::new(Mutex::new(Vec::new()));
-                        let loader_seen = Arc::clone(&seen);
-                        let result = run_training_with_loader(
-                            &cfg,
-                            &Device::Cpu,
-                            &EosSetupReward,
-                            &EosSetupReward,
-                            &[Sample::new("hello", ())],
-                            &[],
-                            None,
-                            None,
-                            None,
-                            &launch,
-                            Some(LaunchRuntime {
-                                device: Device::Cpu,
-                                comm: Box::new(comm),
-                            }),
-                            None,
-                            move |model_dir, _device, _opts| {
-                                let tokenizer =
-                                    ferrl::HfTokenizer::from_file(model_dir.join("tokenizer.json"))
-                                        .map_err(|error| CliError::msg(error.to_string()))?;
-                                let mut identity = test_policy_identity();
-                                identity.tokenizer_sha256 = format!("{rank:02x}").repeat(32);
-                                Ok((EosRecordingPolicy::new(loader_seen), tokenizer, identity))
-                            },
-                        );
-                        let entries = std::fs::read_dir(&cfg.out_dir)
-                            .unwrap()
-                            .map(|entry| entry.unwrap().file_name())
-                            .collect::<Vec<_>>();
-                        let rollout_calls = seen.lock().unwrap().len();
-                        (
-                            rank,
-                            result.map_err(|error| error.to_string()),
-                            rollout_calls,
-                            entries,
-                            sentinel,
-                        )
-                    })
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|handle| handle.join().unwrap())
-                .collect::<Vec<_>>()
-        });
-
-        for (rank, result, rollout_calls, entries, sentinel) in results {
-            let error = result.unwrap_err();
-            assert!(
-                error.contains("tokenizer/prompt provenance"),
-                "rank {rank}: {error}"
-            );
-            assert_eq!(rollout_calls, 0, "rank {rank} reached rollout");
-            assert_eq!(entries, vec![sentinel.file_name().unwrap().to_os_string()]);
-        }
-    }
-
     fn assert_missing_checkpoint_eos_requires_explicit_mode(
         model_dir: &Path,
         tokenizer_path: &Path,
@@ -11210,20 +8453,18 @@ mod tests {
                 None => json["trainer"][field] = value,
             }
             std::fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
-            let prepared = std::cell::Cell::new(false);
 
             let result = train_with_launch_runtime(
                 &TrainArgs { config: path },
                 None,
                 test_build_source_identity(),
-                |_, _| {
-                    prepared.set(true);
-                    Ok(Device::Cpu)
-                },
             );
 
             assert!(result.is_err(), "{field} unexpectedly reached training");
-            assert!(!prepared.get(), "{field} reached device/model setup");
+            assert!(
+                !tmp.path().join("runs").exists(),
+                "{field} created run state"
+            );
         }
     }
 
@@ -11237,7 +8478,6 @@ mod tests {
         json["out_dir"] = serde_json::json!(&out_dir);
         json["distributed"] = serde_json::json!({ "enabled": true });
         std::fs::write(&config_path, serde_json::to_vec(&json).unwrap()).unwrap();
-        let prepared = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         let results = std::thread::scope(|scope| {
             ferrl::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(5))
@@ -11245,7 +8485,6 @@ mod tests {
                 .map(|comm| {
                     let rank = comm.rank();
                     let config_path = config_path.clone();
-                    let prepared = Arc::clone(&prepared);
                     scope.spawn(move || {
                         let local_source = if rank == 1 {
                             Err(CliError::msg("test dirty source on rank one"))
@@ -11263,10 +8502,6 @@ mod tests {
                                     comm: Box::new(comm),
                                 }),
                                 local_source,
-                                move |_, _| {
-                                    prepared.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                                    Ok(Device::Cpu)
-                                },
                             )
                             .map_err(|error| error.to_string()),
                         )
@@ -11289,7 +8524,6 @@ mod tests {
                 );
             }
         }
-        assert_eq!(prepared.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(!out_dir.exists());
     }
 
@@ -11306,7 +8540,6 @@ mod tests {
         json["trainer"]["reward_group_scope"] = serde_json::json!("distributed_same_prompt");
         std::fs::write(&config_path, serde_json::to_vec(&json).unwrap()).unwrap();
 
-        let prepared = std::cell::Cell::new(false);
         let result = train_with_launch_runtime(
             &TrainArgs {
                 config: config_path,
@@ -11316,17 +8549,10 @@ mod tests {
                 comm: Box::new(ferrl::SoloComm),
             }),
             test_build_source_identity(),
-            |_, _| {
-                prepared.set(true);
-                Err(CliError::msg(
-                    "prepare-device sentinel: ineffective live DP group reached device setup",
-                ))
-            },
         );
 
         let error = result.unwrap_err().to_string();
         assert!(error.contains("effective reward-group size"), "{error}");
-        assert!(!prepared.get(), "ineffective group reached device setup");
         assert!(!out_dir.exists(), "ineffective group created its run root");
     }
 
@@ -11343,13 +8569,11 @@ mod tests {
         json["trainer"]["reward_group_scope"] = serde_json::json!("distributed_same_prompt");
         std::fs::write(&config_path, serde_json::to_vec(&json).unwrap()).unwrap();
 
-        let prepared = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let results = std::thread::scope(|scope| {
             ferrl::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(5))
                 .into_iter()
                 .map(|comm| {
                     let config_path = config_path.clone();
-                    let prepared = Arc::clone(&prepared);
                     scope.spawn(move || {
                         train_with_launch_runtime(
                             &TrainArgs {
@@ -11360,12 +8584,6 @@ mod tests {
                                 comm: Box::new(comm),
                             }),
                             test_build_source_identity(),
-                            move |_, _| {
-                                prepared.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                                Err(CliError::msg(
-                                    "prepare-device sentinel: overflowing live DP group reached device setup",
-                                ))
-                            },
                         )
                         .map_err(|error| error.to_string())
                     })
@@ -11383,11 +8601,6 @@ mod tests {
                 "{error}"
             );
         }
-        assert_eq!(
-            prepared.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "overflowing group reached device setup"
-        );
         assert!(!out_dir.exists(), "overflowing group created its run root");
     }
 
@@ -13305,6 +10518,93 @@ benchmarks:
     }
 
     #[test]
+    fn legacy_launch_v2_without_sample_identities_remains_loadable() {
+        let tmp = TestDir::new("artifact-legacy-launch-v2");
+        let cfg: RunConfig = serde_json::from_str(&trimul_score_test_config(4242)).unwrap();
+        let (launch, signer) = launch_manifest_for_test(&cfg, "trimul-1", b"prompt");
+        let mut payload = launch.payload;
+        payload.run.group_id = "trimul-1".to_owned();
+        let legacy = legacy_launch_v2_for_test(LaunchManifest::new(payload).unwrap());
+        let candidate = candidate_for_test(&legacy, &signer, "```python\npass\n```\n");
+        let candidate_sha256 = candidate.record_sha256.clone().unwrap();
+        let run = RunDir::create(tmp.path(), "trimul-1").unwrap();
+        run.write_immutable_launch(&legacy.to_pretty_bytes().unwrap(), Some(b"prompt"))
+            .unwrap();
+        let mut writer = ferrl::telemetry::CandidateWriter::open(run.candidates_path()).unwrap();
+        writer.append(&candidate).unwrap();
+        drop(writer);
+
+        let bound = load_bound_run_candidate(run.root(), &candidate_sha256).unwrap();
+        assert_eq!(
+            bound.launch.contract_version,
+            LEGACY_LAUNCH_CONTRACT_VERSION
+        );
+        assert!(bound.launch.payload.training_samples.is_none());
+        assert!(bound.launch.payload.held_out_samples.is_none());
+    }
+
+    #[test]
+    fn launch_sample_identity_versioning_and_shape_are_strict() {
+        let cfg: RunConfig = serde_json::from_str(&trimul_score_test_config(4242)).unwrap();
+        let (launch, _signer) = launch_manifest_for_test(&cfg, "trimul-1", b"prompt");
+        verify_launch_manifest_payload(&launch).unwrap();
+        assert_eq!(launch.contract_version, LAUNCH_CONTRACT_VERSION);
+
+        let mut missing_training = launch.clone();
+        missing_training.payload.training_samples = None;
+        assert!(verify_launch_manifest_payload(&missing_training)
+            .unwrap_err()
+            .to_string()
+            .contains("ordered training sample identity"));
+
+        let mut bad_digest = launch.clone();
+        bad_digest.payload.held_out_samples.as_mut().unwrap().sha256 = "not-a-digest".to_owned();
+        assert!(verify_launch_manifest_payload(&bad_digest)
+            .unwrap_err()
+            .to_string()
+            .contains("64 lowercase hexadecimal"));
+
+        let legacy = legacy_launch_v2_for_test(launch.clone());
+        let bytes = legacy.to_pretty_bytes().unwrap();
+        let parsed = parse_exact_launch_manifest(Path::new("launch.json"), &bytes).unwrap();
+        verify_launch_manifest_payload(&parsed).unwrap();
+
+        let mut contaminated_legacy = legacy;
+        contaminated_legacy.payload.training_samples = launch.payload.training_samples.clone();
+        assert!(verify_launch_manifest_payload(&contaminated_legacy)
+            .unwrap_err()
+            .to_string()
+            .contains("must not carry v3 sample identity"));
+    }
+
+    #[test]
+    fn trimul_artifact_ingest_rejects_sample_identity_mutation() {
+        let (_tmp, run_dir, candidate_sha256) =
+            write_bound_candidate_run("artifact-sample-identity", 0, 1, 0, 1);
+        let launch_path = run_dir.join(RunDir::LAUNCH_FILE);
+        let launch: LaunchManifest =
+            serde_json::from_slice(&std::fs::read(&launch_path).unwrap()).unwrap();
+
+        let mut count_mutation = launch.payload.clone();
+        count_mutation.training_samples.as_mut().unwrap().count += 1;
+        let count_mutation = attest_launch_for_test(LaunchManifest::new(count_mutation).unwrap());
+        std::fs::write(&launch_path, count_mutation.to_pretty_bytes().unwrap()).unwrap();
+        let error = load_bound_candidate_for_test(&run_dir, &candidate_sha256)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("sample counts disagree"), "{error}");
+
+        let mut digest_mutation = launch.payload;
+        digest_mutation.held_out_samples.as_mut().unwrap().sha256 = "aa".repeat(32);
+        let digest_mutation = attest_launch_for_test(LaunchManifest::new(digest_mutation).unwrap());
+        std::fs::write(&launch_path, digest_mutation.to_pretty_bytes().unwrap()).unwrap();
+        let error = load_bound_candidate_for_test(&run_dir, &candidate_sha256)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("held-out sample digest mismatch"), "{error}");
+    }
+
+    #[test]
     fn launch_bound_candidate_rejects_completion_and_coordinate_mutation() {
         let cfg: RunConfig = serde_json::from_str(&trimul_score_test_config(4242)).unwrap();
         let (launch, signer) = launch_manifest_for_test(&cfg, "test-run", b"prompt");
@@ -13669,7 +10969,7 @@ benchmarks:
             .to_string();
 
         assert!(
-            error.contains("rank/world disagree with launch.json"),
+            error.contains("rank/world disagree with active execution topology"),
             "{error}"
         );
     }
