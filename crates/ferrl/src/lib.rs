@@ -24,8 +24,9 @@
 //!   packages, the versioned separated [`rollout_ledger`] contract, and
 //!   [`telemetry`] for launch/config identity, metrics, candidate rows, and
 //!   held-out reports. The [`discovery`] facade adds generic local launch and
-//!   candidate authentication plus manifest-last accepted-artifact publication;
-//!   the binary retains the stricter task-specific TriMul audit boundary.
+//!   candidate authentication, while [`artifact`] owns task-specific TriMul
+//!   audit decisions and manifest-last publication. The binary is an input/output
+//!   adapter over those library boundaries.
 //! - **Model generality:** [`model`] and [`policy`] define the grad-forward,
 //!   cached-decoder, generation, and token-scoring contracts. [`lm_policy`]
 //!   instantiates them for Qwen3, dense Llama-3.x, Qwen3.5/3.6 dense and `MoE`,
@@ -71,6 +72,7 @@
 // one allow.
 #![deny(unsafe_code)]
 
+pub mod artifact;
 pub mod blocks;
 pub mod checkpoint;
 pub mod comm;

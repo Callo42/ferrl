@@ -1771,6 +1771,15 @@ impl TrimulReward {
         self.reward_profile
     }
 
+    pub(crate) fn artifact_binding(&self) -> (&TrimulVerifierIdentity, u64, usize, usize) {
+        (
+            self.verifier_assets.identity(),
+            self.secret_seed,
+            self.test_cases.len(),
+            self.benchmark_cases.len(),
+        )
+    }
+
     /// Set the per-candidate wall-clock budget.
     #[must_use]
     pub fn with_wall(mut self, wall: Duration) -> Self {
