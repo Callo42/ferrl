@@ -54,39 +54,44 @@ use std::time::Duration;
 
 use candle_core::{DType, Device};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use ferrl::countdown::{build_prompt, generate_dataset, CountdownConfig, CountdownProblem};
+#[cfg(test)]
+use ferrl::orchestration::LaunchRunIdentity;
 use ferrl::orchestration::{
-    CliEosSelection, CliExecution, CliLaunchAttestor, CliLaunchInput, CliOrchestrationError,
-    CliRunHealthPolicy, CliRunOutcome, CliTrainingRequest, LaunchAttestation,
-    LaunchAttestationRequest, LaunchAuthenticationMode, LaunchConfigSnapshot, LaunchManifest,
-    LaunchRunIdentity, LaunchTrustPolicy, LaunchVerifierIdentity, CANDIDATE_RECORD_DOMAIN,
-    LAUNCH_ATTESTATION_ALGORITHM, LAUNCH_ATTESTATION_CONTRACT_VERSION, LAUNCH_ATTESTATION_DOMAIN,
-    LAUNCH_ATTESTATION_KIND, LAUNCH_ATTESTATION_REQUEST_KIND, LAUNCH_CONTRACT_VERSION, LAUNCH_KIND,
-    LAUNCH_PAYLOAD_DOMAIN, LAUNCH_TRUST_POLICY_KIND,
+    CliBuiltinTask, CliDeviceSelection, CliEosSelection, CliLaunchAttestor, CliLaunchRuntime,
+    CliOrchestrationError, CliRunHealthPolicy, CliRunOutcome, CliTrainSetup, CliTrimulBaseline,
+    CliTrimulTask, LaunchAttestation, LaunchAttestationRequest, LaunchAuthenticationMode,
+    LaunchConfigSnapshot, LaunchManifest, LaunchTrustPolicy, LaunchVerifierIdentity,
+    CANDIDATE_RECORD_DOMAIN, LAUNCH_ATTESTATION_ALGORITHM, LAUNCH_ATTESTATION_CONTRACT_VERSION,
+    LAUNCH_ATTESTATION_DOMAIN, LAUNCH_ATTESTATION_KIND, LAUNCH_ATTESTATION_REQUEST_KIND,
+    LAUNCH_CONTRACT_VERSION, LAUNCH_KIND, LAUNCH_PAYLOAD_DOMAIN, LAUNCH_TRUST_POLICY_KIND,
+    LEGACY_LAUNCH_CONTRACT_VERSION, LEGACY_LAUNCH_PAYLOAD_DOMAIN,
 };
 #[cfg(test)]
 use ferrl::orchestration::{
-    LaunchCandidateLedger, LaunchModelIdentity, LaunchPayload, LaunchPromptIdentity, LaunchTrustKey,
+    LaunchCandidateLedger, LaunchModelIdentity, LaunchPayload, LaunchPromptIdentity,
+    LaunchSampleIdentity, LaunchTrustKey,
 };
 #[cfg(test)]
 use ferrl::telemetry::CandidateSigner;
 use ferrl::telemetry::{CandidateRecord, RegressionFailure};
 use ferrl::{
-    compare_distributed_metrics, compare_metrics, math_split_key, read_jsonl, summarize,
-    train_eval_split_by_key, BaseQuantization, CountdownReward, LoaderOpts, MathProblem,
-    MathReward, RegressionBudget, RegressionReport, RewardFn, RunDir, Sample, TensorParallelPlan,
+    compare_distributed_metrics, compare_metrics, summarize, BaseQuantization, LoaderOpts,
+    RegressionBudget, RegressionReport, RewardFn, RunDir, Sample, TensorParallelPlan,
     TrainerConfig, TrimulReward, VerifierExecutorConfig,
 };
+#[cfg(test)]
+use ferrl::{math_split_key, read_jsonl, train_eval_split_by_key, MathProblem};
 use ring::rand::{SecureRandom as _, SystemRandom};
 use ring::signature::{UnparsedPublicKey, ED25519};
 use serde::{
-    de::{DeserializeOwned, Error as _},
+    de::Error as _,
     ser::{Error as _, SerializeStruct},
     Deserialize, Serialize,
 };
 use sha2::{Digest, Sha256};
 
 /// A task's train/eval split: `(train, eval)` samples of the task's target type.
+#[cfg(test)]
 type Splits<T> = (Vec<Sample<T>>, Vec<Sample<T>>);
 
 /// Largest case-generation seed accepted by the protected TriMul evaluator.
@@ -503,35 +508,6 @@ enum DeviceSel {
     Cpu,
     /// CUDA device 0 (requires a `--features cuda` build).
     Cuda,
-}
-
-impl DeviceSel {
-    /// Open the selected device, running the CUDA preflight when applicable.
-    fn open(self) -> Result<Device, CliError> {
-        match self {
-            DeviceSel::Cpu => Ok(Device::Cpu),
-            DeviceSel::Cuda => open_cuda(),
-        }
-    }
-}
-
-/// Open CUDA device 0 with the driver-compat preflight (a `--features cuda` build).
-#[cfg(feature = "cuda")]
-fn open_cuda() -> Result<Device, CliError> {
-    let device = Device::new_cuda(0)?;
-    if let Some(w) = ferrl::check_driver_compat(&device).warning() {
-        tracing::warn!("{w}");
-    }
-    ferrl::guard_first_kernel(&device)?;
-    Ok(device)
-}
-
-/// Without the `cuda` feature there is no CUDA backend to open.
-#[cfg(not(feature = "cuda"))]
-fn open_cuda() -> Result<Device, CliError> {
-    Err(CliError::msg(
-        "device \"cuda\" requires building ferrl with --features cuda; use device \"cpu\" otherwise",
-    ))
 }
 
 /// The dtype the frozen base weights load in.
@@ -1301,10 +1277,6 @@ impl RunConfig {
         Ok(())
     }
 
-    fn open_device(&self) -> Result<Device, CliError> {
-        self.device.open()
-    }
-
     /// Read and parse a run config from `path`.
     fn load(path: &Path) -> Result<Self, CliError> {
         Self::load_for_launch(path).map(|loaded| loaded.config)
@@ -1535,19 +1507,8 @@ impl RunConfig {
 
     /// Build the Countdown train/eval splits: generate `train_n + eval_n` problems
     /// and hold out `eval_n` via the dedup-aware [`train_eval_split`].
-    fn countdown_splits(&self) -> Splits<CountdownProblem> {
-        let cd = CountdownConfig::default();
-        let n = self.data.train_n + self.data.eval_n;
-        let samples: Vec<Sample<CountdownProblem>> = generate_dataset(self.data.seed, n, &cd)
-            .into_iter()
-            .map(|p| Sample::new(build_prompt(&p), p))
-            .collect();
-        train_eval_split_by_key(samples, self.data.eval_n, self.data.seed, |sample| {
-            sample.target.split_key()
-        })
-    }
-
     /// Build the math train/eval splits from the configured JSONL `data.path`.
+    #[cfg(test)]
     fn math_splits(&self) -> Result<Splits<MathProblem>, CliError> {
         let path = self.data.path.as_ref().ok_or_else(|| {
             CliError::msg("task \"math\" requires data.path (a JSONL dataset of {prompt, target})")
@@ -1577,6 +1538,7 @@ impl RunConfig {
     }
 
     /// Read the complete rendered TriMul model prompt file bytes.
+    #[cfg(test)]
     fn trimul_prompt_file_bytes(&self) -> Result<Vec<u8>, CliError> {
         let Some(path) = &self.trimul.prompt_path else {
             return Err(CliError::msg(
@@ -1587,6 +1549,7 @@ impl RunConfig {
     }
 
     /// Decode the exact TriMul prompt text fed to the model from launch-file bytes.
+    #[cfg(test)]
     fn trimul_prompt_text(&self, prompt_file_bytes: &[u8]) -> Result<String, CliError> {
         let prompt = std::str::from_utf8(prompt_file_bytes)
             .map_err(|e| CliError::msg(format!("trimul prompt is not valid UTF-8: {e}")))?;
@@ -1597,6 +1560,7 @@ impl RunConfig {
     }
 
     /// Build the repeated TriMul train/eval splits from the exact model prompt.
+    #[cfg(test)]
     fn trimul_splits_from_prompt(&self, prompt: &str) -> Splits<()> {
         let train = std::iter::repeat_with(|| Sample::new(prompt.to_owned(), ()))
             .take(self.data.train_n)
@@ -1731,6 +1695,7 @@ impl RunConfig {
         Ok(reward)
     }
 
+    #[cfg(test)]
     fn build_trimul_held_out_reward_with_assets(
         &self,
         assets: ferrl::trimul::TrimulVerifierAssets,
@@ -1827,6 +1792,7 @@ trait LaunchAttestor {
 
 struct SystemLaunchAttestor;
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct LaunchContext {
     ferrl_commit: String,
@@ -2149,7 +2115,6 @@ fn train(args: &TrainArgs) -> Result<(), CliError> {
         args,
         launch_runtime,
         embedded_build_source_identity(),
-        prepare_launch_device,
     )
 }
 
@@ -2158,21 +2123,14 @@ fn train_with_launch_runtime(
     args: &TrainArgs,
     launch_runtime: Option<LaunchRuntime>,
     build_source: BuildSourceIdentity,
-    prepare_device: impl FnOnce(&RunConfig, Option<&LaunchRuntime>) -> Result<Device, CliError>,
 ) -> Result<(), CliError> {
-    train_with_launch_runtime_and_source_result(
-        args,
-        launch_runtime,
-        Ok(build_source),
-        prepare_device,
-    )
+    train_with_launch_runtime_and_source_result(args, launch_runtime, Ok(build_source))
 }
 
 fn train_with_launch_runtime_and_source_result(
     args: &TrainArgs,
     launch_runtime: Option<LaunchRuntime>,
     local_build_source: Result<BuildSourceIdentity, CliError>,
-    prepare_device: impl FnOnce(&RunConfig, Option<&LaunchRuntime>) -> Result<Device, CliError>,
 ) -> Result<(), CliError> {
     let launch_comm = launch_runtime.as_ref().map(|runtime| runtime.comm.as_ref());
     let build_source = coordinate_distributed_result(
@@ -2185,170 +2143,23 @@ fn train_with_launch_runtime_and_source_result(
         "run config load",
         RunConfig::load_for_launch(&args.config),
     )?;
-    let cfg = loaded.config;
-    validate_launch_runtime(&cfg, launch_runtime.as_ref())?;
-    validate_launch_config_consensus(&loaded.consensus_digest, launch_comm)?;
-    debug_assert!(!build_source.dirty);
-    let ferrl_commit = build_source.commit;
-    validate_launch_value_consensus("training commit", ferrl_commit.as_bytes(), launch_comm)?;
-    let launch = LaunchContext {
-        ferrl_commit,
-        run: synchronized_run_identity(&cfg, launch_comm)?,
-        config: loaded.launch_config,
-    };
-    let data_parallel_world = if cfg.distributed.enabled {
-        launch_comm
-            .ok_or_else(|| {
-                CliError::msg(
-                    "distributed execution has no live communicator after launch validation",
-                )
-            })?
-            .world_size()
-    } else {
-        1
-    };
-    cfg.trainer
-        .validate_reward_group_world(data_parallel_world)
-        .map_err(|error| CliError::msg(error.to_string()))?;
-    let local_device = prepare_device(&cfg, launch_runtime.as_ref());
-    let device = coordinate_distributed_result(launch_comm, "device setup", local_device)?;
-    match cfg.task.as_str() {
-        "countdown" => {
-            let (train, eval) = cfg.countdown_splits();
-            run_training(
-                &cfg,
-                &device,
-                &CountdownReward::default(),
-                &CountdownReward::default(),
-                &train,
-                &eval,
-                None,
-                None,
-                None,
-                &launch,
-                launch_runtime,
-            )
-        }
-        "math" => {
-            let (train, eval) = coordinate_distributed_result(
-                launch_comm,
-                "math dataset setup",
-                cfg.math_splits(),
-            )?;
-            run_training(
-                &cfg,
-                &device,
-                &MathReward::default(),
-                &MathReward::default(),
-                &train,
-                &eval,
-                None,
-                None,
-                None,
-                &launch,
-                launch_runtime,
-            )
-        }
-        "trimul" => {
-            let (
-                prompt_file_bytes,
-                train,
-                eval,
-                reward,
-                eval_reward,
-                verifier_assets,
-                verifier_identity,
-            ) = coordinate_distributed_result(
-                launch_comm,
-                "TriMul reward and dataset setup",
-                (|| {
-                    let prompt_file_bytes = cfg.trimul_prompt_file_bytes()?;
-                    let prompt = cfg.trimul_prompt_text(&prompt_file_bytes)?;
-                    let (train, eval) = cfg.trimul_splits_from_prompt(&prompt);
-                    let verifier_assets = cfg.capture_trimul_verifier_assets()?;
-                    let reward = cfg.preflight_trimul_reward(
-                        cfg.build_trimul_reward_with_assets(verifier_assets.clone())?,
-                    )?;
-                    let eval_reward = if eval.is_empty() {
-                        None
-                    } else {
-                        Some(cfg.preflight_trimul_reward(
-                            cfg.build_trimul_held_out_reward_with_assets(verifier_assets.clone())?,
-                        )?)
-                    };
-                    let verifier_identity = launch_verifier_identity(&reward, &verifier_assets)?;
-                    Ok((
-                        prompt_file_bytes,
-                        train,
-                        eval,
-                        reward,
-                        eval_reward,
-                        verifier_assets,
-                        verifier_identity,
-                    ))
-                })(),
-            )?;
-            run_training(
-                &cfg,
-                &device,
-                &reward,
-                eval_reward.as_ref().unwrap_or(&reward),
-                &train,
-                &eval,
-                Some(&prompt_file_bytes),
-                Some(&verifier_assets),
-                Some(&verifier_identity),
-                &launch,
-                launch_runtime,
-            )
-        }
-        other => Err(CliError::msg(format!(
-            "unknown task {other:?}; built-in tasks are \"countdown\", \"math\", and \"trimul\""
-        ))),
-    }
-}
-
-/// Run GRPO training (and, when `eval` is non-empty, a held-out eval) for any task.
-///
-/// Monomorphized per task by the [`train`] dispatch — the one place the concrete
-/// reward and its typed target are known.
-#[allow(clippy::too_many_arguments)] // one typed task launch plus immutable launch context
-fn run_training<R: RewardFn>(
-    cfg: &RunConfig,
-    device: &Device,
-    reward: &R,
-    eval_reward: &R,
-    train: &[Sample<R::Target>],
-    eval: &[Sample<R::Target>],
-    rendered_prompt_bytes: Option<&[u8]>,
-    verifier_assets: Option<&ferrl::trimul::TrimulVerifierAssets>,
-    verifier_identity: Option<&LaunchVerifierIdentity>,
-    launch: &LaunchContext,
-    launch_runtime: Option<LaunchRuntime>,
-) -> Result<(), CliError>
-where
-    R::Target: Serialize + DeserializeOwned,
-{
-    let request = cli_training_request(
-        cfg,
-        device,
-        reward,
-        eval_reward,
-        train,
-        eval,
-        rendered_prompt_bytes,
-        verifier_assets,
-        verifier_identity,
-        launch,
-        launch_runtime,
+    validate_launch_runtime(&loaded.config, launch_runtime.as_ref())?;
+    let setup = coordinate_distributed_result(
+        launch_comm,
+        "CLI train setup adaptation",
+        cli_train_setup(loaded, build_source),
     )?;
+    let runtime = launch_runtime.map(|runtime| CliLaunchRuntime {
+        device: runtime.device,
+        comm: runtime.comm,
+    });
     let system_attestor = SystemLaunchAttestor;
     let bridge = CoreLaunchAttestor {
         inner: &system_attestor,
     };
-    let attestor = (cfg.launch_authentication == LaunchAuthenticationMode::ExternalAttestedV1)
+    let attestor = (setup.authentication == LaunchAuthenticationMode::ExternalAttestedV1)
         .then_some(&bridge as &dyn CliLaunchAttestor);
-    match ferrl::orchestration::run_cli_training(request, attestor) {
+    match ferrl::orchestration::run_cli_train_setup(&setup, runtime, attestor) {
         Ok(outcome) => {
             present_cli_run_outcome(outcome);
             Ok(())
@@ -2360,6 +2171,101 @@ where
             Err(error.into())
         }
     }
+}
+
+fn cli_train_setup(
+    loaded: LoadedRunConfig,
+    build_source: BuildSourceIdentity,
+) -> Result<CliTrainSetup, CliError> {
+    debug_assert!(!build_source.dirty);
+    let cfg = loaded.config;
+    let task = match cfg.task.as_str() {
+        "countdown" => CliBuiltinTask::Countdown {
+            train_n: cfg.data.train_n,
+            eval_n: cfg.data.eval_n,
+            seed: cfg.data.seed,
+        },
+        "math" => CliBuiltinTask::Math {
+            path: cfg.data.path.clone().ok_or_else(|| {
+                CliError::msg("task \"math\" requires data.path (a JSONL dataset of {prompt, target})")
+            })?,
+            eval_n: cfg.data.eval_n,
+            seed: cfg.data.seed,
+        },
+        "trimul" => CliBuiltinTask::Trimul(Box::new(CliTrimulTask {
+            prompt_path: cfg.trimul.prompt_path.clone().ok_or_else(|| {
+                CliError::msg("task \"trimul\" requires trimul.prompt_path (the complete rendered model prompt file)")
+            })?,
+            submission_extract_mode: cfg.trimul_submission_extract_mode()?,
+            image: cfg.trimul.image.clone(),
+            eval_dir: cfg.trimul.eval_dir.clone(),
+            scratch_root: cfg.trimul.scratch_root.clone(),
+            verifier_isolation_tier: cfg.trimul.verifier_isolation_tier,
+            verifier_apptainer_bin: cfg.trimul.verifier_apptainer_bin.clone(),
+            verifier_executor_socket: cfg.trimul.verifier_executor_socket.clone(),
+            scratch_max_bytes: cfg.trimul.scratch_max_bytes,
+            secret_seed: cfg.trimul.secret_seed,
+            held_out_secret_seed: cfg.trimul.held_out_secret_seed,
+            wall_secs: cfg.trimul.wall_secs,
+            verifier_cuda_visible_devices: cfg.trimul.verifier_cuda_visible_devices.clone(),
+            verifier_cuda_device_pool: cfg.trimul.verifier_cuda_device_pool.clone(),
+            verifier_parallelism: cfg.trimul.verifier_parallelism,
+            verifier_max_procs: cfg.trimul.verifier_max_procs,
+            baseline: cfg.trimul.baseline.as_ref().map(|baseline| CliTrimulBaseline {
+                ns: baseline.ns,
+                gpu: baseline.gpu.clone(),
+                metric: baseline.metric.clone(),
+                isolation_tier: baseline.isolation_tier,
+                isolation_evidence_sha256: baseline.isolation_evidence_sha256.clone(),
+            }),
+            reward_profile: cfg.trimul.reward,
+            train_n: cfg.data.train_n,
+            eval_n: cfg.data.eval_n,
+            data_seed: cfg.data.seed,
+        })),
+        other => {
+            return Err(CliError::msg(format!(
+                "unknown task {other:?}; built-in tasks are \"countdown\", \"math\", and \"trimul\""
+            )))
+        }
+    };
+    let eos_selection = match cfg.eos_selection {
+        EosSelection::Checkpoint => CliEosSelection::CheckpointDefault,
+        EosSelection::Explicit => CliEosSelection::Explicit(
+            cfg.trainer
+                .eos_token_id
+                .ok_or_else(|| CliError::msg("explicit EOS selector has no numeric token id"))?,
+        ),
+        EosSelection::Disabled => CliEosSelection::Disabled,
+    };
+    let health_policy = CliRunHealthPolicy::from_json_value(
+        serde_json::to_value(&cfg.run_health)
+            .map_err(|error| CliError::msg(format!("serialize run_health: {error}")))?,
+    )?;
+    let loader_opts = cfg.loader_opts();
+    let tensor_parallel_plan = cfg.tensor_parallel_plan();
+    let health_policy_is_default = cfg.run_health.is_default();
+    Ok(CliTrainSetup {
+        task,
+        ferrl_commit: build_source.commit,
+        authentication: cfg.launch_authentication,
+        launch_config: loaded.launch_config,
+        config_consensus_digest: loaded.consensus_digest,
+        model_dir: cfg.model_dir,
+        output_root: cfg.out_dir,
+        device: match cfg.device {
+            DeviceSel::Cpu => CliDeviceSelection::Cpu,
+            DeviceSel::Cuda => CliDeviceSelection::Cuda,
+        },
+        loader_opts,
+        activation_checkpointing: cfg.policy.activation_checkpointing,
+        eos_selection,
+        trainer_config: cfg.trainer,
+        data_parallel: cfg.distributed.enabled,
+        tensor_parallel_plan,
+        health_policy,
+        health_policy_is_default,
+    })
 }
 
 struct CoreLaunchAttestor<'a> {
@@ -2375,80 +2281,6 @@ impl CliLaunchAttestor for CoreLaunchAttestor<'_> {
             .attest(manifest)
             .map_err(|error| CliOrchestrationError::msg(error.to_string()))
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn cli_training_request<'a, R: RewardFn>(
-    cfg: &'a RunConfig,
-    device: &'a Device,
-    reward: &'a R,
-    eval_reward: &'a R,
-    train: &'a [Sample<R::Target>],
-    eval: &'a [Sample<R::Target>],
-    rendered_prompt_bytes: Option<&'a [u8]>,
-    verifier_assets: Option<&'a ferrl::trimul::TrimulVerifierAssets>,
-    verifier_identity: Option<&'a LaunchVerifierIdentity>,
-    launch: &'a LaunchContext,
-    launch_runtime: Option<LaunchRuntime>,
-) -> Result<CliTrainingRequest<'a, R>, CliError>
-where
-    R::Target: Serialize + DeserializeOwned,
-{
-    let execution = if cfg.tensor_parallel.enabled {
-        let runtime =
-            launch_runtime.ok_or_else(|| CliError::msg("distributed launch runtime is missing"))?;
-        CliExecution::TensorParallel {
-            plan: cfg.tensor_parallel_plan(),
-            comm: runtime.comm,
-        }
-    } else if cfg.distributed.enabled {
-        let runtime =
-            launch_runtime.ok_or_else(|| CliError::msg("distributed launch runtime is missing"))?;
-        CliExecution::DataParallel(runtime.comm)
-    } else {
-        CliExecution::WorldOne
-    };
-    let eos_selection = match cfg.eos_selection {
-        EosSelection::Checkpoint => CliEosSelection::CheckpointDefault,
-        EosSelection::Explicit => CliEosSelection::Explicit(
-            cfg.trainer
-                .eos_token_id
-                .ok_or_else(|| CliError::msg("explicit EOS selector has no numeric token id"))?,
-        ),
-        EosSelection::Disabled => CliEosSelection::Disabled,
-    };
-    let health_policy = CliRunHealthPolicy::from_json_value(
-        serde_json::to_value(&cfg.run_health)
-            .map_err(|error| CliError::msg(format!("serialize run_health: {error}")))?,
-    )?;
-    Ok(CliTrainingRequest {
-        launch: CliLaunchInput {
-            task: cfg.task.clone(),
-            ferrl_commit: launch.ferrl_commit.clone(),
-            authentication: cfg.launch_authentication,
-            run: launch.run.clone(),
-            config: launch.config.clone(),
-            output_root: cfg.out_dir.clone(),
-        },
-        model_dir: &cfg.model_dir,
-        device,
-        loader_opts: cfg.loader_opts(),
-        activation_checkpointing: cfg.policy.activation_checkpointing,
-        eos_selection,
-        trainer_config: cfg.trainer.clone(),
-        training_samples: train,
-        evaluation_samples: eval,
-        reward,
-        evaluation_reward: eval_reward,
-        rendered_prompt_bytes,
-        verifier_assets,
-        verifier_identity: verifier_identity.cloned(),
-        execution,
-        health_policy,
-        health_policy_is_default: cfg.run_health.is_default(),
-        data_seed: cfg.data.seed,
-        trimul_held_out_secret_seed: cfg.trimul.held_out_secret_seed,
-    })
 }
 
 fn present_cli_run_outcome(outcome: CliRunOutcome) {
@@ -2546,6 +2378,7 @@ fn validate_full_git_commit(value: &str) -> Result<String, CliError> {
     }
 }
 
+#[cfg(test)]
 fn synchronized_run_identity(
     cfg: &RunConfig,
     comm: Option<&dyn ferrl::Comm>,
@@ -2605,6 +2438,7 @@ fn synchronized_run_identity(
     })
 }
 
+#[cfg(test)]
 fn validate_launch_value_consensus(
     label: &'static str,
     value: &[u8],
@@ -2628,31 +2462,6 @@ fn validate_launch_value_consensus(
         Ok(())
     };
     coordinate_distributed_result(Some(comm), "launch provenance consensus", local)
-}
-
-fn validate_launch_config_consensus(
-    digest: &[u8; 32],
-    comm: Option<&dyn ferrl::Comm>,
-) -> Result<(), CliError> {
-    let Some(comm) = comm.filter(|comm| comm.world_size() > 1) else {
-        return Ok(());
-    };
-    let world = comm.world_size() as f64;
-    let mut mismatch = false;
-    for byte in digest {
-        let value = f64::from(*byte);
-        let sum = comm.all_reduce_scalar_sum(value)?;
-        mismatch |= sum != world * value;
-    }
-    let local = if mismatch {
-        Err(CliError::msg(
-            "launch ranks disagree on run config outside tensor_parallel.rank; configs must \
-             otherwise be identical",
-        ))
-    } else {
-        Ok(())
-    };
-    coordinate_distributed_result(Some(comm), "run config consensus", local)
 }
 
 #[cfg(test)]
@@ -2702,41 +2511,6 @@ fn open_nccl_launch_runtime() -> Result<LaunchRuntime, CliError> {
     Err(CliError::msg(
         "distributed or tensor_parallel execution requires building ferrl with --features nccl",
     ))
-}
-
-#[cfg(feature = "nccl")]
-fn prepare_launch_device(
-    cfg: &RunConfig,
-    runtime: Option<&LaunchRuntime>,
-) -> Result<Device, CliError> {
-    let Some(runtime) = runtime else {
-        return cfg.open_device();
-    };
-    if cfg.device != DeviceSel::Cuda {
-        return Err(CliError::msg(
-            "distributed or tensor_parallel execution requires device = \"cuda\"",
-        ));
-    }
-    let device = &runtime.device;
-    if let Some(w) = ferrl::check_driver_compat(device).warning() {
-        tracing::warn!("{w}");
-    }
-    ferrl::guard_first_kernel(device)?;
-    Ok(device.clone())
-}
-
-#[cfg(not(feature = "nccl"))]
-fn prepare_launch_device(
-    cfg: &RunConfig,
-    runtime: Option<&LaunchRuntime>,
-) -> Result<Device, CliError> {
-    if runtime.is_some() {
-        Err(CliError::msg(
-            "distributed or tensor_parallel execution requires building ferrl with --features nccl",
-        ))
-    } else {
-        cfg.open_device()
-    }
 }
 
 /// This node's first GPU product name, read from `nvidia-smi`, or `None` if it cannot
@@ -3623,6 +3397,7 @@ fn load_bound_run_candidate_impl(
             "launch-bound prompt bytes do not match launch.json",
         ));
     }
+    verify_trimul_launch_sample_identity(&launch, &config, &prompt_bytes)?;
     let ledger = &launch.payload.candidate_ledger;
     if ledger.file != RunDir::CANDIDATES_FILE
         || ledger.format_version != 1
@@ -3649,6 +3424,61 @@ fn load_bound_run_candidate_impl(
         candidate,
         candidate_row_bytes,
     })
+}
+
+fn trimul_repeated_sample_sha256(prompt: &str, count: usize) -> Result<String, CliError> {
+    let sample = Sample::new(prompt.to_owned(), ());
+    let sample_bytes = serde_json::to_vec(&sample)
+        .map_err(|error| CliError::msg(format!("serialize TriMul sample identity: {error}")))?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"[");
+    for index in 0..count {
+        if index != 0 {
+            hasher.update(b",");
+        }
+        hasher.update(&sample_bytes);
+    }
+    hasher.update(b"]");
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn verify_trimul_launch_sample_identity(
+    launch: &LaunchManifest,
+    config: &RunConfig,
+    prompt_bytes: &[u8],
+) -> Result<(), CliError> {
+    if launch.contract_version == LEGACY_LAUNCH_CONTRACT_VERSION {
+        return Ok(());
+    }
+    let prompt = std::str::from_utf8(prompt_bytes)
+        .map_err(|error| CliError::msg(format!("trimul prompt is not valid UTF-8: {error}")))?;
+    let training = launch.payload.training_samples.as_ref().ok_or_else(|| {
+        CliError::msg("launch v3 manifest is missing ordered training sample identity")
+    })?;
+    let held_out = launch.payload.held_out_samples.as_ref().ok_or_else(|| {
+        CliError::msg("launch v3 manifest is missing ordered held-out sample identity")
+    })?;
+    if training.count != config.data.train_n || held_out.count != config.data.eval_n {
+        return Err(CliError::msg(format!(
+            "launch-bound TriMul sample counts disagree with resolved config: train {} vs {}, held-out {} vs {}",
+            training.count, config.data.train_n, held_out.count, config.data.eval_n
+        )));
+    }
+    let training_sha256 = trimul_repeated_sample_sha256(prompt, training.count)?;
+    if training.sha256 != training_sha256 {
+        return Err(CliError::msg(format!(
+            "launch-bound TriMul training sample digest mismatch: recorded {}, computed {training_sha256}",
+            training.sha256
+        )));
+    }
+    let held_out_sha256 = trimul_repeated_sample_sha256(prompt, held_out.count)?;
+    if held_out.sha256 != held_out_sha256 {
+        return Err(CliError::msg(format!(
+            "launch-bound TriMul held-out sample digest mismatch: recorded {}, computed {held_out_sha256}",
+            held_out.sha256
+        )));
+    }
+    Ok(())
 }
 
 fn parse_exact_launch_manifest(
@@ -3740,12 +3570,41 @@ fn verify_launch_config_identity(
 }
 
 fn verify_launch_manifest_payload(manifest: &LaunchManifest) -> Result<(), CliError> {
-    if manifest.contract_version != LAUNCH_CONTRACT_VERSION || manifest.kind != LAUNCH_KIND {
+    if manifest.kind != LAUNCH_KIND {
         return Err(CliError::msg(format!(
             "unsupported launch manifest contract {} / {:?}",
             manifest.contract_version, manifest.kind
         )));
     }
+    let payload_domain = match manifest.contract_version {
+        LAUNCH_CONTRACT_VERSION => {
+            let training = manifest.payload.training_samples.as_ref().ok_or_else(|| {
+                CliError::msg("launch v3 manifest is missing ordered training sample identity")
+            })?;
+            validate_lower_sha256("launch training_samples sha256", &training.sha256)?;
+            let held_out = manifest.payload.held_out_samples.as_ref().ok_or_else(|| {
+                CliError::msg("launch v3 manifest is missing ordered held-out sample identity")
+            })?;
+            validate_lower_sha256("launch held_out_samples sha256", &held_out.sha256)?;
+            LAUNCH_PAYLOAD_DOMAIN
+        }
+        LEGACY_LAUNCH_CONTRACT_VERSION => {
+            if manifest.payload.training_samples.is_some()
+                || manifest.payload.held_out_samples.is_some()
+            {
+                return Err(CliError::msg(
+                    "launch v2 manifest must not carry v3 sample identity fields",
+                ));
+            }
+            LEGACY_LAUNCH_PAYLOAD_DOMAIN
+        }
+        _ => {
+            return Err(CliError::msg(format!(
+                "unsupported launch manifest contract {} / {:?}",
+                manifest.contract_version, manifest.kind
+            )))
+        }
+    };
     validate_lower_sha256("launch payload_sha256", &manifest.payload_sha256)?;
     validate_lower_sha256(
         "launch config source_sha256",
@@ -3920,7 +3779,7 @@ fn verify_launch_manifest_payload(manifest: &LaunchManifest) -> Result<(), CliEr
     }
     let payload_bytes = serde_json::to_vec(&manifest.payload)
         .map_err(|error| CliError::msg(format!("serialize launch payload: {error}")))?;
-    let expected = domain_sha256(LAUNCH_PAYLOAD_DOMAIN, &[&payload_bytes]);
+    let expected = domain_sha256(payload_domain, &[&payload_bytes]);
     if manifest.payload_sha256 != expected {
         return Err(CliError::msg(format!(
             "launch payload hash mismatch: recorded {}, computed {expected}",
@@ -6390,28 +6249,40 @@ mod tests {
     use ferrl::policy::GenConfig;
     use ferrl::Comm as _;
     use ring::signature::{Ed25519KeyPair, KeyPair as _};
-    use std::sync::{Arc, OnceLock};
+    use std::sync::OnceLock;
 
     const TEST_ATTESTATION_KEY_ID: &str = "test-root-1";
     const TEST_LAUNCH_ATTESTOR: TestLaunchAttestor = TestLaunchAttestor;
 
     #[test]
-    fn production_cli_train_cannot_bypass_the_concrete_library_engine() {
+    #[allow(clippy::cognitive_complexity)] // explicit forbidden-operation inventory
+    fn production_cli_train_is_only_parsing_transport_and_presentation() {
         let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/bin/ferrl.rs"));
         let start = source
-            .find("fn run_training<R: RewardFn>(")
-            .expect("production run_training source");
+            .find("fn train_with_launch_runtime_and_source_result(")
+            .expect("production train adapter source");
         let end = source[start..]
             .find("struct CoreLaunchAttestor")
             .map(|offset| start + offset)
-            .expect("production run_training boundary");
+            .expect("production train adapter boundary");
         let entry = &source[start..end];
-        assert!(entry.contains("cli_training_request("));
-        assert!(entry.contains("ferrl::orchestration::run_cli_training(request, attestor)"));
-        assert!(!entry.contains("load_auto_policy_with_identity"));
-        assert!(!entry.contains("Trainer::"));
-        assert!(!entry.contains("evaluate("));
-        assert!(!entry.contains("LaunchManifest::"));
+        assert!(entry.contains("RunConfig::load_for_launch"));
+        assert!(entry.contains("coordinate_distributed_result"));
+        assert!(entry.contains("cli_train_setup(loaded, build_source)"));
+        assert!(entry.contains("ferrl::orchestration::run_cli_train_setup"));
+        assert!(entry.contains("present_cli_run_outcome"));
+        assert!(entry.contains("CliBuiltinTask::Countdown"));
+        assert!(entry.contains("CliBuiltinTask::Math"));
+        assert!(entry.contains("CliBuiltinTask::Trimul"));
+        assert!(!entry.contains("open_cuda"));
+        assert!(!entry.contains("prepare_launch_device"));
+        assert!(!entry.contains("countdown_splits"));
+        assert!(!entry.contains("math_splits"));
+        assert!(!entry.contains("trimul_splits"));
+        assert!(!entry.contains("build_trimul_reward"));
+        assert!(!entry.contains("synchronized_run_identity"));
+        assert!(!entry.contains("cli_training_request"));
+        assert!(!entry.contains("run_cli_training("));
     }
 
     struct TestLaunchAttestor;
@@ -7085,6 +6956,15 @@ mod tests {
     ) -> (LaunchManifest, CandidateSigner) {
         let context = launch_context_for_test(cfg, run_id.to_owned(), 0, 1);
         let signer = CandidateSigner::generate().unwrap();
+        let (training_samples_sha256, held_out_samples_sha256) = if cfg.task == "trimul" {
+            let prompt_text = std::str::from_utf8(prompt).unwrap();
+            (
+                trimul_repeated_sample_sha256(prompt_text, cfg.data.train_n).unwrap(),
+                trimul_repeated_sample_sha256(prompt_text, cfg.data.eval_n).unwrap(),
+            )
+        } else {
+            ("55".repeat(32), "66".repeat(32))
+        };
         let manifest = LaunchManifest::new(LaunchPayload {
             task: cfg.task.clone(),
             ferrl_commit: context.ferrl_commit,
@@ -7101,6 +6981,14 @@ mod tests {
                 file: RunDir::PROMPT_FILE.to_owned(),
                 sha256: sha256_hex(prompt),
                 len_bytes: prompt.len(),
+            }),
+            training_samples: Some(LaunchSampleIdentity {
+                sha256: training_samples_sha256,
+                count: cfg.data.train_n,
+            }),
+            held_out_samples: Some(LaunchSampleIdentity {
+                sha256: held_out_samples_sha256,
+                count: cfg.data.eval_n,
             }),
             verifier: (cfg.task == "trimul").then(|| {
                 test_launch_verifier_identity(
@@ -7124,6 +7012,16 @@ mod tests {
             manifest
         };
         (manifest, signer)
+    }
+
+    fn legacy_launch_v2_for_test(launch: LaunchManifest) -> LaunchManifest {
+        let mut legacy = launch;
+        legacy.contract_version = LEGACY_LAUNCH_CONTRACT_VERSION;
+        legacy.payload.training_samples = None;
+        legacy.payload.held_out_samples = None;
+        let payload_bytes = serde_json::to_vec(&legacy.payload).unwrap();
+        legacy.payload_sha256 = domain_sha256(LEGACY_LAUNCH_PAYLOAD_DOMAIN, &[&payload_bytes]);
+        legacy
     }
 
     fn candidate_for_test(
@@ -7725,16 +7623,6 @@ mod tests {
         path
     }
 
-    fn prepare_test_launch_device(
-        _cfg: &RunConfig,
-        runtime: Option<&LaunchRuntime>,
-    ) -> Result<Device, CliError> {
-        Ok(runtime
-            .ok_or_else(|| CliError::msg("test launch runtime is missing"))?
-            .device
-            .clone())
-    }
-
     fn run_train_configs_world_two(configs: [PathBuf; 2]) -> Vec<Result<(), String>> {
         std::thread::scope(|scope| {
             let handles: Vec<_> = ferrl::LocalComm::world(2)
@@ -7751,7 +7639,6 @@ mod tests {
                             &args,
                             Some(runtime),
                             test_build_source_identity(),
-                            prepare_test_launch_device,
                         )
                         .map_err(|err| err.to_string())
                     })
@@ -8566,20 +8453,18 @@ mod tests {
                 None => json["trainer"][field] = value,
             }
             std::fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
-            let prepared = std::cell::Cell::new(false);
 
             let result = train_with_launch_runtime(
                 &TrainArgs { config: path },
                 None,
                 test_build_source_identity(),
-                |_, _| {
-                    prepared.set(true);
-                    Ok(Device::Cpu)
-                },
             );
 
             assert!(result.is_err(), "{field} unexpectedly reached training");
-            assert!(!prepared.get(), "{field} reached device/model setup");
+            assert!(
+                !tmp.path().join("runs").exists(),
+                "{field} created run state"
+            );
         }
     }
 
@@ -8593,7 +8478,6 @@ mod tests {
         json["out_dir"] = serde_json::json!(&out_dir);
         json["distributed"] = serde_json::json!({ "enabled": true });
         std::fs::write(&config_path, serde_json::to_vec(&json).unwrap()).unwrap();
-        let prepared = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         let results = std::thread::scope(|scope| {
             ferrl::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(5))
@@ -8601,7 +8485,6 @@ mod tests {
                 .map(|comm| {
                     let rank = comm.rank();
                     let config_path = config_path.clone();
-                    let prepared = Arc::clone(&prepared);
                     scope.spawn(move || {
                         let local_source = if rank == 1 {
                             Err(CliError::msg("test dirty source on rank one"))
@@ -8619,10 +8502,6 @@ mod tests {
                                     comm: Box::new(comm),
                                 }),
                                 local_source,
-                                move |_, _| {
-                                    prepared.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                                    Ok(Device::Cpu)
-                                },
                             )
                             .map_err(|error| error.to_string()),
                         )
@@ -8645,7 +8524,6 @@ mod tests {
                 );
             }
         }
-        assert_eq!(prepared.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(!out_dir.exists());
     }
 
@@ -8662,7 +8540,6 @@ mod tests {
         json["trainer"]["reward_group_scope"] = serde_json::json!("distributed_same_prompt");
         std::fs::write(&config_path, serde_json::to_vec(&json).unwrap()).unwrap();
 
-        let prepared = std::cell::Cell::new(false);
         let result = train_with_launch_runtime(
             &TrainArgs {
                 config: config_path,
@@ -8672,17 +8549,10 @@ mod tests {
                 comm: Box::new(ferrl::SoloComm),
             }),
             test_build_source_identity(),
-            |_, _| {
-                prepared.set(true);
-                Err(CliError::msg(
-                    "prepare-device sentinel: ineffective live DP group reached device setup",
-                ))
-            },
         );
 
         let error = result.unwrap_err().to_string();
         assert!(error.contains("effective reward-group size"), "{error}");
-        assert!(!prepared.get(), "ineffective group reached device setup");
         assert!(!out_dir.exists(), "ineffective group created its run root");
     }
 
@@ -8699,13 +8569,11 @@ mod tests {
         json["trainer"]["reward_group_scope"] = serde_json::json!("distributed_same_prompt");
         std::fs::write(&config_path, serde_json::to_vec(&json).unwrap()).unwrap();
 
-        let prepared = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let results = std::thread::scope(|scope| {
             ferrl::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(5))
                 .into_iter()
                 .map(|comm| {
                     let config_path = config_path.clone();
-                    let prepared = Arc::clone(&prepared);
                     scope.spawn(move || {
                         train_with_launch_runtime(
                             &TrainArgs {
@@ -8716,12 +8584,6 @@ mod tests {
                                 comm: Box::new(comm),
                             }),
                             test_build_source_identity(),
-                            move |_, _| {
-                                prepared.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                                Err(CliError::msg(
-                                    "prepare-device sentinel: overflowing live DP group reached device setup",
-                                ))
-                            },
                         )
                         .map_err(|error| error.to_string())
                     })
@@ -8739,11 +8601,6 @@ mod tests {
                 "{error}"
             );
         }
-        assert_eq!(
-            prepared.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "overflowing group reached device setup"
-        );
         assert!(!out_dir.exists(), "overflowing group created its run root");
     }
 
@@ -10658,6 +10515,93 @@ benchmarks:
             ferrl::VerifierIsolationTier::SameUidApptainerV1
         );
         assert!(bound.launch.attestation.is_none());
+    }
+
+    #[test]
+    fn legacy_launch_v2_without_sample_identities_remains_loadable() {
+        let tmp = TestDir::new("artifact-legacy-launch-v2");
+        let cfg: RunConfig = serde_json::from_str(&trimul_score_test_config(4242)).unwrap();
+        let (launch, signer) = launch_manifest_for_test(&cfg, "trimul-1", b"prompt");
+        let mut payload = launch.payload;
+        payload.run.group_id = "trimul-1".to_owned();
+        let legacy = legacy_launch_v2_for_test(LaunchManifest::new(payload).unwrap());
+        let candidate = candidate_for_test(&legacy, &signer, "```python\npass\n```\n");
+        let candidate_sha256 = candidate.record_sha256.clone().unwrap();
+        let run = RunDir::create(tmp.path(), "trimul-1").unwrap();
+        run.write_immutable_launch(&legacy.to_pretty_bytes().unwrap(), Some(b"prompt"))
+            .unwrap();
+        let mut writer = ferrl::telemetry::CandidateWriter::open(run.candidates_path()).unwrap();
+        writer.append(&candidate).unwrap();
+        drop(writer);
+
+        let bound = load_bound_run_candidate(run.root(), &candidate_sha256).unwrap();
+        assert_eq!(
+            bound.launch.contract_version,
+            LEGACY_LAUNCH_CONTRACT_VERSION
+        );
+        assert!(bound.launch.payload.training_samples.is_none());
+        assert!(bound.launch.payload.held_out_samples.is_none());
+    }
+
+    #[test]
+    fn launch_sample_identity_versioning_and_shape_are_strict() {
+        let cfg: RunConfig = serde_json::from_str(&trimul_score_test_config(4242)).unwrap();
+        let (launch, _signer) = launch_manifest_for_test(&cfg, "trimul-1", b"prompt");
+        verify_launch_manifest_payload(&launch).unwrap();
+        assert_eq!(launch.contract_version, LAUNCH_CONTRACT_VERSION);
+
+        let mut missing_training = launch.clone();
+        missing_training.payload.training_samples = None;
+        assert!(verify_launch_manifest_payload(&missing_training)
+            .unwrap_err()
+            .to_string()
+            .contains("ordered training sample identity"));
+
+        let mut bad_digest = launch.clone();
+        bad_digest.payload.held_out_samples.as_mut().unwrap().sha256 = "not-a-digest".to_owned();
+        assert!(verify_launch_manifest_payload(&bad_digest)
+            .unwrap_err()
+            .to_string()
+            .contains("64 lowercase hexadecimal"));
+
+        let legacy = legacy_launch_v2_for_test(launch.clone());
+        let bytes = legacy.to_pretty_bytes().unwrap();
+        let parsed = parse_exact_launch_manifest(Path::new("launch.json"), &bytes).unwrap();
+        verify_launch_manifest_payload(&parsed).unwrap();
+
+        let mut contaminated_legacy = legacy;
+        contaminated_legacy.payload.training_samples = launch.payload.training_samples.clone();
+        assert!(verify_launch_manifest_payload(&contaminated_legacy)
+            .unwrap_err()
+            .to_string()
+            .contains("must not carry v3 sample identity"));
+    }
+
+    #[test]
+    fn trimul_artifact_ingest_rejects_sample_identity_mutation() {
+        let (_tmp, run_dir, candidate_sha256) =
+            write_bound_candidate_run("artifact-sample-identity", 0, 1, 0, 1);
+        let launch_path = run_dir.join(RunDir::LAUNCH_FILE);
+        let launch: LaunchManifest =
+            serde_json::from_slice(&std::fs::read(&launch_path).unwrap()).unwrap();
+
+        let mut count_mutation = launch.payload.clone();
+        count_mutation.training_samples.as_mut().unwrap().count += 1;
+        let count_mutation = attest_launch_for_test(LaunchManifest::new(count_mutation).unwrap());
+        std::fs::write(&launch_path, count_mutation.to_pretty_bytes().unwrap()).unwrap();
+        let error = load_bound_candidate_for_test(&run_dir, &candidate_sha256)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("sample counts disagree"), "{error}");
+
+        let mut digest_mutation = launch.payload;
+        digest_mutation.held_out_samples.as_mut().unwrap().sha256 = "aa".repeat(32);
+        let digest_mutation = attest_launch_for_test(LaunchManifest::new(digest_mutation).unwrap());
+        std::fs::write(&launch_path, digest_mutation.to_pretty_bytes().unwrap()).unwrap();
+        let error = load_bound_candidate_for_test(&run_dir, &candidate_sha256)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("held-out sample digest mismatch"), "{error}");
     }
 
     #[test]

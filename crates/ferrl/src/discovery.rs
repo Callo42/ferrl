@@ -1473,9 +1473,11 @@ impl From<crate::orchestration::EngineError> for DiscoveryError {
     fn from(error: crate::orchestration::EngineError) -> Self {
         match error {
             crate::orchestration::EngineError::Configuration(message)
-            | crate::orchestration::EngineError::Message(message)
-            | crate::orchestration::EngineError::PreemptionCheckpoint(message) => {
+            | crate::orchestration::EngineError::Message(message) => {
                 Self::InvalidConfiguration(message)
+            }
+            crate::orchestration::EngineError::PreemptionCheckpoint(message) => {
+                Self::PreemptionCheckpoint(message)
             }
             crate::orchestration::EngineError::ModelLoad(error) => Self::ModelLoad(error),
             crate::orchestration::EngineError::GenerationEnd(error) => Self::GenerationEnd(error),

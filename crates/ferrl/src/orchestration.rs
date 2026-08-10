@@ -19,6 +19,7 @@ use std::fs::{self, File};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use candle_core::Device;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -146,6 +147,17 @@ pub struct LaunchPromptIdentity {
     pub len_bytes: usize,
 }
 
+/// Exact ordered sample identity persisted in a CLI launch.
+#[doc(hidden)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchSampleIdentity {
+    /// SHA-256 of the exact ordered serialized samples executed by the engine.
+    pub sha256: String,
+    /// Number of samples in the ordered slice.
+    pub count: usize,
+}
+
 /// Candidate-ledger authentication contract persisted in a CLI launch.
 #[doc(hidden)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -266,6 +278,12 @@ pub struct LaunchPayload {
     /// Exact rendered prompt identity where applicable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt: Option<LaunchPromptIdentity>,
+    /// Exact ordered training sample identity (required by launch v3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub training_samples: Option<LaunchSampleIdentity>,
+    /// Exact ordered task-semantic held-out sample identity (required by launch v3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_out_samples: Option<LaunchSampleIdentity>,
     /// TriMul verifier identity where applicable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verifier: Option<LaunchVerifierIdentity>,
@@ -305,13 +323,19 @@ pub trait CliLaunchAttestor {
 
 /// CLI launch-manifest contract version.
 #[doc(hidden)]
-pub const LAUNCH_CONTRACT_VERSION: u32 = 2;
+pub const LAUNCH_CONTRACT_VERSION: u32 = 3;
+/// Previous CLI launch-manifest contract retained for artifact compatibility.
+#[doc(hidden)]
+pub const LEGACY_LAUNCH_CONTRACT_VERSION: u32 = 2;
 /// CLI launch-manifest kind.
 #[doc(hidden)]
 pub const LAUNCH_KIND: &str = "ferrl.run-launch";
 /// Domain for CLI launch payload digests.
 #[doc(hidden)]
-pub const LAUNCH_PAYLOAD_DOMAIN: &str = "ferrl.run-launch.payload.v2";
+pub const LAUNCH_PAYLOAD_DOMAIN: &str = "ferrl.run-launch.payload.v3";
+/// Previous payload-digest domain retained for launch-v2 artifact ingestion.
+#[doc(hidden)]
+pub const LEGACY_LAUNCH_PAYLOAD_DOMAIN: &str = "ferrl.run-launch.payload.v2";
 /// Candidate-row digest domain committed by CLI launches.
 #[doc(hidden)]
 pub const CANDIDATE_RECORD_DOMAIN: &str = CandidateRecord::DIGEST_DOMAIN;
@@ -337,6 +361,11 @@ pub const LAUNCH_TRUST_POLICY_KIND: &str = "ferrl.run-launch-trust-policy";
 impl LaunchManifest {
     /// Construct the canonical immutable launch envelope around `payload`.
     pub fn new(payload: LaunchPayload) -> Result<Self, CliOrchestrationError> {
+        if payload.training_samples.is_none() || payload.held_out_samples.is_none() {
+            return Err(CliOrchestrationError::msg(
+                "launch v3 payload requires ordered training and held-out sample identities",
+            ));
+        }
         let payload_bytes = serde_json::to_vec(&payload).map_err(|error| {
             CliOrchestrationError::msg(format!("serialize launch payload: {error}"))
         })?;
@@ -539,6 +568,135 @@ pub enum CliExecution {
         /// Live tensor-parallel communicator.
         comm: Box<dyn Comm>,
     },
+}
+
+impl CliExecution {
+    fn comm(&self) -> Option<&dyn Comm> {
+        match self {
+            Self::WorldOne => None,
+            Self::DataParallel(comm) | Self::TensorParallel { comm, .. } => Some(comm.as_ref()),
+        }
+    }
+}
+
+/// Device selected by the parsed CLI configuration.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CliDeviceSelection {
+    /// CPU execution.
+    Cpu,
+    /// CUDA device zero.
+    Cuda,
+}
+
+/// Live distributed transport opened by the binary adapter.
+#[doc(hidden)]
+pub struct CliLaunchRuntime {
+    /// Rank-local CUDA device owned by the NCCL transport.
+    pub device: Device,
+    /// Live launch communicator.
+    pub comm: Box<dyn Comm>,
+}
+
+/// Parsed built-in task inputs; the library owns their authoritative construction.
+#[doc(hidden)]
+pub enum CliBuiltinTask {
+    /// Procedural Countdown data.
+    Countdown {
+        train_n: usize,
+        eval_n: usize,
+        seed: u64,
+    },
+    /// JSONL Math data.
+    Math {
+        path: PathBuf,
+        eval_n: usize,
+        seed: u64,
+    },
+    /// TriMul prompt, reward, and verifier setup.
+    Trimul(Box<CliTrimulTask>),
+}
+
+impl CliBuiltinTask {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Countdown { .. } => "countdown",
+            Self::Math { .. } => "math",
+            Self::Trimul(_) => "trimul",
+        }
+    }
+
+    fn data_seed(&self) -> u64 {
+        match self {
+            Self::Countdown { seed, .. } | Self::Math { seed, .. } => *seed,
+            Self::Trimul(task) => task.data_seed,
+        }
+    }
+
+    fn trimul_held_out_secret_seed(&self) -> Option<u64> {
+        match self {
+            Self::Trimul(task) => task.held_out_secret_seed,
+            Self::Countdown { .. } | Self::Math { .. } => None,
+        }
+    }
+}
+
+/// Parsed TriMul baseline pin.
+#[doc(hidden)]
+pub struct CliTrimulBaseline {
+    pub ns: f64,
+    pub gpu: String,
+    pub metric: String,
+    pub isolation_tier: crate::VerifierIsolationTier,
+    pub isolation_evidence_sha256: String,
+}
+
+/// Parsed TriMul task setup; construction and preflight remain library-owned.
+#[doc(hidden)]
+pub struct CliTrimulTask {
+    pub prompt_path: PathBuf,
+    pub submission_extract_mode: crate::trimul::SubmissionExtractMode,
+    pub image: PathBuf,
+    pub eval_dir: PathBuf,
+    pub scratch_root: PathBuf,
+    pub verifier_isolation_tier: crate::VerifierIsolationTier,
+    pub verifier_apptainer_bin: Option<PathBuf>,
+    pub verifier_executor_socket: Option<PathBuf>,
+    pub scratch_max_bytes: u64,
+    pub secret_seed: u64,
+    pub held_out_secret_seed: Option<u64>,
+    pub wall_secs: u64,
+    pub verifier_cuda_visible_devices: Option<String>,
+    pub verifier_cuda_device_pool: Vec<String>,
+    pub verifier_parallelism: usize,
+    pub verifier_max_procs: u64,
+    pub baseline: Option<CliTrimulBaseline>,
+    pub reward_profile: crate::trimul::TrimulRewardProfile,
+    pub train_n: usize,
+    pub eval_n: usize,
+    pub data_seed: u64,
+}
+
+/// Complete parsed `ferrl train` adapter input. The library owns setup, identity,
+/// task construction, request assembly, and execution.
+#[doc(hidden)]
+pub struct CliTrainSetup {
+    pub task: CliBuiltinTask,
+    pub ferrl_commit: String,
+    pub authentication: LaunchAuthenticationMode,
+    pub launch_config: LaunchConfigSnapshot,
+    pub config_consensus_digest: [u8; 32],
+    pub model_dir: PathBuf,
+    pub output_root: PathBuf,
+    pub device: CliDeviceSelection,
+    pub loader_opts: LoaderOpts,
+    pub activation_checkpointing: bool,
+    pub eos_selection: CliEosSelection,
+    pub trainer_config: TrainerConfig,
+    pub data_parallel: bool,
+    pub tensor_parallel_plan: TensorParallelPlan,
+    pub health_policy: CliRunHealthPolicy,
+    pub health_policy_is_default: bool,
 }
 
 /// Immutable CLI launch inputs adapted from parsed command configuration.
@@ -858,6 +1016,571 @@ where
             run_dir: preempted.run_dir,
             presentation_rank: preempted.presentation_rank,
         })),
+    }
+}
+
+/// Run the complete production `ferrl train` path after binary parsing.
+#[doc(hidden)]
+pub fn run_cli_train_setup(
+    setup: &CliTrainSetup,
+    runtime: Option<CliLaunchRuntime>,
+    attestor: Option<&dyn CliLaunchAttestor>,
+) -> Result<CliRunOutcome, CliOrchestrationError> {
+    let launch_comm = runtime.as_ref().map(|runtime| runtime.comm.as_ref());
+    validate_engine_value_consensus(
+        "run config outside tensor_parallel.rank",
+        &setup.config_consensus_digest,
+        launch_comm,
+    )
+    .map_err(cli_engine_error)?;
+    let ferrl_commit = coordinate_engine_result(
+        launch_comm,
+        "training commit validation",
+        validate_cli_git_commit(&setup.ferrl_commit)
+            .map_err(|error| EngineError::Configuration(error.to_string())),
+    )
+    .map_err(cli_engine_error)?;
+    validate_engine_value_consensus("training commit", ferrl_commit.as_bytes(), launch_comm)
+        .map_err(cli_engine_error)?;
+    let run = synchronized_cli_run_identity(setup, launch_comm)?;
+    let data_parallel_world = if setup.data_parallel {
+        launch_comm
+            .ok_or_else(|| {
+                CliOrchestrationError::msg(
+                    "distributed execution has no live communicator after launch validation",
+                )
+            })?
+            .world_size()
+    } else {
+        1
+    };
+    coordinate_engine_result(
+        launch_comm,
+        "trainer reward-group validation",
+        setup
+            .trainer_config
+            .validate_reward_group_world(data_parallel_world)
+            .map_err(|error| EngineError::Configuration(error.to_string())),
+    )
+    .map_err(cli_engine_error)?;
+    let topology_check = match (
+        setup.data_parallel,
+        setup.tensor_parallel_plan.is_sharded(),
+        runtime.is_some(),
+    ) {
+        (true, false, true) | (false, true, true) | (false, false, false) => Ok(()),
+        (true, true, _) => Err(EngineError::Configuration(
+            "combined data-parallel and tensor-parallel execution is unsupported".into(),
+        )),
+        (_, _, true) => Err(EngineError::Configuration(
+            "world-one execution received an unexpected distributed launch runtime".into(),
+        )),
+        (_, _, false) => Err(EngineError::Configuration(
+            "distributed or tensor-parallel execution requires a live launch runtime".into(),
+        )),
+    };
+    coordinate_engine_result(launch_comm, "CLI execution topology", topology_check)
+        .map_err(cli_engine_error)?;
+    let device = coordinate_engine_result(
+        launch_comm,
+        "CLI device setup",
+        prepare_cli_device(setup.device, runtime.as_ref())
+            .map_err(|error| EngineError::Message(error.to_string())),
+    )
+    .map_err(cli_engine_error)?;
+    let execution = match (
+        setup.data_parallel,
+        setup.tensor_parallel_plan.is_sharded(),
+        runtime,
+    ) {
+        (true, false, Some(runtime)) => CliExecution::DataParallel(runtime.comm),
+        (false, true, Some(runtime)) => CliExecution::TensorParallel {
+            plan: setup.tensor_parallel_plan,
+            comm: runtime.comm,
+        },
+        (false, false, None) => CliExecution::WorldOne,
+        (true, true, _) => {
+            return Err(CliOrchestrationError::msg(
+                "combined data-parallel and tensor-parallel execution is unsupported",
+            ));
+        }
+        (_, _, Some(_)) => {
+            return Err(CliOrchestrationError::msg(
+                "world-one execution received an unexpected distributed launch runtime",
+            ));
+        }
+        (_, _, None) => {
+            return Err(CliOrchestrationError::msg(
+                "distributed or tensor-parallel execution requires a live launch runtime",
+            ));
+        }
+    };
+    let launch = CliLaunchInput {
+        task: setup.task.name().to_owned(),
+        ferrl_commit,
+        authentication: setup.authentication,
+        run,
+        config: setup.launch_config.clone(),
+        output_root: setup.output_root.clone(),
+    };
+    match &setup.task {
+        CliBuiltinTask::Countdown {
+            train_n,
+            eval_n,
+            seed,
+        } => {
+            let local = (|| {
+                let config = crate::countdown::CountdownConfig::default();
+                let count = train_n.checked_add(*eval_n).ok_or_else(|| {
+                    EngineError::Configuration("countdown dataset size overflowed usize".into())
+                })?;
+                let samples = crate::countdown::generate_dataset(*seed, count, &config)
+                    .into_iter()
+                    .map(|problem| Sample::new(crate::countdown::build_prompt(&problem), problem))
+                    .collect::<Vec<_>>();
+                Ok(crate::data::train_eval_split_by_key(
+                    samples,
+                    *eval_n,
+                    *seed,
+                    |sample| sample.target.split_key(),
+                ))
+            })();
+            let (train, eval) =
+                coordinate_engine_result(execution.comm(), "Countdown task setup", local)
+                    .map_err(cli_engine_error)?;
+            let reward = crate::countdown::CountdownReward::default();
+            run_cli_built_task(
+                setup, &device, &train, &eval, &reward, &reward, None, None, None, launch,
+                execution, attestor,
+            )
+        }
+        CliBuiltinTask::Math { path, eval_n, seed } => {
+            let local = crate::data::read_jsonl::<crate::math::MathProblem, _>(path)
+                .map(|samples| {
+                    crate::data::train_eval_split_by_key(
+                        samples,
+                        *eval_n,
+                        *seed,
+                        crate::math::math_split_key,
+                    )
+                })
+                .map_err(|error| EngineError::Message(error.to_string()));
+            let (train, eval) =
+                coordinate_engine_result(execution.comm(), "Math task setup", local)
+                    .map_err(cli_engine_error)?;
+            let reward = crate::math::MathReward::default();
+            run_cli_built_task(
+                setup, &device, &train, &eval, &reward, &reward, None, None, None, launch,
+                execution, attestor,
+            )
+        }
+        CliBuiltinTask::Trimul(task) => {
+            let local = (|| {
+                let prompt_bytes = fs::read(&task.prompt_path).map_err(|error| {
+                    EngineError::Message(format!("read {}: {error}", task.prompt_path.display()))
+                })?;
+                let prompt = std::str::from_utf8(&prompt_bytes).map_err(|error| {
+                    EngineError::Configuration(format!("trimul prompt is not valid UTF-8: {error}"))
+                })?;
+                if prompt.is_empty() {
+                    return Err(EngineError::Configuration("trimul prompt is empty".into()));
+                }
+                let train = std::iter::repeat_with(|| Sample::new(prompt.to_owned(), ()))
+                    .take(task.train_n)
+                    .collect::<Vec<_>>();
+                let eval = std::iter::repeat_with(|| Sample::new(prompt.to_owned(), ()))
+                    .take(task.eval_n)
+                    .collect::<Vec<_>>();
+                let assets = crate::trimul::TrimulVerifierAssets::capture(
+                    &task.image,
+                    &task.eval_dir,
+                    &task.scratch_root,
+                )
+                .map_err(|error| EngineError::Message(error.to_string()))?;
+                let reward = build_cli_trimul_reward(task, assets.clone(), task.secret_seed, true)
+                    .map_err(|error| EngineError::Message(error.to_string()))?;
+                let eval_reward = if eval.is_empty() {
+                    None
+                } else {
+                    let seed = task.held_out_secret_seed.ok_or_else(|| {
+                        EngineError::Configuration(
+                            "TriMul held-out eval requires trimul.held_out_secret_seed".into(),
+                        )
+                    })?;
+                    Some(
+                        build_cli_trimul_reward(task, assets.clone(), seed, false)
+                            .map_err(|error| EngineError::Message(error.to_string()))?,
+                    )
+                };
+                let verifier_identity = cli_launch_verifier_identity(&reward, &assets)
+                    .map_err(|error| EngineError::Message(error.to_string()))?;
+                Ok((
+                    prompt_bytes,
+                    train,
+                    eval,
+                    assets,
+                    reward,
+                    eval_reward,
+                    verifier_identity,
+                ))
+            })();
+            let (prompt_bytes, train, eval, assets, reward, eval_reward, verifier_identity) =
+                coordinate_engine_result(execution.comm(), "TriMul task setup", local)
+                    .map_err(cli_engine_error)?;
+            run_cli_built_task(
+                setup,
+                &device,
+                &train,
+                &eval,
+                &reward,
+                eval_reward.as_ref().unwrap_or(&reward),
+                Some(&prompt_bytes),
+                Some(&assets),
+                Some(verifier_identity),
+                launch,
+                execution,
+                attestor,
+            )
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_cli_built_task<R: RewardFn>(
+    setup: &CliTrainSetup,
+    device: &Device,
+    train: &[Sample<R::Target>],
+    eval: &[Sample<R::Target>],
+    reward: &R,
+    evaluation_reward: &R,
+    rendered_prompt_bytes: Option<&[u8]>,
+    verifier_assets: Option<&crate::trimul::TrimulVerifierAssets>,
+    verifier_identity: Option<LaunchVerifierIdentity>,
+    launch: CliLaunchInput,
+    execution: CliExecution,
+    attestor: Option<&dyn CliLaunchAttestor>,
+) -> Result<CliRunOutcome, CliOrchestrationError>
+where
+    R::Target: Serialize + DeserializeOwned,
+{
+    run_cli_training(
+        CliTrainingRequest {
+            launch,
+            model_dir: &setup.model_dir,
+            device,
+            loader_opts: setup.loader_opts.clone(),
+            activation_checkpointing: setup.activation_checkpointing,
+            eos_selection: setup.eos_selection,
+            trainer_config: setup.trainer_config.clone(),
+            training_samples: train,
+            evaluation_samples: eval,
+            reward,
+            evaluation_reward,
+            rendered_prompt_bytes,
+            verifier_assets,
+            verifier_identity,
+            execution,
+            health_policy: setup.health_policy.clone(),
+            health_policy_is_default: setup.health_policy_is_default,
+            data_seed: setup.task.data_seed(),
+            trimul_held_out_secret_seed: setup.task.trimul_held_out_secret_seed(),
+        },
+        attestor,
+    )
+}
+
+fn validate_cli_git_commit(value: &str) -> Result<String, CliOrchestrationError> {
+    let valid_len = matches!(value.len(), 40 | 64);
+    let valid_hex = value
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    if valid_len && valid_hex {
+        Ok(value.to_owned())
+    } else {
+        Err(CliOrchestrationError::msg(
+            "git commit must be a full 40- or 64-character lowercase SHA",
+        ))
+    }
+}
+
+fn synchronized_cli_run_identity(
+    setup: &CliTrainSetup,
+    comm: Option<&dyn Comm>,
+) -> Result<LaunchRunIdentity, CliOrchestrationError> {
+    let local_stamp = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .map_err(|error| {
+                CliOrchestrationError::msg(format!("system clock precedes Unix epoch: {error}"))
+            })
+    };
+    let stamp = match comm.filter(|comm| comm.world_size() > 1) {
+        Some(comm) => {
+            let local = if comm.rank() == 0 {
+                local_stamp()
+            } else {
+                Ok(0)
+            };
+            let local = coordinate_engine_result(
+                Some(comm),
+                "run timestamp",
+                local.map_err(|error| EngineError::Message(error.to_string())),
+            )
+            .map_err(cli_engine_error)?;
+            let reduced = comm
+                .all_reduce_scalar_sum(local as f64)
+                .map_err(|error| CliOrchestrationError::msg(error.to_string()))?;
+            if !reduced.is_finite()
+                || reduced < 0.0
+                || reduced.fract() != 0.0
+                || reduced > (1_u64 << 53) as f64
+            {
+                return Err(CliOrchestrationError::msg(format!(
+                    "distributed run timestamp is not an exact u64: {reduced:?}"
+                )));
+            }
+            reduced as u64
+        }
+        None => local_stamp()?,
+    };
+    let group_id = format!("{}-{stamp}", setup.task.name());
+    let (data_parallel_rank, data_parallel_world_size) = if setup.data_parallel {
+        let comm = comm.ok_or_else(|| {
+            CliOrchestrationError::msg("distributed run identity requires a live communicator")
+        })?;
+        (comm.rank(), comm.world_size())
+    } else {
+        (0, 1)
+    };
+    let run_id = if setup.data_parallel {
+        format!("{group_id}-rank{data_parallel_rank}")
+    } else if setup.tensor_parallel_plan.is_sharded() {
+        format!("{group_id}-rank{}", setup.tensor_parallel_plan.rank())
+    } else {
+        group_id.clone()
+    };
+    Ok(LaunchRunIdentity {
+        group_id,
+        run_id,
+        data_parallel_rank,
+        data_parallel_world_size,
+        tensor_parallel_rank: setup.tensor_parallel_plan.rank(),
+        tensor_parallel_world_size: setup.tensor_parallel_plan.world_size(),
+    })
+}
+
+fn prepare_cli_device(
+    selected: CliDeviceSelection,
+    runtime: Option<&CliLaunchRuntime>,
+) -> Result<Device, CliOrchestrationError> {
+    if let Some(runtime) = runtime {
+        if selected != CliDeviceSelection::Cuda {
+            return Err(CliOrchestrationError::msg(
+                "distributed or tensor_parallel execution requires device = \"cuda\"",
+            ));
+        }
+        let device = runtime.device.clone();
+        if let Some(warning) = crate::check_driver_compat(&device).warning() {
+            tracing::warn!("{warning}");
+        }
+        crate::guard_first_kernel(&device)
+            .map_err(|error| CliOrchestrationError::msg(error.to_string()))?;
+        return Ok(device);
+    }
+    match selected {
+        CliDeviceSelection::Cpu => Ok(Device::Cpu),
+        CliDeviceSelection::Cuda => open_cli_cuda(),
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn open_cli_cuda() -> Result<Device, CliOrchestrationError> {
+    let device =
+        Device::new_cuda(0).map_err(|error| CliOrchestrationError::msg(error.to_string()))?;
+    if let Some(warning) = crate::check_driver_compat(&device).warning() {
+        tracing::warn!("{warning}");
+    }
+    crate::guard_first_kernel(&device)
+        .map_err(|error| CliOrchestrationError::msg(error.to_string()))?;
+    Ok(device)
+}
+
+#[cfg(not(feature = "cuda"))]
+fn open_cli_cuda() -> Result<Device, CliOrchestrationError> {
+    Err(CliOrchestrationError::msg(
+        "device \"cuda\" requires building ferrl with --features cuda; use device \"cpu\" otherwise",
+    ))
+}
+
+#[allow(clippy::cognitive_complexity)] // one fail-closed TriMul reward/preflight transaction
+fn build_cli_trimul_reward(
+    task: &CliTrimulTask,
+    assets: crate::trimul::TrimulVerifierAssets,
+    secret_seed: u64,
+    apply_baseline: bool,
+) -> Result<crate::trimul::TrimulReward, CliOrchestrationError> {
+    let (tests, benches) = crate::trimul::parse_task_yml(assets.task_yml())
+        .map_err(|error| CliOrchestrationError::msg(error.to_string()))?;
+    let wall = Duration::from_secs(if task.wall_secs == 0 {
+        600
+    } else {
+        task.wall_secs
+    });
+    let reward = crate::trimul::TrimulReward::new(assets, &task.scratch_root)
+        .with_cases(tests, benches)
+        .with_secret_seed(secret_seed)
+        .with_wall(wall);
+    let reward = match task.verifier_isolation_tier {
+        crate::VerifierIsolationTier::SameUidApptainerV1 => reward.with_same_uid_apptainer(
+            task.scratch_root.join(".ferrl-verifier"),
+            task.verifier_apptainer_bin
+                .as_deref()
+                .unwrap_or_else(|| Path::new("/usr/bin/apptainer")),
+        ),
+        crate::VerifierIsolationTier::DedicatedUidServiceV1 => reward
+            .with_verifier_executor_socket(
+                task.verifier_executor_socket
+                    .as_deref()
+                    .unwrap_or_else(|| Path::new(crate::DEFAULT_VERIFIER_EXECUTOR_SOCKET)),
+            ),
+    };
+    let mut reward = reward
+        .with_reward_profile(task.reward_profile)
+        .map_err(CliOrchestrationError::msg)?
+        .with_submission_extract_mode(task.submission_extract_mode);
+    if let Some(devices) = &task.verifier_cuda_visible_devices {
+        reward = reward.with_verifier_cuda_visible_devices(devices.clone());
+    }
+    if !task.verifier_cuda_device_pool.is_empty() {
+        reward = reward.with_verifier_cuda_device_pool(task.verifier_cuda_device_pool.clone());
+    }
+    if task.verifier_parallelism != 0 {
+        reward = reward.with_verifier_parallelism(task.verifier_parallelism);
+    }
+    if task.verifier_max_procs != 0 {
+        reward = reward.with_verifier_max_procs(task.verifier_max_procs);
+    }
+    if task.scratch_max_bytes != 0 {
+        reward = reward.with_scratch_max_bytes(task.scratch_max_bytes);
+    }
+    if apply_baseline {
+        if let Some(baseline) = &task.baseline {
+            let expected = crate::trimul::timing_metric_for_tier(task.verifier_isolation_tier);
+            if baseline.metric != expected {
+                return Err(CliOrchestrationError::msg(format!(
+                    "trimul.baseline.metric must be {expected:?}; old or unversioned baselines must be re-measured"
+                )));
+            }
+            if baseline.isolation_tier != task.verifier_isolation_tier {
+                return Err(CliOrchestrationError::msg(
+                    "trimul.baseline.isolation_tier does not match trimul.verifier_isolation_tier",
+                ));
+            }
+            validate_lower_digest(
+                "trimul.baseline.isolation_evidence_sha256",
+                &baseline.isolation_evidence_sha256,
+            )?;
+            guard_cli_baseline_gpu(&baseline.gpu)?;
+            reward = reward.with_baseline_ns(baseline.ns);
+        }
+    }
+    let reward = reward.with_verified_isolation().map_err(|error| {
+        CliOrchestrationError::msg(format!("verifier isolation preflight failed: {error}"))
+    })?;
+    let reward = reward.with_verified_runtime().map_err(|error| {
+        CliOrchestrationError::msg(format!("verifier runtime preflight failed: {error}"))
+    })?;
+    if apply_baseline {
+        if let Some(baseline) = &task.baseline {
+            let isolation = reward
+                .verifier_isolation_evidence()
+                .map_err(|error| CliOrchestrationError::msg(error.to_string()))?;
+            if baseline.isolation_tier != isolation.tier
+                || baseline.isolation_evidence_sha256
+                    != crate::trimul::verifier_isolation_evidence_sha256(&isolation)
+            {
+                return Err(CliOrchestrationError::msg(
+                    "trimul.baseline isolation tier/evidence does not match the active verifier; re-measure the baseline through this exact backend",
+                ));
+            }
+        }
+    }
+    Ok(reward)
+}
+
+fn cli_launch_verifier_identity(
+    reward: &crate::trimul::TrimulReward,
+    assets: &crate::trimul::TrimulVerifierAssets,
+) -> Result<LaunchVerifierIdentity, CliOrchestrationError> {
+    let isolation = reward.verifier_isolation_evidence().map_err(|error| {
+        CliOrchestrationError::msg(format!("verifier preflight revalidation failed: {error}"))
+    })?;
+    let runtime_preflight = reward.runtime_preflight_evidence().map_err(|error| {
+        CliOrchestrationError::msg(format!("runtime control preflight failed: {error}"))
+    })?;
+    Ok(LaunchVerifierIdentity {
+        assets: assets.identity().clone(),
+        isolation_evidence_sha256: crate::trimul::verifier_isolation_evidence_sha256(&isolation),
+        timing_metric: crate::trimul::timing_metric_for_tier(isolation.tier).to_string(),
+        runtime_hardening_contract: crate::trimul::TRIMUL_RUNTIME_HARDENING_CONTRACT.to_string(),
+        runtime_preflight_evidence_sha256: crate::trimul::runtime_preflight_evidence_sha256(
+            &runtime_preflight,
+        ),
+        runtime_preflight,
+        isolation,
+    })
+}
+
+fn validate_lower_digest(label: &str, digest: &str) -> Result<(), CliOrchestrationError> {
+    if digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Ok(())
+    } else {
+        Err(CliOrchestrationError::msg(format!(
+            "{label} must be a 64-character lowercase SHA-256"
+        )))
+    }
+}
+
+fn guard_cli_baseline_gpu(configured: &str) -> Result<(), CliOrchestrationError> {
+    let want = configured.trim();
+    if want.is_empty() {
+        return Err(CliOrchestrationError::msg("trimul.baseline.gpu is empty"));
+    }
+    let output = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=name", "--format=csv,noheader"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success());
+    let detected = output.as_ref().and_then(|output| {
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(ToOwned::to_owned)
+    });
+    let want = want.to_lowercase();
+    let matches = detected.as_deref().is_some_and(|name| {
+        let name = name.to_lowercase();
+        let bytes = name.as_bytes();
+        name.match_indices(&want).any(|(index, matched)| {
+            let before = index == 0 || !bytes[index - 1].is_ascii_alphanumeric();
+            let after_index = index + matched.len();
+            let after = after_index >= bytes.len() || !bytes[after_index].is_ascii_alphanumeric();
+            before && after
+        })
+    });
+    if matches {
+        Ok(())
+    } else {
+        Err(CliOrchestrationError::msg(format!(
+            "baseline was measured on GPU {configured:?} but this node's GPU is {:?}; re-measure on this GPU",
+            detected.as_deref().unwrap_or("unavailable")
+        )))
     }
 }
 
@@ -1271,6 +1994,16 @@ where
                 "exact sample reconstruction and tokenizer preflight",
                 local,
             )?;
+        validate_engine_value_consensus(
+            "ordered training samples",
+            training_sha256.as_bytes(),
+            launch_comm,
+        )?;
+        validate_engine_value_consensus(
+            "ordered held-out samples",
+            evaluation_sha256.as_bytes(),
+            launch_comm,
+        )?;
         self.training_samples = training_samples;
         self.evaluation_samples = evaluation_samples;
         self.training_samples_sha256 = training_sha256;
@@ -1389,6 +2122,14 @@ where
                             sha256: sha256_hex(bytes),
                             len_bytes: bytes.len(),
                         }),
+                    training_samples: Some(LaunchSampleIdentity {
+                        sha256: self.training_samples_sha256.clone(),
+                        count: self.training_samples.len(),
+                    }),
+                    held_out_samples: Some(LaunchSampleIdentity {
+                        sha256: self.evaluation_samples_sha256.clone(),
+                        count: self.evaluation_samples.len(),
+                    }),
                     verifier: self.verifier_identity.clone(),
                     candidate_ledger: LaunchCandidateLedger {
                         file: RunDir::CANDIDATES_FILE.to_owned(),
@@ -1528,33 +2269,21 @@ where
         let run = self.run.as_ref().ok_or_else(|| {
             EngineError::Configuration("preemption requires a published run".into())
         })?;
-        let (completed_steps, checkpoint_path) = if matches!(
-            &self.plan.mode,
-            EngineMode::Discovery(_)
-        ) {
-            let history_len = self.history.as_ref().map_or(0, Vec::len);
-            let completed_steps = u64::try_from(history_len).map_err(|_| {
-                EngineError::PreemptionCheckpoint(
-                    "completed history length does not fit the checkpoint step domain".into(),
-                )
-            })?;
-            let latest = crate::latest_checkpoint(run.checkpoints_dir())
-                .map_err(|error| EngineError::PreemptionCheckpointScan(Box::new(error)))?
-                .ok_or_else(|| {
+        let (completed_steps, checkpoint_path) =
+            if matches!(&self.plan.mode, EngineMode::Discovery(_)) {
+                let history_len = self.history.as_ref().map_or(0, Vec::len);
+                let completed_steps = u64::try_from(history_len).map_err(|_| {
                     EngineError::PreemptionCheckpoint(
-                        "trainer returned Preempted without a complete checkpoint".into(),
+                        "completed history length does not fit the checkpoint step domain".into(),
                     )
                 })?;
-            if latest.step != completed_steps {
-                return Err(EngineError::PreemptionCheckpoint(format!(
-                    "newest complete checkpoint step {} does not match completed history length {completed_steps}",
-                    latest.step
-                )));
-            }
-            (Some(latest.step), Some(latest.dir))
-        } else {
-            (None, None)
-        };
+                let latest = crate::latest_checkpoint(run.checkpoints_dir())
+                    .map_err(|error| EngineError::PreemptionCheckpointScan(Box::new(error)))?;
+                let latest = validate_preemption_checkpoint(completed_steps, latest)?;
+                (Some(latest.step), Some(latest.dir))
+            } else {
+                (None, None)
+            };
         Ok(Some(EngineOutcome::Preempted(EnginePreemptedRun {
             run_dir: run.root().to_path_buf(),
             completed_steps,
@@ -1659,6 +2388,7 @@ where
             EngineMode::Discovery(spec) => publish_discovery_eval_report(
                 spec,
                 &self.evaluation_samples,
+                &self.evaluation_samples_sha256,
                 &report,
                 &run,
                 &launch_sha256,
@@ -1796,6 +2526,24 @@ where
                 .is_some(),
         )
     }
+}
+
+fn validate_preemption_checkpoint(
+    completed_steps: u64,
+    latest: Option<crate::LatestCheckpoint>,
+) -> Result<crate::LatestCheckpoint, EngineError> {
+    let latest = latest.ok_or_else(|| {
+        EngineError::PreemptionCheckpoint(
+            "trainer returned Preempted without a complete checkpoint".into(),
+        )
+    })?;
+    if latest.step != completed_steps {
+        return Err(EngineError::PreemptionCheckpoint(format!(
+            "newest complete checkpoint step {} does not match completed history length {completed_steps}",
+            latest.step
+        )));
+    }
+    Ok(latest)
 }
 
 fn engine_checkpoint_eos_selection(selection: EngineEosSelection) -> CheckpointEosSelection {
@@ -1976,25 +2724,20 @@ struct DiscoveryEngineHeldOutReport<'a> {
     report: &'a crate::eval::EvalReport,
 }
 
-fn publish_discovery_eval_report<T: Serialize>(
+fn publish_discovery_eval_report<T>(
     spec: &DiscoveryLaunchInput<'_>,
     evaluation_samples: &[Sample<T>],
+    frozen_eval_samples_sha256: &str,
     report: &crate::eval::EvalReport,
     run: &RunDir,
     launch_sha256: &str,
 ) -> Result<Vec<u8>, EngineError> {
-    let eval_samples =
-        serde_json::to_vec(evaluation_samples).map_err(|source| EngineError::Serialization {
-            kind: "discovery held-out samples",
-            source,
-        })?;
-    let eval_samples_sha256 = sha256_hex(&eval_samples);
     let durable = DiscoveryEngineHeldOutReport {
         contract: "ferrl.discovery-held-out-report.v1",
         contract_version: 1,
         launch_sha256,
         task: spec.task,
-        held_out_samples_sha256: &eval_samples_sha256,
+        held_out_samples_sha256: frozen_eval_samples_sha256,
         held_out_samples_count: evaluation_samples.len(),
         report,
     };
@@ -3915,6 +4658,10 @@ mod tests {
     }
 
     impl TensorParallelPolicy for ProbePolicy {
+        fn supports_sharded_tensor_parallel_backward(&self) -> bool {
+            true
+        }
+
         fn validate_tensor_parallel_execution(&self, comm: &dyn Comm) -> CandleResult<()> {
             assert!(
                 !(self.panic_on_tp_preflight_rank_one && comm.rank() == 1),
@@ -3952,6 +4699,19 @@ mod tests {
     }
 
     struct ProbeReward;
+
+    #[derive(Debug, Serialize)]
+    struct NonIdempotentTarget(String);
+
+    impl<'de> Deserialize<'de> for NonIdempotentTarget {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            let value = String::deserialize(deserializer)?;
+            Ok(Self(format!("normalized:{value}")))
+        }
+    }
 
     impl RewardFn for ProbeReward {
         type Target = ();
@@ -4349,6 +5109,355 @@ mod tests {
         assert!(!discovery_root.exists());
     }
 
+    fn cli_train_setup_for_test(root: &Path) -> CliTrainSetup {
+        CliTrainSetup {
+            task: CliBuiltinTask::Countdown {
+                train_n: 1,
+                eval_n: 0,
+                seed: 7,
+            },
+            ferrl_commit: "ab".repeat(20),
+            authentication: LaunchAuthenticationMode::LocalEphemeralV1,
+            launch_config: LaunchConfigSnapshot {
+                source_sha256: "01".repeat(32),
+                resolved_sha256: "02".repeat(32),
+                resolved: json!({"task": "countdown"}),
+            },
+            config_consensus_digest: [3; 32],
+            model_dir: root.join("missing-model"),
+            output_root: root.join("runs"),
+            device: CliDeviceSelection::Cpu,
+            loader_opts: LoaderOpts::default(),
+            activation_checkpointing: false,
+            eos_selection: CliEosSelection::Disabled,
+            trainer_config: TrainerConfig::builder()
+                .steps(1)
+                .group_size(2)
+                .max_new_tokens(1)
+                .candidate_log_top_k(2)
+                .build(),
+            data_parallel: false,
+            tensor_parallel_plan: TensorParallelPlan::single(),
+            health_policy: CliRunHealthPolicy::default(),
+            health_policy_is_default: true,
+        }
+    }
+
+    #[test]
+    fn complete_cli_train_setup_owns_identity_task_and_request_assembly() {
+        let temporary = TestDir::new("complete-cli-setup");
+        let setup = cli_train_setup_for_test(&temporary.0);
+        let error = run_cli_train_setup(&setup, None, None).unwrap_err();
+        assert!(error.to_string().contains("model load"));
+        assert!(!setup.output_root.exists());
+
+        let mut invalid = cli_train_setup_for_test(&temporary.0);
+        invalid.ferrl_commit = "not-a-commit".into();
+        assert!(run_cli_train_setup(&invalid, None, None)
+            .unwrap_err()
+            .to_string()
+            .contains("full 40- or 64-character"));
+
+        let mut math = cli_train_setup_for_test(&temporary.0);
+        math.task = CliBuiltinTask::Math {
+            path: temporary.0.join("missing.jsonl"),
+            eval_n: 0,
+            seed: 7,
+        };
+        assert!(run_cli_train_setup(&math, None, None)
+            .unwrap_err()
+            .to_string()
+            .contains("missing.jsonl"));
+
+        let mut trimul = cli_train_setup_for_test(&temporary.0);
+        trimul.task = CliBuiltinTask::Trimul(Box::new(CliTrimulTask {
+            prompt_path: temporary.0.join("missing-prompt.txt"),
+            submission_extract_mode: crate::trimul::SubmissionExtractMode::FinalFence,
+            image: temporary.0.join("image.sif"),
+            eval_dir: temporary.0.join("eval"),
+            scratch_root: temporary.0.join("scratch"),
+            verifier_isolation_tier: crate::VerifierIsolationTier::SameUidApptainerV1,
+            verifier_apptainer_bin: None,
+            verifier_executor_socket: None,
+            scratch_max_bytes: 0,
+            secret_seed: 1,
+            held_out_secret_seed: None,
+            wall_secs: 0,
+            verifier_cuda_visible_devices: None,
+            verifier_cuda_device_pool: Vec::new(),
+            verifier_parallelism: 0,
+            verifier_max_procs: 0,
+            baseline: None,
+            reward_profile: crate::trimul::TrimulRewardProfile::default(),
+            train_n: 1,
+            eval_n: 0,
+            data_seed: 7,
+        }));
+        assert!(run_cli_train_setup(&trimul, None, None)
+            .unwrap_err()
+            .to_string()
+            .contains("missing-prompt.txt"));
+    }
+
+    #[test]
+    fn asymmetric_cli_training_commit_validation_fails_before_mutation() {
+        let temporary = TestDir::new("distributed-cli-commit-consensus");
+        let results = std::thread::scope(|scope| {
+            crate::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(3))
+                .into_iter()
+                .map(|comm| {
+                    let rank = comm.rank();
+                    let mut setup = cli_train_setup_for_test(&temporary.0);
+                    setup.data_parallel = true;
+                    setup.device = CliDeviceSelection::Cuda;
+                    if rank == 1 {
+                        setup.ferrl_commit = "not-a-commit".into();
+                    }
+                    scope.spawn(move || {
+                        run_cli_train_setup(
+                            &setup,
+                            Some(CliLaunchRuntime {
+                                device: Device::Cpu,
+                                comm: Box::new(comm),
+                            }),
+                            None,
+                        )
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(results.iter().any(|result| matches!(
+            result,
+            Err(error) if error.contains("full 40- or 64-character")
+        )));
+        assert!(results.iter().any(|result| matches!(
+            result,
+            Err(error) if error.contains("training commit validation failed on a peer")
+        )));
+        assert!(!temporary.0.join("runs").exists());
+    }
+
+    #[test]
+    fn asymmetric_cli_config_digest_fails_before_device_or_model_setup() {
+        let temporary = TestDir::new("distributed-cli-config-consensus");
+        let results = std::thread::scope(|scope| {
+            crate::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(3))
+                .into_iter()
+                .enumerate()
+                .map(|(rank, comm)| {
+                    let mut setup = cli_train_setup_for_test(&temporary.0);
+                    setup.data_parallel = true;
+                    setup.device = CliDeviceSelection::Cuda;
+                    setup.config_consensus_digest = [rank as u8; 32];
+                    scope.spawn(move || {
+                        run_cli_train_setup(
+                            &setup,
+                            Some(CliLaunchRuntime {
+                                device: Device::Cpu,
+                                comm: Box::new(comm),
+                            }),
+                            None,
+                        )
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(results.iter().all(|result| matches!(
+            result,
+            Err(error) if error.contains("run config outside tensor_parallel.rank")
+        )));
+        assert!(!temporary.0.join("runs").exists());
+    }
+
+    #[test]
+    fn asymmetric_cli_device_setup_fails_in_lockstep_before_mutation() {
+        let temporary = TestDir::new("distributed-cli-device-setup");
+        let results = std::thread::scope(|scope| {
+            crate::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(3))
+                .into_iter()
+                .map(|comm| {
+                    let rank = comm.rank();
+                    let mut setup = cli_train_setup_for_test(&temporary.0);
+                    setup.data_parallel = true;
+                    setup.device = if rank == 0 {
+                        CliDeviceSelection::Cuda
+                    } else {
+                        CliDeviceSelection::Cpu
+                    };
+                    scope.spawn(move || {
+                        run_cli_train_setup(
+                            &setup,
+                            Some(CliLaunchRuntime {
+                                device: Device::Cpu,
+                                comm: Box::new(comm),
+                            }),
+                            None,
+                        )
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(results.iter().any(|result| matches!(
+            result,
+            Err(error) if error.contains("requires device = \"cuda\"")
+        )));
+        assert!(results.iter().any(|result| matches!(
+            result,
+            Err(error) if error.contains("CLI device setup failed on a peer")
+        )));
+        assert!(!temporary.0.join("runs").exists());
+    }
+
+    #[test]
+    fn asymmetric_cli_task_setup_fails_in_lockstep_before_mutation() {
+        let temporary = TestDir::new("distributed-cli-task-setup");
+        let math_path = temporary.0.join("math.jsonl");
+        std::fs::write(
+            &math_path,
+            br#"{"prompt":"1 + 1 = ?","target":{"answer":"2"}}
+"#,
+        )
+        .unwrap();
+        let results = std::thread::scope(|scope| {
+            crate::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(3))
+                .into_iter()
+                .map(|comm| {
+                    let rank = comm.rank();
+                    let mut setup = cli_train_setup_for_test(&temporary.0);
+                    setup.data_parallel = true;
+                    setup.device = CliDeviceSelection::Cuda;
+                    setup.task = CliBuiltinTask::Math {
+                        path: if rank == 0 {
+                            math_path.clone()
+                        } else {
+                            temporary.0.join("missing-math.jsonl")
+                        },
+                        eval_n: 0,
+                        seed: 7,
+                    };
+                    scope.spawn(move || {
+                        run_cli_train_setup(
+                            &setup,
+                            Some(CliLaunchRuntime {
+                                device: Device::Cpu,
+                                comm: Box::new(comm),
+                            }),
+                            None,
+                        )
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(results.iter().any(|result| matches!(
+            result,
+            Err(error) if error.contains("missing-math.jsonl")
+        )));
+        assert!(results.iter().any(|result| matches!(
+            result,
+            Err(error) if error.contains("Math task setup failed on a peer")
+        )));
+        assert!(!temporary.0.join("runs").exists());
+    }
+
+    #[test]
+    fn synchronized_cli_identity_uses_one_distributed_timestamp() {
+        let temporary = TestDir::new("distributed-cli-identity");
+        let identities = std::thread::scope(|scope| {
+            crate::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(3))
+                .into_iter()
+                .map(|comm| {
+                    let mut setup = cli_train_setup_for_test(&temporary.0);
+                    setup.data_parallel = true;
+                    scope.spawn(move || synchronized_cli_run_identity(&setup, Some(&comm)).unwrap())
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(identities[0].group_id, identities[1].group_id);
+        assert_eq!(identities[0].data_parallel_rank, 0);
+        assert_eq!(identities[1].data_parallel_rank, 1);
+        assert_eq!(identities[0].data_parallel_world_size, 2);
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // one compact contract matrix
+    fn cli_setup_identity_and_device_helpers_cover_world_one_and_distributed_contracts() {
+        let temporary = TestDir::new("cli-setup-helpers");
+        let setup = cli_train_setup_for_test(&temporary.0);
+        let identity = synchronized_cli_run_identity(&setup, None).unwrap();
+        assert_eq!(identity.data_parallel_world_size, 1);
+        assert_eq!(identity.tensor_parallel_world_size, 1);
+        assert!(matches!(
+            prepare_cli_device(CliDeviceSelection::Cpu, None).unwrap(),
+            Device::Cpu
+        ));
+        assert!(prepare_cli_device(
+            CliDeviceSelection::Cpu,
+            Some(&CliLaunchRuntime {
+                device: Device::Cpu,
+                comm: Box::new(crate::SoloComm),
+            })
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("requires device = \"cuda\""));
+        assert!(matches!(
+            prepare_cli_device(
+                CliDeviceSelection::Cuda,
+                Some(&CliLaunchRuntime {
+                    device: Device::Cpu,
+                    comm: Box::new(crate::SoloComm),
+                })
+            )
+            .unwrap(),
+            Device::Cpu
+        ));
+        let mut unexpected_runtime = cli_train_setup_for_test(&temporary.0);
+        unexpected_runtime.device = CliDeviceSelection::Cuda;
+        assert!(run_cli_train_setup(
+            &unexpected_runtime,
+            Some(CliLaunchRuntime {
+                device: Device::Cpu,
+                comm: Box::new(crate::SoloComm),
+            }),
+            None,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("unexpected distributed launch runtime"));
+        let mut missing_runtime = cli_train_setup_for_test(&temporary.0);
+        missing_runtime.tensor_parallel_plan = TensorParallelPlan::new(0, 2).unwrap();
+        assert!(run_cli_train_setup(&missing_runtime, None, None)
+            .unwrap_err()
+            .to_string()
+            .contains("requires a live launch runtime"));
+        assert!(validate_lower_digest("digest", &"ab".repeat(32)).is_ok());
+        assert!(validate_lower_digest("digest", "AB").is_err());
+        assert!(guard_cli_baseline_gpu("").is_err());
+    }
+
     #[test]
     fn shared_engine_phase_helpers_are_fail_closed_before_mutation() {
         let samples = vec![Sample::new("prompt", ())];
@@ -4358,6 +5467,169 @@ mod tests {
             preflight_prompt_tokenization(&samples, "test samples", &OneTokenTokenizer,).is_ok()
         );
         assert!(preflight_prompt_tokenization(&samples, "test samples", &EmptyTokenizer,).is_err());
+    }
+
+    #[test]
+    fn asymmetric_data_parallel_training_samples_fail_before_mutation() {
+        let temporary = TestDir::new("dp-sample-consensus");
+        let results = std::thread::scope(|scope| {
+            crate::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(3))
+                .into_iter()
+                .enumerate()
+                .map(|(rank, comm)| {
+                    let root = temporary.0.clone();
+                    scope.spawn(move || {
+                        let samples = vec![Sample::new(format!("rank-{rank}"), ())];
+                        let reward = ProbeReward;
+                        let device = Device::Cpu;
+                        let mut request = cli_probe_request(&root, &device, &samples, &reward);
+                        request.launch.run = LaunchRunIdentity {
+                            group_id: "dp-sample-consensus".into(),
+                            run_id: format!("dp-sample-consensus-rank{rank}"),
+                            data_parallel_rank: rank,
+                            data_parallel_world_size: 2,
+                            tensor_parallel_rank: 0,
+                            tensor_parallel_world_size: 1,
+                        };
+                        request.execution = CliExecution::DataParallel(Box::new(comm));
+                        run_cli_probe(request, false)
+                            .map(|_| ())
+                            .map_err(|error| error.to_string())
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(results.iter().all(|result| matches!(
+            result,
+            Err(error) if error.contains("launch ranks disagree on ordered training samples")
+        )));
+        assert!(!temporary.0.join("dp-sample-consensus-rank0").exists());
+        assert!(!temporary.0.join("dp-sample-consensus-rank1").exists());
+    }
+
+    #[test]
+    fn asymmetric_tensor_parallel_held_out_samples_fail_before_mutation() {
+        let temporary = TestDir::new("tp-sample-consensus");
+        let results = std::thread::scope(|scope| {
+            crate::LocalComm::world_with_timeout(2, std::time::Duration::from_secs(3))
+                .into_iter()
+                .enumerate()
+                .map(|(rank, comm)| {
+                    let root = temporary.0.clone();
+                    scope.spawn(move || {
+                        let training = vec![Sample::new("same", ())];
+                        let evaluation = vec![Sample::new(format!("held-rank-{rank}"), ())];
+                        let reward = ProbeReward;
+                        let device = Device::Cpu;
+                        let mut request = cli_probe_request(&root, &device, &training, &reward);
+                        request.evaluation_samples = &evaluation;
+                        request.launch.run = LaunchRunIdentity {
+                            group_id: "tp-sample-consensus".into(),
+                            run_id: format!("tp-sample-consensus-rank{rank}"),
+                            data_parallel_rank: 0,
+                            data_parallel_world_size: 1,
+                            tensor_parallel_rank: rank,
+                            tensor_parallel_world_size: 2,
+                        };
+                        request.execution = CliExecution::TensorParallel {
+                            plan: TensorParallelPlan::new(rank, 2).unwrap(),
+                            comm: Box::new(comm),
+                        };
+                        run_cli_probe(request, false)
+                            .map(|_| ())
+                            .map_err(|error| error.to_string())
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            results.iter().all(|result| matches!(
+                result,
+                Err(error) if error.contains("launch ranks disagree on ordered held-out samples")
+            )),
+            "{results:?}"
+        );
+        assert!(!temporary.0.join("tp-sample-consensus-rank0").exists());
+        assert!(!temporary.0.join("tp-sample-consensus-rank1").exists());
+    }
+
+    #[test]
+    fn discovery_report_reuses_frozen_digest_for_non_idempotent_targets() {
+        let temporary = TestDir::new("non-idempotent-held-out");
+        let original = vec![Sample::new("prompt", NonIdempotentTarget("value".into()))];
+        let (reconstructed, frozen_bytes) =
+            exact_execution_samples(&original, "non-idempotent held-out samples").unwrap();
+        let frozen_sha256 = sha256_hex(&frozen_bytes);
+        assert_ne!(
+            frozen_sha256,
+            sha256_hex(&serde_json::to_vec(&reconstructed).unwrap())
+        );
+        let run = RunDir::create(&temporary.0, "report").unwrap();
+        let task = crate::discovery::TaskIdentity::new("non-idempotent", 1).unwrap();
+        let spec = DiscoveryLaunchInput {
+            task: &task,
+            metric_contract: crate::discovery::MetricContract::new(
+                "score",
+                "points",
+                crate::discovery::MetricDirection::HigherIsBetter,
+                0.0,
+                0.0,
+            ),
+            ferrl_source: crate::discovery::BuildSourceIdentity::for_orchestration_test(),
+            execution_device: crate::discovery::ExecutionDevice::Cpu,
+            runs_root: &temporary.0,
+            steps: 1,
+            group_size: 2,
+            max_new_tokens: 1,
+            eval_group_size: 1,
+            temperature: 1.0,
+            learning_rate: 1e-3,
+            seed: 1,
+            preemption_flag: None,
+        };
+        let report = crate::eval::EvalReport {
+            n_prompts: 1,
+            group_size: 1,
+            base_reward_mean: 0.0,
+            adapter_reward_mean: 0.0,
+            per_prompt: Vec::new(),
+        };
+        let bytes = publish_discovery_eval_report(
+            &spec,
+            &reconstructed,
+            &frozen_sha256,
+            &report,
+            &run,
+            &"ab".repeat(32),
+        )
+        .unwrap();
+        let durable: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(durable["held_out_samples_sha256"], frozen_sha256);
+    }
+
+    #[test]
+    fn preemption_checkpoint_errors_preserve_dedicated_classification() {
+        let missing = validate_preemption_checkpoint(2, None).unwrap_err();
+        assert!(matches!(missing, EngineError::PreemptionCheckpoint(_)));
+        let mismatched = validate_preemption_checkpoint(
+            2,
+            Some(crate::LatestCheckpoint {
+                dir: PathBuf::from("step-1"),
+                step: 1,
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(mismatched, EngineError::PreemptionCheckpoint(_)));
+        assert!(matches!(
+            crate::discovery::DiscoveryError::from(mismatched),
+            crate::discovery::DiscoveryError::PreemptionCheckpoint(_)
+        ));
     }
 
     struct TestDir(PathBuf);
@@ -4412,6 +5684,14 @@ mod tests {
                 resolved_eos_token_id: None,
             },
             prompt: None,
+            training_samples: Some(LaunchSampleIdentity {
+                sha256: "06".repeat(32),
+                count: 1,
+            }),
+            held_out_samples: Some(LaunchSampleIdentity {
+                sha256: "07".repeat(32),
+                count: 0,
+            }),
             verifier: None,
             candidate_ledger: LaunchCandidateLedger {
                 file: RunDir::CANDIDATES_FILE.to_owned(),
@@ -4422,6 +5702,73 @@ mod tests {
             },
         })
         .unwrap()
+    }
+
+    #[test]
+    fn current_launch_manifest_requires_sample_identities() {
+        let signer = CandidateSigner::generate().unwrap();
+        let mut payload = candidate_test_manifest(0, 1, signer.public_key_hex()).payload;
+        payload.training_samples = None;
+        let error = LaunchManifest::new(payload).unwrap_err().to_string();
+        assert!(
+            error.contains("requires ordered training and held-out sample identities"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn launch_sample_identity_has_a_strict_stable_wire_shape() {
+        let identity = LaunchSampleIdentity {
+            sha256: "ab".repeat(32),
+            count: 3,
+        };
+        let value = serde_json::to_value(&identity).unwrap();
+        assert_eq!(value["sha256"], "ab".repeat(32));
+        assert_eq!(value["count"], 3);
+        let decoded: LaunchSampleIdentity = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.sha256, identity.sha256);
+        assert_eq!(decoded.count, identity.count);
+        assert!(serde_json::from_value::<LaunchSampleIdentity>(json!({
+            "sha256": "ab".repeat(32),
+            "count": 3,
+            "unexpected": true
+        }))
+        .is_err());
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // explicit launch-field mutation matrix
+    fn cli_launch_identity_binds_both_ordered_sample_digests() {
+        let signer = CandidateSigner::generate().unwrap();
+        let original = candidate_test_manifest(0, 1, signer.public_key_hex());
+        let training = original.payload.training_samples.as_ref().unwrap();
+        assert_eq!(training.sha256, "06".repeat(32));
+        assert_eq!(training.count, 1);
+        let held_out = original.payload.held_out_samples.as_ref().unwrap();
+        assert_eq!(held_out.sha256, "07".repeat(32));
+        assert_eq!(held_out.count, 0);
+
+        let mut changed_training = candidate_test_manifest(0, 1, signer.public_key_hex());
+        changed_training
+            .payload
+            .training_samples
+            .as_mut()
+            .unwrap()
+            .sha256 = "08".repeat(32);
+        let changed_training = LaunchManifest::new(changed_training.payload).unwrap();
+        assert_ne!(original.payload_sha256, changed_training.payload_sha256);
+
+        let mut changed_held_out = candidate_test_manifest(0, 1, signer.public_key_hex());
+        let held_out = changed_held_out.payload.held_out_samples.as_mut().unwrap();
+        held_out.sha256 = "09".repeat(32);
+        held_out.count = 1;
+        let changed_held_out = LaunchManifest::new(changed_held_out.payload).unwrap();
+        assert_ne!(original.payload_sha256, changed_held_out.payload_sha256);
+
+        let bytes = original.to_pretty_bytes().unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["payload"]["training_samples"]["count"], 1);
+        assert_eq!(value["payload"]["held_out_samples"]["count"], 0);
     }
 
     fn candidate_test_config() -> TrainerConfig {
