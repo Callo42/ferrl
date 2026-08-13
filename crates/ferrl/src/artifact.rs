@@ -10,11 +10,11 @@ use crate::orchestration::{
 };
 use crate::telemetry::CandidateRecord;
 use crate::trimul::{
-    timing_metric_for_tier, validate_artifact_verification_evidence,
-    verifier_isolation_evidence_sha256, EvidencedTrimulVerification,
-    TrimulArtifactVerificationEvidence, TrimulExecutingDevice, TrimulReward, TrimulRewardProfile,
-    TrimulRuntimePreflightEvidence, TrimulVerification, TrimulVerifierIdentity,
-    DEFAULT_VERIFIER_MAX_PROCS, TRIMUL_RUNTIME_HARDENING_CONTRACT,
+    runtime_hardening_evidence_sha256, timing_metric_for_tier,
+    validate_artifact_verification_evidence, verifier_isolation_evidence_sha256,
+    EvidencedTrimulVerification, TrimulArtifactVerificationEvidence, TrimulExecutingDevice,
+    TrimulReward, TrimulRewardProfile, TrimulRuntimePreflightEvidence, TrimulVerification,
+    TrimulVerifierIdentity, DEFAULT_VERIFIER_MAX_PROCS, TRIMUL_RUNTIME_HARDENING_CONTRACT,
 };
 use crate::{
     RunStatus, VerifierAssetTransport, VerifierIsolationEvidence, VerifierIsolationTier,
@@ -304,20 +304,13 @@ fn validate_trimul_artifact_binding(
     benchmark_cases: usize,
     config: &TrimulArtifactConfig,
 ) -> Result<(), ArtifactError> {
-    let canonical_launch = launch
-        .to_pretty_bytes()
-        .map_err(|error| ArtifactError::msg(error.to_string()))?;
-    let reconstructed = LaunchManifest::new(launch.payload.clone())
-        .map_err(|error| ArtifactError::msg(error.to_string()))?;
-    if canonical_launch != launch_bytes
-        || reconstructed.contract_version != launch.contract_version
-        || reconstructed.kind != launch.kind
-        || reconstructed.payload_sha256 != launch.payload_sha256
-    {
-        return Err(ArtifactError::msg(
-            "TriMul artifact launch bytes or payload identity are not canonical",
-        ));
-    }
+    launch
+        .authenticate_exact_bytes(launch_bytes)
+        .map_err(|error| {
+            ArtifactError::msg(format!(
+                "TriMul artifact launch bytes or payload identity are not canonical: {error}"
+            ))
+        })?;
     candidate
         .verify_signed_provenance(&launch.payload.candidate_ledger.signing_public_key)
         .map_err(|error| ArtifactError::msg(error.to_string()))?;
@@ -363,6 +356,20 @@ fn validate_trimul_artifact_binding(
         .verifier
         .as_ref()
         .ok_or_else(|| ArtifactError::msg("verified TriMul launch has no verifier identity"))?;
+    discovery_verifier
+        .validate_internal_consistency()
+        .map_err(|error| {
+            ArtifactError::msg(format!(
+                "TriMul artifact discovery verifier identity is inconsistent: {error}"
+            ))
+        })?;
+    audit_verifier
+        .validate_internal_consistency()
+        .map_err(|error| {
+            ArtifactError::msg(format!(
+                "TriMul artifact audit verifier identity is inconsistent: {error}"
+            ))
+        })?;
     let (reward_assets, reward_seed, reward_tests, reward_benchmarks) = reward.artifact_binding();
     if &discovery_verifier.assets != reward_assets
         || &audit_verifier.assets != reward_assets
@@ -891,6 +898,7 @@ impl ArtifactPublication {
             &self.staged_files,
             manifest,
             None,
+            false,
             || self.require_owner(),
         )
     }
@@ -903,6 +911,27 @@ pub(crate) fn publish_simple_manifest_last(
     manifest_name: &str,
     manifest_bytes: &[u8],
     fail_after_links: Option<usize>,
+) -> Result<(), ArtifactError> {
+    publish_simple_manifest_last_with_sync_fault(
+        output,
+        stage_dir,
+        files,
+        manifest_name,
+        manifest_bytes,
+        fail_after_links,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_simple_manifest_last_with_sync_fault(
+    output: &Path,
+    stage_dir: &Path,
+    files: &[(&str, &[u8])],
+    manifest_name: &str,
+    manifest_bytes: &[u8],
+    fail_after_links: Option<usize>,
+    fail_before_manifest_sync: bool,
 ) -> Result<(), ArtifactError> {
     let parent = output
         .parent()
@@ -934,11 +963,13 @@ pub(crate) fn publish_simple_manifest_last(
         &staged,
         Path::new(manifest_name),
         fail_after_links,
+        fail_before_manifest_sync,
         || Ok(()),
     )
 }
 
-#[allow(clippy::cognitive_complexity)] // durability ordering keeps nested syncs and commit link explicit
+// Durability ordering keeps nested syncs and the commit link explicit.
+#[allow(clippy::cognitive_complexity, clippy::too_many_arguments)]
 fn link_staged_manifest_last<F>(
     final_dir: &Path,
     stage_dir: &Path,
@@ -946,6 +977,7 @@ fn link_staged_manifest_last<F>(
     staged_files: &BTreeSet<PathBuf>,
     manifest: &Path,
     fail_after_links: Option<usize>,
+    fail_before_manifest_sync: bool,
     require_owner: F,
 ) -> Result<(), ArtifactError>
 where
@@ -999,7 +1031,14 @@ where
     for directory in final_parent_dirs {
         sync_directory(&directory)?;
     }
+    if fail_before_manifest_sync {
+        return Err(ArtifactError::Io {
+            path: final_dir.to_path_buf(),
+            source: std::io::Error::other("injected artifact synchronization failure"),
+        });
+    }
     sync_directory(final_dir)?;
+    sync_directory(parent_dir)?;
     require_owner()?;
     let destination_manifest = final_dir.join(manifest);
     std::fs::hard_link(stage_dir.join(manifest), &destination_manifest).map_err(|source| {
@@ -1007,9 +1046,7 @@ where
             path: destination_manifest,
             source,
         }
-    })?;
-    sync_directory(final_dir)?;
-    sync_directory(parent_dir)
+    })
 }
 
 fn create_private_directory(path: &Path) -> Result<(), ArtifactError> {
@@ -1230,6 +1267,13 @@ fn artifact_execution(
     expected_benchmark_cases: usize,
     audit_verifier: &LaunchVerifierIdentity,
 ) -> Result<ArtifactAuditExecution, ArtifactError> {
+    audit_verifier
+        .validate_internal_consistency()
+        .map_err(|error| {
+            ArtifactError::msg(format!(
+                "selected audit verifier identity is inconsistent: {error}"
+            ))
+        })?;
     if result.isolation != audit_verifier.isolation
         || result.isolation_evidence_sha256 != audit_verifier.isolation_evidence_sha256
         || audit_verifier.runtime_preflight.runtime_hardening.len() != 1
@@ -2062,16 +2106,6 @@ fn artifact_block_is_valid(
     role_binding && executions && ratio_matches
 }
 
-fn runtime_hardening_evidence_sha256(records: &[serde_json::Value]) -> String {
-    let encoded = records
-        .iter()
-        .map(serde_json::to_string)
-        .collect::<Result<Vec<_>, _>>()
-        .expect("runtime hardening evidence contains serializable JSON values");
-    let fields = encoded.iter().map(String::as_bytes).collect::<Vec<_>>();
-    domain_sha256("ferrl.trimul-runtime-hardening-evidence.v1", &fields)
-}
-
 fn validate_note(label: &str, value: &str) -> Result<(), ArtifactError> {
     if value.trim().is_empty() || value.trim() != value {
         return Err(ArtifactError::msg(format!(
@@ -2261,6 +2295,31 @@ mod tests {
     }
 
     #[test]
+    fn shared_manifest_last_sync_failure_leaves_no_commit_marker() {
+        let tmp = TestDir::new("manifest-sync-fault");
+        let output = tmp.0.join("artifact");
+        let error = publish_simple_manifest_last_with_sync_fault(
+            &output,
+            &tmp.0.join(".stage"),
+            &[("payload.json", b"payload")],
+            "manifest.json",
+            b"manifest",
+            None,
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("synchronization failure"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(output.join("payload.json")).unwrap(),
+            b"payload"
+        );
+        assert!(!output.join("manifest.json").exists());
+    }
+
+    #[test]
     fn shared_manifest_last_failure_never_links_manifest_and_claim_blocks_retry() {
         let tmp = TestDir::new("manifest-fault");
         let output = tmp.0.join("artifact");
@@ -2354,7 +2413,9 @@ mod tests {
             contract_version: 1,
             isolation_tier: isolation.tier,
             isolation_evidence_sha256: verifier_isolation_evidence_sha256(isolation),
-            probe_submission_sha256: "22".repeat(32),
+            probe_submission_sha256: sha256_hex(
+                b"def custom_kernel(data):\n    return data[0].clone()\n",
+            ),
             runtime_hardening_evidence_sha256: runtime_hardening_evidence_sha256(&hardening),
             runtime_hardening: hardening,
         }
@@ -2623,6 +2684,20 @@ mod tests {
         }
     }
 
+    fn candidate_for_launch_for_test(
+        signer: &crate::telemetry::CandidateSigner,
+        launch: &LaunchManifest,
+    ) -> CandidateRecord {
+        let mut candidate =
+            CandidateRecord::new(1, 0, 1, 2, 3, 1.5, 4, "```python\npass\n```\n".to_owned());
+        candidate.reward_metadata = Some(serde_json::json!({
+            "source_sha256": sha256_hex(b"pass\n"),
+        }));
+        signer
+            .sign_candidate(&candidate, &launch.payload_sha256)
+            .unwrap()
+    }
+
     fn launch_and_candidate_for_test(
         verifier: &LaunchVerifierIdentity,
         config: &TrimulArtifactConfig,
@@ -2701,22 +2776,39 @@ mod tests {
             },
         };
         let launch = LaunchManifest::new(payload).unwrap();
-        let mut candidate =
-            CandidateRecord::new(1, 0, 1, 2, 3, 1.5, 4, "```python\npass\n```\n".to_owned());
-        candidate.reward_metadata = Some(serde_json::json!({
-            "source_sha256": sha256_hex(b"pass\n"),
-        }));
-        let candidate = signer
-            .sign_candidate(&candidate, &launch.payload_sha256)
-            .unwrap();
+        let candidate = candidate_for_launch_for_test(&signer, &launch);
+        (launch, candidate)
+    }
+
+    fn legacy_launch_and_candidate_for_test(
+        verifier: &LaunchVerifierIdentity,
+        config: &TrimulArtifactConfig,
+    ) -> (LaunchManifest, CandidateRecord) {
+        let (mut launch, _) = launch_and_candidate_for_test(verifier, config);
+        let signer = crate::telemetry::CandidateSigner::generate().unwrap();
+        launch.payload.candidate_ledger.signing_public_key = signer.public_key_hex();
+        launch.payload.training_samples = None;
+        launch.payload.held_out_samples = None;
+        launch.contract_version = crate::orchestration::LEGACY_LAUNCH_CONTRACT_VERSION;
+        let payload_bytes = serde_json::to_vec(&launch.payload).unwrap();
+        launch.payload_sha256 = domain_sha256(
+            crate::orchestration::LEGACY_LAUNCH_PAYLOAD_DOMAIN,
+            &[&payload_bytes],
+        );
+        launch.attestation = None;
+        let candidate = candidate_for_launch_for_test(&signer, &launch);
         (launch, candidate)
     }
 
     #[cfg(unix)]
-    #[test]
-    #[allow(clippy::cognitive_complexity)] // one binding control checks every provenance preimage
-    fn opaque_request_binding_rejects_decomposed_provenance_substitution() {
-        let tmp = TestDir::new("request-binding");
+    fn verifier_assets_for_request_test(
+        tmp: &TestDir,
+    ) -> (
+        crate::trimul::TrimulVerifierAssets,
+        Vec<crate::trimul::TrimulCase>,
+        Vec<crate::trimul::TrimulCase>,
+        PathBuf,
+    ) {
         let image = tmp.0.join("image.sif");
         let eval = tmp.0.join("eval");
         let scratch = tmp.0.join("scratch");
@@ -2734,6 +2826,15 @@ mod tests {
         let assets = crate::trimul::TrimulVerifierAssets::capture(&image, &eval, &scratch).unwrap();
         let (test_cases, benchmark_cases) =
             crate::trimul::parse_task_yml(assets.task_yml()).unwrap();
+        (assets, test_cases, benchmark_cases, scratch)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::cognitive_complexity)] // one binding control checks every provenance preimage
+    fn opaque_request_binding_rejects_decomposed_provenance_substitution() {
+        let tmp = TestDir::new("request-binding");
+        let (assets, test_cases, benchmark_cases, scratch) = verifier_assets_for_request_test(&tmp);
         let mut verifier = verifier_for_test();
         verifier.assets = assets.identity().clone();
         let config = artifact_config_for_test();
@@ -2802,6 +2903,283 @@ mod tests {
         .expect("substituted candidate row must be rejected")
         .to_string();
         assert!(error.contains("candidate bytes"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
+    fn request_binding_rejects_internally_contradictory_verifier_identities() {
+        let tmp = TestDir::new("verifier-binding");
+        let (assets, test_cases, benchmark_cases, scratch) = verifier_assets_for_request_test(&tmp);
+        let mut verifier = verifier_for_test();
+        verifier.assets = assets.identity().clone();
+        let config = artifact_config_for_test();
+        let (launch, candidate) = launch_and_candidate_for_test(&verifier, &config);
+        let launch_bytes = launch.to_pretty_bytes().unwrap();
+        let candidate_row = serde_json::to_vec(&candidate).unwrap();
+        let identity = trimul_artifact_audit_identity(
+            &launch,
+            &candidate,
+            "pass\n",
+            assets.identity(),
+            config.training_secret_seed,
+        );
+        let reward = TrimulReward::new(assets, &scratch)
+            .with_cases(test_cases, benchmark_cases)
+            .with_secret_seed(identity.secret_seed())
+            .with_reward_profile(config.reward_profile)
+            .unwrap();
+        let output = tmp.0.join("artifact");
+
+        let assert_audit_rejected = |audit_verifier: &LaunchVerifierIdentity, expected: &str| {
+            let error = TrimulArtifactRequest::bind(
+                &output,
+                &launch,
+                &launch_bytes,
+                &candidate,
+                &candidate_row,
+                &candidate.completion,
+                b"prompt",
+                "pass\n",
+                &identity,
+                &reward,
+                audit_verifier,
+                1,
+                1,
+                "0",
+                SourceInspection::Clean,
+                "clean source inspection",
+                config.clone(),
+            )
+            .err()
+            .expect("contradictory audit verifier identity must be rejected")
+            .to_string();
+            assert!(error.contains(expected), "{error}");
+            assert!(!output.exists());
+        };
+
+        let mut bad = verifier.clone();
+        bad.isolation_evidence_sha256 = "81".repeat(32);
+        assert_audit_rejected(&bad, "isolation-evidence digest");
+
+        let mut bad = verifier.clone();
+        bad.timing_metric = "substituted-timing-metric-v1".to_owned();
+        assert_audit_rejected(&bad, "timing metric");
+
+        let mut bad = verifier.clone();
+        bad.isolation.tier = VerifierIsolationTier::DedicatedUidServiceV1;
+        bad.isolation_evidence_sha256 = verifier_isolation_evidence_sha256(&bad.isolation);
+        bad.timing_metric =
+            timing_metric_for_tier(VerifierIsolationTier::DedicatedUidServiceV1).to_owned();
+        bad.runtime_preflight.isolation_tier = VerifierIsolationTier::DedicatedUidServiceV1;
+        bad.runtime_preflight.isolation_evidence_sha256 = bad.isolation_evidence_sha256.clone();
+        bad.runtime_preflight_evidence_sha256 =
+            crate::trimul::runtime_preflight_evidence_sha256(&bad.runtime_preflight);
+        assert_audit_rejected(&bad, "declared tier");
+
+        let mut bad = verifier.clone();
+        bad.runtime_preflight.isolation_tier = VerifierIsolationTier::DedicatedUidServiceV1;
+        assert_audit_rejected(&bad, "preflight isolation tier");
+
+        let mut bad = verifier.clone();
+        bad.runtime_preflight.runtime_hardening_evidence_sha256 = "82".repeat(32);
+        assert_audit_rejected(&bad, "nested runtime-hardening digest");
+
+        let mut bad = verifier.clone();
+        bad.runtime_preflight_evidence_sha256 = "83".repeat(32);
+        assert_audit_rejected(&bad, "outer runtime-preflight digest");
+
+        let mut bad = verifier.clone();
+        bad.runtime_preflight.probe_submission_sha256 = "84".repeat(32);
+        assert_audit_rejected(&bad, "fixed probe");
+
+        let mut bad_discovery = verifier.clone();
+        bad_discovery.timing_metric = "substituted-timing-metric-v1".to_owned();
+        let (bad_launch, bad_candidate) = launch_and_candidate_for_test(&bad_discovery, &config);
+        let bad_launch_bytes = bad_launch.to_pretty_bytes().unwrap();
+        let bad_candidate_row = serde_json::to_vec(&bad_candidate).unwrap();
+        let bad_identity = trimul_artifact_audit_identity(
+            &bad_launch,
+            &bad_candidate,
+            "pass\n",
+            &bad_discovery.assets,
+            config.training_secret_seed,
+        );
+        let bad_reward = reward.with_secret_seed(bad_identity.secret_seed());
+        let error = TrimulArtifactRequest::bind(
+            &output,
+            &bad_launch,
+            &bad_launch_bytes,
+            &bad_candidate,
+            &bad_candidate_row,
+            &bad_candidate.completion,
+            b"prompt",
+            "pass\n",
+            &bad_identity,
+            &bad_reward,
+            &verifier,
+            1,
+            1,
+            "0",
+            SourceInspection::Clean,
+            "clean source inspection",
+            config,
+        )
+        .err()
+        .expect("contradictory discovery verifier identity must be rejected")
+        .to_string();
+        assert!(error.contains("timing metric"), "{error}");
+        assert!(!output.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
+    fn canonical_launch_v2_binds_and_is_published_without_reauthentication_as_v3() {
+        use crate::orchestration::{LaunchSampleIdentity, LEGACY_LAUNCH_PAYLOAD_DOMAIN};
+
+        let tmp = TestDir::new("launch-v2-publication");
+        let (assets, test_cases, benchmark_cases, scratch) = verifier_assets_for_request_test(&tmp);
+        let mut verifier = verifier_for_test();
+        verifier.assets = assets.identity().clone();
+        let config = artifact_config_for_test();
+        let (launch, candidate) = legacy_launch_and_candidate_for_test(&verifier, &config);
+        let legacy_payload_sha256 = launch.payload_sha256.clone();
+        let launch_bytes = launch.to_pretty_bytes().unwrap();
+        let candidate_row = serde_json::to_vec(&candidate).unwrap();
+        let identity = trimul_artifact_audit_identity(
+            &launch,
+            &candidate,
+            "pass\n",
+            assets.identity(),
+            config.training_secret_seed,
+        );
+        let reward = TrimulReward::new(assets, &scratch)
+            .with_cases(test_cases, benchmark_cases)
+            .with_secret_seed(identity.secret_seed())
+            .with_reward_profile(config.reward_profile)
+            .unwrap();
+        let output = tmp.0.join("artifact");
+        let request = TrimulArtifactRequest::bind(
+            &output,
+            &launch,
+            &launch_bytes,
+            &candidate,
+            &candidate_row,
+            &candidate.completion,
+            b"prompt",
+            "pass\n",
+            &identity,
+            &reward,
+            &verifier,
+            1,
+            1,
+            "0",
+            SourceInspection::Clean,
+            "clean source inspection",
+            config.clone(),
+        )
+        .unwrap();
+        let view = TrimulArtifactRequestView::from(&request);
+        let published = publish_trimul_artifact_with(&view, |audit_id, publication| {
+            let blocks = blocks_for_test(&verifier, audit_id);
+            for block in &blocks {
+                stage_artifact_execution(publication, block.index, &block.reference)?;
+                stage_artifact_execution(publication, block.index, &block.candidate)?;
+            }
+            Ok(blocks)
+        })
+        .unwrap();
+        assert!(published.accepted());
+        assert_eq!(
+            std::fs::read(output.join("launch.json")).unwrap(),
+            launch_bytes
+        );
+        let retained_launch: LaunchManifest =
+            serde_json::from_slice(&std::fs::read(output.join("launch.json")).unwrap()).unwrap();
+        assert_eq!(
+            retained_launch.contract_version,
+            crate::orchestration::LEGACY_LAUNCH_CONTRACT_VERSION
+        );
+        assert!(retained_launch.payload.training_samples.is_none());
+        assert!(retained_launch.payload.held_out_samples.is_none());
+        assert_eq!(retained_launch.payload_sha256, legacy_payload_sha256);
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(published.manifest_path()).unwrap()).unwrap();
+        assert_eq!(
+            manifest["launch_sha256"],
+            serde_json::json!(legacy_payload_sha256)
+        );
+
+        let mut v2_with_v3_samples = launch.clone();
+        v2_with_v3_samples.payload.training_samples = Some(LaunchSampleIdentity {
+            sha256: "91".repeat(32),
+            count: 1,
+        });
+        let payload_bytes = serde_json::to_vec(&v2_with_v3_samples.payload).unwrap();
+        v2_with_v3_samples.payload_sha256 =
+            domain_sha256(LEGACY_LAUNCH_PAYLOAD_DOMAIN, &[&payload_bytes]);
+        let invalid_bytes = v2_with_v3_samples.to_pretty_bytes().unwrap();
+        let invalid_output = tmp.0.join("invalid-v2");
+        let error = TrimulArtifactRequest::bind(
+            &invalid_output,
+            &v2_with_v3_samples,
+            &invalid_bytes,
+            &candidate,
+            &candidate_row,
+            &candidate.completion,
+            b"prompt",
+            "pass\n",
+            &identity,
+            &reward,
+            &verifier,
+            1,
+            1,
+            "0",
+            SourceInspection::Clean,
+            "clean source inspection",
+            config.clone(),
+        )
+        .err()
+        .expect("launch v2 carrying v3 sample identities must be rejected")
+        .to_string();
+        assert!(
+            error.contains("must not carry v3 sample identities"),
+            "{error}"
+        );
+        assert!(!invalid_output.exists());
+
+        let mut unsupported = launch.clone();
+        unsupported.contract_version = 99;
+        let unsupported_bytes = unsupported.to_pretty_bytes().unwrap();
+        let unsupported_output = tmp.0.join("unsupported-launch");
+        let error = TrimulArtifactRequest::bind(
+            &unsupported_output,
+            &unsupported,
+            &unsupported_bytes,
+            &candidate,
+            &candidate_row,
+            &candidate.completion,
+            b"prompt",
+            "pass\n",
+            &identity,
+            &reward,
+            &verifier,
+            1,
+            1,
+            "0",
+            SourceInspection::Clean,
+            "clean source inspection",
+            config,
+        )
+        .err()
+        .expect("unsupported launch version must be rejected")
+        .to_string();
+        assert!(
+            error.contains("unsupported launch manifest contract version"),
+            "{error}"
+        );
+        assert!(!unsupported_output.exists());
     }
 
     #[test]
@@ -2944,6 +3322,18 @@ mod tests {
             2,
             1,
             &verifier,
+        )
+        .is_err());
+        let mut contradictory_verifier = verifier.clone();
+        contradictory_verifier
+            .runtime_preflight
+            .runtime_hardening_evidence_sha256 = "63".repeat(32);
+        assert!(artifact_execution(
+            ArtifactAuditRole::Candidate,
+            evidenced_verification_for_test(),
+            1,
+            1,
+            &contradictory_verifier,
         )
         .is_err());
 
