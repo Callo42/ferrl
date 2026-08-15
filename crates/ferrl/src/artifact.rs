@@ -910,7 +910,7 @@ impl ArtifactPublication {
             manifest,
             None,
             false,
-            false,
+            sync_directory_io,
             || self.require_owner(),
         )
     }
@@ -971,6 +971,11 @@ fn publish_simple_manifest_last_with_sync_fault(
     write_new_synced(&stage_dir.join(manifest_name), manifest_bytes)?;
     staged.insert(PathBuf::from(manifest_name));
     sync_directory(stage_dir)?;
+    let post_manifest_link_sync: fn(&Path) -> std::io::Result<()> = if fail_after_manifest_link {
+        injected_post_manifest_link_sync_failure
+    } else {
+        sync_directory_io
+    };
     link_staged_manifest_last(
         output,
         stage_dir,
@@ -979,7 +984,7 @@ fn publish_simple_manifest_last_with_sync_fault(
         Path::new(manifest_name),
         fail_after_links,
         fail_before_manifest_sync,
-        fail_after_manifest_link,
+        post_manifest_link_sync,
         || Ok(()),
     )
 }
@@ -994,7 +999,7 @@ fn link_staged_manifest_last<F>(
     manifest: &Path,
     fail_after_links: Option<usize>,
     fail_before_manifest_sync: bool,
-    fail_after_manifest_link: bool,
+    post_manifest_link_sync: fn(&Path) -> std::io::Result<()>,
     require_owner: F,
 ) -> Result<(), ArtifactError>
 where
@@ -1064,14 +1069,7 @@ where
             source,
         }
     })?;
-    let post_link_sync = if fail_after_manifest_link {
-        Err(std::io::Error::other(
-            "injected post-manifest-link directory synchronization failure",
-        ))
-    } else {
-        sync_directory_io(final_dir)
-    };
-    post_link_sync.map_err(|source| ArtifactError::PublicationIndeterminate {
+    post_manifest_link_sync(final_dir).map_err(|source| ArtifactError::PublicationIndeterminate {
         manifest_path: destination_manifest,
         source,
     })
@@ -2219,6 +2217,12 @@ fn sync_directory(path: &Path) -> Result<(), ArtifactError> {
 
 fn sync_directory_io(path: &Path) -> std::io::Result<()> {
     File::open(path).and_then(|directory| directory.sync_all())
+}
+
+fn injected_post_manifest_link_sync_failure(_path: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::other(
+        "injected post-manifest-link directory synchronization failure",
+    ))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
