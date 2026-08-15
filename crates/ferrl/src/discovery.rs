@@ -1458,12 +1458,23 @@ pub enum DiscoveryError {
         #[source]
         source: serde_json::Error,
     },
-    /// Exclusive manifest-last publication failed.
+    /// Exclusive manifest-last publication failed before the manifest became visible.
     #[error("failed to publish accepted artifact at {path}: {source}")]
     Publication {
         /// Path whose exclusive creation, write, or synchronization failed.
         path: PathBuf,
         /// Underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+    /// The manifest is visible, but its directory-entry durability is indeterminate.
+    #[error(
+        "accepted artifact manifest {manifest_path} is visible but post-link directory synchronization failed; publication outcome is indeterminate and non-retryable: {source}"
+    )]
+    PublicationIndeterminate {
+        /// Visible manifest commit-marker path; ordinary retry is unsafe.
+        manifest_path: PathBuf,
+        /// Post-link directory synchronization failure.
         #[source]
         source: std::io::Error,
     },
@@ -1869,6 +1880,7 @@ fn publish_verified_artifact<A: Serialize, V: Serialize>(
         held_out_report_bytes,
         evidence,
         None,
+        false,
     )
 }
 
@@ -1886,6 +1898,7 @@ fn publish_verified_artifact_with_fault<A: Serialize, V: Serialize>(
     held_out_report_bytes: &[u8],
     evidence: FinalEvidence<A, V>,
     fail_after_payload_links: Option<usize>,
+    fail_after_manifest_link: bool,
 ) -> Result<VerifiedArtifact, DiscoveryError> {
     let FinalEvidence {
         artifact,
@@ -1976,10 +1989,20 @@ fn publish_verified_artifact_with_fault<A: Serialize, V: Serialize>(
         ARTIFACT_MANIFEST_FILE,
         &manifest_bytes,
         fail_after_payload_links,
+        fail_after_manifest_link,
     )
-    .map_err(|error| DiscoveryError::Publication {
-        path: output.to_path_buf(),
-        source: std::io::Error::other(error),
+    .map_err(|error| match error {
+        crate::artifact::ArtifactError::PublicationIndeterminate {
+            manifest_path,
+            source,
+        } => DiscoveryError::PublicationIndeterminate {
+            manifest_path,
+            source,
+        },
+        other => DiscoveryError::Publication {
+            path: output.to_path_buf(),
+            source: std::io::Error::other(other),
+        },
     })?;
     let payload_path = output.join(ARTIFACT_PAYLOAD_FILE);
     let candidate_path = output.join(ARTIFACT_CANDIDATE_FILE);
@@ -2951,6 +2974,7 @@ mod tests {
             b"held-out\n",
             evidence(),
             Some(2),
+            false,
         )
         .unwrap_err();
         assert!(matches!(error, DiscoveryError::Publication { .. }));
@@ -2970,10 +2994,109 @@ mod tests {
             b"held-out\n",
             evidence(),
             None,
+            false,
         )
         .unwrap_err();
         assert!(matches!(retry, DiscoveryError::Publication { .. }));
         assert!(!output.join(ARTIFACT_MANIFEST_FILE).exists());
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn post_manifest_link_sync_failure_stays_distinct_and_blocks_retry() {
+        let temp = TestDir::new("publication-post-link-fault");
+        let output = temp.0.join("artifact");
+        let manifest_path = output.join(ARTIFACT_MANIFEST_FILE);
+        let task = TaskIdentity::new("test.discovery", 1).unwrap();
+        let signer = CandidateSigner::generate().unwrap();
+        let public_key = signer.public_key_hex();
+        let launch_sha256 = "cd".repeat(32);
+        let record = signer
+            .sign_candidate(
+                &CandidateRecord::new(0, 0, 1, 0, 0, 1.0, 1, "9".into()),
+                &launch_sha256,
+            )
+            .unwrap();
+        let mut exact_row_bytes = serde_json::to_vec(&record).unwrap();
+        exact_row_bytes.push(b'\n');
+        let provenance_sha256 = record.record_sha256.clone().unwrap();
+        let candidate = AuthenticatedCandidate {
+            record,
+            exact_row_bytes,
+            provenance_sha256,
+        };
+        let evidence = || {
+            FinalEvidence::new(
+                "artifact".to_owned(),
+                "typed verifier evidence".to_owned(),
+                true,
+                MetricReport::new(
+                    "throughput",
+                    "items/s",
+                    MetricDirection::HigherIsBetter,
+                    10.0,
+                    12.0,
+                    1.0,
+                ),
+            )
+        };
+        let error = publish_verified_artifact_with_fault(
+            &output,
+            &task,
+            &test_model(),
+            &clean_test_source(),
+            "run-id",
+            &launch_sha256,
+            &public_key,
+            &candidate,
+            b"launch\n",
+            b"held-out\n",
+            evidence(),
+            None,
+            true,
+        )
+        .unwrap_err();
+        match &error {
+            DiscoveryError::PublicationIndeterminate {
+                manifest_path: actual,
+                source,
+            } => {
+                assert_eq!(actual, &manifest_path);
+                assert!(source
+                    .to_string()
+                    .contains("post-manifest-link directory synchronization failure"));
+            }
+            other => panic!("unexpected post-link discovery error: {other}"),
+        }
+        let message = error.to_string();
+        assert!(
+            message.contains("indeterminate and non-retryable"),
+            "{message}"
+        );
+        assert!(
+            message.contains(manifest_path.to_string_lossy().as_ref()),
+            "{message}"
+        );
+        assert!(manifest_path.is_file());
+
+        let retry = publish_verified_artifact_with_fault(
+            &output,
+            &task,
+            &test_model(),
+            &clean_test_source(),
+            "run-id",
+            &launch_sha256,
+            &public_key,
+            &candidate,
+            b"launch\n",
+            b"held-out\n",
+            evidence(),
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(retry, DiscoveryError::Publication { .. }));
+        assert!(manifest_path.is_file());
     }
 
     #[test]

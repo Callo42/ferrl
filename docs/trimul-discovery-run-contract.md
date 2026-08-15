@@ -413,8 +413,10 @@ and alternating order are derived deterministically from the immutable audit con
 independently of the output path; the CLI accepts no audit-seed override. The client
 writes each raw execution to the retained stage as soon as it is validated. Publication
 uses ownership-checked no-replace hard links and makes `manifest.json` visible only after
-every other artifact file is durable. A failed or partial destination remains claimed and
-cannot be mistaken for a published artifact because it has no manifest.
+every other artifact file is durable, then synchronizes the artifact directory before reporting
+success. A pre-marker failure leaves the claimed destination without a manifest. If the
+post-link directory synchronization fails, the marker is visible but publication durability is
+indeterminate and same-path retry is unsafe; the destination remains claimed in both cases.
 
 This exclusive output transaction is not a global audit ledger. Under
 `operator_attested_v1`, the operator or another process controlling the same host UID can
