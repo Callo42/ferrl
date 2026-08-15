@@ -67,6 +67,17 @@ pub enum ArtifactError {
         #[source]
         source: serde_json::Error,
     },
+    /// The manifest is visible, but its directory-entry durability is indeterminate.
+    #[error(
+        "artifact manifest {manifest_path} is visible but its containing directory could not be synchronized; publication outcome is indeterminate and non-retryable: {source}"
+    )]
+    PublicationIndeterminate {
+        /// Visible manifest commit-marker path.
+        manifest_path: PathBuf,
+        /// Post-link directory synchronization failure.
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 impl ArtifactError {
@@ -899,6 +910,7 @@ impl ArtifactPublication {
             manifest,
             None,
             false,
+            false,
             || self.require_owner(),
         )
     }
@@ -911,6 +923,7 @@ pub(crate) fn publish_simple_manifest_last(
     manifest_name: &str,
     manifest_bytes: &[u8],
     fail_after_links: Option<usize>,
+    fail_after_manifest_link: bool,
 ) -> Result<(), ArtifactError> {
     publish_simple_manifest_last_with_sync_fault(
         output,
@@ -920,6 +933,7 @@ pub(crate) fn publish_simple_manifest_last(
         manifest_bytes,
         fail_after_links,
         false,
+        fail_after_manifest_link,
     )
 }
 
@@ -932,6 +946,7 @@ fn publish_simple_manifest_last_with_sync_fault(
     manifest_bytes: &[u8],
     fail_after_links: Option<usize>,
     fail_before_manifest_sync: bool,
+    fail_after_manifest_link: bool,
 ) -> Result<(), ArtifactError> {
     let parent = output
         .parent()
@@ -964,6 +979,7 @@ fn publish_simple_manifest_last_with_sync_fault(
         Path::new(manifest_name),
         fail_after_links,
         fail_before_manifest_sync,
+        fail_after_manifest_link,
         || Ok(()),
     )
 }
@@ -978,6 +994,7 @@ fn link_staged_manifest_last<F>(
     manifest: &Path,
     fail_after_links: Option<usize>,
     fail_before_manifest_sync: bool,
+    fail_after_manifest_link: bool,
     require_owner: F,
 ) -> Result<(), ArtifactError>
 where
@@ -1043,9 +1060,20 @@ where
     let destination_manifest = final_dir.join(manifest);
     std::fs::hard_link(stage_dir.join(manifest), &destination_manifest).map_err(|source| {
         ArtifactError::Io {
-            path: destination_manifest,
+            path: destination_manifest.clone(),
             source,
         }
+    })?;
+    let post_link_sync = if fail_after_manifest_link {
+        Err(std::io::Error::other(
+            "injected post-manifest-link directory synchronization failure",
+        ))
+    } else {
+        sync_directory_io(final_dir)
+    };
+    post_link_sync.map_err(|source| ArtifactError::PublicationIndeterminate {
+        manifest_path: destination_manifest,
+        source,
     })
 }
 
@@ -2183,12 +2211,14 @@ fn write_new_synced(path: &Path, bytes: &[u8]) -> Result<(), ArtifactError> {
 }
 
 fn sync_directory(path: &Path) -> Result<(), ArtifactError> {
-    File::open(path)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|source| ArtifactError::Io {
-            path: path.to_path_buf(),
-            source,
-        })
+    sync_directory_io(path).map_err(|source| ArtifactError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn sync_directory_io(path: &Path) -> std::io::Result<()> {
+    File::open(path).and_then(|directory| directory.sync_all())
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -2282,6 +2312,7 @@ mod tests {
             "manifest.json",
             b"manifest",
             None,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -2306,6 +2337,7 @@ mod tests {
             b"manifest",
             None,
             true,
+            false,
         )
         .unwrap_err();
         assert!(
@@ -2320,6 +2352,65 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn post_manifest_link_sync_failure_is_indeterminate_and_blocks_retry() {
+        let tmp = TestDir::new("post-manifest-link-sync-fault");
+        let output = tmp.0.join("artifact");
+        let manifest_path = output.join("manifest.json");
+        let error = publish_simple_manifest_last(
+            &output,
+            &tmp.0.join(".stage"),
+            &[("payload.json", b"payload")],
+            "manifest.json",
+            b"manifest",
+            None,
+            true,
+        )
+        .unwrap_err();
+        match &error {
+            ArtifactError::PublicationIndeterminate {
+                manifest_path: actual,
+                source,
+            } => {
+                assert_eq!(actual, &manifest_path);
+                assert!(source
+                    .to_string()
+                    .contains("post-manifest-link directory synchronization failure"));
+            }
+            other => panic!("unexpected post-link error: {other}"),
+        }
+        let message = error.to_string();
+        assert!(
+            message.contains("indeterminate and non-retryable"),
+            "{message}"
+        );
+        assert!(
+            message.contains(manifest_path.to_string_lossy().as_ref()),
+            "{message}"
+        );
+        assert_eq!(std::fs::read(&manifest_path).unwrap(), b"manifest");
+
+        let retry = publish_simple_manifest_last(
+            &output,
+            &tmp.0.join(".retry"),
+            &[("payload.json", b"payload")],
+            "manifest.json",
+            b"manifest",
+            None,
+            false,
+        )
+        .unwrap_err();
+        match retry {
+            ArtifactError::Io { path, source } => {
+                assert_eq!(path, output);
+                assert_eq!(source.kind(), std::io::ErrorKind::AlreadyExists);
+            }
+            other => panic!("unexpected retry error: {other}"),
+        }
+        assert!(manifest_path.is_file());
+    }
+
+    #[test]
     fn shared_manifest_last_failure_never_links_manifest_and_claim_blocks_retry() {
         let tmp = TestDir::new("manifest-fault");
         let output = tmp.0.join("artifact");
@@ -2331,6 +2422,7 @@ mod tests {
             "manifest.json",
             b"manifest",
             Some(1),
+            false,
         )
         .unwrap_err();
         assert!(error.to_string().contains("mid-publication"));
@@ -2342,6 +2434,7 @@ mod tests {
             "manifest.json",
             b"manifest",
             None,
+            false,
         )
         .unwrap_err();
         match retry {
