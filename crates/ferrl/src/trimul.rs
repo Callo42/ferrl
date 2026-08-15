@@ -1771,6 +1771,15 @@ impl TrimulReward {
         self.reward_profile
     }
 
+    pub(crate) fn artifact_binding(&self) -> (&TrimulVerifierIdentity, u64, usize, usize) {
+        (
+            self.verifier_assets.identity(),
+            self.secret_seed,
+            self.test_cases.len(),
+            self.benchmark_cases.len(),
+        )
+    }
+
     /// Set the per-candidate wall-clock budget.
     #[must_use]
     pub fn with_wall(mut self, wall: Duration) -> Self {
@@ -2499,6 +2508,111 @@ pub fn runtime_preflight_evidence_sha256(evidence: &TrimulRuntimePreflightEviden
         .expect("TrimulRuntimePreflightEvidence contains only infallible JSON values");
     domain_sha256("ferrl.trimul-runtime-preflight-evidence.v1", &[&bytes])
 }
+
+pub(crate) fn runtime_hardening_evidence_sha256(records: &[serde_json::Value]) -> String {
+    let encoded = records
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("runtime hardening evidence contains only infallible JSON values");
+    let fields = encoded.iter().map(String::as_bytes).collect::<Vec<_>>();
+    domain_sha256("ferrl.trimul-runtime-hardening-evidence.v1", &fields)
+}
+
+pub(crate) fn validate_verifier_preflight_identity(
+    isolation: &VerifierIsolationEvidence,
+    isolation_evidence_sha256: &str,
+    timing_metric: &str,
+    runtime_hardening_contract: &str,
+    runtime_preflight: &TrimulRuntimePreflightEvidence,
+    runtime_preflight_sha256: &str,
+) -> Result<(), String> {
+    if isolation.contract_version != crate::VERIFIER_ISOLATION_EVIDENCE_VERSION {
+        return Err("isolation evidence has an unsupported contract version".to_owned());
+    }
+    let boundary_matches = matches!(
+        (
+            isolation.tier,
+            isolation.uid_boundary,
+            isolation.asset_transport,
+        ),
+        (
+            VerifierIsolationTier::SameUidApptainerV1,
+            crate::VerifierUidBoundary::SameHostUid,
+            crate::VerifierAssetTransport::InProcessSealedCopy,
+        ) | (
+            VerifierIsolationTier::DedicatedUidServiceV1,
+            crate::VerifierUidBoundary::DistinctHostUid,
+            crate::VerifierAssetTransport::ScmRightsSealedCopy,
+        )
+    );
+    if !boundary_matches
+        || isolation.requester_uid == 0
+        || isolation.launcher_uid == 0
+        || isolation.work_root_uid != isolation.launcher_uid
+        || match isolation.tier {
+            VerifierIsolationTier::SameUidApptainerV1 => {
+                isolation.requester_uid != isolation.launcher_uid
+            }
+            VerifierIsolationTier::DedicatedUidServiceV1 => {
+                isolation.requester_uid == isolation.launcher_uid
+            }
+        }
+        || !isolation.apptainer_path.is_absolute()
+        || !isolation.work_root.is_absolute()
+        || isolation.apptainer_len_bytes == 0
+        || isolation.apptainer_version.trim().is_empty()
+        || isolation.work_root_mode != 0o700
+        || isolation.work_root_inode == 0
+    {
+        return Err("isolation evidence does not prove its declared tier".to_owned());
+    }
+    if isolation_evidence_sha256 != verifier_isolation_evidence_sha256(isolation) {
+        return Err("isolation-evidence digest does not match its nested evidence".to_owned());
+    }
+    if timing_metric != timing_metric_for_tier(isolation.tier) {
+        return Err("timing metric does not match the selected isolation tier".to_owned());
+    }
+    if runtime_hardening_contract != TRIMUL_RUNTIME_HARDENING_CONTRACT {
+        return Err("runtime-hardening contract is unsupported".to_owned());
+    }
+    if runtime_preflight.contract_version != 1 {
+        return Err("runtime preflight has an unsupported contract version".to_owned());
+    }
+    if runtime_preflight.isolation_tier != isolation.tier {
+        return Err("runtime preflight isolation tier differs from its outer identity".to_owned());
+    }
+    if runtime_preflight.isolation_evidence_sha256 != isolation_evidence_sha256 {
+        return Err(
+            "runtime preflight isolation digest differs from its outer identity".to_owned(),
+        );
+    }
+    if runtime_preflight.probe_submission_sha256
+        != sha256_hex(HARDENING_PREFLIGHT_SUBMISSION.as_bytes())
+    {
+        return Err("runtime preflight does not identify Ferrl's fixed probe".to_owned());
+    }
+    if runtime_preflight.runtime_hardening.len() != 1 {
+        return Err(
+            "runtime preflight must contain the fixed probe's one hardening record".to_owned(),
+        );
+    }
+    for record in &runtime_preflight.runtime_hardening {
+        let encoded = serde_json::to_string(record)
+            .map_err(|error| format!("serialize runtime hardening evidence: {error}"))?;
+        validate_runtime_hardening_record(&encoded)?;
+    }
+    if runtime_preflight.runtime_hardening_evidence_sha256
+        != runtime_hardening_evidence_sha256(&runtime_preflight.runtime_hardening)
+    {
+        return Err("runtime preflight nested runtime-hardening digest mismatch".to_owned());
+    }
+    if runtime_preflight_sha256 != runtime_preflight_evidence_sha256(runtime_preflight) {
+        return Err("outer runtime-preflight digest mismatch".to_owned());
+    }
+    Ok(())
+}
+
 const TRIMUL_INFRASTRUCTURE_MARKER: &str = "ferrl-infrastructure: v1";
 const TRIMUL_INFRASTRUCTURE_EXIT: i32 = 114;
 const HARDENING_LOG_KEY: &str = "ferrl-candidate-hardening";

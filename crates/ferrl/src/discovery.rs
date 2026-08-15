@@ -132,8 +132,8 @@
 //! ```
 
 use std::ffi::OsString;
-use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+#[cfg(test)]
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -1961,23 +1961,7 @@ fn publish_verified_artifact_with_fault<A: Serialize, V: Serialize>(
         })?;
     manifest_bytes.push(b'\n');
 
-    let parent = output
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent).map_err(|source| DiscoveryError::Publication {
-        path: parent.to_path_buf(),
-        source,
-    })?;
-    sync_directory(parent)?;
-    fs::create_dir(output).map_err(|source| DiscoveryError::Publication {
-        path: output.to_path_buf(),
-        source,
-    })?;
     let stage_dir = artifact_staging_path(output)?;
-    create_private_directory(&stage_dir)?;
-    sync_directory(parent)?;
-
     let staged_files: [(&str, &[u8]); 5] = [
         (ARTIFACT_PAYLOAD_FILE, &payload_bytes),
         (ARTIFACT_LAUNCH_FILE, launch_bytes),
@@ -1985,42 +1969,22 @@ fn publish_verified_artifact_with_fault<A: Serialize, V: Serialize>(
         (ARTIFACT_CANDIDATE_FILE, &candidate.exact_row_bytes),
         (ARTIFACT_VERIFIER_EVIDENCE_FILE, &verifier_evidence_bytes),
     ];
-    for &(name, bytes) in &staged_files {
-        write_new_synced(&stage_dir.join(name), bytes)?;
-    }
-    write_new_synced(&stage_dir.join(ARTIFACT_MANIFEST_FILE), &manifest_bytes)?;
-    sync_directory(&stage_dir)?;
-
-    let mut linked = 0_usize;
-    for &(name, _) in &staged_files {
-        let destination = output.join(name);
-        fs::hard_link(stage_dir.join(name), &destination).map_err(|source| {
-            DiscoveryError::Publication {
-                path: destination,
-                source,
-            }
-        })?;
-        linked += 1;
-        if fail_after_payload_links == Some(linked) {
-            return Err(DiscoveryError::Publication {
-                path: output.to_path_buf(),
-                source: std::io::Error::other("injected artifact mid-publication failure"),
-            });
-        }
-    }
-    sync_directory(output)?;
+    crate::artifact::publish_simple_manifest_last(
+        output,
+        &stage_dir,
+        &staged_files,
+        ARTIFACT_MANIFEST_FILE,
+        &manifest_bytes,
+        fail_after_payload_links,
+    )
+    .map_err(|error| DiscoveryError::Publication {
+        path: output.to_path_buf(),
+        source: std::io::Error::other(error),
+    })?;
     let payload_path = output.join(ARTIFACT_PAYLOAD_FILE);
     let candidate_path = output.join(ARTIFACT_CANDIDATE_FILE);
     let verification_evidence_path = output.join(ARTIFACT_VERIFIER_EVIDENCE_FILE);
     let manifest_path = output.join(ARTIFACT_MANIFEST_FILE);
-    fs::hard_link(stage_dir.join(ARTIFACT_MANIFEST_FILE), &manifest_path).map_err(|source| {
-        DiscoveryError::Publication {
-            path: manifest_path.clone(),
-            source,
-        }
-    })?;
-    sync_directory(output)?;
-    sync_directory(parent)?;
 
     Ok(VerifiedArtifact {
         output: output.to_path_buf(),
@@ -2050,47 +2014,6 @@ fn artifact_staging_path(output: &Path) -> Result<PathBuf, DiscoveryError> {
     stage_name.push(name);
     stage_name.push(".ferrl-discovery-stage");
     Ok(parent.join(stage_name))
-}
-
-fn create_private_directory(path: &Path) -> Result<(), DiscoveryError> {
-    let mut builder = fs::DirBuilder::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    builder
-        .create(path)
-        .map_err(|source| DiscoveryError::Publication {
-            path: path.to_path_buf(),
-            source,
-        })
-}
-
-fn write_new_synced(path: &Path, bytes: &[u8]) -> Result<(), DiscoveryError> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|source| DiscoveryError::Publication {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    file.write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|source| DiscoveryError::Publication {
-            path: path.to_path_buf(),
-            source,
-        })
-}
-
-fn sync_directory(path: &Path) -> Result<(), DiscoveryError> {
-    File::open(path)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|source| DiscoveryError::Publication {
-            path: path.to_path_buf(),
-            source,
-        })
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

@@ -64,6 +64,8 @@ ferrl/
     │   ├── {sample,reward,countdown,math,trimul}.rs
     │   │                                      # typed tasks and verifiable rewards
     │   ├── {sandbox,verifier_executor}.rs   # untrusted-candidate execution tiers
+    │   ├── {discovery,orchestration,artifact}.rs
+    │   │                                      # stable facade, shared engine, publication
     │   ├── {grpo,trainer,eval}.rs           # RL math, training, held-out evaluation
     │   ├── {checkpoint,rollout_ledger,telemetry}.rs
     │   │                                      # resume, separated execution, provenance
@@ -172,6 +174,51 @@ Transformers versions must change only in a deliberate compatibility update.
 
 ferrl is **bring your own task**: you supply a *reward* and a *dataset of typed
 samples*, and the trainer does the rest. There are two paths in.
+
+### From Rust — the stable discovery facade
+
+Implement `discovery::DiscoveryTask` with a versioned `TaskIdentity`, typed
+training and task-semantic held-out samples, a scalar search reward, a frozen
+`MetricContract`, and a distinct final candidate verifier. Build a
+`DiscoveryConfig`, select a supported checkpoint with `ModelSelection`, then call
+`Discovery::run`.
+
+The stable world-one facade returns one honest terminal `DiscoveryOutcome`:
+
+- `Verified(VerifiedArtifact)` means Ferrl authenticated the selected candidate,
+  validated the task's typed final evidence, and completed exclusive
+  manifest-last publication. Callers cannot construct this capability directly.
+- `NoWin(NoWinReport)` means training completed but no candidate passed held-out
+  correctness and the strict material metric margin.
+- `Preempted(PreemptedReport)` means cooperative preemption produced a resumable
+  checkpoint before final verification or publication.
+- Operational, model-loading, verifier, evidence, or publication failures return
+  `DiscoveryError`; they are never converted into a no-win result.
+
+```rust,no_run
+use ferrl::discovery::{Discovery, DiscoveryConfig, GenerationEnd, ModelSelection};
+# fn task() -> impl ferrl::discovery::DiscoveryTask { todo!() }
+# fn main() -> Result<(), ferrl::discovery::DiscoveryError> {
+let config = DiscoveryConfig::builder("runs", "artifacts/winner")
+    .steps(50)
+    .group_size(8)
+    .max_new_tokens(128)
+    .eval_group_size(4)
+    .build()?;
+let model = ModelSelection::cpu("/path/to/checkpoint")
+    .generation_end(GenerationEnd::CheckpointDefault);
+let outcome = Discovery::new(task(), model, config).run()?;
+# let _ = outcome;
+# Ok(())
+# }
+```
+
+The public SDK intentionally supports world-one CPU/CUDA with the fixed
+GRPO+LoRA recipe. CLI DP/TP remains supported but is not public SDK topology;
+combined DP×TP, dynamic algorithm plugins, and caller-forged accepted artifacts
+remain unsupported. The downstream-only compatibility fixture at
+`crates/ferrl/tests/discovery_sdk.rs` fixes the task extension and outcome names
+without importing binary-private orchestration.
 
 ### From the CLI — a built-in task
 

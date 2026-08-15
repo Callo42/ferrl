@@ -46,7 +46,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs::OpenOptions;
 use std::io::{Read as IoRead, Write as IoWrite};
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -81,6 +81,7 @@ use ferrl::{
 };
 #[cfg(test)]
 use ferrl::{math_split_key, read_jsonl, train_eval_split_by_key, MathProblem};
+#[cfg(test)]
 use ring::rand::{SecureRandom as _, SystemRandom};
 use ring::signature::{UnparsedPublicKey, ED25519};
 use serde::{
@@ -3007,25 +3008,37 @@ fn trimul_score_record(
     }
 }
 
+#[cfg(test)]
 const ARTIFACT_CONTRACT_VERSION: u32 = 4;
+#[cfg(test)]
 const ARTIFACT_AUDIT_BLOCKS: usize = 11;
+#[cfg(test)]
 const ARTIFACT_MATERIAL_SPEEDUP: f64 = 1.02;
+#[cfg(test)]
 const ARTIFACT_REQUIRED_MATERIAL_WINS: usize = 9;
+#[cfg(test)]
 const ARTIFACT_ACCEPTANCE_METHOD: &str = "paired_material_wins_v1";
+#[cfg(test)]
 const ARTIFACT_AUDIT_SEED_DERIVATION: &str = "sha256_contract_prefix_u32_be_v1";
+#[cfg(test)]
 const ARTIFACT_ATTEMPT_SELECTION_ASSURANCE: &str = "operator_attested_v1";
+#[cfg(test)]
 const ARTIFACT_OWNER_FILE: &str = ".ferrl-artifact-owner";
+#[cfg(test)]
 const ARTIFACT_ATTEMPT_FILE: &str = "audit-attempt.json";
 
 /// Which trusted submission occupies one half of a paired audit block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg(test)]
 enum ArtifactAuditRole {
     Reference,
     Candidate,
 }
 
+#[cfg(test)]
 impl ArtifactAuditRole {
+    #[allow(dead_code)]
     const fn other(self) -> Self {
         match self {
             Self::Reference => Self::Candidate,
@@ -3043,6 +3056,7 @@ impl ArtifactAuditRole {
 
 /// Complete raw and structured evidence for one half of a paired audit block.
 #[derive(Debug, Clone, Serialize)]
+#[cfg(test)]
 struct ArtifactAuditExecution {
     role: ArtifactAuditRole,
     isolation_tier: ferrl::VerifierIsolationTier,
@@ -3059,6 +3073,7 @@ struct ArtifactAuditExecution {
 
 /// In-memory paired block before its raw evidence records are written.
 #[derive(Debug)]
+#[cfg(test)]
 struct ArtifactAuditBlock {
     index: usize,
     first: ArtifactAuditRole,
@@ -3070,6 +3085,7 @@ struct ArtifactAuditBlock {
 
 /// Manifest binding for one raw execution-evidence file.
 #[derive(Debug, Clone, Serialize)]
+#[cfg(test)]
 struct ArtifactAuditExecutionManifest {
     role: ArtifactAuditRole,
     evidence_file: String,
@@ -3086,6 +3102,7 @@ struct ArtifactAuditExecutionManifest {
 
 /// One reference/candidate pair in the artifact manifest.
 #[derive(Debug, Clone, Serialize)]
+#[cfg(test)]
 struct ArtifactAuditBlockManifest {
     index: usize,
     first: ArtifactAuditRole,
@@ -3097,6 +3114,7 @@ struct ArtifactAuditBlockManifest {
 
 /// Predeclared empirical material-margin decision.
 #[derive(Debug, Clone, Serialize)]
+#[cfg(test)]
 struct ArtifactAcceptanceDecision {
     method: &'static str,
     paired_blocks: usize,
@@ -3109,6 +3127,7 @@ struct ArtifactAcceptanceDecision {
 
 /// Original discovery verifier provenance, never relabeled as audit evidence.
 #[derive(Debug, Serialize)]
+#[cfg(test)]
 struct DiscoveryVerifierManifest {
     isolation_tier: ferrl::VerifierIsolationTier,
     isolation_evidence_sha256: String,
@@ -3118,6 +3137,7 @@ struct DiscoveryVerifierManifest {
 
 /// Launch-bound paired audit record.
 #[derive(Debug, Serialize)]
+#[cfg(test)]
 struct ArtifactAuditManifest {
     contract: &'static str,
     audit_contract_sha256: String,
@@ -3153,6 +3173,7 @@ enum SourceInspectionResult {
 
 /// Operator-facing source-inspection record.
 #[derive(Debug, Clone, Serialize)]
+#[cfg(test)]
 struct SourceInspectionManifest {
     /// Machine-readable source-inspection result.
     result: SourceInspectionResult,
@@ -3162,6 +3183,7 @@ struct SourceInspectionManifest {
 
 /// Contract manifest written to `manifest.json`.
 #[derive(Debug, Serialize)]
+#[cfg(test)]
 struct ArtifactManifest {
     /// Manifest schema version.
     contract_version: u32,
@@ -3199,6 +3221,7 @@ struct ArtifactManifest {
 
 /// Candidate provenance fields.
 #[derive(Debug, Serialize)]
+#[cfg(test)]
 struct CandidateManifest {
     /// Domain-separated digest stored on the selected candidate row.
     record_sha256: String,
@@ -3228,6 +3251,7 @@ struct CandidateManifest {
 
 /// Model provenance fields.
 #[derive(Debug, Serialize)]
+#[cfg(test)]
 struct ModelManifest {
     /// Loader-derived model family.
     family: String,
@@ -3247,6 +3271,7 @@ struct ModelManifest {
 
 /// Run-config provenance fields.
 #[derive(Debug, Serialize)]
+#[cfg(test)]
 struct ArtifactConfigManifest {
     /// SHA-256 of the original run-config file bytes seen at launch.
     run_config_source_sha256: String,
@@ -3284,6 +3309,7 @@ struct ArtifactConfigManifest {
 
 /// Eval harness provenance fields.
 #[derive(Debug, Serialize)]
+#[cfg(test)]
 struct EvalManifest {
     /// SHA-256 of every ordered relative file name and byte in the eval bundle.
     bundle_sha256: String,
@@ -3890,63 +3916,66 @@ fn trimul_artifact_impl(
             CliError::msg("completion does not contain a closed non-empty fenced code block")
         })?;
     let (test_cases, benchmark_cases) = ferrl::trimul::parse_task_yml(verifier_assets.task_yml())?;
-    let audit_contract_sha256 = artifact_audit_contract_sha256(
+    let audit_identity = ferrl::artifact::trimul_artifact_audit_identity(
         &bound.launch,
         &bound.candidate,
         &submission,
         verifier_assets.identity(),
+        cfg.trimul.secret_seed,
     );
-    let audit_secret_seed =
-        artifact_audit_secret_seed(&audit_contract_sha256, cfg.trimul.secret_seed);
-    let audit_id = artifact_audit_id(&audit_contract_sha256, audit_secret_seed);
-    let mut publication = ArtifactPublication::claim(&args.out, &audit_contract_sha256)?;
-    publication.stage_text(Path::new("submission.py"), &submission)?;
-    publication.stage_text(Path::new("completion.txt"), raw_completion)?;
-    publication.stage_bytes(Path::new(RunDir::LAUNCH_FILE), &bound.launch_bytes)?;
-    publication.stage_bytes(Path::new("candidate.json"), &bound.candidate_row_bytes)?;
-    publication.stage_bytes(Path::new("prompt.txt"), &bound.prompt_bytes)?;
-
-    let reward =
-        build_artifact_audit_reward(cfg, verifier_assets.clone(), args, audit_secret_seed)?
-            .with_submission_extract_mode(extract_mode);
+    let reward = build_artifact_audit_reward(
+        cfg,
+        verifier_assets.clone(),
+        args,
+        audit_identity.secret_seed(),
+    )?
+    .with_submission_extract_mode(extract_mode);
     let audit_verifier = launch_verifier_identity(&reward, &verifier_assets)?;
-    let blocks = verify_submission_paired(
-        &reward,
+    let source_inspection = match args.source_inspection {
+        SourceInspectionResult::Clean => ferrl::artifact::SourceInspection::Clean,
+        SourceInspectionResult::Suspicious => ferrl::artifact::SourceInspection::Suspicious,
+    };
+    let artifact_request = ferrl::artifact::TrimulArtifactRequest::bind(
+        &args.out,
+        &bound.launch,
+        &bound.launch_bytes,
+        &bound.candidate,
+        &bound.candidate_row_bytes,
+        raw_completion,
+        &bound.prompt_bytes,
         &submission,
+        &audit_identity,
+        &reward,
+        &audit_verifier,
         test_cases.len(),
         benchmark_cases.len(),
-        &audit_verifier,
-        &audit_id,
-        &mut publication,
-    )?;
-    let decision = artifact_acceptance_decision(&blocks);
-    let accepted = decision.accepted && args.source_inspection == SourceInspectionResult::Clean;
-    write_artifact_bundle(
-        args,
-        cfg,
-        &mut publication,
-        &ArtifactInputs {
-            launch: &bound.launch,
-            launch_bytes: &bound.launch_bytes,
-            candidate: &bound.candidate,
-            candidate_row_bytes: &bound.candidate_row_bytes,
-            raw_completion,
-            prompt_bytes: &bound.prompt_bytes,
-            submission: &submission,
-            test_cases: test_cases.len(),
-            benchmark_cases: benchmark_cases.len(),
-            audit_contract_sha256,
-            audit_id,
-            audit_secret_seed,
-            audit_verifier,
-            blocks,
-            decision,
-            accepted,
+        &args.audit_cuda_visible_device,
+        source_inspection,
+        &args.source_inspection_notes,
+        ferrl::artifact::TrimulArtifactConfig {
+            lora_rank: cfg.policy.lora_rank,
+            lora_alpha: cfg.policy.lora_alpha,
+            base_dtype: cfg.policy.base_dtype.as_str(),
+            base_quantization: cfg.policy.base_quantization.as_str(),
+            reward_profile: cfg.trimul.reward,
+            trainer_steps: cfg.trainer.steps,
+            group_size: cfg.trainer.group_size,
+            run_health: args.run_health.clone(),
+            policy_seed: cfg.policy.seed,
+            data_seed: cfg.data.seed,
+            training_secret_seed: cfg.trimul.secret_seed,
+            scratch_max_bytes: trimul_scratch_cap(cfg),
+            verifier_parallelism: cfg.trimul.verifier_parallelism.max(1),
+            verifier_max_procs: trimul_verifier_max_procs(cfg),
+            verifier_cuda_device_pool: cfg.trimul.verifier_cuda_device_pool.clone(),
         },
-    )?;
+    )
+    .map_err(|error| CliError::msg(error.to_string()))?;
+    let published = ferrl::artifact::publish_trimul_artifact(&artifact_request)
+        .map_err(|error| CliError::msg(error.to_string()))?;
     println!(
         "ferrl: wrote TriMul artifact bundle -> {}",
-        args.out.display()
+        published.output().display()
     );
     Ok(())
 }
@@ -4046,6 +4075,7 @@ fn capture_launch_bound_trimul_verifier_assets(
 }
 
 #[derive(Debug, Serialize)]
+#[cfg(test)]
 struct ArtifactAttemptRecord<'a> {
     contract_version: u32,
     audit_contract_sha256: &'a str,
@@ -4055,6 +4085,7 @@ struct ArtifactAttemptRecord<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 struct ArtifactDirectoryIdentity {
     #[cfg(unix)]
     device: u64,
@@ -4062,6 +4093,7 @@ struct ArtifactDirectoryIdentity {
     inode: u64,
 }
 
+#[cfg(test)]
 impl ArtifactDirectoryIdentity {
     fn capture(path: &Path) -> Result<Self, CliError> {
         let metadata = std::fs::symlink_metadata(path).map_err(|source| CliError::Io {
@@ -4084,6 +4116,7 @@ impl ArtifactDirectoryIdentity {
 }
 
 #[derive(Debug)]
+#[cfg(test)]
 struct ArtifactPublication {
     final_dir: PathBuf,
     stage_dir: PathBuf,
@@ -4094,6 +4127,7 @@ struct ArtifactPublication {
     staged_files: BTreeSet<PathBuf>,
 }
 
+#[cfg(test)]
 impl ArtifactPublication {
     fn claim(final_dir: &Path, audit_contract_sha256: &str) -> Result<Self, CliError> {
         let file_name = final_dir.file_name().ok_or_else(|| {
@@ -4281,6 +4315,7 @@ impl ArtifactPublication {
     }
 }
 
+#[cfg(test)]
 fn write_new_synced(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
     let mut file = OpenOptions::new()
         .write(true)
@@ -4300,6 +4335,7 @@ fn write_new_synced(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
     })
 }
 
+#[cfg(test)]
 fn sync_artifact_directory(path: &Path) -> Result<(), CliError> {
     let directory = std::fs::File::open(path).map_err(|source| CliError::Io {
         path: path.to_path_buf(),
@@ -4317,6 +4353,7 @@ thread_local! {
 }
 
 /// Values needed to write the artifact bundle.
+#[cfg(test)]
 struct ArtifactInputs<'a> {
     /// Verified immutable launch manifest.
     launch: &'a LaunchManifest,
@@ -4345,6 +4382,7 @@ struct ArtifactInputs<'a> {
     /// Selected verifier identity established at audit preflight.
     audit_verifier: LaunchVerifierIdentity,
     /// Fixed paired audit blocks.
+    #[allow(dead_code)]
     blocks: Vec<ArtifactAuditBlock>,
     /// Predeclared empirical material-margin decision.
     decision: ArtifactAcceptanceDecision,
@@ -4399,6 +4437,7 @@ fn parse_run_config(path: &Path, bytes: &[u8]) -> Result<RunConfig, CliError> {
     Ok(cfg)
 }
 
+#[cfg(test)]
 fn artifact_audit_contract_sha256(
     launch: &LaunchManifest,
     candidate: &CandidateRecord,
@@ -4419,6 +4458,7 @@ fn artifact_audit_contract_sha256(
     )
 }
 
+#[cfg(test)]
 fn artifact_audit_contract_from_identity(
     launch_sha256: &str,
     candidate_sha256: &str,
@@ -4450,6 +4490,7 @@ fn artifact_audit_contract_from_identity(
     )
 }
 
+#[cfg(test)]
 fn artifact_audit_secret_seed(audit_contract_sha256: &str, training_secret_seed: u64) -> u64 {
     let digest = domain_sha256(
         "ferrl.trimul-artifact-audit-seed.v1",
@@ -4465,6 +4506,7 @@ fn artifact_audit_secret_seed(audit_contract_sha256: &str, training_secret_seed:
     seed
 }
 
+#[cfg(test)]
 fn artifact_audit_id(audit_contract_sha256: &str, audit_secret_seed: u64) -> String {
     domain_sha256(
         "ferrl.trimul-artifact-audit-attempt.v2",
@@ -4475,6 +4517,8 @@ fn artifact_audit_id(audit_contract_sha256: &str, audit_secret_seed: u64) -> Str
     )
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn artifact_execution(
     role: ArtifactAuditRole,
     result: ferrl::trimul::EvidencedTrimulVerification,
@@ -4522,6 +4566,8 @@ fn artifact_execution(
     })
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn verify_artifact_role(
     reward: &TrimulReward,
     submission: &str,
@@ -4539,6 +4585,8 @@ fn verify_artifact_role(
     })
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn verify_submission_paired(
     reward: &TrimulReward,
     submission: &str,
@@ -4611,6 +4659,7 @@ fn verify_submission_paired(
     Ok(blocks)
 }
 
+#[cfg(test)]
 fn artifact_audit_schedule(audit_id: &str) -> Vec<ArtifactAuditRole> {
     let starting_byte =
         u8::from_str_radix(&audit_id[..2], 16).expect("domain SHA-256 is lowercase hexadecimal");
@@ -4626,6 +4675,7 @@ fn artifact_audit_schedule(audit_id: &str) -> Vec<ArtifactAuditRole> {
         .collect()
 }
 
+#[cfg(test)]
 fn artifact_acceptance_from_speedups(speedups: &[f64]) -> ArtifactAcceptanceDecision {
     let valid_speedups = speedups
         .iter()
@@ -4648,6 +4698,7 @@ fn artifact_acceptance_from_speedups(speedups: &[f64]) -> ArtifactAcceptanceDeci
     }
 }
 
+#[cfg(test)]
 fn artifact_acceptance_decision(blocks: &[ArtifactAuditBlock]) -> ArtifactAcceptanceDecision {
     artifact_acceptance_from_speedups(
         &blocks
@@ -4658,6 +4709,8 @@ fn artifact_acceptance_decision(blocks: &[ArtifactAuditBlock]) -> ArtifactAccept
 }
 
 /// Write the full contract artifact bundle.
+#[cfg(test)]
+#[allow(dead_code)]
 fn write_artifact_bundle(
     args: &TrimulArtifactArgs,
     cfg: &RunConfig,
@@ -4689,6 +4742,8 @@ fn write_artifact_bundle(
     publication.publish_manifest_last()
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn stage_artifact_execution(
     publication: &mut ArtifactPublication,
     block_index: usize,
@@ -4703,6 +4758,8 @@ fn stage_artifact_execution(
     publication.stage_text(Path::new(&evidence_file), &evidence_json)
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn artifact_execution_manifest(
     block_index: usize,
     execution: &ArtifactAuditExecution,
@@ -4728,6 +4785,7 @@ fn artifact_execution_manifest(
 }
 
 /// Build the artifact manifest.
+#[cfg(test)]
 fn build_manifest(
     args: &TrimulArtifactArgs,
     cfg: &RunConfig,
@@ -4878,12 +4936,14 @@ fn trimul_verifier_max_procs(cfg: &RunConfig) -> u64 {
 }
 
 /// Render pretty JSON for `path` so callers can hash the exact bytes they write.
+#[cfg(test)]
 fn json_pretty<T: Serialize>(path: &Path, value: &T) -> Result<String, CliError> {
     serde_json::to_string_pretty(value)
         .map_err(|e| CliError::msg(format!("serialize {}: {e}", path.display())))
 }
 
 #[allow(clippy::cognitive_complexity)] // renders and independently checks every v4 contract layer
+#[cfg(test)]
 fn artifact_report(
     manifest: &ArtifactManifest,
     _artifact_dir: &Path,
@@ -5466,6 +5526,7 @@ fn artifact_report(
     out
 }
 
+#[cfg(test)]
 fn artifact_accept_reason(manifest: &ArtifactManifest) -> &'static str {
     if manifest.accepted {
         "accepted: at least nine of eleven same-device pairs exceed the 2% material margin"
@@ -5479,6 +5540,7 @@ fn artifact_accept_reason(manifest: &ArtifactManifest) -> &'static str {
 }
 
 /// Stable report label for source inspection results.
+#[cfg(test)]
 fn source_inspection_label(result: SourceInspectionResult) -> &'static str {
     match result {
         SourceInspectionResult::Clean => "clean",
@@ -5487,6 +5549,7 @@ fn source_inspection_label(result: SourceInspectionResult) -> &'static str {
 }
 
 /// Append an operator checklist row.
+#[cfg(test)]
 fn push_check(out: &mut String, pass: bool, label: &str) {
     writeln!(out, "- [{}] {label}", if pass { "pass" } else { "fail" })
         .expect("writing to String cannot fail");
@@ -6285,6 +6348,46 @@ mod tests {
         assert!(!entry.contains("run_cli_training("));
     }
 
+    #[test]
+    fn production_artifact_acceptance_and_publication_are_library_owned() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/bin/ferrl.rs"));
+        let production = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production binary source");
+        assert!(production.contains("ferrl::artifact::publish_trimul_artifact"));
+        let guarded = [
+            "#[cfg(test)]\nstruct ArtifactManifest",
+            "#[cfg(test)]\nstruct ArtifactPublication",
+            "#[cfg(test)]\nimpl ArtifactPublication",
+            "#[cfg(test)]\nfn artifact_acceptance_from_speedups",
+            "#[cfg(test)]\nfn artifact_acceptance_decision",
+        ];
+        for declaration in guarded {
+            assert!(
+                production.contains(declaration),
+                "legacy artifact reference support is not test-only: {declaration}"
+            );
+        }
+        let production = guarded
+            .into_iter()
+            .fold(production.to_owned(), |source, declaration| {
+                source.replace(declaration, "test_only_artifact_reference")
+            });
+        for forbidden in [
+            "struct ArtifactManifest",
+            "struct ArtifactPublication",
+            "impl ArtifactPublication",
+            "fn artifact_acceptance_from_speedups",
+            "fn artifact_acceptance_decision",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "production binary retains trusted artifact authority: {forbidden}"
+            );
+        }
+    }
+
     struct TestLaunchAttestor;
 
     fn test_attestation_pkcs8() -> &'static [u8] {
@@ -7035,8 +7138,11 @@ mod tests {
             .verifier
             .as_ref()
             .expect("TriMul test launch carries verifier evidence");
+        let source_sha256 = ferrl::trimul::extract_submission(completion)
+            .map(|submission| sha256_hex(submission.as_bytes()));
         candidate.reward_metadata = Some(serde_json::json!({
             "correct": true,
+            "source_sha256": source_sha256,
             "submission_extracted": true,
             "verification_executed": true,
             "verifier_isolation_tier": verifier.isolation.tier.as_str(),

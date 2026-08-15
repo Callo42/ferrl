@@ -196,6 +196,24 @@ pub struct LaunchVerifierIdentity {
     pub runtime_preflight_evidence_sha256: String,
 }
 
+impl LaunchVerifierIdentity {
+    pub(crate) fn validate_internal_consistency(&self) -> Result<(), CliOrchestrationError> {
+        crate::trimul::validate_verifier_preflight_identity(
+            &self.isolation,
+            &self.isolation_evidence_sha256,
+            &self.timing_metric,
+            &self.runtime_hardening_contract,
+            &self.runtime_preflight,
+            &self.runtime_preflight_evidence_sha256,
+        )
+        .map_err(|error| {
+            CliOrchestrationError::msg(format!(
+                "TriMul verifier identity is internally inconsistent: {error}"
+            ))
+        })
+    }
+}
+
 /// External attestation envelope for a CLI launch.
 #[doc(hidden)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -358,24 +376,76 @@ pub const LAUNCH_ATTESTATION_REQUEST_KIND: &str = "ferrl.run-launch-attestation-
 #[doc(hidden)]
 pub const LAUNCH_TRUST_POLICY_KIND: &str = "ferrl.run-launch-trust-policy";
 
+fn authenticated_launch_payload_sha256(
+    contract_version: u32,
+    payload: &LaunchPayload,
+) -> Result<String, CliOrchestrationError> {
+    let domain = match contract_version {
+        LAUNCH_CONTRACT_VERSION => {
+            if payload.training_samples.is_none() || payload.held_out_samples.is_none() {
+                return Err(CliOrchestrationError::msg(
+                    "launch v3 payload requires ordered training and held-out sample identities",
+                ));
+            }
+            LAUNCH_PAYLOAD_DOMAIN
+        }
+        LEGACY_LAUNCH_CONTRACT_VERSION => {
+            if payload.training_samples.is_some() || payload.held_out_samples.is_some() {
+                return Err(CliOrchestrationError::msg(
+                    "launch v2 payload must not carry v3 sample identities",
+                ));
+            }
+            LEGACY_LAUNCH_PAYLOAD_DOMAIN
+        }
+        _ => {
+            return Err(CliOrchestrationError::msg(format!(
+                "unsupported launch manifest contract version {contract_version}"
+            )))
+        }
+    };
+    let payload_bytes = serde_json::to_vec(payload).map_err(|error| {
+        CliOrchestrationError::msg(format!("serialize launch payload: {error}"))
+    })?;
+    Ok(domain_sha256(domain, &[&payload_bytes]))
+}
+
 impl LaunchManifest {
     /// Construct the canonical immutable launch envelope around `payload`.
     pub fn new(payload: LaunchPayload) -> Result<Self, CliOrchestrationError> {
-        if payload.training_samples.is_none() || payload.held_out_samples.is_none() {
-            return Err(CliOrchestrationError::msg(
-                "launch v3 payload requires ordered training and held-out sample identities",
-            ));
-        }
-        let payload_bytes = serde_json::to_vec(&payload).map_err(|error| {
-            CliOrchestrationError::msg(format!("serialize launch payload: {error}"))
-        })?;
+        let payload_sha256 =
+            authenticated_launch_payload_sha256(LAUNCH_CONTRACT_VERSION, &payload)?;
         Ok(Self {
             contract_version: LAUNCH_CONTRACT_VERSION,
             kind: LAUNCH_KIND.to_owned(),
-            payload_sha256: domain_sha256(LAUNCH_PAYLOAD_DOMAIN, &[&payload_bytes]),
+            payload_sha256,
             payload,
             attestation: None,
         })
+    }
+
+    pub(crate) fn authenticate_exact_bytes(
+        &self,
+        exact_bytes: &[u8],
+    ) -> Result<(), CliOrchestrationError> {
+        if self.kind != LAUNCH_KIND {
+            return Err(CliOrchestrationError::msg(format!(
+                "unsupported launch manifest kind {:?}",
+                self.kind
+            )));
+        }
+        if self.to_pretty_bytes()? != exact_bytes {
+            return Err(CliOrchestrationError::msg(
+                "launch manifest is not in the exact canonical production encoding",
+            ));
+        }
+        let expected = authenticated_launch_payload_sha256(self.contract_version, &self.payload)?;
+        if self.payload_sha256 != expected {
+            return Err(CliOrchestrationError::msg(format!(
+                "launch payload hash mismatch: recorded {}, computed {expected}",
+                self.payload_sha256
+            )));
+        }
+        Ok(())
     }
 
     /// Attach one protected external attestation to a fresh manifest.
